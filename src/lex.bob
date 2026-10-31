@@ -1,0 +1,379 @@
+import { lowerBound } from "../std/algo"
+import * from "../std/ascii"
+
+export type Keyword = Reserved | Contextual
+
+/// A keyword everywhere but as a key and after . or ?.
+type Reserved = "assert" | "async" | "await" | "break" | "case" | "catch" | "class" | "const" | "continue" | "default"
+	| "else" | "export" | "false" | "finally" | "for" | "function" | "if" | "import" | "instanceof" | "interface" | "let"
+	| "new" | "null" | "return" | "spawn" | "switch" | "test" | "this" | "throw" | "true" | "try" | "type" | "typeof"
+	| "while"
+
+/// A keyword only where the parser asks for it; an ident elsewhere.
+export type Contextual = "as" | "extends" | "from" | "implements" | "of" | "private" | "readonly" | "static" | "throws"
+
+export type Operator = "(" | ")" | "[" | "]" | "{" | "}" | "," | "." | "..." | ";" | ":" | "?." | "??" | "=>" | "=" | "@"
+	| "+=" | "-=" | "*=" | "/=" | "%=" | "**=" | "&=" | "|=" | "^=" | "<<=" | ">>=" | "??=" | "==" | "!=" | "<" | ">"
+	| "<=" | ">=" | "+" | "-" | "*" | "/" | "%" | "**" | "++" | "--" | "<<" | ">>" | "&" | "|" | "^" | "~" | "!" | "&&"
+	| "||"
+
+/// A keyword or operator is its own text.
+export type Kind = Keyword | Operator | "ident" | "int" | "float" | "string" | "template" | "templateHead"
+	| "templateMid" | "templateTail" | "comment" | "eof"
+
+/// A source range: len bytes from pos.
+export class Loc {
+	pos: i32 = 0
+	len: i32 = 0
+
+	static at(pos: i32, len: i32): Loc {
+		const l = new Loc()
+		l.pos = pos
+		l.len = len
+		return l
+	}
+
+	end(): i32 { return this.pos + this.len }
+
+	/// The smallest range covering both.
+	join(o: Loc): Loc {
+		const pos = if (o.pos < this.pos) o.pos else this.pos
+		const end = if (o.end() > this.end()) o.end() else this.end()
+		return Loc.at(pos, end - pos)
+	}
+}
+
+export class Tok {
+	kind: Kind
+	/// Whether a newline comes before it.
+	nl = false
+	loc: ...Loc
+
+	constructor(kind: Kind = "eof", loc: Loc = new Loc()) {
+		this.kind = kind
+		this.loc = { ...loc }
+	}
+}
+
+export class SyntaxError {
+	msg: string
+	loc: ...Loc
+
+	constructor(loc: Loc, msg: string) {
+		this.loc = { ...loc }
+		this.msg = msg
+	}
+}
+
+export class Lexer {
+	private src = ""
+	private pos: i32 = 0
+	private tok: Tok
+	private lines: i32[] = []
+	/// The last token taken other than a comment.
+	private last: Kind = ";"
+
+	constructor(src: string) {
+		this.src = src
+		this.tok = this.scan()
+	}
+
+	/// The token ahead, retagged as keyword `want` if it spells that contextual keyword.
+	peek(want: Kind = "ident"): Tok {
+		this.is(this.tok, want)
+		return this.tok
+	}
+
+	/// Whether t is of kind `want`, retagging t first if it spells that contextual keyword.
+	is(t: Tok, want: Kind): bool {
+		if (t.kind == "ident" && this.text(t) == want && contextual(want)) {
+			t.kind = want
+		}
+		return t.kind == want
+	}
+
+	next(): Tok {
+		const t = this.tok
+		if (t.kind != "comment") {
+			this.last = t.kind
+		}
+		this.tok = this.scan()
+		return t
+	}
+
+	/// Takes a } ahead as where a template's text resumes after ${.
+	resume(): Tok {
+		if (this.tok.kind == "}") {
+			const start = this.tok.loc.pos
+			this.pos = start
+			this.tok = new Tok(this.template("templateMid", "templateTail"), Loc.at(start, this.pos - start))
+		}
+		return this.next()
+	}
+
+	text(t: Tok): string { return this.src.slice(t.loc.pos, t.loc.end()) }
+
+	/// The line and column of pos, from 1, within the source lexed so far.
+	lineCol(pos: i32): [i32, i32] {
+		const i = lowerBound(this.lines, pos) as i32
+		const bol = if (i == 0) 0 else this.lines[i - 1] + 1
+		return [i + 1, pos - bol + 1]
+	}
+
+	private scan(): Tok {
+		this.blanks()
+		const nl = this.at(0) == lf
+		while (this.at(0) == lf) {
+			this.newline()
+			this.pos++
+			this.blanks()
+		}
+		const t = this.token()
+		t.nl = nl
+		return t
+	}
+
+	private blanks() {
+		while (isBlank(this.at(0)) || this.at(0) == cr) {
+			this.pos++
+		}
+	}
+
+	private token(): Tok {
+		const start = this.pos
+		const cur = this.at(0)
+		const kind = switch (cur) {
+			case nul: if (start == this.src.length) "eof" else this.punct()
+			case a ... z, A ... Z, underscore, dollar: this.ident()
+			case zero ... nine: this.number()
+			case quote, apostrophe: this.quoted(cur)
+			case backtick: this.template("templateHead", "template")
+			case slash: if (this.at(1) == slash) this.comment() else this.punct()
+			default: this.punct()
+		}
+		return new Tok(kind, Loc.at(start, this.pos - start))
+	}
+
+	private ident(): Kind {
+		const start = this.pos
+		while (isIdentChar(this.at(0))) {
+			this.pos++
+		}
+		const s = this.src.slice(start, this.pos)
+		const k = keyword(s)
+		return if (k == null || contextual(k) || this.last == "." || this.last == "?.") "ident" else k
+	}
+
+	private number(): Kind {
+		let base = 10
+		if (this.at(0) == zero && isAlphabetic(this.at(1)) && toLower(this.at(1)) != e) {
+			base = switch (this.at(1)) {
+				case x: 16
+				case o: 8
+				case b: 2
+				default: 0
+			}
+			if (base == 0) {
+				throw this.error("malformed number")
+			}
+			this.pos += 2
+		}
+		const start = this.pos
+		this.digits(base)
+		let kind: Kind = "int"
+		if (base == 10 && this.at(0) == dot && isDigit(this.at(1))) {
+			this.pos++
+			this.digits(10)
+			kind = "float"
+		}
+		if (base == 10 && toLower(this.at(0)) == e) {
+			this.pos++
+			if (this.at(0) == plus || this.at(0) == minus) {
+				this.pos++
+			}
+			if (!isDigit(this.at(0))) {
+				throw this.error("malformed number")
+			}
+			while (isDigit(this.at(0))) {
+				this.pos++
+			}
+			kind = "float"
+		}
+		const cur = this.at(0)
+		const leading = kind == "int" && base == 10 && this.src[start] == zero && this.pos - start > 1
+		if (leading || isIdentChar(cur) || cur == dot && this.at(1) != dot) {
+			throw this.error("malformed number")
+		}
+		return kind
+	}
+
+	private comment(): Kind {
+		while (this.at(0) != lf && this.at(0) != 0) {
+			this.pos++
+		}
+		return "comment"
+	}
+
+	/// Skips digits of base with single _ between them.
+	private digits(base: i32) {
+		const start = this.pos
+		let cur = this.at(0)
+		while ((digit(cur) ?? base) < base
+			|| cur == underscore && this.pos > start && (digit(this.at(1)) ?? base) < base) {
+			this.pos++
+			cur = this.at(0)
+		}
+		if (this.pos == start) {
+			throw this.error("malformed number")
+		}
+	}
+
+	private quoted(q: u8): Kind {
+		this.pos++
+		let cur = this.at(0)
+		while (cur != q) {
+			if (cur == nul || cur == lf) {
+				throw this.error("unterminated string")
+			}
+			this.char()
+			cur = this.at(0)
+		}
+		this.pos++
+		return "string"
+	}
+
+	/// Skips template text after ` or }, through ${ (returning more) or ` (returning done).
+	private template(more: Kind, done: Kind): Kind {
+		this.pos++
+		while (true) {
+			const cur = this.at(0)
+			if (cur == backtick) {
+				this.pos++
+				return done
+			}
+			if (cur == dollar && this.at(1) == lbrace) {
+				this.pos += 2
+				return more
+			}
+			if (cur == 0) {
+				throw this.error("unterminated template")
+			}
+			if (cur == lf) {
+				this.newline()
+			}
+			this.char()
+		}
+	}
+
+	/// Skips one character or escape of a string or template.
+	private char() {
+		if (this.at(0) != backslash) {
+			this.pos++
+			return
+		}
+		const esc = this.at(1)
+		if (esc == x && isHexDigit(this.at(2)) && isHexDigit(this.at(3))) {
+			this.pos += 4
+		} else if (esc == u && this.at(2) == lbrace) {
+			let n = 3
+			let v = 0
+			while (isHexDigit(this.at(n))) {
+				v = digit(this.at(n))! + v * 16
+				n++
+			}
+			if (n == 3 || n > 9 || v > 0x10FFFF || this.at(n) != rbrace) {
+				throw this.error("invalid escape")
+			}
+			this.pos += n + 1
+		} else if (isEscape(esc)) {
+			this.pos += 2
+		} else {
+			throw this.error("invalid escape")
+		}
+	}
+
+	private punct(): Kind {
+		const op = operator([this.at(0), this.at(1), this.at(2)])
+		if (op == null) {
+			throw this.error("unexpected character")
+		}
+		this.pos += op.length
+		return op
+	}
+
+	private at(i: i32): u8 {
+		const p = this.pos + i
+		return if (p < this.src.length) this.src[p] else nul
+	}
+
+	private newline() { this.lines.push(this.pos) }
+	private error(msg: string): SyntaxError { return new SyntaxError(Loc.at(this.pos, 1), msg) }
+}
+
+export function keyword(s: string): Keyword | null {
+	for (const k of Keyword.members) {
+		if (s == k.value) {
+			return k.value
+		}
+	}
+	return null
+}
+
+function contextual(s: string): bool {
+	for (const k of Contextual.members) {
+		if (s == k.value) {
+			return true
+		}
+	}
+	return false
+}
+
+/// The longest operator that ahead starts with.
+function operator(ahead: u8[3]): Operator | null {
+	let op: Operator | null = null
+	for (const o of Operator.members) {
+		const s = o.value
+		let i = 0
+		while (i < s.length && s[i] == ahead[i]) {
+			i++
+		}
+		if (i == s.length && s.length > (op?.length ?? 0)) {
+			op = s
+		}
+	}
+	return op
+}
+
+/// The binding level of a binary operator, or 0.
+export function prec(k: string): i32 {
+	return switch (k) {
+		case "??": 1
+		case "||": 2
+		case "&&": 3
+		case "==", "!=", "<", ">", "<=", ">=", "instanceof": 4
+		case "|": 5
+		case "^": 6
+		case "&": 7
+		case "<<", ">>": 8
+		case "+", "-": 9
+		case "*", "/", "%": 10
+		case "**": 11
+		default: 0
+	}
+}
+
+export function assigns(k: Kind): bool {
+	return switch (k) {
+		case "=", "+=", "-=", "*=", "/=", "%=", "**=", "&=", "|=", "^=", "<<=", ">>=", "??=": true
+		default: false
+	}
+}
+
+function isEscape(c: u8): bool {
+	return switch (c) {
+		case n, r, t, zero, backslash, apostrophe, quote, backtick, dollar: true
+		default: false
+	}
+}
+
+function isIdentChar(c: u8): bool { return isAlphanumeric(c) || c == underscore || c == dollar }

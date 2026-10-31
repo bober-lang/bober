@@ -1,0 +1,77 @@
+//! Type, what a type used as a value is (§4.11), which only the compiler makes.
+
+/// What kind of type a Type is, `"type"` that of Type itself.
+export type Kind = "null" | "bool" | "int" | "float" | "string" | "literal" | "array" | "fixed" | "tuple" | "object"
+	| "class" | "interface" | "function" | "async" | "union" | "type"
+
+/// A field of an object, class, interface or tuple.
+export type Field = { name: string, type: Type, readonly: bool, doc: string, tags: Type[] }
+
+/// ## Reflection
+///
+/// A type used as a value is a `Type`, and so is `typeof x`. A `Type` is an ordinary value, stored, passed and returned
+/// like any other. Every `Type` comes from a type written in the program, so its possible values are fixed at compile
+/// time. Operators that form types take static operands, and where a `Type` is expected an expression is read as a
+/// type: `const t: Type = [i32, string]` is a tuple type. Its fields describe the type; on a class name, `.` reaches
+/// static members instead (§5.3).
+///
+/// An expression is *static* when its value is known when compiling: a literal, a type, a type parameter, a `const`
+/// holding a static value, the binding of an unrolled `for`, a member or subscript of a static value, or `!`, `&&`,
+/// `||`, `==` or `!=` of static operands. Only a static `Type` stands for a type where one is expected. A `for` over a
+/// static array or tuple is *unrolled*: its body is compiled once per element, in order, with the binding static. An
+/// `if` or `switch` whose condition or subject is static and depends on a `Type` compiles only the branch it takes; the
+/// others are parsed but not checked. Such an `if` without `else` whose block ends in `return`, `throw`, `break` or
+/// `continue` has the statements after it in its block as its `else`. Where the branch is taken by a type parameter's
+/// `kind`, the parameter is narrowed within it: to `string`, `bool` or `null`, to an array of its `elem` or a fixed
+/// array of it where it has a zero value (§5.1), to the number types of its kind, to a literal, or to the types of its
+/// kind in its type set, else its constraint; with several labels, to any of what each makes it. An operation on a
+/// value of the parameter's type shall be allowed for every type it may be. Such a `switch` shall cover every value of
+/// its subject or have a `default` (§6.7).
+/// A subscript of an object, class or tuple by a static string is the field it names, as with `.`.
+///
+/// ```
+/// function write[T](out: Writer, v: T) {
+///   switch (T.kind) {
+///     case "bool", "int", "float": out.raw(`${v}`)
+///     case "string": out.str(v)
+///     case "array":
+///       out.open("[")
+///       for (const x of v) { out.item(); write(out, x) }    // a loop at run time
+///       out.close("]")
+///     case "class", "object", "interface":
+///       out.open("{")
+///       for (const f of T.fields) { out.key(f.name); write(out, v[f.name]) }    // unrolled
+///       out.close("}")
+///     case "union":
+///       for (const M of T.members) { if (v instanceof M) { write(out, v) } }    // v: M
+///     default: throw `cannot write ${T.name}`
+///   }
+/// }
+/// let t = typeof x; log(t.name)     // a Type at run time
+/// let y: t                          // error: t is not static; with `const t` it is
+/// for (const f of xs) { v[f] }      // error: f is not static
+/// ```
+export interface Type {
+	kind: Kind
+	/// The declared name, else the type as written.
+	name: string
+	/// The doc comment of its declaration, else `""`.
+	doc: string
+	/// The non-static fields of an object, class, interface or tuple in declaration order, private ones only inside the
+	/// class; a tuple's are named `"0"`, `"1"`, …
+	fields: Field[]
+	/// A class's or interface's tags (§5.3) in order, else `[]`.
+	tags: Type[]
+	/// The generic an instance instantiates.
+	base: Type
+	/// An instance's type args, else `[]`.
+	args: Type[]
+	/// A union's members in canonical order (§4.4).
+	members: Type[]
+	/// An array's or fixed array's element.
+	elem: Type
+	/// A fixed array's n.
+	length: i32
+	/// A literal's value.
+	value: string | bool | null
+}

@@ -1,0 +1,700 @@
+//! Recursive descent with Pratt expressions, into a tree of constructs.
+
+import { Kind, Lexer, SyntaxError, Tok, assigns, keyword, prec } from "./lex"
+
+/// A construct, entered at its keyword, operator or opening bracket, at the name of a typeParam, prop
+/// or method, or at the first token of a param. A block is the statements after { or a case's :, and
+/// members are a class's or interface's.
+export type Syntax = "import" | "test" | "var" | "function" | "method" | "typeParams" | "typeParam" | "params" | "param"
+	| "class" | "members" | "type" | "block" | "assign" | "if" | "for" | "while" | "switch" | "case" | "try" | "catch"
+	| "jump" | "template" | "paren" | "unary" | "postfix" | "binary" | "chain" | "member" | "index" | "call" | "array"
+	| "object" | "prop" | "arrow" | "ifExpr" | "switchExpr" | "new"
+
+/// What the last expression parsed is on the outside: a binary operator, as, await, ident, new, (,
+/// one of these, or "" for anything else.
+export type Shape = Kind | "unary" | "member" | "index" | "call" | "array" | ""
+
+type Part = Tree | Tok
+
+/// A construct and its parts in source order. Types, patterns, and statements without an assignment are
+/// expressions. A token part is a name, literal, operator, modifier or comment, or the token before an
+/// optional part.
+export class Tree {
+	kind: Syntax
+	t: ...Tok
+	parts: Part[]
+	/// Where its parts end, before its closing token, for a block, switch or one of items in brackets.
+	end: i32 = 0
+
+	constructor(kind: Syntax, t: Tok, parts: Part[] = []) {
+		this.kind = kind
+		this.t = { ...t }
+		this.parts = parts
+	}
+}
+
+export class Parser {
+	private l: Lexer
+	private shape: Shape = ""
+	/// The comments, in order. They are not in the tree.
+	comments: Tok[] = []
+	private header: bool
+	/// Whether only imports have come so far.
+	private imports = true
+
+	constructor(src: string,
+		header = false 	/// Whether functions may lack a body, as those of a C header do (3.1).
+	) {
+		this.l = new Lexer(src)
+		this.header = header
+	}
+
+	/// The next of the file's imports and then declarations, or null at its end.
+	parse(): Tree | null {
+		const k = this.peek().kind
+		if (k == "eof") {
+			return null
+		}
+		this.imports = this.imports && k == "import"
+		const t = if (this.imports) this.imp() else this.top()
+		this.term()
+		return t
+	}
+
+	/// The line and column of pos, from 1, within the source parsed so far.
+	lineCol(pos: i32): [i32, i32] { return this.l.lineCol(pos) }
+
+	/// The token ahead, after reading the comments before it; want may be a contextual keyword it spells.
+	private peek(want: Kind = "ident"): Tok {
+		while (this.l.peek().kind == "comment") {
+			this.comments.push(this.l.next())
+		}
+		return this.l.peek(want)
+	}
+
+	/// Takes the token ahead, or where resume, the template part after the expression just parsed.
+	private next(resume = false): Tok {
+		this.peek()
+		return if (resume) this.l.resume() else this.l.next()
+	}
+
+	private imp(): Tree {
+		const n = new Tree("import", this.next())
+		if (this.peek().kind != "string") {
+			if (this.peek().kind == "{") {
+				n.parts.push(this.listOf("object", this.next(), "}", this.alias))
+			} else {
+				n.parts.push(this.alias("*"))
+			}
+			this.expect("from")
+		}
+		n.parts.push(this.expect("string"))
+		return n
+	}
+
+	private alias(name: Kind = "ident"): Part {
+		const x = this.expect(name)
+		const t = this.peek()
+		return if (this.eat("as")) new Tree("binary", t, [x, this.expect("ident")]) else x
+	}
+
+	private top(): Tree {
+		if (this.peek().kind == "test") {
+			return this.testBlock(true)
+		}
+		const t = this.peek()
+		return this.decl(if (this.eat("export")) [t] else [])
+	}
+
+	private decl(mods: Part[]): Tree {
+		const t = this.next()
+		switch (t.kind) {
+			case "let", "const":
+				const n = new Tree("var", t, mods)
+				n.parts.push(this.pattern())
+				this.typed(n)
+				return n
+			case "function": return this.fn("function", t, mods)
+			case "type":
+				const n = new Tree("type", t, mods)
+				n.parts.push(this.expect("ident"))
+				this.typeParams(n)
+				this.expect("=")
+				n.parts.push(this.expr())
+				return n
+			case "class", "interface":
+				const n = new Tree("class", t, mods)
+				n.parts.push(this.expect("ident"))
+				this.typeParams(n)
+				if (this.opt(n, if (t.kind == "class") "implements" else "extends")) {
+					n.parts.push(this.expr())
+					while (this.eat(",")) {
+						n.parts.push(this.expr())
+					}
+				}
+				this.tags(n)
+				n.parts.push(this.object("members"))
+				return n
+		}
+		throw fail(t, "a declaration")
+	}
+
+	private testBlock(outer: bool): Tree {
+		const n = new Tree("test", this.next())
+		const k = this.peek().kind
+		if (k != "string" && (outer || k != "template" && k != "templateHead")) {
+			throw fail(this.peek(), "a test name")
+		}
+		n.parts.push(this.primary())
+		n.parts.push(this.block())
+		return n
+	}
+
+	/// A function, after its name, or a method, which may lack a body.
+	private fn(kind: Syntax, t: Tok, mods: Part[]): Tree {
+		const n = new Tree(kind, t, mods)
+		if (kind == "function") {
+			n.parts.push(this.expect("ident"))
+		}
+		this.typeParams(n)
+		n.parts.push(this.listOf("params", this.expect("("), ")", () => this.param(false)))
+		this.optExpr(n, ":")
+		this.errors(n)
+		if (kind == "method") {
+			this.tags(n)
+		}
+		if (kind == "function" && !this.header || this.peek().kind == "{") {
+			n.parts.push(this.block())
+		}
+		return n
+	}
+
+	private typeParams(n: Tree) {
+		const t = this.peek()
+		if (!this.eat("[")) {
+			return
+		}
+		if (this.peek().kind == "]") {
+			throw fail(this.peek(), "a type parameter")
+		}
+		n.parts.push(this.listOf("typeParams", t, "]", this.typeParam))
+	}
+
+	private typeParam(): Tree {
+		const n = new Tree("typeParam", this.expect("ident"))
+		this.optExpr(n, "extends")
+		this.optExpr(n, "=")
+		return n
+	}
+
+	private param(arrow: bool): Tree {
+		const t = this.peek()
+		const rest = this.eat("...")
+		const name = if (arrow) this.expect("ident") else this.pattern()
+		const n = new Tree("param", t, [if (rest) new Tree("unary", t, [name]) else name])
+		if (this.header && this.opt(n, ":")) {
+			n.parts.push(this.arg()) // ...T, a C struct by value (3.1)
+		}
+		this.typed(n)
+		return n
+	}
+
+	/// The param at t of the ident x parsed already, with its type and default.
+	private paramAt(t: Tok, x: Part): Tree {
+		const n = new Tree("param", t, [x])
+		this.typed(n)
+		return n
+	}
+
+	/// A var's or param's type and default.
+	private typed(n: Tree) {
+		this.optExpr(n, ":")
+		this.optExpr(n, "=")
+	}
+
+	private errors(n: Tree) {
+		const t = this.peek()
+		if (!t.nl && this.eat("throws")) {
+			n.parts.push(t)
+			this.eat("|")
+			n.parts.push(this.expr())
+		}
+	}
+
+	private object(kind: Syntax = "object"): Tree {
+		const n = this.listOf(kind, this.expect("{"), "}", () => this.prop(kind == "members"), true)
+		this.shape = ""
+		return n
+	}
+
+	/// Tags (5.3), each a type after an @.
+	private tags(n: Tree) {
+		while (this.optExpr(n, "@")) {}
+	}
+
+	private prop(member: bool): Part {
+		let key = this.next()
+		if (key.kind == "...") {
+			return new Tree("unary", key, [this.expr()])
+		}
+		const mods: Part[] = []
+		while (!this.peek().nl && isKey(this.peek().kind) && this.modifier(key)) {
+			mods.push(key)
+			key = this.next()
+		}
+		if (!isKey(key.kind)) {
+			throw fail(key, "a property")
+		}
+		const k = this.peek().kind
+		if (k == "[" || k == "(") {
+			return this.fn("method", key, mods)
+		}
+		const n = new Tree("prop", key, mods)
+		const value = this.opt(n, ":")
+		if (value) {
+			n.parts.push(this.arg())
+		}
+		if (member) {
+			this.tags(n)
+		}
+		const init = this.optExpr(n, "=")
+		if (key.kind != "ident" && !value && !init) {
+			throw fail(key, "an identifier")
+		}
+		return n
+	}
+
+	/// Whether t, taken already, is static, private or readonly, taking it as such.
+	private modifier(t: Tok): bool { return this.l.is(t, "static") || this.l.is(t, "private") || this.l.is(t, "readonly") }
+
+	private pattern(): Part {
+		const t = this.peek()
+		if (t.kind != "ident" && t.kind != "[" && t.kind != "{") {
+			throw fail(t, "a pattern")
+		}
+		return this.primary()
+	}
+
+	private block(): Tree {
+		const n = new Tree("block", this.expect("{"))
+		this.stmts(n)
+		this.expect("}")
+		return n
+	}
+
+	/// Statements up to a }, case or default.
+	private stmts(n: Tree) {
+		while (!ends(this.peek().kind)) {
+			n.parts.push(this.stmt())
+			this.term()
+		}
+		n.end = this.peek().loc.pos
+	}
+
+	private stmt(): Part {
+		const t = this.peek()
+		switch (t.kind) {
+			case "{": return this.block()
+			case "let", "const", "function", "class", "interface", "type": return this.decl([])
+			case "test": return this.testBlock(false)
+			case "if": return this.ifStmt()
+			case "for": return this.forStmt()
+			case "switch": return this.switchOf(false)
+			case "try": return this.tryStmt()
+			case "while":
+				const n = new Tree("while", this.next())
+				this.paren(n)
+				n.parts.push(this.block())
+				return n
+			case "break", "continue", "return", "throw", "assert":
+				const n = new Tree("jump", this.next())
+				const k = this.peek()
+				if (t.kind != "break" && t.kind != "continue"
+					&& (t.kind != "return" || k.kind != ";" && !ends(k.kind) && !k.nl)) {
+					n.parts.push(this.expr())
+				}
+				return n
+		}
+		return this.simple()
+	}
+
+	private simple(): Part {
+		const x = this.expr()
+		const shape = this.shape
+		const t = this.peek()
+		const assign = assigns(t.kind)
+		if (assign || !t.nl && (t.kind == "++" || t.kind == "--")) {
+			if (shape != "ident" && shape != "member" && shape != "index" && shape != "array") {
+				throw fail(t, "an assignable expression before it")
+			}
+			this.next()
+			return if (assign) new Tree("assign", t, [x, this.expr()]) else new Tree("assign", t, [x])
+		}
+		if (shape != "call" && shape != "new" && shape != "await") {
+			throw fail(t, "a call, await or new before it")
+		}
+		return x
+	}
+
+	private ifStmt(): Tree {
+		const n = new Tree("if", this.next())
+		this.paren(n)
+		n.parts.push(this.block())
+		if (this.opt(n, "else")) {
+			n.parts.push(if (this.peek().kind == "if") this.ifStmt() else this.block())
+		}
+		return n
+	}
+
+	private forStmt(): Tree {
+		const n = new Tree("for", this.next())
+		this.expect("(")
+		const decl = this.next()
+		if (decl.kind != "let" && decl.kind != "const") {
+			throw fail(decl, "let or const")
+		}
+		n.parts.push(decl)
+		n.parts.push(this.pattern())
+		this.expect("of")
+		n.parts.push(this.range(1))
+		this.expect(")")
+		n.parts.push(this.block())
+		return n
+	}
+
+	/// An expression binding at least min, or a range of two.
+	private range(min: i32): Part {
+		const x = this.expr(min)
+		const t = this.peek()
+		return if (this.eat("...")) new Tree("binary", t, [x, this.expr(min)]) else x
+	}
+
+	private label(): Part { return this.range(Suffix) }
+
+	private tryStmt(): Tree {
+		const n = new Tree("try", this.next())
+		n.parts.push(this.block())
+		const caught = this.peek().kind == "catch"
+		if (caught) {
+			n.parts.push(this.catchClause())
+		}
+		if (this.opt(n, "finally")) {
+			n.parts.push(this.block())
+		} else if (!caught) {
+			throw fail(this.peek(), "catch or finally")
+		}
+		return n
+	}
+
+	private catchClause(): Tree {
+		const n = new Tree("catch", this.next())
+		if (this.eat("(")) {
+			n.parts.push(this.pattern())
+			this.optExpr(n, ":")
+			this.expect(")")
+		}
+		n.parts.push(this.block())
+		return n
+	}
+
+	private switchOf(isExpr: bool): Tree {
+		const n = new Tree(if (isExpr) "switchExpr" else "switch", this.next())
+		this.paren(n)
+		this.expect("{")
+		while (this.peek().kind != "}") {
+			n.parts.push(this.arm(isExpr))
+		}
+		n.end = this.next().loc.pos
+		this.shape = ""
+		return n
+	}
+
+	private arm(isExpr: bool): Tree {
+		const c = this.next()
+		if (c.kind != "case" && c.kind != "default") {
+			throw fail(c, "case or default")
+		}
+		const n = new Tree("case", c)
+		const colon = if (c.kind == "case") this.list(n, ":", this.label) else this.expect(":")
+		if (isExpr) {
+			n.parts.push(this.expr())
+			this.term()
+			return n
+		}
+		if (ends(this.peek().kind)) {
+			throw fail(this.peek(), "a statement")
+		}
+		const body = new Tree("block", colon)
+		this.stmts(body)
+		n.parts.push(body)
+		return n
+	}
+
+	/// Parses an expression of operators binding at least min.
+	private expr(min = 1): Part {
+		const t = this.peek()
+		if (min == 1 && this.eat("if")) {
+			const n = new Tree("ifExpr", t)
+			this.paren(n)
+			n.parts.push(this.branch())
+			this.expect("else")
+			n.parts.push(this.branch())
+			this.shape = ""
+			return n
+		}
+		let x = this.prefix()
+		let shape = this.shape
+		while (continues(this.peek()) && power(this.peek("as").kind) >= min) {
+			const op = this.next()
+			x = if (prec(op.kind) == 0) this.suffix(x, op) else this.binary(x, op, shape)
+			shape = this.shape
+		}
+		this.shape = shape
+		return x
+	}
+
+	/// x op and its right, where x is of shape.
+	private binary(x: Part, op: Tok, shape: Shape): Tree {
+		const level = prec(op.kind)
+		const y = this.expr(if (op.kind == "**") level else level + 1)
+		this.shape = op.kind
+		return new Tree(if (level == 4 && prec(shape) == 4) "chain" else "binary", op, [x, y])
+	}
+
+	private branch(): Part {
+		if (this.peek().kind == "{") {
+			throw fail(this.peek(), "an expression")
+		}
+		return this.expr()
+	}
+
+	private prefix(): Part {
+		const t = this.peek()
+		const k = t.kind
+		if (k != "!" && k != "-" && k != "~" && k != "typeof" && k != "async" && k != "spawn" && k != "await") {
+			return this.primary()
+		}
+		this.next()
+		const s = this.peek()
+		const x = if (k == "await" && this.eat("...")) new Tree("unary", s, [this.expr(Suffix)]) else this.expr(Suffix)
+		this.shape = if (k == "await") "await" else "unary"
+		return new Tree("unary", t, [x])
+	}
+
+	/// x and the suffix after it at op: as, !, ., ?. or an opening bracket.
+	private suffix(x: Part, op: Tok): Tree {
+		const k = if (op.kind == "?." && (this.peek().kind == "[" || this.peek().kind == "(")) this.next().kind
+			else op.kind
+		const optional = this.shape == "?." || op.kind == "?."
+		switch (k) {
+			case "[":
+				const n = new Tree("index", op, [x])
+				this.list(n, "]", this.expr)
+				this.shape = if (optional) "?." else "index"
+				return n
+			case "(":
+				const n = new Tree("call", op, [x])
+				this.list(n, ")", this.arg)
+				this.shape = "call"
+				return n
+			case ".", "?.":
+				this.shape = if (optional) "?." else "member"
+				return new Tree("member", op, [x, this.expect("ident")])
+			case "!":
+				this.shape = ""
+				return new Tree("postfix", op, [x])
+		}
+		const y = this.expr(Suffix)
+		if (this.shape == "unary" || this.shape == "await") {
+			throw fail(op, "a type without a unary operator")
+		}
+		this.shape = "as"
+		return new Tree("binary", op, [x, y])
+	}
+
+	private primary(): Part {
+		const t = this.peek()
+		switch (t.kind) {
+			case "ident":
+				const x = this.next()
+				if (this.peek().kind == "=>") {
+					return this.arrow(new Tree("params", t, [this.paramAt(t, x)]))
+				}
+				this.shape = "ident"
+				return x
+			case "int", "float", "string", "template", "true", "false", "null", "this":
+				this.shape = ""
+				return this.next()
+			case "templateHead": return this.template()
+			case "(": return this.group()
+			case "[":
+				const n = this.listOf("array", this.next(), "]", this.elem)
+				this.shape = "array"
+				return n
+			case "{": return this.object()
+			case "switch": return this.switchOf(true)
+			case "new":
+				const n = new Tree("new", this.next())
+				n.parts.push(this.expr(Member))
+				this.expect("(")
+				this.list(n, ")", this.arg)
+				this.shape = "new"
+				return n
+		}
+		throw fail(t, "an expression")
+	}
+
+	private template(): Tree {
+		const head = this.next()
+		const n = new Tree("template", head)
+		let part = head
+		while (part.kind != "templateTail") {
+			n.parts.push(this.expr())
+			part = this.next(true)
+			if (part.kind != "templateMid" && part.kind != "templateTail") {
+				throw fail(part, "}")
+			}
+			n.parts.push(part)
+		}
+		this.shape = ""
+		return n
+	}
+
+	/// A parenthesized expression, or an arrow with its parameters.
+	private group(): Part {
+		const t = this.expect("(")
+		const first = this.peek()
+		if (first.kind == ")" || first.kind == "...") {
+			return this.arrow(this.listOf("params", t, ")", () => this.param(true)))
+		}
+		const x = this.expr()
+		const bare = this.shape == "ident"
+		if (bare && this.peek().kind != ")") {
+			const n = new Tree("params", t, [this.paramAt(first, x)])
+			if (this.peek().kind != ")") {
+				this.expect(",")
+			}
+			this.list(n, ")", () => this.param(true))
+			return this.arrow(n)
+		}
+		this.expect(")")
+		if (bare && this.peek().kind == "=>") {
+			return this.arrow(new Tree("params", t, [this.paramAt(first, x)]))
+		}
+		this.shape = "("
+		return new Tree("paren", t, [x])
+	}
+
+	private arrow(params: Tree): Tree {
+		const n = new Tree("arrow", this.expect("=>"), [params])
+		n.parts.push(if (this.peek().kind == "{") this.block() else this.expr())
+		this.errors(n)
+		this.shape = ""
+		return n
+	}
+
+	private elem(): Part {
+		const x = this.arg()
+		const t = this.peek()
+		return if (this.eat("=")) new Tree("binary", t, [x, this.expr()]) else x
+	}
+
+	private arg(): Part {
+		const t = this.peek()
+		return if (this.eat("...")) new Tree("unary", t, [this.expr()]) else this.expr()
+	}
+
+	/// An expression in parentheses, added to n.
+	private paren(n: Tree) {
+		this.expect("(")
+		n.parts.push(this.expr())
+		this.expect(")")
+	}
+
+	/// Adds to n the items up to close, separated by commas, or also by terminators where terms, and takes close.
+	private list(n: Tree, close: Kind, item: () => Part, terms = false): Tok {
+		while (this.peek().kind != close) {
+			n.parts.push(item())
+			if (this.peek().kind != close && !this.eat(",") && !(terms && (this.eat(";") || this.peek().nl))) {
+				throw fail(this.peek(), ",")
+			}
+		}
+		n.end = this.peek().loc.pos
+		return this.next()
+	}
+
+	/// A construct of kind at t of a list.
+	private listOf(kind: Syntax, t: Tok, close: Kind, item: () => Part, terms = false): Tree {
+		const n = new Tree(kind, t)
+		this.list(n, close, item, terms)
+		return n
+	}
+
+	private term() {
+		const t = this.peek()
+		if (!t.nl && t.kind != "}" && t.kind != "eof") {
+			this.expect(";")
+		}
+	}
+
+	/// Whether kind is next, adding it and the expression after it to n.
+	private optExpr(n: Tree, kind: Kind): bool {
+		const ok = this.opt(n, kind)
+		if (ok) {
+			n.parts.push(this.expr())
+		}
+		return ok
+	}
+
+	/// Whether kind is next, adding it to n.
+	private opt(n: Tree, kind: Kind): bool {
+		const t = this.peek()
+		if (!this.eat(kind)) {
+			return false
+		}
+		n.parts.push(t)
+		return true
+	}
+
+	private eat(kind: Kind): bool {
+		if (this.peek(kind).kind != kind) {
+			return false
+		}
+		this.next()
+		return true
+	}
+
+	private expect(kind: Kind): Tok {
+		this.peek(kind)
+		const t = this.next()
+		if (t.kind != kind) {
+			throw fail(t, kind)
+		}
+		return t
+	}
+}
+
+function isKey(k: Kind): bool { return k == "ident" || k == "string" || k == "int" || keyword(k) != null }
+function ends(k: Kind): bool { return k == "}" || k == "case" || k == "default" || k == "eof" }
+
+/// Binding powers above the binary operators'. . and [ bind tightest so that new's callee stops
+/// before its arguments.
+const As = 12
+const Suffix = 13
+const Member = 14
+
+function power(k: Kind): i32 {
+	return switch (k) {
+		case ".", "[": Member
+		case "(", "?.", "!": Suffix
+		case "as": As
+		default: prec(k)
+	}
+}
+
+/// Whether t continues the expression before it: on a new line, ( [ instanceof and an ident, so also as, do not.
+function continues(t: Tok): bool {
+	return !t.nl || t.kind != "(" && t.kind != "[" && t.kind != "instanceof" && t.kind != "ident"
+}
+
+function fail(t: Tok, want: string): SyntaxError { return new SyntaxError(t.loc, `expected ${want}, got ${t.kind}`) }

@@ -1,0 +1,818 @@
+//! Bober's types, as the checker sees them. Each type is made once (`intern`): two types are the same when they are one
+//! reference, so comparing them is cheap and a union's members are told apart by identity.
+//!
+//! Layout is meant to let builtin types compose cheaply inside tagged unions: references and strings have a spare
+//! byte, so a union of them adds no size in most cases. References are meant to be a 4-byte BiBoP index, a 1-byte tag
+//! and a 2-byte offset, so there are no interior pointers; the spec allows other garbage collectors.
+//!
+//! # Types
+//!
+//! The basic types are `null`, `bool`, the integers `i8 i16 i32 i64` and `u8 u16 u32 u64`, the floats `f32 f64`, and
+//! the strings `string string16 string32`. Signed integers are two's complement, `f32` and `f64` are IEEE 754 binary32
+//! and binary64.
+//!
+//! Every type has a fixed size and alignment, given below in bytes. Compound layout follows C: fields in declaration
+//! order, each at the next offset of its alignment, the whole padded to its alignment.
+//!
+//! - `null`, `bool`: 1, 1
+//! - `iN`, `uN`, `fN`: N/8, N/8
+//! - `string`, `string16`, `string32`: 24, 8
+//! - `T[]`: implementation-defined, 8
+//! - `T[n]`: n× `T`'s, `T`'s; a class `T` counts as embedded (§5.3)
+//! - `{ a: A, b: B }`, an interface: implementation-defined (§4.7)
+//! - `[A, B]`, a class, `(…) => R`, `async T`, `Type`: 8, 8
+//! - `A | B`: §4.4
+//!
+//! The representation of a reference is implementation-defined. References, strings and types of implementation-defined
+//! size do not use their last byte, so a union can hold its tag there (§4.4).
+//!
+//! Numbers, `bool`, `null` and unions are held in place and compared by value; `T[n]` is held in place, elements
+//! included, copied when assigned, passed or returned, and not comparable. Every other value is a *reference*:
+//! assignment and passing copy the reference, so all holders see one object, and `==` compares identity, except that
+//! strings compare by code units, functions do not compare, and an assert compares by value (§5.5).
+
+import { contains, lowerBound, position, unique } from "../std/algo"
+import { HashMap } from "../std/collections/hashmap"
+import { combine, fnv } from "../std/hash"
+import { maxOf } from "../std/limits"
+import { min } from "../std/math"
+import { merge } from "../std/sort"
+
+export type Kind = "null" | "bool" | "int" | "float" | "string" | "literal" | "array" | "fixed" | "tuple" | "object"
+	| "class" | "interface" | "function" | "async" | "union" | "param"
+
+/// A type, a node of the type DAG, told apart by its kind; a field its kind does not use keeps its zero value. A class,
+/// interface or type param is its own type; any other is made once per structure (`intern`), so a type is compared by
+/// identity.
+export class Type {
+	kind: Kind
+	/// A literal's text, "" for one of a type, or the member of its param a derived param stands for, "" for the param
+	/// itself (4.11).
+	text = ""
+	/// The order made, which orders a union's members.
+	id = fresh()
+	/// The type this is built on: a literal's base, a string's or array's class in builtin/, a fixed array's or async's
+	/// element, a function's result, null while unknown, a param's constraint, null if none, or the type a type set
+	/// extends.
+	base: Type | null = null
+	/// The generic an instance is of.
+	generic: Type | null = null
+	/// A tuple's elements, a union's members by id, or a function's params' types.
+	types: Type[] = []
+	/// A generic's type params, an instance's type args, the param a derived one is of (4.11), or the type a literal of
+	/// one is.
+	params: Type[] = []
+	/// An object's, class's or interface's members, its statics among them.
+	fields: Field[] = []
+	/// An int's or float's width in bits, 0 for an untyped constant's; a string's code unit's; a fixed array's length;
+	/// or how many of a function's params are required.
+	n: i32 = 0
+	/// Whether an int is signed.
+	signed = false
+	/// Whether a tuple's last element or a function's last param is a rest.
+	rest = false
+	/// A param's default.
+	fallback: Type | null = null
+
+	constructor(kind: Kind) {
+		this.kind = kind
+	}
+
+	/// A union's members, or this alone.
+	alternatives(): Type[] { return if (this.kind == "union") this.types else [this] }
+	/// The type its values are of: a param's constraint's, null if it has none; what a type set (4.9) extends; else
+	/// itself.
+	underlying(): Type | null {
+		return switch (this.kind) {
+			case "param": this.base?.underlying()
+			case "interface": this.base ?? this
+			default: this
+		}
+	}
+
+	/// Whether f holds for each alternative of its underlying type.
+	each(f: (m: Type) => bool): bool { return this.underlying()?.alternatives().every(f) ?? false }
+
+	isNumber(): bool { return this.each(m => m.kind == "int" || m.kind == "float") }
+	isInt(): bool { return this.each(m => m.kind == "int") }
+	isString(): bool { return this.each(m => m.kind == "string" || m.kind == "literal" && m.base!.kind == "string") }
+	isOrdered(): bool { return this.each(m => m.isNumber() || m.isString()) }
+	/// Whether it is an untyped constant's (4.1).
+	isUntyped(): bool { return (this.kind == "int" || this.kind == "float") && this.n == 0 }
+	/// Whether it has untyped constants in it, as an array or object literal keeps them until stored (4.1).
+	isLoose(): bool { return this.isUntyped() || this.parts().some(p => p.isLoose()) }
+
+	/// Whether a let of this type without an initializer has a zero value (5.1).
+	hasZero(): bool {
+		return switch (this.kind) {
+			case "null", "bool", "int", "float", "string": true
+			case "union": this.hasNull()
+			case "fixed": this.base!.hasZero()
+			case "param": this.each(m => m.hasZero())
+			default: false
+		}
+	}
+
+	hasNull(): bool { return this == Null || this.kind == "union" && among(Null, this.types) }
+	nullable(): Type { return Type.union([this, Null]) }
+	nonNull(): Type { return if (this.hasNull()) Type.union(this.alternatives().filter(m => m != Null)) else this }
+
+	/// The class whose methods it has: itself if a class, its base if a string or an array, its base's if a literal;
+	/// else null.
+	methods(): Type | null {
+		return switch (this.kind) {
+			case "class": this
+			case "literal": this.base!.methods()
+			case "string", "array": this.base
+			default: null
+		}
+	}
+
+	/// The type of its member name, or of its static one if static, or null if it has none. A param's are those of its
+	/// constraint, which each argument has. A class without a constructor, unless of statics only, and a tuple have one
+	/// that takes nothing.
+	member(name: string, static = false): Type | null {
+		switch (this.kind) {
+			case "literal": return this.base!.member(name, static)
+			case "string", "array": return this.methods()?.member(name, static)
+			case "fixed": return if (name == "length" && !static) I32 else null
+			case "tuple":
+				return if (static) null else if (name == "length") I32
+					else if (name == "constructor") Type.function([], Null) else null
+			case "param": return this.underlying()?.member(name, static)
+			case "union":
+				const ts: Type[] = []
+				for (const m of this.types) {
+					const u = m.member(name, static)
+					if (u == null) {
+						return null
+					}
+					ts.push(u)
+				}
+				return Type.union(ts)
+			case "object", "class", "interface":
+				const f = this.fields.find(e => e.name == name && e.static == static)
+				if (f != null) {
+					return f.type
+				}
+				if (name == "constructor" && !static && this.kind == "class" && !this.staticOnly()) {
+					return Type.function([], Null)
+				}
+				for (const e of this.fields) {
+					const m = if (e.embedded) e.type.member(name, static) else null
+					if (m != null) {
+						return m
+					}
+				}
+		}
+		return null
+	}
+
+	/// Whether it has members, all static: a class never instantiated, or an interface no value fits.
+	staticOnly(): bool { return this.fields.length > 0 && this.fields.every(f => f.static) }
+
+	/// Whether a value of this fits t.
+	///
+	/// ## Assignability
+	///
+	/// A value of type `S` fits a type `T` when one holds: they are identical; `S` is a union whose members all fit `T`;
+	/// `T` is a union one of whose members `S` fits; `S` is a literal type whose base fits `T`; `S` is an untyped constant
+	/// `T` can take, or a number type that widens to `T` (§4.1); both are `async` with fitting element types; `T` is an
+	/// object type or interface and `S` has its members (§4.7); or both are function types that fit (§4.6). A conversion
+	/// into a union sets the tag, one into an object type or interface is implementation-defined (§4.7), widening extends
+	/// the number, and any other fit changes no bits.
+	///
+	/// Two values join to one type if one fits the other, or if they differ only by `null` or by literal types of one base,
+	/// which they then join as (`join`). `[1, "s"]` and `if (c) 1 else "s"` have no type.
+	///
+	/// Elements are invariant, so `Square[]` does not fit `Shape[]`, but a literal's untyped constants fit as they would
+	/// alone: `[1, 2]` fits `i64[]`.
+	fits(t: Type): bool {
+		const s = this
+		if (s == t || s.kind == "param" && origin(s) == origin(t) || memberOf(s, t)) {
+			return true
+		}
+		if (s.kind == "union") {
+			return s.types.every(m => m.fits(t))
+		}
+		if (t.kind == "interface" && t.base != null && s.kind != "param") {
+			return fitsRecursive(s, t)
+		}
+		if (t.kind == "union") {
+			if (t.types.some(m => s.fits(m))) {
+				return true
+			}
+			return s.kind == "param" && s.each(m => m.fits(t))
+		}
+		if (t.kind == "param" && s.kind != "param") {
+			return s.isUntyped() && t.each(m => s.fits(m))
+		}
+		switch (s.kind) {
+			case "param": return if (s.base?.kind == "param") s.base!.fits(t) else s.each(m => m.fits(t))
+			case "literal": return s.base!.fits(t)
+			case "int": return t.kind == "int" && (s.n == 0 || t.n > s.n && (t.signed || !s.signed))
+			case "float": return t.kind == "float" && (s.n == 0 || t.n > s.n)
+			case "async": return t.kind == "async" && s.base!.fits(t.base!)
+			case "array": return t.kind == "array" && s.isLoose() && s.params[0].fits(t.params[0])
+			case "tuple": return t.kind == "tuple" && s.rest == t.rest && s.types.equals(t.types)
+			case "function":
+				const r = s.base
+				if (t.kind != "function" || s.types.length < t.types.length || s.n > t.n
+					|| s.rest != t.rest || r != null && !r.fits(t.base!)) {
+					return false
+				}
+				for (const i of 0 ... t.types.length - 1) {
+					if (!t.types[i].fits(s.types[i])) {
+						return false
+					}
+				}
+				return true
+			case "object", "class", "interface": return (t.kind == "object" || t.kind == "interface") && fitsRecursive(s, t)
+		}
+		return false
+	}
+
+	/// The type two values join to, or null (4.10). As it makes no union of literals, one is declared.
+	join(b: Type): Type | null {
+		if (this.fits(b)) {
+			return b
+		}
+		if (b.fits(this)) {
+			return this
+		}
+		const x = bases(this)
+		const y = bases(b)
+		return if (x.nonNull().fits(y) || y.nonNull().fits(x)) Type.union([x, y]) else null
+	}
+
+	/// This with untyped constants in it as i32 and f64, and if literals, or in an array or object, literals as their
+	/// base types; but a union's literals kept, as it is declared (join), and a type's, as it is static (4.11).
+	widen(literals: bool): Type {
+		switch (this.kind) {
+			case "int": return if (this.n == 0) I32 else this
+			case "float": return if (this.n == 0) F64 else this
+			case "literal": return if (literals && this.params.length == 0) this.base! else this
+			case "array", "object": return this.map(p => p.widen(true))
+			case "union": return this.map(p => p.widen(false))
+		}
+		return this
+	}
+
+	/// The types it is built of: its base, elements, members, params' types and result, args, or fields' types.
+	parts(): Type[] {
+		switch (this.kind) {
+			case "literal": return [this.base!, ...this.params]
+			case "fixed", "async": return [this.base!]
+			case "tuple", "union": return this.types
+			case "function":
+				const r = this.base
+				return if (r == null) this.types else [...this.types, r]
+			case "class", "interface", "array": return this.params
+			case "object": return this.fields.map(f => f.type)
+		}
+		return []
+	}
+
+	/// This with each of its parts as f makes it; a class or interface itself.
+	map(f: (p: Type) => Type): Type {
+		switch (this.kind) {
+			case "array": return Type.array(f(this.params[0]))
+			case "fixed": return Type.fixed(f(this.base!), this.n)
+			case "async": return Type.async(f(this.base!))
+			case "literal": return if (this.params.length == 0) this else Type.literal("", this.base!, [f(this.params[0])])
+			case "tuple": return Type.tuple(this.types.map(f), this.rest)
+			case "union": return Type.union(this.types.map(f))
+			case "object": return Type.object(this.fields.map(x => new Field(x.name, f(x.type), x.embedded, x.static)))
+			case "function":
+				const r = this.base
+				return Type.function(this.types.map(f), if (r == null) null else f(r), this.n, this.rest, this.params)
+		}
+		return this
+	}
+
+	/// This generic with args for its params: a function type without params, or a class's or interface's instance, made
+	/// once; itself if they are its params.
+	///
+	/// ## Generics
+	///
+	/// ```grammar
+	/// TypeParams = "[" TypeParam {"," TypeParam} [","] "]"
+	/// TypeParam  = Ident ["extends" Type] ["=" Type]
+	/// ```
+	///
+	/// Functions, classes, interfaces and aliases take type parameters in brackets. A type argument shall fit its
+	/// constraint, which shall not be a union; a parameter with a default may be omitted. A type set holds its union's
+	/// members, a type set among them standing for its own, and is only a constraint; it holds itself only in an array or
+	/// rest tuple. A type argument fits it only by being in it, a literal by its base; a class or interface by fitting an
+	/// interface in it with each field's type in the set; an array by elements that fit an array's in it, a fixed array by
+	/// elements that fit those of them with a zero value (§5.1); a tuple by elements that fit a rest tuple's; or by being a
+	/// parameter constrained by a type set within it. On a value of such a parameter's type, an operation is allowed if it
+	/// is allowed, with the same result type, for each type in the set. Arguments to a generic function are inferred from
+	/// its value arguments where not given. Each distinct set of type arguments is a distinct instantiation with its own
+	/// layout, so a generic shall not instantiate itself, directly or through other generics, with a type argument that
+	/// strictly contains one of its own type parameters. Static branches and unrolled loops (§4.11) that depend on a type
+	/// parameter are checked for each instantiation. In its own constraint a parameter stands for its argument, and a
+	/// default's constraints are checked where the default is used.
+	///
+	/// ```
+	/// function id[T](x: T): T { return x }
+	/// type Opt[T] = T | null
+	/// type Pair[A, B = A] = [A, B]
+	/// id[i32](5)   id(5)   const p: Pair[i32] = [1, 2]
+	/// class Box[T extends Shape] { item: T }
+	/// function eq[T extends Eq[T]](a: T, b: T): bool { return a.equals(b) }   // Eq[T] { equals(o: T): bool }
+	/// function g[T](x: T) { g[T[]]([x]) }      // error: instantiates without end
+	/// interface Signed extends i8 | i16 | i32 | i64 {}         // a type set (§5.3)
+	/// function neg[T extends Signed](x: T): T { return -x }    // ok: T for each type in Signed
+	/// neg(1 as u8)          // error: u8 is not in Signed, though it widens to i16
+	/// interface Json extends f64 | string | New | Json[] {}   // New, std/types: a class new makes without arguments
+	/// let s: Signed         // error: a type set is only a constraint
+	/// function h[T extends i8 | i16](x: T) {}   // error: a union constraint; name a type set
+	/// ```
+	instantiate(args: Type[]): Type {
+		if (args.equals(this.params)) {
+			return this
+		}
+		if (this.kind == "function") {
+			return Type.function(this.types.map(p => p.in(this, args)), this.base?.in(this, args), this.n, this.rest)
+		}
+		// Made once, its members after, as they may refer to it.
+		const t: Type = { ...new Type(this.kind), generic: this, params: args }
+		const u = intern(t)
+		if (u == t) {
+			t.refill()
+		}
+		return u
+	}
+
+	/// Takes an instance's members and base anew from its generic's, as filled in since it was made.
+	refill() {
+		const g = this.generic!
+		this.fields = g.fields.map(f => new Field(f.name, f.type.in(g, this.params), f.embedded, f.static))
+		this.base = g.base?.in(g, this.params)
+	}
+
+	/// This as it is in generic g's instance for args: with g's params as args, those past args left.
+	in(g: Type, args: Type[]): Type {
+		switch (this.kind) {
+			case "param":
+				const i = position(g.params, this)
+				return if (i < 0 || i >= args.length) this else args[i]
+			case "class", "interface": return (this.generic ?? this).instantiate(this.params.map(p => p.in(g, args)))
+		}
+		return this.map(p => p.in(g, args))
+	}
+
+	/// Whether it has one of params in it.
+	mentions(params: Type[]): bool { return contains(params, this) || this.parts().some(p => p.mentions(params)) }
+
+	/// Sets in found the args of params that a value of v fitting this gives them, where found has none yet, an untyped
+	/// one, or one that widens to it (4.9).
+	unify(v: Type, params: Type[], found: (Type | null)[]) {
+		switch (this.kind) {
+			case "param":
+				const i = position(params, this)
+				const f = if (i < 0) null else found[i]
+				if (i >= 0 && (f == null || f.isUntyped() || f.fits(v) && !v.fits(f))) {
+					found[i] = v
+				}
+			case "object": for (const f of this.fields) {
+				const m = v.member(f.name)
+				if (m != null) {
+					f.type.unify(m, params, found)
+				}
+			}
+			case "union":
+				const open = this.types.filter(m => m.kind == "param")
+				const closed = Type.union(this.types.filter(m => m.kind != "param"))
+				const rest = v.alternatives().filter(m => !m.fits(closed))
+				if (open.length == 1 && rest.length > 0) {
+					open[0].unify(Type.union(rest), params, found)
+				}
+			case "function": if (v.kind == "function") {
+				unifyAll(this.types, v.types, params, found)
+				if (v.base != null) {
+					this.base!.unify(v.base, params, found)
+				}
+			}
+			default: if (v.kind == this.kind && v.generic == this.generic) {
+				unifyAll(this.parts(), v.parts(), params, found)
+			}
+		}
+	}
+
+	/// How it is written, a class, interface or param by the name name gives it, else by its kind.
+	toString(name: (t: Type) => string | null = t => null): string {
+		const show = (t: Type | null) => if (t == null) "null" else t.toString(name)
+		const ts = this.types.map(show)
+		if (this.rest) {
+			ts[ts.length - 1] = "..." + ts[ts.length - 1]
+		}
+		// An element's union or function in parens, as `[]` and `async` bind tighter.
+		const elem = (e: Type) => if (e.kind == "union" || e.kind == "function") `(${show(e)})` else show(e)
+		switch (this.kind) {
+			case "int": return if (this.n == 0) "untyped int" else `${if (this.signed) "i" else "u"}${this.n}`
+			case "float": return if (this.n == 0) "untyped float" else `f${this.n}`
+			case "string": return if (this.n == 8) "string" else `string${this.n}`
+			case "literal": return if (this.params.length == 0) this.text else show(this.base)
+			case "class", "interface", "param":
+				const g = this.generic
+				return name(this) ?? (if (g == null) this.kind else `${show(g)}[${this.params.map(show).join(", ")}]`)
+			case "array": return elem(this.params[0]) + "[]"
+			case "fixed": return `${elem(this.base!)}[${this.n}]`
+			case "async": return "async " + elem(this.base!)
+			case "tuple": return `[${ts.join(", ")}]`
+			case "union": return if (ts.length == 0) "empty" else ts.join(" | ")
+			case "function": return `(${ts.join(", ")}) => ${show(this.base)}`
+			case "object": return if (this.fields.length == 0) "{}"
+				else `{ ${this.fields.map(f => `${f.name}: ${show(f.type)}`).join(", ")} }`
+		}
+		return this.kind
+	}
+
+	/// The type set that extends t.
+	static interface(t: Type): Type { return intern({ ...new Type("interface"), base: t }) }
+	/// ## Literal types
+	///
+	/// A string, `true`, `false` or `null` literal in a type denotes the type holding only that value. A literal type fits
+	/// its base type and is stored as it; a union of literals of one base is stored as the base.
+	///
+	/// ```
+	/// type Mode = "fast" | "safe"     // stored as a string
+	/// const m: Mode = "fast"
+	/// const n: Mode = "slow"          // error
+	/// ```
+	///
+	/// A type used as a value is a literal too, of builtin/type.bob's Type, holding the type in params (4.11).
+	static literal(text: string, base: Type, params: Type[] = []): Type {
+		return intern({ ...new Type("literal"), text: text, base: base, params: params })
+	}
+	/// A param standing for member of param p, or for p itself where member is "", constrained by c (4.11): made once.
+	static derived(p: Type, member: string, c: Type | null): Type {
+		return intern({ ...new Type("param"), text: member, params: [p], base: c })
+	}
+	/// An array of t.
+	///
+	/// ## Arrays and tuples
+	///
+	/// `T[]` is a growable array, made by an array literal, a spread, a rest parameter or `new` (§6.3). `xs.length` is an
+	/// `i32`, `xs.push(x)` appends x and `xs.push(...ys)` the elements of ys, `xs.pop()` removes and returns the last
+	/// element and traps on an empty array, `xs.join(sep)` is the elements converted as in a template (§6.9) with the
+	/// string `sep` between them, `xs.map(f)` is a new array of `f(x)` for each element x in order, of type `U[]` for `f`
+	/// of type `(x: T) => U`, and subscripting with an integer outside `0 … length-1` traps, where `xs.at(i)`, of type
+	/// `T | null`, is `null`. `T[n]`, n an integer literal, holds its n elements in place, so a field of it has a fixed
+	/// size; assignment copies the elements, `buf.length` is n, and the elements of a `const`, and their fields, are not
+	/// assignable. Elements of a class type are embedded (§5.3): `buf[i]` is a reference into `buf`, which keeps what holds
+	/// `buf` alive, and a value stored into one shall be an object literal. A tuple `[A, B]` is subscripted by static
+	/// integers (§4.11); `[A, ...B[]]` has a rest of any length after its fixed elements. Array literals keep untyped
+	/// elements until stored. Destructuring an array shorter than the pattern traps. Element types are invariant:
+	/// `Square[]` does not fit `Shape[]`. `T[n]` and tuples have no `push` or `pop`.
+	///
+	/// ```
+	/// const xs = [1, 2, 3]            // i32[]
+	/// const ys: u8[] = [1, 2]
+	/// const zs: [i32, string] = [1, "a"]
+	/// const buf: u8[4] = [0, 0, 0, 0]
+	/// const ws = xs; ws[0] = 9; xs[0] == 9    // one array, two references
+	/// ws.push(4); xs.length == 4
+	/// ws.push(...[5, 6]); xs.length == 6
+	/// xs.join(", ") == "9, 2, 3, 4, 5, 6"
+	/// let copy = buf; copy[0] = 1; buf[0] == 0 // T[n] is copied
+	/// class P { x = 0 }
+	/// let ps: P[2]; ps[0].x = 1        // two Ps in place
+	/// const qs: P[2] = [{x: 1}, {...ps[0]}]  // [ps[0], ps[1]] is an error
+	/// ps[1] = {...ps[0]}               // copies ps[0] into ps[1]
+	/// ps[1] = new P()                  // error: write {...new P()}
+	/// const mixed = [1, "s"]           // error: no common type
+	/// ```
+	static array(t: Type): Type { return Array.instantiate([t]) }
+	static async(t: Type): Type { return intern({ ...new Type("async"), base: t }) }
+	static fixed(t: Type, len: i32): Type { return intern({ ...new Type("fixed"), base: t, n: len }) }
+	static tuple(ts: Type[], rest: bool): Type { return intern({ ...new Type("tuple"), types: ts, rest: rest }) }
+
+	/// An object type of fields.
+	///
+	/// ## Objects and interfaces
+	///
+	/// `{ a: A, b: B }` is an object type. An `interface` is a named object type with methods. Both are structural: a value
+	/// fits if it has each field with a fitting type, and each method with a fitting function type. A class fits an
+	/// interface or object type under the same rule; nothing fits a class but the class itself.
+	///
+	/// An object type or interface is checked as itself; how its values are held and how member access finds the member
+	/// of the type a value came from is implementation-defined: as the union (§4.4) of the types converted to it in the
+	/// program, switching on the tag, or as each value with a table of its type's members. Converted from nothing, it has
+	/// no values. Reflection sees the type as written (§4.11). An object is an 8-byte reference to its fields in
+	/// declaration order.
+	///
+	/// ```
+	/// const p = { x: 1, y: 2 }           // { x: i32, y: i32 }
+	/// const q: { x: i32 } = p            // ok
+	/// const r: { x: i32 } = { y: 1 }     // error
+	/// interface Shape { name: string; area(): f64 }
+	/// const s: Shape = new Square()      // ok if Square has both
+	/// const c: Shape = new Circle()      // ok if Circle has both too
+	/// s.area()                           // Square's area
+	/// ```
+	///
+	/// An interface or object type that embeds another, `...I`, has its members too, and a value fits it only by fitting
+	/// what it embeds.
+	///
+	/// ```
+	/// interface ReadWriter { ...Reader, ...Writer }
+	/// class File implements ReadWriter {} 
+	/// ```
+	///
+	/// ## Classes
+	///
+	/// A class is a nominal type: instances are made by `new`, or by an object literal that spreads a value of the class,
+	/// which copies it with the fields the literal names replaced: `{ ...p, x: 2 }`. Such a literal shall name only fields
+	/// of the class and spread no other class. Only a value of the class fits it. A class value is an 8-byte reference to
+	/// its fields in declaration order (§5.3).
+	static object(fields: Field[]): Type { return intern({ ...new Type("object"), fields: fields.map(internField) }) }
+
+	/// A function of params, all required unless fewer are, with a rest if rest, and a generic's type params.
+	///
+	/// ## Functions
+	///
+	/// ```grammar
+	/// FnType = ArrowParams "=>" Type [Throws]
+	/// ```
+	///
+	/// `(a: A, b: B = …, ...rest: R[]) => T`, with errors as in §7.5. Parameter names are documentation. A parameter with a
+	/// default is optional, and the parameters after it shall have defaults too. A function type fits another when it has
+	/// the same number of parameters, no more required ones, the same rest-ness, each parameter type of the target fits its
+	/// own, its result fits the target's, and its errors are among the target's. Functions are references and are not
+	/// comparable.
+	static function(types: Type[], result: Type | null, required: i32 = types.length, rest = false,
+		params: Type[] = []): Type {
+		return intern({ ...new Type("function"), types: types, base: result, n: required, rest: rest, params: params })
+	}
+
+	/// The union of ts, flattened and without duplicates, its members in order.
+	///
+	/// ## Unions
+	///
+	/// `A | B` holds a value of one member type together with a *tag* naming that type. Nested unions flatten, duplicates
+	/// collapse, and the member order is canonical, so unions of the same members are the same type. A value is placed in a
+	/// union with the tag of the type it was converted from, and keeps it; `instanceof` (§6.5), `switch` and `== null` test
+	/// the tag.
+	///
+	/// Layout: the payload is the size and alignment of the widest member, each member at offset 0. The tag is found, in
+	/// order of preference:
+	///
+	/// 1. in the payload itself, when the members are told apart by their values: one reference member with `null`, where
+	///    `null` is the zero reference, which no value of a reference type is; or members of one base type that is
+	///    otherwise a union of literals (§4.2);
+	/// 2. in a field: object and class members that all declare a field of the same name whose types are disjoint literals
+	///    (a *discriminated* union, like `{ kind: "a", … } | { kind: "b", … }`);
+	/// 3. in a byte unused by every member, if the payload has one;
+	/// 4. appended as a `u8`, the whole padded to the payload's alignment.
+	///
+	/// ```
+	/// let v: i32 | string = 1
+	/// v = "one"
+	/// v instanceof string            // true
+	/// let o: Square | null = null    // 8 bytes, null is 0
+	/// let m: "a" | "b" | null        // a string's size: null is 0
+	/// let n: i32 | null = 3          // 8 bytes: i32, tag, pad
+	/// let u: Square | Circle         // 8 bytes: the tag is in the last byte of the reference
+	/// let s: Shape | null = null     // 8 bytes if Shape is held as Square | Circle (§4.7), null is 0
+	/// n + 1                          // error: n may be null
+	/// (n as i32) + 1                 // ok, traps if null
+	/// n ?? 0                         // ok
+	/// ```
+	static union(ts: Type[]): Type {
+		let ms: Type[] = []
+		for (const t of ts) {
+			ms = merge(ms, t.alternatives(), (a, b) => a.id < b.id)
+		}
+		ms = unique(ms)
+		return if (ms.length == 1) ms[0] else if (ms.length == 0) Empty else intern({ ...new Type("union"), types: ms })
+	}
+}
+
+export class Field {
+	name: string
+	type: Type
+	/// Whether its members are reachable on the type holding it (5.3).
+	embedded: bool
+	static: bool
+
+	constructor(name: string, t: Type, embedded = false, static = false) {
+		this.name = name
+		this.type = t
+		this.embedded = embedded
+		this.static = static
+	}
+}
+
+/// Null's id is the largest, so that a union, ordered by id, reads as T | null.
+export let Null: Type = { ...new Type("null"), id: maxOf[i32]() }
+/// The types named by identifiers, the basics numbered below any type made so that a union shows them before other
+/// types. Each is a let, as its id is isolate state.
+export let Bool: Type = { ...new Type("bool"), id: -14 }
+/// ## Numbers and constants
+///
+/// A *constant* is a literal, possibly negated, a constant cast with `as`, or a name or namespace member denoting a
+/// `const` initialized by a constant. Number literals are *untyped*, and so is a `const` without a type initialized by
+/// an untyped constant. An untyped constant takes the number type its context requires and shall be representable in
+/// it; an untyped int fits only integers, an untyped float only floats. Without a context an untyped int is an `i32`
+/// and an untyped float an `f64`. An operation on two untyped operands shall have a context, whose type it is evaluated
+/// in.
+///
+/// A number type implicitly *widens* to one holding all its values. There is no other implicit conversion between
+/// numbers, nor to or from `bool`. The operands of arithmetic and comparison shall widen to one type, which the result
+/// takes; an untyped operand takes the other's type.
+///
+/// An integer widens to a wider signed one, an unsigned integer to a wider unsigned one.
+///
+/// ```
+/// const base = 20                      // untyped
+/// let a: u8 = 300                      // error: not representable
+/// const sum = base + 1                 // error: no context
+/// let d: i32 = 1; let e: i64 = d + 1   // ok: i32, widened
+/// let g: u32 = 1; d + g                // error: neither widens; use `as`
+/// ```
+export let I8: Type = { ...new Type("int"), n: 8, signed: true, id: -13 }
+export let I16: Type = { ...new Type("int"), n: 16, signed: true, id: -12 }
+export let I32: Type = { ...new Type("int"), n: 32, signed: true, id: -11 }
+export let I64: Type = { ...new Type("int"), n: 64, signed: true, id: -10 }
+export let U8: Type = { ...new Type("int"), n: 8, id: -9 }
+export let U16: Type = { ...new Type("int"), n: 16, id: -8 }
+export let U32: Type = { ...new Type("int"), n: 32, id: -7 }
+export let U64: Type = { ...new Type("int"), n: 64, id: -6 }
+/// A float type: `f32` widens to `f64`.
+///
+/// ```
+/// let d: i32 = 1; let h: f64 = d       // error: use `d as f64`
+/// let x: f64 = 1                       // error: use `1.0`
+/// ```
+export let F32: Type = { ...new Type("float"), n: 32, id: -5 }
+export let F64: Type = { ...new Type("float"), n: 64, id: -4 }
+export let String: Type = { ...new Type("string"), n: 8, id: -3 }
+export let String16: Type = { ...new Type("string"), n: 16, id: -2 }
+export let String32: Type = { ...new Type("string"), n: 32, id: -1 }
+export let UntypedInt: Type = { ...new Type("int"), signed: true }
+export let UntypedFloat: Type = new Type("float")
+/// The empty union, of no values.
+export let Empty: Type = new Type("union")
+/// The generic `T[]`, each array an instance of it. The checker, when it loads builtin/, sets its params and base to
+/// builtin/array.bob's Array's, so an array's base is the Array class of its element.
+export let Array: Type = new Type("array")
+export let basics: Type[] = [Bool, I8, I16, I32, I64, U8, U16, U32, U64, F32, F64, String, String16, String32]
+
+/// The param that param t narrows, through those narrowing it, else t (4.11).
+function origin(t: Type): Type { return if (t.kind == "param" && t.params.length > 0 && t.text == "") origin(t.params[0]) else t }
+
+/// Whether s stands for one of the members of union t, as each of `t.members` does (4.11).
+export function memberOf(s: Type, t: Type): bool {
+	const o = origin(s)
+	return o.kind == "param" && o.text == "members" && origin(o.params[0]) == origin(t)
+}
+
+/// Whether t is a member of ts, in order.
+function among(t: Type, ts: Type[]): bool {
+	const i = lowerBound(ts, t, (a, b) => a.id >= b.id) as i32
+	return i < ts.length && ts[i] == t
+}
+
+/// Whether s fits t, an object type, interface or type set, which may refer to itself: s is assumed to fit while it is
+/// worked out, and if it does not, what was found since may rest on that, so it is dropped. Each is worked out once.
+function fitsRecursive(s: Type, t: Type): bool {
+	const k: [Type, Type] = [s, t]
+	const r = fitted.get(k)
+	if (r != null) {
+		return r
+	}
+	const n = tried.length
+	fitted.set(k, true)
+	tried.push(k)
+	const f = if (t.base != null) inInterface(s, t) else hasMembers(s, t)
+	if (!f) {
+		while (tried.length > n) {
+			fitted.delete(tried.pop())
+		}
+		fitted.set(k, false)
+	}
+	return f
+}
+
+/// Whether s fits what t embeds, and has each other member of t, static or not, with a fitting type.
+function hasMembers(s: Type, t: Type): bool {
+	for (const f of t.fields) {
+		if (f.embedded) {
+			if (!s.fits(f.type)) {
+				return false
+			}
+			continue
+		}
+		const m = s.member(f.name, f.static)
+		if (m == null || !m.fits(f.type)) {
+			return false
+		}
+	}
+	return true
+}
+
+/// Whether s is in type set t (4.9): one of its types, or a literal of one; a type fitting one of its interfaces with
+/// each field but its methods in t; an array of a type fitting the elem of an array in t, or a fixed array of one fitting its zeros; or
+/// a tuple of types fitting the rest of a tuple in t.
+function inInterface(s: Type, t: Type): bool {
+	const ts = t.base!.alternatives()
+	if (contains(ts, s) || s.kind == "literal" && s.base!.fits(t)) {
+		return true
+	}
+	for (const m of ts) {
+		const e = if (m.kind == "array") m.params[0]
+			else if (m.rest && m.types.length == 1 && m.types[0].kind == "array") m.types[0].params[0]
+			else null
+		switch (m.kind) {
+			case "object",
+				"interface": if (s.fits(m) && s.fields.every(f => f.static || f.type.kind == "function" || f.type.fits(t))) {
+				return true
+			}
+			case "array": if (s.kind == "array" && s.params[0].fits(e!)
+				|| s.kind == "fixed" && s.base!.fits(zeros(e!))) {
+				return true
+			}
+			case "tuple": if (e != null && s.kind == "tuple" && s.types.every(x => x.fits(e!))) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+/// The types t holds that have a zero value (5.1), as a type set.
+function zeros(t: Type): Type { return Type.interface(Type.union((t.underlying() ?? t).alternatives().filter(m => m.hasZero()))) }
+
+/// t with literals as their base types.
+function bases(t: Type): Type {
+	return Type.union(t.alternatives().map(m => if (m.kind == "literal") m.base! else m))
+}
+
+/// Unifies each of ps with the v at its index.
+function unifyAll(ps: Type[], vs: Type[], params: Type[], found: (Type | null)[]) {
+	for (const i of 0 ... min(ps.length, vs.length) - 1) {
+		ps[i].unify(vs[i], params, found)
+	}
+}
+
+/// Each type made so far, structural ones by their StructuralHasher, and how many there are.
+const made = new HashMap[Type, Type, StructuralHasher]()
+
+let count = -1
+
+/// Each field of an object type made so far.
+const madeFields = new HashMap[Field, Field]()
+/// Each fits asked so far, by the value's type and the target's. A class, interface or param is filled in
+/// after it is made, so its members shall be known before the first fits that reaches them.
+const fitted = new HashMap[[Type, Type], bool]()
+/// The fits assumed or found since the outermost one still checked began, to drop if one fails.
+const tried: [Type, Type][] = []
+
+function fresh(): i32 {
+	count++
+	return count
+}
+
+/// The one type of t's StructuralHasher: t if it is the first made.
+function intern(t: Type): Type {
+	const u = made.get(t)
+	if (u != null) {
+		return u
+	}
+	made.set(t, t)
+	return t
+}
+
+/// The one field of f's name, type and embedding: f if it is the first made.
+function internField(f: Field): Field {
+	const g = madeFields.get(f)
+	if (g != null) {
+		return g
+	}
+	madeFields.set(f, f)
+	return f
+}
+
+/// Hashes and compares types by their fields, each part by identity, as it is made once already; an instance by its
+/// generic and args, as its members are filled in after.
+class StructuralHasher {
+	static hash(t: Type): u64 {
+		let h = combine(combine(fnv(t.text), t.n), t.generic?.id ?? -1)
+		for (const p of t.parts()) {
+			h = combine(h, p.id)
+		}
+		return h
+	}
+
+	static eq(a: Type, b: Type): bool {
+		if (a.generic != null || b.generic != null) {
+			return a.generic == b.generic && a.params.equals(b.params)
+		}
+		return a.kind == b.kind && a.text == b.text && a.base == b.base && a.n == b.n && a.signed == b.signed && a.rest == b.rest
+			&& a.params.equals(b.params)
+			&& a.types.equals(b.types) && a.fields.equals(b.fields)
+	}
+}
