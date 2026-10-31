@@ -1,0 +1,2172 @@
+//! C11, with the GNU extensions system headers.
+
+import { max, min } from "../../std/math"
+import { HashMap } from "../../std/collections/hashmap"
+import { ScopedMap } from "../../std/collections/scopedmap"
+import { endsWith, split, startsWith, strip } from "../../std/string"
+import { Backend, Block, Unary, Value } from "../backend/backend"
+import { attrs, signature, vaList } from "../backend/abi"
+import { Gen, Val, float, global, int, mask, object } from "./gen"
+import { CError, Tok, precedence } from "./lex"
+import { character, strings } from "./literal"
+import { os } from "../../std/os"
+import { labelPrefix } from "./predef"
+import * from "./type"
+
+export interface Tokens {
+	next(): Tok
+}
+
+/// A file-scope object or function.
+class Global {
+	v: Val
+	/// static linkage
+	local: bool
+	/// _Thread_local.
+	tls: bool
+	align = 0
+	defined = false
+	tentative = false
+	/// Whether every declaration of the function makes its definition one only for inlining.
+	inlineOnly = true
+
+	constructor(v: Val, local: bool, tls: bool) {
+		this.v = v
+		this.local = local
+		this.tls = tls
+	}
+}
+
+class Attrs {
+	packed = false
+	align = 0
+	asm = ""
+	gnuInline = false
+	alwaysInline = false
+	/// The integer mode of the mode attribute, as intMode numbers it, or 0 for none.
+	mode = 0
+}
+
+type Storage = "typedef" | "extern" | "static" | ""
+/// A word of a basic type, as in unsigned long int.
+type Word = "void" | "_Bool" | "char" | "short" | "int" | "long" | "float" | "double" | "signed" | "unsigned" | "__int128"
+
+/// Declaration specifiers (C11 6.7.1-4).
+class Spec {
+	ty: Type = Int
+	storage: Storage = ""
+	inline = false
+	volatile = false
+	/// _Thread_local.
+	tls = false
+	attrs: ...Attrs
+	/// A struct, union, enum or typedef name.
+	named: Type | null = null
+	words: Word[] = []
+
+	/// The attributes of a declarator of the declaration: its alignment and mode carry over.
+	declaratorAttrs(): Attrs { return { ...new Attrs(), align: this.attrs.align, mode: this.attrs.mode } }
+}
+
+class Switch {
+	ty: Type
+	/// The cases' values, unsigned ones as their bits, and the blocks they go to.
+	cases: i64[] = []
+	targets: Block[] = []
+	/// The GNU case ranges, lo ... hi, and the blocks they go to.
+	ranges: [i64, i64, Block][] = []
+	/// The default's block, 0 while there is none.
+	dflt: Block = 0
+
+	constructor(ty: Type) { this.ty = ty }
+}
+
+export class Parser {
+	g: Gen
+	private src: Tokens
+	/// The tokens peeked at, and the last one taken, which errors without a place are placed at.
+	private ahead: Tok[] = []
+	private last: Tok | null = null
+	/// Names, and struct, union and enum tags under keys like "struct S".
+	private scopes = new ScopedMap[Val | Type]()
+	private globals = new HashMap[string, Global]()
+	private order: Global[] = []
+	/// The function being defined.
+	private fname = ""
+	private labels = new HashMap[string, Block]()
+	private breaks: Block[] = []
+	private continues: Block[] = []
+	private sw: Switch | null = null
+	/// The alignment #pragma pack caps members at, 0 for none, and the ones pushed.
+	private pack = 0
+	private packs: i32[] = []
+	/// Whether a static object's initializer is being read, where compound literals are static too.
+	private inStatic = false
+	/// Whether the next suffix is a parameter's outermost one, whose array length may use earlier parameters.
+	private paramSuffix = false
+	/// The library functions an undeclared __builtin_X may call as X, by name.
+	library = new HashMap[string, Type]()
+	/// Whether external tentative definitions are common, as with -fcommon.
+	common = false
+	/// Warnings, each message once, where it is first seen.
+	warnings: CError[] = []
+
+	/// Reads the tokens of src, and emits into the back end b.
+	constructor(src: Tokens, b: Backend) {
+		this.src = src
+		this.g = new Gen(b)
+	}
+
+	/// Compiles the translation unit into the back end.
+	unit() {
+		while (this.peek().kind != "eof") {
+			this.declaration()
+		}
+		for (const g of this.order) {
+			this.finish(g)
+		}
+	}
+
+	// For bind
+	/// What name, or a tag under a key like "struct S", declares at file scope.
+	declared(name: string): Val | Type | null { return this.scopes.get(name) }
+
+	/// Whether the global sym has static linkage.
+	local(sym: string): bool { return this.globals.get(sym)?.local ?? false }
+
+	/// The value of the expression toks, after the translation unit, folded where it is constant.
+	value(toks: Tok[]): Val {
+		this.ahead = toks.slice(0, toks.length)
+		this.g.begin(new Fn(Void), this.g.scratch())
+		const v = this.expr()
+		if (this.peek().kind != "eof") {
+			throw CError.at(this.peek(), "expected the end of the expression")
+		}
+		return v
+	}
+
+	/// Keeps a function's definition for inlining only if every declaration says so (C11 6.7.4p7).
+	/// Defines a tentative global as zeros, an array of unknown length as one element, common if external and asked.
+	private finish(g: Global) {
+		const t = g.v.ty
+		const b = this.g.b
+		if (g.defined && t instanceof Fn && g.inlineOnly && !g.local) {
+			b.inlineOnly(g.v.v)
+		} else if (g.tentative && !g.defined) {
+			const size = if (t instanceof Arr && t.len == null) t.base.size else t.size
+			this.defineGlobal(g.v, new Data().value(b, size), g.local, g.tls, max(g.align, t.align))
+			if (this.common && !g.local && !g.tls) {
+				b.common(g.v.v)
+			}
+		}
+	}
+
+	/// Defines the global v as the constant init, in place of its declaration if it has one, whose name
+	/// it takes then.
+	private defineGlobal(v: Val, init: Value, local: bool, tls: bool, align: i32) {
+		const b = this.g.b
+		const d = b.global(if (v.v != 0) v.sym + ".defined" else v.sym, init, local, align as u32)
+		if (tls) {
+			b.threadLocal(d)
+		}
+		if (v.v != 0) {
+			b.replace(v.v, d)
+		}
+		v.v = d
+	}
+
+	/// p, which the operator t needs to be a pointer.
+	private pointer(t: Tok, p: Val): Val {
+		if (!(p.ty instanceof Ptr)) {
+			throw CError.at(t, "not a pointer")
+		}
+		return p
+	}
+
+	// Tokens, which Init reads too
+	/// The last token taken, or the next before any.
+	here(): Tok { return this.last ?? this.peek() }
+
+	/// The token k ahead.
+	peek(k = 0): Tok {
+		while (this.ahead.length <= k) {
+			this.ahead.push(this.pull())
+		}
+		return this.ahead[k]
+	}
+
+	/// Takes the next n tokens; returns the last.
+	next(n = 1): Tok {
+		const t = this.peek(n - 1)
+		this.ahead = this.ahead.slice(n, this.ahead.length)
+		this.last = t
+		return t
+	}
+
+	is(text: string): bool { return this.peek().is(text) }
+
+	eat(text: string): bool {
+		if (!this.is(text)) {
+			return false
+		}
+		this.next()
+		return true
+	}
+
+	expect(text: string): Tok {
+		const t = this.next()
+		if (!t.is(text)) {
+			throw CError.at(t, `expected ${text}, got ${t.text}`)
+		}
+		return t
+	}
+
+	/// Parses with f for its result alone: the code it emits goes to a function of no consequence, which
+	/// is removed.
+	discard[T](f: () => T): T {
+		const g = this.g
+		const outer = g.f
+		const back = g.b.here()
+		g.begin(new Fn(Void), g.scratch())
+		const t = f()
+		g.b.remove(g.fn().v)
+		g.f = outer
+		if (outer != null) {
+			g.b.at(back)
+		}
+		return t
+	}
+
+	/// The next token from the source, past the lines of directives, obeying #pragma pack among them.
+	private pull(): Tok {
+		let t = this.src.next()
+		while (t.is("#") && t.bol) {
+			const line: Tok[] = []
+			t = this.src.next()
+			while (!t.bol) {
+				line.push(t)
+				t = this.src.next()
+			}
+			if (line.length > 3 && line[0].is("pragma") && line[1].is("pack")) {
+				this.pragmaPack(line)
+			}
+		}
+		return t
+	}
+
+	/// #pragma pack(), (n), (push), (push, n) or (pop).
+	private pragmaPack(line: Tok[]) {
+		const args = line.slice(3, line.length - 1)
+		if (args.length > 0 && args[0].is("pop")) {
+			this.pack = if (this.packs.length > 0) this.packs.pop() else 0
+			return
+		}
+		if (args.length > 0 && args[0].is("push")) {
+			this.packs.push(this.pack)
+		}
+		const n = if (args.length == 0) null else args[args.length - 1].value
+		if (args.length == 0 || n != null) {
+			this.pack = if (n == null) 0 else n[1] as i32
+		}
+	}
+
+	/// Whether t starts declaration specifiers: a specifier word, an attribute or a typedef name.
+	private startsDecl(t: Tok): bool {
+		return t.kind == "ident" && (isSpecifier(t.text) || isAttribute(t.text) || this.scopes.get(t.text) instanceof Type)
+	}
+
+	// Declarations
+	/// A declaration, or at file scope also a function definition.
+	private declaration() {
+		this.eat("__extension__")
+		if (this.eat("_Static_assert")) {
+			this.staticAssert()
+			return
+		}
+		const s = this.specs()
+		let first = true
+		while (!this.eat(";")) {
+			if (!first) {
+				this.expect(",")
+			}
+			const a = s.declaratorAttrs()
+			const [name, declared] = this.declarator(s.ty, a)
+			const ty = moded(declared, a.mode)
+			if (name == null) {
+				throw CError.at(this.peek(), "expected a name")
+			}
+			if (first && ty instanceof Fn && (this.is("{") || !ty.prototyped && this.startsDecl(this.peek()))) {
+				this.typeParams(ty)
+				this.define(name.text, ty, s, a)
+				return
+			}
+			this.declare(name.text, ty, s, a)
+			first = false
+		}
+	}
+
+	private staticAssert() {
+		this.expect("(")
+		const t = this.peek()
+		const ok = this.constant() != 0
+		if (this.eat(",")) {
+			this.strings()
+		}
+		this.expect(")")
+		this.expect(";")
+		if (!ok) {
+			throw CError.at(t, "static assertion failed")
+		}
+	}
+
+	/// The declarations of a K&R definition, between its identifier list and its body, as ft's parameter types.
+	/// A float parameter is passed as a double, so it is one.
+	private typeParams(ft: Fn) {
+		while (!this.is("{")) {
+			const s = this.specs()
+			while (!this.eat(";")) {
+				this.eat(",")
+				const [name, declared] = this.declarator(s.ty, new Attrs())
+				const ty = decay(declared)
+				for (const i of 0 ... ft.params.length - 1) {
+					if (ft.params[i][1] == name?.text) {
+						ft.params[i] = [if (ty.kind == "float") Double else ty, ft.params[i][1]]
+					}
+				}
+			}
+		}
+	}
+
+	/// Declares name as ty, as s says, and parses its initializer if one follows.
+	private declare(name: string, ty: Type, s: Spec, a: Attrs) {
+		if (s.storage == "typedef") {
+			this.scopes.set(name, ty)
+			return
+		}
+		if (ty.kind == "func" || s.storage == "extern" || this.g.f == null) {
+			const g = this.declareGlobal(name, ty, s, a)
+			if (this.eat("=")) {
+				this.initStatic(g.v, g.local, g.tls, g.align, true)
+				g.defined = true
+			} else if (s.storage != "extern" && ty.kind != "func") {
+				g.tentative = true
+			}
+			return
+		}
+		if (s.storage == "static") {
+			const v = global(ty, 0, `${this.fname}.${name}`)
+			this.scopes.set(name, v)
+			this.initStatic(v, true, s.tls, a.align, this.eat("="))
+			return
+		}
+		if (!this.eat("=")) {
+			this.scopes.set(name, this.g.temp(ty, 0, a.align))
+			return
+		}
+		if (ty instanceof Arr && ty.len == null) {
+			this.scopes.set(name, this.unsized(ty, a.align, name))
+			return
+		}
+		const v = this.g.temp(ty, 0, a.align)
+		this.scopes.set(name, v)
+		this.initLocal(v)
+	}
+
+	/// The global name, declared as ty. An inline definition, in C99's sense or with gnu_inline in GNU's,
+	/// only offers its body for inlining; the symbol is defined elsewhere.
+	private declareGlobal(name: string, ty: Type, s: Spec, a: Attrs): Global {
+		let g = this.globals.get(name)
+		if (g == null) {
+			const sym = if (a.asm == "") name else symbol(a.asm)
+			const local = s.storage == "static"
+			const v = if (ty instanceof Fn) this.g.declare(sym, ty, local) else this.g.b.extern(sym, this.g.ty(ty))
+			g = new Global(global(ty, v, sym), local, s.tls)
+			this.globals.set(name, g)
+			this.order.push(g)
+		} else if (!(ty instanceof Fn && !ty.prototyped || ty instanceof Arr && ty.len == null)) {
+			// A redeclaration refines the type, unless it says less.
+			g.v.ty = ty
+		}
+		// C99's inline definition has no extern; GNU's gnu_inline one has extern.
+		const gnu = s.attrs.gnuInline || a.gnuInline
+		const inlineOnly = s.inline && (if (gnu) s.storage == "extern" else s.storage != "extern")
+		if (this.g.f == null) {
+			g.inlineOnly = g.inlineOnly && inlineOnly
+		}
+		g.align = max(g.align, a.align)
+		this.scopes.set(name, g.v)
+		return g
+	}
+
+	/// A function definition: its body, with its parameters bound in a scope of its own.
+	private define(name: string, ty: Fn, s: Spec, a: Attrs) {
+		const g = this.declareGlobal(name, ty, s, a)
+		g.v.ty = ty
+		g.defined = true
+		this.fname = name
+		this.labels = new HashMap[string, Block]()
+		this.redeclare(g, ty)
+		const params = this.g.begin(ty, g.v.v)
+		this.scopes.enter()
+		for (const i of 0 ... params.length - 1) {
+			const pname = ty.params[i][1]
+			if (pname != "") {
+				this.scopes.set(pname, params[i])
+			}
+		}
+		this.block()
+		this.scopes.leave()
+		this.g.fallOff(name == "main")
+		this.g.define(s.attrs.alwaysInline || a.alwaysInline)
+	}
+
+	/// Declares the function g anew as ft where its declaration has another type, as after int f().
+	private redeclare(g: Global, ft: Fn) {
+		const b = this.g.b
+		if (b.valueType(g.v.v) == signature(b, ft)) {
+			return
+		}
+		const f = this.g.declare(g.v.sym + ".redeclared", ft, g.local)
+		b.replace(g.v.v, f)
+		g.v.v = f
+	}
+
+	/// Declaration specifiers and the type they name.
+	private specs(): Spec {
+		const s = new Spec()
+		while (this.specifier(s)) {}
+		s.ty = s.named ?? basic(s.words)
+		if (s.volatile) {
+			s.ty = volatile(s.ty)
+		}
+		return s
+	}
+
+	/// Reads one declaration specifier into s; false at a token that is none.
+	private specifier(s: Spec): bool {
+		const t = this.peek()
+		const w = t.text
+		if (this.attrs(s.attrs)) {
+			return true
+		}
+		if (t.kind != "ident") {
+			return false
+		}
+		if (!isSpecifier(w)) {
+			// A typedef name, unless the type is named already: then it is the declarator's name.
+			const d = this.scopes.get(w)
+			if (s.named != null || s.words.length > 0 || !(d instanceof Type)) {
+				return false
+			}
+			s.named = d
+			this.next()
+			return true
+		}
+		this.next()
+		switch (w) {
+			case "typedef", "extern", "static": s.storage = w as Storage
+			case "inline", "__inline", "__inline__": s.inline = true
+			case "_Thread_local", "__thread": s.tls = true
+			case "struct": s.named = this.record("struct")
+			case "union": s.named = this.record("union")
+			case "enum": s.named = this.enumeration()
+			case "__builtin_va_list": s.named = vaList
+			case "__int128_t": s.named = Int128
+			case "__uint128_t": s.named = UInt128
+			case "typeof", "__typeof__", "__typeof": s.named = this.typeOf()
+			case "void", "_Bool", "char", "short", "int", "long", "float", "double", "unsigned", "__int128":
+				s.words.push(w as Word)
+			case "signed", "__signed", "__signed__": s.words.push("signed")
+			// Qualifiers, auto, register and _Noreturn: only volatile changes anything here.
+			default: s.volatile = s.volatile || isVolatileWord(w)
+		}
+		return true
+	}
+
+	private typeOf(): Type {
+		this.expect("(")
+		const t = if (this.startsDecl(this.peek())) this.typeName() else this.discard(() => this.expr().ty)
+		this.expect(")")
+		return t
+	}
+
+	/// Whether attributes are ahead: GNU's, C23's as in [[gnu::packed]], or _Alignas.
+	private attrsAhead(): bool { return isAttribute(this.peek().text) || this.is("[") && this.peek(1).is("[") }
+
+	/// Reads the GNU and C23 attributes, _Alignas and asm labels ahead into a; returns whether there were any.
+	private attrs(a: Attrs): bool {
+		let any = false
+		while (this.attrsAhead() || isAsmLabel(this.peek().text)) {
+			any = true
+			if (this.eat("[")) {
+				this.next()
+				while (!this.eat("]")) {
+					// The namespace of a name like gnu::packed is left out.
+					if (this.peek(1).is(":")) {
+						this.next(3)
+					}
+					this.attr(a)
+					this.eat(",")
+				}
+				this.expect("]")
+				continue
+			}
+			const w = this.next().text
+			this.expect("(")
+			if (w == "_Alignas") {
+				const n = if (this.startsDecl(this.peek())) this.typeName().align else this.constant() as i32
+				a.align = max(a.align, n)
+			} else if (isAsmLabel(w)) {
+				a.asm = this.asmString()
+			} else {
+				this.expect("(")
+				while (!this.eat(")")) {
+					this.attr(a)
+					this.eat(",")
+				}
+			}
+			this.expect(")")
+		}
+		return any
+	}
+
+	/// One attribute of an __attribute__ list: a name, maybe with arguments. Most are ignored.
+	private attr(a: Attrs) {
+		const t = this.next()
+		const name = strip(t.text, "__")
+		switch (name) {
+			case "packed": a.packed = true
+			case "gnu_inline": a.gnuInline = true
+			case "always_inline": a.alwaysInline = true
+			case "vector_size": throw CError.at(t, "vector types are not supported")
+			case "mode":
+				this.expect("(")
+				a.mode = intMode(strip(this.next().text, "__"))
+				this.expect(")")
+			case "aligned":
+				if (this.eat("(")) {
+					a.align = max(a.align, this.constant() as i32)
+					this.expect(")")
+				} else {
+					a.align = max(a.align, 16)
+				}
+			default:
+				this.warn(t, `ignored attribute ${name}`)
+				if (this.is("(")) {
+					this.skipParens()
+				}
+		}
+	}
+
+	private warn(t: Tok, msg: string) {
+		for (const w of this.warnings) {
+			if (w.msg == msg) {
+				return
+			}
+		}
+		this.warnings.push(CError.at(t, msg))
+	}
+
+	private skipParens() {
+		this.expect("(")
+		let depth = 1
+		while (depth > 0) {
+			const t = this.next()
+			if (t.is("(")) {
+				depth++
+			} else if (t.is(")")) {
+				depth--
+			} else if (t.kind == "eof") {
+				throw CError.at(t, "expected )")
+			}
+		}
+	}
+
+	/// A struct or union specifier after its keyword: a tag, a definition, or both. A definition
+	/// completes the tag of the current scope, or makes a new one; a bare tag refers to a visible one,
+	/// unless it is forward-declared as in `struct S;`, which is a new tag in this scope.
+	private record(kind: "struct" | "union"): Record {
+		const a = new Attrs()
+		this.attrs(a)
+		const name = if (this.peek().kind == "ident") this.next().text else ""
+		const own = this.scopes.local(`${kind} ${name}`)
+		if (!this.is("{")) {
+			const known = if (this.is(";")) own else this.scopes.get(`${kind} ${name}`)
+			return if (known instanceof Record) known else this.newTag(kind, name)
+		}
+		const t = if (own instanceof Record && own.fields == null) own else this.newTag(kind, name)
+		const open = this.peek()
+		const fields = this.members()
+		this.attrs(a)
+		try {
+			layout(t, fields, if (a.packed) 1 else this.pack, a.align)
+		} catch (e: LayoutError) {
+			throw CError.at(open, e.msg)
+		}
+		return t
+	}
+
+	private newTag(kind: "struct" | "union", name: string): Record {
+		const t = new Record(kind)
+		if (name != "") {
+			this.scopes.set(`${kind} ${name}`, t)
+		}
+		return t
+	}
+
+	/// The member declarations of a struct or union, in braces.
+	private members(): Field[] {
+		this.expect("{")
+		const fields: Field[] = []
+		while (!this.eat("}")) {
+			this.eat("__extension__")
+			if (this.eat("_Static_assert")) {
+				this.staticAssert()
+				continue
+			}
+			const s = this.specs()
+			if (this.eat(";")) {
+				// An anonymous struct or union member.
+				if (s.ty instanceof Record) {
+					fields.push(new Field("", s.ty))
+				}
+				continue
+			}
+			while (true) {
+				const a = s.declaratorAttrs()
+				const [name, ty] = if (this.is(":")) [null, s.ty] else this.declarator(s.ty, a)
+				const f = new Field(name?.text ?? "", moded(ty, a.mode))
+				if (this.eat(":")) {
+					f.width = this.constant() as i32
+				}
+				this.attrs(a)
+				f.align = if (a.packed) 1 else max(f.align, a.align)
+				fields.push(f)
+				if (!this.eat(",")) {
+					break
+				}
+			}
+			this.expect(";")
+		}
+		return fields
+	}
+
+	/// An enum's constants are ints, or longs where an int is too narrow. The enum is an unsigned int if
+	/// none is negative, else an int, or 64 bits wide where 32 are too narrow, as in clang; unless it fixes
+	/// its type, as in enum : short.
+	private enumeration(): Type {
+		this.attrs(new Attrs())
+		const name = if (this.peek().kind == "ident") this.next().text else ""
+		const fixed = if (this.eat(":")) this.typeName() else null
+		if (!this.eat("{")) {
+			const known = this.scopes.get(`enum ${name}`)
+			return fixed ?? (if (known instanceof Type) known else Int)
+		}
+		let n: i64 = 0
+		let low: i64 = 0
+		let high: i64 = 0
+		while (!this.eat("}")) {
+			const constant = this.next().text
+			this.attrs(new Attrs())
+			if (this.eat("=")) {
+				n = this.constant()
+			}
+			this.scopes.set(constant, int(n, fixed ?? (if (fits(n, Int)) Int else Long)))
+			low = min(low, n)
+			high = max(high, n)
+			n++
+			if (!this.is("}")) {
+				this.expect(",")
+			}
+		}
+		const ty = fixed ?? (if (low >= 0) (if (fits(high, UInt)) UInt else ULong)
+			else if (fits(low, Int) && fits(high, Int)) Int
+			else Long)
+		if (name != "") {
+			this.scopes.set(`enum ${name}`, ty)
+		}
+		return ty
+	}
+
+	/// A declarator over base: its name, null if abstract, and its type.
+	private declarator(base: Type, a: Attrs): [Tok | null, Type] {
+		const [name, derive] = this.derivation(a)
+		return [name, derive(base)]
+	}
+
+	/// A declarator: its name, and how it derives its type from the base type. The suffixes after a nested
+	/// declarator apply before it: in (*f)(int), f is a pointer to a function.
+	private derivation(a: Attrs): [Tok | null, (base: Type) => Type] {
+		this.attrs(a)
+		const volatiles: bool[] = []
+		while (this.eat("*") || this.eat("^")) {
+			volatiles.push(this.qualifiers(a))
+		}
+		let name: Tok | null = null
+		let nested = (ty: Type) => ty
+		let open = false
+		if (this.eat("(")) {
+			// A nested declarator, or a parameter list after an abstract one; attributes may start either.
+			this.attrs(a)
+			const t = this.peek()
+			open = !(t.is("*") || t.is("(") || t.is("^") || t.kind == "ident" && !this.startsDecl(t))
+			if (!open) {
+				const d = this.derivation(a)
+				name = d[0]
+				nested = d[1]
+				this.expect(")")
+			}
+		} else {
+			const t = this.peek()
+			name = if (t.kind == "ident" && !this.attrsAhead() && !isAsmLabel(t.text)) this.next() else null
+		}
+		const suffix = this.suffix(open)
+		this.attrs(a)
+		return [name, base => {
+			let ty = base
+			for (const v of volatiles) {
+				ty = if (v) volatile(new Ptr(ty)) else new Ptr(ty)
+			}
+			return nested(suffix(ty))
+		}]
+	}
+
+	/// Reads the qualifiers and attributes after a *; returns whether one is volatile.
+	private qualifiers(a: Attrs): bool {
+		let v = false
+		while (true) {
+			const w = this.peek().text
+			if (isQualifier(w)) {
+				this.next()
+				v = v || isVolatileWord(w)
+			} else if (!this.attrs(a)) {
+				return v
+			}
+		}
+	}
+
+	/// The array and function suffixes after a declarator's name, the ( of a parameter list taken if open, as
+	/// how they derive a type from the one before them.
+	private suffix(open: bool): (ty: Type) => Type {
+		const param = this.paramSuffix
+		this.paramSuffix = false
+		if (open || this.eat("(")) {
+			const f = this.params()
+			return ty => {
+				f.result = ty
+				return f
+			}
+		}
+		if (!this.eat("[")) {
+			return ty => ty
+		}
+		while (this.peek().kind == "ident" && (this.is("static") || isQualifier(this.peek().text))) {
+			this.next()
+		}
+		// [*], in a prototype, is an array of some variable length.
+		if (this.is("*") && this.peek(1).is("]")) {
+			this.next()
+		}
+		// A parameter's array is a pointer, so a length there need not be constant, as in int a[n].
+		const t = this.peek()
+		const len = if (this.is("]")) null else this.discard(() => this.g.rv(this.ternary()))
+		if (len != null && len.known != "int" && !param) {
+			throw CError.at(t, "expected an integer constant")
+		}
+		const n = if (len == null || len.known != "int") null else len.n as i32
+		this.expect("]")
+		const rest = this.suffix(false)
+		return ty => new Arr(rest(ty), n)
+	}
+
+	/// A parameter list after its (, as the type of a function, whose result the caller sets. Arrays and
+	/// functions adjust to pointers.
+	private params(): Fn {
+		const f = new Fn(Void)
+		if (this.eat(")")) {
+			f.prototyped = false
+			return f
+		}
+		if (this.is("void") && this.peek(1).is(")")) {
+			this.next(2)
+			return f
+		}
+		// K&R's identifier list: its parameters are ints unless declarations before the body say otherwise.
+		if (this.peek().kind == "ident" && !this.startsDecl(this.peek())) {
+			f.prototyped = false
+			while (f.params.length == 0 || this.eat(",")) {
+				f.params.push([Int, this.next().text])
+			}
+			this.expect(")")
+			return f
+		}
+		// The parameters' prototype scope, where later ones see earlier ones, and which tags declared in it
+		// end with. Their values are a stand-in, as what uses them is not run; a definition binds them again.
+		this.scopes.enter()
+		while (!this.eat(")")) {
+			if (f.params.length > 0 || f.variadic) {
+				this.expect(",")
+			}
+			if (this.eat("...")) {
+				f.variadic = true
+				continue
+			}
+			const s = this.specs()
+			this.paramSuffix = true
+			const [name, declared] = this.declarator(s.ty, new Attrs())
+			const ty = decay(declared)
+			f.params.push([ty, name?.text ?? ""])
+			if (name != null) {
+				this.scopes.set(name.text, object(ty, this.g.b.constZero(this.g.b.ptr())))
+			}
+		}
+		this.scopes.leave()
+		return f
+	}
+
+	private typeName(): Type {
+		const s = this.specs()
+		return this.declarator(s.ty, new Attrs())[1]
+	}
+
+	// Initializers
+	/// Defines the static object v from the initializer ahead if initialized, else as zeros.
+	private initStatic(v: Val, local: bool, tls: bool, align: i32, initialized: bool) {
+		const data = new Data()
+		if (initialized) {
+			// Computed in a scratch function, as what is not constant needs one before put rejects it.
+			v.ty = this.discard(() => this.initialize(v, data))
+		}
+		this.defineGlobal(v, data.value(this.g.b, max(v.ty.size, data.end)), local, tls, max(align, v.ty.align))
+	}
+
+	/// Initializes the local v from the initializer ahead; returns its type, completed if an array's
+	/// length was left out.
+	private initLocal(v: Val): Type {
+		if (v.ty.kind == "array" || v.ty instanceof Record && this.is("{")) {
+			this.g.zero(v, v.ty.size)
+		}
+		return this.initialize(v, null)
+	}
+
+	/// Reads the initializer ahead into data for a static v, else into v itself.
+	private initialize(v: Val, data: Data | null): Type {
+		const outer = this.inStatic
+		this.inStatic = data != null
+		const t = new Init(this, v, data).init(v.ty, 0)
+		this.inStatic = outer
+		return t
+	}
+
+	/// A local array t, named name unless "", whose length its initializer ahead gives. That is known only after
+	/// the initializer, so it is emitted first, into a block of its own storing through a pointer, which the block
+	/// before it jumps to after allocating the array, zeroing it and pointing there.
+	private unsized(t: Arr, align: i32, name: string): Val {
+		const g = this.g
+		const b = g.b
+		const from = b.here()
+		const init = g.label()
+		b.at(init)
+		const p = g.temp(new Ptr(Void))
+		const dest = object(t, b.load(b.ptr(), p.v, false))
+		if (name != "") {
+			this.scopes.set(name, dest)
+		}
+		const ty = this.initialize(dest, null)
+		const end = b.here()
+		b.at(from)
+		const v = g.temp(ty, 0, align)
+		g.zero(v, ty.size)
+		b.store(v.v, p.v, false)
+		b.br(init)
+		b.at(end)
+		return v
+	}
+
+	// Statements
+	/// A compound statement in its own scope. Its value is its last statement's, for ({ }).
+	private block(): Val | null {
+		this.expect("{")
+		this.scopes.enter()
+		let last: Val | null = null
+		while (!this.eat("}")) {
+			this.eat("__extension__")
+			const t = this.peek()
+			if ((this.startsDecl(t) || this.attrsAhead() || t.is("_Static_assert")) && !this.peek(1).is(":")) {
+				this.declaration()
+				last = null
+			} else {
+				last = this.stmt()
+			}
+		}
+		this.scopes.leave()
+		return last
+	}
+
+	/// A statement; its value if it is an expression.
+	private stmt(): Val | null {
+		const t = this.peek()
+		if (t.kind == "ident" && this.peek(1).is(":") && t.text != "default") {
+			this.next(2)
+			this.g.start(this.label(t.text))
+			// A label may carry attributes; but an __asm__ after it is a statement, not an asm label.
+			if (!isAsm(this.peek().text)) {
+				this.attrs(new Attrs())
+			}
+			return if (this.is("}")) null else this.stmt()
+		}
+		if (t.is("{")) {
+			return this.block()
+		}
+		if (this.eat(";")) {
+			return null
+		}
+		if (t.kind != "ident") {
+			return this.exprStmt()
+		}
+		switch (t.text) {
+			case "if": this.ifStmt()
+			case "while": this.whileStmt()
+			case "do": this.doStmt()
+			case "for": this.forStmt()
+			case "switch": this.switchStmt()
+			case "case", "default": return this.caseStmt()
+			case "break": this.jump(this.breaks)
+			case "continue": this.jump(this.continues)
+			case "goto":
+				this.next()
+				this.g.br(this.label(this.next().text))
+				this.expect(";")
+			case "asm", "__asm", "__asm__": this.asmStmt()
+			case "return":
+				this.next()
+				this.g.ret(if (this.is(";")) null else this.expr())
+				this.expect(";")
+			default: return this.exprStmt()
+		}
+		return null
+	}
+
+	private exprStmt(): Val {
+		const v = this.expr()
+		this.expect(";")
+		return v
+	}
+
+	/// asm qualifiers ( template : outputs : inputs : clobbers ); each list may be left out. Without them,
+	/// the template's % are its own, doubled for the extended syntax.
+	private asmStmt() {
+		this.next()
+		while (this.peek().kind == "ident") {
+			this.next()
+		}
+		this.expect("(")
+		const template = this.asmString()
+		const text = if (this.is(":")) template else split(template, "%").join("%%")
+		const outs = this.asmOperands()
+		const ins = this.asmOperands()
+		const clobbers: string[] = []
+		if (this.eat(":")) {
+			while (this.peek().kind == "string") {
+				clobbers.push(this.asmString())
+				this.eat(",")
+			}
+		}
+		this.expect(")")
+		this.expect(";")
+		this.g.asm(text, outs, ins, clobbers)
+	}
+
+	/// After a :, the operands "constraint" (expression).
+	private asmOperands(): [string, Val][] {
+		const ops: [string, Val][] = []
+		if (!this.eat(":")) {
+			return ops
+		}
+		while (this.peek().kind == "string") {
+			const c = this.asmString()
+			this.expect("(")
+			ops.push([c, this.expr()])
+			this.expect(")")
+			this.eat(",")
+		}
+		return ops
+	}
+
+	/// The string literals ahead, without their NUL.
+	private asmString(): string {
+		const s = this.strings()[1]
+		return s.slice(0, s.length - 1)
+	}
+
+	/// The block of the label name in the function being defined.
+	private label(name: string): Block {
+		const l = this.labels.get(name)
+		if (l != null) {
+			return l
+		}
+		const fresh = this.g.label()
+		this.labels.set(name, fresh)
+		return fresh
+	}
+
+	private jump(targets: Block[]) {
+		const t = this.next()
+		this.expect(";")
+		if (targets.length == 0) {
+			throw CError.at(t, `${t.text} outside a loop`)
+		}
+		this.g.br(targets[targets.length - 1])
+	}
+
+	/// The body of a loop that break leaves for out and continue repeats from again.
+	private loop(out: Block, again: Block) {
+		this.breaks.push(out)
+		this.continues.push(again)
+		this.stmt()
+		this.breaks.pop()
+		this.continues.pop()
+	}
+
+	/// A parenthesized condition as an i1.
+	private condition(): Value {
+		this.expect("(")
+		const c = this.g.cond(this.g.rv(this.expr()))
+		this.expect(")")
+		return c
+	}
+
+	private ifStmt() {
+		const f = this.g
+		this.next()
+		const c = this.condition()
+		const yes = f.label()
+		const no = f.label()
+		const end = f.label()
+		f.cbr(c, yes, no)
+		f.start(yes)
+		this.stmt()
+		f.br(end)
+		f.start(no)
+		if (this.eat("else")) {
+			this.stmt()
+		}
+		f.start(end)
+	}
+
+	private whileStmt() {
+		const f = this.g
+		this.next()
+		const check = f.label()
+		const body = f.label()
+		const end = f.label()
+		f.start(check)
+		f.cbr(this.condition(), body, end)
+		f.start(body)
+		this.loop(end, check)
+		f.br(check)
+		f.start(end)
+	}
+
+	private doStmt() {
+		const f = this.g
+		this.next()
+		const body = f.label()
+		const check = f.label()
+		const end = f.label()
+		f.start(body)
+		this.loop(end, check)
+		f.start(check)
+		this.expect("while")
+		f.cbr(this.condition(), body, end)
+		this.expect(";")
+		f.start(end)
+	}
+
+	private forStmt() {
+		const f = this.g
+		this.next()
+		this.expect("(")
+		this.scopes.enter()
+		if (this.startsDecl(this.peek())) {
+			this.declaration()
+		} else if (!this.eat(";")) {
+			this.exprStmt()
+		}
+		const check = f.label()
+		const step = f.label()
+		const body = f.label()
+		const end = f.label()
+		f.start(check)
+		if (this.is(";")) {
+			f.br(body)
+		} else {
+			f.cbr(this.g.cond(this.g.rv(this.expr())), body, end)
+		}
+		this.expect(";")
+		f.start(step)
+		if (!this.is(")")) {
+			this.expr()
+		}
+		this.expect(")")
+		f.br(check)
+		f.start(body)
+		this.loop(end, step)
+		f.br(step)
+		f.start(end)
+		this.scopes.leave()
+	}
+
+	/// A switch jumps to its cases from a dispatch block after its body, once all the cases are known.
+	private switchStmt() {
+		const g = this.g
+		const f = g
+		this.next()
+		this.expect("(")
+		const x = g.rv(this.expr())
+		const v = g.cast(x, promote(x.ty))
+		this.expect(")")
+		const outer = this.sw
+		const sw = new Switch(v.ty)
+		this.sw = sw
+		const dispatch = f.label()
+		const end = f.label()
+		f.br(dispatch)
+		this.breaks.push(end)
+		this.stmt()
+		this.breaks.pop()
+		this.sw = outer
+		f.br(end)
+		f.start(dispatch)
+		g.switch(v, sw.cases, sw.targets, sw.ranges, if (sw.dflt == 0) end else sw.dflt)
+		f.start(end)
+	}
+
+	/// case, a GNU case range, or default.
+	private caseStmt(): Val | null {
+		const t = this.next()
+		const sw = this.sw
+		if (sw == null) {
+			throw CError.at(t, `${t.text} outside a switch`)
+		}
+		const l = this.g.label()
+		if (t.is("case")) {
+			const lo = wrap(this.constant(), sw.ty)
+			if (this.eat("...")) {
+				const hi = wrap(this.constant(), sw.ty)
+				if (if (isUnsigned(sw.ty)) (hi as u64) >= (lo as u64) else hi >= lo) {
+					sw.ranges.push([lo, hi, l])
+				}
+			} else {
+				sw.cases.push(lo)
+				sw.targets.push(l)
+			}
+		} else {
+			sw.dflt = l
+		}
+		this.expect(":")
+		this.g.start(l)
+		return if (this.is("}")) null else this.stmt()
+	}
+
+	// Expressions
+	/// An integer constant expression's value. Outside a function it is parsed in a scratch one, where what
+	/// is not constant compiles before it is found out.
+	constant(): i64 {
+		if (this.g.f == null) {
+			return this.discard(() => this.constant())
+		}
+		const t = this.peek()
+		const v = this.g.rv(this.ternary())
+		if (v.known != "int") {
+			throw CError.at(t, "expected an integer constant")
+		}
+		return v.n
+	}
+
+	expr(): Val {
+		let v = this.assign()
+		while (this.eat(",")) {
+			v = this.assign()
+		}
+		return v
+	}
+
+	/// An assignment expression: x = y, or x op= y as x = x op y with x's parts evaluated once.
+	assign(): Val {
+		const g = this.g
+		const x = this.ternary()
+		const op = this.peek().kind
+		if (!isAssignment(op)) {
+			return x
+		}
+		this.next()
+		const y = g.rv(this.assign())
+		const binary = op.slice(0, op.length - 1)
+		return g.store(x, if (op == "=") y else g.binary(binary, g.rv(x), y))
+	}
+
+	/// c ? a : b, and GNU's c ?: b, which is c unless that is zero.
+	private ternary(): Val {
+		const c = this.binary(1)
+		if (!this.eat("?")) {
+			return c
+		}
+		const g = this.g
+		const cv = g.rv(c)
+		const known = g.truth(cv)
+		const elvis = this.is(":")
+		if (known != null) {
+			return this.decided(cv, known, elvis)
+		}
+		// Each branch leaves its value in a slot; a converts to the result type in a block of its own after
+		// b's, once b's type is known.
+		const yes = g.label()
+		const no = g.label()
+		const fix = g.label()
+		const end = g.label()
+		g.cbr(g.cond(cv), yes, no)
+		g.start(yes)
+		const a = if (elvis) cv else g.rv(this.expr())
+		g.br(fix)
+		this.expect(":")
+		g.start(no)
+		const b = g.rv(this.ternary())
+		const t = joined(a.ty, b.ty)
+		const slot = if (t.kind == "void") null else g.temp(if (t instanceof Record) new Ptr(t) else t)
+		this.keep(slot, g.cast(b, t))
+		g.br(end)
+		g.start(fix)
+		this.keep(slot, g.cast(a, t))
+		g.br(end)
+		g.start(end)
+		if (slot == null) {
+			return new Val(Void, 0)
+		}
+		const r = g.rv(slot)
+		return if (t instanceof Record) g.deref(r) else r
+	}
+
+	/// Stores v in slot, a struct or union by address.
+	private keep(slot: Val | null, v: Val) {
+		if (slot != null) {
+			this.g.store(slot, if (v.ty instanceof Record) this.g.addressOf(v) else v)
+		}
+	}
+
+	/// The rest of a conditional expression whose condition cv is known to be taken or not: only the
+	/// branch taken is compiled, the other parsed for its type.
+	private decided(cv: Val, taken: bool, elvis: bool): Val {
+		const g = this.g
+		const a = if (elvis) cv else if (taken) g.rv(this.expr()) else this.discard(() => g.rv(this.expr()))
+		this.expect(":")
+		const b = if (taken) this.discard(() => g.rv(this.ternary())) else g.rv(this.ternary())
+		return g.cast(if (taken) a else b, joined(a.ty, b.ty))
+	}
+
+	/// Binary operators binding at least as tightly as min.
+	private binary(min: i32): Val {
+		let x = this.cast()
+		while (true) {
+			const op = this.peek().kind
+			const p = precedence(op)
+			if (p < min) {
+				return x
+			}
+			this.next()
+			x = if (op == "&&" || op == "||") this.logic(op, x, p)
+				else this.g.binary(op, this.g.rv(x), this.g.rv(this.binary(p + 1)))
+		}
+	}
+
+	/// x && y or x || y, of precedence p, which evaluates y only if x does not decide.
+	private logic(op: string, x: Val, p: i32): Val {
+		const g = this.g
+		const xv = g.rv(x)
+		const known = g.truth(xv)
+		if (known != null) {
+			if (known == (op == "||")) {
+				this.discard(() => this.binary(p + 1).ty)
+				return int(if (known) 1 else 0, Int)
+			}
+			return g.cast(g.cast(g.rv(this.binary(p + 1)), Bool), Int)
+		}
+		// The slot holds what x alone decides, until y says otherwise.
+		const slot = g.temp(Int)
+		g.store(slot, int(if (op == "&&") 0 else 1, Int))
+		const c = g.cond(xv)
+		const rhs = g.label()
+		const end = g.label()
+		if (op == "&&") {
+			g.cbr(c, rhs, end)
+		} else {
+			g.cbr(c, end, rhs)
+		}
+		g.start(rhs)
+		g.store(slot, g.cast(g.cast(g.rv(this.binary(p + 1)), Bool), Int))
+		g.br(end)
+		g.start(end)
+		return g.rv(slot)
+	}
+
+	/// A cast, or a compound literal, which a type name in parentheses also starts.
+	private cast(): Val {
+		if (this.is("(") && this.startsDecl(this.peek(1))) {
+			const at = this.next()
+			const t = this.typeName()
+			this.expect(")")
+			if (this.is("{")) {
+				return this.suffixes(this.compound(t))
+			}
+			const v = this.g.rv(this.cast())
+			return if (t instanceof Record && !isCompatible(v.ty, t)) this.unionCast(at, t, v) else this.g.cast(v, t)
+		}
+		return this.unary()
+	}
+
+	/// GNU's cast at of v to the union t: a union holding v in its member of v's type.
+	private unionCast(at: Tok, t: Record, v: Val): Val {
+		for (const f of t.fields ?? []) {
+			if (t.kind == "union" && isCompatible(f.ty, v.ty)) {
+				const u = this.g.temp(t)
+				this.g.store(this.g.member(u, f), v)
+				return u
+			}
+		}
+		throw CError.at(at, "a cast to a struct or union, other than to a union from one of its member types")
+	}
+
+	/// A compound literal of type t: static outside functions and in static initializers, else local.
+	private compound(t: Type): Val {
+		if (this.g.f == null || this.inStatic) {
+			const v = global(t, 0, ".compoundliteral")
+			this.initStatic(v, true, false, 0, true)
+			return v
+		}
+		if (t instanceof Arr && t.len == null) {
+			return this.unsized(t, 1, "")
+		}
+		const v = this.g.temp(t)
+		this.initLocal(v)
+		return v
+	}
+
+	private unary(): Val {
+		const g = this.g
+		const t = this.peek()
+		if (t.kind == "ident") {
+			switch (t.text) {
+				case "sizeof":
+					this.next()
+					return int(this.operandType().size, ULong)
+				case "_Alignof", "__alignof__", "__alignof":
+					this.next()
+					return int(this.operandType().align, ULong)
+				case "__extension__":
+					this.next()
+					return this.cast()
+				default: return this.postfix()
+			}
+		}
+		const op = t.kind
+		if (op == "++" || op == "--") {
+			this.next()
+			const v = this.unary()
+			return g.store(v, g.binary(op.slice(0, 1), g.rv(v), int(1, Int)))
+		}
+		if (op != "&" && op != "*" && op != "+" && op != "-" && op != "~" && op != "!") {
+			return this.postfix()
+		}
+		this.next()
+		const v = this.cast()
+		return switch (op) {
+			case "&": g.addressOf(v)
+			case "*": g.deref(this.pointer(t, g.rv(v)))
+			case "+": g.cast(g.rv(v), promote(v.ty))
+			default: g.unary(op, g.rv(v))
+		}
+	}
+
+	/// The type sizeof or _Alignof measures: a type name in parentheses, or an unevaluated expression's.
+	private operandType(): Type {
+		if (!this.is("(") || !this.startsDecl(this.peek(1))) {
+			return this.discard(() => this.unary().ty)
+		}
+		this.next()
+		const t = this.typeName()
+		this.expect(")")
+		return t
+	}
+
+	private postfix(): Val { return this.suffixes(this.primary()) }
+
+	/// The subscripts, calls, member accesses and ++ -- after base.
+	private suffixes(base: Val): Val {
+		const g = this.g
+		let v = base
+		while (true) {
+			const t = this.peek()
+			if (this.eat("[")) {
+				const p = g.rv(v)
+				v = g.deref(this.pointer(t, g.binary("+", p, g.rv(this.expr()))))
+				this.expect("]")
+			} else if (this.eat("(")) {
+				if (callee(v.ty) == null) {
+					throw CError.at(t, "called object is not a function")
+				}
+				v = g.call(v, this.args())
+			} else if (this.eat(".")) {
+				v = this.field(v)
+			} else if (this.eat("->")) {
+				v = this.field(g.deref(this.pointer(t, g.rv(v))))
+			} else if (t.is("++") || t.is("--")) {
+				this.next()
+				const old = g.rv(v)
+				g.store(v, g.binary(t.text.slice(0, 1), old, int(1, Int)))
+				v = old
+			} else {
+				return v
+			}
+		}
+	}
+
+	/// The arguments of a call, through its ).
+	private args(): Val[] {
+		const args: Val[] = []
+		while (!this.eat(")")) {
+			if (args.length > 0) {
+				this.expect(",")
+			}
+			args.push(this.g.rv(this.assign()))
+		}
+		return args
+	}
+
+	/// The member of v the name ahead selects.
+	private field(v: Val): Val {
+		const t = this.next()
+		const f = member(v.ty, t.text)
+		if (f == null) {
+			throw CError.at(t, `no member ${t.text}`)
+		}
+		return this.g.member(v, f)
+	}
+
+	private primary(): Val {
+		const t = this.next()
+		switch (t.kind) {
+			case "number":
+				const c = t.value
+				if (c == null) {
+					throw CError.at(t, `bad number ${t.text}`)
+				}
+				const [ty, n, x] = c
+				return if (ty.kind == "float") float(x, ty) else int(n, ty)
+			case "char":
+				const [ty, n] = character(t.text)
+				return int(n, ty)
+			case "string":
+				const [e, bytes] = this.strings([t.text])
+				return global(new Arr(e, bytes.length / e.size), this.g.bytes(bytes))
+			case "(":
+				if (this.is("{")) {
+					const s = this.block()
+					this.expect(")")
+					return s ?? new Val(Void, 0)
+				}
+				const x = this.expr()
+				this.expect(")")
+				return x
+			case "ident": return this.identifier(t, t.text)
+			default: throw CError.at(t, `expected an expression, got ${t.text}`)
+		}
+	}
+
+	/// texts and the string literals ahead, as one: their elements' type, and their bytes, NUL included.
+	strings(texts: string[] = []): [Type, string] {
+		while (this.peek().kind == "string") {
+			texts.push(this.next().text)
+		}
+		return strings(texts)
+	}
+
+	private identifier(t: Tok, name: string): Val {
+		const d = this.scopes.get(name)
+		if (d instanceof Val) {
+			return d
+		}
+		if (d != null) {
+			throw CError.at(t, `unexpected type ${name}`)
+		}
+		if (name == "__func__" || name == "__FUNCTION__" || name == "__PRETTY_FUNCTION__") {
+			return global(new Arr(Char, this.fname.length + 1), this.g.bytes(this.fname + "\0"))
+		}
+		const b = if (startsWith(name, "__builtin_")) name.slice(10, name.length)
+			else if (startsWith(name, "__atomic_") || startsWith(name, "__sync_") || name == "alloca") name
+			else ""
+		if (b != "") {
+			return this.builtin(t, b)
+		}
+		if (name == "_Generic") {
+			return this.generic(t)
+		}
+		if (!this.is("(")) {
+			throw CError.at(t, `undeclared ${name}`)
+		}
+		return this.implicit(name)
+	}
+
+	/// A generic selection (C11 6.5.1.1): the expression associated with the type of the controlling one after
+	/// lvalue conversion, or else the default one. The controlling expression and the others are parsed for
+	/// their types alone. A default before the match goes to blocks of its own, jumped to only if it is chosen.
+	private generic(t: Tok): Val {
+		const g = this.g
+		const b = g.b
+		this.expect("(")
+		const ty = this.discard(() => g.rv(this.assign()).ty)
+		let chosen: Val | null = null
+		let fallback: Val | null = null
+		// The default's first and last blocks.
+		let first: Block = 0
+		let last: Block = 0
+		while (this.eat(",")) {
+			const dflt = this.eat("default")
+			const match = !dflt && isCompatible(this.typeName(), ty)
+			this.expect(":")
+			if (dflt && fallback != null) {
+				throw CError.at(t, "a second default")
+			}
+			if (match && chosen == null) {
+				chosen = this.assign()
+			} else if (!dflt || chosen != null) {
+				this.discard(() => this.assign())
+			} else if (g.f == null) {
+				// Outside functions it is constant.
+				fallback = this.discard(() => this.assign())
+			} else {
+				const back = b.here()
+				first = g.label()
+				b.at(first)
+				fallback = this.assign()
+				last = b.here()
+				b.at(back)
+			}
+		}
+		this.expect(")")
+		if (fallback == null || g.f == null) {
+			const v = chosen ?? fallback
+			if (v == null) {
+				throw CError.at(t, "no association matches the type")
+			}
+			return v
+		}
+		if (chosen == null) {
+			b.br(first)
+			b.at(last)
+			return fallback
+		}
+		const back = b.here()
+		b.at(last)
+		b.unreachable()
+		b.at(back)
+		return chosen
+	}
+
+	/// A function called before its declaration, which C89 declares as int f().
+	private implicit(name: string): Val {
+		const f = new Fn(Int)
+		f.prototyped = false
+		const g = this.declareGlobal(name, f, new Spec(), new Attrs())
+		return g.v
+	}
+
+	/// The functions the tokens declare, by name.
+	prototypes(): HashMap[string, Type] {
+		const fns = new HashMap[string, Type]()
+		while (this.peek().kind != "eof") {
+			const [name, ty] = this.declarator(this.specs().ty, new Attrs())
+			this.expect(";")
+			fns.set(name!.text, ty)
+		}
+		return fns
+	}
+
+	/// A call of the builtin b, named without __builtin_. One this does not know calls the library function
+	/// of its name if that is declared or in library; a checking one like __builtin___memcpy_chk, the
+	/// unchecked function, as no object's size is known here.
+	private builtin(t: Tok, b: string): Val {
+		const g = this.g
+		this.expect("(")
+		if (b == "offsetof") {
+			return this.offsetof(this.typeName())
+		}
+		if (b == "types_compatible_p") {
+			const x = this.typeName()
+			this.expect(",")
+			const y = this.typeName()
+			this.expect(")")
+			return int(if (isCompatible(x, y)) 1 else 0, Int)
+		}
+		if (b == "va_arg") {
+			const ap = this.assign()
+			this.expect(",")
+			const v = g.vaArg(ap, this.typeName())
+			this.expect(")")
+			return v
+		}
+		const a: Val[] = []
+		while (!this.eat(")")) {
+			if (a.length > 0) {
+				this.expect(",")
+			}
+			a.push(this.assign())
+		}
+		switch (b) {
+			case "va_start": g.vaStart(a[0])
+			case "va_copy": g.vaCopy(a[0], a[1])
+			case "va_end", "prefetch": {}
+			case "unreachable": g.unreachable()
+			case "trap": g.trap()
+			case "alloca": return new Val(new Ptr(Void), g.b.stackAlloc(g.op(g.cast(g.rv(a[0]), ULong))))
+			case "frame_address":
+				if (a[0].known != "int" || a[0].n != 0) {
+					throw CError.at(t, "only the frame address of the function itself, level 0, is supported")
+				}
+				return new Val(new Ptr(Void), g.b.frameAddress())
+			case "__sync_synchronize": g.b.fence()
+			case "__atomic_store_n": g.atomic(this.pointer(t, g.rv(a[0])), a[1])
+			case "__atomic_load_n": return g.atomic(this.pointer(t, g.rv(a[0])), null)
+			case "expect": return a[0]
+			case "constant_p": return int(if (a[0].known == "int" || a[0].known == "float") 1 else 0, Int)
+			// The size is unknown: -1 for types 0 and 1, which ask for a maximum, else 0.
+			case "object_size": return int(if (g.rv(a[1]).n < 2) -1 else 0, ULong)
+			case "inf", "inff", "infl", "huge_val", "huge_valf",
+				"huge_vall": return float(1.0 / 0.0, if (b[b.length - 1] == ("f" as u8)) Float else Double)
+			case "fabs", "fabsf", "fabsl": return g.intrinsic("fabs", if (b == "fabsf") Float else Double, g.rv(a[0]))
+			case "nan", "nanf", "nanl": return float(0.0 / 0.0, if (b == "nanf") Float else Double)
+			case "bswap16", "bswap32", "bswap64", "clz", "clzl", "clzll", "ctz", "ctzl", "ctzll", "popcount",
+				"popcountl", "popcountll":
+				const op: Unary = if (startsWith(b, "bswap")) "bswap"
+					else if (startsWith(b, "clz")) "ctlz"
+					else if (startsWith(b, "ctz")) "cttz"
+					else "ctpop"
+				const width = if (endsWith(b, "16")) UShort else if (endsWith(b, "64") || endsWith(b, "l")) ULong else UInt
+				return g.intrinsic(op, width, g.rv(a[0]))
+			default:
+				const chk = startsWith(b, "__") && endsWith(b, "_chk")
+				const lib = if (chk) b.slice(2, b.length - 4) else b
+				if (!(this.scopes.get(lib) instanceof Val)) {
+					const f = this.library.get(lib)
+					if (f == null) {
+						throw CError.at(t, `unsupported builtin ${t.text}`)
+					}
+					this.declareGlobal(lib, f, new Spec(), new Attrs())
+				}
+				return g.call(this.identifier(t, lib), if (chk) unchecked(lib, a) else a)
+		}
+		return new Val(Void, 0)
+	}
+
+	/// The offset of the member designator ahead in ty, up to a ): the address of the member of an object
+	/// at address 0, which folds to a constant.
+	private offsetof(ty: Type): Val {
+		const g = this.g
+		this.expect(",")
+		let v = this.field(g.deref(int(0, new Ptr(ty))))
+		while (!this.eat(")")) {
+			if (this.eat(".")) {
+				v = this.field(v)
+			} else {
+				const t = this.expect("[")
+				v = g.deref(this.pointer(t, g.binary("+", g.rv(v), g.rv(this.expr()))))
+				this.expect("]")
+			}
+		}
+		return int(v.n, ULong)
+	}
+}
+
+/// The initializer of one object (C11 6.7.9), read from the parser p. A static's becomes the bytes of
+/// data; a local's is stored into dest, which is zero already where it is an aggregate.
+class Init {
+	private p: Parser
+	private dest: Val
+	private data: Data | null
+	/// The expression a struct's initializer read, which is not of its type, for the first scalar in it.
+	private pending: Val | null = null
+
+	constructor(p: Parser, dest: Val, data: Data | null) {
+		this.p = p
+		this.dest = dest
+		this.data = data
+	}
+
+	/// The initializer of the part of type ty at off, braced or not; returns ty, completed if it is an
+	/// array without a length.
+	init(ty: Type, off: i64): Type {
+		if (ty instanceof Arr) {
+			return this.array(ty, off)
+		}
+		if (ty instanceof Record) {
+			this.record(ty, off)
+		} else {
+			this.put(ty, off, this.scalar(), null)
+		}
+		return ty
+	}
+
+	/// An expression, which may stand in braces.
+	private scalar(): Val {
+		const pending = this.pending
+		if (pending != null) {
+			this.pending = null
+			return pending
+		}
+		const braced = this.p.eat("{")
+		const v = this.p.assign()
+		this.end(braced)
+		return v
+	}
+
+	/// Sets the part of type ty at off, or its bitfield bit, to v.
+	private put(ty: Type, off: i64, v: Val, bit: Field | null) {
+		const g = this.p.g
+		const x = g.cast(g.rv(v), ty)
+		const data = this.data
+		if (data == null) {
+			const d = this.at(ty, off)
+			d.bit = bit
+			g.store(d, x)
+		} else if (x.known == "" && (bit != null || !g.b.isConstant(x.v))) {
+			throw CError.at(this.p.here(), "initializer is not a constant")
+		} else if (bit != null) {
+			data.or(off, ty.size, (x.n & mask(bit.width)) << bit.shift)
+		} else if (x.known == "int") {
+			data.int(off, ty.size, x.n)
+		} else {
+			data.piece(off, ty.size, g.op(x))
+		}
+	}
+
+	/// The string s into the char array of length len at off, cut to it.
+	private putString(off: i64, s: string, len: i32) {
+		const bytes = s.slice(0, min(s.length, len))
+		const data = this.data
+		if (data != null) {
+			data.string(off, bytes)
+		} else {
+			this.p.g.copy(this.at(Char, off), global(Char, this.p.g.bytes(bytes)), bytes.length)
+		}
+	}
+
+	/// Copies the size bytes at from to to.
+	private copy(to: i64, from: i64, size: i32) {
+		const data = this.data
+		if (data == null) {
+			this.p.g.copy(this.at(Char, to), this.at(Char, from), size)
+		} else {
+			data.copy(to, from, size)
+		}
+	}
+
+	/// The part of type ty at off of dest.
+	private at(ty: Type, off: i64): Val {
+		const d = object(ty, this.dest.v)
+		d.off = this.dest.off + off
+		return d
+	}
+
+	/// An array's initializer: a string literal for an array of integers, or a list.
+	private array(ty: Arr, off: i64): Type {
+		const e = ty.base
+		const quoted = this.p.is("{") && this.p.peek(1).kind == "string"
+		if (isInt(e) && (this.p.peek().kind == "string" || quoted)) {
+			this.p.eat("{")
+			const s = this.p.strings()[1]
+			const n = ty.len ?? (s.length / e.size)
+			this.putString(off, s, n * e.size)
+			this.end(quoted)
+			return new Arr(e, n)
+		}
+		const braced = this.p.eat("{")
+		const n = this.elements(ty, off, braced, 0)
+		this.end(braced)
+		return if (ty.len == null) new Arr(e, n) else ty
+	}
+
+	/// The elements of the array ty at off from index from on, to the end of the list. Returns the
+	/// length they give the array.
+	private elements(ty: Arr, off: i64, braced: bool, from: i32): i32 {
+		const e = ty.base
+		let i = from
+		let count = from
+		let first = from == 0
+		while (this.more(braced, first, ty.len != null && i >= ty.len!)) {
+			first = false
+			if (braced && this.p.eat("[")) {
+				// [lo ... hi] = x, a GNU range, reads x once, into lo, and copies that element to the rest, the
+				// members a designator after the range leaves out too.
+				i = this.p.constant() as i32
+				const last = if (this.p.eat("...")) this.p.constant() as i32 else i
+				this.p.expect("]")
+				this.designated(e, off + i * e.size, null)
+				for (const k of i + 1 ... last) {
+					this.copy(off + k * e.size, off + i * e.size, e.size)
+				}
+				i = last
+			} else {
+				this.init(e, off + i * e.size)
+			}
+			i++
+			// A designator may have gone back.
+			count = max(count, i)
+		}
+		return count
+	}
+
+	/// A struct's or union's initializer: an expression of its type, or a list.
+	private record(ty: Record, off: i64) {
+		// An expression: of its type, or else the first of the members' without braces. A string is only that.
+		if (this.pending == null && this.data == null && !this.p.is("{") && this.p.peek().kind != "string") {
+			const v = this.p.assign()
+			if (v.ty instanceof Record) {
+				this.put(ty, off, v, null)
+				return
+			}
+			this.pending = v
+		}
+		const braced = this.p.eat("{")
+		this.members(ty, off, braced, 0)
+		this.end(braced)
+	}
+
+	/// The members of the struct or union ty at off from index from on, to the end of the list.
+	private members(ty: Record, off: i64, braced: bool, from: i32) {
+		const fs = ty.fields ?? []
+		let i = settable(fs, from)
+		let first = from == 0
+		while (this.more(braced, first, i >= fs.length || ty.kind == "union" && !first)) {
+			first = false
+			// GNU's obsolete m: designates as .m = does.
+			if (braced && (this.p.eat(".") || this.p.peek().kind == "ident" && this.p.peek(1).is(":"))) {
+				i = this.designatedMember(ty, off)
+			} else {
+				const f = fs[i]
+				if (f.width >= 0) {
+					this.put(f.ty, off + f.off, this.scalar(), f)
+				} else {
+					this.init(f.ty, off + f.off)
+				}
+			}
+			i = settable(fs, i + 1)
+		}
+	}
+
+	/// Whether another item of the list follows, taking the comma before it. A braced list goes on until its
+	/// }, or until its aggregate is full and no designator follows; one without braces ends where its
+	/// aggregate is full or a designator appears.
+	private more(braced: bool, first: bool, full: bool): bool {
+		if (this.pending != null) {
+			return !full
+		}
+		const t = this.p.peek(if (first) 0 else 1)
+		const designated = t.is("[") || t.is(".")
+		if (t.is("}") || !first && !this.p.is(",") || full && !(braced && designated) || !braced && designated) {
+			return false
+		}
+		if (!first) {
+			this.p.next()
+		}
+		return true
+	}
+
+	/// The end of a list, after a trailing comma, if it was braced.
+	private end(braced: bool) {
+		if (braced) {
+			this.p.eat(",")
+			this.p.expect("}")
+		}
+	}
+
+	/// The initializer after designators for the subobject of type ty at off. A nested [i] or .m selects
+	/// an element or member, and the rest of the list continues in its array or struct.
+	private designated(ty: Type, off: i64, bit: Field | null) {
+		if (this.p.eat("[")) {
+			if (!(ty instanceof Arr)) {
+				throw CError.at(this.p.here(), "an index designator outside an array")
+			}
+			const e = ty.base
+			const i = this.p.constant() as i32
+			this.p.expect("]")
+			this.designated(e, off + i * e.size, null)
+			this.elements(ty, off, false, i + 1)
+		} else if (this.p.eat(".")) {
+			if (!(ty instanceof Record)) {
+				throw CError.at(this.p.here(), "a member designator outside a struct or union")
+			}
+			this.members(ty, off, false, this.designatedMember(ty, off) + 1)
+		} else {
+			this.p.eat("=")
+			if (bit != null) {
+				this.put(bit.ty, off, this.scalar(), bit)
+			} else {
+				this.init(ty, off)
+			}
+		}
+	}
+
+	/// The member of ty a . or GNU's obsolete m: names, and what initializes it. Returns the member's index, or
+	/// that of the anonymous member holding it.
+	private designatedMember(ty: Record, off: i64): i32 {
+		const t = this.p.next()
+		const name = t.text
+		this.p.eat(":")
+		const fs = ty.fields ?? []
+		let i = 0
+		while (i < fs.length && fs[i].name != name && (fs[i].name != "" || member(fs[i].ty, name) == null)) {
+			i++
+		}
+		const f = member(ty, name)
+		if (f == null) {
+			throw CError.at(t, `no member ${name}`)
+		}
+		this.designated(f.ty, off + f.off, if (f.width >= 0) f else null)
+		return i
+	}
+}
+
+/// The constant contents of a global: bytes, and pieces that are back end constants where a value's bytes
+/// are not known here, as for floats and addresses. A later write replaces what it overlaps; gaps are zero.
+class Data {
+	/// The end of the last write.
+	end: i64 = 0
+	private bytes: i64[] = []
+	/// The piece each byte belongs to, or -1.
+	private owner: i32[] = []
+	private pieces: Piece[] = []
+
+	/// Sets the size bytes at off to n, little-endian.
+	int(off: i64, size: i32, n: i64) {
+		for (const k of 0 ... size - 1) {
+			this.set(off + k, n >> k * 8 & 0xff)
+		}
+	}
+
+	/// Ors n into the size bytes at off, which bitfields share.
+	or(off: i64, size: i32, n: i64) {
+		for (const k of 0 ... size - 1) {
+			this.set(off + k, this.byte(off + k) | n >> k * 8 & 0xff)
+		}
+	}
+
+	string(off: i64, s: string) {
+		for (const k of 0 ... s.length - 1) {
+			this.set(off + k, s[k])
+		}
+	}
+
+	/// Sets the size bytes at off to the constant v.
+	piece(off: i64, size: i32, v: Value) {
+		this.int(off, size, 0)
+		for (const k of 0 ... size - 1) {
+			this.owner[off + k] = this.pieces.length
+		}
+		this.pieces.push(new Piece(size, v))
+	}
+
+	/// Copies the size bytes at from, and the pieces among them, to to.
+	copy(to: i64, from: i64, size: i32) {
+		let k = 0
+		while (k < size) {
+			const p = if (from + k < this.end) this.owner[from + k] else -1
+			if (p >= 0 && this.pieces[p].size > 0) {
+				this.piece(to + k, this.pieces[p].size, this.pieces[p].v)
+				k += this.pieces[p].size
+			} else {
+				this.set(to + k, this.byte(from + k))
+				k++
+			}
+		}
+	}
+
+	/// The constant of size bytes holding the contents: a packed struct of byte runs and pieces.
+	value(b: Backend, size: i64): Value {
+		if (this.end == 0) {
+			return b.constZero(b.array(b.int(8), size as u64))
+		}
+		const fields: Value[] = []
+		let run = ""
+		let i: i64 = 0
+		while (i < this.end) {
+			const p = this.owner[i]
+			if (p >= 0 && this.pieces[p].size > 0) {
+				if (run != "") {
+					fields.push(b.constBytes(run))
+				}
+				run = ""
+				fields.push(this.pieces[p].v)
+				i += this.pieces[p].size
+			} else {
+				run += chr(this.bytes[i] as u8)
+				i++
+			}
+		}
+		if (run != "") {
+			fields.push(b.constBytes(run))
+		}
+		if (size > this.end) {
+			fields.push(b.constZero(b.array(b.int(8), (size - this.end) as u64)))
+		}
+		return b.constPacked(fields)
+	}
+
+	private byte(off: i64): i64 { return if (off < this.end) this.bytes[off] else 0 }
+
+	/// Sets the byte at off, dropping the piece it was part of.
+	private set(off: i64, b: i64) {
+		while (this.end <= off) {
+			this.bytes.push(0)
+			this.owner.push(-1)
+			this.end++
+		}
+		const p = this.owner[off]
+		if (p >= 0) {
+			this.pieces[p].size = 0
+		}
+		this.owner[off] = -1
+		this.bytes[off] = b
+	}
+}
+
+class Piece {
+	size: i32
+	v: Value
+
+	constructor(size: i32, v: Value) {
+		this.size = size
+		this.v = v
+	}
+}
+
+/// The index of the first member from i on that an initializer sets: unnamed bitfields are skipped.
+function settable(fields: Field[], i: i32): i32 {
+	let j = i
+	while (j < fields.length && fields[j].name == "" && fields[j].width >= 0) {
+		j++
+	}
+	return j
+}
+
+/// The arguments of a call of lib from those of its checking builtin: without the object size, which
+/// comes last, or for sprintf and snprintf comes after a flag, both after the destination and its length.
+function unchecked(lib: string, a: Val[]): Val[] {
+	const sized = lib == "snprintf" || lib == "vsnprintf"
+	if (!sized && lib != "sprintf" && lib != "vsprintf") {
+		return a.slice(0, a.length - 1)
+	}
+	const out = a.slice(0, if (sized) 2 else 1)
+	for (const v of a.slice(out.length + 2, a.length)) {
+		out.push(v)
+	}
+	return out
+}
+
+/// The basic type its words name.
+function basic(words: Word[]): Type {
+	let longs = 0
+	let unsigned = false
+	let signed = false
+	let kind: Word = "int"
+	for (const w of words) {
+		if (w == "long") {
+			longs++
+		} else if (w == "unsigned") {
+			unsigned = true
+		} else if (w == "signed") {
+			signed = true
+		} else if (w != "int") {
+			kind = w
+		}
+	}
+	return switch (kind) {
+		case "void": Void
+		case "_Bool": Bool
+		case "char": if (unsigned) UChar else if (signed) SChar else Char
+		case "short": if (unsigned) UShort else Short
+		case "float": Float
+		case "double": Double
+		case "__int128": if (unsigned) UInt128 else Int128
+		default: if (longs > 0) (if (unsigned) ULong else Long) else if (unsigned) UInt else Int
+	}
+}
+
+/// Whether w begins or continues declaration specifiers, apart from attributes and typedef names.
+function isSpecifier(w: string): bool {
+	return switch (w) {
+		case "typedef", "extern", "static", "auto", "register", "_Thread_local", "__thread", "inline", "__inline",
+			"__inline__", "_Noreturn", "struct", "union", "enum", "__builtin_va_list", "__int128_t", "__uint128_t",
+			"__int128", "typeof", "__typeof__", "__typeof", "void", "_Bool", "char", "short", "int", "long", "float",
+			"double", "signed", "__signed", "__signed__", "unsigned": true
+		default: isQualifier(w)
+	}
+}
+
+function isQualifier(w: string): bool {
+	return switch (w) {
+		case "const", "volatile", "restrict", "__restrict", "__restrict__", "__const", "__volatile", "__volatile__",
+			"_Nonnull", "_Nullable", "_Null_unspecified", "_Nullable_result", "_Atomic", "__unaligned": true
+		default: false
+	}
+}
+
+function isVolatileWord(w: string): bool { return w == "volatile" || w == "__volatile" || w == "__volatile__" }
+/// The integer mode m the mode attribute names: 1 to 5 for 1, 2, 4, 8 and 16 bytes, or 0 for another.
+function intMode(m: string): i32 {
+	switch (m) {
+		case "QI", "byte": return 1
+		case "HI": return 2
+		case "SI": return 3
+		case "DI", "word", "pointer": return 4
+		case "TI": return 5
+		default: return 0
+	}
+}
+
+/// The integer t made as wide as the mode attribute's mode says, if it says one.
+function moded(t: Type, mode: i32): Type {
+	if (mode == 0 || t.kind != "int") {
+		return t
+	}
+	const ints = if (isUnsigned(t)) [UChar, UShort, UInt, ULong, UInt128] else [SChar, Short, Int, Long, Int128]
+	return ints[mode - 1]
+}
+
+function isAttribute(w: string): bool { return w == "__attribute__" || w == "__attribute" || w == "_Alignas" }
+function isAsmLabel(w: string): bool { return w == "__asm" || w == "__asm__" }
+function isAsm(w: string): bool { return w == "asm" || isAsmLabel(w) }
+
+/// Whether n is a value of the integer type t.
+function fits(n: i64, t: Type): bool { return n == wrap(n, t) }
+
+/// The symbol an asm label names: the C name labelPrefix marks, else the label as is, which LLVM's \01
+/// prefix keeps from being mangled.
+function symbol(label: string): string {
+	const prefix = labelPrefix(os)
+	const n = prefix.length
+	return if (label.length > n && startsWith(label, prefix)) label.slice(n, label.length) else "\x01" + label
+}
+
+function isAssignment(op: string): bool {
+	return switch (op) {
+		case "=", "+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "^=", "|=": true
+		default: false
+	}
+}
+
+/// The type of c ? a : b.
+function joined(a: Type, b: Type): Type {
+	if (isArith(a) && isArith(b)) {
+		return common(a, b)
+	}
+	return if (a.kind != "ptr" && b.kind == "ptr") b else a
+}

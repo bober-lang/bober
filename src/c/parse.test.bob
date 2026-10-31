@@ -1,0 +1,227 @@
+import { CError, File, Lexer } from "./lex"
+import { Parser } from "./parse"
+import { library } from "./builtins"
+import { arch, os } from "../../std/os"
+import { labelPrefix } from "./predef"
+import { LLVM } from "../backend/llvm"
+import { Nothing } from "../backend/backend"
+import { split, startsWith, trim } from "../../std/string"
+
+function compile(src: string): string {
+	const m = new LLVM("t.c", 0)
+	const p = new Parser(new Lexer(new File("t.c", src)), m)
+	p.library = library()
+	p.unit()
+	m.verify()
+	return m.text()
+}
+
+/// Whether a line of the module, its indentation aside, starts with prefix.
+function has(ir: string, prefix: string): bool { return split(ir, "\n").some(l => startsWith(trim(l), prefix)) }
+
+test "constant expressions fold while compiling" {
+	const ir = compile("enum { A = 3, B, C = B * 2 }; char a[C + sizeof(long)]; int n = (unsigned)-1 / 2 > 0 ? 7 : 8;")
+	assert has(ir, "@a = global [16 x i8] zeroinitializer, align 1")
+	assert has(ir, "@n = global <{ [4 x i8] }> <{ [4 x i8] c\"\\07\\00\\00\\00\" }>, align 4")
+}
+
+test "static initializers hold address constants and designated members" {
+	const ir = compile("int g[4]; struct { char c; int *p; char s[4]; } s = { .p = &g[2], \"abc\", .s[1] = 122 };")
+	assert has(ir, "@s = global <{ [8 x i8], ptr, [4 x i8], [4 x i8] }> <{ [8 x i8] zeroinitializer, "
+		+ "ptr getelementptr (i8, ptr @g, i64 8), [4 x i8] c\"azc\\00\", [4 x i8] zeroinitializer }>, align 8")
+}
+
+test "#pragma pack caps member alignment" {
+	const ir = compile("#pragma pack(push, 4)\nstruct S { int a; long b; };\n#pragma pack(pop)\nint n = sizeof(struct S); struct T { int a; long b; }; int m = sizeof(struct T);")
+	assert has(ir, "@n = global <{ [4 x i8] }> <{ [4 x i8] c\"\\0C\\00\\00\\00\" }>, align 4")
+	assert has(ir, "@m = global <{ [4 x i8] }> <{ [4 x i8] c\"\\10\\00\\00\\00\" }>, align 4")
+}
+
+test "asm labels rename symbols" {
+	const ir = compile(`int f(void) __asm("${labelPrefix(os)}f$X"); int g(void) { return f(); }`)
+	assert has(ir, "declare i32 @\"f$X\"()")
+}
+
+test "volatile lvalues load and store as such, through pointers and members too" {
+	const ir = compile("volatile int f; struct S { int a; }; int g(volatile struct S *p) { f = 1; return p->a; }")
+	assert has(ir, "store volatile i32 1, ptr @f, align 4")
+	assert has(ir, "%5 = load volatile i32, ptr %4, align 4")
+}
+
+test "compound assignment loads its left side after the right" {
+	const ir = compile("int x; int bump(int *p); void f(void) { x += bump(&x); }")
+	assert has(ir, "%2 = call i32 @bump(ptr @x)")
+	assert has(ir, "%3 = load i32, ptr @x, align 4")
+}
+
+test "a bitfield narrower than an int promotes to an int" {
+	const ir = compile("struct { unsigned f : 1; } b; int f(void) { return b.f - 2 < 0; }")
+	assert has(ir, "%6 = icmp slt i32 %5, 0")
+}
+
+test "an inline definition is external once a declaration is not inline; always_inline marks it" {
+	const ir = compile("inline int f(void) { return 1; } int f(void); inline int g(void) { return 2; } static inline __attribute__((always_inline)) int h(void) { return g(); }")
+	assert has(ir, "define i32 @f()")
+	assert has(ir, "define available_externally i32 @g()")
+	assert has(ir, "define internal i32 @h() #1 {")
+	assert has(ir, "attributes #1 = { alwaysinline \"frame-pointer\"=\"all\" }")
+}
+
+test "__builtin_constant_p is 1 for a constant; other unknown builtins are errors" {
+	assert has(compile("int n = __builtin_constant_p(2 * 3);"),
+		"@n = global <{ [4 x i8] }> <{ [4 x i8] c\"\\01\\00\\00\\00\" }>, align 4")
+	let msg = ""
+	try {
+		compile("int f(void) { return __builtin_foo(); }")
+	} catch (e: CError) {
+		msg = e.where()
+	}
+	assert msg == "t.c:1:22: unsupported builtin __builtin_foo"
+}
+
+test "a builtin of a library function declares it where the program has not" {
+	const ir = compile("void f(char *p) { __builtin_memset(p, 0, 4); __builtin_abort(); }")
+	assert has(ir, "declare ptr @memset(ptr, i32, i64)")
+	assert has(ir, "declare void @abort()")
+}
+
+test "char, signed char and unsigned char are three types; signed char computes like char" {
+	const ir = compile("int a = __builtin_types_compatible_p(char, signed char) + __builtin_types_compatible_p(char, unsigned char) * 2 + __builtin_types_compatible_p(signed char, __signed__ char) * 4 + __builtin_types_compatible_p(signed, int) * 8 + __builtin_types_compatible_p(char *, signed char *) * 16; int b = (signed char)200 == (char)200;")
+	assert has(ir, "@a = global <{ [4 x i8] }> <{ [4 x i8] c\"\\0C\\00\\00\\00\" }>, align 4")
+	assert has(ir, "@b = global <{ [4 x i8] }> <{ [4 x i8] c\"\\01\\00\\00\\00\" }>, align 4")
+}
+
+test "asm statements become inline asm; a + operand is also an input, tied to its output" {
+	const ir = compile("int f(int x, long y) { __asm__ volatile(\"add %w0, %w0, %w1 // $%%\" : \"+r\"(x) : \"r\"(y)"
+		+ " : \"memory\"); return x; }")
+	assert has(ir, "%8 = call i32 asm sideeffect \"add ${0:w}, ${0:w}, ${1:w} // $$%\", \"=r,r,0,~{memory}\""
+		+ "(i64 %6, i32 %7)")
+}
+
+test "the asm constraint g, any operand, is a register" {
+	const ir = compile("void f(int x) { __asm__(\"\" : \"+g\"(x) : \"g\"(x)); }")
+	assert has(ir, "%6 = call i32 asm sideeffect \"\", \"=r,r,0\"(i32 %4, i32 %5)")
+}
+
+test "a K&R definition types its parameters by the declarations before its body, a float as a double" {
+	const ir = compile("int f(a, b, c) char b; float c; { return a + b; } int g(void) { return f(1, 2, 3); }")
+	assert has(ir, "define i32 @f(i32 %0, i8 signext %1, double %2)")
+	assert has(ir, "%2 = call i32 @f(i32 1, i8 signext 2, double 3.000000e+00)")
+}
+
+test "C23 attributes are read as GNU's, before a declaration or a statement" {
+	const ir = compile("[[gnu::noinline, nodiscard]] int f(int x) { switch (x) { case 1: x++; [[fallthrough]]; default:"
+		+ " return x; } } struct [[gnu::packed]] S { char c; int i; }; int n = sizeof(struct S);")
+	assert has(ir, "@n = global <{ [4 x i8] }> <{ [4 x i8] c\"\\05\\00\\00\\00\" }>, align 4")
+}
+
+test "a cast to a union, GNU's, holds the value in the member of its type" {
+	const ir = compile("union U { long l; double d; }; double f(double x) { return ((union U)x).d; }")
+	assert has(ir, "store double %5, ptr %3, align 8")
+	assert has(ir, "%6 = load double, ptr %3, align 8")
+}
+
+test "va_start of a va_list parameter starts the list it points to" {
+	const ir = compile("void f(__builtin_va_list ap, ...) { __builtin_va_start(ap, ap); }")
+	assert has(ir, "%4 = load ptr, ptr %2, align 8")
+	assert has(ir, "call void @llvm.va_start.p0(ptr %4)")
+}
+
+test "a GNU case range is a test of its own, however wide" {
+	const ir = compile("int f(unsigned long x) { switch (x) { case 1 ... -1UL: return 1; } return 0; }")
+	assert has(ir, "%6 = sub i64 %4, 1")
+	assert has(ir, "%7 = icmp ule i64 %6, -2")
+}
+
+test "a signed case range compares from its low end, and an empty one is dropped" {
+	const ir = compile("int f(int x) { switch (x) { case 5 ... 1: return 2; case -3 ... 3: return 1; } return 0; }")
+	assert has(ir, "%6 = sub i32 %4, -3")
+	assert has(ir, "%7 = icmp ule i32 %6, 6")
+}
+
+test "a static initializer may be a constant the back end folds, as bobcc does not for __int128" {
+	const ir = compile("unsigned __int128 k = ((unsigned __int128)1 << 64) + 2;")
+	assert has(ir, "@k = global <{ i128 }> <{ i128 18446744073709551618 }>, align 16")
+}
+
+test "GNU's obsolete designator m: is .m =" {
+	const ir = compile("struct S { int a, b; } s = { b: 2 };")
+	assert has(ir, "@s = global <{ [8 x i8] }> <{ [8 x i8] c\"\\00\\00\\00\\00\\02\\00\\00\\00\" }>, align 4")
+}
+
+test "vector types are errors, not their element type" {
+	let msg = ""
+	try {
+		compile("typedef double v2 __attribute__((vector_size(16)));")
+	} catch (e: CError) {
+		msg = e.where()
+	}
+	assert msg == "t.c:1:34: vector types are not supported"
+}
+
+test "x86-64 aggregates cross calls by eightbyte, a float or double where floats alone are, or on the stack" {
+	if (arch != "x86_64") {
+		return
+	}
+	const ir = compile("struct W { double a; long b; }; struct F { float a, b; }; struct U { double a, b, c, d; };"
+		+ " double w(struct W x) { return x.a; } struct F f(struct F x) { return x; }"
+		+ " double u(struct U x) { return x.a; } double g(struct U *p) { return u(*p); }")
+	assert has(ir, "define double @w({ double, i64 } %0)")
+	assert has(ir, "define double @f(double %0)")
+	assert has(ir, "define double @u(ptr byval([32 x i8]) %0)")
+	assert has(ir, "%6 = call double @u(ptr byval([32 x i8]) %3)")
+}
+
+test "an x86-64 aggregate goes on the stack whole when the registers left cannot hold it" {
+	if (arch != "x86_64") {
+		return
+	}
+	const ir = compile("struct S { long a, b; }; long f(long a, long b, long c, long d, long e, struct S s) {"
+		+ " return s.a; }")
+	assert has(ir, "define i64 @f(i64 %0, i64 %1, i64 %2, i64 %3, i64 %4, ptr byval([16 x i8]) %5)")
+}
+
+test "__builtin_frame_address(0) is the frame pointer" {
+	const ir = compile("void *f(void) { return __builtin_frame_address(0); }")
+	assert has(ir, "%2 = call ptr @llvm.frameaddress.p0(i32 0)")
+}
+
+test "alloca, declared or not, takes its bytes from the stack" {
+	const ir = compile("void use(char *); void f(int n) { use(alloca(n)); use(__builtin_alloca(8)); }")
+	assert has(ir, "%6 = alloca i8, i64 %5, align 16")
+	assert has(ir, "%7 = alloca i8, i64 8, align 16")
+}
+
+test "the mode attribute sets an integer's width, keeping its sign" {
+	const ir = compile("typedef unsigned u __attribute__((mode(TI)));"
+		+ " struct S { int h __attribute__((__mode__(__HI__))); };"
+		+ " int n = sizeof(u) + sizeof(struct S); int neg = (u)-1 > 0;")
+	assert has(ir, "@n = global <{ [4 x i8] }> <{ [4 x i8] c\"\\12\\00\\00\\00\" }>, align 4")
+	assert has(ir, "@neg = global <{ [4 x i8] }> <{ [4 x i8] c\"\\01\\00\\00\\00\" }>, align 4")
+}
+
+test "attributes may open a nested declarator; [*] is an array parameter of unknown length" {
+	const ir = compile("int g(void); int f(int x[const *]);"
+		+ " int h(void) { return ((int (__attribute__((unused)) *)(void))g)(); }")
+	assert has(ir, "declare i32 @f(ptr)")
+	assert has(ir, "%2 = call i32 @g()")
+}
+
+test "a parameter is in scope for the rest of its list, where an array length may use it" {
+	const ir = compile("typedef int T; int f(int T, int a[T]); int g(int n, int a[static n + 1]) { return a[n]; }")
+	assert has(ir, "declare i32 @f(i32, ptr)")
+	assert has(ir, "define i32 @g(i32 %0, ptr %1)")
+	let msg = ""
+	try {
+		compile("int f(int n, int (*a)[n]);")
+	} catch (e: CError) {
+		msg = e.where()
+	}
+	assert msg == "t.c:1:23: expected an integer constant"
+}
+
+test "an ignored attribute warns once, where it is first seen" {
+	const p = new Parser(new Lexer(new File("t.c", "__attribute__((cold)) void f(void);\n[[gnu::__cold__]] void g(void);")), new Nothing())
+	p.unit()
+	assert p.warnings.length == 1 && p.warnings[0].where() == "t.c:1:16: ignored attribute cold"
+}

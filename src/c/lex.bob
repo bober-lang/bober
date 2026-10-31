@@ -1,0 +1,292 @@
+//! C preprocessing tokens (C11 6.4) of a whole file. Keywords are identifiers here; the parser tells
+//! them apart after preprocessing.
+
+import { upperBound } from "../../std/algo"
+import { Set } from "../../std/collections/set"
+import * from "../../std/ascii"
+import { endsWith, indexOf, split } from "../../std/string"
+import { number } from "./literal"
+import { Type } from "./type"
+
+/// A source file, its lines spliced: each backslash-newline and each CR before a newline is dropped.
+export class File {
+	name: string
+	src: string
+	/// Where in src each line of the original source starts.
+	private starts: i32[] = [0]
+
+	constructor(name: string, src: string) {
+		this.name = name
+		this.src = this.splice(src)
+	}
+
+	/// The line and column of pos in the original source, from 1.
+	lineCol(pos: i32): [i32, i32] {
+		const line = upperBound(this.starts, pos) as i32
+		return [line, pos - this.starts[line - 1] + 1]
+	}
+
+	private splice(src: string): string {
+		if (indexOf(src, "\\\n") < 0 && indexOf(src, "\r") < 0) {
+			for (const i of 0 ... src.length - 1) {
+				if (src[i] == lf) {
+					this.starts.push(i + 1)
+				}
+			}
+			return src
+		}
+		const lines = split(src, "\n")
+		const last = lines.length - 1
+		let out = ""
+		for (const i of 0 ... last - 1) {
+			const line = lines[i]
+			let keep = line.length
+			if (endsWith(line, "\r")) {
+				keep -= 1
+			}
+			const joined = keep > 0 && line[keep - 1] == backslash
+			out += line.slice(0, if (joined) keep - 1 else keep)
+			if (!joined) {
+				out += "\n"
+			}
+			this.starts.push(out.length)
+		}
+		return out + lines[last]
+	}
+}
+
+export type Punct = "[" | "]" | "(" | ")" | "{" | "}" | "." | "->" | "++" | "--" | "&" | "*" | "+" | "-" | "~" | "!"
+	| "/" | "%" | "<<" | ">>" | "<" | ">" | "<=" | ">=" | "==" | "!=" | "^" | "|" | "&&" | "||" | "?" | ":" | ";"
+	| "..." | "=" | "*=" | "/=" | "%=" | "+=" | "-=" | "<<=" | ">>=" | "&=" | "^=" | "|=" | "," | "#" | "##"
+
+/// A punctuator is its own text, and a character no other token takes is "other". The preprocessor
+/// alone makes a "placemarker".
+export type Kind = Punct | "ident" | "number" | "char" | "string" | "other" | "placemarker" | "eof"
+
+/// The precedence of binary operator op, 0 if it is none.
+export function precedence(op: Kind): i32 {
+	return switch (op) {
+		case "*", "/", "%": 10
+		case "+", "-": 9
+		case "<<", ">>": 8
+		case "<", ">", "<=", ">=": 7
+		case "==", "!=": 6
+		case "&": 5
+		case "^": 4
+		case "|": 3
+		case "&&": 2
+		case "||": 1
+		default: 0
+	}
+}
+
+/// The hideset of a token that came from no macro.
+const noMacros = new Set()
+const noFile = new File("", "")
+
+export class Tok {
+	kind: Kind = "eof"
+	text = ""
+	file = noFile
+	pos = 0
+	/// First on its line.
+	bol = false
+	/// Whitespace or a comment before it.
+	space = false
+	/// The preprocessor's hideset: the macros not to expand in it again (C11 6.10.3.4). Shared between
+	/// tokens, so never added to.
+	hide = noMacros
+	/// A number's type and value, an integer's or a float's; null if it is no constant, as 12ab is
+	/// none and only the preprocessor takes it.
+	value: [Type, i64, f64] | null = null
+
+	is(text: string): bool { return this.text == text }
+}
+
+export class CError {
+	msg: string
+	file: File
+	pos: i32
+
+	constructor(msg: string, file: File, pos: i32) {
+		this.msg = msg
+		this.file = file
+		this.pos = pos
+	}
+
+	static at(t: Tok, msg: string): CError { return new CError(msg, t.file, t.pos) }
+
+	where(): string {
+		const [line, col] = this.file.lineCol(this.pos)
+		return `${this.file.name}:${line}:${col}: ${this.msg}`
+	}
+}
+
+/// The tokens of a file, taken one at a time; at the end, an "eof" that is first on its line, again and again.
+export class Lexer {
+	private file: File
+	private src: string
+	private pos: i32 = 0
+	/// The token ahead, held in place: advance overwrites it.
+	tok: ...Tok
+
+	constructor(file: File) {
+		this.file = file
+		this.src = file.src
+		this.scan()
+	}
+
+	/// A copy of the token ahead, then advances.
+	next(): Tok {
+		const t: Tok = { ...this.tok }
+		this.advance()
+		return t
+	}
+
+	advance() {
+		if (this.tok.kind != "eof") {
+			this.scan()
+		}
+	}
+
+	/// Drops the token ahead and the rest of its line without making their tokens, as a skipped group needs.
+	skipLine() {
+		while (!this.space() && this.token() != "eof") {}
+		this.scan()
+		this.tok.bol = true
+	}
+
+	private scan() {
+		const before = this.pos
+		const bol = this.space() || before == 0
+		const start = this.pos
+		const kind = this.token()
+		const text = this.src.slice(start, this.pos)
+		this.tok = { kind, text, file: this.file, pos: start, bol: bol || kind == "eof", space: start > before,
+			hide: noMacros, value: if (kind == "number") number(text) else null }
+	}
+
+	/// Skips whitespace and comments, and whether that took a newline.
+	private space(): bool {
+		let bol = false
+		while (true) {
+			const c = this.at(0)
+			if (isSpace(c)) {
+				bol = bol || c == lf
+				this.pos++
+			} else if (c == slash && this.at(1) == slash) {
+				this.lineComment()
+			} else if (c == slash && this.at(1) == star) {
+				this.blockComment()
+			} else {
+				return bol
+			}
+		}
+	}
+
+	private lineComment() {
+		while (this.pos < this.src.length && this.at(0) != lf) {
+			this.pos++
+		}
+	}
+
+	private blockComment() {
+		const start = this.pos
+		this.pos += 2
+		while (!(this.at(0) == star && this.at(1) == slash)) {
+			if (this.pos >= this.src.length) {
+				throw new CError("unterminated comment", this.file, start)
+			}
+			this.pos++
+		}
+		this.pos += 2
+	}
+
+	private token(): Kind {
+		const c = this.at(0)
+		if (this.pos == this.src.length) {
+			return "eof"
+		}
+		if (isIdentStart(c)) {
+			return this.ident()
+		}
+		if (isDigit(c) || c == dot && isDigit(this.at(1))) {
+			return this.number()
+		}
+		return this.quoted() ?? this.punct()
+	}
+
+	/// An identifier; or, when a prefix like L is right before a quote, the char or string it starts.
+	private ident(): Kind {
+		const start = this.pos
+		while (isIdentChar(this.at(0))) {
+			this.pos++
+		}
+		const text = this.src.slice(start, this.pos)
+		if (text == "L" || text == "u" || text == "U" || text == "u8") {
+			return this.quoted() ?? "ident"
+		}
+		return "ident"
+	}
+
+	/// A pp-number: a digit, or . and a digit, then identifier characters, dots, and signs after an exponent.
+	private number(): Kind {
+		this.pos++
+		while (true) {
+			const c = this.at(0)
+			const sign = (c == plus || c == minus) && isExponent(this.at(-1))
+			if (!sign && !isIdentChar(c) && c != dot) {
+				return "number"
+			}
+			this.pos++
+		}
+	}
+
+	/// The char or string whose quote is ahead, if one is and something closes it on its line. An
+	/// unclosed quote, which only skipped groups may hold, is left for punct.
+	private quoted(): Kind | null {
+		const q = this.at(0)
+		if (q != quote && q != apostrophe) {
+			return null
+		}
+		let end = this.pos + 1
+		while (this.src.at(end) != q) {
+			if (end >= this.src.length || this.src[end] == lf) {
+				return null
+			}
+			end += if (this.src[end] == backslash) 2 else 1
+		}
+		this.pos = end + 1
+		return if (q == apostrophe) "char" else "string"
+	}
+
+	/// The longest punctuator ahead, or one character no token takes.
+	private punct(): Kind {
+		const p = punctuator([this.at(0), this.at(1), this.at(2)])
+		this.pos += p?.length ?? 1
+		return p ?? "other"
+	}
+
+	private at(i: i32): u8 { return this.src.at(this.pos + i) ?? nul }
+}
+
+/// Bytes from 0x80 are taken to be UTF-8 for a letter, as clang takes them.
+function isIdentStart(c: u8): bool { return isAlphabetic(c) || c == underscore || c == dollar || c >= 0x80 }
+function isIdentChar(c: u8): bool { return isIdentStart(c) || isDigit(c) }
+function isExponent(c: u8): bool { return c == e || c == E || c == p || c == P }
+
+/// The longest punctuator that ahead starts with.
+function punctuator(ahead: u8[3]): Punct | null {
+	let p: Punct | null = null
+	for (const m of Punct.members) {
+		const s = m.value
+		let i = 0
+		while (i < s.length && s[i] == ahead[i]) {
+			i++
+		}
+		if (i == s.length && s.length > (p?.length ?? 0)) {
+			p = s
+		}
+	}
+	return p
+}

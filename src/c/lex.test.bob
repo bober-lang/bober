@@ -1,0 +1,118 @@
+import { CError, File, Kind, Lexer, Tok } from "./lex"
+import { Double, Float, Int, Long, Type, UInt, ULong } from "./type"
+
+/// All the tokens of f, through its "eof".
+function lex(f: File): Tok[] {
+	const l = new Lexer(f)
+	const toks = [l.next()]
+	while (toks[toks.length - 1].kind != "eof") {
+		toks.push(l.next())
+	}
+	return toks
+}
+
+function toks(src: string): Tok[] { return lex(new File("t.c", src)) }
+function kinds(src: string): Kind[] { return toks(src).map(t => t.kind) }
+function texts(src: string): string[] { return toks(src).filter(t => t.kind != "eof").map(t => t.text) }
+
+function values(src: string): ([Type, i64, f64] | null)[] {
+	return toks(src).filter(t => t.kind == "number").map(t => t.value)
+}
+
+test "punctuators take the longest match" {
+	assert texts("a<<=b>>=c...d->e++f--g##h")
+		== ["a", "<<=", "b", ">>=", "c", "...", "d", "->", "e", "++", "f", "--", "g", "##", "h"]
+	assert texts("a+++++b") == ["a", "++", "++", "+", "b"]
+	assert texts("x..y") == ["x", ".", ".", "y"]
+}
+
+test "pp-numbers" {
+	assert texts("1 0x1fULL 1.5e+3f .5 1e-x 0x1p-3 1..2 12ab")
+		== ["1", "0x1fULL", "1.5e+3f", ".5", "1e-x", "0x1p-3", "1..2", "12ab"]
+	assert kinds("1+2 1e+2 .5") == ["number", "+", "number", "number", "number", "eof"]
+}
+
+test "integers take the first type their value fits" {
+	assert values("42 0x7fffffff 0xffffffff 4294967295 10u 10UL 0x1fLL 0xffffffffffffffff 017 0b101 0")
+		== [[Int, 42, 0.0], [Int, 2147483647, 0.0], [UInt, 4294967295, 0.0], [Long, 4294967295, 0.0], [UInt, 10, 0.0],
+		[ULong, 10, 0.0], [Long, 31, 0.0], [ULong, -1, 0.0], [Int, 15, 0.0], [Int, 5, 0.0], [Int, 0, 0.0]]
+}
+
+test "floats" {
+	assert values("1.5 1.5f 1e20 0x1p-3 .5L 0.1f 0x.8p1 0x1.8p+1f 1. 1.e2")
+		== [[Double, 0, 1.5], [Float, 0, 1.5], [Double, 0, 1e20], [Double, 0, 0.125], [Double, 0, 0.5], [Float, 0, 0.1],
+		[Double, 0, 1.0], [Float, 0, 3.0], [Double, 0, 1.0], [Double, 0, 100.0]]
+}
+
+test "a pp-number need not be a constant" {
+	assert values("12ab 1..2 1e-x 0x 0b 0xUL 0x.p0 0xp1") == [null, null, null, null, null, null, null, null]
+}
+
+test "chars and strings with prefixes" {
+	assert kinds("'a' '\\'' \"s\\\"t\" L'x' u8\"y\" U\"z\" Lx u8")
+		== ["char", "char", "string", "char", "string", "string", "ident", "ident", "eof"]
+	assert texts("u8\"a\" L'b'") == ["u8\"a\"", "L'b'"]
+}
+
+test "unclosed quotes are other" {
+	assert kinds("don't\nx") == ["ident", "other", "ident", "ident", "eof"]
+	assert texts("L'ab\nu8\"c") == ["L", "'", "ab", "u8", "\"", "c"]
+}
+
+test "comments and newlines are space, and bol marks line starts" {
+	const ts = toks("a/* x */b // c\n  #d\ne\nf//g")
+	assert ts.map(t => t.text) == ["a", "b", "#", "d", "e", "f", ""]
+	assert ts.map(t => t.space) == [false, true, true, false, true, true, true]
+	assert ts.map(t => t.bol) == [true, false, true, false, true, true, true]
+}
+
+test "splices drop backslash-newlines and CRs before newlines" {
+	const f = new File("t.c", "#define A \\\n  1\nB\r\nC")
+	assert f.src == "#define A   1\nB\nC"
+	const ts = lex(f)
+	assert ts.map(t => t.text) == ["#", "define", "A", "1", "B", "C", ""]
+	assert ts.map(t => t.bol) == [true, false, false, false, true, true, true]
+	assert new File("t.c", "a\\\nb\\\n").src == "ab"
+}
+
+/// Each token of src as text@line:col.
+function locs(src: string): string[] {
+	const f = new File("t.c", src)
+	return lex(f).map(t => {
+		const [line, col] = f.lineCol(t.pos)
+		return `${t.text}@${line}:${col}`
+	})
+}
+
+test "locations are of the original source" {
+	assert locs("\n\n  a\n") == ["a@3:3", "@4:1"]
+	assert locs("/* x\n y */ z") == ["z@2:7", "@2:8"]
+	assert locs("a\r\n bc\r\n  d\r\n") == ["a@1:1", "bc@2:2", "d@3:3", "@4:1"]
+	assert locs("x \\\r\n y\r\nz") == ["x@1:1", "y@2:2", "z@3:1", "@3:2"]
+	assert locs("a \\\n\\\n\\\n b") == ["a@1:1", "b@4:2", "@4:3"]
+}
+
+test "a token spliced across lines is where it starts" {
+	assert locs("ab\\\ncd e") == ["abcd@1:1", "e@2:4", "@2:5"]
+	assert locs("\"ab\\\ncd\" e") == ["\"abcd\"@1:1", "e@2:5", "@2:6"]
+	assert locs("a // c\\\n b\nc") == ["a@1:1", "c@3:1", "@3:2"]
+}
+
+test "stray characters are other" {
+	assert kinds("@ ` \\") == ["other", "other", "other", "eof"]
+}
+
+/// The error lexing src makes, with where it is.
+function error(src: string): string {
+	try {
+		toks(src)
+	} catch (e: CError) {
+		return e.where()
+	}
+	return ""
+}
+
+test "unterminated comment" {
+	assert error("a /* b") == "t.c:1:3: unterminated comment"
+	assert error("a \\\r\n /* b") == "t.c:2:2: unterminated comment"
+}

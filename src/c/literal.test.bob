@@ -1,0 +1,28 @@
+import { character, strings } from "./literal"
+
+test "characters are signed chars" {
+	assert character("'a'")[1] == 97
+	assert character("'\\n'")[1] == 10
+	assert character("'\\377'")[1] == -1
+	assert character("'\\x41'")[1] == 65
+	assert character("L'\\u00e9'")[1] == 233
+	assert character("'ab'")[1] == 0x6162
+	assert character("'\\''")[1] == 39
+}
+
+test "strings decode escapes and encode by prefix" {
+	assert strings(["\"a\\tb\\\"\""])[1] == "a\tb\"\0"
+	assert strings(["\"\\377\\xff\""])[1] == "\xff\xff\0"
+	assert strings(["u8\"\\u00e9\""])[1] == "\xc3\xa9\0"
+	assert strings(["u\"\xf0\x9f\x98\x80\""])[1] == "\x3d\xd8\x00\xde\0\0"
+	assert strings(["L\"\xc3\xa9\""])[0].size == 4
+}
+
+test "concatenated strings take the prefix of any piece" {
+	assert strings(["\"a\"", "\"b\"", "U\"c\""])[1] == "a\0\0\0b\0\0\0c\0\0\0\0\0\0\0"
+	assert strings(["L\"a\"", "\"b\"", "\"c\""])[1] == "a\0\0\0b\0\0\0c\0\0\0\0\0\0\0"
+	assert strings(["\"a\"", "\"b\"", "u8\"c\""])[1] == "abc\0"
+	assert strings(["\"\\x4\"", "\"1\""])[1] == "\x041\0"
+	assert strings(["\"\\xff\"", "\"\\u00e9\"", "U\"\""])[1] == "\xff\0\0\0\xe9\0\0\0\0\0\0\0"
+	assert strings(["\"\xc3\xa9\"", "\"x\"", "u\"\""])[1] == "\xe9\0x\0\0\0"
+}

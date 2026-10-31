@@ -1,0 +1,288 @@
+import { HashMap } from "../../std/collections/hashmap"
+import { alignUp, max } from "../../std/math"
+
+/// A C type, at the widths bober fixes for it, told apart by its class and kind.
+export type Type = Scalar | Ptr | Arr | Fn | Record
+
+/// Why a struct or union cannot be laid out.
+export class LayoutError {
+	msg: string
+
+	constructor(msg: string) { this.msg = msg }
+}
+
+export class Scalar {
+	kind: "void" | "bool" | "int" | "float"
+	size: i32
+	align: i32
+	/// True for an unsigned int; false only for signed char, which differs from char; else null.
+	unsigned: bool | null
+	volatile = false
+
+	constructor(kind: "void" | "bool" | "int" | "float", size: i32, unsigned: bool | null = null) {
+		this.kind = kind
+		this.size = size
+		this.align = size
+		this.unsigned = unsigned
+	}
+}
+
+export class Ptr {
+	kind: "ptr" = "ptr"
+	size = 8
+	align = 8
+	base: Type
+	volatile = false
+
+	constructor(base: Type) {
+		this.base = base
+	}
+}
+
+/// An array is volatile-qualified through its elements.
+export class Arr {
+	kind: "array" = "array"
+	size: i32
+	align: i32
+	base: Type
+	/// null while unknown.
+	len: i32 | null
+
+	constructor(base: Type, len: i32 | null) {
+		this.size = base.size * (len ?? 0)
+		this.align = base.align
+		this.base = base
+		this.len = len
+	}
+}
+
+export class Fn {
+	kind: "func" = "func"
+	size = 1
+	align = 1
+	result: Type
+	/// The parameters' types and names, "" where left out.
+	params: [Type, string][] = []
+	variadic = false
+	/// False where declared without a prototype, as in int f().
+	prototyped = true
+
+	constructor(result: Type) {
+		this.result = result
+	}
+}
+
+export class Record {
+	kind: "struct" | "union"
+	size = 0
+	align = 1
+	/// The members, null while incomplete.
+	fields: Field[] | null = null
+	/// The members by name, those of anonymous members included at their offset from this record's start.
+	names = new HashMap[string, Field]()
+	volatile = false
+	/// Its volatile-qualified self, made once, so that completing the one completes the other.
+	qualified: Record | null = null
+
+	constructor(kind: "struct" | "union") {
+		this.kind = kind
+	}
+}
+
+/// A struct or union member at byte offset off. A bitfield has a width of at least 0: its value is the
+/// width bits from bit shift of the ty-sized unit at off.
+export class Field {
+	name: string
+	ty: Type
+	align: i32
+	off = 0
+	width = -1
+	shift = 0
+
+	constructor(name: string, ty: Type) {
+		this.name = name
+		this.ty = ty
+		this.align = ty.align
+	}
+}
+
+export const Void = new Scalar("void", 0)
+export const Bool = new Scalar("bool", 1)
+export const Char = new Scalar("int", 1)
+export const SChar = new Scalar("int", 1, false)
+export const UChar = new Scalar("int", 1, true)
+export const Short = new Scalar("int", 2)
+export const UShort = new Scalar("int", 2, true)
+export const Int = new Scalar("int", 4)
+export const UInt = new Scalar("int", 4, true)
+export const Long = new Scalar("int", 8)
+export const ULong = new Scalar("int", 8, true)
+export const Int128 = new Scalar("int", 16)
+export const UInt128 = new Scalar("int", 16, true)
+export const Float = new Scalar("float", 4)
+export const Double = new Scalar("float", 8)
+
+export function isInt(t: Type): bool { return t.kind == "int" || t.kind == "bool" }
+export function isArith(t: Type): bool { return isInt(t) || t.kind == "float" }
+/// Whether t is _Bool or an unsigned int.
+export function isUnsigned(t: Type): bool { return t.kind == "bool" || t instanceof Scalar && t.unsigned == true }
+export function isVolatile(t: Type): bool { return !(t instanceof Arr || t instanceof Fn) && t.volatile }
+
+/// The type a pointer of type t points to.
+export function pointee(t: Type): Type { return (t as Ptr).base }
+
+/// The function type t calls: t itself, or what it points to; null if t calls none.
+export function callee(t: Type): Fn | null {
+	const f = if (t instanceof Ptr) t.base else t
+	return if (f instanceof Fn) f else null
+}
+
+/// t volatile-qualified, an array's elements in its stead. A function stays unqualified.
+export function volatile(t: Type): Type {
+	if (t instanceof Arr) {
+		return new Arr(volatile(t.base), t.len)
+	}
+	if (t instanceof Fn || t.volatile) {
+		return t
+	}
+	if (t instanceof Record) {
+		t.qualified ??= { ...t, volatile: true }
+		return t.qualified!
+	}
+	if (t instanceof Ptr) {
+		return { ...t, volatile: true }
+	}
+	return { ...t, volatile: true }
+}
+
+/// An array's or function's type as a value: a pointer to the element or the function (C11 6.3.2.1).
+export function decay(t: Type): Type {
+	return if (t instanceof Arr) new Ptr(t.base) else if (t instanceof Fn) new Ptr(t) else t
+}
+
+/// n cut to t's width and extended by its signedness.
+export function wrap(n: i64, t: Type): i64 {
+	if (t.kind == "bool") {
+		return if (n != 0) 1 else 0
+	}
+	if (t.kind != "int" || t.size >= 8) {
+		return n
+	}
+	const bits: i64 = t.size * 8
+	return if (isUnsigned(t)) n & (1 << bits) - 1 else n << 64 - bits >> 64 - bits
+}
+
+/// Whether a and b are compatible (C11 6.2.7), qualifiers aside.
+export function isCompatible(a: Type, b: Type): bool {
+	if (a == b) {
+		return true
+	}
+	if (a instanceof Scalar && b instanceof Scalar) {
+		return a.kind == b.kind && a.size == b.size && a.unsigned == b.unsigned
+	}
+	if (a instanceof Record && b instanceof Record) {
+		return a.kind == b.kind && a.fields != null && a.fields == b.fields
+	}
+	if (a instanceof Ptr && b instanceof Ptr) {
+		return isCompatible(a.base, b.base)
+	}
+	if (a instanceof Arr && b instanceof Arr) {
+		return (a.len == null || b.len == null || a.len == b.len) && isCompatible(a.base, b.base)
+	}
+	if (a instanceof Fn && b instanceof Fn) {
+		if (a.prototyped && b.prototyped) {
+			if (a.variadic != b.variadic || a.params.length != b.params.length) {
+				return false
+			}
+			for (const i of 0 ... a.params.length - 1) {
+				if (!isCompatible(a.params[i][0], b.params[i][0])) {
+					return false
+				}
+			}
+		}
+		return isCompatible(a.result, b.result)
+	}
+	return false
+}
+
+/// The integer promotion (C11 6.3.1.1).
+export function promote(t: Type): Type { return if (isInt(t) && t.size < 4) Int else t }
+
+/// The type of an arithmetic operation's operands after the usual conversions (C11 6.3.1.8).
+export function common(a: Type, b: Type): Type {
+	if (a.kind == "float" || b.kind == "float") {
+		return if (b.kind != "float" || a.kind == "float" && a.size >= b.size) a else b
+	}
+	const x = promote(a)
+	const y = promote(b)
+	if (x.size != y.size) {
+		return if (x.size > y.size) x else y
+	}
+	return if (isUnsigned(x)) x else y
+}
+
+/// Completes r with fields laid out in order, each aligned to at most pack if that is not 0, as #pragma pack
+/// and packed, which is pack 1, ask, and the whole to at least atLeast. An unnamed bitfield adds nothing to
+/// the alignment.
+export function layout(r: Record, fields: Field[], pack: i32, atLeast = 0) {
+	const packed = pack == 1
+	let bits = 0
+	let align = max(atLeast, 1)
+	for (const f of fields) {
+		const a = if (pack > 0 && f.align > pack) pack else f.align
+		if (r.kind == "union") {
+			bits = max(bits, if (f.width < 0) f.ty.size * 8 else f.width)
+		} else if (f.width < 0) {
+			bits = alignUp(bits, a * 8)
+			f.off = bits / 8
+			bits += f.ty.size * 8
+		} else {
+			const unit = f.ty.size * 8
+			const straddles = bits / unit != (bits + f.width - 1) / unit
+			if (packed && straddles && f.width > 0) {
+				throw new LayoutError("packed bitfield across its unit")
+			}
+			if (f.width == 0 || straddles) {
+				bits = alignUp(bits, unit)
+			}
+			f.off = bits / unit * f.ty.size
+			f.shift = bits - f.off * 8
+			bits += f.width
+		}
+		if (f.name != "" || f.width < 0) {
+			align = max(align, a)
+		}
+	}
+	r.fields = fields
+	r.align = align
+	r.size = alignUp((bits + 7) / 8, align)
+	index(r.names, fields, 0)
+	const q = r.qualified
+	if (q != null) {
+		q.fields = fields
+		q.align = align
+		q.size = r.size
+	}
+}
+
+/// Adds fields at off to names, looking through anonymous members.
+function index(names: HashMap[string, Field], fields: Field[], off: i32): void {
+	for (const f of fields) {
+		if (f.name == "") {
+			if (f.ty instanceof Record) {
+				index(names, f.ty.fields ?? [], off + f.off)
+			}
+		} else if (names.has(f.name)) {
+			throw new LayoutError(`duplicate member ${f.name}`)
+		} else {
+			const moved: Field = { ...f, off: off + f.off }
+			names.set(f.name, if (off == 0) f else moved)
+		}
+	}
+}
+
+/// The member name of t if it is a struct or union, looked up through anonymous members, with its offset
+/// from t's start.
+export function member(t: Type, name: string): Field | null {
+	return if (t instanceof Record) t.names.get(name) else null
+}

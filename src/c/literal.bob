@@ -1,0 +1,264 @@
+//! The values of C's constants (C11 6.4.4) and the bytes of its string literals (6.4.5).
+
+import { apostrophe, backslash, digit, dot, isDigit, plus, quote, toLower, zero } from "../../std/ascii"
+import * as ascii from "../../std/ascii"
+import { compose, parseFloat } from "../../std/float"
+import { max, min } from "../../std/math"
+import { ParseError, parseInt, scanInt } from "../../std/parse"
+import { codePoint, indexOf, utf8 } from "../../std/string"
+import { Char, Double, Float, Int, Long, Type, UInt, ULong, UShort, isUnsigned, wrap } from "./type"
+
+/// The type and value of a pp-number, or null if it is no constant: an integer, n, typed by its suffix
+/// and magnitude, or a float, x.
+export function number(s: string): [Type, i64, f64] | null {
+	const radix = radixOf(s)
+	const start = if (radix == 16 || radix == 2) 2 else 0
+	// 0x and 0b need a digit, which in a hex float may follow the dot: 0x.8p1 is one, 0x.p0 is none.
+	const first = if (radix == 16 && s.at(start) == dot) start + 1 else start
+	if (start > 0 && !isDigitIn(s.at(first) ?? 0, radix)) {
+		return null
+	}
+	if (isFloating(s, radix)) {
+		return floating(s, radix)
+	}
+	try {
+		const [n, end] = scanInt[u64](s, start, radix)
+		const t = integerType(s.slice(end, s.length), n, radix)
+		return if (t == null) null else [t, n as i64, 0.0]
+	} catch (e: ParseError) {
+		return null // No digits, or too many for 64 bits.
+	}
+}
+
+/// A constant's radix by its prefix: 0x, 0b, or a leading 0 for octal; else 10.
+function radixOf(s: string): i32 {
+	if (s.length < 2 || s[0] != zero) {
+		return 10
+	}
+	return switch (toLower(s[1])) {
+		case ascii.x: 16
+		case ascii.b: 2
+		default: 8
+	}
+}
+
+/// Whether s has a floating constant's dot or exponent, which is p in hex, where e is a digit.
+function isFloating(s: string, radix: i32): bool {
+	const exponent = if (radix == 16) ascii.p else ascii.e
+	for (const ch of s) {
+		if (ch == dot || toLower(ch) == exponent) {
+			return true
+		}
+	}
+	return false
+}
+
+/// A floating constant, double unless suffixed f, for float, or l, for long double, which is double;
+/// null if more follows it, as in 1..2.
+function floating(s: string, radix: i32): [Type, i64, f64] | null {
+	const last = toLower(s[s.length - 1])
+	const body = if (last == ascii.f || last == ascii.l) s.slice(0, s.length - 1) else s
+	try {
+		const x = if (radix == 16) hexFloat(body) else parseFloat(decimal(body))
+		return [if (last == ascii.f) Float else Double, 0, x]
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+/// A decimal float as parseFloat takes it, which wants a digit on both sides of the dot: .5 is 00.5, 1. is 01.0.
+function decimal(s: string): string {
+	const i = indexOf(s, ".")
+	return "0" + (if (i < 0 || isDigit(s.at(i + 1) ?? 0)) s else s.slice(0, i + 1) + "0" + s.slice(i + 1, s.length))
+}
+
+/// A hex float: after 0x, at most 16 hex digits, perhaps with a dot, then p and a decimal exponent of 2.
+function hexFloat(s: string): f64 throws ParseError {
+	const p = max(indexOf(s, "p"), indexOf(s, "P"))
+	if (p < 0) {
+		throw new ParseError("syntax", s.length)
+	}
+	const dot = indexOf(s, ".")
+	const frac = if (dot < 0) 0 else p - dot - 1
+	const mant = parseInt[u64](s.slice(2, if (dot < 0) p else dot) + s.slice(p - frac, p), 16)
+	const exp = parseInt[i32](s.slice(if (s.at(p + 1) == plus) p + 2 else p + 1, s.length))
+	return compose(mant, exp - 4 * frac)
+}
+
+/// The type of the integer n with suffix (C11 6.4.4.1): the first it fits of int, long and, unless it
+/// is decimal, their unsigned kinds; u restricts to the unsigned ones, l to the long ones. The last
+/// candidate if none fits, and null for any other suffix.
+function integerType(suffix: string, n: u64, radix: i32): Type | null {
+	let us = 0
+	let ls = 0
+	for (const ch of suffix) {
+		if (toLower(ch) == ascii.u) {
+			us++
+		} else if (toLower(ch) == ascii.l) {
+			ls++
+		} else {
+			return null
+		}
+	}
+	if (us > 1 || ls > 2) {
+		return null
+	}
+	const candidates: Type[] = if (us == 1) [UInt, ULong]
+		else if (radix == 10) [Int, Long]
+		else [Int, UInt, Long, ULong]
+	for (const t of candidates) {
+		if ((ls == 0 || t.size == 8) && fitsIn(n, t)) {
+			return t
+		}
+	}
+	return candidates[candidates.length - 1]
+}
+
+/// Whether n is at most the greatest value of the integer type t.
+function fitsIn(n: u64, t: Type): bool {
+	const bits = (t.size * 8 - (if (isUnsigned(t)) 0 else 1)) as u64
+	return bits >= 64 || n >> bits == 0
+}
+
+/// The digits in radix from i in s, at most count of them: their value, and where they end; 0 and i
+/// if there are none or too many for 64 bits.
+function digits(s: string, i: i32, radix: i32, count: i32): [i64, i32] {
+	try {
+		const [n, len] = scanInt[u64](s.slice(i, min(i + count, s.length)), 0, radix)
+		return [n as i64, i + len]
+	} catch (e: ParseError) {
+		return [0, i]
+	}
+}
+
+/// Whether ch is a digit in radix.
+function isDigitIn(ch: u8, radix: i32): bool { return (digit(ch) ?? radix) < radix }
+
+/// A character constant's type and value: an int of its char, which is signed, or of its bytes in order
+/// if there are several; with a prefix, the first code point as the prefix's type.
+export function character(text: string): [Type, i64] {
+	const [prefix, body] = parts(text, apostrophe)
+	const units = decode(body, prefix != "")
+	if (prefix != "") {
+		const t = element(prefix)
+		return [t, wrap(units[0], t)]
+	}
+	if (units.length == 1) {
+		return [Int, wrap(units[0], Char)]
+	}
+	let n: i64 = 0
+	for (const b of units) {
+		n = n << 8 | b
+	}
+	return [Int, wrap(n, Int)]
+}
+
+/// Adjacent string literals as one (C11 6.4.5): the type of its elements, and its bytes as they are in
+/// memory, NUL included. A prefix on any of them makes all wide; u8 is not wide.
+export function strings(texts: string[]): [Type, string] {
+	let prefix = ""
+	for (const t of texts) {
+		const head = parts(t, quote)[0]
+		if (head != "" && head != "u8") {
+			prefix = head
+		}
+	}
+	const t = element(prefix)
+	let out = ""
+	for (const text of texts) {
+		for (const n of decode(parts(text, quote)[1], t.size > 1)) {
+			if (t.size == 2 && n > 0xffff) {
+				// Past the BMP, UTF-16 takes a surrogate pair.
+				const m = n - 0x10000
+				out += encode(0xd800 | m >> 10, 2) + encode(0xdc00 | m & 0x3ff, 2)
+			} else {
+				out += encode(n, t.size)
+			}
+		}
+	}
+	return [t, out + encode(0, t.size)]
+}
+
+/// The element type of a literal with prefix: "", u8, L, u or U.
+function element(prefix: string): Type {
+	return switch (prefix) {
+		case "L": Int
+		case "u": UShort
+		case "U": UInt
+		default: Char
+	}
+}
+
+/// The low size bytes of n, least significant first.
+function encode(n: i64, size: i32): string {
+	let out = ""
+	for (const i of 0 ... size - 1) {
+		out += chr((n >> i * 8 & 0xff) as u8)
+	}
+	return out
+}
+
+/// A quoted literal's prefix and body.
+function parts(text: string, q: u8): [string, string] {
+	const i = indexOf(text, chr(q))
+	return [text.slice(0, i), text.slice(i + 1, text.length - 1)]
+}
+
+/// The code units of a literal's body: bytes, with \u and \U in UTF-8; or if wide, code points, with
+/// \x and octal escapes as units of their own.
+function decode(s: string, wide: bool): i64[] {
+	const out: i64[] = []
+	let i = 0
+	while (i < s.length) {
+		if (s[i] == backslash) {
+			const [n, universal, end] = escape(s, i + 1)
+			if (universal && !wide) {
+				for (const b of utf8(n)) {
+					out.push(b)
+				}
+			} else {
+				out.push(if (wide) n else n & 0xff)
+			}
+			i = end
+		} else if (wide && s[i] >= 0x80) {
+			const [cp, end] = codePoint(s, i)
+			out.push(cp)
+			i = end
+		} else {
+			out.push(s[i])
+			i++
+		}
+	}
+	return out
+}
+
+/// The escape sequence after the backslash at i (C11 6.4.4.4): its value, whether it is a universal
+/// character name, whose value is a code point, and where it ends.
+function escape(s: string, i: i32): [i64, bool, i32] {
+	const esc = s.at(i) ?? 0
+	if (esc == ascii.x) {
+		const [n, end] = digits(s, i + 1, 16, s.length)
+		return [n, false, end]
+	}
+	if (esc == ascii.u || esc == ascii.U) {
+		const [n, end] = digits(s, i + 1, 16, if (esc == ascii.u) 4 else 8)
+		return [n, true, end]
+	}
+	if (isDigitIn(esc, 8)) {
+		const [n, end] = digits(s, i, 8, 3)
+		return [n, false, end]
+	}
+	const n: i64 = switch (esc) {
+		case ascii.n: 10
+		case ascii.t: 9
+		case ascii.r: 13
+		case ascii.a: 7
+		case ascii.b: 8
+		case ascii.f: 12
+		case ascii.v: 11
+		case ascii.e, ascii.E: 27
+		default: esc
+	}
+	return [n, false, i + 1]
+}
+

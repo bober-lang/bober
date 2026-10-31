@@ -1,0 +1,274 @@
+import { CError } from "./lex"
+import { Preprocessor, render } from "./pp"
+import { HashMap } from "../../std/collections/hashmap"
+
+/// A file the preprocessor of a test can read.
+type Header = { path: string, content: string }
+
+/// A preprocessor of t.c holding src, which finds no files but t.c and headers.
+function open(src: string, headers: Header[]): Preprocessor {
+	const fs = new HashMap[string, string]()
+	fs.set("t.c", src)
+	for (const h of headers) {
+		fs.set(h.path, h.content)
+	}
+	return new Preprocessor("t.c", ["q"], ["s1", "s2"], p => fs.get(p))
+}
+
+/// The token texts of t.c, without its "eof".
+function pp(src: string, ...headers: Header[]): string[] {
+	const p = open(src, headers)
+	const texts: string[] = []
+	let t = p.next()
+	while (t.kind != "eof") {
+		texts.push(t.text)
+		t = p.next()
+	}
+	return texts
+}
+
+function error(src: string): string {
+	try {
+		pp(src)
+	} catch (e: CError) {
+		return e.where()
+	}
+	return ""
+}
+
+test "C11 6.10.3.5 example 3" {
+	const src = `#define x 3
+#define f(a) f(x * (a))
+#undef x
+#define x 2
+#define g f
+#define z z[0]
+#define h g(~
+#define m(a) a(w)
+#define w 0,1
+#define t(a) a
+#define p() int
+#define q(x) x
+#define r(x,y) x ## y
+#define str(x) # x
+f(y+1) + f(f(z)) % t(t(g)(0) + t)(1);
+g(x+(3,4)-w) | h 5) & m
+	(f)^m(m);
+p() i[q()] = { q(1), r(2,3), r(4,), r(,5), r(,) };
+char c[2][6] = { str(hello), str() };`
+	assert pp(src).join(" ")
+		== "f ( 2 * ( y + 1 ) ) + f ( 2 * ( f ( 2 * ( z [ 0 ] ) ) ) ) % f ( 2 * ( 0 ) ) + t ( 1 ) ; "
+		+ "f ( 2 * ( 2 + ( 3 , 4 ) - 0 , 1 ) ) | f ( 2 * ( ~ 5 ) ) & f ( 2 * ( 0 , 1 ) ) ^ m ( 0 , 1 ) ; "
+		+ "int i [ ] = { 1 , 23 , 4 , 5 , } ; char c [ 2 ] [ 6 ] = { \"hello\" , \"\" } ;"
+}
+
+test "C11 6.10.3.5 example 4" {
+	const src = `#define str(s) # s
+#define xstr(s) str(s)
+#define debug(s, t) printf("x" # s "= %d, x" # t "= %s", \\
+	x ## s, x ## t)
+#define INCFILE(n) vers ## n
+#define glue(a, b) a ## b
+#define xglue(a, b) glue(a, b)
+#define HIGHLOW "hello"
+#define LOW LOW ", world"
+debug(1, 2);
+fputs(str(strncmp("abc\\0d", "abc", '\\4') // this goes away
+	== 0) str(: @\\n), s);
+#include xstr(INCFILE(2).h)
+glue(HIGH, LOW);
+xglue(HIGH, LOW)`
+	assert pp(src, { path: "vers2.h", content: "v2" }).join(" ")
+		== `printf ( "x" "1" "= %d, x" "2" "= %s" , x1 , x2 ) ; `
+		+ `fputs ( "strncmp(\\"abc\\\\0d\\", \\"abc\\", '\\\\4') == 0" ": @\\n" , s ) ; v2 "hello" ; "hello" ", world"`
+}
+
+test "C11 6.10.3.5 examples 5 and 7, placemarkers and variadics" {
+	assert pp("#define t(x,y,z) x ## y ## z\n{ t(1,2,3), t(,4,5), t(6,,7), t(8,9,), t(10,,), t(,11,), t(,,12), t(,,) }").join(" ")
+		== "{ 123 , 45 , 67 , 89 , 10 , 11 , 12 , }"
+	const src = `#define debug(...) fprintf(stderr, __VA_ARGS__)
+#define showlist(...) puts(#__VA_ARGS__)
+#define report(test, ...) ((test)?puts(#test): printf(__VA_ARGS__))
+debug("Flag");
+showlist(The first, second, and third items.);
+report(x>y, "x is %d but y is %d", x, y);`
+	assert pp(src).join(" ")
+		== `fprintf ( stderr , "Flag" ) ; puts ( "The first, second, and third items." ) ; `
+		+ `( ( x > y ) ? puts ( "x>y" ) : printf ( "x is %d but y is %d" , x , y ) ) ;`
+}
+
+test "pasting # and ## makes plain tokens" {
+	const src = `#define hash_hash # ## #
+#define mkstr(a) # a
+#define in_between(a) mkstr(a)
+#define join(c, d) in_between(c hash_hash d)
+join(x, y)`
+	assert pp(src) == ["\"x ## y\""]
+	assert error("#define cat(a, b) a ## b\ncat(+, /)") == "t.c:2:5: '+/' is not a preprocessing token"
+}
+
+test "a macro does not expand inside itself" {
+	assert pp("#define foo foo + 1\n#define a b\n#define b a\nfoo a b") == ["foo", "+", "1", "a", "b"]
+	assert pp("#define f(x) x f\nf(f)(1)") == ["f", "f", "(", "1", ")"]
+	assert pp("#define f(x) g(x\n#define g(x) x\nf(f)(1))") == ["f", "(", "1", ")"]
+}
+
+test "a function-like macro without ( is its name" {
+	assert pp("#define f(x) [x]\nf + f\n(1) f") == ["f", "+", "[", "1", "]", "f"]
+	assert pp("#define f(x) [x]\n#define g f\ng(2)") == ["[", "2", "]"]
+}
+
+test "arguments" {
+	assert pp("#define f(x, y) x|y\nf((a, b), [c])") == ["(", "a", ",", "b", ")", "|", "[", "c", "]"]
+	assert pp("#define f() x\n#define g(a) [a]\nf() g() g( )") == ["x", "[", "]", "[", "]"]
+	assert pp("#define s(x) #x\ns(  a   +\n  b  ) s(\"\\n\" '\"')") == ["\"a + b\"", "\"\\\"\\\\n\\\" '\\\"'\""]
+	assert pp("#define s(x) #x\n#define t(x) s(a. x)\nt(b)") == ["\"a. b\""]
+	assert error("#define f(x, y) x\nf(1)") == "t.c:2:1: macro f takes 2 arguments, not 1"
+	assert error("#define f(x) x\nf(1") == "t.c:2:1: unterminated call to macro f"
+}
+
+test "variadic extensions" {
+	assert pp("#define e(fmt, ...) p(fmt, ## __VA_ARGS__)\ne(a) e(a, b, c)")
+		== ["p", "(", "a", ")", "p", "(", "a", ",", "b", ",", "c", ")"]
+	assert pp("#define e(fmt, args...) p(fmt, args)\ne(a, b, c)") == ["p", "(", "a", ",", "b", ",", "c", ")"]
+	assert pp("#define o(a, ...) f(a __VA_OPT__(,) __VA_ARGS__)\n#define E\no(1) o(1, E) o(1, 2)")
+		== ["f", "(", "1", ")", "f", "(", "1", ")", "f", "(", "1", ",", "2", ")"]
+}
+
+test "conditionals" {
+	const src = `#define A 2
+#if A == 1
+one
+#elif A == 2
+two
+# if 0
+#garbage don't
+# else
+nested
+# endif
+#elif 1/0
+#else
+else
+#endif
+#ifdef A
+defined
+#endif
+#ifndef A
+#error unreachable
+#endif`
+	assert pp(src) == ["two", "nested", "defined"]
+	assert pp("#if defined A || defined(B) || !defined C\nyes\n#endif") == ["yes"]
+	assert pp("#define D defined(X)\n#if D\nno\n#else\nyes\n#endif") == ["yes"]
+}
+
+test "#if arithmetic is intmax_t, or uintmax_t if either side is unsigned" {
+	const cases = ["-1 < 0", "-1 > 0u", "0xFFFFFFFFFFFFFFFF == -1", "18446744073709551615 > 0", "(1 ? -1 : 0u) > 0",
+		"0xffffffff > -1", "!(u'\\xff' > -1)", "L'a' > -1", "-1 >> 63 == -1", "-1u >> 63 == 1", "'a' == 97",
+		"'\\377' < 0", "'\\n' == 10", "'\\x41' == 65", "'ab' == 24930", "'\\377\\377\\377\\377' == -1", "0b101 == 5",
+		"!(0 && 1 / 0)", "1 || 1 % 0", "(2 || 3) == 1", "1 ? 2 : 1 / 0", "undefined_name == 0", "07 + 010 == 15",
+		"3 * 4 - 10 / 3 % 2 << 1 == 22", "(1 | 2 ^ 3 & 1) == 3", "~0 == -1", "!0 == 1", "__STDC_VERSION__ >= 201112L"]
+	for (const c of cases) {
+		test `${c}` {
+			assert pp(`#if ${c}\nyes\n#else\nno\n#endif`) == ["yes"]
+		}
+	}
+	assert error("#if 1 / 0\n#endif") == "t.c:1:7: division by zero in #if expression"
+	assert error("#if 1.0\n#endif") == "t.c:1:5: invalid integer constant 1.0 in #if expression"
+}
+
+test "directive errors" {
+	assert error("#if 1\nx") == "t.c:2:2: unterminated conditional directive"
+	assert error("#endif") == "t.c:1:2: #endif without #if"
+	assert error("#if 1\n#else\n#elif 1\n#endif") == "t.c:3:2: #elif after #else"
+	assert error("#error stop  here\n") == "t.c:1:2: #error stop  here"
+	assert error("#define f(x) #y\n") == "t.c:1:14: # is not followed by a macro parameter"
+	assert error("#include <none.h>\n") == "t.c:1:2: 'none.h' file not found"
+	assert error("#include \"\"\n") == "t.c:1:2: expected \"FILENAME\" or <FILENAME>"
+	assert error("#if\n#endif") == "t.c:1:2: #if expression expected"
+	assert error("#frob\n") == "t.c:1:2: invalid directive #frob"
+}
+
+test "includes search the includer's directory, then quote dirs, then angled dirs" {
+	assert pp("#include \"a.h\"\n#include <a.h>\n#include \"b.h\"", { path: "q/a.h", content: "qa" },
+		{ path: "s1/a.h", content: "s1a" }, { path: "s2/b.h", content: "s2b" }) == ["qa", "s1a", "s2b"]
+	assert pp("#include <d/x.h>", { path: "s1/d/x.h", content: "#include \"y.h\"" },
+		{ path: "s1/d/y.h", content: "dy" }, { path: "q/y.h", content: "qy" }) == ["dy"]
+	assert pp("#define H <a.h>\n#include H\n#if __has_include(\"a.h\") && !__has_include(<none.h>)\nyes\n#endif",
+		{ path: "s2/a.h", content: "a" }) == ["a", "yes"]
+}
+
+test "#include_next continues the search after the includer's directory" {
+	assert pp("#include <a.h>", { path: "s1/a.h", content: "s1\n#include_next <a.h>" },
+		{ path: "s2/a.h", content: "s2" }) == ["s1", "s2"]
+	assert pp("#include <a.h>", { path: "s1/a.h", content: "__has_include_next(<a.h>)" }) == ["0"]
+}
+
+test "#pragma once and include guards" {
+	const fs = new HashMap[string, string]()
+	fs.set("t.c",
+		"#include \"o.h\"\n#include \"./d/../o.h\"\n#include \"g.h\"\n#include \"g.h\"\n#undef G\n#include \"g.h\"")
+	fs.set("o.h", "#pragma once\no")
+	fs.set("g.h", "#ifndef G\n#define G\ng\n#endif")
+	const reads = new HashMap[string, i32]()
+	const p = new Preprocessor("t.c", [], [], (path: string) => {
+		reads.set(path, (reads.get(path) ?? 0) + 1)
+		return fs.get(path)
+	})
+	assert render(p) == "o\ng\ng\n"
+	assert reads.get("o.h") == 1 && reads.get("g.h") == 1
+}
+
+test "#pragma push_macro and pop_macro save and restore a definition, or its absence" {
+	const src = `#define m 1
+#pragma push_macro("m")
+#undef m
+#define m 2
+#pragma push_macro("m")
+#define m 3
+m
+#pragma pop_macro("m")
+m
+#pragma pop_macro("m")
+m
+#pragma push_macro("n")
+#define n 4
+#pragma pop_macro("n")
+n`
+	assert pp(src) == ["3", "2", "1", "n"]
+}
+
+test "__FILE__, __LINE__, #line and __COUNTER__" {
+	assert pp("#include <d/a.h>\n__FILE__ __LINE__", { path: "s1/d/a.h", content: "__FILE__ __FILE_NAME__ __LINE__\n" })
+		== ["\"s1/d/a.h\"", "\"a.h\"", "1", "\"t.c\"", "2"]
+	assert pp("#define L __LINE__\nL\n#line 10 \"x\\\\.c\"\nL __FILE__ __BASE_FILE__")
+		== ["2", "10", "\"x\\\\.c\"", "\"t.c\""]
+	assert pp("a \\\n__LINE__\n#define M(x) x \\\n __LINE__\nM(\\\n1) __LINE__") == ["a", "2", "1", "6", "6"]
+	assert pp("__COUNTER__ __COUNTER__") == ["0", "1"]
+}
+
+test "builtins" {
+	assert pp("_Pragma(\"once\") __has_builtin(__builtin_va_arg) __has_builtin(__builtin_none) __has_attribute(__packed__) __has_attribute(none)")
+		== ["1", "0", "1", "0"]
+	assert pp("#ifdef __has_feature\n__has_feature(modules)\n#endif") == ["0"]
+}
+
+test "define and undef" {
+	const fs = new HashMap[string, string]()
+	fs.set("t.c", "A B F(2) __GNUC__")
+	const p = new Preprocessor("t.c", [], [], (path: string) => fs.get(path))
+	p.define("A")
+	p.define("B", "b")
+	p.define("F(x)", "x x")
+	p.undef("__GNUC__")
+	assert render(p) == "1 b 2 2 __GNUC__\n"
+}
+
+test "render keeps lines and source spacing, and spaces tokens that would paste" {
+	const src = "#define P +\n#define E\nint  x=P+1;\n  y(/**/z) E;\n"
+	assert render(open(src, [])) == "int x= + +1;\ny( z) ;\n"
+}
+
+test "#pragma and _Pragma reach the parser as unexpanded lines" {
+	const src = "#define pack no\n#define P(x) _Pragma(#x)\na\n#pragma pack(4)\nb P(pack(push, 2)) c _Pragma(\"once\") d\n"
+	assert render(open(src, [])) == "a\n#pragma pack(4)\nb\n#pragma pack(push, 2)\nc\nd\n"
+}

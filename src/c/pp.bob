@@ -1,0 +1,1002 @@
+//! The C preprocessor (C11 6.10).
+
+import { CError, File, Lexer, Tok, precedence } from "./lex"
+import { character } from "./literal"
+import { contains, reversed } from "../../std/algo"
+import { HashMap } from "../../std/collections/hashmap"
+import { Set } from "../../std/collections/set"
+import { backslash, quote } from "../../std/ascii"
+import { strip } from "../../std/string"
+import { base, clean, dir, isAbs, join } from "../../std/fs/path"
+import { attributes, builtins, predefined } from "./predef"
+import { arch, os } from "../../std/os"
+import { isUnsigned } from "./type"
+
+/// The macros whose expansion Preprocessor.dynamicToken computes rather than a body gives.
+const dynamicMacros = ["__FILE__", "__FILE_NAME__", "__LINE__", "__COUNTER__", "__DATE__", "__TIME__", "__TIMESTAMP__",
+	"__BASE_FILE__", "_Pragma", "__has_include", "__has_include_next", "__has_attribute", "__has_c_attribute",
+	"__has_cpp_attribute", "__has_builtin", "__has_feature", "__has_extension", "__has_warning", "__building_module"]
+
+class Macro {
+	/// Null for an object-like macro; a variadic one's last is __VA_ARGS__ or the name before its `...`.
+	params: string[] | null = null
+	variadic = false
+	body: Tok[] = []
+	dynamic = false
+}
+
+/// A file being read.
+class Source {
+	file: File
+	lexer: Lexer
+	/// Where the last token Preprocessor.token took is.
+	last = 0
+	/// The index in Preprocessor.dirs of the directory it was found in, -1 if not by a search.
+	dir: i32
+	/// The conditionals open when it was entered.
+	depth: i32
+	/// The name and the shift of the line numbers, as #line sets them.
+	name: string
+	lineShift = 0
+
+	constructor(file: File, dir: i32, depth: i32) {
+		this.file = file
+		this.lexer = new Lexer(file)
+		this.dir = dir
+		this.depth = depth
+		this.name = file.name
+	}
+}
+
+class Cond {
+	/// Some group of it was taken.
+	taken: bool
+	inElse = false
+
+	constructor(taken: bool) {
+		this.taken = taken
+	}
+}
+
+/// Stands for an empty argument next to ## (C11 6.10.3.3) until the pasting is done.
+const placemarker: Tok = { ...new Tok(), kind: "placemarker" }
+/// Stands for a ## of a macro body until the pasting is done; a ## from an argument pastes nothing.
+const pasteOp: Tok = { ...new Tok(), kind: "##", text: "##" }
+
+export class Preprocessor {
+	private macros = new HashMap[string, Macro]()
+	/// The definitions #pragma push_macro saved, the last on top, null where the macro was undefined.
+	private pushed = new HashMap[string, (Macro | null)[]]()
+	/// The quote directories, then the angled ones.
+	private dirs: string[]
+	private quoteDirs: i32
+	private read: (path: string) => string | null
+	/// Each file read, by path.
+	private files = new HashMap[string, File]()
+	private sources: Source[] = []
+	/// Tokens to read before the current file's, last first.
+	private pending: Tok[] = []
+	private conds: Cond[] = []
+	private once = new Set()
+	private counter = 0
+	/// In an #if expression, where defined is an operator.
+	private inIf = false
+	/// The token advance took last, held in place.
+	tok: ...Tok
+	/// For __DATE__, __TIME__ and __TIMESTAMP__: ctime's "Www Mmm dd hh:mm:ss yyyy".
+	date = "Thu Jan  1 00:00:00 1970"
+
+	/// Preprocesses the file at path. "" includes search the includer's directory, then quote, then angled;
+	/// <> includes search angled only. So -iquote dirs go in quote, -I then -isystem dirs in angled.
+	constructor(path: string, quote: string[], angled: string[],
+		read: (path: string) => string | null) {
+		this.dirs = [...quote, ...angled]
+		this.quoteDirs = quote.length
+		this.read = read
+		for (const name of dynamicMacros) {
+			const m = new Macro()
+			m.dynamic = true
+			this.macros.set(name, m)
+		}
+		// Runs the predefined #defines: their only token is their eof.
+		this.sources.push(new Source(new File("<built-in>", predefined(os, arch)), -1, 0))
+		this.token()
+		this.sources.pop()
+		const main = this.file(path)
+		if (main == null) {
+			throw new CError(`cannot open ${path}`, new File(path, ""), 0)
+		}
+		this.sources.push(new Source(main, -1, 0))
+	}
+
+	/// Defines name, which may have a parameter list, as body: -D name=body.
+	define(name: string, body: string = "1") {
+		this.directiveLine("<command line>", `#define ${name} ${body}`)
+	}
+
+	undef(name: string) { this.macros.delete(name) }
+
+	/// The tokens the object-like macro name expands to, or null if name is none.
+	expansion(name: string): Tok[] | null {
+		const m = this.macros.get(name)
+		if (m == null || m.params != null || m.dynamic) {
+			return null
+		}
+		this.sources.push(new Source(new File("<expansion>", name), -1, 0))
+		const toks: Tok[] = []
+		while (true) {
+			const t = this.next()
+			if (t.kind == "eof") {
+				return toks
+			}
+			toks.push(t)
+		}
+	}
+
+	/// Takes the next token after macro expansion into tok.
+	advance() {
+		const s = this.top()
+		const u = s.lexer.tok
+		if (this.pending.length == 0 && u.kind != "eof" && !u.is("#") && !this.macros.has(u.text)) {
+			s.last = u.pos
+			this.tok = { ...u }
+			s.lexer.advance()
+		} else {
+			this.tok = { ...this.next() }
+		}
+	}
+
+	/// The next token after macro expansion: "eof" at the end of the main file, and again after that.
+	next(): Tok {
+		while (true) {
+			const t = this.token()
+			if (t.kind != "ident") {
+				return t
+			}
+			if (this.inIf && t.is("defined")) {
+				return this.defined(t)
+			}
+			const m = this.macros.get(t.text)
+			if (m == null || t.hide.has(t.text)) {
+				return t
+			}
+			if (m.dynamic && t.is("_Pragma")) {
+				this.pragmaOperator(t)
+			} else if (m.dynamic) {
+				return this.dynamicToken(t)
+			} else if (m.params == null) {
+				this.rescan(t, this.substitute(m, m.body, []), t.hide.union(new Set([t.text])))
+			} else {
+				const paren = this.token()
+				if (!paren.is("(")) {
+					this.pending.push(paren)
+					return t
+				}
+				const [args, close] = this.args(m, t)
+				const hide = t.hide.intersection(close.hide).union(new Set([t.text]))
+				this.rescan(t, this.substitute(m, m.body, args), hide)
+			}
+		}
+	}
+
+	/// The next token before macro expansion, after the directives before it.
+	private token(): Tok {
+		while (true) {
+			if (this.pending.length > 0) {
+				return this.pending.pop()
+			}
+			const s = this.top()
+			const t = s.lexer.next()
+			if (t.kind == "eof") {
+				if (this.conds.length > s.depth) {
+					throw CError.at(t, "unterminated conditional directive")
+				}
+				if (this.sources.length == 1) {
+					return t
+				}
+				this.sources.pop()
+				continue
+			}
+			s.last = t.pos
+			if (!t.bol || !t.is("#")) {
+				return t
+			}
+			this.directive(s, t)
+		}
+	}
+
+	private top(): Source { return this.sources[this.sources.length - 1] }
+
+	/// Queues the expansion toks of the macro t for rescanning, marked with the hideset hide and spaced
+	/// as t was.
+	private rescan(t: Tok, toks: Tok[], hide: Set) {
+		const marked: Tok[] = []
+		for (const u of toks) {
+			marked.push({ ...u, hide: u.hide.union(hide), bol: false })
+		}
+		if (marked.length > 0) {
+			marked[0].bol = t.bol
+			marked[0].space = t.space
+		}
+		this.pending.push(...reversed(marked))
+	}
+
+	/// The arguments of a call to m, unexpanded, and the ) that ends it.
+	private args(m: Macro, t: Tok): [Tok[][], Tok] {
+		const params = m.params ?? []
+		const args: Tok[][] = []
+		let arg: Tok[] = []
+		let depth = 0
+		while (true) {
+			const u = this.token()
+			if (u.kind == "eof") {
+				throw CError.at(t, `unterminated call to macro ${t.text}`)
+			}
+			// The commas in the variadic argument, the last, are its own; it may be left out.
+			const inVariadic = m.variadic && args.length == params.length - 1
+			if (depth == 0 && u.is(")")) {
+				args.push(arg)
+				if (params.length == 0 && args.length == 1 && arg.length == 0) {
+					args.pop()
+				}
+				if (m.variadic && args.length == params.length - 1) {
+					args.push([])
+				}
+				if (args.length != params.length) {
+					throw CError.at(t, `macro ${t.text} takes ${params.length} arguments, not ${args.length}`)
+				}
+				return [args, u]
+			}
+			if (depth == 0 && u.is(",") && !inVariadic) {
+				args.push(arg)
+				arg = []
+				continue
+			}
+			if (u.is("(")) {
+				depth++
+			}
+			if (u.is(")")) {
+				depth--
+			}
+			arg.push(u)
+		}
+	}
+
+	/// body, of m, with args in place of its parameters, and # ## and __VA_OPT__ applied (C11 6.10.3.1-3).
+	private substitute(m: Macro, body: Tok[], args: Tok[][]): Tok[] {
+		return paste(this.replace(m, body, args))
+	}
+
+	/// body with # applied, __VA_OPT__ resolved and each parameter replaced by its argument, which is
+	/// macro-expanded unless it is next to a ##, where an empty one becomes a placemarker. The ## stay,
+	/// as pasteOp, for paste.
+	private replace(m: Macro, body: Tok[], args: Tok[][]): Tok[] {
+		const out: Tok[] = []
+		const last = args.length - 1
+		let i = 0
+		while (i < body.length) {
+			const t = body[i]
+			if (t.is("##")) {
+				// GNU's , ## __VA_ARGS__ drops the comma when the arguments are empty, and pastes nothing.
+				const gnuComma = m.variadic && i > 0 && body[i - 1].is(",") && param(m, body[i + 1]) == last
+				if (!gnuComma) {
+					out.push(pasteOp)
+				} else if (args[last].length == 0) {
+					out.pop()
+				}
+				i++
+				continue
+			}
+			let end = i + 1
+			let toks = [t]
+			const p = param(m, t)
+			if (t.is("#") && m.params != null) {
+				end = i + 2
+				toks = [stringize(args[param(m, body[i + 1])], t)]
+			} else if (t.is("__VA_OPT__") && m.variadic) {
+				end = closing(body, i + 1) + 1
+				toks = if (this.expand(args[last], t).length == 0) []
+					else this.substitute(m, body.slice(i + 2, end - 1), args)
+			}
+			const pasted = i > 0 && body[i - 1].is("##") || end < body.length && body[end].is("##")
+			if (p >= 0) {
+				toks = if (pasted) args[p] else this.expand(args[p], t)
+			}
+			if (toks.length == 0 && pasted) {
+				out.push(placemarker)
+			}
+			for (const j of 0 ... toks.length - 1) {
+				out.push(if (j == 0) spaced(toks[0], t.space) else toks[j])
+			}
+			i = end
+		}
+		return out
+	}
+
+	/// toks fully macro-expanded on their own; errors point at at.
+	private expand(toks: Tok[], at: Tok): Tok[] {
+		const end: Tok = { ...new Tok(), file: at.file, pos: at.pos }
+		this.pending.push(end)
+		this.pending.push(...reversed(toks))
+		const out: Tok[] = []
+		while (true) {
+			const t = this.next()
+			if (t == end) {
+				return out
+			}
+			out.push(t)
+		}
+	}
+
+	/// The value of defined X or defined(X).
+	private defined(t: Tok): Tok {
+		const paren = this.token()
+		const name = if (paren.is("(")) this.token() else paren
+		if (name.kind != "ident") {
+			throw CError.at(name, "macro name expected after defined")
+		}
+		if (paren.is("(") && !this.token().is(")")) {
+			throw CError.at(name, "expected ) after defined(")
+		}
+		return synth(if (this.macros.has(name.text)) "1" else "0", t)
+	}
+
+	/// The token the dynamic macro t stands for.
+	private dynamicToken(t: Tok): Tok {
+		const s = this.top()
+		const count = this.counter
+		if (t.is("__COUNTER__")) {
+			this.counter++
+		}
+		return synth(switch (t.text) {
+			case "__FILE__": quoted(s.name)
+			case "__FILE_NAME__": quoted(base(s.name))
+			case "__BASE_FILE__": quoted(this.sources[0].file.name)
+			case "__LINE__": `${s.file.lineCol(s.last)[0] + s.lineShift}`
+			case "__COUNTER__": `${count}`
+			case "__DATE__": quoted(this.date.slice(4, 11) + this.date.slice(20, 24))
+			case "__TIME__": quoted(this.date.slice(11, 19))
+			case "__TIMESTAMP__": quoted(this.date.slice(0, 24))
+			default: if (this.has(t)) "1" else "0"
+		}, t)
+	}
+
+	/// Whether the thing a __has_ macro t asks about is there: no feature, extension, warning or C or C++
+	/// attribute is, and no module is being built.
+	private has(t: Tok): bool {
+		const toks = this.operand(t)
+		if (t.is("__has_include") || t.is("__has_include_next")) {
+			const [name, angled] = this.header(toks, t)
+			return this.find(name, angled, t.is("__has_include_next")) != null
+		}
+		let name = ""
+		for (const u of toks) {
+			name += u.text
+		}
+		name = strip(name, "__")
+		return switch (t.text) {
+			case "__has_attribute": contains(attributes, name)
+			case "__has_builtin": contains(builtins, name)
+			default: false
+		}
+	}
+
+	/// _Pragma("..."), whose string becomes a #pragma line. The parser reads that line through the
+	/// token after it, so that is made to start a line.
+	private pragmaOperator(t: Tok) {
+		const op = this.operand(t)
+		if (op.length != 1 || op[0].kind != "string") {
+			throw CError.at(t, "_Pragma takes a string literal")
+		}
+		const after = this.token()
+		this.pending.push(if (after.kind == "eof") after else spaced(after, after.space, true))
+		this.directiveLine(t.file.name, "#pragma " + unquoted(op[0].text))
+	}
+
+	/// Runs the directive text as a line of the file called name.
+	private directiveLine(name: string, text: string) {
+		const s = new Source(new File(name, text), -1, 0)
+		this.directive(s, s.lexer.next())
+	}
+
+	/// The tokens inside the parentheses after the dynamic macro t.
+	private operand(t: Tok): Tok[] {
+		if (!this.token().is("(")) {
+			throw CError.at(t, `expected ( after ${t.text}`)
+		}
+		const toks: Tok[] = []
+		let depth = 0
+		while (true) {
+			const u = this.token()
+			if (u.kind == "eof") {
+				throw CError.at(t, `unterminated ${t.text}`)
+			}
+			if (u.is(")") && depth == 0) {
+				return toks
+			}
+			if (u.is("(")) {
+				depth++
+			}
+			if (u.is(")")) {
+				depth--
+			}
+			toks.push(u)
+		}
+	}
+
+	/// Runs the directive whose hash was just read from s.
+	private directive(s: Source, hash: Tok) {
+		s.last = hash.pos
+		if (s.lexer.tok.bol) {
+			return
+		}
+		const t = s.lexer.next()
+		const line: Tok[] = []
+		while (!s.lexer.tok.bol) {
+			line.push(s.lexer.next())
+		}
+		switch (t.text) {
+			case "define": this.defineMacro(line, t)
+			case "undef": this.macros.delete(macroName(line, t))
+			case "include", "include_next":
+				const [file, angled] = this.header(line, t)
+				this.include(file, angled, t.is("include_next"), t)
+			case "if": this.cond(this.eval(line, t))
+			case "ifdef": this.cond(this.macros.has(macroName(line, t)))
+			case "ifndef": this.cond(!this.macros.has(macroName(line, t)))
+			case "elif", "else":
+				const group = this.innermost(t)
+				group.inElse = t.is("else")
+				if (group.taken || t.is("elif") && !this.eval(line, t)) {
+					this.skip()
+				} else {
+					group.taken = true
+				}
+			case "endif":
+				this.innermost(t)
+				this.conds.pop()
+			case "line": this.setLine(this.expand(line, t), t)
+			case "error": throw CError.at(t, "#error " + spelling(s.file, line))
+			case "pragma": this.pragma([hash, t, ...line])
+			case "warning": return
+			default:
+				if (t.kind != "number") {
+					throw CError.at(t, `invalid directive #${t.text}`)
+				}
+				this.setLine([t, ...line], t)
+		}
+	}
+
+	/// Takes #pragma once, push_macro and pop_macro; hands any other #pragma line to the parser, its tokens
+	/// never expanded.
+	private pragma(line: Tok[]) {
+		if (line.length > 2 && line[2].is("once")) {
+			this.once.add(this.top().file.name)
+			return
+		}
+		if (line.length == 6 && (line[2].is("push_macro") || line[2].is("pop_macro")) && line[4].kind == "string") {
+			const name = unquoted(line[4].text)
+			const saved = this.pushed.get(name) ?? []
+			this.pushed.set(name, saved)
+			if (line[2].is("push_macro")) {
+				saved.push(this.macros.get(name))
+			} else if (saved.length > 0) {
+				const m = saved.pop()
+				if (m == null) {
+					this.macros.delete(name)
+				} else {
+					this.macros.set(name, m)
+				}
+			}
+			return
+		}
+		const unexpanded: Tok[] = []
+		for (const t of line) {
+			unexpanded.push({ ...t, hide: new Set([t.text]) })
+		}
+		this.pending.push(...reversed(unexpanded))
+	}
+
+	/// #define, from the line after it; at stands for the end of the line.
+	private defineMacro(line: Tok[], at: Tok) {
+		const name = macroName(line, at)
+		const m = new Macro()
+		let i = 1
+		if (i < line.length && line[i].is("(") && !line[i].space) {
+			i = this.defineParams(m, line, i + 1, at)
+		}
+		m.body = line.slice(i, line.length)
+		const n = m.body.length
+		if (n > 0 && (m.body[0].is("##") || m.body[n - 1].is("##"))) {
+			throw CError.at(at, "## at either end of a macro")
+		}
+		for (const j of 0 ... n - 1) {
+			if (m.params != null && m.body[j].is("#") && (j + 1 == n || param(m, m.body[j + 1]) < 0)) {
+				throw CError.at(m.body[j], "# is not followed by a macro parameter")
+			}
+		}
+		this.macros.set(name, m)
+	}
+
+	/// m's parameters from line[i] on, after the (; returns the index past the ).
+	private defineParams(m: Macro, line: Tok[], i: i32, at: Tok): i32 {
+		const params: string[] = []
+		let j = i
+		while (!tokAt(line, j, at).is(")")) {
+			if (params.length > 0) {
+				if (m.variadic || !tokAt(line, j, at).is(",")) {
+					throw CError.at(tokAt(line, j, at), "expected , or ) in parameter list")
+				}
+				j++
+			}
+			const p = tokAt(line, j, at)
+			if (p.is("...")) {
+				params.push("__VA_ARGS__")
+				m.variadic = true
+			} else if (p.kind == "ident") {
+				params.push(p.text)
+				if (tokAt(line, j + 1, at).is("...")) {
+					m.variadic = true
+					j++
+				}
+			} else {
+				throw CError.at(p, "expected a parameter name")
+			}
+			j++
+		}
+		m.params = params
+		return j + 1
+	}
+
+	private cond(taken: bool) {
+		this.conds.push(new Cond(taken))
+		if (!taken) {
+			this.skip()
+		}
+	}
+
+	/// The conditional an #elif, #else or #endif at t belongs to.
+	private innermost(t: Tok): Cond {
+		if (this.conds.length <= this.top().depth) {
+			throw CError.at(t, `#${t.text} without #if`)
+		}
+		const c = this.conds[this.conds.length - 1]
+		if (c.inElse && !t.is("endif")) {
+			throw CError.at(t, `#${t.text} after #else`)
+		}
+		return c
+	}
+
+	/// Skips to the #elif, #else or #endif that ends the current group, and runs it.
+	private skip() {
+		const s = this.top()
+		let depth = 0
+		while (true) {
+			const t = s.lexer.tok
+			if (t.kind == "eof") {
+				throw CError.at(t, "unterminated conditional directive")
+			}
+			if (!t.is("#")) {
+				s.lexer.skipLine()
+				continue
+			}
+			const hash = s.lexer.next()
+			const d = s.lexer.tok
+			if (d.bol) {
+				continue
+			}
+			if (contains(["if", "ifdef", "ifndef"], d.text)) {
+				depth++
+			} else if (contains(["elif", "else", "endif"], d.text)) {
+				if (depth == 0) {
+					this.directive(s, hash)
+					return
+				}
+				if (d.is("endif")) {
+					depth--
+				}
+			}
+			s.lexer.skipLine()
+		}
+	}
+
+	/// The value of the #if or #elif expression toks.
+	private eval(toks: Tok[], t: Tok): bool {
+		this.inIf = true
+		const expanded = this.expand(toks, t)
+		this.inIf = false
+		expanded.push({ ...new Tok(), file: t.file, pos: t.pos })
+		const e = new IfExpr(expanded)
+		const v = e.conditional(true)
+		if (e.peek().kind != "eof") {
+			throw CError.at(e.peek(), "extra tokens in #if expression")
+		}
+		return v.n != 0
+	}
+
+	/// #line, its operands expanded.
+	private setLine(toks: Tok[], t: Tok) {
+		if (toks.length == 0 || toks[0].kind != "number") {
+			throw CError.at(t, "#line expects a line number")
+		}
+		const s = this.top()
+		s.lineShift = (integer(toks[0]).n as i32) - s.file.lineCol(t.pos)[0] - 1
+		if (toks.length > 1 && toks[1].kind == "string") {
+			s.name = unquoted(toks[1].text)
+		}
+	}
+
+	/// The file an #include or __has_include names, and whether in <>.
+	private header(line: Tok[], t: Tok): [string, bool] {
+		const toks = if (line.length > 0 && line[0].kind == "ident") this.expand(line, t) else line
+		if (toks.length > 0 && toks[0].kind == "string" && toks[0].text[0] == quote && toks[0].text.length > 2) {
+			return [toks[0].text.slice(1, toks[0].text.length - 1), false]
+		}
+		if (toks.length > 0 && toks[0].is("<")) {
+			let name = ""
+			for (const i of 1 ... toks.length - 1) {
+				if (toks[i].is(">") && name != "") {
+					return [name, true]
+				}
+				name += (if (toks[i].space && name != "") " " else "") + toks[i].text
+			}
+		}
+		throw CError.at(t, "expected \"FILENAME\" or <FILENAME>")
+	}
+
+	/// Where the header name is: its path, and the index in dirs of its directory, -1 for the includer's
+	/// or none; null if it is nowhere.
+	private find(name: string, angled: bool, next: bool): [string, i32] | null {
+		for (const [path, i] of this.candidates(name, angled, next)) {
+			if (this.file(path) != null) {
+				return [path, i]
+			}
+		}
+		return null
+	}
+
+	/// The paths where the header name may be, in search order, each with the index in dirs of its
+	/// directory. #include_next in a file found in dirs goes on from the directory after that.
+	private candidates(name: string, angled: bool, next: bool): [string, i32][] {
+		if (isAbs(name)) {
+			return [[clean(name), -1]]
+		}
+		const s = this.top()
+		const after = next && s.dir >= 0
+		const paths: [string, i32][] = []
+		if (!angled && !after) {
+			paths.push([join(dir(s.file.name), name), -1])
+		}
+		const first = if (after) s.dir + 1 else if (angled) this.quoteDirs else 0
+		for (const i of first ... this.dirs.length - 1) {
+			paths.push([join(this.dirs[i], name), i])
+		}
+		return paths
+	}
+
+	/// The file at path, read once; null if there is none.
+	private file(path: string): File | null {
+		const known = this.files.get(path)
+		if (known != null) {
+			return known
+		}
+		const src = this.read(path)
+		if (src == null) {
+			return null
+		}
+		const f = new File(path, src)
+		this.files.set(path, f)
+		return f
+	}
+
+	private include(name: string, angled: bool, next: bool, t: Tok) {
+		const found = this.find(name, angled, next)
+		if (found == null) {
+			throw CError.at(t, `'${name}' file not found`)
+		}
+		const [path, dir] = found
+		if (this.once.has(path)) {
+			return
+		}
+		if (this.sources.length > 200) {
+			throw CError.at(t, "#include nested too deeply")
+		}
+		this.sources.push(new Source(this.file(path)!, dir, this.conds.length))
+	}
+}
+
+/// The tokens as -E output: a line per source line that starts one, and tokens spaced unless they were
+/// adjacent in the source.
+export function render(pp: Preprocessor): string {
+	let out = ""
+	// Where the token before ends.
+	let file: File | null = null
+	let end = 0
+	while (true) {
+		pp.advance()
+		const t = pp.tok
+		if (t.kind == "eof") {
+			return if (file == null) out else out + "\n"
+		}
+		if (file != null) {
+			const adjacent = file == t.file && end == t.pos
+			out += if (t.bol) "\n" else if (adjacent) "" else " "
+		}
+		out += t.text
+		file = t.file
+		end = t.pos + t.text.length
+	}
+}
+
+/// toks with each pasteOp joining the tokens around it (C11 6.10.3.3), and placemarkers dropped.
+function paste(toks: Tok[]): Tok[] {
+	const pasted: Tok[] = []
+	let i = 0
+	while (i < toks.length) {
+		if (toks[i] != pasteOp) {
+			pasted.push(toks[i])
+			i++
+			continue
+		}
+		const lhs = pasted.pop()
+		const rhs = toks[i + 1]
+		pasted.push(if (lhs == placemarker) rhs else if (rhs == placemarker) lhs else synth(lhs.text + rhs.text, lhs))
+		i += 2
+	}
+	const out: Tok[] = []
+	for (const t of pasted) {
+		if (t != placemarker) {
+			out.push(t)
+		}
+	}
+	return out
+}
+
+/// An #if operand: an intmax_t, or a uintmax_t if unsigned.
+type Num = { n: i64, unsigned: bool }
+
+function num(n: i64, unsigned: bool): Num { return { n: n, unsigned: unsigned } }
+function truth(b: bool): Num { return num(if (b) 1 else 0, false) }
+
+/// Evaluates an #if expression (C11 6.10.1) that ends in "eof".
+class IfExpr {
+	toks: Tok[]
+	i = 0
+
+	constructor(toks: Tok[]) { this.toks = toks }
+	peek(): Tok { return this.toks[this.i] }
+
+	/// Errors such as division by zero count only where live.
+	conditional(live: bool): Num {
+		const cond = this.binary(0, live)
+		if (!this.peek().is("?")) {
+			return cond
+		}
+		this.i++
+		const then = this.conditional(live && cond.n != 0)
+		this.expect(":")
+		const otherwise = this.conditional(live && cond.n == 0)
+		return num(if (cond.n != 0) then.n else otherwise.n, then.unsigned || otherwise.unsigned)
+	}
+
+	/// Operators binding tighter than prec, left to right.
+	binary(prec: i32, live: bool): Num {
+		let a = this.unary(live)
+		while (true) {
+			const op = this.peek()
+			const p = precedence(op.kind)
+			if (p <= prec) {
+				return a
+			}
+			this.i++
+			const decided = op.is("&&") && a.n == 0 || op.is("||") && a.n != 0
+			a = apply(op, a, this.binary(p, live && !decided), live)
+		}
+	}
+
+	unary(live: bool): Num {
+		const t = this.peek()
+		this.i++
+		if (t.is("+")) {
+			return this.unary(live)
+		}
+		if (t.is("-")) {
+			const v = this.unary(live)
+			return num(-v.n, v.unsigned)
+		}
+		if (t.is("~")) {
+			const v = this.unary(live)
+			return num(~v.n, v.unsigned)
+		}
+		if (t.is("!")) {
+			return truth(this.unary(live).n == 0)
+		}
+		if (t.is("(")) {
+			const v = this.conditional(live)
+			this.expect(")")
+			return v
+		}
+		if (t.kind == "number") {
+			return integer(t)
+		}
+		if (t.kind == "char") {
+			const [ty, n] = character(t.text)
+			return num(n, isUnsigned(ty))
+		}
+		if (t.kind == "ident") {
+			return num(0, false)
+		}
+		throw CError.at(t, if (t.kind == "eof") "#if expression expected" else `unexpected ${t.text} in #if expression`)
+	}
+
+	expect(op: string) {
+		if (!this.peek().is(op)) {
+			throw CError.at(this.peek(), `expected ${op} in #if expression`)
+		}
+		this.i++
+	}
+}
+
+/// a op b, in uintmax_t if either is unsigned.
+function apply(op: Tok, a: Num, b: Num, live: bool): Num {
+	const u = a.unsigned || b.unsigned
+	const l = a.n
+	const r = b.n
+	if ((op.is("/") || op.is("%")) && r == 0) {
+		if (live) {
+			throw CError.at(op, "division by zero in #if expression")
+		}
+		return num(0, u)
+	}
+	return switch (op.text) {
+		case "*": num(l * r, u)
+		case "/": num(if (u) ((l as u64) / (r as u64)) as i64 else l / r, u)
+		case "%": num(if (u) ((l as u64) % (r as u64)) as i64 else l % r, u)
+		case "+": num(l + r, u)
+		case "-": num(l - r, u)
+		case "<<": num(l << r, a.unsigned)
+		case ">>": num(if (a.unsigned) ((l as u64) >> r) as i64 else l >> r, a.unsigned)
+		case "<": truth(if (u) (l as u64) < (r as u64) else l < r)
+		case ">": truth(if (u) (l as u64) > (r as u64) else l > r)
+		case "<=": truth(if (u) (l as u64) <= (r as u64) else l <= r)
+		case ">=": truth(if (u) (l as u64) >= (r as u64) else l >= r)
+		case "==": truth(l == r)
+		case "!=": truth(l != r)
+		case "&": num(l & r, u)
+		case "^": num(l ^ r, u)
+		case "|": num(l | r, u)
+		case "&&": truth(l != 0 && r != 0)
+		default: truth(l != 0 || r != 0)
+	}
+}
+
+/// The value of an integer constant, typed as if int were as wide as intmax_t (C11 6.10.1p4): unsigned
+/// if suffixed u or past intmax_t.
+function integer(t: Tok): Num {
+	const c = t.value
+	if (c == null || c[0].kind == "float") {
+		throw CError.at(t, `invalid integer constant ${t.text} in #if expression`)
+	}
+	let unsigned = c[1] < 0
+	for (const ch of t.text) {
+		unsigned = unsigned || ch == ("u" as u8) || ch == ("U" as u8)
+	}
+	return num(c[1], unsigned)
+}
+
+/// The index of the ) that closes the ( at toks[i].
+function closing(toks: Tok[], i: i32): i32 {
+	if (!toks[i].is("(")) {
+		throw CError.at(toks[i], "expected ( after __VA_OPT__")
+	}
+	let depth = 0
+	for (const j of i ... toks.length - 1) {
+		if (toks[j].is("(")) {
+			depth++
+		}
+		if (toks[j].is(")")) {
+			depth--
+		}
+		if (depth == 0) {
+			return j
+		}
+	}
+	throw CError.at(toks[i], "unterminated __VA_OPT__")
+}
+
+/// The index of t among m's parameters, or -1.
+function param(m: Macro, t: Tok): i32 {
+	const params = m.params ?? []
+	for (const i of 0 ... params.length - 1) {
+		if (t.kind == "ident" && params[i] == t.text) {
+			return i
+		}
+	}
+	return -1
+}
+
+/// line[i], or past the end of the line, at.
+function tokAt(line: Tok[], i: i32, at: Tok): Tok { return if (i < line.length) line[i] else at }
+
+/// The string literal of toks (C11 6.10.3.2).
+function stringize(toks: Tok[], at: Tok): Tok {
+	let s = "\""
+	for (const i of 0 ... toks.length - 1) {
+		const t = toks[i]
+		if (i > 0 && (t.space || t.bol)) {
+			s += " "
+		}
+		s += if (t.kind == "string" || t.kind == "char") escaped(t.text) else t.text
+	}
+	return synth(s + "\"", at)
+}
+
+function quoted(s: string): string { return `"${escaped(s)}"` }
+
+/// The text of the string literal s: its prefix and quotes dropped, and the \" and \\ escapes undone.
+function unquoted(s: string): string {
+	let out = ""
+	let i = 0
+	while (s[i] != quote) {
+		i++
+	}
+	i++
+	while (i < s.length - 1) {
+		if (s[i] == backslash) {
+			i++
+		}
+		out += chr(s[i])
+		i++
+	}
+	return out
+}
+
+/// s with \ before each " and \.
+function escaped(s: string): string {
+	let out = ""
+	for (const ch of s) {
+		if (ch == quote || ch == backslash) {
+			out += "\\"
+		}
+		out += chr(ch)
+	}
+	return out
+}
+
+/// The token text lexes as, in place of t.
+function synth(text: string, t: Tok): Tok {
+	const l = new Lexer(new File(t.file.name, text))
+	const u = l.next()
+	if (u.kind == "eof" || l.next().kind != "eof") {
+		throw CError.at(t, `'${text}' is not a preprocessing token`)
+	}
+	u.bol = t.bol
+	u.space = t.space
+	u.hide = t.hide
+	return u
+}
+
+/// t, or a copy of it with space and bol set.
+function spaced(t: Tok, space: bool, bol: bool = t.bol): Tok {
+	if (t.space == space && t.bol == bol) {
+		return t
+	}
+	return { ...t, space, bol }
+}
+
+/// The macro name a directive at t starts with.
+function macroName(line: Tok[], t: Tok): string {
+	if (line.length == 0 || line[0].kind != "ident") {
+		throw CError.at(t, "macro name expected")
+	}
+	return line[0].text
+}
+
+/// The source text of a directive's line.
+function spelling(f: File, line: Tok[]): string {
+	if (line.length == 0) {
+		return ""
+	}
+	const last = line[line.length - 1]
+	return f.src.slice(line[0].pos, last.pos + last.text.length)
+}
