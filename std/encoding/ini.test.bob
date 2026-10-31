@@ -1,0 +1,137 @@
+import { decode, encode, EncodeError, Rest } from "./ini"
+import { Unknown } from "./json"
+import { ParseError } from "../parse"
+
+class Server {
+	host = "localhost"
+	port: u16 = 8080
+	tags: string[] = ["a"]
+}
+
+class Config {
+	name = "demo"
+	debug = false
+	ratio: f64 = 0.5
+	mode: "fast" | "safe" = "fast"
+	server = new Server()
+	backup: Server | null = null
+}
+
+class Point {
+	x: i32 = 0
+}
+
+class Points {
+	points: Point[] = [new Point()]
+}
+
+test "encode sections" {
+	assert encode(new Config())
+		== `name = demo
+debug = false
+ratio = 0.5
+mode = fast
+
+[server]
+host = localhost
+port = 8080
+tags = a
+`
+	const c = new Config()
+	c.name = " padded"
+	c.backup = new Server()
+	c.backup!.tags = ["x", "\"y\""]
+	assert encode(c)
+		== `name = " padded"
+debug = false
+ratio = 0.5
+mode = fast
+
+[server]
+host = localhost
+port = 8080
+tags = a
+
+[backup]
+host = localhost
+port = 8080
+tags = x
+tags = "\\"y\\""
+`
+	assert decode[Config](encode(c)) == c
+}
+
+test "encode throws on what INI cannot hold" {
+	const c = new Config()
+	c.ratio = 0.0 / 0.0
+	assert encode(c) throws new EncodeError("ratio")
+	assert encode(new Points()) throws new EncodeError("points")
+}
+
+test "decode sections" {
+	const want = new Config()
+	want.name = "My App"
+	want.debug = true
+	want.ratio = 0.2
+	want.mode = "safe"
+	want.server.host = "example.com"
+	want.server.tags = ["x", "y"]
+	want.backup = new Server()
+	want.backup!.port = 1
+	assert decode[Config](`; c
+# c
+name = My App
+debug = Yes
+ratio = 2e-1
+mode=safe
+
+[server]
+host=example.com
+tags = x
+tags = y
+
+[ backup ]\r
+port = 1
+`) == want
+	assert decode[Config]("name =  My App  ").name == "My App"
+	assert decode[Config]("name = \" a\\tb\"").name == " a\tb"
+	assert decode[Config]("name =").name == ""
+}
+
+test "decode is strict" {
+	test "values" {
+		assert decode[Config]("nope = 1") throws new ParseError("syntax", 0)
+		assert decode[Config]("name") throws new ParseError("syntax", 4)
+		assert decode[Config]("mode = slow") throws new ParseError("syntax", 7)
+		assert decode[Config]("debug = maybe") throws new ParseError("syntax", 8)
+		assert decode[Config]("ratio = 1.") throws new ParseError("syntax", 10)
+		assert decode[Config]("[server]\nport = 70000") throws new ParseError("range", 16)
+	}
+	test "sections" {
+		assert decode[Config]("[name]") throws new ParseError("syntax", 0)
+		assert decode[Config]("[server.x]") throws new ParseError("syntax", 0)
+		assert decode[Config]("[server") throws new ParseError("syntax", 6)
+		assert decode[Config]("[server..x]") throws new ParseError("syntax", 8)
+	}
+}
+
+class Num {
+	n: i32 | f64 = 0
+}
+
+test "a union takes an integer member first" {
+	assert decode[Num]("n = 1").n instanceof i32
+	assert decode[Num]("n = 1.5").n == 1.5
+}
+
+class Loose {
+	x: i32 = 0
+	rest: Unknown[] @Rest = []
+}
+
+test "rest takes unknown keys" {
+	const v = decode[Loose]("a = 1\nx = 2\n[s.t]\nb = \"q\"\n")
+	assert v.x == 2
+	assert v.rest == [["a", "1"], ["s.t.b", `"q"`]]
+	assert encode(v) == "x = 2\na = 1\ns.t.b = \"q\"\n"
+}

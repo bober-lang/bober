@@ -1,0 +1,285 @@
+//! Values as INI: plain fields as `key = value`, class fields as [sections], arrays as repeated keys.
+//! Decoding is strict as json's; a Rest field takes the unknown keys, an unknown section's under its path.
+
+import { dot, equal, hash, isControl, isSpace, lbracket, lf, quote, rbracket, semicolon } from "../ascii"
+import { Set } from "../collections/set"
+import * as json from "./json"
+import { Unknown } from "./json"
+import { isFinite } from "../math"
+import { ParseError } from "../parse"
+import { lower } from "../string"
+import { Decodable, has, New } from "../types"
+
+/// Tags an Unknown[] field to take the keys no other field takes, and to encode them back.
+export class Rest {}
+
+/// A value INI cannot hold, under the key path.
+export class EncodeError {
+	path: string
+
+	constructor(path: string) { this.path = path }
+}
+
+export function encode[T extends New](v: T): string throws EncodeError {
+	return section(v, "")
+}
+
+export function decode[T extends New](s: string): T throws ParseError {
+	const d = new Decoder(s)
+	let root = new T()
+	let header: string[] = []
+	while (d.i < s.length) {
+		const [a, b] = d.line()
+		if (a == b || s[a] == semicolon || s[a] == hash) {
+			continue
+		}
+		if (s[a] == lbracket) {
+			if (s[b - 1] != rbracket) {
+				throw new ParseError("syntax", b - 1)
+			}
+			header = d.names(a + 1, b - 1)
+			root = d.walk[T](root, header, 0, false, a)
+		} else {
+			let eq = a
+			while (eq < b && s[eq] != equal) {
+				eq++
+			}
+			const [k, kb] = d.trim(a, eq)
+			if (eq == b || k == kb) {
+				throw new ParseError("syntax", eq)
+			}
+			const [v, vb] = d.trim(eq + 1, b)
+			d.text = s.slice(v, vb)
+			d.at = v
+			root = d.walk[T](root, [...header, s.slice(k, kb)], 0, true, a)
+		}
+	}
+	return root
+}
+
+/// The keys of v, then its sections, each under path.
+function section[T](v: T, path: string): string throws EncodeError {
+	const t = typeof v
+	const keys: string[] = []
+	const sections: string[] = []
+	switch (t.kind) {
+		case "class", "object", "interface":
+			for (const f of t.fields) {
+				if (has(f.tags, Rest) && f.type == Unknown[]) {
+					for (const [k, text] of v[f.name]) {
+						keys.push(`${k} = ${text}\n`)
+					}
+				} else {
+					field(keys, sections, path, f.name, v[f.name])
+				}
+			}
+		default: throw new EncodeError(path)
+	}
+	let out = keys.join("")
+	for (const s of sections) {
+		out += if (out == "") s else `\n${s}`
+	}
+	return out
+}
+
+/// Adds v as the key name to keys, or as the section path.name to sections.
+function field[T](keys: string[], sections: string[], path: string, name: string, v: T): null throws EncodeError {
+	const t = typeof v
+	const p = path + name
+	switch (t.kind) {
+		case "null": return
+		case "union":
+			for (const M of t.members) {
+				if (v instanceof M) {
+					field(keys, sections, path, name, v)
+				}
+			}
+		case "class", "object", "interface": sections.push(`[${p}]\n${section(v, `${p}.`)}`)
+		case "array":
+			for (const x of v) {
+				keys.push(`${name} = ${value(x, p)}\n`)
+			}
+		default: keys.push(`${name} = ${value(v, p)}\n`)
+	}
+}
+
+function value[T](v: T, path: string): string throws EncodeError {
+	const t = typeof v
+	switch (t.kind) {
+		case "bool", "int": return `${v}`
+		case "float":
+			if (isFinite(v)) {
+				return `${v}`
+			}
+		case "string": return if (plain(v)) v else json.quoted(v)
+		case "literal": return value[string | bool | null](t.value, path)
+		case "union":
+			for (const M of t.members) {
+				if (v instanceof M) {
+					return value(v, path)
+				}
+			}
+		default: throw new EncodeError(path)
+	}
+	throw new EncodeError(path)
+}
+
+/// Whether s reads back as written: without outer whitespace, a leading `"` or control characters.
+function plain(s: string): bool {
+	if (s.length > 0 && (isSpace(s[0]) || isSpace(s[s.length - 1]) || s[0] == quote)) {
+		return false
+	}
+	for (const ch of s) {
+		if (isControl(ch)) {
+			return false
+		}
+	}
+	return true
+}
+
+class Decoder {
+	s: string
+	i = 0
+	/// The value of the current line, and where it starts.
+	text = ""
+	at = 0
+	/// The paths of the arrays set, which a repeated key appends to rather than replaces.
+	arrays = new Set()
+
+	constructor(s: string) { this.s = s }
+
+	/// v with the section, or the key's value, at path[i…] set, or a ParseError at at.
+	walk[T extends Decodable](v: T, path: string[], i: i32, key: bool, at: i32): T throws ParseError {
+		if (i == path.length && key) {
+			return this.leaf[T](v, path)
+		}
+		switch (T.kind) {
+			case "union":
+				for (const M of T.members) {
+					if (M.kind == "class") {
+						return this.walk[M](if (v instanceof M) v else new M(), path, i, key, at)
+					}
+				}
+			case "class":
+				if (i == path.length) {
+					return v
+				}
+				for (const f of T.fields) {
+					if (path[i] == f.name && !has(f.tags, Rest)) {
+						v[f.name] = this.walk[f.type](v[f.name], path, i + 1, key, at)
+						return v
+					}
+				}
+				for (const f of T.fields) {
+					if (has(f.tags, Rest) && f.type == Unknown[]) {
+						if (key) {
+							const rest: Unknown[] = v[f.name]
+							rest.push([path.slice(i, path.length).join("."), this.text])
+						}
+						return v
+					}
+				}
+			default: throw new ParseError("syntax", at)
+		}
+		throw new ParseError("syntax", at)
+	}
+
+	/// v with the value set, or appended if v is an array set before.
+	leaf[T extends Decodable](v: T, path: string[]): T throws ParseError {
+		switch (T.kind) {
+			case "array":
+				const xs: T = if (this.again(path)) v else []
+				xs.push(this.value[T.elem]())
+				return xs
+			default: return this.value[T]()
+		}
+	}
+
+	/// Whether the array at path was set before, marking it set.
+	again(path: string[]): bool {
+		const k = path.join(".")
+		if (this.arrays.has(k)) {
+			return true
+		}
+		this.arrays.add(k)
+		return false
+	}
+
+	value[T extends Decodable](): T throws ParseError {
+		const t = this.text
+		switch (T.kind) {
+			case "bool":
+				switch (lower(t)) {
+					case "true", "yes", "on", "1": return true
+					case "false", "no", "off", "0": return false
+				}
+			case "int", "float": return this.parse[T]()
+			case "string": return if (t.length > 0 && t[0] == quote) this.parse[string]() else t
+			case "literal":
+				if (this.value[string]() == `${T.value}`) {
+					return T.value
+				}
+			case "union":
+				// Integers first, as 1 fits a float too and the members are in canonical order (§4.4), not as written.
+				for (const ints of [true, false]) {
+					for (const M of T.members) {
+						if ((M.kind == "int") == ints) {
+							try {
+								return this.value[M]()
+							} catch {}
+						}
+					}
+				}
+			default: throw new ParseError("syntax", this.at)
+		}
+		throw new ParseError("syntax", this.at)
+	}
+
+	/// The value read as JSON.
+	parse[T extends Decodable](): T throws ParseError {
+		try {
+			return json.decode[T](this.text)
+		} catch (e: ParseError) {
+			throw new ParseError(e.kind, this.at + e.at)
+		}
+	}
+
+	/// The current line without outer whitespace, as [start, end], moving past it.
+	line(): [i32, i32] {
+		let end = this.i
+		while (end < this.s.length && this.s[end] != lf) {
+			end++
+		}
+		const line = this.trim(this.i, end)
+		this.i = end + 1
+		return line
+	}
+
+	trim(a: i32, b: i32): [i32, i32] {
+		let i = a
+		let j = b
+		while (i < j && isSpace(this.s[i])) {
+			i++
+		}
+		while (j > i && isSpace(this.s[j - 1])) {
+			j--
+		}
+		return [i, j]
+	}
+
+	names(a: i32, b: i32): string[] {
+		const names: string[] = []
+		let start = a
+		for (const j of a ... b) {
+			if (j == b || this.s[j] == dot) {
+				const [x, y] = this.trim(start, j)
+				if (x == y) {
+					throw new ParseError("syntax", j)
+				}
+				names.push(this.s.slice(x, y))
+				start = j + 1
+			}
+		}
+		return names
+	}
+}

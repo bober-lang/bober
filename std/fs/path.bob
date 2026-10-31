@@ -1,0 +1,224 @@
+//! Slash-separated paths, after Go's path/filepath and Zig's std.fs.path.
+//! Everything is lexical: nothing reads the file system or the working directory,
+//! so ".." drops the name before it even when that name is a symlink.
+
+import { backslash, caret, dot, exclamation, lbracket, minus, question, rbracket, slash, star } from "../ascii"
+import { startsWith } from "../string"
+
+/// The names in p other than "" and ".", in order.
+function names(p: string): string[] {
+	const out: string[] = []
+	let start = 0
+	for (const i of 0 ... p.length) {
+		if (i == p.length || p[i] == slash) {
+			const name = p.slice(start, i)
+			if (name != "" && name != ".") {
+				out.push(name)
+			}
+			start = i + 1
+		}
+	}
+	return out
+}
+
+export function isAbs(p: string): bool { return p.length > 0 && p[0] == slash }
+
+/// The shortest path to the same file as p: no repeated or trailing slashes, no ".",
+/// no ".." after a name or the root; "." for an empty result.
+export function clean(p: string): string {
+	const abs = isAbs(p)
+	const out: string[] = []
+	for (const name of names(p)) {
+		if (name != "..") {
+			out.push(name)
+		} else if (out.length > 0 && out[out.length - 1] != "..") {
+			out.pop()
+		} else if (!abs) {
+			out.push("..")
+		}
+	}
+	const s = out.join("/")
+	return if (abs) "/" + s else if (s == "") "." else s
+}
+
+/// The non-empty parts joined by slashes, then cleaned. A rooted part does not discard the
+/// ones before it: join("a", "/b") is "a/b".
+export function join(...parts: string[]): string {
+	let p = ""
+	for (const part of parts) {
+		if (part != "") {
+			p = if (p == "") part else p + "/" + part
+		}
+	}
+	return clean(p)
+}
+
+/// p without its last name, cleaned, so that join(dir(p), base(p)) is clean(p).
+/// dir("a/b/") is "a"; repeated dir ends at "." or "/".
+export function dir(p: string): string {
+	const ns = names(p)
+	if (ns.length > 0) {
+		ns.pop()
+	}
+	return clean((if (isAbs(p)) "/" else "") + ns.join("/"))
+}
+
+/// The last name in p, or "" if it has none, as "/" and "." do.
+export function base(p: string): string {
+	const ns = names(p)
+	return if (ns.length > 0) ns[ns.length - 1] else ""
+}
+
+/// The suffix of base(p) from its last dot, or "" if the only dot is the first byte: ext(".gitignore") is "".
+export function ext(p: string): string {
+	const name = base(p)
+	let i = name.length - 1
+	while (i > 0 && name[i] != dot) {
+		i--
+	}
+	return if (i > 0) name.slice(i, name.length) else ""
+}
+
+/// base(p) without ext(p).
+export function stem(p: string): string {
+	const name = base(p)
+	return name.slice(0, name.length - ext(p).length)
+}
+
+/// The path that join(start, rel(start, p)) cleans to clean(p), or null if there is none:
+/// one of them is rooted and the other not, or start climbs above p with "..".
+export function rel(start: string, p: string): string | null {
+	if (isAbs(start) != isAbs(p)) {
+		return null
+	}
+	// cleaned first, so ".." only leads
+	const f = names(clean(start))
+	const t = names(clean(p))
+	let i = 0
+	while (i < f.length && i < t.length && f[i] == t[i]) {
+		i++
+	}
+	if (i < f.length && f[i] == "..") {
+		return null
+	}
+	return join(...f.slice(i, f.length).map(_ => ".."), ...t.slice(i, t.length))
+}
+
+/// Whether p is non-empty, relative and stays within its directory: "a/../b" does, "a/../../b" does not.
+export function isLocal(p: string): bool {
+	const c = clean(p)
+	return p != "" && !isAbs(p) && c != ".." && !startsWith(c, "../")
+}
+
+/// Whether p matches pattern, name by name, both rooted or both not. In a name, * matches any bytes, ? any one byte,
+/// [abc] and [a-z] one byte of the class, [!...] or [^...] one byte not of it, and \ the byte after it; other bytes,
+/// and a [ that no ] closes, match themselves. A name that is just ** matches any number of names, none included.
+export function match(pattern: string, p: string): bool {
+	return isAbs(pattern) == isAbs(p) && matchNames(patternNames(pattern), 0, names(p), 0)
+}
+
+/// The names of pattern, as match takes it, with each run of ** as one, which matches the same but is tried just once.
+export function patternNames(pattern: string): string[] {
+	const ps: string[] = []
+	for (const name of names(pattern)) {
+		if (name != "**" || ps.length == 0 || ps[ps.length - 1] != "**") {
+			ps.push(name)
+		}
+	}
+	return ps
+}
+
+/// Whether the names ns from j match the pattern's names ps from i.
+function matchNames(ps: string[], i: i32, ns: string[], j: i32): bool {
+	if (i == ps.length) {
+		return j == ns.length
+	}
+	if (ps[i] == "**") {
+		for (const k of j ... ns.length) {
+			if (matchNames(ps, i + 1, ns, k)) {
+				return true
+			}
+		}
+		return false
+	}
+	return j < ns.length && matchName(ps[i], ns[j]) && matchNames(ps, i + 1, ns, j + 1)
+}
+
+/// Whether name, a single name, matches pattern, a name of a pattern as match takes it.
+export function matchName(pattern: string, name: string): bool {
+	let i = 0
+	let j = 0
+	// The last * seen, and the bytes of name it matches so far, which a mismatch later makes one longer.
+	let lastStar = -1
+	let starEnd = 0
+	while (j < name.length) {
+		if (i < pattern.length && pattern[i] == star) {
+			lastStar = i
+			starEnd = j
+			i++
+			continue
+		}
+		const next = if (i < pattern.length) matchByte(pattern, i, name[j]) else -1
+		if (next >= 0) {
+			i = next
+			j++
+		} else if (lastStar >= 0) {
+			starEnd++
+			i = lastStar + 1
+			j = starEnd
+		} else {
+			return false
+		}
+	}
+	while (i < pattern.length && pattern[i] == star) {
+		i++
+	}
+	return i == pattern.length
+}
+
+/// Where the part of pattern at i that matches one byte ends if it matches ch, else -1.
+function matchByte(pattern: string, i: i32, ch: u8): i32 {
+	const p = pattern[i]
+	if (p == question) {
+		return i + 1
+	}
+	if (p == lbracket) {
+		const [end, has] = inClass(pattern, i, ch)
+		if (end >= 0) {
+			return if (has) end else -1
+		}
+	}
+	if (p == backslash && i + 1 < pattern.length) {
+		return if (pattern[i + 1] == ch) i + 2 else -1
+	}
+	return if (p == ch) i + 1 else -1
+}
+
+/// Where the class at i, a [, ends past its ], and whether ch is in it; -1 if no ] closes it. A ] first in it is
+/// itself, as is a - first or last.
+function inClass(pattern: string, i: i32, ch: u8): [i32, bool] {
+	let k = i + 1
+	const negated = k < pattern.length && (pattern[k] == exclamation || pattern[k] == caret)
+	if (negated) {
+		k++
+	}
+	let has = false
+	const first = k
+	while (k < pattern.length && (k == first || pattern[k] != rbracket)) {
+		const [lo, afterLo] = classByte(pattern, k)
+		let hi = lo
+		k = afterLo
+		if (k + 1 < pattern.length && pattern[k] == minus && pattern[k + 1] != rbracket) {
+			const [h, afterHi] = classByte(pattern, k + 1)
+			hi = h
+			k = afterHi
+		}
+		has = has || lo <= ch && ch <= hi
+	}
+	return if (k < pattern.length) [k + 1, has != negated] else [-1, false]
+}
+
+/// The byte of a class at k, the one after a \, and where it ends.
+function classByte(pattern: string, k: i32): [u8, i32] {
+	return if (pattern[k] == backslash && k + 1 < pattern.length) [pattern[k + 1], k + 2] else [pattern[k], k + 1]
+}

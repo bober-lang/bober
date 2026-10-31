@@ -1,0 +1,68 @@
+import { Attr, decode, encode, Name, parse, serialize, Skip, Text, xmlNS } from "./xml"
+import { ParseError } from "../parse"
+
+class Link {
+	href: string @Attr = ""
+	rel: string | null @Attr = null
+	label: string @Text = ""
+}
+
+class Feed @Name["feed"] {
+	title = ""
+	version: i32 @Attr = 1
+	links: Link[] = []
+	draft = false
+	cache: string @Skip = ""
+	kind: "atom" | "rss" = "atom"
+	score: f64 | null = null
+}
+
+class Num @Name["n"] {
+	a: i32 | f64 @Attr = 0
+	e: i32 | f64 = 0
+}
+
+test "parse and serialize" {
+	const doc = parse(`<?xml version="1.0"?><!-- c --><a x='1' y="&lt;&#65;"><b/>t&amp;<![CDATA[<c>]]><?p d?></a>`)
+	assert serialize(doc) == `<!-- c --><a x="1" y="&lt;A"><b/>t&amp;&lt;c&gt;<?p d?></a>`
+}
+
+test "reject" {
+	assert parse("<?xml?><a/>") throws new ParseError("syntax", 0)
+	assert parse("<a></b>") throws new ParseError("syntax", 3)
+	assert parse("<a b='<'/>") throws new ParseError("syntax", 6)
+	assert parse("<a>&#0;</a>") throws new ParseError("syntax", 3)
+	assert parse("<a>&e;</a>") throws new ParseError("syntax", 3)
+	assert parse("<p:a/>") throws new ParseError("syntax", 0)
+	assert parse("<a xmlns:p='u' xmlns:q='u' p:x='1' q:x='2'/>") throws new ParseError("syntax", 0)
+	assert parse("<!DOCTYPE r [<!ENTITY e \"<x xmlns:p='u'/>\">]><r>&e;<p:y/></r>") throws new ParseError("syntax", 51)
+	assert parse("<!DOCTYPE r [<!ENTITY a '&a;'>]><r>&a;</r>") throws new ParseError("range", 35)
+	assert parse("<!DOCTYPE r [<!ENTITY e 'ab'>]><r>&e;&e;</r>", 3) throws new ParseError("range", 37)
+	assert parse("<!DOCTYPE r [<!ATTLIST r x CDATA 'ab'>]><r/>", 3).children[1].attr("x") == "ab"
+	assert parse("<!DOCTYPE r [<!ATTLIST r x CDATA 'ab'>]><r/>", 2) throws new ParseError("range", 40)
+	assert parse("<!DOCTYPE r [<!ELEMENT r ( a, (b|c)*, d? )+><!ELEMENT a ( #PCDATA | b )*><!ELEMENT b ANY>]><r/>")
+		.children.length == 2
+	assert parse("<!DOCTYPE r [<!ELEMENT r (a|b,c)>]><r/>") throws new ParseError("syntax", 29)
+	assert parse("<!DOCTYPE r [<!ELEMENT r (#PCDATA|a)>]><r/>") throws new ParseError("syntax", 36)
+}
+
+test "encode and decode" {
+	const f = new Feed()
+	f.title = "T"
+	const l = new Link()
+	l.href = "/a"
+	l.label = "A & B"
+	f.links = [l, l]
+	const s = encode(f)
+	const link = `<links href="/a">A &amp; B</links>`
+	assert s == `<feed version="1"><title>T</title>${link}${link}<draft>false</draft><kind>atom</kind></feed>`
+	const g = decode[Feed](s)
+	assert encode(g) == s
+	assert decode[Feed]("<other/>") throws new ParseError("syntax", 0)
+}
+
+test "a union takes an integer member first" {
+	const n = decode[Num]("<n a='1'><e>2</e></n>")
+	assert n.a instanceof i32 && n.e instanceof i32
+	assert decode[Num]("<n a='1.5'/>").a == 1.5
+}

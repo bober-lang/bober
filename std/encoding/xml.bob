@@ -1,0 +1,1101 @@
+//! XML 1.0 with namespaces as a tree of Nodes, which ./html builds too, and values as XML.
+//! Documents are UTF-8 and are not validated. Of the DOCTYPE only the internal subset's general entities are read; a
+//! reference to an external entity, or to one an external declaration could declare, is left out.
+//! As a value, a class is an element with a child element per field in order, an array field one per item and a null
+//! one none; a scalar is its element's text. Tags make a field an attribute, the text, rename it or skip it. Decoding
+//! is strict and takes a union's member as json's does, and ignores whitespace between a class's children.
+
+import { ampersand as amp, colon, digit, dot, greater, isAlphanumeric, isDigit, less, minus, quote,
+	underscore } from "../ascii"
+
+import * as ascii from "../ascii"
+import { contains, insertAt, position } from "../algo"
+import { HashMap } from "../collections/hashmap"
+import { parseFloat } from "../float"
+import { ParseError, parseInt } from "../parse"
+import { codePoint, indexOf, lower, occurs, replace, split, startsWith, trim, utf8 } from "../string"
+import { Decodable, has, tag } from "../types"
+
+export const htmlNS = "http://www.w3.org/1999/xhtml"
+export const svgNS = "http://www.w3.org/2000/svg"
+export const mathNS = "http://www.w3.org/1998/Math/MathML"
+export const xlinkNS = "http://www.w3.org/1999/xlink"
+export const xmlNS = "http://www.w3.org/XML/1998/namespace"
+export const xmlnsNS = "http://www.w3.org/2000/xmlns/"
+
+export type Kind = "document" | "doctype" | "element" | "text" | "comment" | "instruction"
+
+export class Attribute {
+	/// As written, with its prefix.
+	name: string
+	value: string
+	/// The namespace URI, or "" for none.
+	ns: string
+
+	constructor(name: string, value: string, ns: string = "") {
+		this.name = name
+		this.value = value
+		this.ns = ns
+	}
+}
+
+export class Node {
+	kind: Kind
+	/// An element's or doctype's name, an element's as written with its prefix, or an instruction's target.
+	name: string
+	/// The text of a text, comment or instruction.
+	data: string
+	/// An element's namespace URI, or "" for none.
+	ns = ""
+	attrs: Attribute[] = []
+	children: Node[] = []
+	parent: Node | null = null
+	/// A doctype's identifiers.
+	publicId = ""
+	systemId = ""
+	/// Where in its source the node starts.
+	at = 0
+
+	constructor(kind: Kind, name: string = "", data: string = "") {
+		this.kind = kind
+		this.name = name
+		this.data = data
+	}
+
+	/// The value of the attribute named name, or null.
+	attr(name: string): string | null {
+		for (const a of this.attrs) {
+			if (a.name == name) {
+				return a.value
+			}
+		}
+		return null
+	}
+
+	/// Inserts n, taken from its parent, before ref, or last where ref is null.
+	insert(n: Node, ref: Node | null = null) {
+		n.parent?.remove(n)
+		n.parent = this
+		const i = if (ref == null) -1 else position(this.children, ref)
+		if (i < 0) {
+			this.children.push(n)
+		} else {
+			this.children = insertAt(this.children, i, n)
+		}
+	}
+
+	remove(n: Node) {
+		this.children = this.children.filter(c => c != n)
+		n.parent = null
+	}
+
+	/// The text of this and its descendants.
+	text(): string {
+		if (this.kind == "text") {
+			return this.data
+		}
+		const parts: string[] = []
+		for (const c of this.children) {
+			if (c.kind == "element" || c.kind == "text") {
+				parts.push(c.text())
+			}
+		}
+		return parts.join("")
+	}
+
+	/// The descendant elements in document order, those named name if not "".
+	elements(name: string = ""): Node[] {
+		const out: Node[] = []
+		for (const c of this.children) {
+			if (c.kind == "element") {
+				if (name == "" || c.name == name) {
+					out.push(c)
+				}
+				out.append(c.elements(name))
+			}
+		}
+		return out
+	}
+}
+
+/// The bytes that a document's references and attribute defaults may expand to unless parse or decode is given others.
+export const defaultLimit: u32 = 1 << 24
+
+/// The document that s holds, whose references and attribute defaults may expand to at most limit bytes.
+export function parse(s: string, limit = defaultLimit): Node throws ParseError {
+	const t = if (indexOf(s, "\r") < 0) s else replace(replace(s, "\r\n", "\n"), "\r", "\n")
+	return new Parser(t, new Dtd(limit)).document()
+}
+
+/// n as XML; a document without an XML declaration.
+export function serialize(n: Node): string {
+	const out: string[] = []
+	write(n, out)
+	return out.join("")
+}
+
+/// Tags a scalar field to be an attribute.
+export class Attr {}
+/// Tags a string field to be the element's text.
+export class Text {}
+/// Tags a class or field to be named K.
+export class Name[K extends string] {}
+/// Tags a field to leave out of encoding and decoding.
+export class Skip {}
+
+export function encode[T](v: T): string { return serialize(element(tag((typeof v).tags, Name, (typeof v).name), v)) }
+
+export function decode[T extends Decodable](s: string, limit = defaultLimit): T throws ParseError {
+	for (const n of parse(s, limit).children) {
+		if (n.kind == "element") {
+			if (T.kind != "union" && n.name != tag(T.tags, Name, T.name)) {
+				throw new ParseError("syntax", n.at)
+			}
+			return value[T](n)
+		}
+	}
+	throw new ParseError("syntax", 0)
+}
+
+/// s quoted as a system literal, which cannot escape a quote.
+function systemLiteral(s: string): string { return if (indexOf(s, "\"") < 0) `"${s}"` else `'${s}'` }
+
+function write(n: Node, out: string[]): void {
+	switch (n.kind) {
+		case "document": for (const c of n.children) {
+			write(c, out)
+		}
+		case "doctype":
+			out.push(`<!DOCTYPE ${n.name}`)
+			if (n.publicId != "") {
+				out.push(` PUBLIC "${n.publicId}" ${systemLiteral(n.systemId)}`)
+			} else if (n.systemId != "") {
+				out.push(` SYSTEM ${systemLiteral(n.systemId)}`)
+			}
+			out.push(">")
+		case "element":
+			out.push(`<${n.name}`)
+			for (const a of n.attrs) {
+				out.push(` ${a.name}="${escape(a.value, true)}"`)
+			}
+			if (n.children.length == 0) {
+				out.push("/>")
+				return
+			}
+			out.push(">")
+			for (const c of n.children) {
+				write(c, out)
+			}
+			out.push(`</${n.name}>`)
+		case "text": out.push(escape(n.data, false))
+		case "comment": out.push(`<!--${n.data}-->`)
+		case "instruction": out.push(`<?${n.name}${if (n.data == "") "" else " " + n.data}?>`)
+	}
+}
+
+/// s escaped as text, or as an attribute value, whose whitespace other than spaces would be read back as spaces.
+function escape(s: string, attr: bool): string {
+	let out = ""
+	let from = 0
+	for (const i of 0 ... s.length - 1) {
+		const e = switch (s[i]) {
+			case amp: "&amp;"
+			case less: "&lt;"
+			case greater: "&gt;"
+			case quote: if (attr) "&quot;" else ""
+			case ascii.tab: if (attr) "&#9;" else ""
+			case ascii.lf: if (attr) "&#10;" else ""
+			case ascii.cr: "&#13;"
+			default: ""
+		}
+		if (e != "") {
+			out += s.slice(from, i) + e
+			from = i + 1
+		}
+	}
+	return out + s.slice(from, s.length)
+}
+
+/// What a document's internal subset declares, which the parsers of entities' text share.
+class Dtd {
+	entities = new HashMap[string, string]()
+	parameters = new HashMap[string, string]()
+	/// Of each element, the attributes declared for it.
+	attlists = new HashMap[string, Declared[]]()
+	/// Whether declarations may be missing, which an external subset or parameter entity could have made.
+	partial = false
+	/// The bytes that references and attribute defaults have expanded to, which stop at limit against entities that
+	/// expand exponentially and defaults that expand quadratically.
+	expanded: i64 = 0
+	limit: u32
+
+	constructor(limit: u32) { this.limit = limit }
+}
+
+/// An attribute as an ATTLIST declares it.
+class Declared {
+	name: string
+	/// Whether of type CDATA, whose values are not normalized further.
+	cdata: bool
+	default: string | null
+
+	constructor(name: string, cdata: bool, d: string | null) {
+		this.name = name
+		this.cdata = cdata
+		this.default = d
+	}
+}
+
+/// The text of the predefined entity name, which is never markup, or null.
+function builtin(name: string): string | null {
+	return switch (name) {
+		case "lt": "<"
+		case "gt": ">"
+		case "amp": "&"
+		case "apos": "'"
+		case "quot": "\""
+		default: null
+	}
+}
+
+class Parser {
+	s: string
+	i = 0
+	dtd: Dtd
+	/// The namespace prefixes in scope, each with its URI, innermost last.
+	scope: string[] = ["xml", xmlNS, "xmlns", xmlnsNS]
+	depth = 0
+
+	constructor(s: string, dtd: Dtd) {
+		this.s = s
+		this.dtd = dtd
+	}
+
+	document(): Node {
+		const doc = new Node("document")
+		let i = 0
+		while (i < this.s.length) {
+			const [cp, next] = codePoint(this.s, i)
+			if (cp < 0x20 && cp != 9 && cp != 10 || cp == 0xfffd && next == i + 1 || cp == 0xfffe || cp == 0xffff) {
+				throw new ParseError("syntax", i)
+			}
+			i = next
+		}
+		this.eat("\xef\xbb\xbf")
+		if (this.looking("<?xml") && isSpace(this.s.at(this.i + 5) ?? 0)) {
+			this.declaration()
+		}
+		let root = false
+		while (this.i < this.s.length) {
+			const at = this.i
+			if (this.space()) {
+				continue
+			}
+			if (this.eat("<!DOCTYPE")) {
+				if (root || doc.children.some(c => c.kind == "doctype")) {
+					throw new ParseError("syntax", at)
+				}
+				this.doctype(doc)
+			} else if (this.looking("<!--") || this.looking("<?")) {
+				this.misc(doc)
+			} else if (!root && this.looking("<")) {
+				this.element(doc)
+				root = true
+			} else {
+				throw this.error()
+			}
+		}
+		if (!root) {
+			throw this.error()
+		}
+		return doc
+	}
+
+	/// The XML declaration, which tells the version, encoding and standalone, in that order.
+	declaration() {
+		this.i += 5
+		const names = ["version", "encoding", "standalone"]
+		let k = 0
+		let first = true
+		while (first || !this.eat("?>")) {
+			if (!this.space()) {
+				throw this.error()
+			}
+			if (!first && this.eat("?>")) {
+				return
+			}
+			const at = this.i
+			const n = this.name()
+			while (k < names.length && names[k] != n) {
+				k++
+			}
+			if (k == names.length || (k == 0) != first) {
+				throw new ParseError("syntax", at)
+			}
+			first = false
+			this.equals()
+			const v = this.literal()
+			if (n == "encoding" && lower(v) != "utf-8" && lower(v) != "us-ascii") {
+				throw new ParseError("syntax", at)
+			}
+		}
+	}
+
+	doctype(doc: Node) {
+		const d = new Node("doctype")
+		d.at = this.i - 9
+		this.required()
+		d.name = this.name()
+		this.space()
+		if (this.externalId(d)) {
+			this.dtd.partial = true
+			this.space()
+		}
+		if (this.eat("[")) {
+			this.subset()
+			this.space()
+		}
+		this.expect(">")
+		doc.insert(d)
+	}
+
+	/// The external ID, as SYSTEM "uri" or PUBLIC "id" "uri", into d if one is next.
+	externalId(d: Node): bool {
+		if (this.eat("SYSTEM")) {
+			this.required()
+			d.systemId = this.literal()
+			return true
+		}
+		if (!this.eat("PUBLIC")) {
+			return false
+		}
+		this.required()
+		d.publicId = this.literal()
+		this.required()
+		d.systemId = this.literal()
+		return true
+	}
+
+	/// The internal subset, up to its ], or a parameter entity's text in it.
+	subset() {
+		while (if (this.depth > 0) this.i < this.s.length else !this.eat("]")) {
+			const at = this.i
+			if (this.space()) {
+				continue
+			}
+			if (this.eat("%")) {
+				const v = this.expand(this.dtd.parameters, this.name(), at)
+				this.expect(";")
+				if (v != null) {
+					this.nested(v, at, p => p.subset())
+				}
+			} else if (this.eat("<!ENTITY")) {
+				this.entity()
+			} else if (this.eat("<!ATTLIST")) {
+				this.attlist()
+			} else if (this.looking("<!--") || this.looking("<?")) {
+				this.misc(new Node("document"))
+			} else if (this.eat("<!ELEMENT")) {
+				this.elementDecl()
+			} else if (this.eat("<!NOTATION")) {
+				this.required()
+				while (!this.eat(">")) {
+					if (this.peek() == quote || this.peek() == ascii.apostrophe) {
+						this.literal()
+					} else {
+						this.next()
+					}
+				}
+			} else {
+				throw this.error()
+			}
+		}
+	}
+
+	/// An element type declaration, whose content model is only checked.
+	elementDecl() {
+		this.required()
+		this.name()
+		this.required()
+		if (!this.eat("EMPTY") && !this.eat("ANY")) {
+			this.expect("(")
+			this.space()
+			if (this.eat("#PCDATA")) {
+				this.space()
+				let names = false
+				while (this.eat("|")) {
+					this.space()
+					this.name()
+					this.space()
+					names = true
+				}
+				this.expect(")")
+				if (!this.eat("*") && names) {
+					throw this.error()
+				}
+			} else {
+				this.group()
+			}
+		}
+		this.space()
+		this.expect(">")
+	}
+
+	/// A choice or sequence after its (, whose particles are names or groups, each with an optional ?, * or +.
+	group() {
+		let sep = ascii.nul
+		while (true) {
+			this.space()
+			if (this.eat("(")) {
+				this.group()
+			} else {
+				this.name()
+				this.repeat()
+			}
+			this.space()
+			if (this.eat(")")) {
+				break
+			}
+			const c = this.next()
+			if (c != ascii.pipe && c != ascii.comma || sep != ascii.nul && c != sep) {
+				throw new ParseError("syntax", this.i - 1)
+			}
+			sep = c
+		}
+		this.repeat()
+	}
+
+	repeat() {
+		if (!this.eat("?") && !this.eat("*")) {
+			this.eat("+")
+		}
+	}
+
+	/// An entity declaration; the first of a name binds it.
+	entity() {
+		this.required()
+		const parameter = this.eat("%")
+		if (parameter) {
+			this.required()
+		}
+		const name = this.name()
+		this.required()
+		const ids = new Node("doctype")
+		let v: string | null = null
+		if (!this.externalId(ids)) {
+			v = this.entityValue()
+		}
+		this.space()
+		if (v == null && this.eat("NDATA")) {
+			this.required()
+			this.name()
+			this.space()
+		}
+		this.expect(">")
+		const entities = if (parameter) this.dtd.parameters else this.dtd.entities
+		if (v == null) {
+			this.dtd.partial = true
+		} else if (!entities.has(name) && (parameter || builtin(name) == null)) {
+			entities.set(name, v)
+		}
+	}
+
+	/// An attribute-list declaration; the first of an attribute binds it.
+	attlist() {
+		this.required()
+		const el = this.name()
+		const decls = this.dtd.attlists.get(el) ?? []
+		this.dtd.attlists.set(el, decls)
+		while (true) {
+			const spaced = this.space()
+			if (this.eat(">")) {
+				return
+			}
+			if (!spaced) {
+				throw this.error()
+			}
+			const name = this.name()
+			this.required()
+			const kind = if (this.looking("(")) "" else this.name()
+			if (kind == "NOTATION") {
+				this.required()
+			}
+			if (kind == "" || kind == "NOTATION") {
+				this.expect("(")
+				while (!this.eat(")")) {
+					this.next()
+				}
+			}
+			this.required()
+			let v: string | null = null
+			if (!this.eat("#REQUIRED") && !this.eat("#IMPLIED")) {
+				if (this.eat("#FIXED")) {
+					this.required()
+				}
+				v = this.attrValue(this.opening())
+			}
+			if (!decls.some(d => d.name == name)) {
+				decls.push(new Declared(name, kind == "CDATA", v))
+			}
+		}
+	}
+
+	/// The replacement text of an entity's quoted text: its character references expanded.
+	entityValue(): string {
+		const q = chr(this.opening())
+		let out = ""
+		while (!this.eat(q)) {
+			if (this.looking("&#")) {
+				this.i++
+				out += this.charRef()
+			} else {
+				if (this.peek() == ascii.percent) {
+					this.dtd.partial = true
+				}
+				out += chr(this.next())
+			}
+		}
+		return out
+	}
+
+	/// The comment or processing instruction next, into parent.
+	misc(parent: Node) {
+		const at = this.i
+		if (this.eat("<!--")) {
+			const end = indexOf(this.s, "--", this.i)
+			if (end < 0 || !this.at(end + 2, ">")) {
+				throw new ParseError("syntax", if (end < 0) this.s.length else end)
+			}
+			this.add(parent, new Node("comment", "", this.s.slice(this.i, end)), at)
+			this.i = end + 3
+			return
+		}
+		this.expect("<?")
+		const target = this.name()
+		if (lower(target) == "xml") {
+			throw new ParseError("syntax", at)
+		}
+		let data = ""
+		if (!this.eat("?>")) {
+			this.required()
+			const end = indexOf(this.s, "?>", this.i)
+			if (end < 0) {
+				throw new ParseError("syntax", this.s.length)
+			}
+			data = this.s.slice(this.i, end)
+			this.i = end + 2
+		}
+		this.add(parent, new Node("instruction", target, data), at)
+	}
+
+	element(parent: Node) {
+		const at = this.i
+		this.expect("<")
+		const el = new Node("element", this.name())
+		this.add(parent, el, at)
+		const outer = this.scope
+		while (!this.looking(">") && !this.looking("/>")) {
+			this.required()
+			if (this.looking(">") || this.looking("/>")) {
+				break
+			}
+			const k = this.i
+			const name = this.name()
+			this.equals()
+			const v = this.attrValue(this.opening())
+			if (el.attr(name) != null) {
+				throw new ParseError("syntax", k)
+			}
+			el.attrs.push(new Attribute(name, v))
+		}
+		for (const d of this.dtd.attlists.get(el.name) ?? []) {
+			const given = el.attrs.filter(a => a.name == d.name)
+			if (given.length == 0 && d.default != null) {
+				this.grow(d.name.length + d.default.length, at)
+				el.attrs.push(new Attribute(d.name, if (d.cdata) d.default else collapse(d.default)))
+			}
+			for (const a of given) {
+				if (!d.cdata) {
+					a.value = collapse(a.value)
+				}
+			}
+		}
+		for (const a of el.attrs) {
+			if (a.name == "xmlns" || startsWith(a.name, "xmlns:")) {
+				const prefix = if (a.name == "xmlns") "" else a.name.slice(6, a.name.length)
+				const v = a.value
+				if (prefix == "xmlns" || (prefix == "xml") != (v == xmlNS) || prefix != "" && v == "" || v == xmlnsNS) {
+					throw new ParseError("syntax", at)
+				}
+				this.scope = [...this.scope, prefix, v]
+			}
+		}
+		el.ns = this.resolve(el.name, true, at)
+		const expanded: string[] = []
+		for (const a of el.attrs) {
+			a.ns = this.resolve(a.name, false, at)
+			const e = `${a.ns} ${a.name.slice(indexOf(a.name, ":") + 1, a.name.length)}`
+			if (a.ns != "" && contains(expanded, e)) {
+				throw new ParseError("syntax", at)
+			}
+			expanded.push(e)
+		}
+		if (!this.eat("/>")) {
+			this.expect(">")
+			this.content(el)
+			const end = this.i
+			this.expect("</")
+			if (this.name() != el.name) {
+				throw new ParseError("syntax", end)
+			}
+			this.space()
+			this.expect(">")
+		}
+		this.scope = outer
+	}
+
+	/// The namespace URI of the qualified name, an element's if element, where a prefix is bound to one.
+	resolve(name: string, element: bool, at: i32): string {
+		if (name == "xmlns") {
+			return xmlnsNS
+		}
+		const c = indexOf(name, ":")
+		if (c < 0 && !element) {
+			return ""
+		}
+		const prefix = if (c < 0) "" else name.slice(0, c)
+		let i = this.scope.length - 2
+		while (i >= 0) {
+			if (this.scope[i] == prefix) {
+				return this.scope[i + 1]
+			}
+			i -= 2
+		}
+		if (prefix != "") {
+			throw new ParseError("syntax", at)
+		}
+		return ""
+	}
+
+	/// The content of an element, up to its end tag, into parent.
+	content(parent: Node) {
+		while (!this.looking("</")) {
+			const at = this.i
+			if (this.i == this.s.length) {
+				if (this.depth > 0) {
+					return
+				}
+				throw this.error()
+			}
+			if (this.eat("<![CDATA[")) {
+				const end = indexOf(this.s, "]]>", this.i)
+				if (end < 0) {
+					throw new ParseError("syntax", this.s.length)
+				}
+				this.text(parent, this.s.slice(this.i, end), at)
+				this.i = end + 3
+			} else if (this.looking("<!--") || this.looking("<?")) {
+				this.misc(parent)
+			} else if (this.looking("<")) {
+				this.element(parent)
+			} else if (this.eat("&")) {
+				this.reference(parent, at)
+			} else {
+				while (this.i < this.s.length && this.s[this.i] != less && this.s[this.i] != amp) {
+					if (this.looking("]]>")) {
+						throw this.error()
+					}
+					this.i++
+				}
+				this.text(parent, this.s.slice(at, this.i), at)
+			}
+		}
+	}
+
+	/// The reference after the & at at in content, into parent.
+	reference(parent: Node, at: i32) {
+		if (this.peek() == ascii.hash) {
+			this.text(parent, this.charRef(), at)
+			return
+		}
+		const name = this.name()
+		this.expect(";")
+		const lit = builtin(name)
+		if (lit != null) {
+			this.text(parent, lit, at)
+			return
+		}
+		const v = this.expand(this.dtd.entities, name, at)
+		if (v == null) {
+			return
+		}
+		if (indexOf(v, "<") < 0 && indexOf(v, "&") < 0) {
+			this.text(parent, v, at)
+			return
+		}
+		this.nested(v, at, p => p.content(parent))
+	}
+
+	/// The replacement text of the entity name of entities, referred to at at, or null for one left out.
+	expand(entities: HashMap[string, string], name: string, at: i32): string | null {
+		const v = entities.get(name)
+		if (v == null) {
+			if (this.dtd.partial) {
+				return null
+			}
+			throw new ParseError("syntax", at)
+		}
+		if (this.depth > 16) {
+			throw new ParseError("range", at)
+		}
+		this.grow(v.length, at)
+		return v
+	}
+
+	/// Counts n more bytes expanded at at against the limit.
+	grow(n: i32, at: i32) {
+		this.dtd.expanded += n
+		if (this.dtd.expanded > this.dtd.limit) {
+			throw new ParseError("range", at)
+		}
+	}
+
+	/// Parses v, the text of an entity referred to at at, whole with f, on a parser that shares this one's declarations
+	/// and scope.
+	nested(v: string, at: i32, f: (p: Parser) => void) {
+		const p = new Parser(v, this.dtd)
+		p.scope = this.scope
+		p.depth = this.depth + 1
+		try {
+			f(p)
+			if (p.i != v.length) {
+				throw p.error()
+			}
+		} catch (e: ParseError) {
+			throw new ParseError(e.kind, at)
+		}
+	}
+
+	/// The character reference after the &, as UTF-8.
+	charRef(): string {
+		const at = this.i - 1
+		this.expect("#")
+		const radix = if (this.eat("x")) 16 else 10
+		let cp: i64 = 0
+		const from = this.i
+		while (this.i < this.s.length && digit(this.s[this.i]) != null && digit(this.s[this.i])! < radix) {
+			cp = cp * radix + digit(this.s[this.i])!
+			if (cp > 0x10ffff) {
+				throw new ParseError("syntax", at)
+			}
+			this.i++
+		}
+		if (this.i == from || !this.eat(";") || cp < 0x20 && cp != 9 && cp != 10 && cp != 13 || 0xd800 <= cp < 0xe000
+			|| cp == 0xfffe || cp == 0xffff) {
+			throw new ParseError("syntax", at)
+		}
+		return utf8(cp)
+	}
+
+	/// An attribute value after its opening quote q, or an entity's text in one where q is 0, normalized: references
+	/// expanded and whitespace made spaces.
+	attrValue(q: u8): string {
+		let out = ""
+		while (if (q == 0) this.i < this.s.length else !this.eat(chr(q))) {
+			const at = this.i
+			const ch = this.next()
+			if (ch == less) {
+				throw new ParseError("syntax", at)
+			}
+			if (ch == amp && this.peek() == ascii.hash) {
+				out += this.charRef()
+			} else if (ch == amp) {
+				const name = this.name()
+				this.expect(";")
+				const lit = builtin(name)
+				const v = lit ?? this.expand(this.dtd.entities, name, at)
+				if (lit != null) {
+					out += lit
+				} else if (v != null) {
+					this.nested(v, at, p => {
+						out += p.attrValue(0)
+					})
+				}
+			} else {
+				out += if (ch == ascii.tab || ch == ascii.lf || ch == ascii.cr) " " else chr(ch)
+			}
+		}
+		return out
+	}
+
+	/// Appends n, which starts at at, to parent.
+	add(parent: Node, n: Node, at: i32) {
+		n.at = at
+		parent.insert(n)
+	}
+
+	/// Appends the text t at at to parent, joined to a text before it.
+	text(parent: Node, t: string, at: i32) {
+		const last = parent.children.at(parent.children.length - 1)
+		if (last != null && last.kind == "text") {
+			last.data += t
+		} else if (t != "") {
+			this.add(parent, new Node("text", "", t), at)
+		}
+	}
+
+	name(): string {
+		const at = this.i
+		while (this.i < this.s.length && isNameChar(this.s[this.i])
+			&& (this.i > at || !isDigit(this.s[at]) && this.s[at] != minus && this.s[at] != dot)) {
+			this.i++
+		}
+		if (this.i == at) {
+			throw this.error()
+		}
+		return this.s.slice(at, this.i)
+	}
+
+	/// The quote that opens a literal, which i moves past.
+	opening(): u8 {
+		const q = this.next()
+		if (q != quote && q != ascii.apostrophe) {
+			throw new ParseError("syntax", this.i - 1)
+		}
+		return q
+	}
+
+	/// A quoted literal's text.
+	literal(): string {
+		const q = this.opening()
+		const end = indexOf(this.s, chr(q), this.i)
+		if (end < 0) {
+			throw new ParseError("syntax", this.s.length)
+		}
+		const v = this.s.slice(this.i, end)
+		this.i = end + 1
+		return v
+	}
+
+	equals() {
+		this.space()
+		this.expect("=")
+		this.space()
+	}
+
+	/// Moves past whitespace; whether there was any.
+	space(): bool {
+		const at = this.i
+		while (this.i < this.s.length && isSpace(this.s[this.i])) {
+			this.i++
+		}
+		return this.i > at
+	}
+
+	required() {
+		if (!this.space()) {
+			throw this.error()
+		}
+	}
+
+	looking(w: string): bool { return this.at(this.i, w) }
+
+	/// Whether w is in the text at i.
+	at(i: i32, w: string): bool { return occurs(this.s, i, w) }
+
+	eat(w: string): bool {
+		if (!this.looking(w)) {
+			return false
+		}
+		this.i += w.length
+		return true
+	}
+
+	expect(w: string) {
+		if (!this.eat(w)) {
+			throw this.error()
+		}
+	}
+
+	peek(): u8 { return if (this.i < this.s.length) this.s[this.i] else ascii.nul }
+
+	next(): u8 {
+		if (this.i == this.s.length) {
+			throw this.error()
+		}
+		this.i++
+		return this.s[this.i - 1]
+	}
+
+	error(): ParseError { return new ParseError("syntax", this.i) }
+}
+
+/// Whether ch can be in a name; any byte of UTF-8 past ASCII can.
+function isNameChar(ch: u8): bool {
+	return isAlphanumeric(ch) || ch == underscore || ch == colon || ch == minus || ch == dot || ch >= 0x80
+}
+
+/// The element named n of v.
+function element[T](n: string, v: T): Node {
+	const el = new Node("element", n)
+	const t = typeof v
+	switch (t.kind) {
+		case "union": for (const M of t.members) {
+			if (v instanceof M) {
+				return element(n, v as M)
+			}
+		}
+		case "class", "object", "interface": for (const f of t.fields) {
+			const k = tag(f.tags, Name, f.name)
+			if (has(f.tags, Skip)) {
+				continue
+			} else if (has(f.tags, Attr)) {
+				const s = format(v[f.name])
+				if (s != null) {
+					el.attrs.push(new Attribute(k, s))
+				}
+			} else if (has(f.tags, Text)) {
+				el.insert(new Node("text", "", format(v[f.name]) ?? ""))
+			} else {
+				children(el, k, v[f.name])
+			}
+		}
+		default: el.insert(new Node("text", "", format(v) ?? ""))
+	}
+	return el
+}
+
+/// The elements named n of v into el: none for null, one for each item of an array.
+function children[T](el: Node, n: string, v: T): void {
+	const t = typeof v
+	switch (t.kind) {
+		case "null": return
+		case "array", "fixed": for (const x of v) {
+			children(el, n, x)
+		}
+		case "union": for (const M of t.members) {
+			if (v instanceof M) {
+				children(el, n, v as M)
+			}
+		}
+		default: el.insert(element(n, v))
+	}
+}
+
+/// The text of the scalar v, or null for null or what is not a scalar.
+function format[T](v: T): string | null {
+	const t = typeof v
+	switch (t.kind) {
+		case "bool", "int", "float", "string": return `${v}`
+		case "literal": return `${t.value}`
+		case "union":
+			for (const M of t.members) {
+				if (v instanceof M) {
+					return format(v as M)
+				}
+			}
+			return null
+		default: return null
+	}
+}
+
+/// The T that the element n holds.
+function value[T extends Decodable](n: Node): T throws ParseError {
+	switch (T.kind) {
+		case "union":
+			// Integers first, as 1 fits a float too and the members are in canonical order (§4.4), not as written.
+			for (const ints of [true, false]) {
+				for (const M of T.members) {
+					if ((M.kind == "int") == ints) {
+						try {
+							return value[M](n)
+						} catch {}
+					}
+				}
+			}
+			throw new ParseError("syntax", n.at)
+		case "class":
+			const r = new T()
+			for (const a of n.attrs) {
+				let known = a.ns == xmlnsNS
+				for (const f of T.fields) {
+					if (has(f.tags, Attr) && !has(f.tags, Skip) && a.name == tag(f.tags, Name, f.name)) {
+						r[f.name] = scalar[f.type](a.value, n.at)
+						known = true
+					}
+				}
+				if (!known) {
+					throw new ParseError("syntax", n.at)
+				}
+			}
+			for (const c of n.children) {
+				let known = c.kind == "comment" || c.kind == "instruction" || c.kind == "text" && trim(c.data) == ""
+				for (const f of T.fields) {
+					if (has(f.tags, Text) && f.type == string) {
+						if (c.kind == "text") {
+							const t: string = r[f.name]
+							r[f.name] = t + c.data
+							known = true
+						}
+					} else if (!has(f.tags, Attr) && !has(f.tags, Skip)) {
+						if (c.kind == "element" && c.name == tag(f.tags, Name, f.name)) {
+							if (f.type.kind == "array") {
+								const xs: f.type = r[f.name]
+								xs.push(value[f.type.elem](c))
+							} else {
+								r[f.name] = value[f.type](c)
+							}
+							known = true
+						}
+					}
+				}
+				if (!known) {
+					throw new ParseError("syntax", c.at)
+				}
+			}
+			return r
+		default:
+			if (n.children.some(c => c.kind == "element") || n.attrs.some(a => a.ns != xmlnsNS)) {
+				throw new ParseError("syntax", n.at)
+			}
+			return scalar[T](n.text(), n.at)
+	}
+}
+
+/// The T that the text s at at holds.
+function scalar[T extends Decodable](s: string, at: i32): T throws ParseError {
+	switch (T.kind) {
+		case "null": if (s == "") {
+			return null
+		}
+		case "bool": if (s == "true" || s == "false") {
+			return s == "true"
+		}
+		case "int", "float": try {
+			return if (T.kind == "int") parseInt[T](trim(s)) else parseFloat[T](trim(s))
+		} catch (e: ParseError) {
+			throw new ParseError(e.kind, at)
+		}
+		case "string": return s
+		case "literal": if (s == `${T.value}`) {
+			return T.value
+		}
+		case "union":
+			// Integers first, as 1 fits a float too and the members are in canonical order (§4.4), not as written.
+			for (const ints of [true, false]) {
+				for (const M of T.members) {
+					if ((M.kind == "int") == ints) {
+						try {
+							return scalar[M](s, at)
+						} catch {}
+					}
+				}
+			}
+	}
+	throw new ParseError("syntax", at)
+}
+
+/// s with its spaces collapsed, as the values of attributes not of type CDATA are.
+function collapse(s: string): string { return split(s, " ").filter(w => w != "").join(" ") }
+/// Whether ch is XML's whitespace.
+function isSpace(ch: u8): bool { return ch == ascii.space || ch == ascii.tab || ch == ascii.lf || ch == ascii.cr }

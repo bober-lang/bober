@@ -1,0 +1,259 @@
+//! html.bob against the tests in vendor/xml-tests: html5lib's tokenizer tests, each input in each of its initial states
+//! to its tokens; WPT's tree construction tests, each document or fragment to its tree; and WPT's serializing tests.
+//! Left out is what is not HTML parsing: xmlViolation.test's tokens as an XML infoset coerces them, doubleEscaped
+//! tests' lone surrogates, which UTF-8 cannot hold, scripted_*.dat's scripts, and selectedcontent's copy of the
+//! selected option, which the select element's DOM makes.
+
+import { contains } from "../algo"
+import { glob, readFile } from "../fs"
+import { base } from "../fs/path"
+import { sortBy } from "../sort"
+import { indexOf, split, startsWith, trim } from "../string"
+import { decode, quoted, Rest, Unknown } from "./json"
+import { parse, parseFragment, serialize, State, Tokenizer } from "./html"
+import { htmlNS, mathNS, Node, svgNS, xlinkNS, xmlNS, xmlnsNS } from "./xml"
+
+const root = "vendor/xml-tests"
+
+test "tokenizer" {
+	for (const f of glob(`${root}/html5lib/tokenizer/*.test`)) {
+		if (base(f) == "xmlViolation.test") {
+			continue
+		}
+		for (const c of decode[Suite](readFile(f)).tests) {
+			if (!c.doubleEscaped) {
+				for (const s of c.initialStates) {
+					test `${base(f)}: ${c.description} in ${s}` {
+						assert show(tokens(c.input, state(s), c.lastStartTag)) == show(c.output)
+					}
+				}
+			}
+		}
+	}
+}
+
+test "tree construction" {
+	for (const f of glob(`${root}/wpt/tree-construction/*.dat`)) {
+		if (!startsWith(base(f), "scripted_")) {
+			for (const c of cases(readFile(f))) {
+				if (indexOf(c.data, "<selectedcontent>") < 0) {
+					for (const scripting of [true, false]) {
+						if (c.scripting == null || c.scripting == scripting) {
+							test `${base(f)}: ${quoted(c.data)}` {
+								assert tree(c, scripting) == c.document
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+test "serializing" {
+	const page = readFile(`${root}/wpt/serializing.html`)
+	const from = indexOf(page, "var expected = ") + 15
+	const expected = decode[string[][]](page.slice(from, indexOf(page, "];", from) + 1))
+	const div = parse(page).elements("div").filter(d => d.attr("id") == "test")[0]
+	const els = div.children.filter(n => n.kind == "element")
+	assert els.length == expected.length
+	for (const i of 0 ... els.length - 1) {
+		test `${expected[i][1]}` {
+			assert els[i].children.map(serialize).join("") == expected[i][0]
+			assert serialize(els[i]) == expected[i][1]
+		}
+	}
+}
+
+class Attrs {
+	rest: Unknown[] @Rest = []
+}
+
+/// A token's field as html5lib writes it, in an array that starts with the token's kind.
+type Value = string | bool | null | Attrs
+
+class Test {
+	description = ""
+	input = ""
+	output: Value[][] = []
+	initialStates: string[] = ["Data state"]
+	lastStartTag = ""
+	doubleEscaped = false
+	rest: Unknown[] @Rest = []
+}
+
+class Suite {
+	tests: Test[] = []
+}
+
+function state(s: string): State {
+	return switch (s) {
+		case "PLAINTEXT state": "plaintext"
+		case "RCDATA state": "rcdata"
+		case "RAWTEXT state": "rawtext"
+		case "Script data state": "script"
+		case "CDATA section state": "cdata"
+		default: "data"
+	}
+}
+
+/// The tokens of s as html5lib writes them.
+function tokens(s: string, st: State, last: string): Value[][] {
+	const tok = new Tokenizer(s)
+	tok.state = st
+	tok.last = last
+	const out: Value[][] = []
+	while (true) {
+		const t = tok.next()
+		switch (t.kind) {
+			case "eof": return out
+			case "doctype": out.push(["DOCTYPE", if (t.name == "") null else t.name, t.publicId, t.systemId, !t.quirks])
+			case "start":
+				const a = new Attrs()
+				for (const x of t.attrs) {
+					a.rest.push([x.name, quoted(x.value)])
+				}
+				const v: Value[] = ["StartTag", t.name, a]
+				if (t.selfClosing) {
+					v.push(true)
+				}
+				out.push(v)
+			case "end": out.push(["EndTag", t.name])
+			case "comment": out.push(["Comment", t.data])
+			case "instruction": out.push(["ProcessingInstruction", t.name, t.data])
+			case "text": out.push(["Character", t.data])
+		}
+	}
+}
+
+/// tokens as text to compare, adjacent characters merged.
+function show(tokens: Value[][]): string {
+	const out: string[] = []
+	let chars = ""
+	for (const t of tokens) {
+		if (t[0] == "Character") {
+			chars += t[1] as string
+			continue
+		}
+		if (chars != "") {
+			out.push(`["Character",${quoted(chars)}]`)
+			chars = ""
+		}
+		out.push(`[${t.map(value).join(",")}]`)
+	}
+	if (chars != "") {
+		out.push(`["Character",${quoted(chars)}]`)
+	}
+	return out.join(",")
+}
+
+function value(v: Value): string {
+	if (v instanceof string) {
+		return quoted(v)
+	}
+	if (v instanceof Attrs) {
+		const kv: string[] = []
+		for (const [k, text] of v.rest) {
+			kv.push(`${quoted(k)}:${quoted(decode[string](text))}`)
+		}
+		return `{${kv.join(",")}}`
+	}
+	return `${v}`
+}
+
+class Case {
+	data = ""
+	/// The fragment's context element, as "td" or "svg path", or "" for a document.
+	fragment = ""
+	scripting: bool | null = null
+	document = ""
+}
+
+const headers = ["#data", "#errors", "#new-errors", "#document-fragment", "#script-off", "#script-on", "#document",
+	"#description"]
+
+/// The cases of a .dat file.
+function cases(text: string): Case[] {
+	const out: Case[] = []
+	let c = new Case()
+	let section = ""
+	let body = ""
+	const flush = () => {
+		const v = if (body.length > 0) body.slice(0, body.length - 1) else body
+		switch (section) {
+			case "#data": c.data = v
+			case "#document-fragment": c.fragment = v
+			case "#document": c.document = trim(v)
+			default: {}
+		}
+		body = ""
+	}
+	for (const line of split(text, "\n")) {
+		if (contains(headers, line)) {
+			flush()
+			if ((line == "#data" || line == "#description") && section == "#document") {
+				out.push(c)
+				c = new Case()
+			}
+			section = line
+			if (line == "#script-on" || line == "#script-off") {
+				c.scripting = line == "#script-on"
+			}
+		} else {
+			body += line + "\n"
+		}
+	}
+	flush()
+	out.push(c)
+	return out
+}
+
+/// The tree that c parses to, as html5lib dumps it.
+function tree(c: Case, scripting: bool): string {
+	const out: string[] = []
+	if (c.fragment == "") {
+		dump(parse(c.data, scripting).children, "", out)
+	} else {
+		const sp = indexOf(c.fragment, " ")
+		const context = new Node("element", c.fragment.slice(sp + 1, c.fragment.length))
+		context.ns = if (sp < 0) htmlNS else if (startsWith(c.fragment, "svg")) svgNS else mathNS
+		dump(parseFragment(c.data, context, scripting), "", out)
+	}
+	return out.join("\n")
+}
+
+function dump(nodes: Node[], pad: string, out: string[]): void {
+	for (const n of nodes) {
+		switch (n.kind) {
+			case "doctype": out.push(if (n.publicId == "" && n.systemId == "") `| <!DOCTYPE ${n.name}>`
+				else `| <!DOCTYPE ${n.name} "${n.publicId}" "${n.systemId}">`)
+			case "text": out.push(`| ${pad}"${n.data}"`)
+			case "comment": out.push(`| ${pad}<!-- ${n.data} -->`)
+			case "instruction": out.push(`| ${pad}<?${n.name} ${n.data}?>`)
+			case "element":
+				out.push(`| ${pad}<${prefix(n.ns)}${n.name}>`)
+				const attrs = n.attrs.map(a => `| ${pad}  ${prefix(a.ns)}${if (a.ns == "") a.name else a.name.slice(indexOf(a.name, ":") + 1, a.name.length)}="${a.value}"`)
+				sortBy(attrs, (a, b) => a < b)
+				out.append(attrs)
+				if (n.ns == htmlNS && n.name == "template") {
+					out.push(`| ${pad}  content`)
+					dump(n.children, pad + "    ", out)
+				} else {
+					dump(n.children, pad + "  ", out)
+				}
+			default: {}
+		}
+	}
+}
+
+/// The prefix that html5lib writes for a name in ns.
+function prefix(ns: string): string {
+	return switch (ns) {
+		case svgNS: "svg "
+		case mathNS: "math "
+		case xlinkNS: "xlink "
+		case xmlNS: "xml "
+		case xmlnsNS: "xmlns "
+		default: ""
+	}
+}

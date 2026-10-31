@@ -1,0 +1,34 @@
+//! Bytes as hexadecimal text.
+
+import { digit } from "../ascii"
+import { ParseError } from "../parse"
+
+const hex = "0123456789abcdef"
+
+/// The bytes of s, two lowercase hex digits each.
+export function encode(s: string): string {
+	let out = ""
+	for (const b of s) {
+		out += chr(hex[b >> 4]) + chr(hex[b & 15])
+	}
+	return out
+}
+
+/// The bytes that s, hex digits of either case, spells; a syntax error at a bad digit, or at the end if s is odd.
+export function decode(s: string): string throws ParseError {
+	let out = ""
+	for (const i of 0 ... s.length / 2 - 1) {
+		const [hi, lo] = [digit(s[2 * i]), digit(s[2 * i + 1])]
+		if (hi == null || hi > 15) {
+			throw new ParseError("syntax", 2 * i)
+		}
+		if (lo == null || lo > 15) {
+			throw new ParseError("syntax", 2 * i + 1)
+		}
+		out += chr(hi << 4 | lo)
+	}
+	if (s.length % 2 == 1) {
+		throw new ParseError("syntax", s.length)
+	}
+	return out
+}

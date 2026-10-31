@@ -1,0 +1,2226 @@
+//! HTML as the WHATWG's living standard parses it, into ./xml's Nodes, and Nodes back to HTML. Parsing never fails:
+//! as in a browser, any text makes a document, and parse errors are not reported. The input is UTF-8, the encoding is
+//! not sniffed, and scripts do not run. A template's contents are its children.
+
+import { contains, insertAt, position, removeAt } from "../algo"
+
+import { ampersand as amp, exclamation, greater, isAlphabetic, isAlphanumeric, isDigit, less, minus, question, quote,
+	semicolon, slash, toLower, underscore, x } from "../ascii"
+
+import * as ascii from "../ascii"
+import { HashMap } from "../collections/hashmap"
+import { endsWith, indexOf, lower, occurs, replace, startsWith, utf8 } from "../string"
+import { entities } from "./html/entities"
+import { Attribute, htmlNS, mathNS, Node, svgNS, xlinkNS, xmlNS, xmlnsNS } from "./xml"
+
+/// The document that s holds; scripting, as in a browser that runs scripts, parses noscript's content as text.
+export function parse(s: string, scripting: bool = true): Node {
+	const p = new Parser(s, scripting, null)
+	p.run()
+	return p.doc
+}
+
+/// The nodes that s holds as the content of context, as innerHTML sets them.
+export function parseFragment(s: string, context: Node, scripting: bool = true): Node[] {
+	const p = new Parser(s, scripting, context)
+	p.run()
+	const nodes = p.doc.children[0].children
+	for (const n of nodes) {
+		n.parent = null
+	}
+	return nodes
+}
+
+/// n as HTML: an element with its tags, a document as its children.
+export function serialize(n: Node): string {
+	const out: string[] = []
+	write(n, out)
+	return out.join("")
+}
+
+export type TokenKind = "doctype" | "start" | "end" | "comment" | "instruction" | "text" | "eof"
+
+export class Token {
+	kind: TokenKind
+	/// A tag's or doctype's name, or an instruction's target.
+	name: string
+	/// The text of a text, comment or instruction.
+	data: string
+	attrs: Attribute[] = []
+	selfClosing = false
+	/// A doctype's identifiers, null where missing.
+	publicId: string | null = null
+	systemId: string | null = null
+	/// Whether a doctype forces quirks mode.
+	quirks = false
+
+	constructor(kind: TokenKind, name: string = "", data: string = "") {
+		this.kind = kind
+		this.name = name
+		this.data = data
+	}
+
+	attr(name: string): string | null {
+		for (const a of this.attrs) {
+			if (a.name == name) {
+				return a.value
+			}
+		}
+		return null
+	}
+}
+
+/// The states that tokenize an element's text, which a tree builder switches to after its start tag, and a CDATA
+/// section's.
+export type State = "data" | "rcdata" | "rawtext" | "script" | "plaintext" | "cdata"
+
+/// The tokens of HTML in order, each run of text one token.
+export class Tokenizer {
+	s: string
+	i = 0
+	state: State = "data"
+	/// The name of the last start tag, which an end tag must have to end RCDATA, RAWTEXT or script data.
+	last = ""
+	/// Whether <![CDATA[ opens a CDATA section, as it does where the adjusted current node is not HTML.
+	cdata = false
+
+	constructor(s: string) { this.s = if (indexOf(s, "\r") < 0) s else replace(replace(s, "\r\n", "\n"), "\r", "\n") }
+
+	next(): Token {
+		while (this.i < this.s.length) {
+			const t = this.step()
+			if (t != null) {
+				return t
+			}
+		}
+		if (this.state == "cdata") {
+			this.state = "data"
+		}
+		return new Token("eof")
+	}
+
+	step(): Token | null {
+		switch (this.state) {
+			case "data": return if (this.s[this.i] == less) this.tag() else this.text(true, "\0")
+			case "rcdata", "rawtext", "script":
+				if (this.endTagAhead()) {
+					this.i += 2
+					this.state = "data"
+					return this.tagName("end")
+				}
+				return if (this.state == "script") this.script() else this.text(this.state == "rcdata", "\u{FFFD}")
+			case "plaintext": return this.text(false, "\u{FFFD}")
+			case "cdata":
+				const end = indexOf(this.s, "]]>", this.i)
+				const from = this.i
+				this.i = if (end < 0) this.s.length else end + 3
+				this.state = "data"
+				return if (end == from) null
+					else new Token("text", "", this.s.slice(from, if (end < 0) this.s.length else end))
+		}
+	}
+
+	/// The text up to the next tag, with character references if refs, and NUL replaced by nul.
+	text(refs: bool, nul: string): Token {
+		let out = ""
+		let from = this.i
+		while (this.i < this.s.length) {
+			const ch = this.s[this.i]
+			if (ch == less && (this.state == "data" || this.state != "plaintext" && this.endTagAhead())) {
+				break
+			}
+			if (ch == amp && refs || ch == 0 && nul != "\0") {
+				out += this.s.slice(from, this.i)
+				this.i++
+				out += if (ch == 0) nul else this.charRef(false)
+				from = this.i
+			} else {
+				this.i++
+			}
+		}
+		return new Token("text", "", out + this.s.slice(from, this.i))
+	}
+
+	/// Script data up to its end tag, past the <!-- --> that escape it and the <script> that double escape it.
+	script(): Token {
+		let st = "data"
+		let out = ""
+		let from = this.i
+		while (this.i < this.s.length) {
+			const ch = this.s[this.i]
+			const double = startsWith(st, "double")
+			const base = if (double) "double" else "escaped"
+			if (ch == less) {
+				if (!double && this.endTagAhead()) {
+					break
+				}
+				if (st == "data") {
+					if (this.at(this.i, "<!--")) {
+						st = "escapedDashDash"
+						this.i += 3
+					}
+				} else if (!double) {
+					const name = this.letters(this.i + 1)
+					st = if (name == "script" && this.ends(this.i + 1 + name.length)) "double" else "escaped"
+					this.i += name.length
+				} else if (this.s.at(this.i + 1) == slash) {
+					const name = this.letters(this.i + 2)
+					st = if (name == "script" && this.ends(this.i + 2 + name.length)) "escaped" else "double"
+					this.i += 1 + name.length
+				} else {
+					st = "double"
+				}
+			} else if (st != "data") {
+				st = if (ch == minus) (if (st == base) base + "Dash" else base + "DashDash")
+					else if (ch == greater && endsWith(st, "DashDash")) "data"
+					else base
+			}
+			if (ch == 0) {
+				out += this.s.slice(from, this.i) + "\u{FFFD}"
+				from = this.i + 1
+			}
+			this.i++
+		}
+		return new Token("text", "", out + this.s.slice(from, this.i))
+	}
+
+	/// The ASCII letters at i, in lower case.
+	letters(i: i32): string {
+		let j = i
+		while (j < this.s.length && isAlphabetic(this.s[j])) {
+			j++
+		}
+		return lower(this.s.slice(i, j))
+	}
+
+	/// Whether a tag name could end at i: whitespace, / or > is there.
+	ends(i: i32): bool {
+		const ch = this.s.at(i) ?? ascii.nul
+		return isSpace(ch) || ch == slash || ch == greater
+	}
+
+	/// Whether the end tag of the last start tag is at i.
+	endTagAhead(): bool {
+		const n = this.last.length
+		return n > 0 && this.at(this.i, "</") && this.i + 2 + n < this.s.length
+			&& lower(this.s.slice(this.i + 2, this.i + 2 + n)) == this.last && this.ends(this.i + 2 + n)
+	}
+
+	/// The tag, comment, doctype or instruction at the <, or what of it is text, or null for what makes no token.
+	tag(): Token | null {
+		this.i++
+		if (this.i == this.s.length) {
+			return new Token("text", "", "<")
+		}
+		const ch = this.s[this.i]
+		if (ch == exclamation) {
+			this.i++
+			return this.declaration()
+		}
+		if (ch == slash) {
+			this.i++
+			if (this.i == this.s.length) {
+				return new Token("text", "", "</")
+			}
+			if (isAlphabetic(this.s[this.i])) {
+				return this.tagName("end")
+			}
+			if (this.s[this.i] == greater) {
+				this.i++
+				return null
+			}
+			return this.bogus("")
+		}
+		if (isAlphabetic(ch)) {
+			return this.tagName("start")
+		}
+		if (ch == question) {
+			this.i++
+			return this.instruction()
+		}
+		return new Token("text", "", "<")
+	}
+
+	/// The tag whose name is at i, or null where the input ends in it.
+	tagName(kind: TokenKind): Token | null {
+		const t = new Token(kind, this.name(false))
+		while (true) {
+			this.space()
+			if (this.i == this.s.length) {
+				return null
+			}
+			const ch = this.s[this.i]
+			if (ch == greater) {
+				this.i++
+				if (kind == "start") {
+					this.last = t.name
+				} else {
+					t.attrs = []
+					t.selfClosing = false
+				}
+				return t
+			}
+			if (ch == slash) {
+				this.i++
+				t.selfClosing = this.s.at(this.i) == greater
+				continue
+			}
+			t.selfClosing = false
+			const name = this.name(true)
+			let value = ""
+			this.space()
+			if (this.s.at(this.i) == ascii.equal) {
+				this.i++
+				this.space()
+				const v = this.value()
+				if (v == null) {
+					return null
+				}
+				value = v
+			}
+			if (t.attr(name) == null) {
+				t.attrs.push(new Attribute(name, value))
+			}
+		}
+	}
+
+	/// A tag's or attribute's name, in lower case, an attribute's starting with any character but whitespace, / and >.
+	name(attr: bool): string {
+		let out = ""
+		const from = this.i
+		while (this.i < this.s.length) {
+			const ch = this.s[this.i]
+			if (isSpace(ch) || ch == slash || ch == greater || attr && ch == ascii.equal && this.i > from) {
+				break
+			}
+			out += if (ch == 0) "\u{FFFD}" else chr(toLower(ch))
+			this.i++
+		}
+		return out
+	}
+
+	/// An attribute's value, quoted or not, or null where the input ends in it.
+	value(): string | null {
+		const q = this.s.at(this.i) ?? ascii.nul
+		const quoted = q == quote || q == ascii.apostrophe
+		if (quoted) {
+			this.i++
+		}
+		let out = ""
+		while (this.i < this.s.length) {
+			const ch = this.s[this.i]
+			if (if (quoted) ch == q else isSpace(ch) || ch == greater) {
+				if (quoted) {
+					this.i++
+				}
+				return out
+			}
+			this.i++
+			out += if (ch == amp) this.charRef(true) else if (ch == 0) "\u{FFFD}" else chr(ch)
+		}
+		return null
+	}
+
+	/// The text of the character reference after an &, in an attribute's value if attr, or "&" where there is none.
+	charRef(attr: bool): string {
+		const ch = this.s.at(this.i) ?? ascii.nul
+		if (ch == ascii.hash) {
+			return this.numeric()
+		}
+		if (!isAlphanumeric(ch)) {
+			return "&"
+		}
+		let n = 0
+		while (this.i + n < this.s.length && n < 32 && isAlphanumeric(this.s[this.i + n])) {
+			n++
+		}
+		if (this.s.at(this.i + n) == semicolon) {
+			n++
+		}
+		while (n > 0) {
+			const v = named.get(this.s.slice(this.i, this.i + n))
+			if (v != null) {
+				const next = this.s.at(this.i + n) ?? ascii.nul
+				if (attr && this.s[this.i + n - 1] != semicolon && (next == ascii.equal || isAlphanumeric(next))) {
+					return "&"
+				}
+				this.i += n
+				return v
+			}
+			n--
+		}
+		return "&"
+	}
+
+	/// The text of the numeric character reference after an &, or "&" where it has no digits.
+	numeric(): string {
+		const at = this.i
+		this.i++
+		const hex = ((this.s.at(this.i) ?? 0) | 32) == x
+		if (hex) {
+			this.i++
+		}
+		const radix = if (hex) 16 else 10
+		const from = this.i
+		let cp: i64 = 0
+		while (this.i < this.s.length && ascii.digit(this.s[this.i]) != null && ascii.digit(this.s[this.i])! < radix) {
+			cp = cp * radix + ascii.digit(this.s[this.i])!
+			if (cp > 0x10ffff) {
+				cp = 0x110000
+			}
+			this.i++
+		}
+		if (this.i == from) {
+			this.i = at
+			return "&"
+		}
+		if (this.s.at(this.i) == semicolon) {
+			this.i++
+		}
+		if (cp == 0 || cp > 0x10ffff || 0xd800 <= cp < 0xe000) {
+			return "\u{FFFD}"
+		}
+		if (0x80 <= cp < 0xa0 && windows1252[(cp - 0x80) as i32] != 0) {
+			return utf8(windows1252[(cp - 0x80) as i32])
+		}
+		return utf8(cp)
+	}
+
+	/// What follows a <!: a comment, doctype or CDATA section, or a bogus comment.
+	declaration(): Token | null {
+		if (this.at(this.i, "--")) {
+			this.i += 2
+			return this.comment()
+		}
+		if (this.i + 7 <= this.s.length && lower(this.s.slice(this.i, this.i + 7)) == "doctype") {
+			this.i += 7
+			return this.doctype()
+		}
+		if (this.cdata && this.at(this.i, "[CDATA[")) {
+			this.i += 7
+			this.state = "cdata"
+			return null
+		}
+		return this.bogus("")
+	}
+
+	/// A comment after its <!--, as the comment states read it.
+	comment(): Token {
+		let d = ""
+		let st = "start"
+		while (this.i < this.s.length) {
+			const ch = this.s[this.i]
+			this.i++
+			switch (st) {
+				case "start", "startDash":
+					if (ch == greater) {
+						return new Token("comment", "", d)
+					}
+					if (ch == minus && st == "start") {
+						st = "startDash"
+					} else if (ch == minus) {
+						st = "end"
+					} else {
+						d += if (st == "startDash") "-" else ""
+						this.i--
+						st = "comment"
+					}
+				case "comment": if (ch == minus) {
+					st = "endDash"
+				} else {
+					d += if (ch == 0) "\u{FFFD}" else chr(ch)
+				}
+				case "endDash": if (ch == minus) {
+					st = "end"
+				} else {
+					d += "-"
+					this.i--
+					st = "comment"
+				}
+				case "end":
+					if (ch == greater) {
+						return new Token("comment", "", d)
+					}
+					if (ch == exclamation) {
+						st = "bang"
+					} else if (ch == minus) {
+						d += "-"
+					} else {
+						d += "--"
+						this.i--
+						st = "comment"
+					}
+				default:
+					if (ch == greater) {
+						return new Token("comment", "", d)
+					}
+					d += "--!"
+					if (ch == minus) {
+						st = "endDash"
+					} else {
+						this.i--
+						st = "comment"
+					}
+			}
+		}
+		return new Token("comment", "", d)
+	}
+
+	/// A comment of what is at i up to the next >, after prefix.
+	bogus(prefix: string): Token { return new Token("comment", "", prefix + replace(this.skip(), "\0", "\u{FFFD}")) }
+
+	/// The text at i up to the next >, which i moves past.
+	skip(): string {
+		const from = this.i
+		const end = indexOf(this.s, ">", from)
+		this.i = if (end < 0) this.s.length else end + 1
+		return this.s.slice(from, if (end < 0) this.s.length else end)
+	}
+
+	/// A processing instruction after its <?, a bogus comment where it has no valid target, or null where the input ends
+	/// in it.
+	instruction(): Token | null {
+		const from = this.i
+		if (from < this.s.length && !isAlphabetic(this.s[from]) && this.s[from] != underscore) {
+			return this.bogus("?")
+		}
+		while (this.i < this.s.length
+			&& (isAlphanumeric(this.s[this.i]) || this.s[this.i] == minus || this.s[this.i] == underscore)) {
+			this.i++
+		}
+		const target = this.s.slice(from, this.i)
+		if (this.i == this.s.length) {
+			return null
+		}
+		const ch = this.s[this.i]
+		if (!isSpace(ch) && ch != question && ch != greater || lower(target) == "xml"
+			|| lower(target) == "xml-stylesheet") {
+			return this.bogus("?" + target)
+		}
+		this.space()
+		const start = this.i
+		while (this.i < this.s.length) {
+			if (this.s[this.i] == greater) {
+				const end = if (this.i > start && this.s[this.i - 1] == question) this.i - 1 else this.i
+				this.i++
+				return new Token("instruction", target, this.s.slice(start, end))
+			}
+			this.i++
+		}
+		return null
+	}
+
+	/// A doctype after its <!DOCTYPE, as the doctype states read it.
+	doctype(): Token {
+		const t = new Token("doctype")
+		this.space()
+		if (this.i == this.s.length || this.eat(">")) {
+			t.quirks = true
+			return t
+		}
+		while (this.i < this.s.length && !isSpace(this.s[this.i]) && this.s[this.i] != greater) {
+			t.name += if (this.s[this.i] == 0) "\u{FFFD}" else chr(toLower(this.s[this.i]))
+			this.i++
+		}
+		if (this.end(t)) {
+			return t
+		}
+		const keyword = if (this.i + 6 <= this.s.length) lower(this.s.slice(this.i, this.i + 6)) else ""
+		let pub = keyword == "public"
+		if (pub || keyword == "system") {
+			this.i += 6
+			this.space()
+			while (this.s.at(this.i) == quote || this.s.at(this.i) == ascii.apostrophe) {
+				const q = this.s[this.i]
+				this.i++
+				let id = ""
+				while (this.i < this.s.length && this.s[this.i] != q && this.s[this.i] != greater) {
+					id += if (this.s[this.i] == 0) "\u{FFFD}" else chr(this.s[this.i])
+					this.i++
+				}
+				if (pub) {
+					t.publicId = id
+				} else {
+					t.systemId = id
+				}
+				if (!this.eat(chr(q))) {
+					t.quirks = true
+					this.eat(">")
+					return t
+				}
+				if (this.end(t)) {
+					return t
+				}
+				if (!pub) {
+					this.skip()
+					return t
+				}
+				pub = false
+			}
+		}
+		t.quirks = true
+		if (!this.eat(">")) {
+			this.skip()
+		}
+		return t
+	}
+
+	/// Whether t ends after whitespace, at its > or at the end of the input, which forces quirks mode.
+	end(t: Token): bool {
+		this.space()
+		if (this.eat(">")) {
+			return true
+		}
+		t.quirks = this.i == this.s.length
+		return t.quirks
+	}
+
+	space(): bool {
+		const at = this.i
+		while (this.i < this.s.length && isSpace(this.s[this.i])) {
+			this.i++
+		}
+		return this.i > at
+	}
+
+	at(i: i32, w: string): bool { return occurs(this.s, i, w) }
+
+	eat(w: string): bool {
+		if (!this.at(this.i, w)) {
+			return false
+		}
+		this.i += w.length
+		return true
+	}
+}
+
+/// The code points that the references from &#x80; to &#x9F; stand for, as windows-1252 has them, or 0 for their own.
+const windows1252: i64[] = [0x20ac, 0, 0x201a, 0x192, 0x201e, 0x2026, 0x2020, 0x2021, 0x2c6, 0x2030, 0x160, 0x2039,
+	0x152, 0, 0x17d, 0, 0, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014, 0x2dc, 0x2122, 0x161, 0x203a, 0x153,
+	0, 0x17e, 0x178]
+
+const named = index(entities)
+
+function index(pairs: string[]): HashMap[string, string] {
+	const m = new HashMap[string, string]()
+	let i = 0
+	while (i < pairs.length) {
+		m.set(pairs[i], pairs[i + 1])
+		i += 2
+	}
+	return m
+}
+
+/// Whether ch is HTML's whitespace.
+function isSpace(ch: u8): bool {
+	return ch == ascii.space || ch == ascii.tab || ch == ascii.lf || ch == 0x0c || ch == ascii.cr
+}
+
+type Mode = "initial" | "beforeHtml" | "beforeHead" | "inHead" | "inHeadNoscript" | "afterHead" | "inBody" | "text"
+	| "inTable" | "inTableText" | "inCaption" | "inColumnGroup" | "inTableBody" | "inRow" | "inCell" | "inTemplate"
+	| "afterBody" | "inFrameset" | "afterFrameset" | "afterAfterBody" | "afterAfterFrameset"
+
+type Scope = "default" | "list" | "button" | "table"
+
+/// The tree builder, as the standard's tree construction stage, named as there.
+class Parser {
+	tok: Tokenizer
+	doc = new Node("document")
+	scripting: bool
+	/// The fragment's context element, or null for a document.
+	context: Node | null
+	mode: Mode = "initial"
+	original: Mode = "initial"
+	templateModes: Mode[] = []
+	open: Node[] = []
+	/// The list of active formatting elements, null for a marker.
+	active: (Node | null)[] = []
+	head: Node | null = null
+	form: Node | null = null
+	framesetOk = true
+	foster = false
+	quirks = false
+	/// The pending table character tokens.
+	pending = ""
+	/// Whether a line feed that starts the next token is dropped, as after <pre> and <textarea>.
+	skipLF = false
+
+	constructor(s: string, scripting: bool, context: Node | null) {
+		this.tok = new Tokenizer(s)
+		this.scripting = scripting
+		this.context = context
+		if (context == null) {
+			return
+		}
+		const root = new Node("element", "html")
+		root.ns = htmlNS
+		this.doc.insert(root)
+		this.open = [root]
+		if (inHTML(context)) {
+			this.tok.state = switch (context.name) {
+				case "title", "textarea": "rcdata"
+				case "style", "xmp", "iframe", "noembed", "noframes": "rawtext"
+				case "script": "script"
+				case "noscript": if (scripting) "rawtext" else "data"
+				case "plaintext": "plaintext"
+				default: "data"
+			}
+		}
+		if (isHTML(context, "template")) {
+			this.templateModes.push("inTemplate")
+		}
+		this.reset()
+		let n: Node | null = context
+		while (n != null && !isHTML(n, "form")) {
+			n = n.parent
+		}
+		this.form = n
+	}
+
+	run() {
+		while (true) {
+			const n = this.adjusted()
+			this.tok.cdata = n != null && !inHTML(n)
+			const t = this.tok.next()
+			this.process(t)
+			if (t.kind == "eof") {
+				return
+			}
+		}
+	}
+
+	/// The tree construction dispatcher.
+	process(t: Token) {
+		if (this.skipLF) {
+			this.skipLF = false
+			if (t.kind == "text" && startsWith(t.data, "\n")) {
+				t.data = t.data.slice(1, t.data.length)
+				if (t.data == "") {
+					return
+				}
+			}
+		}
+		const n = this.adjusted()
+		if (n == null || inHTML(n) || t.kind == "eof"
+			|| isMathText(n) && (t.kind == "text" || t.kind == "start" && t.name != "mglyph" && t.name != "malignmark")
+			|| n.ns == mathNS && n.name == "annotation-xml" && t.kind == "start" && t.name == "svg"
+			|| isIntegration(n) && (t.kind == "start" || t.kind == "text")) {
+			this.step(this.mode, t)
+		} else {
+			this.foreign(t)
+		}
+	}
+
+	step(mode: Mode, t: Token) {
+		switch (mode) {
+			case "initial": this.initial(t)
+			case "beforeHtml": this.beforeHtml(t)
+			case "beforeHead": this.beforeHead(t)
+			case "inHead": this.inHead(t)
+			case "inHeadNoscript": this.inHeadNoscript(t)
+			case "afterHead": this.afterHead(t)
+			case "inBody": this.inBody(t)
+			case "text": this.text(t)
+			case "inTable": this.inTable(t)
+			case "inTableText": this.inTableText(t)
+			case "inCaption": this.inCaption(t)
+			case "inColumnGroup": this.inColumnGroup(t)
+			case "inTableBody": this.inTableBody(t)
+			case "inRow": this.inRow(t)
+			case "inCell": this.inCell(t)
+			case "inTemplate": this.inTemplate(t)
+			case "afterBody": this.afterBody(t)
+			case "inFrameset": this.inFrameset(t)
+			case "afterFrameset": this.afterFrameset(t)
+			case "afterAfterBody": this.afterAfterBody(t)
+			case "afterAfterFrameset": this.afterAfterFrameset(t)
+		}
+	}
+
+	initial(t: Token) {
+		switch (t.kind) {
+			case "text": if (this.space(t, "drop")) {
+				return
+			}
+			case "comment", "instruction":
+				this.comment(t, this.doc)
+				return
+			case "doctype":
+				const d = new Node("doctype", t.name)
+				d.publicId = t.publicId ?? ""
+				d.systemId = t.systemId ?? ""
+				this.doc.insert(d)
+				this.quirks = isQuirky(t)
+				this.mode = "beforeHtml"
+				return
+		}
+		this.quirks = true
+		this.mode = "beforeHtml"
+		this.process(t)
+	}
+
+	beforeHtml(t: Token) {
+		switch (t.kind) {
+			case "doctype": return
+			case "comment", "instruction":
+				this.comment(t, this.doc)
+				return
+			case "text": if (this.space(t, "drop")) {
+				return
+			}
+			case "start": if (t.name == "html") {
+				this.root(t)
+				return
+			}
+			case "end": if (!contains(["head", "body", "html", "br"], t.name)) {
+				return
+			}
+		}
+		this.root(new Token("start", "html"))
+		this.process(t)
+	}
+
+	root(t: Token) {
+		const n = element(t.name, htmlNS, t.attrs)
+		this.doc.insert(n)
+		this.open.push(n)
+		this.mode = "beforeHead"
+	}
+
+	beforeHead(t: Token) {
+		switch (t.kind) {
+			case "text": if (this.space(t, "drop")) {
+				return
+			}
+			case "comment", "instruction":
+				this.comment(t)
+				return
+			case "doctype": return
+			case "start":
+				if (t.name == "html") {
+					this.inBody(t)
+					return
+				}
+				if (t.name == "head") {
+					this.head = this.insert(t)
+					this.mode = "inHead"
+					return
+				}
+			case "end": if (!contains(["head", "body", "html", "br"], t.name)) {
+				return
+			}
+		}
+		this.head = this.insert(new Token("start", "head"))
+		this.mode = "inHead"
+		this.process(t)
+	}
+
+	inHead(t: Token) {
+		switch (t.kind) {
+			case "text": if (this.space(t)) {
+				return
+			}
+			case "comment", "instruction":
+				this.comment(t)
+				return
+			case "doctype": return
+			case "start": switch (t.name) {
+				case "html":
+					this.inBody(t)
+					return
+				case "base", "basefont", "bgsound", "link", "meta":
+					this.insert(t)
+					this.open.pop()
+					return
+				case "title":
+					this.textual(t, "rcdata")
+					return
+				case "noframes", "style":
+					this.textual(t, "rawtext")
+					return
+				case "noscript":
+					if (this.scripting) {
+						this.textual(t, "rawtext")
+					} else {
+						this.insert(t)
+						this.mode = "inHeadNoscript"
+					}
+					return
+				case "script":
+					this.textual(t, "script")
+					return
+				case "template":
+					this.insert(t)
+					this.active.push(null)
+					this.framesetOk = false
+					this.mode = "inTemplate"
+					this.templateModes.push("inTemplate")
+					return
+				case "head": return
+			}
+			case "end": switch (t.name) {
+				case "head":
+					this.open.pop()
+					this.mode = "afterHead"
+					return
+				case "template":
+					if (!this.has("template")) {
+						return
+					}
+					this.generateImplied("", thorough)
+					this.popUntil(["template"])
+					this.clearToMarker()
+					this.templateModes.pop()
+					this.reset()
+					return
+				default: if (!contains(["body", "html", "br"], t.name)) {
+					return
+				}
+			}
+		}
+		this.open.pop()
+		this.mode = "afterHead"
+		this.process(t)
+	}
+
+	inHeadNoscript(t: Token) {
+		switch (t.kind) {
+			case "doctype": return
+			case "text": if (this.space(t)) {
+				return
+			}
+			case "comment", "instruction":
+				this.inHead(t)
+				return
+			case "start": switch (t.name) {
+				case "html":
+					this.inBody(t)
+					return
+				case "basefont", "bgsound", "link", "meta", "noframes", "style":
+					this.inHead(t)
+					return
+				case "head", "noscript": return
+			}
+			case "end":
+				if (t.name == "noscript") {
+					this.open.pop()
+					this.mode = "inHead"
+					return
+				}
+				if (t.name != "br") {
+					return
+				}
+		}
+		this.open.pop()
+		this.mode = "inHead"
+		this.process(t)
+	}
+
+	afterHead(t: Token) {
+		switch (t.kind) {
+			case "text": if (this.space(t)) {
+				return
+			}
+			case "comment", "instruction":
+				this.comment(t)
+				return
+			case "doctype": return
+			case "start": switch (t.name) {
+				case "html":
+					this.inBody(t)
+					return
+				case "body":
+					this.insert(t)
+					this.framesetOk = false
+					this.mode = "inBody"
+					return
+				case "frameset":
+					this.insert(t)
+					this.mode = "inFrameset"
+					return
+				case "base", "basefont", "bgsound", "link", "meta", "noframes", "script", "style", "template", "title":
+					const head = this.head!
+					this.open.push(head)
+					this.inHead(t)
+					this.open = this.open.filter(n => n != head)
+					return
+				case "head": return
+			}
+			case "end":
+				if (t.name == "template") {
+					this.inHead(t)
+					return
+				}
+				if (!contains(["body", "html", "br"], t.name)) {
+					return
+				}
+		}
+		this.insert(new Token("start", "body"))
+		this.framesetOk = true
+		this.mode = "inBody"
+		this.process(t)
+	}
+
+	inBody(t: Token) {
+		switch (t.kind) {
+			case "text":
+				const d = replace(t.data, "\0", "")
+				if (d != "") {
+					this.reconstruct()
+					this.insertText(d)
+					this.framesetOk = this.framesetOk && isAllSpace(d)
+				}
+			case "comment", "instruction": this.comment(t)
+			case "eof": if (this.templateModes.length > 0) {
+				this.inTemplate(t)
+			}
+			case "start": this.bodyStart(t)
+			case "end": this.bodyEnd(t)
+		}
+	}
+
+	bodyStart(t: Token) {
+		const name = t.name
+		switch (name) {
+			case "html": if (!this.has("template")) {
+				merge(this.open[0], t)
+			}
+			case "base", "basefont", "bgsound", "link", "meta", "noframes", "script", "style", "template",
+				"title": this.inHead(t)
+			case "body": if (this.open.length > 1 && isHTML(this.open[1], "body") && !this.has("template")) {
+				this.framesetOk = false
+				merge(this.open[1], t)
+			}
+			case "frameset": if (this.open.length > 1 && isHTML(this.open[1], "body") && this.framesetOk) {
+				this.open[1].parent?.remove(this.open[1])
+				this.open = this.open.slice(0, 1)
+				this.insert(t)
+				this.mode = "inFrameset"
+			}
+			case "address", "article", "aside", "blockquote", "center", "details", "dialog", "dir", "div", "dl",
+				"fieldset", "figcaption", "figure", "footer", "header", "hgroup", "main", "menu", "nav", "ol", "p",
+				"search", "section", "summary", "ul":
+				this.closeP()
+				this.insert(t)
+			case "h1", "h2", "h3", "h4", "h5", "h6":
+				this.closeP()
+				if (isHTMLOf(this.current(), headings)) {
+					this.open.pop()
+				}
+				this.insert(t)
+			case "pre", "listing":
+				this.closeP()
+				this.insert(t)
+				this.skipLF = true
+				this.framesetOk = false
+			case "form": if (this.form == null || this.templating()) {
+				this.closeP()
+				const f = this.insert(t)
+				if (!this.templating()) {
+					this.form = f
+				}
+			}
+			case "li", "dd", "dt":
+				this.framesetOk = false
+				const names: string[] = if (name == "li") ["li"] else ["dd", "dt"]
+				let k = this.open.length - 1
+				while (k >= 0) {
+					const n = this.open[k]
+					if (isHTMLOf(n, names)) {
+						this.generateImplied(n.name)
+						this.popUntil([n.name])
+						break
+					}
+					if (isSpecial(n) && !isHTMLOf(n, ["address", "div", "p"])) {
+						break
+					}
+					k--
+				}
+				this.closeP()
+				this.insert(t)
+			case "plaintext":
+				this.closeP()
+				this.insert(t)
+				this.tok.state = "plaintext"
+			case "button":
+				if (this.inScope("button")) {
+					this.generateImplied()
+					this.popUntil(["button"])
+				}
+				this.reconstruct()
+				this.insert(t)
+				this.framesetOk = false
+			case "a":
+				const a = this.formatting("a")
+				if (a != null) {
+					this.adoption("a")
+					this.active = this.active.filter(e => e != a)
+					this.open = this.open.filter(e => e != a)
+				}
+				this.reconstruct()
+				this.pushActive(this.insert(t))
+			case "b", "big", "code", "em", "font", "i", "s", "small", "strike", "strong", "tt", "u":
+				this.reconstruct()
+				this.pushActive(this.insert(t))
+			case "nobr":
+				this.reconstruct()
+				if (this.inScope("nobr")) {
+					this.adoption("nobr")
+					this.reconstruct()
+				}
+				this.pushActive(this.insert(t))
+			case "applet", "marquee", "object":
+				this.reconstruct()
+				this.insert(t)
+				this.active.push(null)
+				this.framesetOk = false
+			case "table":
+				if (!this.quirks) {
+					this.closeP()
+				}
+				this.insert(t)
+				this.framesetOk = false
+				this.mode = "inTable"
+			case "area", "br", "embed", "img", "keygen", "wbr":
+				this.reconstruct()
+				this.insert(t)
+				this.open.pop()
+				this.framesetOk = false
+			case "input":
+				if (this.context != null && isHTML(this.context, "select")) {
+					return
+				}
+				if (this.inScope("select")) {
+					this.popUntil(["select"])
+				}
+				this.reconstruct()
+				this.insert(t)
+				this.open.pop()
+				this.framesetOk = this.framesetOk && lower(t.attr("type") ?? "") == "hidden"
+			case "param", "source", "track":
+				this.insert(t)
+				this.open.pop()
+			case "hr":
+				this.closeP()
+				if (this.inScope("select")) {
+					this.generateImplied()
+				}
+				this.insert(t)
+				this.open.pop()
+				this.framesetOk = false
+			case "image":
+				t.name = "img"
+				this.process(t)
+			case "textarea":
+				this.insert(t)
+				this.skipLF = true
+				this.tok.state = "rcdata"
+				this.original = this.mode
+				this.framesetOk = false
+				this.mode = "text"
+			case "xmp":
+				this.closeP()
+				this.reconstruct()
+				this.framesetOk = false
+				this.textual(t, "rawtext")
+			case "iframe":
+				this.framesetOk = false
+				this.textual(t, "rawtext")
+			case "noembed": this.textual(t, "rawtext")
+			case "select":
+				if (this.context != null && isHTML(this.context, "select")) {
+					return
+				}
+				if (this.inScope("select")) {
+					this.popUntil(["select"])
+					return
+				}
+				this.reconstruct()
+				this.insert(t)
+				this.framesetOk = false
+			case "option", "optgroup":
+				if (this.inScope("select")) {
+					this.generateImplied(if (name == "option") "optgroup" else "")
+				} else if (isHTML(this.current(), "option")) {
+					this.open.pop()
+				}
+				this.reconstruct()
+				this.insert(t)
+			case "rb", "rtc", "rp", "rt":
+				if (this.inScope("ruby")) {
+					this.generateImplied(if (name == "rp" || name == "rt") "rtc" else "")
+				}
+				this.insert(t)
+			case "math", "svg":
+				this.reconstruct()
+				adjustAttrs(t, if (name == "math") mathNS else svgNS)
+				this.insert(t, if (name == "math") mathNS else svgNS)
+				if (t.selfClosing) {
+					this.open.pop()
+				}
+			case "caption", "col", "colgroup", "frame", "head", "tbody", "td", "tfoot", "th", "thead", "tr": return
+			default:
+				if (name == "noscript" && this.scripting) {
+					this.textual(t, "rawtext")
+					return
+				}
+				this.reconstruct()
+				this.insert(t)
+		}
+	}
+
+	bodyEnd(t: Token) {
+		const name = t.name
+		switch (name) {
+			case "template": this.inHead(t)
+			case "body", "html": if (this.inScope("body")) {
+				this.mode = "afterBody"
+				if (name == "html") {
+					this.process(t)
+				}
+			}
+			case "address", "article", "aside", "blockquote", "button", "center", "details", "dialog", "dir", "div",
+				"dl", "fieldset", "figcaption", "figure", "footer", "header", "hgroup", "listing", "main", "menu",
+				"nav", "ol", "pre", "search", "section", "select", "summary", "ul", "applet", "marquee",
+				"object": if (this.inScope(name)) {
+				this.generateImplied()
+				this.popUntil([name])
+				if (name == "applet" || name == "marquee" || name == "object") {
+					this.clearToMarker()
+				}
+			}
+			case "form":
+				if (this.templating()) {
+					if (this.inScope("form")) {
+						this.generateImplied()
+						this.popUntil(["form"])
+					}
+					return
+				}
+				const f = this.form
+				this.form = null
+				if (f != null && this.scoped(n => n == f, "default")) {
+					this.generateImplied()
+					this.open = this.open.filter(n => n != f)
+				}
+			case "p":
+				if (!this.inScope("p", "button")) {
+					this.insert(new Token("start", "p"))
+				}
+				this.closeP()
+			case "li", "dd", "dt": if (this.inScope(name, if (name == "li") "list" else "default")) {
+				this.generateImplied(name)
+				this.popUntil([name])
+			}
+			case "h1", "h2", "h3", "h4", "h5", "h6": if (this.scoped(n => isHTMLOf(n, headings), "default")) {
+				this.generateImplied()
+				this.popUntil(headings)
+			}
+			case "a", "b", "big", "code", "em", "font", "i", "nobr", "s", "small", "strike", "strong", "tt",
+				"u": this.adoption(name)
+			case "br": this.bodyStart(new Token("start", "br"))
+			default: this.anyOtherEnd(name)
+		}
+	}
+
+	anyOtherEnd(name: string) {
+		let k = this.open.length - 1
+		while (k >= 0) {
+			const n = this.open[k]
+			if (isHTML(n, name)) {
+				this.generateImplied(name)
+				this.open = this.open.slice(0, position(this.open, n))
+				return
+			}
+			if (isSpecial(n)) {
+				return
+			}
+			k--
+		}
+	}
+
+	/// The adoption agency algorithm for an end tag named subject.
+	adoption(subject: string) {
+		const cur = this.current()
+		if (isHTML(cur, subject) && position(this.active, cur) < 0) {
+			this.open.pop()
+			return
+		}
+		for (const _ of 1 ... 8) {
+			const fe = this.formatting(subject)
+			if (fe == null) {
+				this.anyOtherEnd(subject)
+				return
+			}
+			const si = position(this.open, fe)
+			if (si < 0) {
+				this.active = this.active.filter(e => e != fe)
+				return
+			}
+			if (!this.scoped(n => n == fe, "default")) {
+				return
+			}
+			let fb: Node | null = null
+			for (const k of si + 1 ... this.open.length - 1) {
+				if (isSpecial(this.open[k])) {
+					fb = this.open[k]
+					break
+				}
+			}
+			if (fb == null) {
+				this.open = this.open.slice(0, si)
+				this.active = this.active.filter(e => e != fe)
+				return
+			}
+			const block = fb
+			const common = this.open[si - 1]
+			let bookmark = position(this.active, fe)
+			let ni = position(this.open, block)
+			let last = block
+			let inner = 0
+			while (true) {
+				inner++
+				ni--
+				const node = this.open[ni]
+				if (node == fe) {
+					break
+				}
+				let ai = position(this.active, node)
+				if (inner > 3 && ai >= 0) {
+					this.active = removeAt(this.active, ai)
+					if (ai < bookmark) {
+						bookmark--
+					}
+					ai = -1
+				}
+				if (ai < 0) {
+					this.open = removeAt(this.open, ni)
+					continue
+				}
+				const el = clone(node)
+				this.active[ai] = el
+				this.open[ni] = el
+				if (last == block) {
+					bookmark = ai + 1
+				}
+				el.insert(last)
+				last = el
+			}
+			const [p, ref] = this.place(common)
+			p.insert(last, ref)
+			const el = clone(fe)
+			for (const c of block.children) {
+				c.parent = el
+			}
+			el.children = block.children
+			block.children = []
+			block.insert(el)
+			const fi = position(this.active, fe)
+			this.active = removeAt(this.active, fi)
+			if (fi < bookmark) {
+				bookmark--
+			}
+			this.active = insertAt(this.active, bookmark, el)
+			this.open = removeAt(this.open, position(this.open, fe))
+			this.open = insertAt(this.open, position(this.open, block) + 1, el)
+		}
+	}
+
+	text(t: Token) {
+		switch (t.kind) {
+			case "text": this.insertText(t.data)
+			case "eof":
+				this.open.pop()
+				this.mode = this.original
+				this.process(t)
+			default:
+				this.open.pop()
+				this.mode = this.original
+		}
+	}
+
+	inTable(t: Token) {
+		switch (t.kind) {
+			case "text": if (isHTMLOf(this.current(), ["table", "tbody", "template", "tfoot", "thead", "tr"])) {
+				this.pending = ""
+				this.original = this.mode
+				this.mode = "inTableText"
+				this.process(t)
+				return
+			}
+			case "comment", "instruction":
+				this.comment(t)
+				return
+			case "doctype": return
+			case "start": switch (t.name) {
+				case "caption":
+					this.clearTo(["table", "template", "html"])
+					this.active.push(null)
+					this.insert(t)
+					this.mode = "inCaption"
+					return
+				case "colgroup", "col":
+					this.clearTo(["table", "template", "html"])
+					this.insert(new Token("start", "colgroup"))
+					this.mode = "inColumnGroup"
+					if (t.name == "col") {
+						this.process(t)
+					}
+					return
+				case "tbody", "tfoot", "thead":
+					this.clearTo(["table", "template", "html"])
+					this.insert(t)
+					this.mode = "inTableBody"
+					return
+				case "td", "th", "tr":
+					this.clearTo(["table", "template", "html"])
+					this.insert(new Token("start", "tbody"))
+					this.mode = "inTableBody"
+					this.process(t)
+					return
+				case "table":
+					if (this.inScope("table", "table")) {
+						this.popUntil(["table"])
+						this.reset()
+						this.process(t)
+					}
+					return
+				case "style", "script", "template":
+					this.inHead(t)
+					return
+				case "input": if (lower(t.attr("type") ?? "") == "hidden") {
+					this.insert(t)
+					this.open.pop()
+					return
+				}
+				case "form":
+					if (this.form == null || this.templating()) {
+						const f = this.insert(t)
+						if (!this.templating()) {
+							this.form = f
+						}
+						this.open.pop()
+					}
+					return
+			}
+			case "end": switch (t.name) {
+				case "table":
+					if (this.inScope("table", "table")) {
+						this.popUntil(["table"])
+						this.reset()
+					}
+					return
+				case "body", "caption", "col", "colgroup", "html", "tbody", "td", "tfoot", "th", "thead", "tr": return
+				case "template":
+					this.inHead(t)
+					return
+			}
+			case "eof":
+				this.inBody(t)
+				return
+		}
+		this.foster = true
+		this.inBody(t)
+		this.foster = false
+	}
+
+	inTableText(t: Token) {
+		if (t.kind == "text") {
+			this.pending += replace(t.data, "\0", "")
+			return
+		}
+		if (isAllSpace(this.pending)) {
+			this.insertText(this.pending)
+		} else {
+			this.foster = true
+			this.inBody(new Token("text", "", this.pending))
+			this.foster = false
+		}
+		this.mode = this.original
+		this.process(t)
+	}
+
+	inCaption(t: Token) {
+		const name = t.name
+		if (t.kind == "end" && (name == "caption" || name == "table")
+			|| t.kind == "start"
+			&& contains(["caption", "col", "colgroup", "tbody", "td", "tfoot", "th", "thead", "tr"], name)) {
+			if (!this.inScope("caption", "table")) {
+				return
+			}
+			this.generateImplied()
+			this.popUntil(["caption"])
+			this.clearToMarker()
+			this.mode = "inTable"
+			if (name != "caption" || t.kind == "start") {
+				this.process(t)
+			}
+		} else if (t.kind != "end"
+			|| !contains(["body", "col", "colgroup", "html", "tbody", "td", "tfoot", "th", "thead", "tr"], name)) {
+			this.inBody(t)
+		}
+	}
+
+	inColumnGroup(t: Token) {
+		switch (t.kind) {
+			case "text": if (this.space(t)) {
+				return
+			}
+			case "comment", "instruction":
+				this.comment(t)
+				return
+			case "doctype": return
+			case "start": switch (t.name) {
+				case "html":
+					this.inBody(t)
+					return
+				case "col":
+					this.insert(t)
+					this.open.pop()
+					return
+				case "template":
+					this.inHead(t)
+					return
+			}
+			case "end": switch (t.name) {
+				case "col": return
+				case "template":
+					this.inHead(t)
+					return
+				case "colgroup":
+					if (isHTML(this.current(), "colgroup")) {
+						this.open.pop()
+						this.mode = "inTable"
+					}
+					return
+			}
+			case "eof":
+				this.inBody(t)
+				return
+		}
+		if (isHTML(this.current(), "colgroup")) {
+			this.open.pop()
+			this.mode = "inTable"
+			this.process(t)
+		}
+	}
+
+	inTableBody(t: Token) {
+		const name = t.name
+		const sections = ["tbody", "tfoot", "thead"]
+		if (t.kind == "start" && (name == "tr" || name == "th" || name == "td")) {
+			this.clearTo(["tbody", "tfoot", "thead", "template", "html"])
+			this.insert(new Token("start", "tr"))
+			this.mode = "inRow"
+			if (name != "tr") {
+				this.process(t)
+			}
+		} else if (t.kind == "end" && contains(sections, name)) {
+			if (this.inScope(name, "table")) {
+				this.clearTo(["tbody", "tfoot", "thead", "template", "html"])
+				this.open.pop()
+				this.mode = "inTable"
+			}
+		} else if (t.kind == "start" && contains(["caption", "col", "colgroup", ...sections], name)
+			|| t.kind == "end" && name == "table") {
+			if (sections.some(s => this.inScope(s, "table"))) {
+				this.clearTo(["tbody", "tfoot", "thead", "template", "html"])
+				this.open.pop()
+				this.mode = "inTable"
+				this.process(t)
+			}
+		} else if (t.kind != "end"
+			|| !contains(["body", "caption", "col", "colgroup", "html", "td", "th", "tr"], name)) {
+			this.inTable(t)
+		}
+	}
+
+	inRow(t: Token) {
+		const name = t.name
+		if (t.kind == "start" && (name == "th" || name == "td")) {
+			this.clearTo(["tr", "template", "html"])
+			this.insert(t)
+			this.mode = "inCell"
+			this.active.push(null)
+		} else if (t.kind == "end" && contains(["tr", "table", "tbody", "tfoot", "thead"], name)
+			|| t.kind == "start" && contains(["caption", "col", "colgroup", "tbody", "tfoot", "thead", "tr"], name)) {
+			if (!this.inScope(name, "table") && t.kind == "end" && name != "tr" && name != "table"
+				|| !this.inScope("tr", "table")) {
+				return
+			}
+			this.clearTo(["tr", "template", "html"])
+			this.open.pop()
+			this.mode = "inTableBody"
+			if (name != "tr" || t.kind == "start") {
+				this.process(t)
+			}
+		} else if (t.kind != "end" || !contains(["body", "caption", "col", "colgroup", "html", "td", "th"], name)) {
+			this.inTable(t)
+		}
+	}
+
+	inCell(t: Token) {
+		const name = t.name
+		if (t.kind == "end" && (name == "td" || name == "th")) {
+			if (this.inScope(name, "table")) {
+				this.generateImplied()
+				this.popUntil([name])
+				this.clearToMarker()
+				this.mode = "inRow"
+			}
+		} else if (t.kind == "start"
+			&& contains(["caption", "col", "colgroup", "tbody", "td", "tfoot", "th", "thead", "tr"], name)
+			|| t.kind == "end" && contains(["table", "tbody", "tfoot", "thead", "tr"], name)) {
+			if (if (t.kind == "start") this.inScope("td", "table") || this.inScope("th", "table")
+				else this.inScope(name, "table")) {
+				this.generateImplied()
+				this.popUntil(["td", "th"])
+				this.clearToMarker()
+				this.mode = "inRow"
+				this.process(t)
+			}
+		} else if (t.kind != "end" || !contains(["body", "caption", "col", "colgroup", "html"], name)) {
+			this.inBody(t)
+		}
+	}
+
+	inTemplate(t: Token) {
+		switch (t.kind) {
+			case "text", "comment", "instruction", "doctype": this.inBody(t)
+			case "start": switch (t.name) {
+				case "base", "basefont", "bgsound", "link", "meta", "noframes", "script", "style", "template",
+					"title": this.inHead(t)
+				case "caption", "colgroup", "tbody", "tfoot", "thead": this.retemplate("inTable", t)
+				case "col": this.retemplate("inColumnGroup", t)
+				case "tr": this.retemplate("inTableBody", t)
+				case "td", "th": this.retemplate("inRow", t)
+				default: this.retemplate("inBody", t)
+			}
+			case "end": if (t.name == "template") {
+				this.inHead(t)
+			}
+			case "eof": if (this.has("template")) {
+				this.popUntil(["template"])
+				this.clearToMarker()
+				this.templateModes.pop()
+				this.reset()
+				this.process(t)
+			}
+		}
+	}
+
+	retemplate(mode: Mode, t: Token) {
+		this.templateModes.pop()
+		this.templateModes.push(mode)
+		this.mode = mode
+		this.process(t)
+	}
+
+	afterBody(t: Token) {
+		switch (t.kind) {
+			case "text": if (this.space(t, "body")) {
+				return
+			}
+			case "comment", "instruction":
+				this.comment(t, this.open[0])
+				return
+			case "doctype", "eof": return
+			case "start": if (t.name == "html") {
+				this.inBody(t)
+				return
+			}
+			case "end": if (t.name == "html") {
+				if (this.context == null) {
+					this.mode = "afterAfterBody"
+				}
+				return
+			}
+		}
+		this.mode = "inBody"
+		this.process(t)
+	}
+
+	inFrameset(t: Token) {
+		switch (t.kind) {
+			case "text": this.insertText(spaces(t.data))
+			case "comment", "instruction": this.comment(t)
+			case "start": switch (t.name) {
+				case "html": this.inBody(t)
+				case "frameset": this.insert(t)
+				case "frame":
+					this.insert(t)
+					this.open.pop()
+				case "noframes": this.inHead(t)
+			}
+			case "end": if (t.name == "frameset" && this.open.length > 1) {
+				this.open.pop()
+				if (this.context == null && !isHTML(this.current(), "frameset")) {
+					this.mode = "afterFrameset"
+				}
+			}
+		}
+	}
+
+	afterFrameset(t: Token) {
+		switch (t.kind) {
+			case "text": this.insertText(spaces(t.data))
+			case "comment", "instruction": this.comment(t)
+			case "start": if (t.name == "html") {
+				this.inBody(t)
+			} else if (t.name == "noframes") {
+				this.inHead(t)
+			}
+			case "end": if (t.name == "html") {
+				this.mode = "afterAfterFrameset"
+			}
+		}
+	}
+
+	afterAfterBody(t: Token) {
+		switch (t.kind) {
+			case "comment", "instruction":
+				this.comment(t, this.doc)
+				return
+			case "doctype", "eof": return
+			case "text": if (this.space(t, "body")) {
+				return
+			}
+			case "start": if (t.name == "html") {
+				this.inBody(t)
+				return
+			}
+		}
+		this.mode = "inBody"
+		this.process(t)
+	}
+
+	afterAfterFrameset(t: Token) {
+		switch (t.kind) {
+			case "comment", "instruction": this.comment(t, this.doc)
+			case "text":
+				const ws = spaces(t.data)
+				if (ws != "") {
+					this.inBody(new Token("text", "", ws))
+				}
+			case "start": if (t.name == "html") {
+				this.inBody(t)
+			} else if (t.name == "noframes") {
+				this.inHead(t)
+			}
+		}
+	}
+
+	/// The rules for parsing tokens in foreign content.
+	foreign(t: Token) {
+		switch (t.kind) {
+			case "text":
+				this.insertText(replace(t.data, "\0", "\u{FFFD}"))
+				this.framesetOk = this.framesetOk && isAllSpace(replace(t.data, "\0", ""))
+			case "comment", "instruction": this.comment(t)
+			case "start":
+				if (contains(breakout, t.name)
+					|| t.name == "font"
+					&& (t.attr("color") != null || t.attr("face") != null || t.attr("size") != null)) {
+					this.popForeign()
+					this.step(this.mode, t)
+					return
+				}
+				const ns = this.adjusted()!.ns
+				if (ns == svgNS) {
+					t.name = svgTags.get(t.name) ?? t.name
+				}
+				adjustAttrs(t, ns)
+				this.insert(t, ns)
+				if (t.selfClosing) {
+					this.open.pop()
+				}
+			case "end":
+				if (t.name == "br" || t.name == "p") {
+					this.popForeign()
+					this.step(this.mode, t)
+					return
+				}
+				let k = this.open.length - 1
+				while (k > 0) {
+					const n = this.open[k]
+					if (lower(n.name) == t.name) {
+						this.open = this.open.slice(0, k)
+						return
+					}
+					k--
+					if (inHTML(this.open[k])) {
+						this.step(this.mode, t)
+						return
+					}
+				}
+		}
+	}
+
+	popForeign() {
+		while (!isMathText(this.current()) && !isIntegration(this.current()) && !inHTML(this.current())) {
+			this.open.pop()
+		}
+	}
+
+	current(): Node { return this.open[this.open.length - 1] }
+
+	adjusted(): Node | null {
+		return if (this.context != null && this.open.length == 1) this.context else this.open.at(this.open.length - 1)
+	}
+
+	/// Whether the parser is parsing template contents.
+	templating(): bool { return this.has("template") || this.context != null && isHTML(this.context, "template") }
+	/// Whether an HTML element named name is open.
+	has(name: string): bool { return this.open.some(n => isHTML(n, name)) }
+	inScope(name: string, scope: Scope = "default"): bool { return this.scoped(n => isHTML(n, name), scope) }
+
+	/// Whether an element that matches is open within scope.
+	scoped(match: (n: Node) => bool, scope: Scope): bool {
+		let k = this.open.length - 1
+		while (k >= 0) {
+			const n = this.open[k]
+			if (match(n)) {
+				return true
+			}
+			if (if (scope == "table") isHTMLOf(n, ["html", "table", "template"])
+				else isScoping(n) || scope == "list" && isHTMLOf(n, ["ol", "ul"])
+				|| scope == "button" && isHTML(n, "button")) {
+				return false
+			}
+			k--
+		}
+		return false
+	}
+
+	/// The appropriate place for inserting a node, in target or the current node.
+	place(target: Node | null = null): [Node, Node | null] {
+		const parent = target ?? this.current()
+		if (!this.foster || !isHTMLOf(parent, ["table", "tbody", "tfoot", "thead", "tr"])) {
+			return [parent, null]
+		}
+		let k = this.open.length - 1
+		while (k >= 0 && !isHTMLOf(this.open[k], ["template", "table"])) {
+			k--
+		}
+		if (k < 0) {
+			return [this.open[0], null]
+		}
+		const last = this.open[k]
+		if (last.name == "template") {
+			return [last, null]
+		}
+		if (last.parent != null) {
+			return [last.parent!, last]
+		}
+		return [this.open[k - 1], null]
+	}
+
+	/// Inserts an element for t in ns, and opens it.
+	insert(t: Token, ns: string = htmlNS): Node {
+		const n = element(t.name, ns, t.attrs)
+		const [p, ref] = this.place()
+		p.insert(n, ref)
+		this.open.push(n)
+		return n
+	}
+
+	insertText(s: string) {
+		if (s == "") {
+			return
+		}
+		const [p, ref] = this.place()
+		if (p.kind == "document") {
+			return
+		}
+		const prev = p.children.at(if (ref == null) p.children.length - 1 else position(p.children, ref) - 1)
+		if (prev != null && prev.kind == "text") {
+			prev.data += s
+		} else {
+			p.insert(new Node("text", "", s), ref)
+		}
+	}
+
+	/// Inserts the comment or instruction t last in parent, or at the appropriate place.
+	comment(t: Token, parent: Node | null = null) {
+		const n = new Node(if (t.kind == "comment") "comment" else "instruction", t.name, t.data)
+		if (parent != null) {
+			parent.insert(n)
+			return
+		}
+		const [p, ref] = this.place()
+		p.insert(n, ref)
+	}
+
+	/// Takes the leading whitespace of t's text, which keeps the rest, to drop it, insert it, or process it in body;
+	/// whether that was all.
+	space(t: Token, to: "drop" | "insert" | "body" = "insert"): bool {
+		let n = 0
+		while (n < t.data.length && isSpace(t.data[n])) {
+			n++
+		}
+		const ws = t.data.slice(0, n)
+		t.data = t.data.slice(n, t.data.length)
+		if (ws != "" && to == "insert") {
+			this.insertText(ws)
+		} else if (ws != "" && to == "body") {
+			this.inBody(new Token("text", "", ws))
+		}
+		return t.data == ""
+	}
+
+	/// The generic RCDATA or raw text element parsing algorithm, or the script start tag's, by state.
+	textual(t: Token, state: State) {
+		this.insert(t)
+		this.tok.state = state
+		this.original = this.mode
+		this.mode = "text"
+	}
+
+	/// Generates implied end tags, but for except, of the elements of which.
+	generateImplied(except: string = "", which: string[] = implied) {
+		while (isHTMLOf(this.current(), which) && this.current().name != except) {
+			this.open.pop()
+		}
+	}
+
+	/// Closes a p element where one is in button scope.
+	closeP() {
+		if (this.inScope("p", "button")) {
+			this.generateImplied("p")
+			this.popUntil(["p"])
+		}
+	}
+
+	/// Pops elements until an HTML element named one of names has been popped.
+	popUntil(names: string[]) { while (this.open.length > 0 && !isHTMLOf(this.open.pop(), names)) {} }
+
+	/// Pops elements while the current node is not an HTML element named one of names.
+	clearTo(names: string[]) {
+		while (!isHTMLOf(this.current(), names)) {
+			this.open.pop()
+		}
+	}
+
+	/// The last active formatting element named name after the last marker, or null.
+	formatting(name: string): Node | null {
+		let k = this.active.length - 1
+		while (k >= 0 && this.active[k] != null) {
+			if (this.active[k]!.name == name) {
+				return this.active[k]
+			}
+			k--
+		}
+		return null
+	}
+
+	pushActive(el: Node) {
+		let same = 0
+		let first = -1
+		let k = this.active.length - 1
+		while (k >= 0 && this.active[k] != null) {
+			const e = this.active[k]!
+			if (e.name == el.name && e.ns == el.ns && e.attrs.length == el.attrs.length
+				&& e.attrs.every(a => el.attr(a.name) == a.value)) {
+				same++
+				first = k
+			}
+			k--
+		}
+		if (same >= 3) {
+			this.active = removeAt(this.active, first)
+		}
+		this.active.push(el)
+	}
+
+	reconstruct() {
+		let k = this.active.length - 1
+		if (k < 0 || this.active[k] == null || position(this.open, this.active[k]!) >= 0) {
+			return
+		}
+		while (k > 0 && this.active[k - 1] != null && position(this.open, this.active[k - 1]!) < 0) {
+			k--
+		}
+		while (k < this.active.length) {
+			const el = clone(this.active[k]!)
+			const [p, ref] = this.place()
+			p.insert(el, ref)
+			this.open.push(el)
+			this.active[k] = el
+			k++
+		}
+	}
+
+	clearToMarker() { while (this.active.length > 0 && this.active.pop() != null) {} }
+
+	/// Resets the insertion mode appropriately.
+	reset() {
+		let k = this.open.length - 1
+		while (k >= 0) {
+			const last = k == 0
+			const n = if (last && this.context != null) this.context! else this.open[k]
+			if (inHTML(n)) {
+				switch (n.name) {
+					case "td", "th": if (!last) {
+						this.mode = "inCell"
+						return
+					}
+					case "tr":
+						this.mode = "inRow"
+						return
+					case "tbody", "thead", "tfoot":
+						this.mode = "inTableBody"
+						return
+					case "caption":
+						this.mode = "inCaption"
+						return
+					case "colgroup":
+						this.mode = "inColumnGroup"
+						return
+					case "table":
+						this.mode = "inTable"
+						return
+					case "template":
+						this.mode = this.templateModes[this.templateModes.length - 1]
+						return
+					case "head": if (!last) {
+						this.mode = "inHead"
+						return
+					}
+					case "body":
+						this.mode = "inBody"
+						return
+					case "frameset":
+						this.mode = "inFrameset"
+						return
+					case "html":
+						this.mode = if (this.head == null) "beforeHead" else "afterHead"
+						return
+				}
+			}
+			if (last) {
+				this.mode = "inBody"
+				return
+			}
+			k--
+		}
+	}
+}
+
+const headings = ["h1", "h2", "h3", "h4", "h5", "h6"]
+const implied = ["dd", "dt", "li", "optgroup", "option", "p", "rb", "rp", "rt", "rtc"]
+const thorough = [...implied, "caption", "colgroup", "tbody", "td", "tfoot", "th", "thead", "tr"]
+
+/// The start tags that leave foreign content.
+const breakout = ["b", "big", "blockquote", "body", "br", "center", "code", "dd", "div", "dl", "dt", "em", "embed",
+	"h1", "h2", "h3", "h4", "h5", "h6", "head", "hr", "i", "img", "li", "listing", "menu", "meta", "nobr", "ol", "p",
+	"pre", "ruby", "s", "small", "span", "strong", "strike", "sub", "sup", "table", "tt", "u", "ul", "var"]
+
+const special = ["address", "applet", "area", "article", "aside", "base", "basefont", "bgsound", "blockquote", "body",
+	"br", "button", "caption", "center", "col", "colgroup", "dd", "details", "dir", "div", "dl", "dt", "embed",
+	"fieldset", "figcaption", "figure", "footer", "form", "frame", "frameset", "h1", "h2", "h3", "h4", "h5", "h6",
+	"head", "header", "hgroup", "hr", "html", "iframe", "img", "input", "keygen", "li", "link", "listing", "main",
+	"marquee", "menu", "meta", "nav", "noembed", "noframes", "noscript", "object", "ol", "p", "param", "plaintext",
+	"pre", "script", "search", "section", "select", "source", "style", "summary", "table", "tbody", "td", "template",
+	"textarea", "tfoot", "th", "thead", "title", "tr", "track", "ul", "wbr", "xmp"]
+
+/// SVG's names in camel case, which the tokenizer lowers.
+const svgTags = camel(["altGlyph", "altGlyphDef", "altGlyphItem", "animateColor", "animateMotion", "animateTransform",
+	"clipPath", "feBlend", "feColorMatrix", "feComponentTransfer", "feComposite", "feConvolveMatrix",
+	"feDiffuseLighting", "feDisplacementMap", "feDistantLight", "feDropShadow", "feFlood", "feFuncA", "feFuncB",
+	"feFuncG", "feFuncR", "feGaussianBlur", "feImage", "feMerge", "feMergeNode", "feMorphology", "feOffset",
+	"fePointLight", "feSpecularLighting", "feSpotLight", "feTile", "feTurbulence", "foreignObject", "glyphRef",
+	"linearGradient", "radialGradient", "textPath"])
+
+const svgAttrs = camel(["attributeName", "attributeType", "baseFrequency", "baseProfile", "calcMode", "clipPathUnits",
+	"diffuseConstant", "edgeMode", "filterUnits", "glyphRef", "gradientTransform", "gradientUnits", "kernelMatrix",
+	"kernelUnitLength", "keyPoints", "keySplines", "keyTimes", "lengthAdjust", "limitingConeAngle", "markerHeight",
+	"markerUnits", "markerWidth", "maskContentUnits", "maskUnits", "numOctaves", "pathLength", "patternContentUnits",
+	"patternTransform", "patternUnits", "pointsAtX", "pointsAtY", "pointsAtZ", "preserveAlpha", "preserveAspectRatio",
+	"primitiveUnits", "refX", "refY", "repeatCount", "repeatDur", "requiredExtensions", "requiredFeatures",
+	"specularConstant", "specularExponent", "spreadMethod", "startOffset", "stdDeviation", "stitchTiles",
+	"surfaceScale", "systemLanguage", "tableValues", "targetX", "targetY", "textLength", "viewBox", "viewTarget",
+	"xChannelSelector", "yChannelSelector", "zoomAndPan"])
+
+function camel(names: string[]): HashMap[string, string] {
+	const m = new HashMap[string, string]()
+	for (const n of names) {
+		m.set(lower(n), n)
+	}
+	return m
+}
+
+/// Adjusts the attributes of t for an element in ns: MathML's and SVG's case, and the namespaces of foreign ones.
+function adjustAttrs(t: Token, ns: string) {
+	for (const a of t.attrs) {
+		if (ns == mathNS && a.name == "definitionurl") {
+			a.name = "definitionURL"
+		} else if (ns == svgNS) {
+			a.name = svgAttrs.get(a.name) ?? a.name
+		}
+		if (contains(["xlink:actuate", "xlink:arcrole", "xlink:href", "xlink:role", "xlink:show", "xlink:title",
+			"xlink:type"], a.name)) {
+			a.ns = xlinkNS
+		} else if (a.name == "xml:lang" || a.name == "xml:space") {
+			a.ns = xmlNS
+		} else if (a.name == "xmlns" || a.name == "xmlns:xlink") {
+			a.ns = xmlnsNS
+		}
+	}
+}
+
+const quirkyIds = ["-//w3o//dtd w3 html strict 3.0//en//", "-/w3c/dtd html 4.0 transitional/en", "html"]
+
+const quirkyPrefixes = ["+//silmaril//dtd html pro v0r11 19970101//", "-//as//dtd html 3.0 aswedit + extensions//",
+	"-//advasoft ltd//dtd html 3.0 aswedit + extensions//", "-//ietf//dtd html 2.0 level 1//",
+	"-//ietf//dtd html 2.0 level 2//", "-//ietf//dtd html 2.0 strict level 1//",
+	"-//ietf//dtd html 2.0 strict level 2//", "-//ietf//dtd html 2.0 strict//", "-//ietf//dtd html 2.0//",
+	"-//ietf//dtd html 2.1e//", "-//ietf//dtd html 3.0//", "-//ietf//dtd html 3.2 final//", "-//ietf//dtd html 3.2//",
+	"-//ietf//dtd html 3//", "-//ietf//dtd html level 0//", "-//ietf//dtd html level 1//",
+	"-//ietf//dtd html level 2//", "-//ietf//dtd html level 3//", "-//ietf//dtd html strict level 0//",
+	"-//ietf//dtd html strict level 1//", "-//ietf//dtd html strict level 2//", "-//ietf//dtd html strict level 3//",
+	"-//ietf//dtd html strict//", "-//ietf//dtd html//", "-//metrius//dtd metrius presentational//",
+	"-//microsoft//dtd internet explorer 2.0 html strict//", "-//microsoft//dtd internet explorer 2.0 html//",
+	"-//microsoft//dtd internet explorer 2.0 tables//", "-//microsoft//dtd internet explorer 3.0 html strict//",
+	"-//microsoft//dtd internet explorer 3.0 html//", "-//microsoft//dtd internet explorer 3.0 tables//",
+	"-//netscape comm. corp.//dtd html//", "-//netscape comm. corp.//dtd strict html//",
+	"-//o'reilly and associates//dtd html 2.0//", "-//o'reilly and associates//dtd html extended 1.0//",
+	"-//o'reilly and associates//dtd html extended relaxed 1.0//", "-//sq//dtd html 2.0 hotmetal + extensions//",
+	"-//softquad software//dtd hotmetal pro 6.0::19990601::extensions to html 4.0//",
+	"-//softquad//dtd hotmetal pro 4.0::19971010::extensions to html 4.0//", "-//spyglass//dtd html 2.0 extended//",
+	"-//sun microsystems corp.//dtd hotjava html//", "-//sun microsystems corp.//dtd hotjava strict html//",
+	"-//w3c//dtd html 3 1995-03-24//", "-//w3c//dtd html 3.2 draft//", "-//w3c//dtd html 3.2 final//",
+	"-//w3c//dtd html 3.2//", "-//w3c//dtd html 3.2s draft//", "-//w3c//dtd html 4.0 frameset//",
+	"-//w3c//dtd html 4.0 transitional//", "-//w3c//dtd html experimental 19960712//",
+	"-//w3c//dtd html experimental 970421//", "-//w3c//dtd w3 html//", "-//w3o//dtd w3 html 3.0//",
+	"-//webtechs//dtd mozilla html 2.0//", "-//webtechs//dtd mozilla html//"]
+
+/// Whether the doctype t sets the document to quirks mode.
+function isQuirky(t: Token): bool {
+	const pub = lower(t.publicId ?? "")
+	const sys = t.systemId ?? ""
+	return t.quirks || t.name != "html" || contains(quirkyIds, pub)
+		|| lower(sys) == "http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd"
+		|| quirkyPrefixes.some(p => startsWith(pub, p))
+		|| sys == ""
+		&& (startsWith(pub, "-//w3c//dtd html 4.01 frameset//")
+		|| startsWith(pub, "-//w3c//dtd html 4.01 transitional//"))
+}
+
+/// An element named name in ns, with copies of attrs.
+function element(name: string, ns: string, attrs: Attribute[]): Node {
+	const n = new Node("element", name)
+	n.ns = ns
+	n.attrs = attrs.map(a => new Attribute(a.name, a.value, a.ns))
+	return n
+}
+
+/// A new element as n was made, of its name and attributes.
+function clone(n: Node): Node { return element(n.name, n.ns, n.attrs) }
+/// Adds the attributes of t that el has not to it.
+function merge(el: Node, t: Token) { el.attrs.append(t.attrs.filter(a => el.attr(a.name) == null)) }
+/// Whether n is in HTML's namespace, as an element without one is taken to be.
+function inHTML(n: Node): bool { return n.ns == htmlNS || n.ns == "" }
+function isHTML(n: Node, name: string): bool { return inHTML(n) && n.name == name }
+function isHTMLOf(n: Node, names: string[]): bool { return inHTML(n) && contains(names, n.name) }
+
+function isSpecial(n: Node): bool {
+	if (inHTML(n)) {
+		return contains(special, n.name)
+	}
+	return isMathText(n) || n.ns == mathNS && n.name == "annotation-xml"
+		|| n.ns == svgNS && contains(svgIntegration, n.name)
+}
+
+/// Whether n bounds the default scope.
+function isScoping(n: Node): bool {
+	return if (inHTML(n)) contains(["applet", "caption", "html", "table", "td", "th", "marquee", "object", "select",
+		"template"], n.name)
+		else isSpecial(n)
+}
+
+function isMathText(n: Node): bool { return n.ns == mathNS && contains(["mi", "mo", "mn", "ms", "mtext"], n.name) }
+
+/// Whether n is an HTML integration point.
+function isIntegration(n: Node): bool {
+	if (n.ns == mathNS && n.name == "annotation-xml") {
+		const e = lower(n.attr("encoding") ?? "")
+		return e == "text/html" || e == "application/xhtml+xml"
+	}
+	return n.ns == svgNS && contains(svgIntegration, n.name)
+}
+
+/// The SVG elements that are HTML integration points.
+const svgIntegration = ["foreignObject", "desc", "title"]
+
+function isAllSpace(s: string): bool {
+	for (const ch of s) {
+		if (!isSpace(ch)) {
+			return false
+		}
+	}
+	return true
+}
+
+/// The whitespace of s.
+function spaces(s: string): string {
+	let out = ""
+	for (const ch of s) {
+		if (isSpace(ch)) {
+			out += chr(ch)
+		}
+	}
+	return out
+}
+
+const voids = ["area", "base", "basefont", "bgsound", "br", "col", "embed", "frame", "hr", "img", "input", "keygen",
+	"link", "meta", "param", "source", "track", "wbr"]
+
+function write(n: Node, out: string[]): void {
+	switch (n.kind) {
+		case "document": for (const c of n.children) {
+			write(c, out)
+		}
+		case "doctype": out.push(`<!DOCTYPE ${n.name}>`)
+		case "element":
+			out.push(`<${n.name}`)
+			for (const a of n.attrs) {
+				out.push(` ${a.name}="${escape(a.value, true)}"`)
+			}
+			out.push(">")
+			if (inHTML(n) && contains(voids, n.name)) {
+				return
+			}
+			for (const c of n.children) {
+				write(c, out)
+			}
+			out.push(`</${n.name}>`)
+		case "text":
+			const p = n.parent
+			const raw = p != null
+				&& isHTMLOf(p, ["style", "script", "xmp", "iframe", "noembed", "noframes", "plaintext", "noscript"])
+			out.push(if (raw) n.data else escape(n.data, false))
+		case "comment": out.push(`<!--${n.data}-->`)
+		case "instruction": out.push(`<?${n.name} ${n.data}?>`)
+	}
+}
+
+/// s escaped as text, or as an attribute value.
+function escape(s: string, attr: bool): string {
+	let out = ""
+	let from = 0
+	for (const i of 0 ... s.length - 1) {
+		const e = switch (s[i]) {
+			case amp: "&amp;"
+			case less: "&lt;"
+			case greater: "&gt;"
+			case quote: if (attr) "&quot;" else ""
+			case 0xa0: if (i > 0 && s[i - 1] == 0xc2) "&nbsp;" else ""
+			default: ""
+		}
+		if (e != "") {
+			out += s.slice(from, if (s[i] == 0xa0) i - 1 else i) + e
+			from = i + 1
+		}
+	}
+	return out + s.slice(from, s.length)
+}

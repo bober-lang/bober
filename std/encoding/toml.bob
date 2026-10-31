@@ -1,0 +1,656 @@
+//! Values as TOML 1.0: a class or object as a table of its fields in declaration order, plain fields first as
+//! `key = value`, then fields holding a class as [tables] and nonempty arrays of classes as [[arrays of tables]]. TOML
+//! has no null: a null field of a table is left out, and a null elsewhere, inline tables included, cannot be encoded.
+//! Decoding is strict as json's: no unknown keys, a class it makes takes no arguments, fields left out keep their
+//! initial values, a union's value is a member that fits, an integer if one does, and a key path through a union
+//! takes its first class. A Rest field takes the unknown keys, an unknown table's under its dotted path. A key or
+//! table defined twice is rejected. Dates and times are not supported.
+
+import { contains } from "../algo"
+import * as ascii from "../ascii"
+import { apostrophe, backslash, digit, dot, equal, hash, isAlphanumeric, isControl, isDigit, lbrace, lbracket, lf,
+	minus, nul, plus, quote, rbrace, rbracket, space, tab, underscore, zero } from "../ascii"
+import { parseFloat } from "../float"
+import { inf, isFinite, isNaN, nan } from "../math"
+import { quoted, Unknown } from "./json"
+import { ParseError, parseInt } from "../parse"
+import { startsWith, utf8 } from "../string"
+import { Decodable, Float, has, Integral } from "../types"
+
+/// Tags an Unknown[] field to take the keys no other field takes, and to encode them back.
+export class Rest {}
+
+/// A null that is not a field, which TOML cannot hold, under the key path.
+export class EncodeError {
+	path: string
+
+	constructor(path: string) { this.path = path }
+}
+
+export function encode[T](v: T): string throws EncodeError {
+	return table(v, "")
+}
+
+export function decode[T extends Decodable](s: string): T throws ParseError {
+	const d = new Decoder(s)
+	switch (T.kind) {
+		case "class":
+			let root = new T()
+			let header: string[] = []
+			while (d.line()) {
+				const at = d.i
+				if (d.eat(lbracket)) {
+					const array = d.eat(lbracket)
+					d.space()
+					header = d.keys()
+					d.expect(rbracket)
+					if (array) {
+						d.expect(rbracket)
+					} else {
+						d.define(header, at)
+					}
+					root = d.walk[T](root, header, 0, if (array) "array" else "table", at)
+				} else {
+					root = d.pair[T](root, header)
+				}
+				d.end()
+			}
+			return root
+		default: throw new ParseError("syntax", 0)
+	}
+}
+
+/// The keys of v, then its tables, each under path.
+function table[T](v: T, path: string): string throws EncodeError {
+	const t = typeof v
+	const keys: string[] = []
+	const tables: string[] = []
+	switch (t.kind) {
+		case "class", "object", "interface":
+			for (const f of t.fields) {
+				if (has(f.tags, Rest) && f.type == Unknown[]) {
+					for (const [k, text] of v[f.name]) {
+						keys.push(`${k} = ${text}\n`)
+					}
+				} else {
+					field(keys, tables, path, f.name, v[f.name])
+				}
+			}
+		default: throw new EncodeError(path)
+	}
+	let out = keys.join("")
+	for (const s of tables) {
+		out += if (out == "") s else `\n${s}`
+	}
+	return out
+}
+
+/// Adds v as the key name to keys, or as the table path.name to tables.
+function field[T](keys: string[], tables: string[], path: string, name: string, v: T): null throws EncodeError {
+	const t = typeof v
+	const p = path + key(name)
+	switch (t.kind) {
+		case "null": return
+		case "union":
+			for (const M of t.members) {
+				if (v instanceof M) {
+					field(keys, tables, path, name, v)
+				}
+			}
+		case "class", "object", "interface": tables.push(`[${p}]\n${table(v, `${p}.`)}`)
+		case "array":
+			if (t.elem.kind == "class" || t.elem.kind == "object" || t.elem.kind == "interface") {
+				if (v.length > 0) {
+					for (const x of v) {
+						tables.push(`[[${p}]]\n${table(x, `${p}.`)}`)
+					}
+					return
+				}
+			}
+			keys.push(`${key(name)} = ${value(v, p)}\n`)
+		default: keys.push(`${key(name)} = ${value(v, p)}\n`)
+	}
+}
+
+function value[T](v: T, path: string): string throws EncodeError {
+	const t = typeof v
+	const items: string[] = []
+	switch (t.kind) {
+		case "bool", "int": return `${v}`
+		case "float":
+			if (!isFinite(v)) {
+				return if (isNaN(v)) "nan" else if (v > 0.0) "inf" else "-inf"
+			}
+			const s = `${v}`
+			for (const ch of s) {
+				if (!isDigit(ch) && ch != minus) {
+					return s
+				}
+			}
+			return `${s}.0`
+		case "string": return quoted(v)
+		case "literal": return value[string | bool | null](t.value, path)
+		case "union":
+			for (const M of t.members) {
+				if (v instanceof M) {
+					return value(v, path)
+				}
+			}
+			return ""
+		case "array", "fixed":
+			for (const x of v) {
+				items.push(value(x, path))
+			}
+			return `[${items.join(", ")}]`
+		case "tuple":
+			for (const f of t.fields) {
+				items.push(value(v[f.name], path))
+			}
+			return `[${items.join(", ")}]`
+		case "class", "object", "interface":
+			for (const f of t.fields) {
+				if (has(f.tags, Rest) && f.type == Unknown[]) {
+					for (const [k, text] of v[f.name]) {
+						items.push(`${k} = ${text}`)
+					}
+				} else {
+					items.push(`${key(f.name)} = ${value(v[f.name], `${path}.${key(f.name)}`)}`)
+				}
+			}
+			return `{${items.join(", ")}}`
+		default: throw new EncodeError(path)
+	}
+}
+
+function key(k: string): string {
+	for (const ch of k) {
+		if (!bare(ch)) {
+			return quoted(k)
+		}
+	}
+	return k
+}
+
+function bare(ch: u8): bool { return isAlphanumeric(ch) || ch == underscore || ch == minus }
+
+/// An inline table of any keys.
+class Keys {
+	all: Unknown[] @Rest = []
+}
+
+class Decoder {
+	s: string
+	i = 0
+	/// The paths of the arrays of tables begun, which a [[header]] appends to rather than replaces.
+	arrays: string[] = []
+	/// The key paths of the keys and [tables] defined, which may not be again: in an inline table, its own.
+	defined: string[] = []
+
+	constructor(s: string) { this.s = s }
+
+	pair[T extends Decodable](v: T, table: string[]): T throws ParseError {
+		const at = this.i
+		const path = [...table, ...this.keys()]
+		this.define(path, at)
+		this.expect(equal)
+		this.space()
+		return this.walk[T](v, path, 0, "value", at)
+	}
+
+	/// v with the value, table or new element of an array of tables at path[i…] set, or a ParseError at at.
+	walk[T extends Decodable](v: T, path: string[], i: i32, leaf: "value" | "table" | "array", at: i32): T throws ParseError {
+		if (i == path.length && leaf == "value") {
+			return this.value[T]()
+		}
+		switch (T.kind) {
+			case "union":
+				for (const M of T.members) {
+					if (M.kind == "class") {
+						return this.walk[M](if (v instanceof M) v else new M(), path, i, leaf, at)
+					}
+				}
+			case "class":
+				if (i == path.length) {
+					if (leaf == "table") {
+						return v
+					}
+				} else {
+					for (const f of T.fields) {
+						if (path[i] == f.name && !has(f.tags, Rest)) {
+							v[f.name] = this.walk[f.type](v[f.name], path, i + 1, leaf, at)
+							return v
+						}
+					}
+					for (const f of T.fields) {
+						if (has(f.tags, Rest) && f.type == Unknown[]) {
+							if (leaf == "value") {
+								const start = this.i
+								this.skip()
+								const rest: Unknown[] = v[f.name]
+								rest.push([path.slice(i, path.length).map(key).join("."), this.s.slice(start, this.i)])
+							}
+							return v
+						}
+					}
+				}
+			case "array":
+				if (i < path.length && v.length > 0) {
+					v[v.length - 1] = this.walk[T.elem](v[v.length - 1], path, i, leaf, at)
+					return v
+				}
+				if (T.elem.kind == "class") {
+					if (i == path.length && leaf == "array") {
+						const xs: T = if (this.again(path)) v else []
+						xs.push(new T.elem())
+						return xs
+					}
+				}
+			default: throw new ParseError("syntax", at)
+		}
+		throw new ParseError("syntax", at)
+	}
+
+	/// Marks path defined, or throws a ParseError at at if it was.
+	define(path: string[], at: i32) throws ParseError {
+		const k = path.map(key).join(".")
+		if (contains(this.defined, k)) {
+			throw new ParseError("syntax", at)
+		}
+		this.defined.push(k)
+	}
+
+	/// Whether the array of tables at path was begun before, marking it begun and what is in its new element not.
+	again(path: string[]): bool {
+		const k = path.map(key).join(".")
+		const begun = contains(this.arrays, k)
+		this.arrays = [k, ...this.arrays.filter(a => a != k && !startsWith(a, `${k}.`))]
+		this.defined = this.defined.filter(a => !startsWith(a, `${k}.`))
+		return begun
+	}
+
+	value[T extends Decodable](): T throws ParseError {
+		const at = this.i
+		switch (T.kind) {
+			case "bool": return this.bool()
+			case "int": return this.int[T]()
+			case "float": return this.float[T]()
+			case "string": return this.string()
+			case "literal":
+				if (this.value[string | bool]() != T.value) {
+					throw new ParseError("syntax", at)
+				}
+				return T.value
+			case "union":
+				// Integers first, as 1 fits a float too and the members are in canonical order (§4.4), not as written.
+				for (const ints of [true, false]) {
+					for (const M of T.members) {
+						if ((M.kind == "int") == ints) {
+							try {
+								return this.value[M]()
+							} catch {
+								this.i = at
+							}
+						}
+					}
+				}
+				throw new ParseError("syntax", at)
+			case "array":
+				const xs: T = []
+				this.expect(lbracket)
+				while (this.more(xs.length)) {
+					xs.push(this.value[T.elem]())
+				}
+				return xs
+			case "fixed":
+				let fixed: T
+				this.expect(lbracket)
+				for (const i of 0 ... T.length - 1) {
+					this.need(this.more(i))
+					fixed[i] = this.value[T.elem]()
+				}
+				this.need(!this.more(T.length))
+				return fixed
+			case "tuple":
+				const tuple = new T()
+				this.expect(lbracket)
+				let n = 0
+				for (const f of T.fields) {
+					this.need(this.more(n))
+					tuple[f.name] = this.value[f.type]()
+					n++
+				}
+				this.need(!this.more(n))
+				return tuple
+			case "class":
+				let r = new T()
+				this.expect(lbrace)
+				this.space()
+				if (this.eat(rbrace)) {
+					return r
+				}
+				// Its keys are its own, and the outer ones come back also when a union tries another member.
+				const outer = this.defined
+				this.defined = []
+				try {
+					let more = true
+					while (more) {
+						this.space()
+						r = this.pair[T](r, [])
+						this.space()
+						more = this.eat(ascii.comma)
+					}
+					this.expect(rbrace)
+				} finally {
+					this.defined = outer
+				}
+				return r
+			default: throw new ParseError("syntax", at)
+		}
+	}
+
+	/// Moves past a value of any type.
+	skip() {
+		switch (this.peek()) {
+			case lbracket:
+				this.i++
+				let n = 0
+				while (this.more(n)) {
+					this.skip()
+					n++
+				}
+			case lbrace: this.value[Keys]()
+			default: this.value[string | i64 | f64 | bool]()
+		}
+	}
+
+	bool(): bool {
+		const v = this.peek() == ascii.t
+		this.word(if (v) "true" else "false")
+		return v
+	}
+
+	int[T extends Integral](): T throws ParseError {
+		const at = this.i
+		const sign = this.sign()
+		let radix = 10
+		if (this.i == at && this.peek() == zero) {
+			radix = switch (this.peek(1)) { case ascii.x: 16; case ascii.o: 8; case ascii.b: 2; default: 10 }
+			if (radix != 10) {
+				this.i += 2
+			}
+		}
+		const digits = if (radix == 10) this.decimal() else this.digits(radix)
+		if (this.peek() == dot || this.peek() == ascii.e || this.peek() == ascii.E) {
+			throw this.error()
+		}
+		try {
+			return parseInt[T](sign + digits, radix)
+		} catch (e: ParseError) {
+			throw new ParseError(e.kind, at)
+		}
+	}
+
+	float[T extends Float](): T throws ParseError {
+		const at = this.i
+		let n = this.sign()
+		if (this.peek() == ascii.i || this.peek() == ascii.n) {
+			const isInf = this.peek() == ascii.i
+			this.word(if (isInf) "inf" else "nan")
+			const v = if (isInf) inf else nan
+			return (if (n == "-") -v else v) as T
+		}
+		n += this.decimal()
+		if (this.eat(dot)) {
+			n += `.${this.digits(10)}`
+		}
+		if (this.eat(ascii.e) || this.eat(ascii.E)) {
+			n += `e${this.sign()}${this.digits(10)}`
+		}
+		try {
+			return parseFloat[T](n)
+		} catch (e: ParseError) {
+			throw new ParseError(e.kind, at)
+		}
+	}
+
+	sign(): string {
+		if (this.eat(minus)) {
+			return "-"
+		}
+		this.eat(plus)
+		return ""
+	}
+
+	decimal(): string {
+		const at = this.i
+		const d = this.digits(10)
+		if (d.length > 1 && d[0] == zero) {
+			throw new ParseError("syntax", at)
+		}
+		return d
+	}
+
+	/// Digits in radix, each `_` between two of them, without the `_`s.
+	digits(radix: i32): string {
+		let out = ""
+		while (this.inRadix(radix)) {
+			out += chr(this.next())
+			if (this.eat(underscore) && !this.inRadix(radix)) {
+				throw this.error()
+			}
+		}
+		if (out == "") {
+			throw this.error()
+		}
+		return out
+	}
+
+	inRadix(radix: i32): bool {
+		const d = digit(this.peek())
+		return d != null && d < radix
+	}
+
+	/// A basic or literal string, on one line or, between triple quotes, on several.
+	string(): string {
+		const q = this.peek()
+		if (q != quote && q != apostrophe) {
+			throw this.error()
+		}
+		const triple = chr(q) + chr(q) + chr(q)
+		const multi = this.ahead(triple)
+		this.i += if (multi) 3 else 1
+		if (multi) {
+			this.newline()
+		}
+		let out = ""
+		while (true) {
+			if (multi && this.ahead(triple)) {
+				this.i += 3
+				for (const _ of 1 ... 2) {
+					if (this.eat(q)) {
+						out += chr(q)
+					}
+				}
+				return out
+			}
+			if (!multi && this.eat(q)) {
+				return out
+			}
+			if (multi && this.newline()) {
+				out += "\n"
+				continue
+			}
+			const ch = this.next()
+			if (ch == backslash && q == quote) {
+				if (!(multi && this.joined())) {
+					out += this.escape()
+				}
+			} else if (isControl(ch) && ch != tab) {
+				throw new ParseError("syntax", this.i - 1)
+			} else {
+				out += chr(ch)
+			}
+		}
+	}
+
+	/// Whether a `\` ends the line here, skipping the line break and the whitespace after it.
+	joined(): bool {
+		const at = this.i
+		this.space()
+		if (!this.newline()) {
+			this.i = at
+			return false
+		}
+		while (this.newline() || this.eat(space) || this.eat(tab)) {}
+		return true
+	}
+
+	escape(): string {
+		const ch = this.next()
+		switch (ch) {
+			case quote, backslash: return chr(ch)
+			case ascii.b: return "\x08"
+			case ascii.f: return "\x0c"
+			case ascii.n: return "\n"
+			case ascii.r: return "\r"
+			case ascii.t: return "\t"
+			case ascii.u: return this.unicode(4)
+			case ascii.U: return this.unicode(8)
+			default: throw new ParseError("syntax", this.i - 1)
+		}
+	}
+
+	unicode(n: i32): string {
+		const at = this.i
+		let cp: i64 = 0
+		for (const _ of 1 ... n) {
+			const d = digit(this.next())
+			if (d == null || d >= 16) {
+				throw new ParseError("syntax", this.i - 1)
+			}
+			cp = cp << 4 | d
+		}
+		if (0xd800 <= cp < 0xe000 || cp > 0x10ffff) {
+			throw new ParseError("syntax", at)
+		}
+		return utf8(cp)
+	}
+
+	keys(): string[] {
+		const ks = [this.key()]
+		this.space()
+		while (this.eat(dot)) {
+			this.space()
+			ks.push(this.key())
+			this.space()
+		}
+		return ks
+	}
+
+	key(): string {
+		if (this.peek() == quote || this.peek() == apostrophe) {
+			return this.string()
+		}
+		const at = this.i
+		while (bare(this.peek())) {
+			this.i++
+		}
+		if (this.i == at) {
+			throw this.error()
+		}
+		return this.s.slice(at, this.i)
+	}
+
+	/// Whether an array has another item, past the comma after the nth.
+	more(n: i32): bool {
+		this.blank()
+		const comma = n == 0 || this.eat(ascii.comma)
+		this.blank()
+		if (this.eat(rbracket)) {
+			return false
+		}
+		this.need(comma)
+		return true
+	}
+
+	need(ok: bool) {
+		if (!ok) {
+			throw this.error()
+		}
+	}
+
+	line(): bool {
+		this.blank()
+		return this.i < this.s.length
+	}
+
+	end() {
+		this.space()
+		this.comment()
+		if (this.i < this.s.length && !this.newline()) {
+			throw this.error()
+		}
+	}
+
+	blank() {
+		this.space()
+		while (this.comment() || this.newline()) {
+			this.space()
+		}
+	}
+
+	comment(): bool {
+		if (!this.eat(hash)) {
+			return false
+		}
+		while (this.i < this.s.length && this.s[this.i] != lf) {
+			this.i++
+		}
+		return true
+	}
+
+	newline(): bool {
+		if (this.ahead("\r\n")) {
+			this.i++
+		}
+		return this.eat(lf)
+	}
+
+	space() {
+		while (this.eat(space) || this.eat(tab)) {}
+	}
+
+	ahead(t: string): bool { return this.i + t.length <= this.s.length && this.s.slice(this.i, this.i + t.length) == t }
+
+	word(w: string) {
+		for (const ch of w) {
+			this.expect(ch)
+		}
+	}
+
+	peek(k: i32 = 0): u8 { return if (this.i + k < this.s.length) this.s[this.i + k] else nul }
+
+	next(): u8 {
+		if (this.i == this.s.length) {
+			throw this.error()
+		}
+		this.i++
+		return this.s[this.i - 1]
+	}
+
+	eat(ch: u8): bool {
+		if (this.peek() != ch) {
+			return false
+		}
+		this.i++
+		return true
+	}
+
+	expect(ch: u8) {
+		if (!this.eat(ch)) {
+			throw this.error()
+		}
+	}
+
+	error(): ParseError { return new ParseError("syntax", this.i) }
+}

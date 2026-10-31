@@ -1,0 +1,68 @@
+//! Bytes as base64 text (RFC 4648), in the standard alphabet or the URL-safe one, padded with = or not.
+
+import { equal } from "../ascii"
+import { ParseError } from "../parse"
+import { indexOf } from "../string"
+
+export type Alphabet = "std" | "url"
+export type Padding = "padded" | "raw"
+
+const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+const stdDigits = letters + "+/"
+const urlDigits = letters + "-_"
+
+/// The bytes of s in base64.
+export function encode(s: string, alphabet: Alphabet = "std", padding: Padding = "padded"): string {
+	const abc = if (alphabet == "url") urlDigits else stdDigits
+	let out = ""
+	let i = 0
+	while (i < s.length) {
+		const n = s.length - i
+		const v = (s[i] as u32) << 16 | ((s.at(i + 1) ?? 0) as u32) << 8 | ((s.at(i + 2) ?? 0) as u32)
+		out += chr(abc[v >> 18 & 63]) + chr(abc[v >> 12 & 63])
+		out += if (n > 1) chr(abc[v >> 6 & 63]) else if (padding == "padded") "=" else ""
+		out += if (n > 2) chr(abc[v & 63]) else if (padding == "padded") "=" else ""
+		i += 3
+	}
+	return out
+}
+
+/// The bytes that s, base64 in the given alphabet and padded or not accordingly, spells: a syntax error at a
+/// character outside the alphabet, at a = where none belongs, and at the end where s stops short.
+export function decode(s: string, alphabet: Alphabet = "std", padding: Padding = "padded"): string throws ParseError {
+	const abc = if (alphabet == "url") urlDigits else stdDigits
+	let out = ""
+	let i = 0
+	while (i < s.length) {
+		let v: u32 = 0
+		let n = 0
+		while (n < 4 && i + n < s.length && s[i + n] != equal) {
+			const bits = indexOf(abc, chr(s[i + n]))
+			if (bits < 0) {
+				throw new ParseError("syntax", i + n)
+			}
+			v = v << 6 | (bits as u32)
+			n++
+		}
+		if (n < 2 || padding == "raw" && s.at(i + n) == equal) {
+			throw new ParseError("syntax", i + n)
+		}
+		out += chr((v << (24 - 6 * n) >> 16) as u8)
+		if (n > 2) {
+			out += chr((v << (24 - 6 * n) >> 8 & 255) as u8)
+		}
+		if (n > 3) {
+			out += chr((v & 255) as u8)
+		}
+		i += n
+		if (padding == "padded") {
+			for (const _ of n ... 3) {
+				if (s.at(i) != equal) {
+					throw new ParseError("syntax", i)
+				}
+				i++
+			}
+		}
+	}
+	return out
+}

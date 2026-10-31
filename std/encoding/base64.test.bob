@@ -1,0 +1,46 @@
+import { decode, encode } from "./base64"
+import { ParseError } from "../parse"
+
+/// From RFC 4648 §10 and Go's encoding/base64 tests: bytes, padded and raw.
+const vectors: [string, string, string][] = [["", "", ""], ["f", "Zg==", "Zg"], ["fo", "Zm8=", "Zm8"],
+	["foo", "Zm9v", "Zm9v"], ["foob", "Zm9vYg==", "Zm9vYg"], ["fooba", "Zm9vYmE=", "Zm9vYmE"],
+	["foobar", "Zm9vYmFy", "Zm9vYmFy"], ["sure.", "c3VyZS4=", "c3VyZS4"],
+	["\x14\xfb\x9c\x03\xd9\x7e", "FPucA9l+", "FPucA9l+"], ["\xff\xef\xbf", "/++/", "/++/"]]
+
+test "both ways" {
+	for (const [bytes, padded, raw] of vectors) {
+		test `${padded}` {
+			assert encode(bytes) == padded
+			assert decode(padded) == bytes
+			assert encode(bytes, "std", "raw") == raw
+			assert decode(raw, "std", "raw") == bytes
+		}
+	}
+}
+
+test "url alphabet" {
+	assert encode("\xff\xef\xbf", "url") == "_--_"
+	assert decode("_--_", "url") == "\xff\xef\xbf"
+	assert encode("\xfb\xff", "url", "raw") == "-_8"
+	assert decode("-_8", "url", "raw") == "\xfb\xff"
+	assert decode("_--_") throws new ParseError("syntax", 0)
+	assert decode("/++/", "url") throws new ParseError("syntax", 0)
+}
+
+test "errors" {
+	test "padded" {
+		assert decode("Z") throws new ParseError("syntax", 1)
+		assert decode("Zg") throws new ParseError("syntax", 2)
+		assert decode("Zg=") throws new ParseError("syntax", 3)
+		assert decode("Zm9vYg") throws new ParseError("syntax", 6)
+		assert decode("Zm9v=") throws new ParseError("syntax", 4)
+		assert decode("Zm 9v") throws new ParseError("syntax", 2)
+		assert decode("====") throws new ParseError("syntax", 0)
+		assert decode("Zm9vZg==Zg") throws new ParseError("syntax", 10)
+	}
+	test "raw" {
+		assert decode("Zm9v", "std", "raw") == "foo"
+		assert decode("Z", "std", "raw") throws new ParseError("syntax", 1)
+		assert decode("Zg==", "std", "raw") throws new ParseError("syntax", 2)
+	}
+}

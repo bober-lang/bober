@@ -1,0 +1,150 @@
+import { decode, encode, EncodeError, Name, OmitEmpty, Rest, Skip, Unknown } from "./json"
+import { inf, isNaN, nan } from "../math"
+import { ParseError } from "../parse"
+
+class Point {
+	x: i32 = 0
+	y: f64 = 0.5
+}
+
+class Shape {
+	name: string = "box"
+	corners: Point[] = [new Point(), new Point()]
+	parent: Shape | null = null
+	kind: "open" | "closed" = "open"
+}
+
+class User {
+	id: i32 @Name["ID"] = 7
+	nick: string | null @OmitEmpty = null
+	tags: string[] @OmitEmpty @Name["t"] = []
+	admin: bool @OmitEmpty = false
+	cache: string @Skip = "c"
+}
+
+test "encode scalars and strings" {
+	assert encode(null) == "null"
+	assert encode(true) == "true"
+	assert encode(-3) == "-3"
+	assert encode(1.25) == "1.25"
+	assert encode(1e300) == "1e+300"
+	assert encode(18446744073709551615 as u64) == "18446744073709551615"
+	assert encode("a\"b\\c\n\t\r\x01\x7fé") == `"a\\"b\\\\c\\n\\t\\r\\u0001\\u007fé"`
+}
+
+test "encode arrays, objects and classes" {
+	assert encode([1, 2, 3]) == "[1,2,3]"
+	assert encode([] as i32[]) == "[]"
+	assert encode({ a: 1, b: "x" }) == `{"a":1,"b":"x"}`
+	assert encode(new Shape())
+		== `{"name":"box","corners":[{"x":0,"y":0.5},{"x":0,"y":0.5}],"parent":null,"kind":"open"}`
+}
+
+test "encode unions untagged" {
+	assert encode[i32 | string](3) == "3"
+	assert encode[i32 | string]("a") == `"a"`
+	assert encode[Point | null](new Point()) == `{"x":0,"y":0.5}`
+}
+
+test "encode throws on NaN and infinity" {
+	assert encode([inf]) throws new EncodeError(inf)
+	assert encode([-inf]) throws new EncodeError(-inf)
+	let v = 0.0
+	try {
+		encode([nan])
+	} catch (e: EncodeError) {
+		v = e.value
+	}
+	assert isNaN(v)
+}
+
+test "tags rename, omit and skip fields" {
+	const u = new User()
+	assert encode(u) == `{"ID":7}`
+	u.nick = ""
+	u.tags = ["x"]
+	u.admin = true
+	assert encode(u) == `{"ID":7,"t":["x"],"admin":true}`
+	const want = new User()
+	want.id = 1
+	want.nick = "n"
+	want.tags = ["a"]
+	assert decode[User](`{"ID": 1, "nick": "n", "t": ["a"]}`) == want
+	assert decode[User](`{"id": 1}`) throws new ParseError("syntax", 1)
+	assert decode[User](`{"cache": "x"}`) throws new ParseError("syntax", 1)
+}
+
+test "decode scalars" {
+	assert decode[null]("null") == null
+	assert decode[bool](" true ")
+	assert !decode[bool]("false")
+	assert decode[i32]("-42") == -42
+	assert decode[u8]("255") == 255
+	assert decode[f64]("0") == 0.0
+	assert decode[f64]("-1.5e3") == -1500.0
+	assert decode[f32]("0.1") == (0.1 as f32)
+	assert decode[string](`"a\\"\\\\\\/\\b\\f\\n\\r\\t\\u00e9\\ud83d\\ude00"`) == "a\"\\/\x08\x0c\n\r\té\u{1F600}"
+}
+
+test "decode classes, arrays and unions" {
+	const want = new Shape()
+	want.corners[0].x = 1
+	want.corners[1].x = 3
+	want.corners[1].y = 2.0
+	want.parent = new Shape()
+	want.parent!.name = "p"
+	want.kind = "closed"
+	assert decode[Shape](`{"corners": [{"x": 1}, {"y": 2, "x": 3}], "parent": {"name": "p"}, "kind": "closed"}`) == want
+	assert decode[Shape](encode(want)) == want
+	assert decode[i32[]](" [ ] ") == []
+	assert decode[[i32, string]](`[1,"a"]`) == [1, "a"]
+	assert decode[u8[2]]("[1,2]")[1] == 2
+	assert decode[i32 | f64]("1.5") == 1.5
+	assert decode[i32 | f64]("1") instanceof i32
+}
+
+test "decode is strict" {
+	test "numbers" {
+		assert decode[i32]("") throws new ParseError("syntax", 0)
+		assert decode[i32]("01") throws new ParseError("syntax", 1)
+		assert decode[i32]("1.5") throws new ParseError("syntax", 1)
+		assert decode[i32]("1 2") throws new ParseError("syntax", 2)
+		assert decode[u8]("-1") throws new ParseError("syntax", 0)
+		assert decode[u8]("256") throws new ParseError("range", 0)
+		assert decode[f64](".5") throws new ParseError("syntax", 0)
+		assert decode[f64]("+1") throws new ParseError("syntax", 0)
+		assert decode[f64]("1.") throws new ParseError("syntax", 2)
+		assert decode[f64]("1e999") throws new ParseError("range", 0)
+		assert decode[f32]("1e39") throws new ParseError("range", 0)
+	}
+	test "strings" {
+		assert decode[string](`"a\nb"`) throws new ParseError("syntax", 2)
+		assert decode[string](`"\\x41"`) throws new ParseError("syntax", 2)
+		assert decode[string](`"\\udc00"`) throws new ParseError("syntax", 3)
+		assert decode[string](`"abc`) throws new ParseError("syntax", 4)
+	}
+	test "arrays and classes" {
+		assert decode[i32[2]]("[1]") throws new ParseError("syntax", 2)
+		assert decode[i32[]]("[1,]") throws new ParseError("syntax", 3)
+		assert decode[i32[]]("[1 2]") throws new ParseError("syntax", 3)
+		assert decode[Point](`{"z": 1}`) throws new ParseError("syntax", 1)
+		assert decode[Point](`{"x": "1"}`) throws new ParseError("syntax", 6)
+	}
+	test "literals" {
+		assert decode[bool]("tru") throws new ParseError("syntax", 3)
+		assert decode["open" | "closed"](`"shut"`) throws new ParseError("syntax", 0)
+	}
+}
+
+class Loose {
+	x: i32 = 0
+	rest: Unknown[] @Rest = []
+}
+
+test "rest takes unknown keys" {
+	const v = decode[Loose](`{"a": [1, {"b": null}], "x": 2, "c": "s"}`)
+	assert v.x == 2
+	assert v.rest == [["a", `[1, {"b": null}]`], ["c", `"s"`]]
+	assert encode(v) == `{"x":2,"a":[1, {"b": null}],"c":"s"}`
+	assert decode[Loose](`{"a": [1,]}`) throws new ParseError("syntax", 9)
+}

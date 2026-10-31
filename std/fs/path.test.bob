@@ -1,0 +1,53 @@
+import { base, clean, dir, ext, isAbs, isLocal, join, match, rel, stem } from "./path"
+
+test "clean" {
+	assert clean("") == "." && clean(".") == "." && clean("/") == "/" && clean("//") == "/"
+	assert clean("a//b/./c/") == "a/b/c" && clean("a/b/../c") == "a/c" && clean("a/..") == "."
+	assert clean("../a/../..") == "../.." && clean("/../a") == "/a" && clean("/a/b/../../..") == "/"
+}
+
+test "join" {
+	assert join() == "." && join("", "") == "." && join("a", "", "b") == "a/b"
+	assert join("a", "/b") == "a/b" && join("/", "a") == "/a" && join("a/", "../b") == "b"
+}
+
+test "dir and base" {
+	assert dir("a/b") == "a" && dir("a/b/") == "a" && dir("a") == "." && dir("/a") == "/" && dir("/") == "/"
+	assert dir("") == "." && dir(".") == "." && dir("..") == "." && dir("a/..") == "a"
+	for (const p of ["", "/", "a", "a/b/", "/a/./b", "a/..", "../a", "/.."]) {
+		assert join(dir(p), base(p)) == clean(p)
+	}
+	assert base("a/b") == "b" && base("a/b//") == "b" && base("/") == "" && base("") == "" && base("a/..") == ".."
+}
+
+test "ext and stem" {
+	assert ext("main.bob") == ".bob" && ext("src/lib.tar.gz") == ".gz" && ext("a.b/c") == "" && ext("keep.") == "."
+	assert ext(".gitignore") == "" && ext(".image.png") == ".png" && ext("") == ""
+	assert stem("src/lib.tar.gz") == "lib.tar" && stem(".gitignore") == ".gitignore" && stem("a/b/") == "b"
+}
+
+test "rel" {
+	assert rel("a/b", "a/b") == "." && rel("a", "a/b/c") == "b/c" && rel("a/b/c", "a") == "../.."
+	assert rel("a/b", "a/c/d") == "../c/d" && rel("/", "/a") == "a" && rel("/a/b", "/c") == "../../c"
+	assert rel(".", "..") == ".." && rel("", "a") == "a"
+	assert rel("a", "/a") == null && rel("..", "a") == null
+}
+
+test "isAbs and isLocal" {
+	assert isAbs("/a") && !isAbs("a") && !isAbs("")
+	assert isLocal("a") && isLocal("a/../b") && isLocal(".") && !isLocal("") && !isLocal("/a")
+	assert !isLocal("..") && !isLocal("a/../../b")
+}
+
+test "match" {
+	assert match("*.c", "a.c") && match("*.c", ".c") && !match("*.c", "a.h") && !match("*.c", "d/a.c")
+	assert match("a*b*c", "abbbc") && match("a*b*c", "abcbc") && !match("a*b*c", "abcb")
+	assert match("?.bob", "a.bob") && !match("?.bob", ".bob") && match("a/?/c", "a/b/c") && !match("a?c", "a/c")
+	assert match("[a-c]x", "bx") && !match("[a-c]x", "dx") && match("[!a-c]x", "dx") && match("[^a]", "b")
+	assert match("[]a]", "]") && match("[a-]", "-") && match("[\\]]", "]") && match("[", "[") && match("a[", "a[")
+	assert match("\\*", "*") && !match("\\*", "a") && match("a\\", "a\\")
+	assert match("**", "") && match("**", "a/b") && match("a/**", "a") && match("a/**/c", "a/c")
+	assert match("a/**/c", "a/b/b/c") && !match("a/**/c", "a/b") && match("**/*.c", "x/y.c") && match("**/*.c", "y.c")
+	assert !match("**/**/**/**/**/**/**/**/**/**/**/**/**/**/**/**/**/**/z", "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t/u/v/w/y")
+	assert match("/a/*", "/a/b") && !match("/a/*", "a/b") && !match("a/*", "/a/b") && match("a//b/", "./a/b")
+}

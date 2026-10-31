@@ -1,0 +1,231 @@
+import { decode, encode, EncodeError, Rest } from "./toml"
+import { Unknown } from "./json"
+import { isNaN } from "../math"
+import { ParseError } from "../parse"
+import { Decodable } from "../types"
+
+class Point {
+	x: i32 = 0
+	y: f64 = 0.5
+}
+
+class Server {
+	host = "localhost"
+	port: u16 = 8080
+	tags: string[] = []
+}
+
+class Config {
+	title = "demo"
+	mode: "fast" | "safe" = "fast"
+	origin = new Point()
+	server: Server | null = null
+	points: Point[] = []
+	matrix: i32[][] = [[1, 2], [3]]
+}
+
+class Box[T] {
+	v: T | null = null
+}
+
+class Int {
+	v: i32 = 0
+}
+
+class Byte {
+	v: u8 = 0
+}
+
+class Real {
+	v = 0.0
+}
+
+class Text {
+	v = ""
+}
+
+class Ints {
+	v: i32[] = []
+}
+
+class Scalars {
+	on = true
+	whole: f64 = 1.0
+	big: f64 = 1.0 / 0.0
+	text = "a\"b\\c\n\t\x01\x7fé"
+	$k = 1
+}
+
+class Nulls {
+	xs: (i32 | null)[] = [1, null]
+}
+
+function value[T extends Decodable](s: string): T { return decode[Box[T]](`v = ${s}`).v! }
+
+function configured(): Config {
+	const c = new Config()
+	c.server = new Server()
+	c.points = [new Point(), new Point()]
+	c.points[1].x = 2
+	return c
+}
+
+test "encode tables" {
+	assert encode(configured())
+		== `title = "demo"
+mode = "fast"
+matrix = [[1, 2], [3]]
+
+[origin]
+x = 0
+y = 0.5
+
+[server]
+host = "localhost"
+port = 8080
+tags = []
+
+[[points]]
+x = 0
+y = 0.5
+
+[[points]]
+x = 2
+y = 0.5
+`
+	assert encode(new Config())
+		== `title = "demo"
+mode = "fast"
+points = []
+matrix = [[1, 2], [3]]
+
+[origin]
+x = 0
+y = 0.5
+`
+}
+
+test "encode scalars" {
+	assert encode(new Scalars())
+		== `on = true
+whole = 1.0
+big = inf
+text = "a\\"b\\\\c\\n\\t\\u0001\\u007fé"
+"$k" = 1
+`
+}
+
+test "encode throws on null in an array" {
+	assert encode(new Nulls()) throws new EncodeError("xs")
+}
+
+test "decode tables" {
+	const want = new Config()
+	want.title = "hi"
+	want.origin.x = -1000
+	want.origin.y = 100.0
+	want.server = new Server()
+	want.server!.port = 31
+	want.server!.tags = ["a", "b"]
+	want.points = [new Point(), new Point()]
+	want.points[1].x = 3
+	assert decode[Config](`# comment
+title = 'hi' # trailing
+
+[origin]
+x = -1_000
+y = 1e2
+
+[ server ]
+port = 0x1F
+tags = [
+  "a", # first
+  "b",
+]
+
+[[points]]
+[[points]]
+x = 3
+`) == want
+	assert decode[Config](encode(configured())) == configured()
+}
+
+test "decode dotted keys and inline tables" {
+	const want = new Config()
+	want.origin.x = 1
+	want.server = new Server()
+	want.server!.host = "h"
+	want.matrix = [[], [4]]
+	assert decode[Config](`origin.x = 1
+server = { host = "h", tags = [] }
+matrix = [[], [4]]\r
+`) == want
+}
+
+test "decode scalars" {
+	assert value[bool]("true")
+	test "numbers" {
+		assert value[i64]("+5") == 5
+		assert value[i64]("0o17") == 15
+		assert value[u8]("0b1010_1010") == 170
+		assert value[i32 | f64]("1.5") == 1.5
+		assert value[i32 | f64]("2") instanceof i32
+		assert value[f64]("-0.5") == -0.5
+		assert value[f64]("3") == 3.0
+		assert value[f64]("6.5e-1") == 0.65
+		assert value[f64]("-inf") == -1.0 / 0.0
+		assert isNaN(value[f64]("nan"))
+	}
+	test "strings" {
+		assert value[string](`"a\\tb\\u00e9\\U0001F600"`) == "a\tbé\u{1F600}"
+		assert value[string](`'C:\\path'`) == "C:\\path"
+		assert value[string](`"""\nl1\nl2"""`) == "l1\nl2"
+		assert value[string](`"""a \\\n   b"""`) == "a b"
+		assert value[string](`'''x''''`) == "x'"
+	}
+}
+
+test "decode is strict" {
+	test "numbers" {
+		assert decode[Int]("v = 01") throws new ParseError("syntax", 4)
+		assert decode[Int]("v = 1.5") throws new ParseError("syntax", 5)
+		assert decode[Int]("v = 1__0") throws new ParseError("syntax", 6)
+		assert decode[Int]("v = +0x1") throws new ParseError("syntax", 6)
+		assert decode[Byte]("v = 256") throws new ParseError("range", 4)
+		assert decode[Real]("v = 1.") throws new ParseError("syntax", 6)
+		assert decode[Real]("v = 1e999") throws new ParseError("range", 4)
+	}
+	test "values" {
+		assert decode[Int]("w = 1") throws new ParseError("syntax", 0)
+		assert decode[Int]("v = 1 2") throws new ParseError("syntax", 6)
+		assert decode[Text](`v = "a\nb"`) throws new ParseError("syntax", 6)
+		assert decode[Text](`v = "\\x41"`) throws new ParseError("syntax", 6)
+		assert decode[Ints]("v = [1 2]") throws new ParseError("syntax", 7)
+	}
+	test "tables" {
+		assert decode[Config](`mode = "slow"`) throws new ParseError("syntax", 7)
+		assert decode[Config]("[nope]") throws new ParseError("syntax", 0)
+		assert decode[Config]("[title]") throws new ParseError("syntax", 0)
+		assert decode[Config]("[[origin]]") throws new ParseError("syntax", 0)
+	}
+	test "defined twice" {
+		assert decode[Int]("v = 1\nv = 2") throws new ParseError("syntax", 6)
+		assert decode[Config]("[origin]\n[origin]") throws new ParseError("syntax", 9)
+		assert decode[Config]("origin = { x = 1, x = 2 }") throws new ParseError("syntax", 18)
+		assert decode[Config]("[[points]]\nx = 1\n[[points]]\nx = 2").points.map(p => p.x) == [1, 2]
+		assert decode[Loose]("a = {x = 1}\nx = 2").x == 2
+	}
+}
+
+class Loose {
+	x: i32 = 0
+	rest: Unknown[] @Rest = []
+}
+
+test "rest takes unknown keys" {
+	const v = decode[Loose]("a = [1, {b = 2}]\nx = 2\n[s.\"t u\"]\nc = 'q'\n")
+	assert v.x == 2
+	assert v.rest == [["a", "[1, {b = 2}]"], [`s."t u".c`, "'q'"]]
+	assert encode(v) == "x = 2\na = [1, {b = 2}]\ns.\"t u\".c = 'q'\n"
+	assert decode[Loose](encode(v)) == v
+}

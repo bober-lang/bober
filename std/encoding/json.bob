@@ -1,0 +1,416 @@
+//! Values as JSON: a class, object or interface as an object of its fields in declaration order, an array, fixed
+//! array or tuple as an array, and a union's value untagged, which decoding reads as a member that fits, an integer
+//! if one does. Decoding is strict: no unknown keys, a class it makes takes no arguments, and fields left out keep
+//! their initial values. Tags on a field (spec 5.3) change its key, leave it out, or take the unknown keys.
+
+import { backslash, colon, comma, cr, digit, dot, isControl, isDigit, lbrace, lbracket, lf, minus, nul, plus, quote, rbrace, rbracket,
+	slash, space, tab, zero } from "../ascii"
+import * as ascii from "../ascii"
+import { parseFloat } from "../float"
+import { isFinite } from "../math"
+import { ParseError, parseInt } from "../parse"
+import { utf8 } from "../string"
+import { Decodable, Float, has, Integral, tag } from "../types"
+
+/// Tags a field to encode and decode under the key K instead of its name.
+export class Name[K extends string] {}
+
+/// Tags a field to leave out of encoding and decoding.
+export class Skip {}
+
+/// Tags a field to leave out of encoding when it is empty: null, false, zero, "" or [].
+export class OmitEmpty {}
+
+/// Tags an Unknown[] field to take the keys no other field takes, and to encode them back.
+export class Rest {}
+
+/// A key and its value's text, as a Rest field holds them.
+export type Unknown = [string, string]
+
+/// A NaN or infinite float, which JSON cannot hold.
+export class EncodeError {
+	value: f64
+
+	constructor(value: f64) { this.value = value }
+}
+
+export function encode[T](v: T): string throws EncodeError {
+	const t = typeof v
+	const items: string[] = []
+	switch (t.kind) {
+		case "null", "bool", "int": return `${v}`
+		case "float":
+			if (!isFinite(v)) {
+				throw new EncodeError(v)
+			}
+			return `${v}`
+		case "string": return quoted(v)
+		case "literal": return encode[string | bool | null](t.value)
+		case "union":
+			for (const M of t.members) {
+				if (v instanceof M) {
+					return encode(v)
+				}
+			}
+			return ""
+		case "array", "fixed":
+			for (const x of v) {
+				items.push(encode(x))
+			}
+			return `[${items.join(",")}]`
+		case "tuple":
+			for (const f of t.fields) {
+				items.push(encode(v[f.name]))
+			}
+			return `[${items.join(",")}]`
+		case "class", "object", "interface":
+			for (const f of t.fields) {
+				const x = v[f.name]
+				if (has(f.tags, Rest) && f.type == Unknown[]) {
+					for (const [k, text] of x) {
+						items.push(`${quoted(k)}:${text}`)
+					}
+				} else if (!has(f.tags, Skip) && !(has(f.tags, OmitEmpty) && empty(x))) {
+					items.push(`${quoted(tag(f.tags, Name, f.name))}:${encode(x)}`)
+				}
+			}
+			return `{${items.join(",")}}`
+		default: return quoted(t.name)
+	}
+}
+
+export function decode[T extends Decodable](s: string): T throws ParseError {
+	const d = new Decoder(s)
+	const v = d.value[T]()
+	d.space()
+	if (d.i != s.length) {
+		throw d.error()
+	}
+	return v
+}
+
+function empty[T](v: T): bool {
+	const t = typeof v
+	switch (t.kind) {
+		case "null": return true
+		case "bool": return !v
+		case "int": return v == 0
+		case "float": return v == 0.0
+		case "string", "array": return v.length == 0
+		case "union":
+			for (const M of t.members) {
+				if (v instanceof M) {
+					return empty(v)
+				}
+			}
+			return false
+		default: return false
+	}
+}
+
+const hex = "0123456789abcdef"
+
+/// s as a JSON string.
+export function quoted(s: string): string {
+	let q = ""
+	for (const ch of s) {
+		q += switch (ch) {
+			case quote: "\\\""
+			case backslash: "\\\\"
+			case lf: "\\n"
+			case cr: "\\r"
+			case tab: "\\t"
+			default: if (isControl(ch)) `\\u00${chr(hex[ch >> 4])}${chr(hex[ch & 15])}` else chr(ch)
+		}
+	}
+	return `"${q}"`
+}
+
+/// An object of any keys.
+class Keys {
+	all: Unknown[] @Rest = []
+}
+
+class Decoder {
+	s: string
+	i = 0
+
+	constructor(s: string) { this.s = s }
+
+	value[T extends Decodable](): T throws ParseError {
+		this.space()
+		const at = this.i
+		switch (T.kind) {
+			case "null":
+				this.word("null")
+				return null
+			case "bool": return this.bool()
+			case "int": return this.int[T]()
+			case "float": return this.float[T]()
+			case "string": return this.string()
+			case "literal":
+				if (this.value[string | bool | null]() != T.value) {
+					throw new ParseError("syntax", at)
+				}
+				return T.value
+			case "union":
+				// Integers first, as 1 fits a float too and the members are in canonical order (§4.4), not as written.
+				for (const ints of [true, false]) {
+					for (const M of T.members) {
+						if ((M.kind == "int") == ints) {
+							try {
+								return this.value[M]()
+							} catch {
+								this.i = at
+							}
+						}
+					}
+				}
+				throw this.error()
+			case "array":
+				const xs: T = []
+				this.expect(lbracket)
+				while (this.more(rbracket, xs.length)) {
+					xs.push(this.value[T.elem]())
+				}
+				return xs
+			case "fixed":
+				let fixed: T
+				this.expect(lbracket)
+				for (const i of 0 ... T.length - 1) {
+					this.comma(i)
+					fixed[i] = this.value[T.elem]()
+				}
+				this.close(rbracket)
+				return fixed
+			case "tuple":
+				const tuple = new T()
+				this.expect(lbracket)
+				let i = 0
+				for (const f of T.fields) {
+					this.comma(i)
+					tuple[f.name] = this.value[f.type]()
+					i++
+				}
+				this.close(rbracket)
+				return tuple
+			case "class":
+				const r = new T()
+				this.expect(lbrace)
+				let n = 0
+				while (this.more(rbrace, n)) {
+					const k = this.i
+					const name = this.string()
+					this.close(colon)
+					let known = false
+					for (const f of T.fields) {
+						if (!has(f.tags, Skip) && !has(f.tags, Rest) && name == tag(f.tags, Name, f.name)) {
+							r[f.name] = this.value[f.type]()
+							known = true
+						}
+					}
+					for (const f of T.fields) {
+						if (!known && has(f.tags, Rest) && f.type == Unknown[]) {
+							this.space()
+							const at = this.i
+							this.skip()
+							const rest: Unknown[] = r[f.name]
+							rest.push([name, this.s.slice(at, this.i)])
+							known = true
+						}
+					}
+					if (!known) {
+						throw new ParseError("syntax", k)
+					}
+					n++
+				}
+				return r
+			default: throw this.error()
+		}
+	}
+
+	/// Moves past a value of any type.
+	skip() {
+		switch (this.peek()) {
+			case lbracket:
+				this.i++
+				let n = 0
+				while (this.more(rbracket, n)) {
+					this.skip()
+					n++
+				}
+			case lbrace: this.value[Keys]()
+			default: this.value[string | f64 | bool | null]()
+		}
+	}
+
+	bool(): bool {
+		const v = this.peek() == ascii.t
+		this.word(if (v) "true" else "false")
+		return v
+	}
+
+	int[T extends Integral](): T {
+		const at = this.i
+		const text = this.number()
+		try {
+			return parseInt[T](text)
+		} catch (e: ParseError) {
+			throw new ParseError(e.kind, at + e.at)
+		}
+	}
+
+	float[T extends Float](): T {
+		const at = this.i
+		const text = this.number()
+		try {
+			return parseFloat[T](text)
+		} catch (e: ParseError) {
+			throw new ParseError(e.kind, at + e.at)
+		}
+	}
+
+	number(): string {
+		const at = this.i
+		this.eat(minus)
+		if (!this.eat(zero)) {
+			this.digits()
+		}
+		if (this.eat(dot)) {
+			this.digits()
+		}
+		if (this.eat(ascii.e) || this.eat(ascii.E)) {
+			if (!this.eat(plus)) {
+				this.eat(minus)
+			}
+			this.digits()
+		}
+		return this.s.slice(at, this.i)
+	}
+
+	digits() {
+		const at = this.i
+		while (this.i < this.s.length && isDigit(this.s[this.i])) {
+			this.i++
+		}
+		if (this.i == at) {
+			throw this.error()
+		}
+	}
+
+	string(): string {
+		this.expect(quote)
+		let out = ""
+		while (!this.eat(quote)) {
+			const ch = this.next()
+			if (ch < space) {
+				throw new ParseError("syntax", this.i - 1)
+			}
+			out += if (ch == backslash) this.escape() else chr(ch)
+		}
+		return out
+	}
+
+	escape(): string {
+		const ch = this.next()
+		switch (ch) {
+			case quote, backslash, slash: return chr(ch)
+			case ascii.b: return "\x08"
+			case ascii.f: return "\x0c"
+			case ascii.n: return "\n"
+			case ascii.r: return "\r"
+			case ascii.t: return "\t"
+			case ascii.u: return utf8(this.unicode())
+			default: throw new ParseError("syntax", this.i - 1)
+		}
+	}
+
+	/// The code point of a \u escape, joining a surrogate pair.
+	unicode(): i64 {
+		const at = this.i
+		const hi = this.hex4()
+		if (hi < 0xd800 || hi >= 0xe000) {
+			return hi
+		}
+		if (hi < 0xdc00 && this.eat(backslash) && this.eat(ascii.u)) {
+			const lo = this.hex4()
+			if (0xdc00 <= lo < 0xe000) {
+				return 0x10000 + (hi - 0xd800 << 10) + lo - 0xdc00
+			}
+		}
+		throw new ParseError("syntax", at)
+	}
+
+	hex4(): i64 {
+		let v: i64 = 0
+		for (const _ of 1 ... 4) {
+			const d = digit(this.next())
+			if (d == null || d >= 16) {
+				throw new ParseError("syntax", this.i - 1)
+			}
+			v = v << 4 | d
+		}
+		return v
+	}
+
+	/// Whether another item comes before close, past the comma that follows the nth.
+	more(close: u8, n: i32): bool {
+		this.space()
+		if (this.eat(close)) {
+			return false
+		}
+		this.comma(n)
+		this.space()
+		return true
+	}
+
+	close(ch: u8) {
+		this.space()
+		this.expect(ch)
+	}
+
+	comma(n: i32) {
+		if (n > 0) {
+			this.space()
+			this.expect(comma)
+		}
+	}
+
+	space() {
+		while (this.peek() == space || this.peek() == tab || this.peek() == lf || this.peek() == cr) {
+			this.i++
+		}
+	}
+
+	word(w: string) {
+		for (const ch of w) {
+			this.expect(ch)
+		}
+	}
+
+	peek(): u8 { return if (this.i < this.s.length) this.s[this.i] else nul }
+
+	next(): u8 {
+		if (this.i == this.s.length) {
+			throw this.error()
+		}
+		this.i++
+		return this.s[this.i - 1]
+	}
+
+	eat(ch: u8): bool {
+		if (this.peek() != ch) {
+			return false
+		}
+		this.i++
+		return true
+	}
+
+	expect(ch: u8) {
+		if (!this.eat(ch)) {
+			throw this.error()
+		}
+	}
+
+	error(): ParseError { return new ParseError("syntax", this.i) }
+}

@@ -1,0 +1,33 @@
+import { parse, parseFragment, serialize } from "./html"
+import { Node } from "./xml"
+
+test "parse a page" {
+	const doc = parse("<!doctype html><title>Hi &amp; bye</title><p class=x>One<p>Two<br>three")
+	assert serialize(doc)
+		== `<!DOCTYPE html><html><head><title>Hi &amp; bye</title></head><body><p class="x">One</p><p>Two<br>three</p></body></html>`
+	const ps = doc.elements("p")
+	assert ps.length == 2
+	assert ps[0].attr("class") == "x"
+	assert ps[1].text() == "Twothree"
+}
+
+test "fix markup as a browser does" {
+	assert serialize(parse("<table><tr><td>a</table>x"))
+		== "<html><head></head><body><table><tbody><tr><td>a</td></tr></tbody></table>x</body></html>"
+	assert serialize(parse("<b><i>a</b>b</i>")) == "<html><head></head><body><b><i>a</i></b><i>b</i></body></html>"
+	assert serialize(parse("<svg viewbox='0 0 1 1'><circle/></svg>"))
+		== `<html><head></head><body><svg viewBox="0 0 1 1"><circle></circle></svg></body></html>`
+}
+
+test "build and write a fragment" {
+	const ul = new Node("element", "ul")
+	for (const s of ["a < b", "\"c\""]) {
+		const li = new Node("element", "li")
+		li.insert(new Node("text", "", s))
+		ul.insert(li)
+	}
+	assert serialize(ul) == `<ul><li>a &lt; b</li><li>"c"</li></ul>`
+	const nodes = parseFragment("<li>x<script>a<b</script>", ul)
+	assert nodes.length == 1
+	assert serialize(nodes[0]) == "<li>x<script>a<b</script></li>"
+}
