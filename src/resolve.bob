@@ -1,0 +1,1317 @@
+//! Instances and their code, which src/mono.bob makes for the whole program. An instance is a decl with an env, the
+//! args of its and its owners' type params (src/bc/program.bob), keyed by both in the Program's instances: a decl
+//! needing no args is its own instance, else it is a decl of its generic's module and name that notes the generic and
+//! env, a member's in its class's instance. Copy copies a decl's code for an instance: it substitutes the env,
+//! types the operand stack, folds what it knows and turns members and builtins into the calls they make.
+//!
+//! ## What mono knows
+//!
+//! Mono knows the value of a constant, of a Type, of what reflection makes of one, and of each `Readonly` local
+//! holding one of those, from the op that stores it on. From those it folds `!`, `&&`, `||`, `==`, `!=` and reflection,
+//! keeps only the branch an `If` it knows takes, and unrolls an `Each` over an array it knows, one Block per element
+//! with the local holding it. A call passes what its params holding a Type get, a closure what the locals it captures
+//! holding one hold, all known, to an instance made for those values, in whose copy they are known. A call of such an
+//! instance is still made, for its effects, but is known as what its Returns return where each it may run returns the
+//! same known value, as one returning a Type must; a Return or Throw outside any branch taken at run time ends those it
+//! may run. A type of what a local holds, Of or Member, is resolved by those values, through a memo the copy owns that
+//! is reset when one changes. A known value no op makes, a Type or an array or record of them, is never at run time.
+
+import { contains, position, removeAt } from "../std/algo"
+import { HashMap } from "../std/collections/hashmap"
+import { bits, fromBits } from "../std/float"
+import * as decl from "./bc/decl"
+import * as kind from "./bc/kind"
+import * as op from "./bc/op"
+import { Opcode } from "./bc/op"
+import { Code, Decl, Program, pair } from "./bc/program"
+import { qualified, showType } from "./bc/show"
+import { CompileError } from "./error"
+import { builtin } from "./root"
+
+/// A constant as the op that makes it, of its immediates.
+class Op {
+	op: Opcode
+	a: i32
+	b: i32
+
+	constructor(o: Opcode, a: i32 = 0, b: i32 = 0) {
+		this.op = o
+		this.a = a
+		this.b = b
+	}
+}
+
+/// A value known when compiling (§4.11): a constant, as the op that makes it, a Type, or an array or record of them as
+/// reflection makes, or a closure taking or giving one, as its code.
+export class Known {
+	op: Op | null
+	/// A Type's type, -1 for another value.
+	t: i32
+	/// A closure's decl, whose captures are its object's at run time, else -1.
+	fn = -1
+	/// An array's items or a record's values, null for a constant or Type.
+	items: Known[] | null
+	/// A record's field names.
+	names: string[]
+
+	constructor(o: Op | null, t: i32 = -1, items: Known[] | null = null, names: string[] = []) {
+		this.op = o
+		this.t = t
+		this.items = items
+		this.names = names
+	}
+
+	/// A record's value of field name.
+	get(name: string): Known throws CompileError {
+		const i = position(this.names, name)
+		if (i < 0) {
+			throw new CompileError(`no field ${name}`)
+		}
+		return this.items![i]
+	}
+}
+
+function typeValue(t: i32): Known { return new Known(null, t) }
+function closureValue(k: i32): Known {
+	const v = new Known(null)
+	v.fn = k
+	return v
+}
+function array(items: Known[], names: string[] = []): Known { return new Known(null, -1, items, names) }
+function truth(b: bool): Known { return new Known(new Op(if (b) op.True else op.False)) }
+
+/// An instance's code once copied, and per op of it the type of the operand that decides how the op is written out:
+/// what a Cast converts or a Throw throws, and the union, interface or object a Field, SetField or CallMethod works on;
+/// else -1.
+export class Inst {
+	code: Code | null = null
+	info: i32[] = []
+	/// Of an instance for known values, per local of its decl's code what it holds on entry, else [].
+	values: (Known | null)[] = []
+	/// Whether it is for known values, if none, as a closure owned by one is.
+	special = false
+	/// Whether it is the object of a closure taking a Type, whose code is never run, but its specials' (see Known.fn).
+	idle = false
+	/// What each Return it may run returns, if the same known value, else null.
+	result: Known | null = null
+	/// How many Returns it may run.
+	returns = 0
+	copied = false
+
+	/// Notes a Return of v, null if not known.
+	returned(v: Known | null) {
+		const same = this.returns == 0 || v != null && this.result != null && keyOf(v) == keyOf(this.result!)
+		this.result = if (same) v else null
+		this.returns++
+	}
+}
+
+/// The instances of a program and what mono knows of types.
+export class Instances {
+	p: Program
+	/// Per instance decl, its code.
+	insts = new HashMap[i32, Inst]()
+	/// The instance decls, in the order made.
+	order: i32[] = []
+	/// Per interface and object type, the union of what is converted into it, as src/mono.bob collects it, complete only
+	/// once its collecting settles; copying code reads none of it.
+	held = new HashMap[i32, i32]()
+	/// The decl being worked on, for errors.
+	where = ""
+	/// The instances whose code is still to copy.
+	private todo: i32[] = []
+	/// Per type id, whether the class instances it names are made.
+	private reached: bool[] = []
+	/// The instances for known values, by decl, env and values.
+	private specials = new HashMap[string, i32]()
+
+	constructor(p: Program) { this.p = p }
+
+	/// The instance of decl d for the env, made on first use; of a class with its members, but generic methods, which are
+	/// instanced as they are called, and but builtin/'s, of which only what is used is.
+	instance(d: i32, env: i32): i32 throws CompileError {
+		const p = this.p
+		const found = p.instances.get(pair(d, env))
+		if (found != null) {
+			return found
+		}
+		const x = p.decls[d]
+		// Its owner's instance owns it, so is kept with it; a class's makes it in turn.
+		const owner = if (x.owner < 0) -1 else this.instance(x.owner, this.prefix(env, p.identity(x.owner).length))
+		const made = p.instances.get(pair(d, env))
+		if (made != null) {
+			return made
+		}
+		const k = this.add(p.instance(d, env, owner), [], false)
+		if ((x.kind == decl.Class || x.kind == decl.Interface) && !builtin(p.modules[x.module].path)) {
+			for (const m of x.members) {
+				if (p.decls[m].params.length == 0 && !takesType(p, m, env)) {
+					this.instance(m, env)
+				}
+			}
+		}
+		return k
+	}
+
+	/// The instance of decl d for the env and values, per local of its code what it holds on entry if known, made on
+	/// first use: a decl of its own, owned by owner, else as instance makes it.
+	special(d: i32, env: i32, values: (Known | null)[], owner = -1): i32 throws CompileError {
+		const key = `${d} ${env} ${owner} ${values.map(v => keyOf(v)).join(" ")}`
+		const found = this.specials.get(key)
+		if (found != null) {
+			return found
+		}
+		const p = this.p
+		const x = p.decls[d]
+		const o = if (owner >= 0 || x.owner < 0) owner else this.instance(x.owner, this.prefix(env, p.identity(x.owner).length))
+		const k = this.add(p.instance(d, env, o, this.specials.size + 1), values, true)
+		this.specials.set(key, k)
+		return k
+	}
+
+	/// Notes instance k for values, its code to copy.
+	private add(k: i32, values: (Known | null)[], special: bool): i32 throws CompileError {
+		const i = new Inst()
+		i.values = values
+		i.special = special
+		this.insts.set(k, i)
+		this.order.push(k)
+		this.reach(this.p.decls[k].type)
+		if (this.p.decls[source(this.p, k)].code != null) {
+			this.todo.push(k)
+		}
+		return k
+	}
+
+	/// What instance k returns if known, copied first if not yet.
+	result(k: i32): Known | null throws CompileError {
+		this.make(k)
+		return this.insts.get(k)!.result
+	}
+
+	/// The env of decl d used with the type args, which lower gives in full, defaults filled in.
+	env(d: i32, args: i32[]): i32 throws CompileError {
+		if (args.length != this.p.identity(d).length) {
+			throw new CompileError(`${qualified(this.p, d)} needs ${this.p.identity(d).length} type args (${this.where})`)
+		}
+		return this.p.list(args)
+	}
+
+	/// The env of the first n args of env.
+	private prefix(env: i32, n: i32): i32 { return this.p.list(this.p.lists[env].slice(0, n)) }
+
+	/// Copies the code of the instances made, as they are made.
+	copy() throws CompileError {
+		let next = 0
+		while (next < this.todo.length) {
+			this.make(this.todo[next])
+			next++
+		}
+		this.todo = []
+	}
+
+	/// Copies the code of instance k, unless done.
+	private make(k: i32) throws CompileError {
+		const i = this.insts.get(k)!
+		if (i.copied) {
+			return
+		}
+		i.copied = true
+		const where = this.where
+		this.where = qualified(this.p, k)
+		new Copy(this, k, i).run()
+		this.where = where
+	}
+
+	/// Makes the class instances closed type t names, so that their members are copied.
+	reach(t: i32) throws CompileError {
+		while (this.reached.length <= t) {
+			this.reached.push(false)
+		}
+		if (this.reached[t] || !this.p.closed(t)) {
+			return
+		}
+		this.reached[t] = true
+		if (this.p.kind(t) == kind.Named && (this.p.b(t) != 0 || this.p.decls[this.p.a(t)].params.length == 0)) {
+			this.instance(this.p.a(t), this.p.b(t))
+		}
+		for (const x of this.p.parts(t)) {
+			this.reach(x)
+		}
+	}
+
+	// Types.
+
+	/// The kind of class or interface decl t names, -1 if it names none.
+	nominal(t: i32): i32 { return if (this.p.kind(t) == kind.Named) this.p.decls[this.p.a(t)].kind else -1 }
+
+	/// Whether t is held as a union of what is converted to it: an interface or object type.
+	abstract(t: i32): bool { return this.nominal(t) == decl.Interface || this.p.kind(t) == kind.Object }
+
+	/// The member of class or interface t named name, a Str, or -1; but a generic method.
+	member(t: i32, name: i32): i32 {
+		const m = if (this.p.kind(t) == kind.Named) this.p.member(this.p.a(t), name) else -1
+		return if (m < 0 || this.p.decls[m].params.length > 0) -1 else m
+	}
+
+	/// The instance of member(t, name), or -1.
+	memberOf(t: i32, name: i32): i32 throws CompileError {
+		const m = this.member(t, name)
+		return if (m < 0) -1 else this.instance(m, this.p.b(t))
+	}
+
+	/// Instances each field of t if a class of builtin/, whose fields are otherwise instanced only where named; what new
+	/// makes holds them all, as builtin/fiber.bob's Thrown, written through its layout alone.
+	allFields(t: i32) throws CompileError {
+		const p = this.p
+		if (this.nominal(t) != decl.Class || !builtin(p.modules[p.decls[p.a(t)].module].path)) {
+			return
+		}
+		for (const m of p.decls[p.a(t)].members) {
+			if (p.decls[m].kind == decl.Var && (p.decls[m].mods & decl.Static) == 0) {
+				this.instance(m, p.b(t))
+			}
+		}
+	}
+
+	/// The type of field name, a Str, of t; of each member of a union.
+	fieldType(t: i32, name: i32): i32 throws CompileError {
+		const p = this.p
+		const k = p.kind(t)
+		if (k == kind.Union) {
+			return p.union(p.items(t).map(m => this.fieldType(m, name)))
+		}
+		const d = this.memberOf(t, name)
+		if (d >= 0) {
+			return p.decls[d].type
+		}
+		const i = if (k == kind.Object || k == kind.Tuple) p.field(t, name) else -1
+		if (i >= 0) {
+			return p.items(t)[i]
+		}
+		const text = t == kind.String || t == kind.String16 || t == kind.String32 || k == kind.Literal
+		if (p.strings[name] == "length" && (text || k == kind.Array || k == kind.FixedArray)) {
+			return kind.I32
+		}
+		throw new CompileError(`${showType(p, t)} has no field ${p.strings[name]} (${this.where})`)
+	}
+
+	/// The Func type of method name of t, -1 if it has none: of a class or interface, a function field of an object, or
+	/// of each member of a union, then taking each param's and returning each result.
+	methodType(t: i32, name: i32): i32 throws CompileError {
+		const p = this.p
+		if (p.kind(t) == kind.Union) {
+			const fs = p.items(t).map(m => this.methodType(m, name))
+			if (fs.length == 0 || contains(fs, -1)) {
+				return -1
+			}
+			const ps: i32[] = []
+			for (const i of 0 ... p.items(fs[0]).length - 1) {
+				ps.push(p.union(fs.map(f => p.items(f)[i])))
+			}
+			return p.type(kind.Func, p.list(ps), p.union(fs.map(f => p.b(f))))
+		}
+		const d = this.memberOf(t, name)
+		if (d >= 0) {
+			return if (p.decls[d].kind == decl.Function) p.decls[d].type else -1
+		}
+		const f = if (p.kind(t) == kind.Object && p.field(t, name) >= 0) this.fieldType(t, name) else 0
+		return if (p.kind(f) == kind.Func) f else -1
+	}
+
+	/// The types a value of t is one of at run time, ordered: a union's members, an interface's or object type's held
+	/// types, a literal's base; an object type among them stands for its literals.
+	flat(t: i32): i32[] {
+		const p = this.p
+		const k = p.kind(t)
+		if (k == kind.Literal) {
+			return [p.a(t)]
+		}
+		if (k == kind.Union) {
+			return p.members(p.union(p.items(t).map(m => p.union(this.flat(m)))))
+		}
+		return if (this.abstract(t)) p.members(this.held.get(t) ?? p.union([])) else [t]
+	}
+
+	// Reflection (§4.11).
+
+	/// Member name of Type t.
+	reflect(t: i32, name: string): Known throws CompileError {
+		const p = this.p
+		const named = p.kind(t) == kind.Named
+		const d = if (named) p.a(t) else -1
+		switch (name) {
+			case "kind": return this.str(kindName(p, t))
+			case "name": return this.str(showType(p, t))
+			case "fields": return array(this.fields(t))
+			case "doc": return new Known(new Op(op.Str, if (named) p.decls[d].doc else 0))
+			case "tags": return if (named) this.tags(d, p.b(t)) else array([])
+			case "args":
+				const env = if (named) p.lists[p.b(t)] else []
+				return array(env.slice(env.length - (if (named) p.decls[d].params.length else 0), env.length).map(typeValue))
+			case "base", "elem":
+				const r = p.type(kind.Member, t, p.intern(name))
+				if (p.kind(r) == kind.Member) {
+					throw new CompileError(`${showType(p, t)} has no ${name} (${this.where})`)
+				}
+				return typeValue(r)
+			case "members": return array(p.members(t).map(typeValue))
+			case "length": return this.int(if (p.kind(t) == kind.FixedArray) p.b(t) else if (p.kind(t) == kind.Func) p.items(t).length else 0)
+			case "value":
+				const a = p.a(t)
+				return if (t == kind.Null) new Known(new Op(op.Null)) else if (a == kind.String) new Known(new Op(op.Str, p.b(t)))
+					else if (a == kind.Bool) truth(p.b(t) == 1) else new Known(new Op(op.Int, a, p.b(t)))
+		}
+		throw new CompileError(`Type has no member ${name} (${this.where})`)
+	}
+
+	/// The fields of t as reflection gives them: a record of name, type, readonly, doc and tags each.
+	fields(t: i32): Known[] {
+		const p = this.p
+		const fs: Known[] = []
+		const field = (name: i32, ft: i32, ro: bool, doc: i32, tags: Known) => {
+			fs.push(array([new Known(new Op(op.Str, name)), typeValue(ft), truth(ro), new Known(new Op(op.Str, doc)), tags],
+				["name", "type", "readonly", "doc", "tags"]))
+		}
+		const k = p.kind(t)
+		const ts = if (k == kind.Object || k == kind.Tuple) p.items(t) else []
+		switch (k) {
+			case kind.Object:
+				const ns = p.names[p.b(t)]
+				for (const i of 0 ... ts.length - 1) {
+					field(ns[2 * i], ts[i], (ns[2 * i + 1] & decl.Readonly) != 0, 0, array([]))
+				}
+			case kind.Tuple:
+				for (const i of 0 ... ts.length - 1) {
+					field(p.elementName(i), ts[i], false, 0, array([]))
+				}
+			case kind.Named:
+				for (const m of p.decls[p.a(t)].members) {
+					const x = p.decls[m]
+					if (x.kind == decl.Var && (x.mods & decl.Static) == 0) {
+						field(x.name, p.subst(x.type, p.b(t)), (x.mods & decl.Readonly) != 0, x.doc, this.tags(m, p.b(t)))
+					}
+				}
+		}
+		return fs
+	}
+
+	/// The tags of decl d in env, as Type values.
+	private tags(d: i32, env: i32): Known { return array(this.p.lists[this.p.decls[d].tags].map(t => typeValue(this.p.subst(t, env)))) }
+
+	str(s: string): Known { return new Known(new Op(op.Str, this.p.intern(s))) }
+	int(v: i64): Known { return new Known(new Op(op.Int, kind.I32, this.p.int(v))) }
+}
+
+/// What reflection calls the kind of t.
+function kindName(p: Program, t: i32): string {
+	return switch (p.kind(t)) {
+		case kind.None: "none"
+		case kind.Null: "null"
+		case kind.Bool: "bool"
+		case kind.F32, kind.F64, kind.Float: "float"
+		case kind.String, kind.String16, kind.String32: "string"
+		case kind.Type: "type"
+		case kind.Array: "array"
+		case kind.FixedArray: "fixed"
+		case kind.Tuple: "tuple"
+		case kind.Union: "union"
+		case kind.Object: "object"
+		case kind.Func: "function"
+		case kind.Named: if (p.decls[p.a(t)].kind == decl.Class) "class" else "interface"
+		case kind.Literal: "literal"
+		case kind.Optional, kind.Rest, kind.Embed: kindName(p, p.a(t))
+		default: "int"
+	}
+}
+
+/// The decl instance k is of.
+function source(p: Program, k: i32): i32 { return if (p.decls[k].generic < 0) k else p.decls[k].generic }
+
+/// Function type f as called at run time: without the params holding a Type, whose args are known, and of no result
+/// where it holds one, which is known.
+export function runtime(p: Program, f: i32): i32 {
+	const r = if (holdsType(p, p.b(f))) kind.None else p.b(f)
+	return p.type(kind.Func, p.list(p.items(f).filter(t => !holdsType(p, t))), r)
+}
+
+/// The key of a known value, the same for equal ones.
+function keyOf(v: Known | null): string {
+	if (v == null) {
+		return "_"
+	}
+	const o = v.op
+	return if (v.fn >= 0) `f${v.fn}` else if (o != null) `${o.op as i32}.${o.a}.${o.b}` else if (v.t >= 0) `t${v.t}` else `[${v.items!.map(x => keyOf(x)).join(",")}]`
+}
+
+/// Whether a param of decl d holds a Type, so that d is instanced per what they get.
+function takesType(p: Program, d: i32, env = 0): bool {
+	return p.decls[d].kind == decl.Function && p.items(p.subst(p.decls[d].type, env)).some(t => holdsType(p, t) || coded(p, t))
+}
+
+/// Whether a value of t holds a Type, and so is never at run time in a release build.
+function holdsType(p: Program, t: i32): bool {
+	return t == kind.Type || p.kind(t) != kind.Named && p.kind(t) != kind.Func && p.parts(t).some(x => holdsType(p, x))
+}
+
+/// Whether t is a function type taking or giving a Type, so that a value of it is known as its code (see Known.fn).
+function coded(p: Program, t: i32): bool { return p.kind(t) == kind.Func && p.parts(t).some(x => holdsType(p, x) || coded(p, x)) }
+
+/// Whether decl x is a module's const of a number literal, which its uses take, as they do an untyped one's, rather
+/// than load the global that its module's init sets.
+function numeral(x: Decl): bool {
+	const c = x.code
+	return x.owner < 0 && (x.mods & decl.Readonly) != 0 && c != null && c.ops.length == 2
+		&& (c.ops[0] == op.Int || c.ops[0] == op.Float)
+}
+
+/// Whether t is a literal type or a union of them.
+function literals(p: Program, t: i32): bool { return p.kind(t) == kind.Literal || p.kind(t) == kind.Union && p.items(t).every(m => literals(p, m)) }
+
+/// A value on the operand stack: its type, its value if known, and the index of the constant op that pushed it, -1
+/// for none.
+type Slot = { t: i32, v: Known | null, at: i32 }
+
+/// Copies one decl's code for an instance: substitutes its env, folds what it knows, keeps the branch each If it
+/// knows takes and repeats the body of each Each over a known array per element, and types the operand stack, so
+/// that each call names its instance and info says what writing the code out needs.
+class Copy {
+	ins: Instances
+	p: Program
+	/// The instance made.
+	k: i32
+	inst: Inst
+	env: i32
+	src: Code
+	dst = new Code()
+	info: i32[] = []
+	private stack: Slot[] = []
+	/// Per block being copied, the stack height it starts at, its result type, None for none, and whether it is run
+	/// whenever what holds it is: a branch taken or an element of an unrolled for.
+	private frames: { base: i32, result: i32, taken: bool }[] = []
+	/// Whether a Return or Throw outside any branch taken at run time is copied, so no Return after it is run.
+	private gone = false
+	/// Per op of dst, whether a fold took its value, so it is left out.
+	private dead: bool[] = []
+	/// Per local of src, what it holds if known.
+	private values: (Known | null)[] = []
+	/// Per local of src, whether its type depends on what locals hold, so that it has a local of dst per type it takes.
+	private vary: bool[] = []
+	/// Per pair(local of src, type), its local of dst.
+	private variants = new HashMap[i64, i32]()
+	/// Per local of src, its local of dst, but of one that varies.
+	private slots: i32[] = []
+	/// The types depending on what locals hold resolved, while those keep their values.
+	private typed = new HashMap[i32, i32]()
+	/// Whether its result holds a Type, and whether it has one that is not null.
+	private returnsType: bool
+	private returns: bool
+
+	/// Copies instance k, i its Inst, and writes its code and info to i. Its params come first among the locals of dst,
+	/// but those holding a Type, which take no arg; those and the other locals holding one have no type.
+	constructor(ins: Instances, k: i32, i: Inst) {
+		const p = ins.p
+		this.ins = ins
+		this.p = p
+		this.k = k
+		this.inst = i
+		this.env = p.decls[k].env
+		const d = source(p, k)
+		this.src = p.decls[d].code!
+		this.values = if (i.values.length > 0) [...i.values] else this.src.locals.map(_ => null)
+		// A var's code inits it, of no params.
+		const f = if (p.decls[d].kind == decl.Var) -1 else p.decls[k].type
+		const n = if (f < 0) 0 else p.items(f).length + (if (p.method(d)) 1 else 0)
+		const fixed = this.src.locals.map(l => holdsType(p, p.subst(l.type, this.env)))
+		for (const l of 0 ... fixed.length - 1) {
+			this.vary.push(!fixed[l] && p.reflected(this.src.locals[l].type))
+			this.slots.push(-1)
+		}
+		for (const pass of [false, true]) {
+			for (const l of 0 ... n - 1) {
+				if (fixed[l] == pass) {
+					this.slots[l] = this.add(l, fixed[l], true)
+				}
+			}
+		}
+		for (const l of n ... fixed.length - 1) {
+			this.slots[l] = this.add(l, fixed[l], false)
+		}
+		this.dst.captures = this.src.captures.filter(l => !fixed[l]).map(l => this.slots[l])
+		const r = if (f < 0) kind.Null else p.b(f)
+		this.returnsType = holdsType(p, r)
+		this.returns = r != kind.Null
+	}
+
+	/// Adds local l of src to dst: of no type if fixed, as it holds a Type, or varies but as a param, whose type the
+	/// values the instance is for resolve.
+	private add(l: i32, fixed: bool, param: bool): i32 throws CompileError {
+		const x = this.src.locals[l]
+		const t = if (fixed || this.vary[l] && !param) kind.None else this.type(x.type)
+		const n = this.dst.local(x.name, t, x.mods)
+		if (this.vary[l] && param) {
+			this.variants.set(pair(l, t), n)
+		}
+		return n
+	}
+
+	run() throws CompileError {
+		if (this.inst.idle) {
+			this.emit(op.Unreachable, 0)
+		} else {
+			this.block(0, this.src.ops.length)
+		}
+		const info: i32[] = []
+		this.dst.retain(i => {
+			if (!this.dead[i]) {
+				info.push(this.info[i])
+			}
+			return !this.dead[i]
+		})
+		this.inst.code = this.dst
+		this.inst.info = info
+	}
+
+	/// Copies the ops from start up to end.
+	private block(start: i32, end: i32) throws CompileError {
+		const s = this.src
+		let i = start
+		while (i < end) {
+			const o = s.ops[i]
+			const v = if (o == op.If || o == op.Each) this.top().v else null
+			const xs = if (o == op.Each) v?.items else null
+			if (if (o == op.Each) xs == null && this.p.kind(this.top().t) != kind.Tuple else v == null) {
+				this.step(i)
+				i++
+				continue
+			}
+			this.dst.at = s.pos[i]
+			const e = s.next(i)
+			const last = if (s.ops[e] == op.Else) s.next(e) else e
+			if (o == op.If) {
+				this.take()
+				const t = this.type(s.a(i))
+				this.open(op.Block, t, t, true)
+				const at = this.dst.ops.length - 1
+				if (v!.op?.op == op.True) {
+					this.block(i + 1, e)
+				} else if (v!.op?.op == op.False) {
+					if (e < last) {
+						this.block(e + 1, last)
+					}
+				} else {
+					throw new CompileError(`an if needs a bool (${this.ins.where})`)
+				}
+				// A known result stays known, without the Block.
+				let kept = t != kind.None && this.stack.length > this.frames[this.frames.length - 1].base && this.top().v != null
+				for (const j of at + 1 ... this.dst.ops.length - 1) {
+					kept = kept && (this.dead[j] || j == this.top().at)
+				}
+				const top = if (kept) this.top() else null
+				this.step(last)
+				if (kept) {
+					this.dead[at] = true
+					this.dead[this.dst.ops.length - 1] = true
+					this.stack.pop()
+					this.stack.push(top!)
+				}
+			} else {
+				// Per element, the local holding it, then the body in a Block, which Br 0 leaves for the next.
+				const t = this.top().t
+				const n = if (xs == null) this.p.items(t).length else xs!.length
+				const tmp = if (xs == null) this.dst.local(0, t) else -1
+				if (xs == null) {
+					this.plain(op.SetLocal, 1, kind.None, tmp)
+				} else {
+					this.take()
+				}
+				for (const j of 0 ... n - 1) {
+					if (xs == null) {
+						this.emit(op.Local, tmp)
+						this.plain(op.Field, 0, elem(this.p, t, j), this.p.elementName(j))
+					} else {
+						this.known(xs![j])
+					}
+					this.fresh(s.a(i))
+					this.store(s.a(i), true)
+					this.open(op.Block, kind.None, kind.None, true)
+					this.block(i + 1, last)
+					this.step(last)
+				}
+			}
+			i = last + 1
+		}
+	}
+
+	/// Copies op i of src.
+	private step(i: i32) throws CompileError {
+		const p = this.p
+		const ins = this.ins
+		const s = this.src
+		const o = s.ops[i]
+		const a = s.a(i)
+		const b = s.b(i)
+		this.dst.at = s.pos[i]
+		switch (o) {
+			case op.Block, op.If:
+				if (o == op.If) {
+					this.pop()
+				}
+				const t = this.type(a)
+				this.open(o, t, t)
+			case op.Loop, op.Try: this.open(o, kind.None)
+			case op.Test:
+				this.pop()
+				this.open(o, kind.None)
+			case op.Default: this.open(o, kind.None, this.local(a))
+			case op.Each:
+				this.pop()
+				this.open(o, kind.None, this.local(a))
+			case op.Else, op.Catch, op.Finally:
+				this.cut(this.frames[this.frames.length - 1].base)
+				if (o == op.Catch) {
+					this.emit(o, this.type(a), this.local(b))
+				} else {
+					this.emit(o)
+				}
+			case op.End:
+				if (this.frames.length > 0) {
+					const f = this.frames.pop()
+					this.cut(f.base)
+					if (f.result != kind.None) {
+						this.push(f.result)
+					}
+				}
+				this.emit(o)
+			case op.Return:
+				const v = if (this.returnsType) this.take() else if (this.returns) this.top().v else null
+				if (!this.gone) {
+					this.inst.returned(v)
+				}
+				this.emit(o)
+				this.end()
+			case op.Br, op.Unreachable: this.emit(o, a)
+			case op.BrIf: this.plain(o, 1, kind.None, a)
+			case op.Throw:
+				this.info[this.emit(o)] = this.pop().t
+				this.end()
+			case op.BrNull:
+				const t = this.pop().t
+				this.emit(o, a)
+				this.push(p.union(p.members(t).filter(m => m != kind.Null)))
+			case op.Call: this.callOf(a, this.types(b))
+			case op.CallMethod: this.callMethod(a, b)
+			case op.CallRef:
+				const f = this.stack[this.stack.length - 1 - a]
+				if (coded(p, f.t)) {
+					const v = this.which(f)
+					this.call(source(p, v.fn), p.decls[v.fn].env, v)
+				} else {
+					this.plain(o, a + 1, p.b(f.t), a)
+				}
+			case op.Drop:
+				if (this.top().v != null) {
+					this.take()
+				} else {
+					this.plain(o, 1, kind.None)
+				}
+			case op.Local:
+				const v = this.values[a]
+				if (v != null && v.fn < 0) {
+					this.known(v)
+				} else {
+					const l = this.local(a)
+					const at = this.emit(o, l)
+					this.push(this.dst.locals[l].type, v, if (v == null) -1 else at)
+				}
+			case op.SetLocal: this.store(a, (s.locals[a].mods & decl.Readonly) != 0)
+			case op.Fresh: this.fresh(a)
+			case op.Global, op.SetGlobal:
+				const d = ins.instance(a, ins.env(a, this.types(b)))
+				const t = p.decls[d].type
+				if (o == op.Global && (kind.untyped(t) || numeral(p.decls[d]))) {
+					this.known(new Known(this.untyped(d, t)))
+				} else if (o == op.Global) {
+					this.plain(o, 0, t, d)
+				} else {
+					this.plain(o, 1, kind.None, d)
+				}
+			case op.False, op.True, op.Null: this.known(new Known(new Op(o)))
+			case op.Int, op.Float: this.known(new Known(new Op(o, this.type(a), b)))
+			case op.Str: this.known(new Known(new Op(o, a)))
+			case op.Missing: this.plain(o, 0, this.type(a), this.type(a))
+			case op.Type: this.push(kind.Type, typeValue(this.type(a)))
+			case op.Member, op.SetMember:
+				const r = this.stack[this.stack.length - (if (o == op.Member) 1 else 2)].t
+				const d = ins.instance(a, p.b(r))
+				if (o == op.Member) {
+					this.plain(o, 1, p.decls[d].type, d)
+				} else {
+					this.plain(o, 2, kind.None, d)
+				}
+			case op.Field: this.field(a)
+			case op.SetField: this.setField(a)
+			case op.Subscript:
+				const k = this.top()
+				const xs = this.stack[this.stack.length - 2]
+				if (k.v?.op?.op == op.Str) {
+					this.field(this.name(this.take()))
+				} else if (k.v != null && xs.v?.items != null) {
+					const at = p.ints[this.take().op!.b]
+					this.known(this.take().items![at])
+				} else {
+					this.plain(o, 2, elem(p, xs.t, if (k.v == null) -1 else p.ints[k.v!.op!.b] as i32))
+				}
+			case op.SetSubscript:
+				if (this.stack[this.stack.length - 2].v?.op?.op == op.Str) {
+					const v = this.stack.pop()
+					const n = this.name(this.take())
+					this.stack.push(v)
+					this.setField(n)
+				} else {
+					this.plain(o, 3, kind.None)
+				}
+			case op.Unpack: this.emit(o, a)
+			case op.Array, op.Object:
+				const t = this.type(a)
+				const spreads = s.items(s.c(i))
+				if (o == op.Array && holdsType(p, t)) {
+					// Its items are known, so it is.
+					const base = this.stack.length - b
+					const items: Known[] = []
+					for (const j of 0 ... b - 1) {
+						const v = this.taken(this.stack[base + j])
+						if (spreads.includes(j)) {
+							items.push(...v.items!)
+						} else {
+							items.push(v)
+						}
+					}
+					this.cut(base)
+					this.known(array(items))
+				} else {
+					this.plain(o, b, t, t, b, this.dst.list(spreads))
+				}
+			case op.New:
+				const t = this.type(a)
+				if (p.kind(t) == kind.Array) {
+					this.call(p.lang("newArray"), p.list([p.a(t)]))
+				} else if (p.kind(t) == kind.Tuple) {
+					// Its elements at their zero values.
+					const ts = p.items(t)
+					for (const x of ts) {
+						this.call(p.lang("zero"), p.list([x]))
+					}
+					this.plain(op.Array, ts.length, t, t, ts.length)
+				} else {
+					ins.allFields(t)
+					const ctor = ins.memberOf(t, p.intern("constructor"))
+					this.plain(o, if (ctor >= 0) p.items(p.decls[ctor].type).length else 0, t, t)
+				}
+			case op.Closure: this.closure(a, ins.env(a, this.types(b)), s.items(s.c(i)))
+			case op.Cast: this.cast(this.type(a))
+			case op.Is:
+				const t = this.type(a)
+				const v = this.top().t
+				if (p.kind(t) == kind.Literal && literals(p, v)) {
+					// A union of literals is held as their base, so a test of one of them compares values.
+					this.known(ins.reflect(t, "value"))
+					this.eq(op.Eq)
+				} else if (p.kind(v) != kind.Union && ![v, ...p.members(t)].some(m => ins.abstract(m))) {
+					// A value of one concrete type, a literal also of its base, is known to be a t or not, so that a
+					// branch it rules out, which may cast it to t, is dropped.
+					const is = contains(p.members(t), v) || p.kind(v) == kind.Literal && contains(p.members(t), p.a(v))
+					this.plain(op.Drop, 1, kind.None)
+					this.known(truth(is))
+				} else {
+					// Noting the operand's type, whose members that fit t mono holds in t, as for a Cast.
+					this.info[this.emit(o, t)] = this.pop().t
+					this.push(kind.Bool)
+				}
+			case op.Assert: this.plain(o, 1, kind.None)
+			case op.Not:
+				const x = this.bool(this.top())
+				if (x >= 0) {
+					this.take()
+					this.known(truth(x == 0))
+				} else {
+					this.plain(o, 1, this.top().t)
+				}
+			case op.Eq, op.Ne:
+				if (this.top().v != null && this.stack[this.stack.length - 2].v != null) {
+					this.known(truth(equal(p, this.take(), this.take()) == (o == op.Eq)))
+				} else {
+					this.eq(o)
+				}
+			case op.Lt, op.Gt, op.Le, op.Ge, op.Same: this.plain(o, 2, kind.Bool)
+			case op.And, op.Or:
+				const y = this.bool(this.top())
+				const x = this.bool(this.stack[this.stack.length - 2])
+				if (x >= 0 && y >= 0) {
+					this.take()
+					this.take()
+					this.known(truth(if (o == op.And) x + y == 2 else x + y > 0))
+				} else {
+					this.plain(o, 2, this.stack[this.stack.length - 2].t)
+				}
+			case op.Pow:
+				const t = this.stack[this.stack.length - 2].t
+				if (kind.isInt(t) && t != kind.Int) {
+					this.call(p.lang("pow"), p.list([t]))
+				} else {
+					this.plain(o, 2, t)
+				}
+			case op.Add, op.Sub, op.Mul, op.Div, op.Rem, op.Xor, op.Shl, op.Shr: this.plain(o, 2, this.stack[this.stack.length - 2].t)
+			case op.Neg: this.plain(o, 1, this.top().t)
+		}
+	}
+
+	/// The number of type t that untyped or numeral const d stands for: its initializer is a literal or such a const,
+	/// negated as many times as it says (4.1).
+	private untyped(d: i32, t: i32): Op throws CompileError {
+		const c = this.p.decls[d].code!
+		const x = if (c.ops[0] == op.Global) this.untyped(c.a(0), t) else new Op(c.ops[0], t, c.b(0))
+		if (x.op != op.Int && x.op != op.Float) {
+			throw new CompileError(`an untyped const that is not a literal (${this.ins.where})`)
+		}
+		let v = this.p.ints[x.b]
+		let i = 1
+		while (c.ops[i] == op.Neg) {
+			v = if (x.op == op.Int) -v else bits(-fromBits(v as u64)) as i64
+			i++
+		}
+		return new Op(x.op, t, this.p.int(v))
+	}
+
+	/// Stores the value on top in local l: one known, if l is Readonly, also as what l holds, and only that if no op
+	/// makes it.
+	private store(l: i32, readonly: bool) throws CompileError {
+		const v = this.top().v
+		if (readonly && v != null && v.fn < 0 && (v.op == null || holdsType(this.p, this.src.locals[l].type))) {
+			this.hold(l, this.take())
+			return
+		}
+		this.pop()
+		this.emit(op.SetLocal, this.local(l))
+		if (readonly) {
+			this.hold(l, v)
+		}
+	}
+
+	/// A Fresh of local l, unless it holds a Type, as it then is not at run time.
+	private fresh(l: i32) throws CompileError {
+		const d = this.local(l)
+		if (this.dst.locals[d].type != kind.None) {
+			this.emit(op.Fresh, d)
+		}
+	}
+
+	/// Notes that local l holds v.
+	private hold(l: i32, v: Known | null) {
+		if (this.values[l] != null || v != null) {
+			this.values[l] = v
+			this.typed = new HashMap[i32, i32]()
+		}
+	}
+
+	/// A Call of decl d with the type args.
+	private callOf(d: i32, args: i32[]) throws CompileError {
+		if (builtin(this.p.modules[this.p.decls[d].module].path) && d == this.p.lang("literal") && !this.spelled(args[0])) {
+			// A generic as whose type turns out to be no string literal type converts as any.
+			this.cast(args[0])
+			return
+		}
+		this.call(d, this.ins.env(d, args))
+	}
+
+	/// A Call of decl d with env: of d with the env if an intrinsic, a function of builtin/ without a body, which emit
+	/// writes out by its type args; else of its instance for what its params holding a Type get, known, which so leave
+	/// the stack, and if any did, known as what the instance returns where it knows that. With via, a CallRef of closure
+	/// via.fn, d its source, of its code for those values too, with the env of its object under the args.
+	private call(d: i32, env: i32, via: Known | null = null) throws CompileError {
+		const p = this.p
+		const c = p.decls[d].code
+		const n = p.items(p.decls[d].type).length + (if (p.method(d)) 1 else 0)
+		if (c == null && env != 0) {
+			const f = p.subst(p.decls[d].type, env)
+			this.plain(op.Call, n, p.b(f), d, env)
+			return
+		}
+		const base = this.stack.length - n
+		const fixed = c != null && (via != null || takesType(p, d, env))
+		const held = if (via == null) [] else this.ins.insts.get(via.fn)!.values
+		const values: (Known | null)[] = if (held.length > 0) [...held] else if (fixed) c!.locals.map(_ => null) else []
+		if (fixed) {
+			const args = this.stack.slice(base, this.stack.length)
+			this.cut(base)
+			for (const l of 0 ... n - 1) {
+				const t = p.subst(c!.locals[l].type, env)
+				if (holdsType(p, t)) {
+					values[l] = this.taken(args[l])
+				} else {
+					if (coded(p, t)) {
+						values[l] = this.which(args[l])
+					}
+					this.stack.push(args[l])
+				}
+			}
+		}
+		const k = if (via != null) this.ins.special(d, env, values, p.decls[via.fn].owner)
+			else if (fixed) this.ins.special(d, env, values) else this.ins.instance(d, env)
+		const r = p.b(p.decls[k].type)
+		const returnsType = holdsType(p, r)
+		const given = this.stack.length - base
+		if (via != null) {
+			// Called from what may be another module.
+			p.decls[k].mods |= decl.Export
+			this.plain(op.CallRef, given + 1, if (returnsType) kind.None else r, given, k + 1)
+		} else {
+			this.plain(op.Call, given, if (returnsType) kind.None else r, k)
+		}
+		const v = if (returnsType || fixed) this.ins.result(k) else null
+		// A closure it returns is not known as which: only one made where it is called is.
+		if (v != null && v.fn < 0) {
+			if (!returnsType) {
+				this.plain(op.Drop, 1, kind.None)
+			}
+			this.known(v!)
+		} else if (returnsType) {
+			throw new CompileError(`${qualified(p, k)} returns no static value (${this.ins.where})`)
+		}
+	}
+
+	/// A Closure of decl d with env capturing locals ls: of its instance for what those of them holding a Type hold,
+	/// known, which so are not captured, and owned by this instance where it is one for known values.
+	private closure(d: i32, env: i32, ls: i32[]) throws CompileError {
+		const p = this.p
+		const c = p.decls[d].code!
+		const values: (Known | null)[] = c.locals.map(_ => null)
+		let special = this.inst.special
+		const kept: i32[] = []
+		for (const j of 0 ... ls.length - 1) {
+			const t = p.subst(c.locals[c.captures[j]].type, env)
+			if (!holdsType(p, t)) {
+				kept.push(this.local(ls[j]))
+				if (coded(p, t) && this.values[ls[j]] != null) {
+					values[c.captures[j]] = this.values[ls[j]]
+					special = true
+				}
+			} else if (this.values[ls[j]] == null) {
+				throw new CompileError(`a captured Type not known (${this.ins.where})`)
+			} else {
+				values[c.captures[j]] = this.values[ls[j]]
+				special = true
+			}
+		}
+		const k = if (special) this.ins.special(d, env, values, this.k) else this.ins.instance(d, env)
+		this.ins.insts.get(k)!.idle = takesType(p, d, env)
+		const t = p.decls[k].type
+		this.push(t, if (coded(p, t)) closureValue(k) else null, this.emit(op.Closure, k, 0, this.dst.list(kept)))
+	}
+
+	/// The closure a value of a coded type, s, is known as.
+	private which(s: Slot): Known throws CompileError {
+		if ((s.v?.fn ?? -1) < 0) {
+			throw new CompileError(`a closure taking or giving a Type, not known which (${this.ins.where})`)
+		}
+		return s.v!
+	}
+
+	/// A CallMethod of name and n args: on a class it becomes a Call of the method's instance; a toString the type lacks
+	/// a Call of builtin/'s show.
+	private callMethod(name: i32, n: i32) throws CompileError {
+		const p = this.p
+		const slot = this.stack[this.stack.length - 1 - n]
+		const t = slot.v?.t ?? -1
+		const s = if (t >= 0) this.static(t, name) else -1
+		if (s >= 0) {
+			// A static called through a type param: the type, known, leaves the stack; the args stay.
+			this.stack = removeAt(this.stack, this.stack.length - 1 - n)
+			this.call(s, p.b(t))
+			return
+		}
+		const f = this.ins.methodType(slot.t, name)
+		if (f < 0 && p.strings[name] == "toString") {
+			this.call(this.p.lang("show"), p.list([slot.t]))
+		} else if (f < 0) {
+			throw new CompileError(`no method ${p.strings[name]} to call (${this.ins.where})`)
+		} else if (this.ins.nominal(slot.t) == decl.Class) {
+			this.call(this.ins.member(slot.t, name), p.b(slot.t))
+		} else {
+			this.drop(n + 1)
+			this.info[this.emit(op.CallMethod, name, n)] = slot.t
+			this.push(p.b(f))
+		}
+	}
+
+	/// Field name, a Str, of the value on top.
+	private field(name: i32) throws CompileError {
+		const r = this.top()
+		if (r.v == null) {
+			this.note(this.emit(op.Field, name), r.t)
+			this.pop()
+			this.push(this.ins.fieldType(r.t, name))
+			return
+		}
+		const v = this.take()
+		const s = if (v.t >= 0) this.static(v.t, name) else -1
+		if (s >= 0) {
+			const d = this.ins.instance(s, this.p.b(v.t))
+			this.plain(op.Global, 0, this.p.decls[d].type, d)
+		} else if (v.t >= 0) {
+			this.known(this.ins.reflect(v.t, this.p.strings[name]))
+		} else if (v.items != null) {
+			this.known(if (this.p.strings[name] == "length") this.ins.int(v.items!.length) else v.get(this.p.strings[name]))
+		} else {
+			this.known(this.ins.int(this.p.strings[this.name(v)].length))
+		}
+	}
+
+	/// Static member name of class t, which shadows t's reflection, or -1.
+	private static(t: i32, name: i32): i32 {
+		const d = this.ins.member(t, name)
+		return if (d >= 0 && (this.p.decls[d].mods & decl.Static) != 0) d else -1
+	}
+
+	/// Sets field name, converting the value to its type, which lower leaves to mono where it is resolved here; not if
+	/// embedded, as what is copied into it is an object (5.3).
+	private setField(name: i32) throws CompileError {
+		const r = this.stack[this.stack.length - 2].t
+		const d = this.ins.memberOf(r, name)
+		if (d < 0 || (this.p.decls[d].mods & decl.Embed) == 0) {
+			this.cast(this.ins.fieldType(r, name))
+		}
+		this.note(this.emit(op.SetField, name), r)
+		this.drop(2)
+	}
+
+	/// Notes the receiver of a Field or SetField where it is held as a union.
+	private note(at: i32, t: i32) {
+		if (this.ins.abstract(t) || this.p.kind(t) == kind.Union) {
+			this.info[at] = t
+		}
+	}
+
+	/// Converts the value on top of the stack to t.
+	private cast(t: i32) throws CompileError {
+		const v = this.top().v
+		if (v != null && v.op == null) {
+			// A Type, or what holds them, stays known.
+			return
+		}
+		const c = v?.op
+		if (c != null && (c.op == op.Int || c.op == op.Float) && kind.untyped(c.a)) {
+			this.take()
+			this.known(new Known(new Op(c.op, this.p.numberIn(t, if (c.op == op.Float) kind.Float else kind.Int), c.b)))
+		}
+		const spelled = this.spelled(t)
+		if (spelled && this.top().v?.op?.op == op.Str) {
+			// A string literal cast to a union of literals stays itself and known.
+			return
+		}
+		// Another value, as compared to a literal, becomes a string, compared by value; as checks it (lower).
+		const to = if (spelled && !this.literal(this.top())) kind.String else t
+		if (this.top().t != to) {
+			this.info[this.emit(op.Cast, to)] = this.pop().t
+			this.push(to)
+		}
+	}
+
+	/// Whether t is a string literal type, or a union of them, held as a string.
+	private spelled(t: i32): bool {
+		if (!literals(this.p, t)) {
+			return false
+		}
+		const text = this.ins.flat(t)
+		return text.length == 1 && text[0] == kind.String
+	}
+
+	/// Whether s is a string literal, or of a string literal type, and so the one value of it (§4.2).
+	private literal(s: Slot): bool { return s.v?.op?.op == op.Str || this.spelled(s.t) }
+
+	/// An Eq or Ne of the two values on top: of two string literals a Same, as equal ones are one value (§4.2).
+	private eq(o: Opcode) throws CompileError {
+		if (!this.literal(this.top()) || !this.literal(this.stack[this.stack.length - 2])) {
+			this.plain(o, 2, kind.Bool)
+			return
+		}
+		this.plain(op.Same, 2, kind.Bool)
+		if (o == op.Ne) {
+			this.plain(op.Not, 1, kind.Bool)
+		}
+	}
+
+	/// The string a known value is, a Str.
+	private name(v: Known): i32 throws CompileError {
+		if (v.op?.op != op.Str) {
+			throw new CompileError(`a static string is needed (${this.ins.where})`)
+		}
+		return v.op!.a
+	}
+
+	/// 1 if s is a known true, 0 if a known false, else -1.
+	private bool(s: Slot): i32 { return if (s.v?.op?.op == op.True) 1 else if (s.v?.op?.op == op.False) 0 else -1 }
+
+	/// Type t of src for the instance: its env substituted, and what locals hold for those of them it depends on.
+	private type(t: i32): i32 throws CompileError {
+		const p = this.p
+		const r = if (p.closed(t)) t else if (!p.reflected(t)) p.subst(t, this.env) else this.resolve(t)
+		this.ins.reach(r)
+		return r
+	}
+
+	/// Type t, which depends on what locals hold, kept while they hold it.
+	private resolve(t: i32): i32 throws CompileError {
+		const p = this.p
+		const found = this.typed.get(t)
+		if (found != null) {
+			return found
+		}
+		let r = 0
+		switch (p.kind(t)) {
+			case kind.Of:
+				const held = this.values[p.a(t)]
+				const v = if (held == null || p.b(t) == 0) held else held.get(p.strings[p.b(t)])
+				if (v == null || v.t < 0) {
+					throw new CompileError(`${showType(p, t)} is not known (${this.ins.where})`)
+				}
+				r = v.t
+			case kind.Member:
+				r = this.ins.reflect(this.type(p.a(t)), p.strings[p.b(t)]).t
+				if (r < 0) {
+					throw new CompileError(`${showType(p, t)} is not a type (${this.ins.where})`)
+				}
+			default: r = p.map(t, x => this.type(x))
+		}
+		this.typed.set(t, r)
+		return r
+	}
+
+	private types(list: i32): i32[] { return this.p.lists[list].map(t => this.type(t)) }
+
+	/// The local of dst for local l of src.
+	private local(l: i32): i32 throws CompileError {
+		if (!this.vary[l]) {
+			return this.slots[l]
+		}
+		const t = this.type(this.src.locals[l].type)
+		const found = this.variants.get(pair(l, t))
+		if (found != null) {
+			return found
+		}
+		const n = this.dst.local(this.src.locals[l].name, t, this.src.locals[l].mods)
+		this.variants.set(pair(l, t), n)
+		return n
+	}
+
+	/// Opens a block of result type t, by op o of immediate a, taken if run whenever what holds it is.
+	private open(o: Opcode, t: i32, a: i32 = 0, taken = false) throws CompileError {
+		this.frames.push({ base: this.stack.length, result: t, taken })
+		this.emit(o, a)
+	}
+
+	/// Ends the code run after a Return or Throw: all of it, if no branch taken at run time holds it.
+	private end() {
+		this.gone = this.gone || this.frames.every(f => f.taken)
+	}
+
+	/// Copies an op that pops n values used at run time and pushes one of type t, none for None.
+	private plain(o: Opcode, n: i32, t: i32, a: i32 = 0, b: i32 = 0, c: i32 = 0) throws CompileError {
+		this.drop(n)
+		this.emit(o, a, b, c)
+		if (t != kind.None) {
+			this.push(t)
+		}
+	}
+
+	private emit(o: Opcode, a: i32 = 0, b: i32 = 0, c: i32 = 0): i32 throws CompileError {
+		this.dead.push(false)
+		this.info.push(-1)
+		return this.dst.add(o, a, b, c)
+	}
+
+	private push(t: i32, v: Known | null = null, at: i32 = -1) { this.stack.push({ t, v, at }) }
+
+	/// Pushes a known value; a constant also by its op, kept unless a fold takes it.
+	private known(v: Known) throws CompileError {
+		const o = v.op
+		if (o == null) {
+			this.push(if (v.t >= 0) kind.Type else kind.None, v)
+		} else {
+			this.push(constantType(o), v, this.emit(o.op, o.a, o.b))
+		}
+	}
+
+	private top(): Slot { return this.stack[this.stack.length - 1] }
+
+	/// Pops a value used at run time.
+	private pop(): Slot throws CompileError {
+		const s = this.stack.pop()
+		if (s.v != null && s.at < 0) {
+			throw new CompileError(`a static value used at run time (${this.ins.where})`)
+		}
+		return s
+	}
+
+	private drop(n: i32) throws CompileError {
+		for (const _ of 1 ... n) {
+			this.pop()
+		}
+	}
+
+	/// Pops a known value for a fold, leaving out the op that pushed it.
+	private take(): Known throws CompileError { return this.taken(this.stack.pop()) }
+
+	/// The known value of slot s, leaving out the op that pushed it.
+	private taken(s: Slot): Known throws CompileError {
+		if (s.v == null) {
+			throw new CompileError(`a static value is needed (${this.ins.where})`)
+		}
+		if (s.at >= 0) {
+			this.dead[s.at] = true
+		}
+		return s.v!
+	}
+
+	private cut(height: i32) {
+		while (this.stack.length > height) {
+			this.stack.pop()
+		}
+	}
+}
+
+/// The type a constant op pushes.
+function constantType(o: Op): i32 {
+	return switch (o.op) {
+		case op.Int, op.Float: o.a
+		case op.Str: kind.String
+		case op.Null: kind.Null
+		default: kind.Bool
+	}
+}
+
+/// Whether two known values are equal: types by identity, constants by value, floats as IEEE 754 compares them.
+function equal(p: Program, a: Known, b: Known): bool {
+	const x = a.op
+	const y = b.op
+	if (x == null || y == null) {
+		return x == null && y == null && a.t >= 0 && a.t == b.t
+	}
+	return x.op == y.op && switch (x.op) {
+		case op.Int: x.b == y.b
+		case op.Float: fromBits(p.ints[x.b] as u64) == fromBits(p.ints[y.b] as u64)
+		default: x.a == y.a
+	}
+}
+
+/// The type of an element at index i, -1 if not known, of a value of t: a string's code unit, a tuple's element, an
+/// array's.
+function elem(p: Program, t: i32, i: i32): i32 {
+	const s = if (p.kind(t) == kind.Literal) p.a(t) else t
+	return switch (s) {
+		case kind.String: kind.U8
+		case kind.String16: kind.U16
+		case kind.String32: kind.U32
+		default: if (p.kind(t) == kind.Tuple) p.items(t)[i] else p.a(t)
+	}
+}

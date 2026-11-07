@@ -1,0 +1,394 @@
+//! Monomorphization (§8.3): a release build's whole Program in, the same Program out with no generics, interfaces,
+//! object types held as unions or Type values left in what its modules list. It runs in three steps. Instantiation
+//! (src/resolve.bob) makes each decl reached from the roots an instance per env and copies its code. Then the types
+//! converted into each interface and object type are collected program-wide, making it the union of them (§4.7). Last,
+//! each instance's types and code are lowered onto those unions, member access on them becoming calls of dispatch
+//! functions that switch on the tag, and each module lists its instances.
+//!
+//! A dispatch function is a decl of the module using it named `.f[T]` for reading field f of T, `.f=[T]` for writing
+//! it and `.f()[T]` for calling method f. An intrinsic, a function of builtin/ without a body, is called as itself with
+//! its type args, for emit.
+
+import { contains } from "../std/algo"
+import { HashMap } from "../std/collections/hashmap"
+import { sortBy } from "../std/sort"
+import * as decl from "./bc/decl"
+import * as kind from "./bc/kind"
+import * as op from "./bc/op"
+import { Imm } from "./bc/op"
+import { Code, Program, pair } from "./bc/program"
+import { qualified, showType } from "./bc/show"
+import { CompileError } from "./error"
+import { Instances, runtime } from "./resolve"
+import { builtin, builtinPath } from "./root"
+
+/// Monomorphizes p, whose module main holds the main function and tests: those, every module's typed vars and
+/// builtin/'s plain exported functions are the roots, and only decls they reach are kept. Each module's decls and inits
+/// become their instances, its dispatch functions after its decls, and each instance's members those of its members'
+/// instances it owns.
+export function mono(p: Program, main: i32) throws CompileError { new Mono(p).run(main) }
+
+class Mono {
+	p: Program
+	ins: Instances
+	/// The interfaces and object types something is converted into, and per one, what: itself for a literal of it.
+	private abstracts: i32[] = []
+	private sources = new HashMap[i32, i32[]]()
+	/// The pairs of types convert has seen.
+	private converted = new HashMap[i64, bool]()
+	/// Per type, as it is at run time.
+	private lows = new HashMap[i32, i32]()
+	/// Per module, type, member and access, the dispatch function made there.
+	private made = new HashMap[[i32, i32, i32, string], i32]()
+	private dispatches: i32[] = []
+	/// The types thrown and caught, and the types and names of the members accessed through a union, as collected.
+	private thrown: i32[] = []
+	private caught: i32[] = []
+	private reached = new HashMap[i64, [i32, i32]]()
+
+	constructor(p: Program) {
+		this.p = p
+		this.ins = new Instances(p)
+	}
+
+	run(main: i32) throws CompileError {
+		const p = this.p
+		for (const d of p.modules[main].decls) {
+			if (p.decls[d].kind == decl.Test || p.decls[d].kind == decl.Function && p.strings[p.decls[d].name] == "main") {
+				this.ins.instance(d, 0)
+			}
+		}
+		for (const m of p.modules) {
+			for (const d of m.inits) {
+				if (!kind.untyped(p.decls[d].type)) {
+					this.ins.instance(d, 0)
+				}
+			}
+			for (const d of m.decls) {
+				const x = p.decls[d]
+				// Emit calls builtin/'s plain exports itself, so they are roots too, but type.bob's, of Types as lowered.
+				if (builtin(m.path) && m.path != builtinPath("type") && x.kind == decl.Function && (x.mods & decl.Export) != 0
+					&& x.params.length == 0) {
+					this.ins.instance(d, 0)
+				}
+			}
+		}
+		// Until no instance is made: copying, collecting, and instancing the members dispatch functions reach.
+		let from = 0
+		while (from < this.ins.order.length) {
+			this.ins.copy()
+			from = this.collect(from)
+		}
+		this.write()
+	}
+
+	// Interfaces and object types.
+
+	/// Collects what is converted into each interface and object type, or tested against one, a thrown value into each
+	/// type caught, from the instances from on, and makes the members dispatch functions reach; returns where the
+	/// instances it saw end.
+	private collect(from: i32): i32 throws CompileError {
+		const p = this.p
+		const thrown = this.thrown
+		const caught = this.caught
+		const end = this.ins.order.length
+		for (const k of this.ins.order.slice(from, end)) {
+			const i = this.ins.insts.get(k)!
+			const c = i.code
+			for (const j of 0 ... (if (c == null) 0 else c.ops.length) - 1) {
+				const o = c!.ops[j]
+				if ((o == op.CallMethod || o == op.Field || o == op.SetField) && i.info[j] >= 0
+					&& !this.reached.has(pair(i.info[j], c!.a(j)))) {
+					this.reached.set(pair(i.info[j], c!.a(j)), [i.info[j], c!.a(j)])
+				}
+				if (o == op.Cast || o == op.Is) {
+					this.convert(i.info[j], c!.a(j))
+				} else if (o == op.Object) {
+					this.source(c!.a(j), c!.a(j))
+				} else if (o == op.Throw && !contains(thrown, i.info[j])) {
+					thrown.push(i.info[j])
+				} else if (o == op.Catch && c!.a(j) != kind.None && !contains(caught, c!.a(j))) {
+					caught.push(c!.a(j))
+				}
+			}
+		}
+		for (const t of caught) {
+			for (const s of thrown) {
+				this.convert(s, t)
+			}
+		}
+		let changed = true
+		while (changed) {
+			changed = false
+			for (const x of this.abstracts) {
+				const ss = this.sources.get(x)!.map(s => if (s != x && this.ins.abstract(s)) p.union(this.ins.flat(s)) else s)
+				const u = p.union(ss)
+				if (u != (this.ins.held.get(x) ?? p.union([]))) {
+					this.ins.held.set(x, u)
+					changed = true
+				}
+			}
+		}
+		for (const [t, name] of this.reached.values()) {
+			for (const m of this.ins.flat(t)) {
+				this.ins.memberOf(m, name)
+			}
+		}
+		return end
+	}
+
+	/// Notes the members of src that a Cast into to puts into one of its interfaces or object types: each class,
+	/// interface or object type having each of its members, unless to holds it as itself; once per src and to.
+	private convert(src: i32, to: i32) {
+		const p = this.p
+		const ins = this.ins
+		if (this.converted.has(pair(src, to))) {
+			return
+		}
+		this.converted.set(pair(src, to), true)
+		const targets = p.members(to)
+		for (const x of targets.filter(x => ins.abstract(x))) {
+			for (const s of p.members(src)) {
+				if ((ins.abstract(s) || ins.nominal(s) == decl.Class) && !contains(targets, s) && covers(p, s, x)) {
+					this.source(x, s)
+				}
+			}
+		}
+	}
+
+	private source(x: i32, s: i32) {
+		const ss = this.sources.get(x)
+		if (ss == null) {
+			this.abstracts.push(x)
+			this.sources.set(x, [s])
+		} else if (!contains(ss, s)) {
+			ss.push(s)
+		}
+	}
+
+	// Writing out.
+
+	/// Lowers each instance kept, a class's to its members and each other's to its type and code, and lists them.
+	private write() throws CompileError {
+		const p = this.p
+		const ins = this.ins
+		// Per source decl, its instances kept: not of interfaces, their members, or untyped vars, which are folded.
+		const of = new HashMap[i32, i32[]]()
+		const kept: i32[] = []
+		for (const k of ins.order) {
+			const x = p.decls[k]
+			const iface = (d: i32) => d >= 0 && p.decls[d].kind == decl.Interface
+			if (iface(k) || iface(x.owner) || x.kind == decl.Var && kind.untyped(x.type)) {
+				continue
+			}
+			add(of, if (x.generic < 0) k else x.generic, k)
+			kept.push(k)
+		}
+		// Per instance kept, its members kept, in source order, the generic methods instanced for it included.
+		const owned = new HashMap[i32, i32[]]()
+		for (const k of kept.filter(k => p.decls[k].owner >= 0)) {
+			add(owned, p.decls[k].owner, k)
+		}
+		const source = (d: i32) => if (p.decls[d].generic < 0) d else p.decls[d].generic
+		for (const k of kept) {
+			const i = ins.insts.get(k)!
+			const x = p.decls[k]
+			ins.where = qualified(p, k)
+			x.supers = 0
+			x.members = owned.get(k) ?? []
+			sortBy(x.members, (a, b) => source(a) < source(b))
+			if (x.kind != decl.Class) {
+				x.type = this.low(if (x.kind == decl.Function) runtime(p, x.type) else x.type)
+				x.code = if (i.code == null) null else this.lower(x.module, i.code!, i.info)
+			}
+		}
+		const instances = (ds: i32[]) => {
+			const out: i32[] = []
+			for (const d of ds) {
+				out.append(of.get(d) ?? [])
+			}
+			return out
+		}
+		for (const mi of 0 ... p.modules.length - 1) {
+			const m = p.modules[mi]
+			m.decls = [...instances(m.decls), ...this.dispatches.filter(d => p.decls[d].module == mi)]
+			m.inits = instances(m.inits)
+		}
+	}
+
+	/// Type t as it is at run time: an interface or object type as the union it holds, a class by its instance.
+	private low(t: i32): i32 throws CompileError {
+		const p = this.p
+		const found = this.lows.get(t)
+		if (found != null) {
+			return found
+		}
+		const k = p.kind(t)
+		let r = 0
+		if (t == kind.Type || k == kind.Param || k == kind.Of || k == kind.Member) {
+			throw new CompileError(`${showType(p, t)} at run time (${this.ins.where})`)
+		} else if (this.ins.nominal(t) == decl.Class) {
+			r = p.type(kind.Named, this.ins.instance(p.a(t), p.b(t)), 0)
+		} else if (k == kind.Union || k == kind.Literal || this.ins.abstract(t)) {
+			r = p.union(this.ins.flat(t).map(m => this.conc(m)))
+		} else if (k == kind.Func && runtime(p, t) != t) {
+			r = this.low(runtime(p, t))
+		} else {
+			r = p.map(t, x => this.low(x))
+		}
+		this.lows.set(t, r)
+		return r
+	}
+
+	/// A type a value is held as at run time: an object type as the struct its literals make.
+	private conc(t: i32): i32 throws CompileError { return if (this.p.kind(t) == kind.Object) this.p.map(t, x => this.low(x)) else this.low(t) }
+
+	/// Code c of module m lowered, info per op as src/resolve.bob's Inst has it.
+	private lower(m: i32, c: Code, info: i32[]): Code throws CompileError {
+		const p = this.p
+		const to = new Code()
+		for (const l of c.locals) {
+			to.local(l.name, this.low(l.type), l.mods)
+		}
+		to.captures = c.captures
+		for (const j of 0 ... c.ops.length - 1) {
+			const o = c.ops[j]
+			const r = info[j]
+			to.at = c.pos[j]
+			if (o == op.CallMethod && r >= 0) {
+				to.add(op.Call, this.dispatch(m, r, c.a(j), "()"))
+			} else if ((o == op.Field || o == op.SetField) && r >= 0 && p.kind(this.low(r)) == kind.Union) {
+				to.add(op.Call, this.dispatch(m, r, c.a(j), if (o == op.Field) "" else "="))
+			} else {
+				const s = op.shape[o]
+				const imm = [c.a(j), c.b(j), c.c(j)]
+				for (const i of 0 ... s.length - 1) {
+					imm[i] = this.imm(s[i], imm[i], c, to)
+				}
+				if (o == op.Object) {
+					imm[0] = this.conc(c.a(j))
+				}
+				to.add(o, imm[0], imm[1], imm[2])
+				if (o == op.Object && imm[0] != this.low(c.a(j))) {
+					to.add(op.Cast, this.low(c.a(j)))
+				}
+			}
+		}
+		return to
+	}
+
+	/// Immediate x of kind k of an op of code c lowered into code to.
+	private imm(k: Imm, x: i32, c: Code, to: Code): i32 throws CompileError {
+		return switch (k) {
+			case op.TypeId: this.low(x)
+			case op.TypeList: this.p.list(this.p.lists[x].map(t => this.low(t)))
+			case op.LocalList, op.NumList: to.list(c.items(x))
+			default: x
+		}
+	}
+
+	/// The function of module m that reads (how ""), writes ("=") or calls ("()") member name, a Str, of a value of t by
+	/// a switch on its tag; it takes the value, then the value written or the args.
+	private dispatch(m: i32, t: i32, name: i32, how: string): i32 throws CompileError {
+		const p = this.p
+		const ins = this.ins
+		const found = this.made.get([m, t, name, how])
+		if (found != null) {
+			return found
+		}
+		const [ps, result] = shape(p, how, if (how == "()") ins.methodType(t, name) else ins.fieldType(t, name))
+		const c = new Code()
+		const types = [this.low(t), ...ps.map(x => this.low(x))]
+		for (const i of 0 ... types.length - 1) {
+			c.local(if (i == 0) p.intern("this") else 0, types[i])
+		}
+		const cast = (from: i32, to: i32) => {
+			if (this.low(from) != to) {
+				c.add(op.Cast, to)
+			}
+		}
+		const ms = ins.flat(t)
+		for (const mt of ms) {
+			const ct = this.conc(mt)
+			if (ms.length > 1) {
+				c.add(op.Local, 0)
+				c.add(op.Is, ct)
+				c.add(op.If, kind.None)
+			}
+			const d = ins.memberOf(mt, name)
+			const method = how == "()" && d >= 0 && p.decls[d].kind == decl.Function
+			const [takes, gives] = shape(p, how, if (method) p.decls[d].type else ins.fieldType(mt, name))
+			const recv = () => {
+				c.add(op.Local, 0)
+				cast(t, ct)
+			}
+			const pass = () => {
+				for (const i of 0 ... takes.length - 1) {
+					c.add(op.Local, i + 1)
+					cast(ps[i], this.low(takes[i]))
+				}
+			}
+			if (method) {
+				recv()
+				pass()
+				c.add(op.Call, d)
+			} else if (how == "()") {
+				recv()
+				c.add(op.Field, name)
+				pass()
+				c.add(op.CallRef, takes.length)
+			} else {
+				recv()
+				pass()
+				c.add(if (how == "=") op.SetField else op.Field, name)
+			}
+			if (result != kind.None) {
+				cast(gives, this.low(result))
+			}
+			c.add(op.Return)
+			if (ms.length > 1) {
+				c.add(op.End)
+			}
+		}
+		if (ms.length != 1) {
+			c.add(op.Unreachable)
+		}
+		c.add(op.End)
+		const k = p.decl(m, -1, `.${p.strings[name]}${how}[${showType(p, t)}]`, decl.Function)
+		p.decls[k].type = p.type(kind.Func, p.list(types), this.low(result))
+		p.decls[k].code = c
+		this.made.set([m, t, name, how], k)
+		this.dispatches.push(k)
+		return k
+	}
+}
+
+/// Adds v to the list of k in m.
+function add(m: HashMap[i32, i32[]], k: i32, v: i32) {
+	const vs = m.get(k)
+	if (vs == null) {
+		m.set(k, [v])
+	} else {
+		vs.push(v)
+	}
+}
+
+/// Whether class, interface or object type s has a field or method of each name interface or object type x has.
+function covers(p: Program, s: i32, x: i32): bool {
+	const has = (name: i32) => if (p.kind(s) == kind.Named) p.member(p.a(s), name) >= 0 else p.field(s, name) >= 0
+	if (p.kind(x) == kind.Named) {
+		return p.decls[p.a(x)].members.every(m => has(p.decls[m].name))
+	}
+	for (const i of 0 ... p.items(x).length - 1) {
+		if (!has(p.names[p.b(x)][2 * i])) {
+			return false
+		}
+	}
+	return true
+}
+
+/// What a dispatch function's access how of a member of type ft takes after the receiver, and gives: nothing and the
+/// field's value, the value written and nothing, or the args and the result of the method or function field.
+function shape(p: Program, how: string, ft: i32): [i32[], i32] {
+	return if (how == "") [[], ft] else if (how == "=") [[ft], kind.None] else [p.items(ft), p.b(ft)]
+}

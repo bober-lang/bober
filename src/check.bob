@@ -1,0 +1,4293 @@
+//! bober check: the type checker, which is the linter too, reports the errors of each file given and of the modules
+//! they import. It declares a file's top-level names, then checks each declaration, those it uses first, and hands it
+//! to the next stage with the type of each construct and token in it.
+
+import { contains } from "../std/algo"
+import { digit, isAlphabetic, o, x } from "../std/ascii"
+import { HashMap } from "../std/collections/hashmap"
+import { ScopedMap } from "../std/collections/scopedmap"
+import { Set } from "../std/collections/set"
+import { Cc, Rest } from "../std/encoding/optarg"
+import { join } from "../std/fs/path"
+import { sortBy } from "../std/sort"
+import { endsWith, indexOf, startsWith } from "../std/string"
+import { bind, located } from "./c/bind"
+import { CompileError } from "./error"
+import { Kind, Loc, SyntaxError, Tok, prec } from "./lex"
+import { Parser, Syntax, Tree } from "./parse"
+import { builtin, builtinPath, root } from "./root"
+import {
+	Array as Arrays, Bool, Empty, Field, I32, Kind as TypeKind, Null, String, String16, String32, Type, U8, UntypedFloat,
+	UntypedInt, bases, basics, memberOf,
+} from "./type"
+
+/// The modules of builtin/ every module outside builtin/ and C's loads first: those declaring the classes of a string's
+/// and an array's methods, then those exporting the prelude's names. A module one of them imports sees only the exports
+/// of those before it, so io.bob, which imports show.bob, comes last.
+let first = ["array", "string", "type", "c", "tag", "io"].map(builtinPath)
+/// The exports of first that every module sees without importing them.
+const prelude = ["print", "readFile", "writeFile", "args", "targetOs", "targetArch", "now", "random", "idOf", "chr", "fromBytes",
+	"toC", "toCN", "fromC", "fromCN", "peek", "poke", "Deprecated", "Experimental", "Type"]
+/// The constructs a doc comment documents.
+const documented: Syntax[] = ["test", "var", "function", "class", "type", "method", "prop", "param", "typeParam"]
+/// What the compiler lowers the builtin types and the prelude to, which every program holds.
+let lowered = [...first, ...["equal", "show", "math", "fiber"].map(builtinPath)]
+
+/// The errors of the modules at paths and of those they import, each checked once and handed on to next.
+export function check(paths: string[], includes: string[] = [], read: (path: string) => string | null = p => readFile(p),
+	next: Checked = new Ignore()): TypeError[] {
+	info = new HashMap[string, Member]()
+	fills = new HashMap[i32, () => void]()
+	filling = []
+	early = []
+	tagTypes = new HashMap[string, Type]()
+	const ms = new Modules(includes, read, next)
+	for (const path of [...paths, ...lowered]) {
+		const m = ms.load(normal(path))
+		if (m instanceof string) {
+			ms.errors.push(new TypeError(path, Loc.at(0, 0), m))
+		}
+	}
+	return ms.errors
+}
+
+/// How t is written, its classes, interfaces and type params by name.
+export function show(t: Type): string { return t.toString(nameOf) }
+
+/// The name of class, interface or type param t; of a param standing for a member of another, that one's and the member
+/// (4.11).
+function nameOf(t: Type): string | null {
+	const n = names.get(t)
+	if (n != null || t.kind != "param" || t.params.length == 0) {
+		return n
+	}
+	const o = nameOf(t.params[0]) ?? "param"
+	return if (t.text == "") o else `${o}.${t.text}`
+}
+
+/// The names of the classes, interfaces and type params declared, as show writes them.
+const names = new HashMap[Type, string, ById]()
+/// What is known of each member of a class, interface or namespace beyond its type, by about's key.
+let info = new HashMap[string, Member]()
+/// How to fill in each class and interface declared that is not yet, by its id; those being filled; and the instances
+/// made of those while they were, to be filled in again after.
+let fills = new HashMap[i32, () => void]()
+let filling: Type[] = []
+/// How many searches of uses ran, each marking the declarations it visits (Decl.seen).
+let searches = 0
+let early: Type[] = []
+/// The classes of builtin/tag.bob, by name.
+let tagTypes = new HashMap[string, Type]()
+/// builtin/type.bob's Type, of any type as a value (4.11).
+let Meta = Empty
+/// builtin/'s classes and interfaces, by path and name, made once for every program.
+const builtins = new HashMap[string, Type]()
+
+/// The members of t, its class or interface filled in first if it is not yet.
+function members(t: Type): Field[] {
+	const g = t.generic ?? t
+	const f = fills.get(g.id)
+	if (f != null) {
+		fills.delete(g.id)
+		filling.push(g)
+		f()
+		filling.pop()
+		for (const i of early) {
+			if (i.generic == g) {
+				i.refill()
+			}
+		}
+	}
+	return t.fields
+}
+
+/// The members of t a value has: those not static.
+function fields(t: Type): Field[] { return members(t).filter(f => !f.static) }
+
+/// Whether t has members, all static, filled in first.
+function staticOnly(t: Type): bool {
+	members(t)
+	return t.staticOnly()
+}
+
+/// Generic g's instance for args, g filled in first, or once it is if it is being.
+function instance(g: Type, args: Type[]): Type {
+	members(g)
+	const t = g.instantiate(args)
+	if (contains(filling, g)) {
+		early.push(t)
+	}
+	return t
+}
+
+/// An array of t, its class filled in first.
+function arrayOf(t: Type): Type {
+	if (Arrays.base != null) {
+		instance(Arrays.base!, [t])
+	}
+	return Type.array(t)
+}
+
+/// Hashes a type by its identity.
+class ById {
+	static hash(t: Type): u64 { return t.id as u64 }
+	static eq(a: Type, b: Type): bool { return a == b }
+}
+
+/// What is known of a member beyond its type.
+class Member {
+	hidden = false
+	/// Whether it is readonly, so assigned only by its initializer or, on this, by its class's constructor.
+	readonly = false
+	/// Whether its type is known, or is yet to be given by its initializer, or is not, as checking it failed.
+	state: "typed" | "pending" | "failed" = "typed"
+	warning: Warning | null = null
+	errors = new Errors()
+	/// What running it may run (3): its own for a top-level class's method or static member, the class's for its
+	/// constructor, the named one for a namespace's member.
+	decl: Decl | null = null
+}
+
+/// What a function or method may throw (7.5): the types it lists, else those inferred from its body's sites.
+class Errors {
+	types: Type[]
+	/// Whether types are listed, not inferred: as it lists them, or is exported or main and lists none.
+	listed = false
+	/// The throws and calls in its body.
+	sites: Site[] = []
+
+	constructor(types: Type[] = []) {
+		this.types = types
+	}
+}
+
+/// A throw or call, which may throw the types of from, but those a catch around it takes, null for any.
+class Site {
+	at: Loc
+	from: Errors
+	caught: (Type | null)[] = []
+
+	constructor(at: Loc, from: Errors) {
+		this.at = at
+		this.from = from
+	}
+
+	/// The types it lets escape; a type param's are unchecked, as what it stands for is not known here.
+	escaping(): Type[] {
+		return this.from.types.filter(t => t.kind != "param" && !this.caught.some(c => c == null || t.fits(c)))
+	}
+}
+
+/// Adds t to ts unless it fits one of them; returns whether it did.
+function add(ts: Type[], t: Type): bool {
+	if (ts.some(u => t.fits(u))) {
+		return false
+	}
+	ts.push(t)
+	return true
+}
+
+/// What is known of member name of t, or its static member if static: an instance's are its generic's.
+function about(t: Type, name: string, static = false): Member {
+	const k = `${(t.generic ?? t).id}${if (static) ":" else "."}${name}`
+	const m = info.get(k) ?? new Member()
+	info.set(k, m)
+	return m
+}
+
+/// What a use of a declaration or member tagged @Deprecated or @Experimental from outside its module is warned of.
+class Warning {
+	msg: string
+	/// Its module's path.
+	path: string
+
+	constructor(msg: string, path: string) {
+		this.msg = msg
+		this.path = path
+	}
+}
+
+/// What a command line gives the checker, spelled as a C compiler's and anywhere on it: the directories of its -I
+/// flags, whether a build is -release, and the other arguments.
+export class Flags @Cc {
+	I: string[] = []
+	release: bool = false
+	args: string[] @Rest = []
+}
+
+/// The stage after the checker.
+export interface Checked {
+	/// A top-level declaration or test, once checked, of a module after those it imports, and after those it needs
+	/// checked first.
+	decl(n: Node, path: string, src: string)
+	/// A top-level declaration of the module at path that one handed on before it refers to, typed but not yet checked
+	/// whole, so that the next stage knows it ahead of its decl.
+	declare(n: Node, path: string, src: string)
+	/// The module at path checked, after the modules it imports: each of its declarations handed on, or failed.
+	done(path: string)
+}
+
+class Ignore implements Checked {
+	decl(n: Node, path: string, src: string) {}
+	declare(n: Node, path: string, src: string) {}
+	done(path: string) {}
+}
+
+/// A construct, or a token where kind is "token", with the type of its value once checked, or of a type expression,
+/// declaration or pattern the type it stands for.
+export class Node {
+	kind: Syntax | "token"
+	t: Tok
+	parts: Node[] = []
+	type: Type | null = null
+	/// A declaration's or member's tags (5.3), once typed.
+	tags: Type[] | null = null
+	/// A declaration's doc comment.
+	doc = ""
+	/// For the name of a top-level declaration, or a use of one, its module's path and its name, unique in the
+	/// program. A namespace's is its module's path and the colon.
+	symbol = ""
+
+	constructor(kind: Syntax | "token", t: Tok) {
+		this.kind = kind
+		this.t = t
+	}
+}
+
+
+export class TypeError {
+	path: string
+	msg: string
+	loc: ...Loc
+	/// Where loc starts, from 1.
+	line = 1
+	col = 1
+	/// Whether it is only a warning, which does not stop a build.
+	warning: bool
+
+	constructor(path: string, loc: Loc, msg: string, warning = false) {
+		this.path = path
+		this.loc = { ...loc }
+		this.msg = msg
+		this.warning = warning
+	}
+}
+
+/// The source bind makes of each header's names, by the key of their module and the includes, kept across checks,
+/// as each checks builtin/ and its headers again: binding is slow, and a header does not change while the compiler runs.
+const bound = new HashMap[string, string]()
+
+/// The modules of a program by path, each checked once, when first imported.
+///
+/// Freezing (below) is meant to be free on the hot path: after const initialization, collect the heap once, move the
+/// survivors to their own pages and mprotect them read-only. A write faults and is reported as a trap. Frozen data
+/// cannot point into an isolate's heap, so the GC never scans it.
+///
+/// # Modules
+///
+/// ```grammar
+/// File       = {Import Term} {Decl Term}
+/// Import     = "import" [ImportList "from"] String
+/// ImportList = "{" [Ident ["as" Ident] {"," Ident ["as" Ident]} [","]] "}" | "*" ["as" Ident]
+/// Decl       = Test | ["export"] (Function | Class | Interface | TypeAlias | Var)
+/// Term       = ";" | newline (§2.2)
+/// ```
+///
+/// A file is a module. Imports come first and name exported declarations of another module, whose path `p` is relative
+/// to the importing file if it starts with a dot, else to the implementation's, as `"std/fs"`. `import * from "p"` names
+/// every exported declaration of `p`. An imported name shall not also be imported otherwise or declared at the top
+/// level. `import "p"` is `import * as n from "p"`, with `n` the last segment of `p` without `.bob`, which shall be an
+/// identifier. Only `export`ed declarations are visible to other modules, and an exported declaration's type shall name
+/// only exported or imported declarations; but a test file, one named `*.test.bob`, may import any top-level declaration
+/// by name.
+///
+/// Top-level declarations may appear in any order and may refer to each other. A variable's *dependencies* are what
+/// running its initializer may run, found lexically, whether reached at run time or not: the functions and variables
+/// it names, with their bodies and initializers, and theirs in turn; for `new C(…)`, or a class embedding `C`, `C`'s
+/// field initializers and constructor; for `new T()`, those of each class in `T`'s constraint; for `x.m` or `C.m`, the
+/// method or static member `m` of the class of `x` or of `C`, and for `${x}`, `x`'s `toString`. Types, annotations
+/// included, run nothing. A function literal may be called where it is, so its body counts, but where it is all of a
+/// variable's initializer: a function's value does not depend on its body, so that variable has no dependencies,
+/// though naming it counts its body. A variable, or static field (§5.3), shall not be among its own dependencies, and a
+/// `const` shall not depend on a `let`. Variables are initialized before `main`, each after its dependencies; the order
+/// is otherwise implementation-defined. A variable read before it is initialized, through a member of an interface,
+/// union or object, or a function or object one initializer stores and another runs, holds its zero value, or null
+/// where its type has none.
+///
+/// ```
+/// const total = double(base) + 1    // base is initialized first
+/// const base = 20
+/// function double(x: i32): i32 { return x * 2 }
+///
+/// function even(n: i32): bool { return n == 0 || odd(n - 1) }
+/// function odd(n: i32): bool { return n != 0 && even(n - 1) }   // ok: only functions in the cycle
+/// const k: i32 = h()
+/// function h(): i32 { return k }     // error: k depends on itself
+/// const i = 1
+/// let j = f()
+/// function f(): i32 { return if (i == 2) j else 0 }   // error: j depends on itself, though never reached
+/// const c: i32 = d
+/// const d: i32 = c                   // error: cycle
+/// const fact: (n: i64) => i64 = n => if (n == 0) 1 else n * fact(n - 1)   // ok: its value is the function
+/// const e: () => i32 = () => g()
+/// const g: () => i32 = () => e()     // ok: neither is run
+/// const once: i32 = (() => once)()   // error: the function is run
+/// class P { ps: P[] = none }
+/// const none: P[] = []               // ok: types run nothing
+/// const q = new Q()
+/// class Q { q: Q | null = q }         // error: new Q() runs q's initializer
+/// const empty = new R()
+/// class R { x = 0; same(): R { return empty } }    // ok: new R() does not run same
+/// const s = S.none()
+/// class S { static none(): S { return s } }        // error: s depends on itself
+/// ```
+///
+/// A program runs in *isolates*, which run in parallel and share no mutable data. Top-level `const`s are initialized
+/// first; from then on they, and everything reachable from them, captures included, are *frozen*: shared by all
+/// isolates, and writing them traps. A `const` shall not depend on a top-level `let`. Each isolate then initializes its
+/// own top-level `let`s and runs its initial function: `main` or the test being run for the first isolate, the callee
+/// of `spawn` (§6.10) for the others. `main` takes no parameters and returns an integer, the exit status, or `null` for
+/// zero. The program ends when the first isolate does.
+///
+/// ```
+/// const config = load()       // runs before main, then frozen
+/// function main(): i32 {
+///   config.port = 80          // traps: frozen
+///   return if (ok()) 0 else 1
+/// }
+/// ```
+///
+/// Statements are not allowed at the top level: `g()` and `assert` outside a function or test are errors.
+class Modules {
+	errors: TypeError[] = []
+	next: Checked
+	/// Whether an error is reported, after which nothing more is handed on to next, whose work would be dropped.
+	failed = false
+	private includes: string[]
+	private read: (path: string) => string | null
+	private loaded = new HashMap[string, Module]()
+
+	constructor(includes: string[], read: (path: string) => string | null, next: Checked) {
+		this.includes = includes
+		this.read = p => read(p) ?? readFile(p) // the files read gives none of, as builtin/, from disk
+		this.next = next
+	}
+
+	/// The module at path, or why there is none.
+	load(path: string): Module | string {
+		const m = this.loaded.get(path)
+		if (m != null) {
+			return if (m.done) m else `import cycle through ${path}`
+		}
+		const src = this.read(path)
+		return if (src == null) `cannot read ${path}` else this.checked(path, src, false)
+	}
+
+	/// The module of names from C header spec, as importer includes it, or why there is none (3.1).
+	header(importer: string, spec: string, names: string[]): Module | string {
+		const key = `${located(importer, spec, this.includes, this.read)}: ${names.join(" ")}`
+		const m = this.loaded.get(key)
+		if (m != null) {
+			return m
+		}
+		try {
+			const k = `${key} ${this.includes.join(" ")}`
+			const src = bound.get(k) ?? bind(importer, spec, names, this.includes, this.read)
+			bound.set(k, src)
+			return this.checked(key, src, true)
+		} catch (e: CompileError) {
+			return e.msg
+		}
+	}
+
+	private checked(path: string, src: string, header: bool): Module {
+		const m = new Module(path)
+		this.loaded.set(path, m)
+		const p = new Parser(src, header || builtin(path)) // builtin/'s intrinsics have no body
+		const c = new Checker(m, src, p, this)
+		c.check()
+		m.done = true
+		if (!this.failed) {
+			this.next.done(path)
+		}
+		sortBy(c.errors, (a, b) => a.loc.pos < b.loc.pos)
+		for (const e of c.errors) {
+			const [line, col] = p.lineCol(e.loc.pos)
+			e.line = line
+			e.col = col
+			this.errors.push(e)
+		}
+		return m
+	}
+}
+
+/// A module checked, or being checked, the names it exports, and all its top-level declarations, for tests.
+class Module {
+	path: string
+	names: string[] = []
+	exports = new HashMap[string, Binding]()
+	tops = new HashMap[string, Binding]()
+	done = false
+
+	constructor(path: string) { this.path = path }
+}
+
+/// What ends checking a statement, or a declaration outside one, at its first error. A variable that it leaves without
+/// a type fails each statement that uses it, without an error of its own.
+class Failed {}
+
+/// A top-level declaration or test, checked in order or when first needed. Its node is dropped once handed on.
+class Decl {
+	node: Node | null
+	/// Whether it was declared to the next stage ahead of being handed on.
+	ahead = false
+	kind: Syntax | "token"
+	/// The name a variable is reported by, and whether it is a let.
+	at: Tok
+	mutable: bool
+	/// The class or interface it declares.
+	nominal: Type | null = null
+	/// Whether a check in it failed, so that it is not handed on.
+	failed = false
+	state: "new" | "busy" | "done" = "new"
+	/// The top-level declarations it references.
+	deps: Decl[] = []
+	/// What running it may run (3): the functions, variables and class members it names and the classes it constructs;
+	/// a class's are those of its constructor and instance field initializers.
+	uses: Decl[] = []
+	/// The last search of uses that visited it.
+	seen = 0
+	warning: Warning | null = null
+	errors = new Errors()
+
+	constructor(node: Node, at: Tok) {
+		this.node = node
+		this.kind = node.kind
+		this.at = at
+		this.mutable = node.t.kind == "let"
+	}
+}
+
+/// What a name stands for: a value, or a type where isType. A top-level one is typed when first needed.
+class Binding {
+	type: Type | null
+	/// What a condition, jump or assignment narrowed it to (6.11).
+	narrowed: Type | null = null
+	mutable: bool
+	isType: bool
+	decl: Decl | null = null
+	/// How many functions deep it is declared, as narrowing does not apply to captured variables.
+	depth = 0
+	/// Whether it is a const or unrolled for's binding whose static value depends on a type param (4.11).
+	generic = false
+	failed = false
+	/// Whether a function it is captured by assigns it, so that it is not narrowed.
+	shared = false
+	symbol = ""
+	/// For the binding of a member path, that path, as this.a.b.
+	path = ""
+	/// A generic class's, interface's or alias's type params.
+	params: Type[] = []
+	/// For a const initialized by an integer or string constant, the literal type its name denotes in a type (4.2).
+	literal: Type | null = null
+	/// While its initializer is checked, whether that is a function literal, which does not run it, or a value (3).
+	initializing: "" | "function" | "value" = ""
+
+	constructor(t: Type | null, mutable: bool, isType: bool) {
+		this.type = t
+		this.mutable = mutable
+		this.isType = isType
+	}
+}
+
+/// A binding narrowed to type, or to none.
+///
+/// ## Narrowing
+///
+/// Inside a branch controlled by a condition, a local or parameter `x` of union, object or interface type has a
+/// narrower type: `x == null` or `x != null` removes or keeps `null`; `x instanceof T` narrows as in §6.5; comparing a
+/// discriminating field (§4.4) with a literal, `x.kind == "a"`, narrows to the members with that literal; `&&`, `||`,
+/// `!` and `if`/`else` combine as expected, and `x ?? d` and `x?.` remove `null`. A `switch` on `x` with type labels,
+/// or on `x.kind` with literal labels, narrows in each case. An assignment to `x` narrows it to the assigned value's
+/// type, and where branches meet, `x` has the union of their types. A loop or `try` loses the narrowing of the
+/// variables it assigns. Narrowing applies to a local, and to a member path from a local or `this`, as `a.b.c`, until a
+/// part of the path is assigned; never to a captured variable.
+///
+/// ```
+/// function label(s: Shape | null): string {
+///   if (s == null) { return "none" }
+///   return s.name                      // s: Shape
+/// }
+/// if (v instanceof string && v.length > 0) { }
+/// type Ev = { kind: "key", code: i32 } | { kind: "move", x: i32, y: i32 }
+/// switch (e.kind) { case "key": use(e.code); case "move": use(e.x) }
+/// ```
+class Narrowing {
+	b: Binding
+	type: Type | null
+
+	constructor(b: Binding, t: Type | null) {
+		this.b = b
+		this.type = t
+	}
+}
+
+/// What holds where ns or ms does: the bindings both narrow, to the union of what the last of each narrows them to, a
+/// type param to a param of either.
+function either(ns: Narrowing[], ms: Narrowing[]): Narrowing[] {
+	const out: Narrowing[] = []
+	for (const n of ns) {
+		const a = lastOf(ns, n.b)
+		const b = lastOf(ms, n.b)
+		const t = if (a == null || b == null) null else if (n.b.isType) anyOf(n.b.type!, [a, b]) else Type.union([a, b])
+		if (t != null) {
+			out.push(new Narrowing(n.b, t))
+		}
+	}
+	return out
+}
+
+/// A param narrowing p to what each of ts makes it, or null where one tells no type (4.11).
+function anyOf(p: Type, ts: Type[]): Type | null {
+	const bs: Type[] = []
+	for (const t of ts) {
+		const b = if (t.kind == "param") t.underlying()?.alternatives() ?? [] else [t]
+		if (b.length == 0) {
+			return null
+		}
+		bs.push(...b)
+	}
+	return Type.derived(p, "", typeSet(bs))
+}
+
+/// What the last of ns narrowing b narrows it to, null where that is to none or there is none.
+function lastOf(ns: Narrowing[], b: Binding): Type | null {
+	let t: Type | null = null
+	for (const n of ns) {
+		if (n.b == b) {
+			t = n.type
+		}
+	}
+	return t
+}
+
+/// What a condition narrows where true, and where false.
+class Facts {
+	yes: Narrowing[]
+	no: Narrowing[]
+
+	constructor(yes: Narrowing[], no: Narrowing[]) {
+		this.yes = yes
+		this.no = no
+	}
+}
+
+/// The function, method, arrow or test being checked.
+class Fn {
+	/// The declared result, null where inferred from the returns.
+	result: Type | null
+	returns: Type[] = []
+	inLoop = false
+	/// Whether the innermost loop or case is a case, which break shall not leave.
+	cased = false
+	/// Whether a break left the innermost loop.
+	broke = false
+	/// Whether a subtest may be here.
+	tests = false
+	/// Whether a check in it failed, so that its result cannot be inferred.
+	failed = false
+	/// Those of a function or method, whose sites it notes; null where unchecked.
+	errors: Errors | null = null
+	/// The class this is the constructor of, which assigns its readonly fields on this.
+	builds: Type | null = null
+
+	constructor(result: Type | null) { this.result = result }
+}
+
+class Checker {
+	/// In the order reported, until Modules.checked sorts them by position.
+	errors: TypeError[] = []
+	private reported = new Set()
+	private m: Module
+	private src: string
+	/// The parser of src, done, which has its comments.
+	private p: Parser
+	private modules: Modules
+	private prelude = new HashMap[string, Binding]()
+	private top = new HashMap[string, Binding]()
+	private vars: Decl[] = []
+	/// Whether a type param's default is being read, whose constraints are checked where it is used.
+	private defaulting = false
+	private locals = new ScopedMap[Binding]()
+	/// The top-level declaration being checked, whose references are recorded.
+	private owner: Decl | null = null
+	/// Whether a type annotation is being read, whose names are not uses of the owner.
+	private annotating = false
+	/// The class member being checked whose uses are its own, else null for the owner's.
+	private user: Decl | null = null
+	private self: Type | null = null
+	/// The class whose body is being checked, which sees its private members, as tests do.
+	private host: Type | null = null
+	private testing = false
+	private fn: Fn | null = null
+	private depth = 0
+	/// In a local class's body, the function depth it is declared at, whose locals but types it cannot capture (5.3);
+	/// else -1.
+	private wall = -1
+	/// The narrowings to undo, with what each binding was narrowed to before.
+	private undo: Narrowing[] = []
+	/// The bindings narrowing params that no name declares, as the type of each of `T.fields` (4.11).
+	private holders: Binding[] = []
+	/// The bindings of the member paths narrowed (6.11) in the function being checked.
+	private paths: Binding[] = []
+	/// Those of the functions and methods whose bodies are checked.
+	private throwing: Errors[] = []
+	/// The declarations settled and not yet handed on.
+	private settled: Decl[] = []
+	/// The call of an async or spawn being checked, whose errors are unchecked.
+	private deferred: Node | null = null
+
+	constructor(m: Module, src: string, p: Parser, modules: Modules) {
+		this.m = m
+		this.src = src
+		this.p = p
+		this.modules = modules
+		for (const t of basics) {
+			this.prelude.set(show(t), new Binding(t, false, true))
+		}
+		this.prelude.set("void", new Binding(Null, false, true))
+		for (const p of if (builtin(m.path) || indexOf(m.path, ": ") >= 0) [] else first) {
+			const loaded = modules.load(p)
+			if (loaded instanceof Module) {
+				for (const name of prelude) {
+					const b = loaded.exports.get(name)
+					if (b != null) {
+						this.prelude.set(name, b)
+					}
+				}
+			}
+		}
+	}
+
+	/// Checks the file's top-level constructs, or those before a syntax error, as they are parsed: declares their names,
+	/// and checks what each import names as soon as it is parsed, so that only the imports of the modules importing it
+	/// are kept meanwhile; in builtin/, once all its names are declared, so that its String and Array are known before
+	/// the modules it imports make strings and arrays. Then checks each.
+	check() {
+		const ds: Decl[] = []
+		const imports: Node[] = []
+		const early = !builtin(this.m.path)
+		try {
+			let t = this.p.parse()
+			while (t != null) {
+				const n = this.node(t)
+				if (n.kind != "import") {
+					ds.push(this.declare(n))
+				} else if (early) {
+					this.imports(n)
+				} else {
+					imports.push(n)
+				}
+				t = this.p.parse()
+			}
+		} catch (e: SyntaxError) {
+			this.report(e.loc, e.msg)
+		}
+		for (const n of imports) {
+			this.imports(n)
+		}
+		for (const d of ds) {
+			this.settle(d)
+			this.handOn()
+		}
+		this.escapes()
+		for (const d of this.vars) {
+			this.cycles(d)
+		}
+	}
+
+	/// Infers the errors of the functions that do not list theirs, then warns of each type another lets escape but does
+	/// not list, once, where it first escapes; it is not added to its errors, so no caller is warned of it again (7.5).
+	private escapes() {
+		let changed = true
+		while (changed) {
+			changed = false
+			for (const e of this.throwing.filter(e => !e.listed)) {
+				for (const s of e.sites) {
+					for (const t of s.escaping()) {
+						changed = add(e.types, t) || changed
+					}
+				}
+			}
+		}
+		for (const e of this.throwing.filter(e => e.listed)) {
+			const known = [...e.types]
+			for (const s of e.sites) {
+				for (const t of s.escaping()) {
+					if (add(known, t)) {
+						this.report(s.at, `${show(t)} is neither caught nor listed`, true)
+					}
+				}
+			}
+		}
+	}
+
+	/// t's construct, after reporting what in it 6.5 needs parenthesized.
+	private node(t: Tree): Node {
+		const n = new Node(t.kind, t.t)
+		for (const p of t.parts) {
+			n.parts.push(if (p instanceof Tree) this.node(p) else new Node("token", p))
+		}
+		if (contains(documented, t.kind)) {
+			n.doc = this.p.doc(start(n).pos)
+		}
+		if (n.kind == "binary" || n.kind == "chain") {
+			this.parens(n)
+		}
+		return n
+	}
+
+	/// Rejects what 6.5 forbids without parentheses: as or ?? mixed with other binary operators, a unary operand
+	/// left of **, and comparison chains other than of == only, < <= only or > >= only.
+	private parens(n: Node) {
+		const op = n.t.kind
+		if (op == "as") {
+			return
+		}
+		const l = outer(n.parts[0])
+		const r = outer(n.parts[1])
+		const ok = l != "as" && r != "as" && switch (op) {
+			case "??": (l == "??" || prec(l) == 0) && prec(r) == 0
+			case "**": l != "unary" && l != "await"
+			default: prec(op) != 4 || prec(l) != 4 || chain(op) != 0 && chain(op) == chain(l)
+		}
+		if (!ok) {
+			this.report(n.t.loc, `${op} needs parentheses around an operand`)
+		}
+	}
+
+	private declare(n: Node): Decl {
+		if (n.kind == "test") {
+			return new Decl(n, n.t)
+		}
+		const names = patternNames(operands(n)[0])
+		const d = new Decl(n, names[0].t)
+		d.errors.listed = isTok(n.parts[0], "export") || this.text(names[0].t) == "main"
+		if (n.kind == "class") {
+			d.nominal = this.nominal(n, d)
+			n.type = d.nominal
+			about(d.nominal!, "constructor").decl = d
+		}
+		for (const t of names) {
+			const b = new Binding(d.nominal, n.t.kind == "let", n.kind == "class" || n.kind == "type")
+			b.params = d.nominal?.params ?? []
+			b.decl = d
+			const name = this.text(t.t)
+			b.symbol = `${this.m.path}:${name}`
+			t.symbol = b.symbol
+			this.declareTop(name, t.t, b)
+			const own = name.copy() // as it outlives the source
+			this.m.tops.set(own, b)
+			if (isTok(n.parts[0], "export")) {
+				this.m.names.push(own)
+				this.m.exports.set(own, b)
+			}
+		}
+		return d
+	}
+
+	/// Declares the names import n names (3).
+	private imports(n: Node) {
+		const s = n.parts[n.parts.length - 1].t
+		const spec = this.key(s)
+		const what = n.parts[0]
+		const listed = what.kind == "object"
+		const names: Tok[] = []
+		const texts: string[] = []
+		for (const p of if (listed) what.parts else []) {
+			names.push(if (p.kind == "token") p.t else p.parts[0].t)
+			texts.push(this.text(names[names.length - 1]))
+		}
+		let m: Module | string = ""
+		if (!endsWith(spec, ".h")) {
+			m = this.modules.load(resolve(this.m.path, if (endsWith(spec, ".bob")) spec else spec + ".bob"))
+		} else if (listed) {
+			m = this.modules.header(this.m.path, spec, texts)
+		} else {
+			m = "a C header's names are imported by name"
+		}
+		if (m instanceof string) {
+			return this.report(s.loc, m)
+		}
+		if (listed) {
+			const tests = endsWith(this.m.path, ".test.bob")
+			const visible = if (tests) m.tops else m.exports
+			for (const i of 0 ... names.length - 1) {
+				const b = visible.get(texts[i])
+				const p = what.parts[i]
+				const alias = if (p.kind == "token") p.t else p.parts[1].t
+				if (b == null) {
+					this.report(names[i].loc, `${spec} does not ${if (tests) "declare" else "export"} ${texts[i]}`)
+				} else {
+					this.declareTop(this.text(alias), alias, b)
+				}
+			}
+		} else if (isTok(what, "*")) {
+			for (const name of m.names) {
+				this.declareTop(name, what.t, m.exports.get(name)!)
+			}
+		} else {
+			const fs: Field[] = []
+			for (const name of m.names) {
+				const b = m.exports.get(name)!
+				const t = b.type
+				fs.push(new Field(name, if (t == null) Empty else if (b.isType) meta(t) else t))
+			}
+			const o = Type.object(fs)
+			for (const name of m.names) {
+				const b = m.exports.get(name)!
+				const f = about(o, name)
+				f.decl = b.decl
+				f.warning = b.decl?.warning ?? null
+				f.errors = b.decl?.errors ?? f.errors
+				if (b.type == null || b.failed) {
+					f.state = "failed"
+				}
+			}
+			const at = if (what.kind == "binary") what.parts[1].t else s
+			const name = if (what.kind == "binary") this.text(at) else segment(spec)
+			const b = new Binding(o, false, false)
+			b.symbol = m.path + ":"
+			this.declareTop(name, at, b)
+		}
+	}
+
+	private declareTop(name: string, t: Tok, b: Binding) {
+		if (this.top.has(name)) {
+			this.report(t.loc, `${name} is declared twice`)
+		} else {
+			this.top.set(name, b)
+		}
+	}
+
+	/// A class or interface, whose members are filled in when first needed. builtin/'s String and Array are those of
+	/// strings and arrays.
+	private nominal(n: Node, owner: Decl): Type {
+		const name = this.text(operands(n)[0].t)
+		const key = `${this.m.path}:${name}`
+		const made = builtins.get(key)
+		const t = made ?? new Type(if (n.t.kind == "class") "class" else "interface")
+		if (made != null) {
+			// Filled anew each check, as fill also records the members' info.
+			t.fields = []
+		} else {
+			names.set(t, name.copy())
+			t.params = this.paramsOf(n)
+			if (builtin(this.m.path)) {
+				builtins.set(key, t)
+			}
+		}
+		// A local class sees the block's types (5.1).
+		const locals = this.locals
+		const wall = if (locals.level > 0) this.depth else -1
+		const user = this.user
+		fills.set(t.id, () => this.within(owner, () => {
+			if (wall >= 0) {
+				this.locals = locals
+				this.wall = wall
+				this.user = user
+			}
+			this.apart(() => this.fill(t, n))
+		}))
+		if (this.m.path == builtinPath("string")) {
+			String.base = t
+			String16.base = t
+			String32.base = t
+		} else if (this.m.path == builtinPath("array")) {
+			Arrays.params = t.params
+			Arrays.base = t
+		} else if (this.m.path == builtinPath("tag")) {
+			tagTypes.set(name, t)
+		} else if (this.m.path == builtinPath("type")) {
+			Meta = t
+		}
+		return t
+	}
+
+	/// Checks d, to hand on unless it failed.
+	private settle(d: Decl) {
+		if (d.state != "new") {
+			return
+		}
+		const n = d.node!
+		d.state = "busy"
+		this.within(d, () => {
+			if (!this.apart(() => this.decl(n)) && n.kind != "test") {
+				for (const t of patternNames(operands(n)[0])) {
+					this.top.get(this.text(t.t))!.failed = true
+				}
+			}
+			if (n.kind != "class") {
+				this.apart(() => this.tagged(n))
+			}
+			d.warning = this.warning(n)
+		})
+		d.state = "done"
+		if (d.failed) {
+			d.node = null
+		} else {
+			this.settled.push(d)
+		}
+	}
+
+	/// Hands on the declarations settled, in order, once each they refer to is typed whole and declared ahead; completing
+	/// one may settle more, which join them.
+	private handOn() {
+		let i = 0
+		while (i < this.settled.length) {
+			this.complete(this.settled[i], [])
+			this.ahead(this.settled[i])
+			i++
+		}
+		for (const d of this.settled) {
+			if (!this.modules.failed) {
+				this.modules.next.decl(d.node!, this.m.path, this.src)
+			}
+			d.node = null
+		}
+		this.settled = []
+	}
+
+	/// Fills in the members of the classes and interfaces d depends on that are not handed on yet, and declares them to
+	/// the next stage ahead, so that it sees them whole; they are this module's, as those imported are handed on.
+	private complete(d: Decl, seen: Decl[]) {
+		for (const e of d.deps) {
+			const t = e.nominal
+			if (e.state != "done" && !contains(seen, e)) {
+				seen.push(e)
+				if (t != null) {
+					members(t)
+				}
+				this.ahead(e)
+				this.complete(e, seen)
+			}
+		}
+	}
+
+	/// Declares d to the next stage ahead of handing it on, once; not a test, which nothing refers to.
+	private ahead(d: Decl) {
+		if (!d.ahead && d.kind != "test" && !this.modules.failed) {
+			d.ahead = true
+			this.modules.next.declare(d.node!, this.m.path, this.src)
+		}
+	}
+
+	/// Runs f to check d, apart from what is being checked now.
+	private within(d: Decl | null, f: () => void) {
+		const locals = this.locals
+		const owner = this.owner
+		const self = this.self
+		const host = this.host
+		const testing = this.testing
+		const fn = this.fn
+		const depth = this.depth
+		const paths = this.paths
+		const annotating = this.annotating
+		const user = this.user
+		const wall = this.wall
+		const mark = this.undo.length
+		this.locals = new ScopedMap[Binding]()
+		this.paths = []
+		this.owner = d
+		this.self = null
+		this.host = null
+		this.testing = false
+		this.fn = null
+		this.annotating = false
+		this.user = null
+		this.wall = -1
+		try {
+			f()
+		} finally {
+			this.restore(mark)
+			this.locals = locals
+			this.owner = owner
+			this.self = self
+			this.host = host
+			this.testing = testing
+			this.fn = fn
+			this.depth = depth
+			this.paths = paths
+			this.annotating = annotating
+			this.user = user
+			this.wall = wall
+		}
+	}
+
+	/// Reports a variable among its own dependencies, or a const depending on a let, unless checking it failed (3).
+	private cycles(d: Decl) {
+		searches++
+		const e = if (d.failed) null else reached(d, e => e == d || !d.mutable && e.mutable, searches)
+		if (e == d) {
+			this.report(d.at.loc, `${this.text(d.at)} depends on itself`)
+		} else if (e != null) {
+			this.report(d.at.loc, `${this.text(d.at)} is a const that depends on a let`)
+		}
+	}
+
+	/// ## Tests and assertions
+	///
+	/// ```grammar
+	/// Test   = "test" (String | Template) Block
+	/// Assert = "assert" Expr ["throws" Expr]
+	/// ```
+	///
+	/// A top-level test is named by a string literal; inside a test's block, outside nested functions, a *subtest* may
+	/// also be named by a template. Running a subtest runs its enclosing tests but skips their other subtests. `assert`
+	/// traps if its `bool` operand is false. Within the operand, nested functions included, `==` and `!=` compare by
+	/// value: arrays and tuples element by element, objects and class instances field by field, a union's members by tag
+	/// and then value, the rest as elsewhere. A value holding itself compares without end, a field of a `T[n]` is an
+	/// error, and `switch` cases match as elsewhere. `assert x throws e` traps unless `x` throws a value of `e`'s type
+	/// that equals `e`, which is evaluated after; a value of another type propagates. Tests and assertions exist only in
+	/// test and debug builds; in other builds they are not compiled, so they shall have no side effects a program relies
+	/// on.
+	///
+	/// ```
+	/// test "patterns" {
+	///   const [a, b] = [1, 2]
+	///   assert a + b == 3
+	///   assert parseInt("x") throws new ParseError("syntax", 0)
+	///   test `sub ${a}` { assert a == 1 }
+	/// }
+	/// ```
+	private test(n: Node) {
+		const f = new Fn(Null)
+		f.tests = true
+		this.testing = true
+		this.expr(n.parts[0], null)
+		this.body(n.parts[1], f)
+	}
+
+	/// # Declarations
+	///
+	/// A declaration is a Var, Function, Class, Interface or TypeAlias (§3), at the top level or in a block (§7).
+	///
+	/// ## Type aliases
+	///
+	/// ```grammar
+	/// TypeAlias = "type" Ident [TypeParams] {Tag} "=" Type
+	/// ```
+	///
+	/// An alias names a type; it introduces no new type, and so shall not refer to itself, as a class may.
+	private decl(n: Node) {
+		const name = operands(n)[0]
+		const ts = tags(n)
+		if (this.locals.level > 0 && ts.length > 0) {
+			this.report(start(ts[0]), "a local declaration has no tags")
+		}
+		switch (n.kind) {
+			case "test": return this.test(n)
+			case "var": return this.variable(n)
+			case "function":
+				const f = this.declared(name, null, false)
+				f.type = this.function(n, f, true, f.decl?.errors ?? null)
+				name.type = f.type
+				const r = f.type.base!
+				if (this.locals.level == 0 && this.text(name.t) == "main" && (f.type.types.length > 0 || r != Null && r != I32)) {
+					this.report(name.t.loc, "main takes no parameters and returns an i32 or nothing")
+				}
+			case "class":
+				const c = this.declared(name, null, true)
+				const ct = c.type ?? this.nominal(n, this.owner!)
+				c.type = ct
+				c.params = ct.params
+				n.type = ct
+				name.type = ct
+				return this.classBody(n, ct)
+			case "type":
+				const t = this.declared(name, null, true)
+				this.locals.enter()
+				const ps = this.paramsOf(n)
+				this.typeParams(n, ps, true)
+				const a = this.typeExpr(n.parts[n.parts.length - 1])
+				this.locals.leave()
+				t.type = a
+				t.params = ps
+				n.type = a
+				name.type = a
+		}
+	}
+
+	/// The binding name declares: the top-level one, else a new local one.
+	private declared(name: Node, t: Type | null, isType: bool): Binding {
+		if (this.locals.level == 0) {
+			return this.top.get(this.text(name.t))!
+		}
+		const b = new Binding(t, false, isType)
+		b.depth = this.depth
+		this.insert(name.t, b)
+		return b
+	}
+
+	private insert(name: Tok, b: Binding) {
+		if (!this.locals.insert(this.text(name), b)) {
+			this.report(name.loc, `${this.text(name)} is declared twice`)
+		}
+	}
+
+	private define(name: Tok, t: Type, mutable: bool) {
+		if (this.locals.level == 0) {
+			this.top.get(this.text(name))!.type = t
+		} else {
+			const b = new Binding(t, mutable, false)
+			b.depth = this.depth
+			this.insert(name, b)
+		}
+	}
+
+	/// ## Variables
+	///
+	/// ```grammar
+	/// Var     = ("let" | "const") Pattern [":" Type] {Tag} ["=" Expr]
+	/// Pattern = Ident | Array | Object
+	/// ```
+	///
+	/// A `const` is assigned once, by its initializer; the referent of a reference stays mutable, unless frozen (§3). A
+	/// `let` without an initializer holds the zero value of its type, which shall have one: 0, false, `""`, `null` for
+	/// a type that includes it, the type `null` for `Type`, or a `T[n]` whose `T` has one or is a class that needs no
+	/// arguments (§5.3), each element then a new `T`. Without a type, a variable takes the type of its initializer,
+	/// with untyped parts widened (§4.1). A name is declared once per scope; a block's declarations are visible from
+	/// their declaration to the end of the block. A variable named by an identifier is in scope in its own initializer,
+	/// but is read there only inside the function literal that is all of it (§3), and only if its type is declared.
+	///
+	/// A pattern destructures: an array pattern takes elements by position, an object pattern takes fields by name,
+	/// `name: pattern` renames or nests, `= Expr` replaces a `null` value (unlike a parameter default, which replaces a
+	/// left-out argument), and `...rest` collects the remaining elements or fields.
+	///
+	/// ```
+	/// const [a, b] = [1, 2]
+	/// const { c, d: e } = { c: 3, d: 4 }
+	/// const [f, ...rest] = [5, 6, 7]
+	/// const { g: [h, i] } = { g: [8, 9] }
+	/// const { s: t = 1, ...u } = obj
+	/// let n: i32        // 0
+	/// let a, b          // error: one name per declaration
+	/// let q: Square     // error: no zero value; write `Square | null`
+	/// const m: i32 = m + 1           // error: m depends on itself
+	/// const loop = () => loop()      // error: loop needs a type to be used in its own initializer
+	/// const g: () => i32 = () => g() // ok
+	/// ```
+	private variable(n: Node) {
+		const ann = after(n, ":")
+		const init = after(n, "=")
+		const declared = if (ann == null) null else this.annotation(ann)
+		const pattern = operands(n)[0]
+		// Declared before its initializer, which a function in it may use (3).
+		const b = if (pattern.kind == "token") this.declared(pattern, declared, false) else null
+		if (b != null) {
+			b.type = declared
+			b.mutable = n.t.kind == "let"
+			b.initializing = if (init?.kind == "arrow") "function" else "value"
+		}
+		if (this.locals.level == 0 && b?.initializing != "function") {
+			this.vars.push(this.owner!)
+		}
+		let t = declared
+		let literal: Type | null = null
+		if (init != null) {
+			const v = this.expr(init, declared)
+			literal = if (n.t.kind == "const" && b != null) this.literal(init, v, declared) else null
+			if (declared != null) {
+				this.fit(v, declared, init)
+				t = literal ?? declared
+			} else {
+				const w = if (n.t.kind == "const" && v.isUntyped() && isConstant(init)) v else v.widen(n.t.kind == "let")
+				this.convert(init, w)
+				t = w
+			}
+		} else if (n.t.kind == "const") {
+			throw this.error(n.t.loc, "a const needs an initializer")
+		} else if (declared != null && !declared.hasZero()) {
+			throw this.error(start(ann!), `${show(declared)} has no zero value`)
+		}
+		if (t == null) {
+			throw this.error(start(pattern), "a variable needs a type or an initializer")
+		}
+		n.type = t
+		if (b != null) {
+			pattern.type = t
+			b.type = t
+			b.literal = literal
+			b.initializing = ""
+		} else {
+			this.bind(pattern, t, n.t.kind == "let")
+		}
+		if (init != null && n.t.kind == "const") {
+			this.generic(pattern, init)
+		}
+	}
+
+	/// The literal type a const initialized by p, of type v, and declared t denotes in a type, where p is an integer or
+	/// string constant (4.2): of its value in t, else in v's base or `i32`; else null.
+	private literal(p: Node, v: Type, t: Type | null): Type | null {
+		const n = if (v == UntypedInt) this.constant(p) else null
+		const text = if (n != null) decimal(n!) else if (v.kind == "literal") v.text else null
+		const base = t ?? (if (n != null) I32 else v.base)
+		return if (text != null && (base?.kind == "int" || base?.kind == "string")) Type.literal(text!, base!) else null
+	}
+
+	/// Binds the names of pattern p to the parts of a value of t. A prop without a pattern binds its key.
+	private bind(p: Node, t: Type, mutable: bool) {
+		p.type = t
+		if (p.kind == "token" || p.kind == "prop") {
+			return this.define(p.t, t, mutable)
+		}
+		for (const i of 0 ... p.parts.length - 1) {
+			const q = p.parts[i]
+			if (p.kind == "array") {
+				const e = element(t, i)
+				if (e == null) {
+					throw this.error(start(p), `cannot destructure ${show(t)} into ${i + 1} elements`)
+				}
+				if (q.kind == "unary") {
+					this.bind(q.parts[0], Type.array(e), mutable)
+				} else if (q.kind == "binary") {
+					this.bindPart(q.parts[0], e, q.parts[1], mutable)
+				} else {
+					this.bind(q, e, mutable)
+				}
+			} else if (q.kind == "unary") {
+				this.bind(q.parts[0], this.rest(t, p), mutable)
+			} else {
+				const m = this.member(t, q.t)
+				q.type = m
+				this.bindPart(after(q, ":") ?? q, m, after(q, "="), mutable)
+			}
+		}
+	}
+
+	/// The fields of object t that object pattern p leaves to its rest.
+	private rest(t: Type, p: Node): Type {
+		const fs: Field[] = []
+		for (const f of fields(t)) {
+			let named = false
+			for (const q of p.parts) {
+				named = named || q.kind != "unary" && this.key(q.t) == f.name
+			}
+			if (!named) {
+				fs.push(f)
+			}
+		}
+		return Type.object(fs)
+	}
+
+	/// Binds a pattern's part, whose default, if any, replaces null.
+	private bindPart(p: Node, t: Type, def: Node | null, mutable: bool) {
+		if (def == null) {
+			return this.bind(p, t, mutable)
+		}
+		const v = t.nonNull()
+		this.fit(this.expr(def, v), v, def)
+		this.bind(p, v, mutable)
+	}
+
+	/// Checks a function or method, with its body if bodies, and returns its type. Without a result type, a
+	/// function returns what its body returns, a method null.
+	///
+	/// ## Functions
+	///
+	/// ```grammar
+	/// Function = "function" Ident [TypeParams] Params [":" Type] [Throws] {Tag} Block
+	/// Params   = "(" [Param {"," Param} [","]] ")"
+	/// Param    = ["..."] Pattern [":" Type] ["=" Expr]
+	/// Throws   = "throws" ["|"] Ident {"|" Ident}
+	/// ```
+	///
+	/// Without a result type a function returns what its body returns; a function that calls itself shall state its
+	/// type. A default is evaluated by the callee when the argument is left out, each call. A rest parameter is of an
+	/// array type and takes the remaining arguments as one. A nested function is a closure over the enclosing locals,
+	/// which it shares by reference.
+	///
+	/// ```
+	/// function sum(...xs: i32[]): i32 { let s = 0; for (const x of xs) { s += x }; return s }
+	/// function add(a: i32, b: i32 = 5): i32 { return a + b }
+	/// sum()  sum(1, ...[2, 3])  add(1) == 6
+	/// function f(n: i32) { return f(n) }   // error: result type needed
+	/// function g(...xs: i32) {}            // error: a rest param is an array
+	/// ```
+	private function(n: Node, b: Binding | null, bodies: bool, errors: Errors | null = null, builds: Type | null = null): Type {
+		const paths = this.open()
+		const ps = this.paramsOf(n)
+		this.typeParams(n, ps, true)
+		const listed = after(n, "throws")
+		if (errors != null && listed != null) {
+			errors.types = this.annotation(listed).alternatives()
+			errors.listed = true
+		}
+		const params = child(n, "params")!
+		const sig = this.params(params, null)
+		const ann = after(n, ":")
+		const body = bodyOf(n)
+		const result = if (ann != null) this.annotation(ann) else if (n.kind == "method" || body == null) Null else null
+		if (result != null && b != null) {
+			b.type = returning(sig, result, ps)
+		}
+		const f = new Fn(result)
+		f.errors = errors
+		f.builds = builds
+		if (bodies && body != null && errors != null) {
+			this.throwing.push(errors)
+		}
+		const t = returning(sig, if (bodies && body != null) this.body(body, f) else result, ps)
+		this.close(paths)
+		if (contains(t.types, Empty)) {
+			throw new Failed()
+		}
+		params.type = t
+		n.type = t
+		return t
+	}
+
+	/// Binds params n, typed by their annotations, else by want's params, else by their defaults, and returns
+	/// the function type they make, without its result. A param that fails is Empty, and fails where used.
+	private params(n: Node, want: Type | null): Type {
+		const types: Type[] = []
+		let required = 0
+		let rest = false
+		for (const i of 0 ... n.parts.length - 1) {
+			const p = n.parts[i]
+			const name = if (p.parts[0].kind == "unary") p.parts[0].parts[0] else p.parts[0]
+			rest = p.parts[0].kind == "unary"
+			if (!rest && after(p, "=") == null) {
+				required = i + 1
+			}
+			let pt = Empty
+			const typed = this.apart(() => { pt = this.param(p, i, want) })
+			p.type = pt
+			types.push(pt)
+			if (typed) {
+				this.bind(name, pt, true)
+			} else {
+				this.failNames(name)
+			}
+		}
+		const t = Type.function(types, null, required, rest)
+		n.type = t
+		return t
+	}
+
+	private param(p: Node, i: i32, want: Type | null): Type {
+		const ann = after(p, ":")
+		const init = after(p, "=")
+		const rest = p.parts[0].kind == "unary"
+		let pt = if (ann != null) this.annotation(ann) else if (want == null) null
+			else if (rest && want.rest) want.types[want.types.length - 1] else element(want, i)
+		if (init != null) {
+			const v = this.expr(init, pt)
+			if (pt == null) {
+				pt = v.widen(true)
+			} else {
+				this.fit(v, pt, init)
+			}
+		}
+		if (pt == null) {
+			throw this.error(start(p), "a param needs a type")
+		}
+		if (rest && pt.kind != "array") {
+			throw this.error(start(p), `a rest param is an array, got ${show(pt)}`)
+		}
+		return pt
+	}
+
+	/// The type params n declares, without their constraints and defaults yet.
+	private paramsOf(n: Node): Type[] {
+		const ps: Type[] = []
+		const tp = child(n, "typeParams")
+		for (const p of if (tp == null) [] else tp.parts) {
+			const t = new Type("param")
+			names.set(t, this.text(p.t).copy())
+			ps.push(t)
+		}
+		return ps
+	}
+
+	/// Binds the type params ps of n, and if bounds gives them their constraints and defaults (4.9).
+	private typeParams(n: Node, ps: Type[], bounds: bool) {
+		const tp = child(n, "typeParams")
+		for (const i of 0 ... ps.length - 1) {
+			const p = tp!.parts[i]
+			const t = ps[i]
+			p.type = t
+			this.insert(p.t, new Binding(t, false, true))
+			const c = after(p, "extends")
+			const d = after(p, "=")
+			if (bounds && c != null) {
+				const ct = this.typeExpr(c)
+				t.base = ct
+				if (ct.kind == "union") {
+					this.report(start(c), "a constraint is not a union; name a type set")
+				}
+			}
+			if (bounds && d != null) {
+				this.defaulting = true
+				try {
+					t.fallback = this.typeExpr(d)
+				} finally {
+					this.defaulting = false
+				}
+			}
+		}
+	}
+
+	/// Checks a function's body, and returns its result type.
+	private body(n: Node, f: Fn): Type {
+		const outer = this.fn
+		const result = f.result
+		const mark = this.undo.length
+		this.fn = f
+		const open = this.block(n)
+		this.restore(mark)
+		if (f.failed && result == null) {
+			this.fn = outer
+			throw new Failed()
+		}
+		if (open) {
+			if (result == null) {
+				f.returns.push(Null)
+			} else if (!Null.fits(result)) {
+				this.report(n.t.loc, `missing return of ${show(result)}`)
+			}
+		}
+		this.fn = outer
+		if (result != null || f.returns.length == 0) {
+			return result ?? Null
+		}
+		let t = f.returns[0]
+		for (const r of f.returns) {
+			t = this.joined(t, r, null, n.t.loc)
+		}
+		return t
+	}
+
+	/// Fills in the members of class or interface t declared by n, in order, then checks the initializers, which
+	/// may refer to them.
+	///
+	/// ## Classes and interfaces
+	///
+	/// ```grammar
+	/// Class     = "class" Ident [TypeParams] ["implements" Type] {Tag} Object
+	/// Interface = "interface" Ident [TypeParams] ["extends" Type] {Tag} Object
+	/// Object    = "{" [Prop {Sep Prop} [Sep]] "}"
+	/// Prop      = "..." Expr
+	///           | {"static" | "private"} ["readonly"] Key [":" ["..."] Type] {Tag} ["=" Expr]
+	///           | {"static" | "private"} Key [TypeParams] Params [":" Type] [Throws] {Tag} [Block]
+	/// Tag       = "@" Type
+	/// Key       = Ident | String | Int | keyword
+	/// Sep       = "," | Term
+	/// ```
+	///
+	/// A class body declares fields and methods. A field has a type, an initializer, or both; without an initializer
+	/// its type shall have a zero value (§5.1) or be embedded. A method without a result type returns `null`; a method
+	/// without a body is allowed only in an interface. Members are instance members unless `static`, which belong to
+	/// the class and are reached as `C.m`; a static field is a top-level variable (§3), one per instantiation, a
+	/// `const` if `readonly` and a `let` otherwise. `private` members are visible only inside the class body. Instance
+	/// `readonly` fields are assigned only by their initializer or on `this` in the class's `constructor`, not in its
+	/// closures. Methods see the instance as `this`; static methods have no `this`. Methods cannot capture locals of an
+	/// enclosing function.
+	///
+	/// An interface may declare static methods. A type fits such an interface when it has each static method with a
+	/// fitting function type; a value never does. A type parameter constrained by it reaches those statics through its
+	/// name, as `H.hash(k)`, which each instantiation resolves to the argument's. A class with only static members is
+	/// never instantiated: `new` on it is an error.
+	///
+	/// ```
+	/// interface Hasher[K] {
+	///   static hash(k: K): u64
+	///   static eq(a: K, b: K): bool
+	/// }
+	/// class Caseless {
+	///   static hash(k: string): u64 { return fnv(lower(k)) }
+	///   static eq(a: string, b: string): bool { return lower(a) == lower(b) }
+	/// }
+	/// class HashMap[K, V, H extends Hasher[K] = Auto[K]] { … H.hash(k) … }
+	/// new HashMap[string, i32, Caseless]()
+	/// new Caseless()                       // error: Caseless has only statics
+	/// ```
+	///
+	/// A *tag* attaches a type to a declaration or member; a class's, interface's or member's tags are data for
+	/// reflection (§4.11). A tag is checked as a type and never evaluated; a library declares an empty generic class and
+	/// its type arguments carry the payload. A declaration or member may have any number of tags. A use of one tagged
+	/// `@Deprecated` or `@Experimental` (builtin/tag.bob) from another module is a warning.
+	///
+	/// ```
+	/// class Build {
+	///   /// parallel jobs
+	///   jobs: i32 | null @argv.Short["j"]
+	///   verbose: bool @argv.Short["v" | "V"] @json.Skip
+	/// }
+	/// function parseOld(s: string): i32 @Deprecated[{ use: typeof parseInt, why: "it ignores signs" }] { … }
+	/// ```
+	///
+	/// `new C(args)` allocates an instance, sets every field to its zero value, runs the initializers in declaration
+	/// order with `this` bound, then calls the method named `constructor` with `args` if the class declares one. A
+	/// class without one takes no arguments.
+	///
+	/// A field `a: ...T` in a class body *embeds* the class `T`: the instance holds the fields of a `T` in place, laid
+	/// out as a struct of `T`'s size and alignment, not a reference to them. At the field's position, `new` runs `T`'s
+	/// initializers and constructor on it in place, so `T` shall need no arguments: its constructor's params, if any,
+	/// all have defaults. `x.a` is a reference to the `T` inside `x`, which keeps `x` alive. The field's initializer,
+	/// and a value assigned to `x.a`, shall be an object literal: a new `T` takes its fields and is copied into place,
+	/// so `x.a = {...v}` copies `v` and `x.a = v` is an error. A class shall not hold itself in place, directly or
+	/// through embeds or `T[n]` fields. `...T` alone is the field `T: ...T`, whose members are also reachable directly
+	/// on the class and run on the embedded value; the class's own members win over embedded ones.
+	///
+	/// A class shall have every member of the type it `implements`, an interface embedding several for several. An
+	/// interface has the members of the type it `extends`, then its own. An interface that extends a union declares no
+	/// members and is a type set (§4.9).
+	///
+	/// ```
+	/// interface Shape { name: string; area(): f64 }
+	/// class Square implements Shape {
+	///   name = "square"
+	///   side: f64 = 1.0
+	///   private static count = 0          // a let: one per isolate
+	///   area(): f64 { return this.side * this.side }
+	///   constructor(side: f64) { this.side = side; Square.count += 1 }
+	/// }
+	/// class A { a: i32 }
+	/// class B { a: ...A, b: i32 }                   // a.a at offset 0, b at 4, no reference
+	/// const x = new B(); x.a.a = 1                  // x.a is the A inside x
+	/// x.a = {...new A()}                            // copies a fresh A into x
+	/// x.a = new A()                                 // error: write {...new A()}
+	/// class L { ...A; label = "" }                  // new L().a reads .A.a
+	/// class M { m: M }                              // error: no zero value
+	/// class N { next: N | null = null }             // a reference, so N may hold an N
+	/// class R { r: ...R }                           // error: embeds itself
+	/// class S { s: S[1] }                           // error: holds itself in place
+	/// class K { static n = 0; static readonly m = K.n }  // error: a const depends on a let (§3)
+	/// class P {}; class Q {}; const p: P = new Q()  // error: classes are nominal
+	/// class C extends A {}                          // error: no inheritance
+	/// ```
+	private fill(t: Type, n: Node) {
+		this.locals.enter()
+		this.typeParams(n, t.params, true)
+		this.apart(() => this.tagged(n))
+		const set: Type[] = []
+		for (const s of if (t.kind == "interface") supers(n) else []) {
+			const st = this.typeExpr(s)
+			if (st.kind == "object" || st.kind == "class" || st.kind == "interface" && !isSet(st)) {
+				t.fields.push(...members(st))
+				continue
+			}
+			for (const m of st.alternatives()) {
+				// One being filled has no set yet.
+				if (m == t || m.kind == "interface" && members(m).length == 0 && !isSet(m)) {
+					this.report(start(s), "a type set holds itself only in an array or tuple")
+				} else {
+					set.push(...(if (isSet(m)) m.base!.alternatives() else [m]))
+				}
+			}
+		}
+		if (set.length > 0) {
+			t.base = Type.union(set)
+		}
+		this.host = t
+		const ms = child(n, "members")!.parts
+		let constructs = false
+		for (const m of ms) {
+			constructs = constructs || m.kind == "method" && this.key(m.t) == "constructor"
+		}
+		const fields: Field[] = []
+		const inits: Node[] = []
+		for (const m of ms) {
+			const f = new Field(this.key(m.t).copy(), Empty, false, has(m, "static"))
+			this.apart(() => this.tagged(m))
+			let state: "typed" | "pending" | "failed" = "failed"
+			this.apart(() => { state = this.declareMember(m, f, t, constructs) })
+			const a = about(t, f.name, f.static)
+			a.hidden = has(m, "private")
+			a.readonly = has(m, "readonly")
+			a.errors.listed = isTok(n.parts[0], "export") && !a.hidden
+			a.warning = this.warning(m)
+			a.state = state
+			if (t.kind == "class" && this.wall < 0 && (f.static || m.kind == "method") && f.name != "constructor") {
+				a.decl = new Decl(m, m.t)
+				a.decl!.mutable = m.kind != "method" && !has(m, "readonly")
+			}
+			if (t.fields.some(e => e.name == f.name && e.static == f.static)) {
+				this.report(m.t.loc, `${f.name} is declared twice`)
+			}
+			t.fields.push(f)
+			m.type = f.type
+			if (after(m, "=") != null && state != "failed") {
+				fields.push(f)
+				inits.push(m)
+			}
+		}
+		const user = this.user
+		for (const i of 0 ... inits.length - 1) {
+			const a = about(t, fields[i].name, fields[i].static)
+			if (a.decl != null && after(inits[i], "=")!.kind != "arrow") {
+				this.vars.push(a.decl!)
+			}
+			this.user = a.decl ?? user
+			const ok = this.apart(() => this.initializer(inits[i], fields[i], t))
+			a.state = if (ok) "typed" else "failed"
+		}
+		this.user = user
+		this.locals.leave()
+	}
+
+	/// Types the tags of declaration or member n.
+	private tagged(n: Node) {
+		n.tags = tags(n).map(e => this.typeExpr(e))
+	}
+
+	/// What a use of n from another module is warned of, by its typed tags.
+	private warning(n: Node): Warning | null {
+		const es = tags(n)
+		const ts = n.tags ?? []
+		for (const i of 0 ... ts.length - 1) {
+			const t = ts[i]
+			if (t == tagTypes.get("Experimental")) {
+				return new Warning("experimental", this.m.path)
+			}
+			if (t.generic != null && t.generic == tagTypes.get("Deprecated")) {
+				const e = if (es[i].kind == "index") es[i].parts[1] else null
+				return new Warning(`deprecated${this.deprecation(e)}`, this.m.path)
+			}
+		}
+		return null
+	}
+
+	/// What @Deprecated adds to "deprecated", by its type argument e as written: ": why", "; use x", both, or none.
+	private deprecation(e: Node | null): string {
+		if (e == null || isTok(e, "string")) {
+			const why = if (e == null) "" else this.key(e.t)
+			return if (why == "") "" else `: ${why}`
+		}
+		const bad = "@Deprecated takes a string, or { use: T, why: string }"
+		let why = ""
+		let use = ""
+		for (const m of if (e.kind == "object") e.parts else []) {
+			const a = after(m, ":")!
+			const k = this.key(m.t)
+			if (k == "why" && isTok(a, "string")) {
+				why = `: ${this.key(a.t)}`
+			} else if (k == "use") {
+				use = `; use ${this.source(if (a.kind == "unary" && a.t.kind == "typeof") a.parts[0] else a)}`
+			} else {
+				this.report(start(e), bad)
+				return ""
+			}
+		}
+		if (why == "" && use == "") {
+			this.report(start(e), bad)
+		}
+		return why + use
+	}
+
+	/// Reports a warning of w at a use of name, unless it is in w's module.
+	private warn(w: Warning | null, at: Loc, name: string) {
+		if (w != null && w.path != this.m.path) {
+			this.report(at, `${name} is ${w.msg}`, true)
+		}
+	}
+
+	/// Types member m of class or interface t as field f, but where its initializer is to give it its type: then it is
+	/// pending.
+	private declareMember(m: Node, f: Field, t: Type, constructs: bool): "typed" | "pending" {
+		const ann = after(m, ":")
+		if (m.kind == "unary") {
+			f.type = this.typeExpr(m.parts[0])
+			f.name = nameOf(f.type.generic ?? f.type) ?? ""
+			f.embedded = true
+		} else if (m.kind == "method") {
+			if (t.kind == "class" && bodyOf(m) == null) {
+				this.report(m.t.loc, "a class's method needs a body")
+			}
+			f.type = this.function(m, null, false)
+		} else if (ann != null) {
+			f.embedded = ann.kind == "unary"
+			f.type = if (f.embedded) this.typeExpr(ann) else this.annotation(ann)
+			if (!f.embedded && after(m, "=") == null && !f.type.hasZero() && !constructs && t.kind == "class") {
+				this.report(m.t.loc, `${show(f.type)} has no zero value`)
+			}
+		} else if (after(m, "=") == null) {
+			throw this.error(m.t.loc, "a field needs a type or an initializer")
+		} else {
+			return "pending"
+		}
+		if (f.embedded) {
+			this.runs(f.type, "constructor", false)
+		}
+		const c = if (f.embedded) f.type.member("constructor") else null
+		if (c != null && c.kind == "function" && c.n > 0) {
+			this.report(m.t.loc, `${show(f.type)} takes constructor arguments, which an embedded one is not given`)
+		}
+		return "typed"
+	}
+
+	/// Checks the initializer of member m, typing field f by it where m has no type.
+	private initializer(m: Node, f: Field, t: Type) {
+		const init = after(m, "=")!
+		const want = if (f.embedded) embedding(f.type) else if (after(m, ":") == null) null else f.type
+		this.self = if (has(m, "static")) null else selfOf(t)
+		const v = this.expr(init, want)
+		if (want == null) {
+			f.type = v.widen(true)
+			m.type = f.type
+			this.convert(init, f.type)
+		} else {
+			this.fit(v, want, init)
+		}
+	}
+
+	/// Checks what a class's type leaves out: that it implements its interfaces, and its methods' bodies.
+	private classBody(n: Node, t: Type) {
+		members(t)
+		if (t.kind == "class") {
+			for (const s of supers(n)) {
+				this.apart(() => {
+					const i = this.typeExpr(s)
+					if (!t.fits(i) && !failed(i)) {
+						this.report(start(s), `${show(t)} does not implement ${show(i)}`)
+					}
+				})
+			}
+		}
+		const self = this.self
+		const host = this.host
+		const wall = this.wall
+		this.host = t
+		this.wall = if (this.locals.level > 0) this.depth else -1
+		const user = this.user
+		this.locals.enter()
+		this.typeParams(n, t.params, false)
+		for (const m of child(n, "members")!.parts) {
+			if (m.kind == "method") {
+				const static = has(m, "static")
+				const a = about(t, this.key(m.t), static)
+				this.self = if (static) null else selfOf(t)
+				this.user = a.decl ?? user
+				const builds = if (!static && this.key(m.t) == "constructor") t else null
+				this.apart(() => { this.function(m, null, true, a.errors, builds) })
+			}
+		}
+		this.user = user
+		this.locals.leave()
+		this.self = self
+		this.host = host
+		this.wall = wall
+	}
+
+	/// Checks the statements of a block, and returns whether its end is reachable.
+	private block(n: Node): bool {
+		this.locals.enter()
+		let open = true
+		let reported = false
+		let i = 0
+		while (i < n.parts.length) {
+			const p = n.parts[i]
+			if (!open && !reported) {
+				this.report(start(p), "unreachable", true)
+				reported = true
+			}
+			this.guard(n, i)
+			open = this.stmt(p) && open
+			i++
+		}
+		this.locals.leave()
+		return open
+	}
+
+	/// Makes the statements after the ith of block n its else where it is a static if (4.11) without one whose block
+	/// ends in a jump, so that an instantiation taking the if compiles none of them.
+	private guard(n: Node, i: i32) {
+		const p = n.parts[i]
+		if (p.kind != "if" || i + 1 == n.parts.length || after(p, "else") != null || !this.dependent(p.parts[0])) {
+			return
+		}
+		const body = p.parts[1].parts
+		const last = if (body.length == 0) null else body[body.length - 1]
+		if (last == null || last.kind != "jump" || last.t.kind == "assert") {
+			return
+		}
+		const rest = new Node("block", n.parts[i + 1].t)
+		rest.parts = n.parts.slice(i + 1, n.parts.length)
+		p.parts.push(new Node("token", new Tok("else", last.t.loc)))
+		p.parts.push(rest)
+		n.parts = n.parts.slice(0, i + 1)
+	}
+
+	/// Checks a statement, and returns whether its end is reachable. Where it fails, the names it declares fail where
+	/// used, and its end is reachable unless it was to jump.
+	private stmt(p: Node): bool {
+		let open = true
+		if (this.apart(() => { open = this.statement(p) })) {
+			return open
+		}
+		this.fail(p)
+		return p.kind != "jump" || p.t.kind == "assert"
+	}
+
+	/// Declares the names statement p declares as ones that fail where used.
+	private fail(p: Node) {
+		if (p.kind == "var" || p.kind == "function" || p.kind == "class" || p.kind == "type") {
+			this.failNames(operands(p)[0])
+		}
+	}
+
+	/// Binds the names of pattern as failing where used, also those bound already in this scope.
+	private failNames(pattern: Node) {
+		for (const t of patternNames(pattern)) {
+			const b = new Binding(null, false, false)
+			b.failed = true
+			if (!this.locals.insert(this.text(t.t), b)) {
+				this.locals.get(this.text(t.t))!.failed = true
+			}
+		}
+	}
+
+	/// Binds pattern p to the type f gives, or where f fails, as failing where used.
+	private bindBy(p: Node, f: () => Type, mutable: bool) {
+		if (!this.apart(() => this.bind(p, f(), mutable))) {
+			this.failNames(p)
+		}
+	}
+
+	/// What condition p narrows, or nothing where it fails.
+	private facts(p: Node): Facts {
+		let f = new Facts([], [])
+		this.apart(() => { f = this.cond(p) })
+		return f
+	}
+
+	/// Runs f, and returns whether it did not fail. A failure ends f, but not what it is a part of; it marks the
+	/// declaration and function being checked.
+	private apart(f: () => void): bool {
+		const depth = this.depth
+		const paths = this.paths
+		const level = this.locals.level
+		const mark = this.undo.length
+		try {
+			f()
+			return true
+		} catch (e: Failed) {
+			this.depth = depth
+			this.paths = paths
+			while (this.locals.level > level) {
+				this.locals.leave()
+			}
+			this.restore(mark)
+			if (this.fn != null) {
+				this.fn!.failed = true
+			}
+			if (this.owner != null) {
+				this.owner!.failed = true
+			}
+			return false
+		}
+	}
+
+	private statement(p: Node): bool {
+		switch (p.kind) {
+			case "var", "function", "class", "type": this.decl(p)
+			case "block": return this.block(p)
+			case "assign": this.assign(p)
+			case "if": return this.ifStmt(p)
+			case "while":
+				this.forget(p.parts[1])
+				const broke = this.loop(p.parts[1], this.facts(p.parts[0]).yes)
+				return broke || !isTok(p.parts[0], "true")
+			case "for":
+				this.locals.enter()
+				this.bindBy(p.parts[1], () => this.iterated(p.parts[2]), isTok(p.parts[0], "let"))
+				this.forget(p.parts[3])
+				this.generic(p.parts[1], p.parts[2])
+				this.loop(p.parts[3], [])
+				this.locals.leave()
+			case "switch":
+				const mark = this.undo.length
+				const ends: Narrowing[][] = []
+				this.cases(p, (b: Node, at: Tok) => {
+					const f = this.fn!
+					const cased = f.cased
+					f.cased = true
+					if (this.block(b)) {
+						ends.push(this.since(mark))
+					}
+					f.cased = cased
+				})
+				if (!p.parts.some(c => c.t.kind == "default")) {
+					ends.push([])
+				}
+				this.merge(ends)
+				return ends.length > 0
+			case "try": return this.tryStmt(p)
+			case "jump": return this.jump(p)
+			case "test":
+				const f = this.fn
+				if (f == null || !f.tests) {
+					this.report(p.t.loc, "a test is only at the top level or in a test")
+				}
+				this.expr(p.parts[0], null)
+				this.forget(p.parts[1])
+				const mark = this.undo.length
+				this.block(p.parts[1])
+				this.restore(mark)
+			default: this.value(p)
+		}
+		return true
+	}
+
+	/// ## if, while
+	///
+	/// The condition is a `bool`; branches and bodies are blocks, not bare statements.
+	private ifStmt(n: Node): bool {
+		const f = this.facts(n.parts[0])
+		const mark = this.undo.length
+		const ends: Narrowing[][] = []
+		this.narrow(f.yes)
+		if (this.block(n.parts[1])) {
+			ends.push(this.since(mark))
+		}
+		this.restore(mark)
+		this.narrow(f.no)
+		const e = after(n, "else")
+		if (e == null || this.stmt(e)) {
+			ends.push(this.since(mark))
+		}
+		this.restore(mark)
+		this.merge(ends)
+		return ends.length > 0
+	}
+
+	/// What the bindings narrowed or assigned since mark are narrowed to now.
+	private since(mark: i32): Narrowing[] {
+		const ns: Narrowing[] = []
+		for (const u of this.undo.slice(mark, this.undo.length)) {
+			if (!u.b.isType) {
+				ns.push(new Narrowing(u.b, u.b.narrowed))
+			}
+		}
+		return ns
+	}
+
+	/// Narrows each binding in some of the ends of the flows that join here to what it may be at any of them.
+	private merge(ends: Narrowing[][]) {
+		const ns: Narrowing[] = []
+		for (const end of ends) {
+			for (const n of end) {
+				const d = n.b.type
+				if (d == null || ns.some(m => m.b == n.b)) {
+					continue
+				}
+				const ts: Type[] = []
+				for (const other of ends) {
+					const m = other.find(o => o.b == n.b)
+					ts.push((if (m == null) n.b.narrowed else m.type) ?? d)
+				}
+				const u = Type.union(ts)
+				ns.push(new Narrowing(n.b, if (u == d) null else u))
+			}
+		}
+		this.narrow(ns)
+	}
+
+	/// Narrows to none the variables assigned in n, as a loop or try may get to any part of it after another.
+	private forget(n: Node) {
+		if (n.kind == "assign") {
+			this.clobber(n.parts[0])
+			for (const b of this.places(n.parts[0])) {
+				this.narrow([new Narrowing(b, null)])
+			}
+		}
+		this.locals.enter()
+		if (n.kind == "for") {
+			this.failNames(n.parts[1])
+		}
+		for (const p of n.parts) {
+			this.forget(p)
+			if (n.kind == "block") {
+				this.fail(p)
+			}
+		}
+		this.locals.leave()
+	}
+
+	/// Checks a loop's body narrowed by ns, and returns whether a break leaves it. What the body narrows holds only in
+	/// it, as it may run again or not at all.
+	private loop(n: Node, ns: Narrowing[]): bool {
+		const f = this.fn!
+		const inLoop = f.inLoop
+		const cased = f.cased
+		const broke = f.broke
+		f.inLoop = true
+		f.cased = false
+		f.broke = false
+		const mark = this.undo.length
+		this.narrow(ns)
+		this.block(n)
+		this.restore(mark)
+		const left = f.broke
+		f.inLoop = inLoop
+		f.cased = cased
+		f.broke = broke
+		return left
+	}
+
+	/// The type a for binds to each item of p.
+	///
+	/// ## for
+	///
+	/// `for (const x of a ... b)` binds `x` to each integer from `a` to `b` inclusive, none if `b < a`; `a` and `b` are
+	/// evaluated once and have one integer type, `i32` if both are untyped, which `x` takes. `for (const x of xs)`
+	/// iterates the elements of an array, fixed array or tuple, or the code units of a string (§4.3), in order,
+	/// unrolled if `xs` is a static array or tuple (§4.11). The pattern is destructured each iteration; with `let` it
+	/// is assignable.
+	///
+	/// ```
+	/// for (const i of 1 ... 4) { s += i }           // 10
+	/// for (const _ of 4 ... 1) { }                  // never
+	/// for (const [a, b] of [[1, 2], [3, 4]]) { }
+	/// for (const c of "hi") { }                     // c: u8, 104 then 105
+	/// for (let i = 0; i < 3; i++) { }               // error
+	/// ```
+	private iterated(p: Node): Type {
+		if (p.kind == "binary" && p.t.kind == "...") {
+			const a = this.expr(p.parts[0], null)
+			const b = this.expr(p.parts[1], null)
+			const t = if (a.isUntyped() && b.isUntyped()) I32 else this.common(a, b, null, p.t)
+			if (!t.isInt()) {
+				throw this.error(p.t.loc, `expected integers, got ${show(t)}`)
+			}
+			this.convert(p.parts[0], t)
+			this.convert(p.parts[1], t)
+			p.type = t
+			return t
+		}
+		const t = this.value(p)
+		const es: Type[] = []
+		for (const m of bases(opened(t)).alternatives()) {
+			switch (m.kind) {
+				case "array", "fixed": es.push(element(m, 0)!)
+				case "string": es.push(U8)
+				case "tuple": es.push(...m.types)
+				default: throw this.error(start(p), `cannot iterate ${show(t)}`)
+			}
+		}
+		return Type.union(es)
+	}
+
+	/// Checks a switch's subject and case labels, then each case's body narrowed by its type and literal labels, and
+	/// returns whether its cases cover every value of the subject: with a default, or labels naming each member.
+	///
+	/// ## switch
+	///
+	/// The subject is evaluated once. A label is a constant, equal to the subject with `==`, or an inclusive range
+	/// `lo ... hi` of integer constants, or a type, matching a union, object or interface subject as `instanceof` does
+	/// (§6.5), or equal to a `Type` subject. The body of the first matching case runs, else `default`'s if present.
+	/// Cases do not fall through, each has at least one statement, and `break` is not allowed inside a case, even
+	/// within a loop; `continue` is.
+	///
+	/// ```
+	/// switch (c) {
+	///   case 1: s = 10
+	///   case 2, 3:
+	///     s += 1
+	///     s += 1
+	///   default: s = -1
+	/// }
+	/// switch (a) { case 1 | 2: g() }    // error: not a constant; write 1, 2
+	/// switch (v) { case string: n = v.length; case i32: n = v }
+	/// ```
+	private cases(n: Node, body: (p: Node, at: Tok) => void): bool {
+		const s = n.parts[0]
+		let subject: Type | null = null
+		this.apart(() => { subject = this.expr(s, null) })
+		const b = this.place(s)
+		const k = this.kindOf(s)
+		let all = false
+		const named: Type[] = []
+		for (const c of n.parts.slice(1, n.parts.length)) {
+			all = all || c.t.kind == "default"
+			const labels = c.parts.slice(0, c.parts.length - 1)
+			const types: Type[] = []
+			for (const l of if (subject == null) [] else labels) {
+				this.apart(() => this.label(l, subject!, types))
+			}
+			named.push(...types)
+			const mark = this.undo.length
+			if (b != null && types.length > 0) {
+				this.narrow([new Narrowing(b, Type.union(types))])
+			}
+			const kt = if (k == null || labels.length == 0) null else this.byKind(k.type!, labels)
+			if (kt != null) {
+				this.narrow([new Narrowing(k!, kt)])
+			}
+			const d = if (labels.length == 0) null else this.discriminated(s, labels)
+			if (d != null) {
+				this.narrow(d.yes)
+			}
+			body(c.parts[c.parts.length - 1], c.t)
+			this.restore(mark)
+		}
+		return all || subject != null && subject!.alternatives().every(m => contains(named, m))
+	}
+
+	/// Whether p is static and its value depends on a type param (4.11).
+	private dependent(p: Node): bool {
+		switch (p.kind) {
+			case "token":
+				const b = if (p.t.kind == "ident") this.find(this.text(p.t)) else null
+				return b != null && (b.generic || b.isType && b.type?.kind == "param")
+			case "unary":
+				if (p.t.kind != "typeof") {
+					return p.t.kind == "!" && this.dependent(p.parts[0])
+				}
+				// A binding's type, as guard asks before the operand is checked.
+				const x = p.parts[0]
+				const b = if (isTok(x, "ident")) this.find(this.text(x.t)) else null
+				return (b?.type ?? x.type)?.kind == "param"
+			case "member", "index", "paren": return this.dependent(p.parts[0])
+			case "binary":
+				const op = p.t.kind
+				return (op == "==" || op == "!=" || op == "&&" || op == "||")
+					&& (this.dependent(p.parts[0]) || this.dependent(p.parts[1]))
+		}
+		return false
+	}
+
+	/// Marks the names pattern binds as depending on a type param where the value of p does. A type such a name holds
+	/// that is known only per instantiation stands for a param of its own: each of `T.members` for one of T's, and the
+	/// type of each of `T.fields` for one of T's fields' (4.11).
+	private generic(pattern: Node, p: Node) {
+		if (pattern.kind == "token" && this.dependent(p)) {
+			const b = this.locals.get(this.text(pattern.t))!
+			b.generic = true
+			const of = if (p.kind == "member") standsFor(p.parts[0].type!) else null
+			const t = b.type!
+			const f = t.member("type")
+			if (of?.kind == "param" && (t == Meta || f == Meta)) {
+				// Its own, not made once, as each binding's stands for another type.
+				const member = this.text(p.parts[1].t)
+				const d: Type = { ...new Type("param"), text: member, params: [of!], base: partOf(of!, member) }
+				names.set(d, this.text(pattern.t))
+				b.type = if (t == Meta) meta(d) else Type.object(t.fields.map(x => new Field(x.name, if (x.name == "type") meta(d) else x.type)))
+				pattern.type = b.type
+			}
+		}
+	}
+
+	/// Checks a case label against the subject's type, adding to types the type it names, if it is one, or the member of
+	/// the subject's it is the one value of, a literal or null.
+	private label(p: Node, subject: Type, types: Type[]) {
+		if (p.kind == "binary" && p.t.kind == "...") {
+			for (const q of p.parts) {
+				this.fit(this.expr(q, subject), subject, q)
+			}
+		} else if (this.isType(p)) {
+			const t = this.typeExpr(p)
+			if (!this.narrows(subject, t)) {
+				throw this.error(start(p), `${show(subject)} is never ${show(t)}`)
+			}
+			types.push(t)
+		} else {
+			const v = this.expr(p, subject)
+			if (v.join(subject) == null) {
+				throw this.error(start(p), `expected ${show(subject)}, got ${show(v)}`)
+			}
+			if ((v.kind == "literal" || v == Null) && contains(subject.alternatives(), v)) {
+				types.push(v)
+			}
+		}
+	}
+
+	/// Checks a try, whose catches and finally may run after any part of its body, so that what the body narrows holds
+	/// only in it, and what it assigns is narrowed to nothing after.
+	///
+	/// ## try, throw
+	///
+	/// Any value may be thrown; it carries its static type, or its tag if that is a union. `catch (p: T)` handles a
+	/// thrown value whose carried type fits `T` and binds the pattern; `catch` without a parameter handles every value,
+	/// and `catch (p)` without a type is an error. An unhandled value propagates to the caller, and out of the first
+	/// isolate it traps. `finally` runs after the body or the handler, also when they throw or when a `return`, `break`
+	/// or `continue` leaves them; a throw from `finally` replaces the pending one. Traps are not caught.
+	///
+	/// A function's *errors* are the types it lists after `throws` (§5.2), or, without the list, the types of the
+	/// values its body throws and does not catch, its calls' errors included. An exported function, a method of an
+	/// exported class or interface but a private one, and `main` have only the errors they list. A value thrown, or an
+	/// error of a call, is caught by a `catch` whose type it fits, of a `try` whose body holds it; one neither caught
+	/// nor an error of the function is warned of, once per function, where it first escapes, and is not among the
+	/// function's errors after, so that its callers are not warned of it again. Errors of a type param; calls of
+	/// a function value, a nested function, or a method the receiver's type does not declare itself (of a union, a type
+	/// param, an embedded or extended type); the errors of `async c` and `spawn c`; and arrows, tests and top-level
+	/// initializers are unchecked.
+	///
+	/// ```
+	/// try { s = 1 + f() } catch (e: i32) { s = e }
+	/// try { throw 1 } catch { s += 1; throw 2 }
+	/// try { return 1 } finally { n = 5 }       // returns 1, n is 5
+	/// try { }                                  // error: catch or finally
+	/// function parse(s: string): i32 throws ParseError { throw new ParseError() }
+	/// function port(s: string): i32 throws ParseError { return parse(s) }
+	/// function main() { try { port("80") } catch (e: ParseError) { } }
+	/// function inferred() { parse("") }        // its errors are ParseError
+	/// export function bad() { parse("") }      // warning: ParseError is neither caught nor listed
+	/// ```
+	private tryStmt(n: Node): bool {
+		const mark = this.undo.length
+		const all = this.fn?.errors?.sites ?? []
+		const from = all.length
+		let open = this.block(n.parts[0])
+		const sites = all.slice(from, all.length)
+		this.restore(mark)
+		this.forget(n)
+		const caught = this.undo.length
+		for (const i of 1 ... n.parts.length - 1) {
+			const p = n.parts[i]
+			this.restore(caught)
+			if (p.kind == "token") {
+				open = this.block(n.parts[i + 1]) && open
+				break
+			}
+			// A catch without a type, or whose type fails, takes any.
+			let takes: Type | null = null
+			const ann = after(p, ":")
+			this.locals.enter()
+			if (p.parts.length > 1) {
+				this.bindBy(p.parts[0], () => {
+					if (ann == null) {
+						throw this.error(start(p.parts[0]), "a caught value needs a type")
+					}
+					takes = this.annotation(ann!)
+					return takes!
+				}, false)
+			}
+			for (const s of sites) {
+				s.caught.push(takes)
+			}
+			open = this.block(p.parts[p.parts.length - 1]) || open
+			this.locals.leave()
+		}
+		this.restore(caught)
+		return open
+	}
+
+	/// ## Jumps
+	///
+	/// `return` leaves the innermost function with its value, or with `null` when it has none, as does reaching the end
+	/// of the body; a value on the next line is not part of it. `break` and `continue` leave or restart the innermost
+	/// loop and shall be inside one. `throw` needs an operand. A statement after one whose end is unreachable, as a
+	/// jump's, never runs; the first in each block is warned of.
+	///
+	/// ```
+	/// return
+	/// f()          // warning: unreachable; f() is not returned
+	/// ```
+	private jump(n: Node): bool {
+		const f = this.fn!
+		const x = if (n.parts.length > 0) n.parts[0] else null
+		switch (n.t.kind) {
+			case "return":
+				const result = f.result
+				const t = if (x == null) Null else this.expr(x, result)
+				if (result != null) {
+					this.fit(t, result, x ?? n)
+				} else {
+					f.returns.push(t.widen(false))
+					this.convert(x ?? n, t.widen(false))
+				}
+			case "throw": this.thrown(n.t.loc, new Errors(this.value(x!).widen(true).alternatives()))
+			case "assert":
+				const e = after(n, "throws")
+				if (e == null) {
+					this.narrow(this.cond(x!).yes)
+				} else {
+					this.value(x!)
+					const t = this.value(e)
+					if (t.kind == "function" || t.kind == "fixed") {
+						this.report(n.t.loc, `cannot compare ${show(t)}`)
+					}
+				}
+				return true
+			case "break":
+				if (f.cased) {
+					this.report(n.t.loc, "break inside a case")
+				} else if (!f.inLoop) {
+					this.report(n.t.loc, "break outside a loop")
+				}
+				f.broke = true
+			case "continue":
+				if (!f.inLoop) {
+					this.report(n.t.loc, "continue outside a loop")
+				}
+		}
+		return false
+	}
+
+	private assign(n: Node) {
+		const target = n.parts[0]
+		const op = n.t.kind
+		const t = this.target(target)
+		const now = target.type!
+		const value = if (n.parts.length > 1) n.parts[1] else null
+		if ((op == "++" || op == "--") && !now.isNumber()) {
+			throw this.error(n.t.loc, `${op} needs a number, got ${show(now)}`)
+		}
+		const v = if (value == null) now else this.expr(value, if (op == "??=") t.nonNull() else t)
+		const r = switch (op) {
+			case "=": v
+			case "++", "--": bases(now)
+			case "??=": if (now.hasNull()) t.nonNull() else this.never(now, n.t)
+			default: this.operate(op.slice(0, op.length - 1), now, v, t, n.t)
+		}
+		this.fit(r, t, value ?? target)
+		if (value != null) {
+			this.convert(value, r)
+		}
+		const narrowed = if (op == "=") this.heldAs(value!.type!, t) else r
+		this.clobber(target)
+		for (const b of this.places(target, t)) {
+			const d = b.type!
+			const narrows = target.kind != "array" && (d.kind == "union" || d.kind == "object" || d.kind == "interface")
+			this.narrow([new Narrowing(b, if (narrows) narrowed else null)])
+		}
+	}
+
+	/// The type a value of v is held as in t: v, or the number member of a union it widens to (§4.1).
+	private heldAs(v: Type, t: Type): Type {
+		if (v.kind == "union") {
+			return Type.union(v.types.map(m => this.heldAs(m, t)))
+		}
+		const ms = t.alternatives()
+		return if (t.kind != "union" || !v.isNumber() || ms.some(m => m == v)) v else ms.find(m => v.fits(m)) ?? v
+	}
+
+	/// Narrows to none the member paths under the assigned target p, whose members may be anything now.
+	private clobber(p: Node) {
+		const s = this.path(p)
+		for (const b of this.paths) {
+			if (s != null && startsWith(b.path, `${s}.`)) {
+				this.narrow([new Narrowing(b, null)])
+			}
+		}
+	}
+
+	/// The bindings narrowed for the places assignment target p assigns, a pattern's each.
+	private places(p: Node, declared: Type | null = null): Binding[] {
+		if (p.kind != "array") {
+			const b = this.place(p, declared)
+			return if (b == null) [] else [b]
+		}
+		const bs: Binding[] = []
+		for (const q of p.parts) {
+			bs.push(...this.places(if (q.kind == "unary") q.parts[0] else q))
+		}
+		return bs
+	}
+
+	/// The declared type of an assignment's target. One assigned from a function it is captured by is not narrowed.
+	private target(p: Node): Type {
+		if (p.kind == "array") {
+			const ts: Type[] = []
+			for (const q of p.parts) {
+				ts.push(if (q.kind == "unary") this.target(q.parts[0]) else this.target(q))
+			}
+			const t = Type.tuple(ts, p.parts.length > 0 && p.parts[p.parts.length - 1].kind == "unary")
+			p.type = t
+			return t
+		}
+		if (p.kind != "token") {
+			const t = this.link(p, true)
+			p.type = t
+			return t
+		}
+		const t = this.expr(p, null)
+		const b = this.find(this.text(p.t))
+		if (b == null) {
+			return t
+		}
+		if (!b.mutable) {
+			throw this.error(p.t.loc, `${this.text(p.t)} is not assignable`)
+		}
+		b.shared = b.shared || b.depth != this.depth
+		return b.type ?? t
+	}
+
+	/// Checks expression p, whose value converts to want, if given, and returns its type.
+	///
+	/// ## Evaluation
+	///
+	/// Operands are evaluated left to right in source order, each exactly once, before the operation that uses them;
+	/// `&&`, `||`, `??`, `?.`, `if` and `switch` evaluate only what their rules state. A value has one static type, and
+	/// where it is used decides the conversion it undergoes (§4.10).
+	private expr(p: Node, want: Type | null): Type {
+		const t = this.refine(this.valueOf(p, want))
+		p.type = t
+		return t
+	}
+
+	/// t with each type param in it that a static branch narrows (4.11) as the type it is known to be there.
+	private refine(t: Type): Type {
+		if (t.kind == "union") {
+			const ts: Type[] = []
+			let changed = false
+			for (const m of t.types) {
+				ts.push(this.refine(m))
+				changed = changed || ts[ts.length - 1] != m
+			}
+			return if (changed) Type.union(ts) else t
+		}
+		const n = if (t.kind == "param") this.holder(t)?.narrowed else null
+		return n ?? t
+	}
+
+	/// The binding a static branch narrows param p by (4.11): its name's, else one of its own, made if make.
+	private holder(p: Type, make: bool = false): Binding | null {
+		const name = names.get(p)
+		const b = if (name == null) null else this.find(name)
+		if (b != null && b.isType && b.type == p) {
+			return b
+		}
+		for (const h of this.holders) {
+			if (h.type == p) {
+				return h
+			}
+		}
+		if (!make) {
+			return null
+		}
+		const h = new Binding(p, false, true)
+		this.holders.push(h)
+		return h
+	}
+
+	/// The binding of the param that static s is the kind of, as T in `T.kind` or `(typeof v).kind`, or null.
+	private kindOf(s: Node): Binding | null {
+		const t = if (s.kind == "member" && this.text(s.parts[1].t) == "kind") s.parts[0].type else null
+		const p = if (t == null) null else standsFor(t)
+		return if (p?.kind == "param") this.holder(p!, true) else null
+	}
+
+	/// What the param of k, known to be one of some scalars, is narrowed to where its kind is not label l's (4.11).
+	private otherKind(k: Binding, l: Node): Narrowing[] {
+		const n = k.narrowed
+		const ts = if (isTok(l, "string")) scalars(this.key(l.t)) else null
+		const c = n?.base
+		if (n?.kind != "param" || c == null || !isSet(c) || ts == null) {
+			return []
+		}
+		const rest = c.base!.alternatives().filter(t => !contains(ts!, t))
+		return [new Narrowing(k, Type.derived(n!.params[0], "", typeSet(rest)))]
+	}
+
+	/// What param p is known to be where its kind is one of the labels' (4.11): what the kind of one makes it, else a
+	/// param narrowing p to the types each makes it, or null where a kind tells no type.
+	private byKind(p: Type, labels: Node[]): Type | null {
+		const ts: Type[] = []
+		for (const l of labels) {
+			const t = ofKind(p, if (isTok(l, "string")) this.key(l.t) else "")
+			if (labels.length == 1 || t == null) {
+				return t
+			}
+			ts.push(t)
+		}
+		return anyOf(p, ts)
+	}
+
+	/// Checks expression p where nothing converts its value, so that its untyped constants take their own types (4.1).
+	private value(p: Node): Type {
+		const t = this.expr(p, null).widen(false)
+		this.convert(p, t)
+		return t
+	}
+
+	private valueOf(p: Node, want: Type | null): Type {
+		switch (p.kind) {
+			case "token": return this.atom(p)
+			case "paren": return this.expr(p.parts[0], want)
+			case "unary": return this.unary(p, want)
+			case "binary": return this.binary(p, want)
+			case "chain":
+				this.compare(p)
+				return Bool
+			case "member", "index", "call", "postfix":
+				const t = this.link(p, false, want)
+				return if (optional(p)) t.nullable() else t
+			case "new": return this.construct(p, want)
+			case "array": return this.array(p, want)
+			case "object": return this.object(p, want)
+			case "arrow": return this.arrow(p, want)
+			case "ifExpr":
+				const f = this.cond(p.parts[0])
+				const yes = p.parts[1]
+				const no = p.parts[2]
+				const later = if (want == null && yes.kind == "array") this.branch(no, f.no, null) else null
+				const a = this.branch(yes, f.yes, want ?? later)
+				const b = later ?? this.branch(no, f.no, if (want == null && no.kind == "array") a else want)
+				const t = this.joined(a, b, want, p.t.loc)
+				this.convert(p.parts[1], t)
+				this.convert(p.parts[2], t)
+				return t
+			case "switchExpr":
+				const ts: Type[] = []
+				const all = this.cases(p, (v: Node, at: Tok) => {
+					const u = this.expr(v, want)
+					ts.push(if (ts.length == 0) u else this.joined(ts[ts.length - 1], u, want, at.loc))
+				})
+				if (!all) {
+					this.report(p.t.loc, "a switch expression needs a default or a case for each value")
+				}
+				if (ts.length == 0) {
+					throw this.error(p.t.loc, "a switch expression needs a case")
+				}
+				const t = ts[ts.length - 1]
+				for (const c of p.parts.slice(1, p.parts.length)) {
+					this.convert(c.parts[c.parts.length - 1], t)
+				}
+				return t
+			case "template":
+				for (const q of p.parts) {
+					// Each piece converts by its toString, which every type has.
+					const t = if (isTok(q, "templateMid") || isTok(q, "templateTail")) null else this.value(q)
+					if (t != null) {
+						this.runs(t!, "toString", false)
+					}
+				}
+				return String
+		}
+		throw this.error(start(p), "expected an expression")
+	}
+
+	/// Checks a branch of an if expression narrowed by ns. Without a type wanted, an array literal is checked after the
+	/// other branch, against its type.
+	///
+	/// ## Conditional expressions
+	///
+	/// ```grammar
+	/// IfExpr     = "if" "(" Expr ")" Expr "else" Expr
+	/// SwitchExpr = "switch" "(" Expr ")" "{" {CaseHead Expr Term} "}"
+	/// CaseHead   = ("case" Range {"," Range} | "default") ":"
+	/// Range      = Expr ["..." Expr]
+	/// ```
+	///
+	/// An `if` expression stands only where an Expr begins, so inside an operand it needs parentheses; its branches
+	/// shall not begin with `{`, and the `else` branch extends as far as possible. Its type is the join of the
+	/// branches. A `switch` expression evaluates the subject once, then the body of the first case with a matching
+	/// label; its cases, labelled as in §7.4, shall cover every value of the subject's type, or have a `default`.
+	///
+	/// ```
+	/// const a = if (x > 0) x else -x
+	/// const b: i32 = 1 + (if (c) 2 else 3)
+	/// const d: i32 = if (c) 1 else 2 + 3     // 1 or 5
+	/// const g = switch (n) { case 90 ... 100: "A"; case 80 ... 89, 79: "B"; default: "F" }
+	/// const k = switch (n) { case 0: "none"; case 1 ... 9: "few"; default: "many" }
+	/// if (c) 1                       // error: `else` required
+	/// if (c) { v: 1 } else 2         // error: `{`
+	/// ```
+	private branch(p: Node, ns: Narrowing[], want: Type | null): Type {
+		const mark = this.undo.length
+		this.narrow(ns)
+		const t = this.expr(p, want)
+		this.restore(mark)
+		return t
+	}
+
+	private atom(p: Node): Type {
+		const t = p.t
+		switch (t.kind) {
+			case "ident": return this.name(p)
+			case "int": return UntypedInt
+			case "float": return UntypedFloat
+			case "string": return Type.literal(this.text(t), String)
+			case "template": return String
+			case "true", "false": return Bool
+			case "null": return Null
+			case "this":
+				if (this.self == null) {
+					throw this.error(t.loc, "this outside a method")
+				}
+				return this.self!
+		}
+		throw this.error(t.loc, `expected an expression, got ${t.kind}`)
+	}
+
+	private name(p: Node): Type {
+		const n = p.t
+		const b = this.lookup(n)
+		p.symbol = b.symbol
+		const t = this.typeOf(b, n)
+		return if (b.isType) meta(t) else this.place(p)?.narrowed ?? t
+	}
+
+	/// The binding of a name, recording a top-level one as a reference of the declaration being checked, and a use if
+	/// uses.
+	private lookup(t: Tok, uses = true): Binding {
+		const name = this.text(t)
+		const b = this.find(name)
+		if (b == null) {
+			throw this.error(t.loc, `${name} is not declared`)
+		}
+		const d = b.decl
+		if (d == null && !b.isType && b.depth <= this.wall && this.locals.get(name) == b) {
+			throw this.error(t.loc, `a local class cannot capture ${name}`)
+		}
+		const owner = this.owner
+		if (d != null && owner != null && !contains(owner.deps, d)) {
+			owner.deps.push(d)
+		}
+		if (uses && !b.isType) {
+			this.use(d)
+		}
+		this.warn(d?.warning ?? null, t.loc, name)
+		if (b.failed) {
+			throw new Failed()
+		}
+		return b
+	}
+
+	/// Records d as a use of the class member being checked, else of the declaration.
+	private use(d: Decl | null) {
+		const u = this.user ?? this.owner
+		if (u != null && d != null && !contains(u.uses, d)) {
+			u.uses.push(d)
+		}
+	}
+
+	/// Records a use of member k of t, or of each class param t stands for; a class's constructor is the class (3).
+	private runs(t: Type, k: string, static: bool) {
+		for (const c of if (t.kind == "param") t.underlying()?.alternatives() ?? [] else [t]) {
+			this.use(about(declarer(c, k, static) ?? c, k, static).decl)
+		}
+	}
+
+	private find(name: string): Binding | null { return this.locals.get(name) ?? this.top.get(name) ?? this.prelude.get(name) }
+
+	/// The type of b, checking its declaration if it is not yet.
+	private typeOf(b: Binding, at: Tok): Type {
+		const d = b.decl
+		if (b.type == null && d != null && d.state == "new") {
+			const n = d.node!
+			if (n.kind == "function" && after(n, ":") != null) {
+				d.state = "busy"
+				try {
+					this.within(d, () => { b.type = this.function(n, null, false) })
+				} finally {
+					d.state = "new"
+				}
+			} else {
+				this.settle(d)
+			}
+		} else if (b.type == null && b.isType) {
+			throw this.error(at.loc, `${this.text(at)} refers to itself`)
+		} else if (b.initializing == "value" && (d == null || b.type == null)) {
+			// A typed top-level one is left to cycles, as are its other dependencies (3).
+			throw this.error((d?.at ?? at).loc, `${this.text(at)} depends on itself`)
+		} else if (b.type == null && b.initializing == "function") {
+			// Read in the function literal that is all of its own initializer, which does not run it (3).
+			throw this.error(at.loc, `${this.text(at)} needs a type to be used in its own initializer`)
+		} else if (b.type == null && (d == null || d.kind == "function")) {
+			throw this.error(at.loc, `${this.text(at)} calls itself, so it needs a result type`)
+		} else if (b.type == null && d?.state == "busy") {
+			// A destructured variable read while its initializer is checked (3).
+			throw this.error(at.loc, `${this.text(at)} depends on itself`)
+		}
+		const t = b.type
+		if (t == null || b.failed) {
+			throw new Failed()
+		}
+		// An alias's type is not yet known while its own is read, which a class it names may hold.
+		if (b.isType && this.owner?.kind != "type") {
+			members(t)
+		}
+		return t
+	}
+
+	/// ## Unary operators
+	///
+	/// - `!x`, of a `bool`: negation
+	/// - `-x`, of a number: negation; integers wrap; an untyped operand gives an untyped result
+	/// - `~x`, of an integer: bitwise complement
+	/// - `typeof x`, of anything: the static type of `x`, a `Type` (§4.11); `x` is not evaluated
+	/// - `async c`, of a call: starts `c` on a new fiber; `async T` (§6.10)
+	/// - `spawn c`, of a call: starts `c` in a new isolate; `async T` (§6.10)
+	/// - `await f`, of an `async T`: waits for `f`; `T`
+	/// - `await ...fs`, of an `(async T)[]`: waits for the first of `fs` to finish; `[i32, T]` (§6.10)
+	private unary(n: Node, want: Type | null): Type {
+		const x = n.parts[0]
+		const op = n.t.kind
+		switch (op) {
+			case "!":
+				this.cond(n)
+				return Bool
+			case "-", "~":
+				const t = this.expr(x, want)
+				if (!(if (op == "-") t.isNumber() else t.isInt())) {
+					throw this.error(n.t.loc, `${op} needs ${if (op == "-") "a number" else "an integer"}, got ${show(t)}`)
+				}
+				return bases(t)
+			case "typeof": return meta(this.expr(x, null))
+			case "await":
+				if (x.kind == "unary" && x.t.kind == "...") {
+					const fs = x.parts[0]
+					const ts: Type[] = []
+					for (const f of if (fs.kind == "array") fs.parts else [fs]) {
+						const t = this.expr(f, null)
+						ts.push(if (fs.kind == "array") this.awaited(t, f) else this.awaited(element(t, 0) ?? t, f))
+					}
+					return Type.tuple([I32, Type.union(ts)], false)
+				}
+				return this.awaited(this.expr(x, null), x)
+			case "async", "spawn":
+				if (x.kind != "call") {
+					throw this.error(start(x), `expected a call after ${op}`)
+				}
+				const deferred = this.deferred
+				this.deferred = x
+				const r = this.expr(x, null)
+				this.deferred = deferred
+				return Type.async(r)
+			case "...":
+				const t = this.expr(x, null)
+				if (t.kind != "array") {
+					throw this.error(start(x), `cannot spread ${show(t)}`)
+				}
+				return t
+		}
+		throw this.error(n.t.loc, `${op} outside a type`)
+	}
+
+	/// What awaiting a value of t at p gives.
+	///
+	/// ## Deferred computation
+	///
+	/// Any call may be deferred: `async f(args)` evaluates the callee and arguments, then runs the call on a new
+	/// *fiber* and yields a *future*, an `async T`, where `T` is the call's result type. `await x` suspends the current
+	/// fiber until `x` finishes, then yields its result or rethrows what it threw. Any function may suspend. A call
+	/// runs to completion whether or not its future is awaited.
+	///
+	/// `await ...fs` races the futures of an array: it suspends until one not yet taken by a race finishes, takes it,
+	/// and yields `[i, v]`, its index and result, or rethrows what it threw. Of several finished, the lowest index is
+	/// taken. A taken future counts as awaited, and a plain `await` of it yields its result again; a plain `await`
+	/// takes nothing. Racing an empty array, or one whose futures are all taken, traps. The futures of an array literal
+	/// may differ in type: racing `[async T, async U]` yields `[i32, T | U]`.
+	///
+	/// The fibers of an isolate take turns: one runs until it suspends.
+	///
+	/// `spawn f(args)` is `async f(args)` run as the initial function of a new isolate (§3); `f` shall name a top-level
+	/// function. Its arguments, result and thrown value cross isolates: frozen data is shared; a value that holds no
+	/// reference but strings is copied, as is a `T[]`, tuple, object or class instance whose elements or members hold
+	/// none. Anything else traps the isolate it leaves. Spawning before the first isolate's initial function starts
+	/// traps.
+	///
+	/// ```
+	/// const job = async load(a)      // async T
+	/// const b = await job
+	/// const c = await load(a)        // error: load(a) is a T; `await` wants an async T
+	/// async 1                        // error: not a call
+	/// async g()                      // error as a statement: bind or await it
+	///
+	/// const jobs = [async load(a), async load(b)]
+	/// for (const _ of jobs) {
+	///   const [i, v] = await ...jobs  // each job once, in the order they finish
+	/// }
+	/// const [i, v] = await ...[async load(a), async parse(b)]   // [i32, T | U]
+	///
+	/// const x = spawn work(new Point())   // the Point is copied
+	/// const y = spawn work(points)        // traps: a Point[] is neither copied nor frozen
+	/// ```
+	private awaited(t: Type, p: Node): Type {
+		if (t.kind != "async") {
+			throw this.error(start(p), `expected an async, got ${show(t)}`)
+		}
+		return t.base!
+	}
+
+	/// ## Binary operators
+	///
+	/// From loosest to tightest, as `prec` in src/lex.bob; all but `**` are left associative. Operands:
+	///
+	/// - `??`: a `T | null`, then a `T`
+	/// - `||`: bools, short-circuit
+	/// - `&&`: bools, short-circuit
+	/// - `== != < > <= >= instanceof`: see below; the result is a `bool`
+	/// - `|`: integers, or types (a union)
+	/// - `^`: integers
+	/// - `&`: integers
+	/// - `<< >>`: integers; the result is the shifted value's type, untyped for an untyped one; the count is taken
+	///   modulo the width; `>>` is arithmetic for signed types
+	/// - `+ -`: numbers; `+` also concatenates strings
+	/// - `* / %`: numbers; integer `/` truncates toward zero, `%` takes the sign of the dividend; integer division by
+	///   zero traps
+	/// - `**`: numbers; right associative; a negative integer exponent traps
+	///
+	/// Number operands are of one type or widen to one (§4.1), which the result takes. Integer results wrap. Floats
+	/// follow IEEE 754 with round-to-nearest. `==` and `!=` take operands that join (§4.10), a type set's parameter as
+	/// the union of its set, and compare values, string code units, reference identity (in an assert, by value: §5.5),
+	/// or a union's tag and then its value; two `Type`s are equal when they are one type, and equal types are one
+	/// reference; functions and `T[n]` are not comparable. `< > <= >=` take numbers or strings.
+	///
+	/// A chain `a < b <= c` means `a < b && b <= c` with `b` evaluated once; chains are of `==` only, of `< <=` only,
+	/// or of `> >=` only. `??` shall not mix with other binary operators without parentheses, the left operand of `**`
+	/// shall not begin with a unary operator, and `as` shall not mix with binary operators.
+	///
+	/// `x instanceof T`, `x` of union, object or interface type, is true if the type of its tag fits `T`. Some member
+	/// of `x`'s type shall fit `T`, and `x` narrows to those members; or `T` shall fit an object or interface member,
+	/// and `x` narrows to `T` (§6.11). A type that is no union is its only member, and a type set's parameter has the
+	/// members of its set.
+	///
+	/// ```
+	/// let x: i32 = 1 + 2 * 3           // 7
+	/// x = 2 ** 3 ** 2                  // 512
+	/// x = 1 << 2 + 1                   // 8
+	/// x = 1 | 2 ^ 3 & 1                // 3
+	/// 1 < x < 10   x >= 3 > 2   x == 7 == 7                            // chains
+	/// -2 ** 2    1 < x > 0    a != b != c    a ?? b || c    b as u8 + 1    // errors
+	/// 1 + 2 == 3                       // error: no context (§4.1)
+	/// let y: i8 = 127; y + 1 == -128   // wraps
+	/// x / 2 * 2 + x % 2 == 7           // integer division
+	/// let e = -1; 2 ** e               // traps
+	/// f == g                           // error: functions do not compare
+	/// ```
+	private binary(n: Node, want: Type | null): Type {
+		const a = n.parts[0]
+		const b = n.parts[1]
+		switch (n.t.kind) {
+			case "&&", "||", "instanceof":
+				this.cond(n)
+				return Bool
+			case "==", "!=", "<", ">", "<=", ">=":
+				this.compare(n)
+				return Bool
+			case "as": return this.cast(n)
+			case "??":
+				const l = this.expr(a, if (want == null) null else want.nullable())
+				const r = this.expr(b, want ?? l.nonNull())
+				return this.joined(if (l.hasNull()) l.nonNull() else this.never(l, n.t), r, want, n.t.loc)
+			case "|":
+				if (this.isType(a)) {
+					return meta(this.typeExpr(n))
+				}
+			case "...":
+				throw this.error(n.t.loc, "a range is only in a for or case")
+			case "=":
+				throw this.error(n.t.loc, "a default is only in a pattern")
+		}
+		// An untyped operand is in the other operand's context, else in the operation's (§4.1).
+		const shift = n.t.kind == "<<" || n.t.kind == ">>"
+		const l = this.expr(a, want)
+		const t = this.operate(n.t.kind, l, this.expr(b, if (!shift && l.isNumber() && !l.isUntyped()) bases(l) else want), want, n.t)
+		this.convert(a, t)
+		this.convert(b, t)
+		return t
+	}
+
+	private never(t: Type, at: Tok): Type { throw this.error(at.loc, `${show(t)} is never null`) }
+
+	/// The type of arithmetic or bitwise operation op on l and r, a literal's being its base's (4.2).
+	private operate(op: string, l: Type, r: Type, want: Type | null, at: Tok): Type {
+		if (op == "+" && l.isString() && r.isString()) {
+			return String
+		}
+		const ints = op != "+" && op != "-" && op != "*" && op != "/" && op != "%" && op != "**"
+		if (!l.isNumber() || !r.isNumber() || ints && (!l.isInt() || !r.isInt())) {
+			throw this.error(at.loc, `${op} needs ${if (ints) "integers" else "numbers"}, got ${show(l)} and ${show(r)}`)
+		}
+		if (op == "<<" || op == ">>") {
+			// The count does not type the shifted value; an untyped one stays untyped (4.1).
+			return if (l.isUntyped()) this.common(l, l, want, at) else bases(l)
+		}
+		return this.common(bases(l), bases(r), want, at)
+	}
+
+	/// The number type l and r widen to: an untyped one takes the other's type, and two untyped ones stay untyped,
+	/// typed where the context converts them, which there shall be (4.1).
+	private common(l: Type, r: Type, want: Type | null, at: Tok): Type {
+		if (l.isUntyped() && r.isUntyped() && l.kind == r.kind) {
+			if (want == null || !l.fits(want)) {
+				throw this.error(at.loc, `${at.kind} of untyped constants needs a type from its context`)
+			}
+			return l
+		}
+		if (l.fits(r)) {
+			return r
+		}
+		if (r.fits(l)) {
+			return l
+		}
+		throw this.error(at.loc, `${show(l)} and ${show(r)} do not widen to one type`)
+	}
+
+	/// Checks a comparison or chain of them, and returns the type of its last operand.
+	private compare(n: Node): Type {
+		n.type = Bool
+		const a = n.parts[0]
+		const b = n.parts[1]
+		const l = if (n.kind == "chain") this.compare(a) else this.expr(a, null)
+		const r = this.expr(b, l)
+		const op = n.t.kind
+		if (op == "==" || op == "!=") {
+			if (l.kind == "function" || r.kind == "function" || l.kind == "fixed" || r.kind == "fixed" || compared(l, r) == null) {
+				throw this.error(n.t.loc, `cannot compare ${show(l)} and ${show(r)}`)
+			}
+		} else if (!l.isNumber() || !r.isNumber()) {
+			if ((!l.isString() || !r.isString()) && (l != r || !l.isOrdered())) {
+				throw this.error(n.t.loc, `${op} needs numbers or strings, got ${show(l)} and ${show(r)}`)
+			}
+			return r
+		}
+		if (l.isNumber() && r.isNumber()) {
+			const t = if (l.isUntyped() && r.isUntyped() && l.kind == r.kind) l.widen(false) else this.common(bases(l), bases(r), null, n.t)
+			this.convert(if (n.kind == "chain") a.parts[1] else a, t)
+			this.convert(b, t)
+		}
+		return r
+	}
+
+	/// Checks condition p, and returns what it narrows.
+	private cond(p: Node): Facts {
+		const op = p.t.kind
+		p.type = Bool
+		if (p.kind == "paren") {
+			return this.cond(p.parts[0])
+		}
+		if (p.kind == "unary" && op == "!") {
+			const f = this.cond(p.parts[0])
+			return new Facts(f.no, f.yes)
+		}
+		if (p.kind == "binary" && (op == "&&" || op == "||")) {
+			const a = this.facts(p.parts[0])
+			const mark = this.undo.length
+			this.narrow(if (op == "&&") a.yes else a.no)
+			const b = this.facts(p.parts[1])
+			this.restore(mark)
+			return if (op == "&&") new Facts([...a.yes, ...b.yes], either(a.no, b.no)) else new Facts(either(a.yes, b.yes), [...a.no, ...b.no])
+		}
+		if (p.kind == "binary" && (op == "==" || op == "!=")) {
+			this.compare(p)
+			const k = this.kindOf(p.parts[0])
+			const kt = if (k == null) null else this.byKind(k.type!, [p.parts[1]])
+			if (k != null && kt != null) {
+				const f = new Facts([new Narrowing(k, kt)], this.otherKind(k, p.parts[1]))
+				return if (op == "==") f else new Facts(f.no, f.yes)
+			}
+			// A Type standing for a param, equal to another Type, is that one (4.11).
+			const tp = standsFor(p.parts[0].type!)
+			const tv = standsFor(p.parts[1].type!)
+			if (tp?.kind == "param" && tv != null) {
+				const f = new Facts([new Narrowing(this.holder(tp!, true)!, tv)], [])
+				return if (op == "==") f else new Facts(f.no, f.yes)
+			}
+			const d = this.discriminated(p.parts[0], [p.parts[1]])
+			if (d != null) {
+				return if (op == "==") d else new Facts(d.no, d.yes)
+			}
+			const x = if (isTok(p.parts[1], "null")) p.parts[0] else if (isTok(p.parts[0], "null")) p.parts[1] else null
+			const b = if (x == null) null else this.place(x)
+			if (b == null) {
+				return new Facts([], [])
+			}
+			const t = b.narrowed ?? b.type!
+			const f = new Facts([new Narrowing(b, Null)], [new Narrowing(b, t.nonNull())])
+			return if (op == "==") f else new Facts(f.no, f.yes)
+		}
+		if (p.kind == "binary" && op == "instanceof") {
+			const x = p.parts[0]
+			const l = this.expr(x, null)
+			const t = this.typeExpr(p.parts[1])
+			const b = this.place(x)
+			if (!this.narrows(l, t)) {
+				throw this.error(p.t.loc, `${show(l)} is never ${show(t)}`)
+			}
+			if (b == null) {
+				return new Facts([], [])
+			}
+			const yes: Type[] = []
+			const no: Type[] = []
+			for (const m of l.alternatives()) {
+				(if (m.fits(t)) yes else no).push(m)
+			}
+			return new Facts([new Narrowing(b, if (yes.length == 0) t else Type.union(yes))], [new Narrowing(b, Type.union(no))])
+		}
+		this.fit(this.expr(p, Bool), Bool, p)
+		return new Facts([], [])
+	}
+
+	/// What x.k being one of string literals ls narrows x, a path to a union, to (6.11): the members whose k may be one of
+	/// them, and those whose k may be another; null where p is not such an x.k.
+	private discriminated(p: Node, ls: Node[]): Facts | null {
+		const b = if (p.kind == "member" && p.t.kind == ".") this.place(p.parts[0]) else null
+		const t = if (b == null) null else b.narrowed ?? b.type
+		if (t == null || t.kind != "union") {
+			return null
+		}
+		const vs: Type[] = []
+		for (const l of ls) {
+			if (!isTok(l, "string")) {
+				return null
+			}
+			vs.push(Type.literal(this.text(l.t), String))
+		}
+		const yes: Type[] = []
+		const no: Type[] = []
+		for (const m of t.types) {
+			const k = m.member(this.text(p.parts[1].t)) ?? String
+			for (const v of vs) {
+				if (v.fits(k)) {
+					yes.push(m)
+					break
+				}
+			}
+			if (!k.fits(Type.union(vs))) {
+				no.push(m)
+			}
+		}
+		return new Facts([new Narrowing(b!, Type.union(yes))], [new Narrowing(b!, Type.union(no))])
+	}
+
+	/// Whether a value of type l, a type set's param any type in it, may be a t (6.5).
+	private narrows(l: Type, t: Type): bool {
+		for (const m of opened(l).alternatives()) {
+			if (m.fits(t) || (m.kind == "object" || m.kind == "interface" || memberOf(t, m)) && t.fits(m)) {
+				return true
+			}
+		}
+		return false
+	}
+
+	/// The binding narrowed for p: a local of this function it does not share with a nested one, or a member path,
+	/// made with its declared type if it has none yet; null where p is neither, or made elsewhere, or only given a type.
+	private place(p: Node, declared: Type | null = null): Binding | null {
+		if (p.kind == "token") {
+			const b = if (p.t.kind == "ident") this.locals.get(this.text(p.t)) else null
+			return if (b == null || b.depth != this.depth || b.shared) null else b
+		}
+		const s = this.path(p)
+		if (s == null) {
+			return null
+		}
+		for (const b of this.paths) {
+			if (b.path == s) {
+				return b
+			}
+		}
+		if (declared == null) {
+			return null
+		}
+		const b = new Binding(declared, true, false)
+		b.depth = this.depth
+		b.path = s
+		this.paths.push(b)
+		return b
+	}
+
+	/// p as a path of members from this or a local of this function, as this.a.b, or null where it is something else.
+	private path(p: Node): string | null {
+		if (isTok(p, "this")) {
+			return "this"
+		}
+		if (p.kind == "member" && p.t.kind == ".") {
+			const o = this.path(p.parts[0])
+			return if (o == null) null else `${o}.${this.text(p.parts[1].t)}`
+		}
+		return if (p.kind == "token" && this.place(p) != null) this.text(p.t) else null
+	}
+
+	/// Opens a function's scope, with no member paths narrowed yet, and returns the paths of the one left for close.
+	private open(): Binding[] {
+		const paths = this.paths
+		this.paths = []
+		this.depth++
+		this.locals.enter()
+		return paths
+	}
+
+	private close(paths: Binding[]) {
+		this.locals.leave()
+		this.depth--
+		this.paths = paths
+	}
+
+	private narrow(ns: Narrowing[]) {
+		for (const n of ns) {
+			this.undo.push(new Narrowing(n.b, n.b.narrowed))
+			n.b.narrowed = n.type
+		}
+	}
+
+	private restore(mark: i32) {
+		while (this.undo.length > mark) {
+			const n = this.undo.pop()
+			n.b.narrowed = n.type
+		}
+	}
+
+	/// ## Casts
+	///
+	/// `x as T` converts. Between number types and `bool`: integers truncate or extend to the width and reinterpret
+	/// signedness; a float to an integer rounds toward zero and saturates, NaN giving 0; an integer to a float rounds
+	/// to nearest; to `bool` is `!= 0`. Into a union: sets the tag. From a union to a member type: traps if the tag is
+	/// another type. A string to a string literal type: the literal it spells, which traps if none (§4.2). A string
+	/// constant of one code point casts to an integer type as that code point, below 0x80 for `u8`, so that it never
+	/// equals a byte of a longer encoding. Otherwise `x` shall fit `T`; in particular a literal shall be representable
+	/// in `T`.
+	///
+	/// ```
+	/// let n: i32 = 300; n as u8 == 44     let m = -1; m as u32 == 4294967295
+	/// let f = 1e20; f as i32 == 2147483647
+	/// (v as i32) + 1      // traps if v: i32 | string holds a string
+	/// x as u8 as i32
+	/// 300 as u8           // error: not representable
+	/// "a" as u8 == 97     "\u{1F600}" as u32 == 0x1F600
+	/// "é" as u8           // error: u8 takes only ASCII, as "é"[0] == 0xC3
+	/// ```
+	private cast(n: Node): Type {
+		const x = n.parts[0]
+		const t = this.typeExpr(n.parts[1])
+		const v = this.expr(x, t)
+		const scalars = (v.isNumber() || v.kind == "bool") && (t.isNumber() || t.kind == "bool")
+		if (!scalars && !v.fits(t) && !t.fits(v) && !(isTok(x, "string") && t.kind == "int")) {
+			throw this.error(n.t.loc, `cannot cast ${show(v)} to ${show(t)}`)
+		}
+		if (v.fits(t)) {
+			this.representable(x, t)
+		}
+		this.convert(x, if (v.fits(t)) t else v.widen(false))
+		return t
+	}
+
+	/// The type of a member, subscript, call or ! in an access chain, without the null a ?. before it adds, and
+	/// for an embedded field assigned, of the object literal it takes (5.3). A call infers from want too.
+	///
+	/// ## Members, subscripts and calls
+	///
+	/// `a.b` reads field or method `b`; a method read without a call is bound to `a`. `a[i]` subscripts an array, fixed
+	/// array or string with an integer, a tuple with a static integer, or an object, class or tuple with a static
+	/// string (§4.11); `a[T, …]` instantiates a generic `a` with types, and `T[]` or `T[n]` forms an array type when
+	/// `T` is a type. `f(args)` calls; `...xs` spreads an array into the arguments of a rest parameter or of
+	/// `push` (§4.5). The operand of `.`, `[` or `(` shall not be `null`; use `?.`, or `as` (§6.6) to trap instead;
+	/// `a!` is `a` cast from `T | null` to `T`.
+	///
+	/// `a?.b`, `a?.[i]` and `a?.(args)` give `null` without evaluating the rest of the chain when `a` is `null`; the
+	/// chain's type is the result's type `| null`.
+	///
+	/// ```
+	/// o?.k ?? 0        xs?.[0]        f?.()        a?.b?.[0]?.(1)
+	/// const c: i32 | null = n?.b.c    // the whole chain after `?.` is skipped on null
+	/// const d = a.b                   // error if a: {…} | null
+	/// ```
+	private link(n: Node, assigned: bool, want: Type | null = null): Type {
+		const a = n.parts[0]
+		let o = if (isLink(a)) this.link(a, false) else this.expr(a, null)
+		if (n.t.kind == "?.") {
+			o = o.nonNull()
+		} else if (n.kind != "postfix" && o.hasNull()) {
+			throw this.error(start(a), `${if (a.kind == "token") this.text(a.t) else show(o)} may be null`)
+		}
+		const t = switch (n.kind) {
+			case "postfix": o.nonNull()
+			case "member": this.field(o, n.parts[1], assigned, isTok(a, "this"))
+			case "index": this.index(o, n, assigned)
+			default: this.call(o, a, n.parts.slice(1, n.parts.length), n.t, want)
+		}
+		if (n.kind == "call" && n != this.deferred) {
+			this.thrown(n.t.loc, this.errorsOf(a))
+		}
+		const b = if (n.kind == "member" && !assigned) this.place(n, t) else null
+		n.type = if (b == null) t else b.narrowed ?? t
+		return n.type!
+	}
+
+	/// The type of member name of o, or for an embedded field assigned, of the object literal it takes (5.3); own:
+	/// whether o is this.
+	private field(o: Type, name: Node, assigned: bool, own: bool): Type {
+		const f = if (assigned) fieldOf(o, this.text(name.t)) else null
+		const m = this.member(o, name.t, assigned, own)
+		const t = if (f != null && f.embedded) embedding(f.type) else m
+		name.type = t
+		return t
+	}
+
+	private member(o: Type, name: Tok, assigned = false, own = false): Type {
+		const k = this.key(name)
+		const s = standsFor(o)
+		const r = if (s?.kind == "param") this.refine(s!) else s
+		const t = (if (r == null) null else r.member(k, true) ?? reflected(r, k)) ?? o.member(k)
+		if (t == null) {
+			throw this.error(name.loc, `${show(s ?? o)} has no member ${k}`)
+		}
+		const c = s ?? o.methods() ?? o
+		const w = declarer(c, k, s != null) ?? c
+		const a = about(w, k, s != null)
+		const g = w.generic ?? w
+		if (a.hidden && g != this.host && !this.testing) {
+			throw this.error(name.loc, `${k} is private to ${show(g)}`)
+		}
+		if (assigned && a.readonly && !(own && this.fn?.builds == g)) {
+			throw this.error(name.loc, `${k} is readonly`)
+		}
+		if (a.state == "pending") {
+			throw this.error(name.loc, `${k} is read before its initializer gives it a type`)
+		}
+		if (a.state == "failed") {
+			throw new Failed()
+		}
+		this.warn(a.warning, name.loc, k)
+		if (c.kind == "param") {
+			this.runs(c, k, s != null)
+		} else {
+			this.use(a.decl)
+		}
+		return t
+	}
+
+	private index(o: Type, n: Node, assigned: bool): Type {
+		const args = n.parts.slice(1, n.parts.length)
+		if (assigned && o.isString()) {
+			throw this.error(n.t.loc, "strings are immutable")
+		}
+		if (isTypeValue(o)) {
+			return meta(this.typeExpr(n))
+		}
+		switch (o.kind) {
+			case "function":
+				const targs: Type[] = []
+				for (const a of args) {
+					targs.push(this.typeExpr(a))
+				}
+				return this.applied(o, o.params, targs, n.parts[0])
+		}
+		if (args.length != 1) {
+			throw this.error(n.t.loc, `expected one subscript, got ${args.length}`)
+		}
+		const i = args[0]
+		if (isTok(i, "string")) {
+			const m = this.member(o, i.t, assigned, isTok(n.parts[0], "this"))
+			i.type = m
+			return m
+		}
+		const t = this.value(i)
+		const f = if (i.kind == "member" && this.text(i.parts[1].t) == "name") standsFor((i.parts[0].type!).member("type") ?? Null) else null
+		if (o.kind == "param" && f?.kind == "param" && f!.text == "fields") {
+			return f! // the field of each of T.fields by its name (4.11)
+		}
+		if (!t.isInt()) {
+			throw this.error(start(i), `expected an integer subscript, got ${show(t)}`)
+		}
+		if (o.isString()) {
+			return U8
+		}
+		const u = opened(o)
+		switch (u.kind) {
+			case "array", "fixed": return element(u, 0)!
+			case "tuple":
+				const v = this.constant(i)
+				const e = if (v == null) null else element(u, v as i32)
+				if (e == null) {
+					throw this.error(start(i), `expected a static subscript within ${show(o)}`)
+				}
+				return e
+		}
+		throw this.error(n.t.loc, `cannot subscript ${show(o)}`)
+	}
+
+	/// The result of calling callee, of type f, with args, where want is wanted. The callee takes the type of f as
+	/// instantiated for the call.
+	private call(f: Type, callee: Node, args: Node[], at: Tok, want: Type | null): Type {
+		if (f.kind != "function") {
+			throw this.error(at.loc, `cannot call ${show(f)}`)
+		}
+		if (this.appends(callee, args)) {
+			const xs = callee.parts[0].type!
+			this.fit(this.expr(args[0].parts[0], xs), xs, args[0].parts[0])
+			callee.type = f
+			return Null
+		}
+		const known: (Type | null)[] = []
+		const g = if (f.params.length > 0) this.infer(f, args, at, known, want) else f
+		this.args(g, args, at, known)
+		callee.type = g
+		return g.base!
+	}
+
+	/// Whether callee(args) is xs.push(...ys), which appends the elements of ys (4.5).
+	private appends(callee: Node, args: Node[]): bool {
+		return callee.kind == "member" && callee.parts[0].type!.kind == "array" && this.text(callee.parts[1].t) == "push"
+			&& args.length == 1 && args[0].kind == "unary" && args[0].t.kind == "..."
+	}
+
+	/// The errors of callee where it names a top-level function or a method, else null: a function value's are unchecked.
+	private errorsOf(callee: Node): Errors | null {
+		const c = if (callee.kind == "index") callee.parts[0] else callee
+		if (c.kind == "member") {
+			const o = c.parts[0].type!.nonNull()
+			const s = standsFor(o)
+			const k = this.key(c.parts[1].t)
+			const m = s ?? o.methods() ?? o
+			return about(declarer(m, k, s != null) ?? m, k, s != null).errors
+		}
+		return if (isTok(c, "ident")) this.find(this.text(c.t))?.decl?.errors ?? null else null
+	}
+
+	/// Notes that the types of from may be thrown at at, in the function being checked.
+	private thrown(at: Loc, from: Errors | null) {
+		const e = this.fn?.errors
+		if (e != null && from != null) {
+			e.sites.push(new Site(at, from))
+		}
+	}
+
+	/// Checks args against what f takes, but for the types known already.
+	private args(f: Type, args: Node[], at: Tok, known: (Type | null)[] = []) {
+		let spread = false
+		for (const i of 0 ... args.length - 1) {
+			const a = args[i]
+			const p = element(f, i)
+			const k = if (i < known.length) known[i] else null
+			if (a.kind == "unary" && a.t.kind == "...") {
+				if (!f.rest || i < f.types.length - 1) {
+					throw this.error(a.t.loc, "a spread goes only into a rest param")
+				}
+				spread = true
+				this.expr(a, null)
+			} else if (p == null && k == null) {
+				this.value(a)
+			} else if (p != null) {
+				this.fit(k ?? this.expr(a, p), p, a)
+			}
+		}
+		const most = if (f.rest) "" else `${f.types.length}`
+		if (!spread && (args.length < f.n || !f.rest && args.length > f.types.length)) {
+			const range = if (f.n == f.types.length) most else `${f.n} to ${if (most == "") "any" else most}`
+			throw this.error(at.loc, `expected ${range} arguments, got ${args.length}`)
+		}
+	}
+
+	/// ## new
+	///
+	/// The callee of `new` is read as a type (§4.11), and the parentheses are required. `new C(args)` and
+	/// `new C[T](args)` construct a class instance (§5.3); a generic `C` without type arguments infers them as a generic
+	/// function does (§4.9), from the constructor's arguments and the type wanted. `new [A, B]()` makes a tuple, with an
+	/// empty rest, and `new T[](n)` an array of n elements, given as an `i32`, all at their zero value, which their types
+	/// shall have (§5.1); a negative n traps. Other types have no `new`.
+	///
+	/// ```
+	/// const box = new Box("s")            // a Box[string]
+	/// const buf = new u8[](size)
+	/// const pair = new [i32, string]()    // [0, ""]
+	/// new (Square | null)[](4)            // four nulls
+	/// new Square[](4)                     // error: no zero value
+	/// new u8[4]()                         // error: write `let b: u8[4]`
+	/// ```
+	private construct(n: Node, want: Type | null): Type {
+		const args = n.parts.slice(1, n.parts.length)
+		const known: (Type | null)[] = []
+		const t = this.inferred(n, args, known, want) ?? this.typeExpr(n.parts[0])
+		switch (t.kind) {
+			case "class":
+				if (staticOnly(t)) {
+					throw this.error(start(n.parts[0]), `${show(t)} has only statics; it is not instantiated`)
+				}
+				const c = t.member("constructor")
+				this.args(if (c?.kind == "function") c! else Type.function([], Null), args, n.t, known)
+				this.thrown(n.t.loc, about(t, "constructor").errors)
+				this.runs(t, "constructor", false)
+			case "array":
+				const e = t.params[0]
+				if (!e.hasZero()) {
+					throw this.error(start(n.parts[0]), `${show(e)} has no zero value`)
+				}
+				this.args(Type.function([I32], Null), args, n.t)
+			case "tuple": this.args(Type.function([], Null), args, n.t)
+			case "param":
+				// A param each of whose types new makes without arguments makes one so (4.9).
+				if (!newable(t) || args.length > 0) {
+					throw this.error(start(n.parts[0]), `${show(t)} has no new`)
+				}
+				this.runs(t, "constructor", false)
+			default: throw this.error(start(n.parts[0]), `${show(t)} has no new`)
+		}
+		return t
+	}
+
+	/// The instance of the generic class new n names without type args that its constructor's args give, else null.
+	private inferred(n: Node, args: Node[], known: (Type | null)[], want: Type | null): Type | null {
+		const p = n.parts[0]
+		const [g, ps] = if (isTok(p, "ident")) this.named(p) else [Null, []]
+		if (g.kind != "class" || ps.length == 0 || g.params != ps) {
+			return null
+		}
+		members(g)
+		const c = g.member("constructor")
+		const f = this.infer(returning(if (c?.kind == "function") c! else Type.function([], Null), g, ps), args, n.t, known, want)
+		p.type = instance(g, f.base!.params)
+		return p.type
+	}
+
+	private array(n: Node, want: Type | null): Type {
+		const w = aim(want, ["array", "fixed", "tuple"])
+		const n0 = if (w?.kind == "tuple" && !w!.rest) w!.types.length else if (w?.kind == "fixed") w!.n else -1
+		if (n0 >= 0 && n.parts.length != n0) {
+			throw this.error(n.t.loc, `expected ${n0} elements, got ${n.parts.length}`)
+		}
+		let elem: Type | null = null
+		for (const i of 0 ... n.parts.length - 1) {
+			const e = n.parts[i]
+			const ew = if (w == null) null else element(w, i)
+			const spread = e.kind == "unary" && e.t.kind == "..."
+			const t = if (spread) element(this.expr(e, null), 0)! else this.expr(e, ew)
+			if (ew != null) {
+				this.fit(t, ew, e)
+			} else {
+				elem = if (elem == null || t == elem || t.fits(elem)) elem ?? t else this.joined(elem, t, null, start(e))
+			}
+		}
+		if (w == null && elem == null) {
+			throw this.error(n.t.loc, "an empty array needs a type")
+		}
+		// Not yet a variable's, a literal's elements are not their literal types, so ["a"] fits a string[].
+		return w ?? arrayOf(if (elem!.kind == "literal" && elem!.params.length == 0) elem!.base! else elem!)
+	}
+
+	/// An object literal's type: the class a spread of one gives it, whose other parts shall be its fields (4.8),
+	/// else the object of its parts.
+	private object(n: Node, want: Type | null): Type {
+		const spreads: Type[] = []
+		let cls: Type | null = null
+		for (const q of n.parts) {
+			if (q.kind == "unary") {
+				const t = this.expr(q.parts[0], null)
+				if (t.kind == "class") {
+					if (cls != null && cls != t) {
+						throw this.error(start(q), `cannot spread ${show(t)} into ${show(cls)}`)
+					}
+					cls = t
+				}
+				spreads.push(t)
+			}
+		}
+		const w = cls ?? aim(want, ["object", "interface"])
+		const fs: Field[] = []
+		let k = 0
+		for (const q of n.parts) {
+			if (q.kind == "unary") {
+				for (const f of fields(spreads[k])) {
+					if (cls != null && spreads[k] != cls) {
+						this.fit(f.type, this.fieldType(cls, f.name, q), q)
+					}
+					fs.push(f)
+				}
+				k++
+				continue
+			}
+			const name = this.key(q.t)
+			const ft = if (cls != null) this.fieldType(cls, name, q) else if (w == null) null else w.member(name)
+			const v = after(q, ":")
+			const t = if (q.kind == "method") this.function(q, null, true) else if (v == null) this.name(q) else this.expr(v, ft)
+			if (ft != null) {
+				this.fit(t, ft, v ?? q)
+			}
+			q.type = ft ?? t
+			fs.push(new Field(name, ft ?? t))
+		}
+		return cls ?? Type.object(fs)
+	}
+
+	/// The type of the field name of class cls, as set by the literal at that copies one.
+	private fieldType(cls: Type, name: string, at: Node): Type {
+		const f = fieldOf(cls, name)
+		if (f == null) {
+			throw this.error(start(at), `${show(cls)} has no field ${name}`)
+		}
+		return f.type
+	}
+
+	/// ## Arrows
+	///
+	/// ```grammar
+	/// ArrowParams = "(" [ArrowParam {"," ArrowParam} [","]] ")"
+	/// ArrowParam  = ["..."] Ident [":" Type] ["=" Expr]
+	/// ArrowBody   = Block | Expr
+	/// ```
+	///
+	/// An arrow is a closure. Its parameters are typed as in §5.2 or by the function type it is checked against; its
+	/// result type is the one it declares, else that type's, else its body's, and its errors are that type's. A result
+	/// type follows parameters in parentheses, except a lone untyped `(x)`. An expression body that is an object literal is
+	/// parenthesized.
+	///
+	/// ```
+	/// const double = (x: i32) => x * 2
+	/// const positive = (x: i32): bool => x > 0
+	/// const add = (a: i32) => (b: i32) => a + b
+	/// const wrap = (x: i32) => ({ v: x })
+	/// const fact: (n: i64) => i64 = n => if (n == 0) 1 else n * fact(n - 1)
+	/// apply(x => x * 3, 2)                  // x typed from apply's parameter
+	/// const f = (x: i32): i32 => x          // error: result type comes from context
+	/// const h = ({ v }: V) => v             // error: destructure in the body
+	/// ```
+	private arrow(n: Node, want: Type | null): Type {
+		const w = aim(want, ["function"])
+		const paths = this.open()
+		const sig = this.params(n.parts[0], w)
+		const declared = if (isTok(n.parts[1], ":")) this.annotation(n.parts[2]) else null
+		const f = new Fn(declared ?? w?.base)
+		const body = arrowBody(n)
+		const t = returning(sig, if (body.kind == "block") this.body(body, f) else this.returned(body, f.result))
+		this.close(paths)
+		if (contains(t.types, Empty)) {
+			throw new Failed()
+		}
+		n.parts[0].type = t
+		return t
+	}
+
+	/// The result of an arrow whose body is expression p, where result is declared or wanted.
+	private returned(p: Node, result: Type | null): Type {
+		if (result == Null) {
+			this.value(p)
+			return Null
+		}
+		const r = this.expr(p, result)
+		const t = result ?? r.widen(false)
+		this.fit(r, t, p)
+		return t
+	}
+
+	/// The type that type annotation p of a variable, field, param or result stands for.
+	private annotation(p: Node): Type {
+		const annotating = this.annotating
+		this.annotating = true
+		try {
+			return this.typeExpr(p)
+		} finally {
+			this.annotating = annotating
+		}
+	}
+
+	/// The type that type expression p stands for.
+	private typeExpr(p: Node): Type {
+		const t = this.refine(this.typeOfExpr(p))
+		p.type = t
+		return t
+	}
+
+	private typeOfExpr(p: Node): Type {
+		const a = if (p.parts.length > 0) p.parts[0] else p
+		switch (p.kind) {
+			case "token":
+				switch (p.t.kind) {
+					case "ident":
+						const [t, ps] = this.named(p)
+						return this.applied(t, ps, [], p)
+					case "null": return Null
+					case "string": return Type.literal(this.text(p.t), String)
+					case "true", "false": return Type.literal(this.text(p.t), Bool)
+				}
+				throw this.error(p.t.loc, `expected a type, got ${p.t.kind}`)
+			case "paren": return this.typeExpr(a)
+			case "binary":
+				if (p.t.kind == "|") {
+					return Type.union([this.typeExpr(a), this.typeExpr(p.parts[1])])
+				}
+			case "index":
+				const [base, ps] = if (isTok(a, "ident")) this.named(a) else [this.typeExpr(a), []]
+				a.type = base
+				if (p.parts.length == 1) {
+					return arrayOf(this.applied(base, ps, [], a))
+				}
+				const len = this.constant(p.parts[1])
+				if (len != null && p.parts.length == 2) {
+					return Type.fixed(this.applied(base, ps, [], a), len as i32)
+				}
+				const args: Type[] = []
+				for (const q of p.parts.slice(1, p.parts.length)) {
+					args.push(this.typeExpr(q))
+				}
+				return this.applied(base, ps, args, a)
+			case "array":
+				const ts: Type[] = []
+				let rest = false
+				for (const q of p.parts) {
+					rest = q.kind == "unary"
+					ts.push(this.typeExpr(q))
+				}
+				return Type.tuple(ts, rest)
+			case "object":
+				const fs: Field[] = []
+				for (const m of p.parts) {
+					const ann = after(m, ":")
+					if (m.kind != "method" && ann == null) {
+						throw this.error(m.t.loc, "a member needs a type")
+					}
+					const mt = if (m.kind == "method") this.function(m, null, false) else this.typeExpr(ann!)
+					m.type = mt
+					fs.push(new Field(this.key(m.t), mt))
+				}
+				return Type.object(fs)
+			case "arrow":
+				this.locals.enter()
+				const sig = this.params(a, null)
+				if (contains(sig.types, Empty)) {
+					throw new Failed()
+				}
+				const t = returning(sig, this.typeExpr(p.parts[1]))
+				a.type = t
+				this.locals.leave()
+				return t
+			case "unary":
+				switch (p.t.kind) {
+					case "typeof": return this.expr(a, null)
+					case "async": return Type.async(this.typeExpr(a))
+					case "...": return this.typeExpr(a)
+				}
+			case "member":
+				const m = this.expr(p, null)
+				const b = standsFor(m)
+				if (b != null) {
+					return b
+				}
+		}
+		throw this.error(start(p), "expected a type")
+	}
+
+	/// The type that name p stands for, and its type params, if it is a generic or an alias that has some.
+	private named(p: Node): [Type, Type[]] {
+		const b = this.lookup(p.t, !this.annotating)
+		p.symbol = b.symbol
+		if (b.isType) {
+			return [this.typeOf(b, p.t), b.params]
+		}
+		const d = b.decl
+		const t = if (d != null && d.kind == "function") null else this.typeOf(b, p.t)
+		const known = if (t == null) null else b.literal ?? standsFor(t)
+		if (known == null) {
+			throw this.error(p.t.loc, `${this.text(p.t)} is not a type`)
+		}
+		return [known, []]
+	}
+
+	/// Generic g of params ps, named by at, with type args, the ones left out by their defaults, or g if it has no params
+	/// (4.9).
+	private applied(g: Type, ps: Type[], args: Type[], at: Node): Type {
+		if (args.length > ps.length) {
+			throw this.error(start(at), `${this.source(at)} takes ${ps.length} type arguments, got ${args.length}`)
+		}
+		if (ps.length == 0) {
+			return g
+		}
+		const targs: Type[] = []
+		for (const i of 0 ... ps.length - 1) {
+			const a = if (i < args.length) args[i] else this.byDefault(ps, i, targs, start(at))
+			if (a == null) {
+				throw this.error(start(at), `${this.source(at)} needs a type argument for ${show(ps[i])}`)
+			}
+			targs.push(this.satisfying(a, ps, targs, start(at)))
+		}
+		return if (g.params != ps) substitute(g, ps, targs) else if (g.kind == "function") g.instantiate(targs) else instance(g, targs)
+	}
+
+	/// Generic function f instantiated with the type args that args give, else their defaults (4.9). Each arg is checked
+	/// once, its type kept in known; one its context shapes last, with what the others and then want give.
+	private infer(f: Type, args: Node[], at: Tok, known: (Type | null)[], want: Type | null): Type {
+		const ps = f.params
+		const found: (Type | null)[] = []
+		for (const p of ps) {
+			found.push(null)
+		}
+		for (const a of args) {
+			known.push(null)
+		}
+		for (const shaped of [false, true]) {
+			if (shaped && want != null) {
+				// What the result is wanted as gives only the type args the others leave open.
+				const wanted = found.slice(0, found.length)
+				f.base!.unify(want.nonNull(), ps, wanted)
+				for (const i of 0 ... ps.length - 1) {
+					found[i] = found[i] ?? wanted[i]
+				}
+			}
+			for (const i of 0 ... args.length - 1) {
+				const a = args[i]
+				const p = element(f, i)
+				if (p == null || (a.kind == "arrow" || contextual(a)) != shaped || a.t.kind == "...") {
+					continue
+				}
+				const w = if (shaped) this.partly(p, ps, found) else null
+				known[i] = this.expr(a, if (w != null && (a.kind == "arrow" || !w.mentions(ps))) w else null)
+				p.unify(known[i]!, ps, found)
+			}
+		}
+		const targs: Type[] = []
+		for (const i of 0 ... ps.length - 1) {
+			const t = found[i]
+			const a = if (t != null) t.widen(true) else this.byDefault(ps, i, targs, at.loc)
+			if (a == null) {
+				throw this.error(at.loc, `cannot infer ${show(ps[i])}`)
+			}
+			targs.push(this.satisfying(a, ps, targs, at.loc))
+		}
+		return f.instantiate(targs)
+	}
+
+	/// p with the type args found so far, a function's result left to the arg while it has others.
+	private partly(p: Type, ps: Type[], found: (Type | null)[]): Type {
+		const partial: Type[] = []
+		for (const i of 0 ... ps.length - 1) {
+			const f = found[i]
+			partial.push(if (f == null) ps[i] else f.widen(true))
+		}
+		const want = substitute(p, ps, partial)
+		return if (want.kind == "function" && want.base!.mentions(ps)) returning(want, null, want.params) else want
+	}
+
+	/// The default of param i of ps, given the args before it, reported at at where those do not fit it.
+	private byDefault(ps: Type[], i: i32, args: Type[], at: Loc): Type | null {
+		const d = ps[i].fallback
+		if (d == null) {
+			return null
+		}
+		const t = substitute(d, ps.slice(0, i), args)
+		const g = t.generic
+		for (const j of 0 ... (if (g == null) 0 else t.params.length) - 1) {
+			this.satisfying(t.params[j], g!.params, t.params.slice(0, j), at)
+		}
+		return t
+	}
+
+	/// a, reported where it does not fit the constraint of the param of ps after those with the args before it, the
+	/// param itself standing for a in it, as T in `T extends Eq[T]`.
+	private satisfying(a: Type, ps: Type[], args: Type[], at: Loc): Type {
+		const p = ps[args.length]
+		const k = p.base
+		const c = if (k == null) null else substitute(k, ps.slice(0, args.length + 1), [...args, a])
+		if (c != null && !this.defaulting && !a.fits(c)) {
+			throw this.error(at, `${show(a)} does not fit ${show(p)}'s constraint ${show(c)}`)
+		}
+		return a
+	}
+
+	/// Whether p reads as a type, so that a case label is one.
+	private isType(p: Node): bool {
+		if (p.kind == "token") {
+			const b = if (p.t.kind == "ident") this.find(this.text(p.t)) else null
+			return b != null && b.isType
+		}
+		return (p.kind == "paren" || p.kind == "index" || p.kind == "binary" && p.t.kind == "|") && this.isType(p.parts[0])
+	}
+
+	/// Reports v not fitting want, or an integer constant not representable in it.
+	private fit(v: Type, wanted: Type, at: Node) {
+		const want = this.refine(wanted)
+		if (want.kind == "interface" && staticOnly(want)) {
+			throw this.error(start(at), `a value never fits ${show(want)}, which has only statics`)
+		}
+		if (!v.fits(want)) {
+			if (failed(want)) {
+				return
+			}
+			throw this.error(start(at), `expected ${show(want)}, got ${show(v)}`)
+		} else if (v.isLoose()) {
+			this.representable(at, want)
+			this.convert(at, want)
+		}
+	}
+
+	/// Gives p, whose value converts to t, and the untyped constants in it the types they take (4.1): a number the
+	/// member of a union t it takes by default, else the first it fits.
+	private convert(p: Node, t: Type) {
+		const u = p.type
+		if (u == null || !u.isLoose() || t.isLoose()) {
+			return
+		}
+		const ms = if (u.kind == "union") [t] else t.alternatives() // a union, as `if (c) 1 else null`, takes all of t
+		let c = ms[0]
+		for (const m of ms) {
+			if (m == u.widen(false) || !u.fits(c) && u.fits(m)) {
+				c = m
+			}
+		}
+		p.type = c
+		switch (p.kind) {
+			case "array":
+				for (const i of 0 ... p.parts.length - 1) {
+					const q = p.parts[i]
+					const spread = q.kind == "unary" && q.t.kind == "..."
+					const e = element(c, i)
+					if (e != null) {
+						this.convert(if (spread) q.parts[0] else q, if (spread) c else e)
+					}
+				}
+			case "object":
+				for (const q of p.parts) {
+					const m = if (q.kind == "prop") c.member(this.key(q.t)) else null
+					if (m != null) {
+						this.convert(q, m)
+					}
+				}
+			case "switchExpr":
+				for (const k of p.parts.slice(1, p.parts.length)) {
+					this.convert(k.parts[k.parts.length - 1], c)
+				}
+			case "ifExpr":
+				this.convert(p.parts[1], c)
+				this.convert(p.parts[2], c)
+			case "index": this.convert(p.parts[0], arrayOf(c))
+			case "prop", "paren", "unary", "binary":
+				for (const q of p.parts) {
+					this.convert(q, c)
+				}
+		}
+	}
+
+	private representable(p: Node, t: Type) {
+		const v = this.constant(p)
+		if (v != null && !holds(t, v)) {
+			throw this.error(start(p), `${decimal(v!)} is not representable as ${show(t)}`)
+		}
+	}
+
+	/// The value of p where it is an integer literal, possibly negated.
+	private constant(p: Node): f64 | null {
+		if (p.kind == "token") {
+			return if (p.t.kind == "int") integer(this.text(p.t)) else null
+		}
+		if (p.kind == "paren") {
+			return this.constant(p.parts[0])
+		}
+		const v = if (p.kind == "unary" && p.t.kind == "-") this.constant(p.parts[0]) else null
+		return if (v == null) null else -v
+	}
+
+	/// want if a and b both fit it, else their join.
+	private joined(a: Type, b: Type, want: Type | null, at: Loc): Type {
+		const t = if (want != null && a.fits(want) && b.fits(want)) want else a.join(b)
+		if (t == null) {
+			throw this.error(at, `${show(a)} and ${show(b)} have no common type`)
+		}
+		return t
+	}
+
+	/// Reports an error that ends the statement, or the declaration outside one, it is in (7).
+	private error(at: Loc, msg: string): Failed {
+		this.report(at, msg)
+		return new Failed()
+	}
+
+	/// Reports each error once, as what is checked when first needed, or stopped by a missing name, is checked again.
+	private report(at: Loc, msg: string, warning = false) {
+		const key = `${at.pos} ${msg}`
+		if (!this.reported.has(key)) {
+			this.reported.add(key)
+			this.errors.push(new TypeError(this.m.path, at, msg, warning))
+			this.modules.failed = this.modules.failed || !warning
+		}
+	}
+
+	private text(t: Tok): string { return this.src.slice(t.loc.pos, t.loc.end()) }
+
+	/// The source of p.
+	private source(p: Node): string { return this.src.slice(start(p).pos, stop(p)) }
+
+	private key(t: Tok): string {
+		const s = this.text(t)
+		return if (t.kind == "string") s.slice(1, s.length - 1) else s
+	}
+}
+
+/// Function type f with result and the type params ps.
+function returning(f: Type, result: Type | null, ps: Type[] = []): Type { return Type.function(f.types, result, f.n, f.rest, ps) }
+
+/// The object literal an embedded class t takes: its fields, not its methods (5.3).
+function embedding(t: Type): Type {
+	return Type.object(fields(t).filter(f => f.type.kind != "function").map(f => new Field(f.name, f.type)))
+}
+
+/// The class that declares member k, or static member k, of class c: c or one it embeds (5.3), else null.
+function declarer(c: Type, k: string, static: bool): Type | null {
+	const fs = if (c.kind == "class") members(c) else []
+	if (!static && k == "constructor" || fs.some(f => f.name == k && f.static == static)) {
+		return c
+	}
+	let o: Type | null = null
+	for (const f of fs) {
+		o = o ?? (if (f.embedded) declarer(f.type, k, static) else null)
+	}
+	return o
+}
+
+/// Whether checking a member of class or interface t failed, so that what fits it is not known.
+function failed(t: Type): bool { return members(t).some(f => about(t, f.name, f.static).state == "failed") }
+
+function fieldOf(t: Type, name: string): Field | null {
+	for (const f of fields(t)) {
+		if (f.name == name) {
+			return f
+		}
+	}
+	return null
+}
+
+/// What this is in the methods of class t: t, but a string or T[] in builtin/'s.
+export function selfOf(t: Type): Type { return if (t == String.base) String else if (t == Arrays.base) Type.array(t.params[0]) else t }
+
+/// The type of t used as a value (4.11), Meta filled in first, as a Type's members are read by o.member.
+function meta(t: Type): Type {
+	members(Meta)
+	return Type.literal("", Meta, [t])
+}
+
+/// The type a Type value of type t stands for, null where t is not that or the type is not known.
+export function standsFor(t: Type): Type | null { return if (t.kind == "literal" && t.base == Meta) t.params[0] else null }
+
+/// Whether a value of type t is a Type.
+export function isTypeValue(t: Type): bool { return t == Meta || standsFor(t) != null }
+
+/// The type of member name of a Type standing for t where it says more than builtin/type.bob's: a union's members, an
+/// element, or a literal's value (4.11).
+function reflected(t: Type, name: string): Type | null {
+	const e = t.underlying()
+	return switch (name) {
+		case "members": if (t.kind == "union") Type.array(meta(t)) else null
+		case "elem": if (e?.kind == "array") meta(e!.params[0]) else if (e?.kind == "fixed") meta(e!.base!) else null
+		case "value": if (t.kind == "param" || t.alternatives().every(m => m.kind == "literal")) t else null
+		default: null
+	}
+}
+
+/// Whether t is a type set (4.9).
+function isSet(t: Type): bool { return t.kind == "interface" && t.base != null }
+
+/// The type set that holds ts.
+function typeSet(ts: Type[]): Type { return Type.interface(Type.union(ts)) }
+
+/// t, or the union of the type set constraining param t.
+function opened(t: Type): Type { return if (t.kind == "param" && t.base != null && isSet(t.base!)) t.base!.base! else t }
+
+/// The type a and b compare as (6.5): their join, else that of a type set param's union in place of the param; null if
+/// they do not compare.
+export function compared(a: Type, b: Type): Type | null { return a.join(b) ?? opened(a).join(opened(b)) }
+
+/// t with each of params in it replaced by the arg at its index.
+export function substitute(t: Type, params: Type[], args: Type[]): Type { return t.in({ ...new Type("class"), params: params }, args) }
+
+/// Whether t, or one of its int members, holds integer v; true of other types.
+function holds(t: Type, v: f64): bool {
+	if (t.kind == "param") {
+		return t.each(m => holds(m, v))
+	}
+	if (t.kind == "union") {
+		return t.types.some(m => m.kind == "int" && holds(m, v))
+	}
+	if (t.kind != "int" || t.n == 0) {
+		return true
+	}
+	const max = 2.0 ** ((if (t.signed) t.n - 1 else t.n) as f64)
+	return (v < max || t.n == 64 && v == max) && v >= (if (t.signed) -max else 0.0)
+}
+
+/// Whether `new` makes a t without arguments: a class or tuple, or an interface with a constructor, that needs none,
+/// as each type a param may be does (5.3).
+function newable(t: Type): bool {
+	switch (t.kind) {
+		case "param": return t.each(newable)
+		case "tuple": return true
+		case "class", "interface":
+			const c = t.member("constructor")
+			return c != null && c.kind == "function" && c.n == 0
+	}
+	return false
+}
+
+/// The path of spec, imported from the module at importer: relative to importer's directory if it starts with a dot, else
+/// to bober's root, as "std/fs".
+function resolve(importer: string, spec: string): string {
+	return normal(if (startsWith(spec, ".")) importer + "/../" + spec else join(root, spec))
+}
+
+/// path without . and with each .. but leading ones applied.
+export function normal(path: string): string {
+	const out: string[] = []
+	let rest = path + "/"
+	while (rest != "") {
+		const i = indexOf(rest, "/")
+		const s = rest.slice(0, i)
+		rest = rest.slice(i + 1, rest.length)
+		if (s == ".." && out.length > 0 && out[out.length - 1] != "..") {
+			out.pop()
+		} else if (s != "." && (s != "" || out.length == 0)) {
+			out.push(s)
+		}
+	}
+	return out.join("/")
+}
+
+/// The last segment of spec, without .bob.
+function segment(spec: string): string {
+	let s = spec
+	while (indexOf(s, "/") >= 0) {
+		s = s.slice(indexOf(s, "/") + 1, s.length)
+	}
+	return if (endsWith(s, ".bob")) s.slice(0, s.length - 4) else s
+}
+
+/// The parts after a declaration's modifiers.
+export function operands(n: Node): Node[] {
+	let i = 0
+	while (i < n.parts.length && isModifier(n.parts[i])) {
+		i++
+	}
+	return n.parts.slice(i, n.parts.length)
+}
+
+function isModifier(p: Node): bool {
+	return isTok(p, "export") || isTok(p, "static") || isTok(p, "private") || isTok(p, "readonly")
+}
+
+/// Whether a ?. in access chain n makes it null where it cuts the chain short.
+export function optional(n: Node): bool { return n.t.kind == "?." || isLink(n.parts[0]) && optional(n.parts[0]) }
+
+/// The operator on the outside of p: a binary one, as, await, unary for another unary one, or "".
+function outer(p: Node): string {
+	return switch (p.kind) {
+		case "binary", "chain": p.t.kind
+		case "unary": if (p.t.kind == "await") "await" else "unary"
+		default: ""
+	}
+}
+
+function chain(k: string): i32 {
+	return switch (k) {
+		case "==": 1
+		case "<", "<=": 2
+		case ">", ">=": 3
+		default: 0
+	}
+}
+
+export function isLink(n: Node): bool { return n.kind == "member" || n.kind == "index" || n.kind == "call" || n.kind == "postfix" }
+
+export function isTok(p: Node, kind: Kind): bool { return p.kind == "token" && p.t.kind == kind }
+
+export function has(n: Node, kind: Kind): bool {
+	for (const p of n.parts) {
+		if (isTok(p, kind)) {
+			return true
+		}
+	}
+	return false
+}
+
+export function after(n: Node, kind: Kind): Node | null {
+	for (const i of 1 ... n.parts.length - 1) {
+		if (isTok(n.parts[i - 1], kind)) {
+			return n.parts[i]
+		}
+	}
+	return null
+}
+
+export function child(n: Node, kind: Syntax): Node | null {
+	for (const p of n.parts) {
+		if (p.kind == kind) {
+			return p
+		}
+	}
+	return null
+}
+
+/// The type after implements or extends, if any.
+export function supers(n: Node): Node[] {
+	const s = after(n, "implements") ?? after(n, "extends")
+	return if (s == null) [] else [s]
+}
+
+/// The tags of a class, interface or member: the type after each @.
+export function tags(n: Node): Node[] {
+	const ts: Node[] = []
+	for (const i of 1 ... n.parts.length - 1) {
+		if (isTok(n.parts[i - 1], "@")) {
+			ts.push(n.parts[i])
+		}
+	}
+	return ts
+}
+
+/// The body of arrow n, after its params and result type.
+export function arrowBody(n: Node): Node { return n.parts[if (isTok(n.parts[1], ":")) 3 else 1] }
+
+export function bodyOf(n: Node): Node | null {
+	const b = n.parts[n.parts.length - 1]
+	return if (b.kind == "block") b else null
+}
+
+function start(p: Node): Loc {
+	const first = if (p.parts.length > 0) start(p.parts[0]) else p.t.loc
+	return if (first.pos < p.t.loc.pos) first else p.t.loc
+}
+
+/// Where p's source ends.
+function stop(p: Node): i32 {
+	let end = p.t.loc.end()
+	for (const q of p.parts) {
+		const e = stop(q)
+		end = if (e > end) e else end
+	}
+	return end
+}
+
+/// Whether the type of p depends on what it converts to.
+function contextual(p: Node): bool {
+	return p.kind == "array" || p.kind == "object" || p.kind == "ifExpr" || p.kind == "switchExpr"
+		|| p.kind == "binary" && p.t.kind == "??" || p.kind == "paren" && contextual(p.parts[0])
+}
+
+/// Integer constant v in decimal.
+function decimal(v: f64): string { return if (v < 0.0) `${v as i64}` else `${v as u64}` }
+
+/// Whether p is a constant, so that an untyped one initializes an untyped const (4.1).
+function isConstant(p: Node): bool {
+	return p.kind == "token" || p.kind == "member" || (p.kind == "paren" || p.kind == "unary" && p.t.kind == "-")
+		&& isConstant(p.parts[0])
+}
+
+/// The names pattern p binds.
+export function patternNames(p: Node): Node[] {
+	switch (p.kind) {
+		case "token": return [p]
+		case "array", "object":
+			let ns: Node[] = []
+			for (const q of p.parts) {
+				ns = [...ns, ...patternNames(q)]
+			}
+			return ns
+		case "prop":
+			const v = after(p, ":")
+			return if (v == null) [p] else patternNames(v)
+	}
+	return patternNames(p.parts[0])
+}
+
+/// What param p is where its kind is k (4.11): a string, bool, null or Type, an array of a param standing for p's elem, else
+/// a param narrowing p, constrained to the scalars or literals of kind k or to a fixed array of p's elem; null for no
+/// kind.
+function ofKind(p: Type, k: string): Type | null {
+	const ts = if (k == "literal") [String, Bool, Null] else scalars(k)
+	return switch (k) {
+		case "string": String
+		case "bool": Bool
+		case "null": Null
+		case "type": Meta
+		case "array": arrayOf(Type.derived(p, "elem", partOf(p, "elem")))
+		case "fixed": Type.derived(p, "", typeSet([Type.fixed(Type.derived(p, "elem", zeros(partOf(p, "elem"))), -1)]))
+		case "": null
+		default: Type.derived(p, "", if (ts.length > 0) typeSet(ts) else ofKnown(p, k))
+	}
+}
+
+/// The scalars of kind k, as reflection names them (4.11), or none for another kind.
+function scalars(k: string): Type[] { return if (k == "string") [String] else [Null, ...basics].filter(t => t.kind == k) }
+
+/// The type set constraining the param standing for member of param p (4.11), from p's: each field or union member
+/// of a type in it is in it, and each elem is in the elems of its arrays; else null.
+function partOf(p: Type, member: string): Type | null {
+	const c = p.base
+	if (c == null || !isSet(c)) {
+		return null
+	}
+	if (member != "elem") {
+		return c
+	}
+	const es: Type[] = []
+	for (const m of c.base!.alternatives()) {
+		if (m.kind == "array") {
+			const e = m.params[0]
+			es.push(...(if (isSet(e)) e.base!.alternatives() else [e]))
+		}
+	}
+	return typeSet(es)
+}
+
+/// The types of p's type set of kind k, as a type set, else p's constraint.
+function ofKnown(p: Type, k: string): Type | null {
+	const c = p.base
+	if (c == null || !isSet(c)) {
+		return c
+	}
+	const ts = c.base!.alternatives().filter(m => m.kind == k || k == "class" && m.kind == "interface")
+	return if (ts.length == 0) c else typeSet(ts)
+}
+
+/// The types of type set t, or null for none, that have a zero value (5.1), as a type set.
+function zeros(t: Type | null): Type | null { return if (t == null) null else typeSet(t.base!.alternatives().filter(m => m.hasZero())) }
+
+/// The type of element i of an array, fixed array or tuple t, or of param i of function t, or null if it has none.
+export function element(t: Type, i: i32): Type | null {
+	switch (t.kind) {
+		case "array": return t.params[0]
+		case "fixed": return t.base
+		case "tuple", "function":
+			const last = t.types.length - 1
+			return if (t.rest && i >= last) element(t.types[last], 0) else if (i <= last) t.types[i] else null
+	}
+	return null
+}
+
+/// want, or its one member, of one of kinds.
+function aim(want: Type | null, kinds: TypeKind[]): Type | null {
+	if (want == null) {
+		return null
+	}
+	const found: Type[] = []
+	for (const m of want.alternatives()) {
+		if (contains(kinds, m.kind)) {
+			found.push(m)
+		}
+	}
+	return if (found.length == 1) found[0] else null
+}
+
+/// The first use of origin, or of theirs, transitively, that to holds of, through the declarations not yet seen by
+/// search; else null.
+function reached(origin: Decl, to: (d: Decl) => bool, search: i32): Decl | null {
+	for (const d of origin.uses) {
+		if (to(d)) {
+			return d
+		}
+		if (d.seen != search) {
+			d.seen = search
+			const e = reached(d, to, search)
+			if (e != null) {
+				return e
+			}
+		}
+	}
+	return null
+}
+
+/// The value of an integer literal, or infinity past u64.
+function integer(s: string): f64 {
+	let radix: u64 = 10
+	let i = 0
+	if (s.length > 2 && isAlphabetic(s[1])) {
+		radix = switch (s[1]) {
+			case x: 16
+			case o: 8
+			default: 2
+		}
+		i = 2
+	}
+	let v: u64 = 0
+	for (const c of s.slice(i, s.length)) {
+		const d = digit(c)
+		if (d != null) {
+			const next = v * radix + d
+			if (next / radix != v) {
+				return 1.0 / 0.0
+			}
+			v = next
+		}
+	}
+	return v as f64
+}
