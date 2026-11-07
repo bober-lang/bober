@@ -725,8 +725,11 @@
  * callbacks are provided by MBEDTLS_SSL_TICKET_C.
  *
  * Comment this macro to disable support for SSL session tickets
+ *
+ * bober: off, as std/tls never resumes. On, a TLS 1.3 client handles a NewSessionTicket as a handshake step,
+ * which resends a record a parked write left and fails a write meanwhile; off, it ignores the ticket.
  */
-#define MBEDTLS_SSL_SESSION_TICKETS
+//#define MBEDTLS_SSL_SESSION_TICKETS
 
 /**
  * \def MBEDTLS_SSL_SRV_C

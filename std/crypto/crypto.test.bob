@@ -1,0 +1,60 @@
+import { decode, encode } from "../encoding/hex"
+import { open, seal } from "./aead"
+import { ed25519PublicKey, ed25519Sign, ed25519Verify, x25519, x25519PublicKey } from "./curve25519"
+import { CryptoError } from "./error"
+import { argon2id, blake2b, equal, hkdfSha512, hmacSha256, hmacSha512, sha256, sha512 } from "./hash"
+import * as random from "./random"
+
+test "digests" {
+	assert encode(sha512("abc")) == "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a" +
+		"2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+	assert encode(blake2b("abc")) == "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d1" +
+		"7d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923"
+	assert blake2b("abc", 32, "key").length == 32
+	assert encode(sha256("abc")) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+}
+
+test "macs and kdfs" {
+	// RFC 4231 case 2
+	assert encode(hmacSha512("Jefe", "what do ya want for nothing?")) == "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd6" +
+		"10270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737"
+	assert encode(hmacSha256("Jefe", "what do ya want for nothing?"))
+		== "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+	assert hkdfSha512("ikm", "salt", "info", 80).length == 80
+	assert equal("abc", "abc") && equal("", "") && !equal("abc", "abd") && !equal("abc", "ab")
+	const a = argon2id("hunter2", "saltsalt", 32, 64, 1)
+	assert a.length == 32 && a == argon2id("hunter2", "saltsalt", 32, 64, 1) && a != argon2id("hunter2", "saltsal2", 32, 64, 1)
+	assert argon2id("hunter2", "short") throws
+		new CryptoError("argon2id takes a salt of 8 bytes or more, a size of 4, 8 KiB and a pass")
+}
+
+test "aead" {
+	const key = random.bytes(32)
+	const nonce = random.bytes(24)
+	const s = seal(key, nonce, "attack at dawn", "header")
+	assert s.length == 14 + 16
+	assert open(key, nonce, s, "header") == "attack at dawn"
+	assert open(key, nonce, s, "other") == null
+	assert open(key, nonce, s.slice(0, 29) + "\0", "header") == null
+	assert seal("short", nonce, "") throws new CryptoError("key has 5 bytes, not 32")
+}
+
+test "curve25519" {
+	// RFC 8032 test 1
+	const seed = decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+	const pub = ed25519PublicKey(seed)
+	assert encode(pub) == "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+	const sig = ed25519Sign(seed, "")
+	assert encode(sig) == "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155" +
+		"5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+	assert ed25519Verify(pub, "", sig) && !ed25519Verify(pub, "x", sig)
+	// RFC 7748 6.1
+	const alice = decode("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+	const bob = decode("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
+	assert encode(x25519PublicKey(alice)) == "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
+	assert encode(x25519(alice, x25519PublicKey(bob))) == "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
+}
+
+test "random" {
+	assert random.bytes(32).length == 32 && random.bytes(32) != random.bytes(32)
+}

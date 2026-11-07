@@ -1,0 +1,29 @@
+//! Authenticated encryption with XChaCha20-Poly1305, by Monocypher: a 32-byte key and a 24-byte nonce, which is long
+//! enough to be random. A key shall never seal two messages with one nonce.
+
+import { CryptoError, sized } from "./error"
+import { crypto_aead_lock, crypto_aead_unlock } from "../../vendor/monocypher/monocypher.h"
+
+/// plain encrypted, then a 16-byte tag over it and ad, data sent in the clear.
+export function seal(key: string, nonce: string, plain: string, ad: string = ""): string throws CryptoError {
+	sized(key, 32, "key")
+	sized(nonce, 24, "nonce")
+	const out = new u8[](plain.length)
+	const mac = new u8[](16)
+	crypto_aead_lock(out, mac, key, nonce, ad, ad.length as u64, plain, plain.length as u64)
+	return fromBytes(out) + fromBytes(mac)
+}
+
+/// What seal sealed, or null if sealed or ad are not what it was given.
+export function open(key: string, nonce: string, sealed: string, ad: string = ""): string | null throws CryptoError {
+	sized(key, 32, "key")
+	sized(nonce, 24, "nonce")
+	if (sealed.length < 16) {
+		return null
+	}
+	const n = sealed.length - 16
+	const plain = new u8[](n)
+	const forged = crypto_aead_unlock(plain, sealed.slice(n, sealed.length), key, nonce, ad, ad.length as u64, sealed,
+		n as u64) != 0
+	return if (forged) null else fromBytes(plain)
+}

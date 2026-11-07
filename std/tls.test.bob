@@ -1,0 +1,248 @@
+import { readFile } from "./fs"
+import { IoError } from "./io"
+import * as net from "./net"
+import { Config, client, server } from "./tls"
+import { Signal } from "../builtin/fiber"
+
+const own = owning()
+
+/// The test certificate, speaking http/1.1.
+function owning(): Config {
+	const cfg = new Config()
+	cfg.cert = readFile("std/tls/testdata/cert.pem")
+	cfg.key = readFile("std/tls/testdata/key.pem")
+	cfg.alpn = ["http/1.1"]
+	return cfg
+}
+
+/// Trusts the test certificate alone.
+function trusting(): Config {
+	const cfg = new Config()
+	cfg.roots = own.cert
+	cfg.alpn = ["h2", "http/1.1"]
+	return cfg
+}
+
+/// Answers one message on the connection l accepts: the protocol agreed on, or null if the handshake fails.
+function serve(l: net.Listener): string | null throws IoError {
+	const c = l.accept()
+	try {
+		const s = server(c, own)
+		s.write(`pong ${s.read(1024)!}`)
+		s.shutdown()
+		const alpn = s.alpn
+		s.close()
+		return alpn
+	} catch (e: IoError) {
+		c.close()
+		return null
+	}
+}
+
+/// What the connection l accepts first reads, after the handshake.
+function reading(l: net.Listener): string | null throws IoError {
+	const s = server(l.accept(), own)
+	try {
+		return s.read(1024)
+	} finally {
+		s.close()
+	}
+}
+
+/// Reads one message on the connection l accepts, then drops the socket without a word.
+function cutting(l: net.Listener) throws IoError {
+	const c = l.accept()
+	server(c, own).read(1024)
+	c.close()
+}
+
+test "bytes round trip, the protocol agreed on, to a name with its root's dot" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l)
+	const c = client(net.dial(`${l.addr}`), "localhost.", trusting())
+	assert c.alpn == "http/1.1"
+	c.write("ping")
+	assert c.read(1024) == "pong ping"
+	assert c.read(1024) == null && c.read(1024) == null
+	c.close()
+	c.close()
+	assert await job == "http/1.1"
+	l.close()
+}
+
+test "insecure takes a self-signed certificate" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l)
+	const cfg = new Config()
+	cfg.insecure = true
+	const s = client(net.dial(`${l.addr}`), "localhost", cfg)
+	assert s.alpn == null
+	s.write("x")
+	assert s.read(1024) == "pong x"
+	s.close()
+	assert await job == null
+	l.close()
+}
+
+test "an IP host is checked against the certificate's IPs" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l)
+	const c = client(net.dial(`${l.addr}`), "127.0.0.1", trusting())
+	c.write("ip")
+	assert c.read(1024) == "pong ip"
+	c.close()
+	await job
+	const refused = async serve(l)
+	let kind = ""
+	try {
+		client(net.dial(`${l.addr}`), "10.0.0.1", trusting())
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	assert kind == "Tls" && await refused == null
+	l.close()
+}
+
+test "a peer closed reads as an end, one cut off as ConnectionReset" {
+	const l = net.listen("127.0.0.1:0")
+	const closing = async reading(l)
+	const c = client(net.dial(`${l.addr}`), "localhost", trusting())
+	c.write("bye")
+	assert c.read(1024) == null && await closing == "bye"
+	c.close()
+	const cut = async cutting(l)
+	const d = client(net.dial(`${l.addr}`), "localhost", trusting())
+	d.write("bye")
+	let kind = ""
+	try {
+		d.read(1024)
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	assert kind == "ConnectionReset"
+	d.close()
+	await cut
+	l.close()
+}
+
+/// 16 MiB: more than the sockets' buffers.
+function flood(): string {
+	let s = "x"
+	while (s.length < 1 << 24) {
+		s += s
+	}
+	return s
+}
+
+/// Reads all the connection l accepts sends, once go, if any, wakes it, after forging it a record of nonsense past the
+/// TLS if forge: the byte count.
+function draining(l: net.Listener, go: Signal | null, forge = false): i32 throws IoError {
+	const c = l.accept()
+	const s = server(c, own)
+	try {
+		if (forge) {
+			c.write("\x17\x03\x03\x00\x20" + flood().slice(0, 32))
+		}
+		if (go != null) {
+			go.wait()
+		}
+		let n = 0
+		let got = s.read(1 << 16)
+		while (got != null) {
+			n += got.length
+			got = s.read(1 << 16)
+		}
+		return n
+	} finally {
+		s.close()
+	}
+}
+
+test "a write that timed out fails the ones after it" {
+	const l = net.listen("127.0.0.1:0")
+	const go = new Signal()
+	const job = async draining(l, go)
+	const c = client(net.dial(`${l.addr}`), "localhost", trusting())
+	c.timeout = 100_000_000
+	const kinds: string[] = []
+	try {
+		c.write(flood())
+	} catch (e: IoError) {
+		kinds.push(e.kind)
+	}
+	go.wake()  // drained from now on: the tail would otherwise flush the stale record and seem sent
+	try {
+		c.write("tail")
+	} catch (e: IoError) {
+		kinds.push(e.kind)
+	}
+	c.close()
+	let kind = ""
+	try {
+		await job
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	assert kinds.join(",") == "TimedOut,TimedOut" && kind == "ConnectionReset"
+	l.close()
+}
+
+test "shutdown leaves a parked write whole" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async draining(l, null)
+	const c = client(net.dial(`${l.addr}`), "localhost", trusting())
+	const big = flood()
+	const write = async c.write(big)  // parks in its first send
+	c.shutdown()
+	await write
+	c.shutdown()
+	assert await job == big.length
+	c.close()
+	l.close()
+}
+
+test "a read's alert leaves a parked write whole" {
+	const l = net.listen("127.0.0.1:0")
+	const go = new Signal()
+	const job = async draining(l, go, true)
+	const c = client(net.dial(`${l.addr}`), "localhost", trusting())
+	const big = flood()
+	const write = async c.write(big)  // parks in its first send
+	let kind = ""
+	try {
+		c.read(1024)  // the forged record fails, and its alert must not resend the parked record
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	go.wake()
+	await write
+	c.shutdown()
+	assert kind == "Tls" && await job == big.length
+	c.close()
+	l.close()
+}
+
+test "concurrent writes each arrive whole" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async draining(l, null)
+	const c = client(net.dial(`${l.addr}`), "localhost", trusting())
+	const big = flood()
+	const a = async c.write(big)
+	const b = async c.write(big)
+	await a
+	await b
+	c.shutdown()
+	assert await job == 2 * big.length
+	c.close()
+	l.close()
+}
+
+test "close ends a read in flight" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async reading(l)
+	const c = client(net.dial(`${l.addr}`), "localhost", trusting())
+	const read = async c.read(1024)
+	c.close()
+	assert await read == null && await job == null
+	l.close()
+}
