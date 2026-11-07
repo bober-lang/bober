@@ -1,0 +1,35 @@
+import { open, remove } from "./fs"
+import { IoError, copy, readAll } from "./io"
+import { getpid } from "unistd.h"
+
+const path = `/tmp/bober-io-${getpid()}`
+
+test "a file reads back what was written" {
+	const w = open(path, "w")
+	w.write("abc")
+	w.write("")
+	w.write("def\n")
+	w.close()
+	const r = open(path)
+	assert r.read(2) == "ab"
+	assert readAll(r) == "cdef\n"
+	assert r.read(1) == null
+	r.close()
+	const a = open(path)
+	const b = open(`${path}.copy`, "w")
+	b.write("> ")
+	assert copy(a, b) == 7
+	a.close()
+	b.close()
+	const c = open(`${path}.copy`)
+	assert readAll(c) == "> abcdef\n"
+	c.close()
+	remove(path)
+	remove(`${path}.copy`)
+}
+
+test "errors name the call and their kind" {
+	assert open("/tmp/bober-io-none/x") throws new IoError("NotFound", "open", "/tmp/bober-io-none/x")
+	const e = new IoError("NotFound", "open", "/x")
+	assert e.kind == "NotFound" && e.message() == "open /x: NotFound"
+}

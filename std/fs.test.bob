@@ -1,0 +1,62 @@
+import * as fs from "./fs"
+import { IoError, readAll, stdout } from "./io"
+import { sort } from "./sort"
+import { getpid } from "unistd.h"
+
+const root = `/tmp/bober-fs-${getpid()}`
+
+test "files" {
+	fs.mkdirAll(`${root}/a/b`)
+	fs.mkdirAll(`${root}/a/b`)
+	fs.writeFile(`${root}/a/f`, "hello")
+	fs.appendFile(`${root}/a/f`, ", world\n")
+	assert fs.readFile(`${root}/a/f`) == "hello, world\n"
+	const i = fs.stat(`${root}/a/f`)
+	assert i.isFile && !i.isDirectory && i.size == 13 && i.modified > 0
+	assert fs.stat(`${root}/a/b`).isDirectory
+	const f = fs.open(`${root}/a/f`, "r")
+	assert f.read(5) == "hello"
+	assert readAll(f) == ", world\n" && f.read(1) == null
+	f.close()
+	fs.rename(`${root}/a/f`, `${root}/a/g`)
+	assert !fs.exists(`${root}/a/f`) && fs.exists(`${root}/a/g`)
+	const names: string[] = []
+	for (const e of fs.readDir(`${root}/a`)) {
+		names.push(`${e.name}:${e.isDirectory}`)
+	}
+	sort(names)
+	assert names == ["b:true", "g:false"]
+	fs.removeAll(root)
+	assert !fs.exists(root)
+}
+
+test "errors" {
+	assert fs.readFile(`${root}/none`) throws new IoError("NotFound", "open", `${root}/none`)
+	fs.mkdir(root)
+	assert fs.open(root, "x") throws new IoError("AlreadyExists", "open", root)
+	assert fs.stat(`${root}\0/x`) throws new IoError("InvalidInput", "stat", `${root}\0/x`)
+	assert fs.remove(`${root}/none`) throws new IoError("NotFound", "remove", `${root}/none`)
+	fs.remove(root)
+}
+
+test "glob" {
+	fs.mkdirAll(`${root}/a/b`)
+	fs.mkdir(`${root}/c`)
+	for (const f of ["x.c", "y.h", "a/z.c", "a/b/w.c", ".hidden.c"]) {
+		fs.writeFile(`${root}/${f}`, "")
+	}
+	const glob = (p: string) => fs.glob(`${root}/${p}`).map(f => f.slice(root.length + 1, f.length)).join(" ")
+	assert glob("*.c") == ".hidden.c x.c"
+	assert glob("?.[ch]") == "x.c y.h"
+	assert glob("*/*.c") == "a/z.c"
+	assert glob("**/*.c") == ".hidden.c a/b/w.c a/z.c x.c"
+	assert glob("a/**") == "a a/b a/b/w.c a/z.c"
+	assert glob("**/b/**/*.c") == "a/b/w.c"
+	assert glob("**/*/**/w.c") == "a/b/w.c" && glob("a/**/**/*.c") == "a/b/w.c a/z.c"
+	assert glob("a/z.c") == "a/z.c" && glob("a/none.c") == "" && glob("x.c/*") == "" && glob("none/*") == ""
+	fs.removeAll(root)
+}
+
+test "stdout" {
+	stdout.write("written to stdout\n")
+}

@@ -1,0 +1,43 @@
+import { parseInt, scanInt, ParseError } from "./parse"
+
+test "whole strings" {
+	assert parseInt("0") == 0 && parseInt("42") == 42 && parseInt("-42") == -42
+	assert parseInt("007") == 7
+	assert parseInt("ff", 16) == 255 && parseInt("FF", 16) == 255 && parseInt("-z", 36) == -35
+	assert parseInt("101", 2) == 5 && parseInt("-0") == 0 && parseInt("Zz", 36) == 1295
+}
+
+test "no JS leniency" {
+	assert parseInt("") throws new ParseError("syntax", 0)
+	assert parseInt("-") throws new ParseError("syntax", 1)
+	assert parseInt("+1") throws new ParseError("syntax", 0)
+	assert parseInt(" 1") throws new ParseError("syntax", 0)
+	assert parseInt("1 ") throws new ParseError("syntax", 1)
+	assert parseInt("12px") throws new ParseError("syntax", 2)
+	assert parseInt("0x10") throws new ParseError("syntax", 1)
+	assert parseInt("1_0") throws new ParseError("syntax", 1)
+	assert parseInt("12", 2) throws new ParseError("syntax", 1)
+	assert parseInt("--1") throws new ParseError("syntax", 1)
+	assert parseInt("g", 16) throws new ParseError("syntax", 0)
+	assert parseInt("é") throws new ParseError("syntax", 0)
+}
+
+test "the bounds of i32" {
+	assert parseInt("2147483647") == 2147483647 && parseInt("-2147483648") == -2147483647 - 1
+	assert parseInt("2147483648") throws new ParseError("range", 0)
+	assert parseInt("-2147483649") throws new ParseError("range", 0)
+	assert parseInt("99999999999") throws new ParseError("range", 0)
+	assert parseInt("-99999999999") throws new ParseError("range", 0)
+	assert parseInt("7fffffff", 16) == 2147483647 && parseInt("-80000000", 16) == -2147483647 - 1
+	assert parseInt("80000000", 16) throws new ParseError("range", 0)
+}
+
+test "a prefix from a start" {
+	const [v, end] = scanInt("x=-12;", 2)
+	assert v == -12 && end == 5
+	const [w, stop] = scanInt("1f!", 0, 16)
+	assert w == 31 && stop == 2
+	assert scanInt("ab", 2) throws new ParseError("syntax", 2)
+	assert scanInt("a-x", 1) throws new ParseError("syntax", 2)
+	assert scanInt("x=99999999999", 2) throws new ParseError("range", 2)
+}
