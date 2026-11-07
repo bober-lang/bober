@@ -1,0 +1,337 @@
+//! WebSockets, as RFC 6455 frames them, on a connection std/http upgraded: a server's handler accepts a request into
+//! one, a client connects to a URL. A Socket sends and receives messages, text or binary, each a string; pings are
+//! answered and fragments joined inside receive, up to maxMessage bytes, past which it is TooLarge. A frame that is
+//! not the protocol's, a masked one from a server or a bare one from a client, is a Protocol error, and either ends
+//! the socket. Reads and writes are bounded by the stream's timeout. The UTF-8 of a text is not checked. No extension
+//! is negotiated.
+
+import { bytes } from "../crypto/random"
+import { encode as base64 } from "../encoding/base64"
+import { Client, Headers, Request, Response, send, text } from "../http"
+import { IoError } from "../io"
+import { ParseError } from "../parse"
+import { lower, split, trim } from "../string"
+import { parse } from "../url"
+import { Stream } from "./h1"
+import { Signal } from "../../builtin/fiber"
+
+import { PSA_ALG_SHA_1, psa_crypto_init,
+	psa_hash_compute } from "../../vendor/mbedtls/tf-psa-crypto/include/psa/crypto.h"
+
+export class Message {
+	readonly kind: "text" | "binary"
+	readonly data: string
+
+	constructor(kind: "text" | "binary", data: string) {
+		this.kind = kind
+		this.data = data
+	}
+}
+
+export class Socket {
+	/// The connection, whose timeout bounds each read and write.
+	readonly stream: Stream
+	/// What the peer may send in one message.
+	maxMessage: i64 = 16 << 20
+	/// The subprotocol agreed on, if any.
+	protocol: string | null = null
+	/// The status and reason the peer closed with, once it has; 1005 for a close without one.
+	code: u16 | null = null
+	reason = ""
+	/// Whether this side masks what it sends: a client.
+	private masking: bool
+	private buf = ""
+	private sent = false
+	private done = false
+	/// Whether a receive is under way: close leaves the peer's close to it, as two must not read one stream.
+	private reading = false
+	/// Whether a frame is being written: a pong from receive must not cut into a send.
+	private writing = false
+	private wrote = new Signal()
+
+	constructor(stream: Stream, client: bool) {
+		this.stream = stream
+		this.masking = client
+	}
+
+	send(text: string) throws IoError { this.put(1, text) }
+	sendBinary(data: string) throws IoError { this.put(2, data) }
+	ping(data: string = "") throws IoError { this.put(9, data) }
+
+	/// The next message; null once the socket is closed, answering the peer's close first, or closing, read by another.
+	receive(): Message | null throws IoError {
+		if (this.done || this.reading && this.sent) {
+			return null
+		}
+		let kind: "text" | "binary" = "text"
+		let data = ""
+		let open = false
+		this.reading = true
+		try {
+			while (true) {
+				const [op, fin, payload] = this.frame()
+				switch (op) {
+					case 0, 1, 2:
+						if ((op == 0) != open) {
+							throw new IoError("Protocol", "read", "fragment")
+						}
+						if (op != 0) {
+							kind = if (op == 1) "text" else "binary"
+						}
+						data += payload
+						open = !fin
+						if (data.length > this.maxMessage) {
+							throw new IoError("TooLarge", "read", "message")
+						}
+						if (fin) {
+							return new Message(kind, data)
+						}
+					case 8:
+						const code = if (payload.length < 2) 1005 else (payload[0] as u16) << 8 | (payload[1] as u16)
+						if (payload.length > 0 && !sendable(code)) {
+							throw new IoError("Protocol", "read", "close")
+						}
+						this.code = code
+						this.reason = payload.slice(if (payload.length < 2) 0 else 2, payload.length)
+						if (!this.sent) {
+							this.sent = true
+							this.put(8, payload.slice(0, if (payload.length < 2) 0 else 2))
+						}
+						this.finish()
+						return null
+					case 9: this.put(10, payload)
+					case 10: {}
+					default: throw new IoError("Protocol", "read", `opcode ${op}`)
+				}
+			}
+		} catch (e: IoError) {
+			// The peer's fault is told before the stream closes.
+			if (e.kind == "Protocol" && !this.sent) {
+				this.sent = true
+				try {
+					this.put(8, be(1002, 2))
+				} catch (e: IoError) {}
+			}
+			this.finish()
+			throw e
+		} finally {
+			this.reading = false
+		}
+	}
+
+	/// Sends a close, its reason cut on a character to the 123 bytes a control frame holds, waits a second at most for
+	/// the peer's, discarding messages, and closes the stream; a receive under way on another fiber is left to do both.
+	close(code: u16 = 1000, reason: string = "") throws IoError {
+		if (!this.done && !this.sent) {
+			this.sent = true
+			let cut = if (reason.length > 123) 123 else reason.length
+			while (cut > 0 && cut < reason.length && (reason[cut] & 0xc0) == 0x80) {
+				cut--
+			}
+			this.put(8, be(code as i64, 2) + reason.slice(0, cut))
+		}
+		if (this.reading) {
+			return
+		}
+		// One deadline for the whole wait, not each read: a peer that keeps sending must not hold it open.
+		const t = this.stream.timeout
+		let left = if (t == 0 || t > second) second else t
+		const end = now() + left
+		try {
+			while (left > 0) {
+				this.stream.timeout = left
+				if (this.receive() == null) {
+					break
+				}
+				left = end - now()
+			}
+		} catch (e: IoError) {}
+		this.finish()
+	}
+
+	private finish() {
+		this.done = true
+		try {
+			this.stream.close()
+		} catch (e: IoError) {}
+	}
+
+	/// Writes one unfragmented frame, whole, or ends the socket: the next frame would start inside a part sent.
+	private put(op: i32, data: string) throws IoError {
+		const n = data.length as i64
+		const m: u8 = if (this.masking) 0x80 else 0
+		let h = chr((0x80 | op) as u8)
+		h += if (n < 126) chr(m | (n as u8)) else if (n < 65536) chr(m | 126) + be(n, 2) else chr(m | 127) + be(n, 8)
+		const key = if (this.masking) bytes(4) else ""
+		while (this.writing) {
+			this.wrote.wait()
+		}
+		this.writing = true
+		try {
+			this.stream.write(h + key + (if (this.masking) xor(data, key) else data))
+		} catch (e: IoError) {
+			this.finish()
+			throw e
+		} finally {
+			this.writing = false
+			this.wrote.wake()
+		}
+	}
+
+	/// The next frame: its opcode, whether it is the last of its message, and its payload unmasked.
+	private frame(): [i32, bool, string] throws IoError {
+		const h = this.exact(2)
+		if ((h[0] & 0x70) != 0) {
+			throw new IoError("Protocol", "read", "extension")
+		}
+		const op = (h[0] & 0x0f) as i32
+		const fin = (h[0] & 0x80) != 0
+		const masked = (h[1] & 0x80) != 0
+		if (masked == this.masking) {
+			throw new IoError("Protocol", "read", "mask")
+		}
+		let n = (h[1] & 0x7f) as i64
+		if (n == 126) {
+			n = unbe(this.exact(2))
+		} else if (n == 127) {
+			n = unbe(this.exact(8))
+		}
+		if (op >= 8 && (!fin || n > 125)) {
+			throw new IoError("Protocol", "read", "control")
+		}
+		if (n < 0 || n > this.maxMessage) {
+			throw new IoError("TooLarge", "read", "frame")
+		}
+		const key = if (masked) this.exact(4) else ""
+		const payload = this.exact(n as i32)
+		return [op, fin, if (masked) xor(payload, key) else payload]
+	}
+
+	/// Exactly n bytes of the stream; ConnectionReset if it ends first.
+	private exact(n: i32): string throws IoError {
+		while (this.buf.length < n) {
+			const more = this.stream.read(1 << 16)
+			if (more == null) {
+				throw new IoError("ConnectionReset", "read", "websocket")
+			}
+			this.buf += more
+		}
+		const s = this.buf.slice(0, n)
+		this.buf = this.buf.slice(n, this.buf.length)
+		return s
+	}
+}
+
+/// req, a handshake, upgraded to a socket handler runs on, with the first of protocols the client offers, if any;
+/// a 400 if req is not a handshake.
+export function accept(req: Request, handler: (ws: Socket) => void throws IoError, protocols: string[] = []): Response {
+	const key = req.headers.get("sec-websocket-key")
+	if (!upgrades(req.headers) || key == null || req.headers.get("sec-websocket-version") != "13") {
+		return text("not a websocket handshake", 400)
+	}
+	const res = new Response(101)
+	res.headers.set("upgrade", "websocket")
+	res.headers.set("connection", "Upgrade")
+	res.headers.set("sec-websocket-accept", acceptKey(key))
+	const offered = tokens(req.headers.all("sec-websocket-protocol"))
+	const chosen = protocols.find(p => offered.some(o => o == lower(p)))
+	if (chosen != null) {
+		res.headers.set("sec-websocket-protocol", chosen)
+	}
+	res.upgrade = c => {
+		const ws = new Socket(c, false)
+		ws.protocol = chosen
+		try {
+			handler(ws)
+		} catch (e: IoError) {}
+	}
+	return res
+}
+
+/// A socket to the ws, wss, http or https URL, offering protocols, through client or the default one.
+export function connect(url: string, client: Client | null = null,
+	protocols: string[] = []): Socket throws IoError | ParseError {
+	const u = parse(url)
+	switch (u.scheme) {
+		case "ws", "http": u.scheme = "http"
+		case "wss", "https": u.scheme = "https"
+		default: throw new IoError("Unsupported", "connect", u.scheme)
+	}
+	const key = base64(bytes(16))
+	const req = new Request("GET", u)
+	req.headers.set("upgrade", "websocket")
+	req.headers.set("connection", "Upgrade")
+	req.headers.set("sec-websocket-key", key)
+	req.headers.set("sec-websocket-version", "13")
+	if (protocols.length > 0) {
+		req.headers.set("sec-websocket-protocol", protocols.join(", "))
+	}
+	const res = if (client == null) send(req) else client.send(req)
+	const s = res.stream
+	const protocol = res.headers.get("sec-websocket-protocol")
+	if (res.status != 101 || s == null || !upgrades(res.headers) || res.headers.has("sec-websocket-extensions")
+		|| res.headers.get("sec-websocket-accept") != acceptKey(key)
+		|| protocol != null && !protocols.some(p => lower(p) == lower(protocol!))) {
+		res.close()
+		if (s != null) {
+			s.close()
+		}
+		throw new IoError("Protocol", "connect", `${res.status}`)
+	}
+	const ws = new Socket(s, true)
+	ws.protocol = protocol
+	return ws
+}
+
+const second: i64 = 1_000_000_000
+
+/// The accept key of a handshake's key: the base64 of the SHA-1 of it and the protocol's GUID.
+function acceptKey(key: string): string {
+	psa_crypto_init()
+	const h = new u8[](20)
+	const s = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	psa_hash_compute(PSA_ALG_SHA_1, s, s.length as u64, h, 20, new u64[](1))
+	return base64(fromBytes(h))
+}
+
+/// Whether h has an upgrade to websocket and a connection with the upgrade token, as both handshakes have.
+function upgrades(h: Headers): bool {
+	return lower(h.get("upgrade") ?? "") == "websocket" && tokens(h.all("connection")).includes("upgrade")
+}
+
+/// The comma-separated tokens of the header values, lowercased.
+function tokens(values: string[]): string[] { return split(lower(values.join(",")), ",").map(t => trim(t)) }
+
+/// n as k big-endian bytes.
+function be(n: i64, k: i32): string {
+	const out = new u8[](k)
+	for (const i of 0 ... k - 1) {
+		out[i] = (n >> (8 * (k - 1 - i))) as u8
+	}
+	return fromBytes(out)
+}
+
+function unbe(s: string): i64 {
+	let n: i64 = 0
+	for (const b of s) {
+		n = n << 8 | (b as i64)
+	}
+	return n
+}
+
+/// data masked with the 4-byte key, which unmasks it too.
+function xor(data: string, key: string): string {
+	if (data.length == 0) {
+		return data
+	}
+	const out = new u8[](data.length)
+	for (const i of 0 ... data.length - 1) {
+		out[i] = data[i] ^ key[i & 3]
+	}
+	return fromBytes(out)
+}
+
+/// Whether a close code may be sent (RFC 6455 §7.4.1): not 1004 to 1006, 1015, reserved or above private use.
+function sendable(code: u16): bool {
+	return code >= 1000 && code <= 1003 || code >= 1007 && code <= 1014 || code >= 3000 && code <= 4999
+}

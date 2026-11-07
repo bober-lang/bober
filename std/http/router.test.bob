@@ -1,0 +1,79 @@
+import { Request, Response, text } from "../http"
+import { Router } from "./router"
+
+function routes(): Router {
+	const r = new Router()
+	r.use((req, next) => {
+		req.headers.append("x-in", "a")
+		const res = next(req)
+		res.headers.append("x-out", "a")
+		return res
+	})
+	r.use((req, next) => {
+		req.headers.append("x-in", "b")
+		const res = next(req)
+		res.headers.append("x-out", "b")
+		return res
+	})
+	r.get("/users/:id", (req, p) => text(`user ${p.get("id")!}`))
+	r.get("/users/me", (req, p) => text("me"))
+	r.post("/users", (req, p) => text("made", 201))
+	r.get("/files/*path", (req, p) => text(`file ${p.get("path")!}`))
+	r.get("/in", (req, p) => text(req.headers.all("x-in").join("")))
+	r.get("/slash/", (req, p) => text("slash"))
+	const api = new Router()
+	api.use((req, next) => {
+		const res = next(req)
+		res.headers.set("x-api", "1")
+		return res
+	})
+	api.get("/:name", (req, p) => text(`api ${p.get("name")!}`))
+	r.mount("/api", api)
+	return r
+}
+
+const app = routes()
+
+function on(method: string, path: string): Response { return app.handle(new Request(method, `http://x${path}`)) }
+
+test "params, wildcards and literals" {
+	assert on("GET", "/users/1").body.text() == "user 1"
+	assert on("GET", "/users/me").body.text() == "me"
+	assert on("GET", "/files/a/b.txt").body.text() == "file a/b.txt"
+	assert on("GET", "/files/").body.text() == "file "
+	assert on("POST", "/users").status == 201
+}
+
+test "what is not found" {
+	assert on("GET", "/nothing").status == 404
+	assert on("GET", "/slash").status == 404
+	assert on("GET", "/slash/").status == 200
+	const res = on("DELETE", "/users/1")
+	assert res.status == 405 && res.headers.get("allow") == "GET"
+	const users = on("GET", "/users")
+	assert users.status == 405 && users.headers.get("allow") == "POST"
+	assert on("HEAD", "/users/1").status == 200
+}
+
+test "a HEAD takes the GET before a later catch-all" {
+	const r = new Router()
+	r.get("/a", (req, p) => text("get"))
+	r.any("/*rest", (req, p) => text("any"))
+	r.get("/b", (req, p) => text("get"))
+	r.head("/b", (req, p) => text("head"))
+	assert r.handle(new Request("HEAD", "http://x/a")).body.text() == "get"
+	assert r.handle(new Request("HEAD", "http://x/b")).body.text() == "head"
+	assert r.handle(new Request("HEAD", "http://x/c")).body.text() == "any"
+}
+
+test "middleware wraps outermost first" {
+	const res = on("GET", "/in")
+	assert res.body.text() == "ab"
+	assert res.headers.all("x-out").join("") == "ba"
+}
+
+test "a mounted router keeps its middleware" {
+	const res = on("GET", "/api/thing")
+	assert res.body.text() == "api thing" && res.headers.get("x-api") == "1"
+	assert on("GET", "/api/a/b").status == 404
+}
