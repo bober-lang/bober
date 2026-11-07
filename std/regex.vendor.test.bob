@@ -1,0 +1,209 @@
+//! regex.bob against the suites in vendor/regex-tests: Go's re2-search.txt, which RE2 logged, and the findTests of Go's
+//! find_test.go; and Oniguruma's test_utf8.c, whose cases in a syntax that regex.bob takes run, but those where
+//! Oniguruma's semantics differ from RE2's.
+
+import { contains } from "./algo"
+import { backslash, backtick, digit, isAlphanumeric, isDigit, isSpace, minus, quote, seven, slash, u, underscore, x,
+	zero } from "./ascii"
+import { min } from "./math"
+import { parseInt } from "./parse"
+import { compile, Regex } from "./regex"
+import { indexOf, split, startsWith, unquoted, utf8 } from "./string"
+
+const root = "vendor/regex-tests"
+
+/// Each regexp of a stanza is followed by a line of results per string of it. Of their four results, the first two are
+/// of a match of the whole string and of the leftmost-first one; the other two are leftmost-longest. RE2's \B also
+/// holds within a code point, which Go's and regex.bob's are not tried at.
+test "re2-search" {
+	const lines = split(readFile(`${root}/go/re2-search.txt`)!, "\n")
+	let strings: string[] = []
+	let input: string[] = []
+	let re: Regex | null = null
+	let whole: Regex | null = null
+	let q = ""
+	let inStrings = false
+	for (const k of 0 ... lines.length - 1) {
+		const line = lines[k]
+		if (line == "strings") {
+			strings = []
+			inStrings = true
+		} else if (line == "regexps") {
+			inStrings = false
+		} else if (startsWith(line, "\"")) {
+			q = unquoted(line)
+			if (inStrings) {
+				strings.push(q)
+			} else {
+				const unsupported = indexOf(q, "\\C") >= 0 || indexOf(q, "\\p") >= 0 || indexOf(q, "\\P") >= 0
+				re = if (unsupported) null else compile(q)
+				whole = if (unsupported) null else compile(`\\A(?:${q})\\z`)
+				input = [...strings]
+			}
+		} else if (line != "" && (line[0] == minus || isDigit(line[0]))) {
+			const text = input[0]
+			input = input.slice(1, input.length)
+			if (re != null && !(indexOf(q, "\\B") >= 0 && !ascii(text))) {
+				test `${k + 1}: ${q} on ${text}` {
+					const want = split(line, ";")
+					assert spans(whole!.find(text)) == want[0]
+					assert spans(re!.find(text)) == want[1]
+				}
+			}
+		}
+	}
+}
+
+/// Each case is {pattern, text, at most how many matches, build(how many, their spans…) or nil}.
+test "find_test.go" {
+	const src = readFile(`${root}/go/find_test.go`)!
+	const start = indexOf(src, "var findTests")
+	const t = tokens(src.slice(start, indexOf(src, "\n}\n", start)))
+	for (const k of 0 ... t.length - 2) {
+		if (t[k] == "{" && t[k + 1][0] == quote) {
+			const pattern = t[k + 1].slice(1, t[k + 1].length)
+			const text = t[k + 3].slice(1, t[k + 3].length)
+			const most = parseInt(t[k + 5])
+			const want: string[] = []
+			if (t[k + 7] == "build") {
+				let j = k + 11
+				const xs: i32[] = []
+				while (t[j - 1] != ")") {
+					xs.push(parseInt(t[j]))
+					j += 2
+				}
+				const per = xs.length / parseInt(t[k + 9])
+				for (const m of 0 ... parseInt(t[k + 9]) - 1) {
+					want.push(spans(xs.slice(m * per, m * per + per)))
+				}
+			}
+			test `${pattern} on ${text}` {
+				const all = compile(pattern).findAll(text).map(spans)
+				assert all.slice(0, if (most < 0) all.length else min(most, all.length)).join(";") == want.join(";")
+			}
+		}
+	}
+}
+
+/// x2(pattern, text, start, end) and x3(…, group) give where the match or a group of it is, n(pattern, text) that
+/// there is none. The patterns regex.bob rejects are left out, as in Oniguruma's syntax only.
+test "oniguruma" {
+	for (const line of split(readFile(`${root}/oniguruma/test_utf8.c`)!, "\n")) {
+		const t = tokens(line)
+		if (t.length < 6 || !contains(["x2", "x3", "n"], t[0]) || t[t.length - 1] != ";") {
+			continue
+		}
+		const pattern = t[2].slice(1, t[2].length)
+		const text = t[4].slice(1, t[4].length)
+		let re: Regex | null = null
+		try {
+			re = compile(pattern)
+		} catch {}
+		if (re != null && !differs(pattern, text)) {
+			test `${pattern} on ${text}` {
+				const found = re!.find(text)
+				if (t[0] == "n") {
+					assert found == null
+				} else {
+					const g = if (t[0] == "x3") 2 * parseInt(t[10]) else 0
+					assert found != null && `${found[g]}-${found[g + 1]}` == `${t[6]}-${t[8]}`
+				}
+			}
+		}
+	}
+}
+
+/// Whether Oniguruma's meaning of pattern on text differs from RE2's: it folds case beyond ASCII, which regex.bob does not
+/// either, and has \w, \b and \s beyond it; it nests classes and intersects them with &&; its (?m) is RE2's (?s);
+/// and the cases of others.
+function differs(pattern: string, text: string): bool {
+	const has = (sub: string) => indexOf(pattern, sub) >= 0
+	return !ascii(pattern + text) && (has("(?i") || has("\\w") || has("\\W") || has("\\b") || has("\\B") || has("\\s"))
+		|| has("[[") || has("[^[") || has("&&") || has("(?m") || contains(others, pattern)
+}
+
+/// Its ^ also holds after a line feed, its (?i) holds for the rest of an alternation, not only of a branch, x{n}? is
+/// (x{n})?, and its \x escapes are bytes.
+const others = ["^a", "a(?i)b|c", "c(?i)a.|b.", "a{3}?", "[a[cdef]]", "[a[xyz]-c]", "\\xca\\xb8"]
+
+/// found as re2-search.txt writes it: "-" for none, else each group's start-end, "-" for one that took no part.
+function spans(found: i32[] | null): string {
+	if (found == null) {
+		return "-"
+	}
+	const out: string[] = []
+	for (const j of 0 ... found.length / 2 - 1) {
+		out.push(if (found[2 * j] < 0) "-" else `${found[2 * j]}-${found[2 * j + 1]}`)
+	}
+	return out.join(" ")
+}
+
+function ascii(s: string): bool {
+	for (const c of s) {
+		if (c >= 0x80) {
+			return false
+		}
+	}
+	return true
+}
+
+/// The tokens of Go or C source but space and comments: a number, a name, another character, or a string literal's
+/// value after a ".
+function tokens(src: string): string[] {
+	const out: string[] = []
+	let i = 0
+	while (i < src.length) {
+		const start = i
+		const c = src[i]
+		i++
+		if (c == slash && src.at(i) == slash) {
+			const end = indexOf(src, "\n", i)
+			i = if (end < 0) src.length else end
+		} else if (c == backtick) {
+			i = indexOf(src, "`", i) + 1
+			out.push(`"${src.slice(start + 1, i - 1)}`)
+		} else if (c == quote) {
+			let s = "\""
+			while (src[i] != quote) {
+				const [ch, next] = escaped(src, i)
+				s += ch
+				i = next
+			}
+			i++
+			out.push(s)
+		} else if (isAlphanumeric(c) || c == minus || c == underscore) {
+			while (i < src.length && (isAlphanumeric(src[i]) || src[i] == underscore)) {
+				i++
+			}
+			out.push(src.slice(start, i))
+		} else if (!isSpace(c)) {
+			out.push(chr(c))
+		}
+	}
+	return out
+}
+
+/// The character or escape of a Go or C string literal at i, and where it ends.
+function escaped(src: string, i: i32): [string, i32] {
+	if (src[i] != backslash) {
+		return [chr(src[i]), i + 1]
+	}
+	const c = src[i + 1]
+	let j = i + 2
+	let v: i64 = 0
+	if (c == x || c == u || isOctal(c)) {
+		// \xhh and \ooo are a byte, \uhhhh a code point.
+		const radix = if (isOctal(c)) 8 else 16
+		j = if (isOctal(c)) i + 1 else j
+		const end = j + (if (c == u) 4 else if (c == x) 2 else 3)
+		while (j < end && (digit(src[j]) ?? 99) < radix) {
+			v = v * radix + digit(src[j])!
+			j++
+		}
+		return [if (c == u) utf8(v) else chr(v as u8), j]
+	}
+	const k = indexOf("afnrtv", chr(c))
+	return [if (k >= 0) chr("\x07\x0c\n\r\t\x0b"[k]) else chr(c), j]
+}
+
+function isOctal(c: u8): bool { return c >= zero && c <= seven }
