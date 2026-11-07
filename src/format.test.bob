@@ -1,0 +1,84 @@
+import { SyntaxError } from "./lex"
+import { format } from "./format"
+
+function same(src: string): bool { return format(src) == src }
+
+test "statements go one per line, blocks indent by tabs" {
+	assert format("function f(a:i32,b :i32):i32{if(a<b){return a}else{return b};g()}")
+		== "function f(a: i32, b: i32): i32 {\n\tif (a < b) {\n\t\treturn a\n\t} else {\n\t\treturn b\n\t}\n\tg()\n}\n"
+	assert format("const x = f(a,\n  b ||\n  c)\n") == "const x = f(a, b || c)\n"
+}
+
+test "expressions" {
+	assert same("const x = -a.b?.c[1]!.d(...e, () => 1, y => [y]) + (2 as i32)\n")
+	assert same("const t = `a${b}c${d}` + new C[T](typeof x, await f())\n")
+	assert same("const s = if (a) [b, c] else switch (x) {\n\tcase 1, 2 ... 3: \"low\"\n\tdefault: \"\"\n}\n")
+}
+
+test "declarations" {
+	assert same("import \"a\"\nimport * as b from \"b\"\nimport { c, d as e } from \"c\"\n\nexport type T[U] = U | null\n")
+	assert same("export class A[T] implements I {\n\tstatic readonly n = 1\n\tx: T\n\n\tget(): T throws E { return this.x }\n\n\tset(x: T) {\n\t\tthis.x = x\n\t\tg()\n\t}\n}\n")
+	assert same("interface I {\n\tcase(): i32\n\tdefault(): i32\n}\n")
+	assert same("export function alloc[T](n: i64): u64\nexport function f() {}\n")
+	assert same("class A implements I & J @T @U {\n\tx: i32 @V = 1\n\n\tf(): i32 @W { return 1 }\n}\n")
+	assert same("class A @T {\n\tx: i32 @V\n}\n")
+	assert same("function f(): i32 @T { return 1 }\n\nconst a: i32 @U = 1\n\ntype B[T] @V = T\n")
+	assert same("test \"t\" {\n\tassert f() throws new E(1)\n}\n")
+}
+
+test "statements" {
+	assert format("test \"t\" {\n\tfor (const i of 0 ... 9) { a += i }\n\ttry { f() } catch (e: E) { g() } finally { h() }\n}\n")
+		== "test \"t\" {\n\tfor (const i of 0 ... 9) {\n\t\ta += i\n\t}\n\ttry {\n\t\tf()\n\t} catch (e: E) {\n\t\tg()\n\t} finally {\n\t\th()\n\t}\n}\n"
+}
+
+test "a case body of one short statement stays on its line" {
+	assert same("function f() {\n\tswitch (x) {\n\t\tcase 1: return a\n\t\tcase 2:\n\t\t\tg()\n\t\t\treturn b\n\t\tdefault: {}\n\t}\n}\n")
+}
+
+test "blank lines go between kinds and around multi-line declarations" {
+	assert format("//! m\nimport \"a\"\nconst a = 1\nconst b = 2\nfunction f() {}\nfunction g() { h() }\nconst c = 3\n")
+		== "//! m\n\nimport \"a\"\n\nconst a = 1\nconst b = 2\n\nfunction f() {}\nfunction g() { h() }\n\nconst c = 3\n"
+}
+
+test "comments keep their place" {
+	assert same("// a\nconst a = 1 // b\n\nfunction f() {\n\t// c\n\tg() // d\n\t// e\n}\n// f\n")
+	assert format("const a = f(1, // x\n2)\nconst b = 1\n") == "const a = f(\n\t1, // x\n\t2\n)\n\nconst b = 1\n"
+	assert same("const t = [\n\t// a\n\t[1, 2], // b\n\t{ c: 3 } // d\n]\n")
+	assert same("class C {\n\tconstructor(\n\t\ta: i32,\n\t\tb = 1 /// e\n\t) {}\n}\n")
+	assert same("const o = {\n\ta: 1, // f\n\tb: 2\n}\n")
+	assert format("function f() {\n\tswitch (x) {\n\t\t// a\n\t\tcase 1: g() // b\n\t}\n}\n")
+		== "function f() {\n\tswitch (x) {\n\t\t// a\n\t\tcase 1: g() // b\n\t}\n}\n"
+	assert same("function f() {\n\tswitch (x) {\n\t\tcase 1:\n\t\t\t// a\n\t\t\tg()\n\t}\n}\n")
+}
+
+test "edge cases" {
+	assert format("const x = - -a\n") == "const x = - -a\n"
+	assert format("import {} from \"m\"\n") == "import {} from \"m\"\n"
+	assert format("") == ""
+	assert same("function f() {\n\t// todo\n}\n")
+	assert format("//! m\n\n/// f\nfunction f() {}\n") == "//! m\n\n/// f\nfunction f() {}\n"
+	assert format("function f() {\n\tswitch (x) {\n\t\tcase 1: {\n\t\t\tg()\n\t\t}\n\t}\n}\n")
+		== "function f() {\n\tswitch (x) {\n\t\tcase 1: {\n\t\t\tg()\n\t\t}\n\t}\n}\n"
+}
+
+test "long lines wrap at 120 columns, deeper parts last" {
+	assert same("export type Keyword = \"as\" | \"assert\" | \"async\" | \"await\" | \"break\" | \"case\" | \"catch\" | \"class\" | \"const\" | \"continue\"\n\t| \"default\" | \"else\" | \"export\" | \"extends\" | \"false\" | \"finally\" | \"for\" | \"from\" | \"function\" | \"if\"\n\t| \"implements\" | \"import\" | \"instanceof\" | \"interface\" | \"let\" | \"new\" | \"null\" | \"of\" | \"private\" | \"readonly\"\n\t| \"return\" | \"spawn\" | \"static\" | \"switch\" | \"test\" | \"this\" | \"throw\" | \"throws\" | \"true\" | \"try\" | \"type\"\n\t| \"typeof\" | \"while\"\n")
+	assert same("function f() {\n\tif (a) {\n\t\tif (b) {\n\t\t\tconst op = if (this.pos + n > (this.src.length as u32)) null\n\t\t\t\telse operator(this.src.slice(this.pos, this.pos + n))\n\t\t}\n\t}\n}\n")
+	assert same("function f() {\n\treturn switch (prev) {\n\t\tcase \"ident\", \"int\", \"float\", \"string\", \"template\", \"templateTail\", \")\", \"]\", \"}\", \"++\", \"--\", \"this\", \"null\",\n\t\t\t\"true\", \"false\", \"!\": key || !continues(next)\n\t}\n}\n")
+	assert same("const x = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa as T\nconst y = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa instanceof U\n")
+	assert same("const x = if (a.b.c || d.e == \"f\") g(`xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`)\n\telse h()\n")
+}
+
+test "templates keep their text" {
+	assert same("function f() {\n\treturn `a\n  b${c}`\n}\n")
+}
+
+test "a syntax error stops the format" {
+	let msg = ""
+	try {
+		format("function f() {\n\tfor (const i of 0 ... ) {}\n\tconst x = a + (b *\n")
+	} catch (e: SyntaxError) {
+		msg = e.msg
+	}
+	assert msg == "expected an expression, got )"
+}
