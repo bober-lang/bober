@@ -1,0 +1,744 @@
+//! Tests of src/lower.bob: small sources lowered, their bytecode shown.
+
+import * as op from "./bc/op"
+import { show } from "./bc/show"
+import { CompileError } from "./error"
+import { lower } from "./lower"
+
+/// The bytecode of main.bob of source src shown, where it imports lib.bob of source lib: the module's top-level decls,
+/// its vars in the order its init runs them and the modules it depends on, then each decl it has.
+function lowered(src: string, lib: string = ""): string {
+	const p = lower(["main.bob"], [], path => if (path == "main.bob") src else if (path == "lib.bob") lib else null)
+	const m = p.module("main.bob")
+	const names = (ds: i32[]) => ds.map(d => p.strings[p.decls[d].name]).join(", ")
+	const deps = p.modules[m].deps.map(d => p.modules[d].path).join(", ")
+	return `module main.bob [${names(p.modules[m].decls)}] inits [${names(p.modules[m].inits)}] deps [${deps}]\n${show(p, m)}`
+}
+
+test "declarations, their mods, and variables in the order they initialize" {
+	assert lowered(`export const a = b + 1
+let c = [a, 2]
+const b: i32 = 3
+type T = i32 | "s"
+function f(x: T): T { return x }
+test "t" { assert c.length == 2 }`) == `module main.bob [b, a, c, f, t] inits [b, a, c] deps []
+readonly var b: i32
+	Int i32 3
+End
+export readonly var a: i32
+	Global b
+	Int i32 1
+	Add
+End
+var c: i32[]
+	Global a
+	Int i32 2
+	Array i32[] 2 []
+End
+function f: (i32 | "s") => i32 | "s"
+	locals x: i32 | "s"
+	Local 0
+	Return
+End
+test t: () => null
+	Global c
+	Field "length"
+	Int i32 2
+	Eq
+	Assert
+End
+`
+}
+
+test "a decl of another module is referred to as is, its module a dep" {
+	assert lowered(`import { h } from "./lib"
+function g(): i32 { return h() + h() }`, `export function h(): i32 { return 1 }`) == `module main.bob [g] inits [] deps [lib.bob]
+function g: () => i32
+	Call h
+	Call h
+	Add
+	Return
+End
+`
+}
+
+test "class members are decls; fields by Member, interface methods by name" {
+	assert lowered(`interface Shape { area(): f64 }
+class Sq implements Shape {
+	static count = 0
+	private readonly side: f64
+	constructor(side: f64) { this.side = side; Sq.count++ }
+	area(): f64 { return this.side * this.side }
+}
+function total(s: Shape): f64 { return s.area() + new Sq(2.0).area() }`) == `module main.bob [Shape, Sq, total] inits [count] deps []
+interface Shape
+function Shape.area: () => f64
+class Sq implements Shape
+static var Sq.count: i32
+	Int i32 0
+End
+private readonly var Sq.side: f64
+function Sq.constructor: (f64) => null
+	locals readonly this: Sq, side: f64
+	Local 0
+	Local 1
+	SetMember Sq.side
+	Global Sq.count
+	Int i32 1
+	Add
+	SetGlobal Sq.count
+End
+function Sq.area: () => f64
+	locals readonly this: Sq
+	Local 0
+	Member Sq.side
+	Local 0
+	Member Sq.side
+	Mul
+	Return
+End
+function total: (Shape) => f64
+	locals s: Shape
+	Local 0
+	CallMethod "area" 0
+	Float f64 2
+	New Sq
+	Call Sq.area
+	Add
+	Return
+End
+`
+}
+
+test "generics have type params, which Params name, and calls pass their type args" {
+	assert lowered(`class Box[T] {
+	v: T
+	constructor(v: T) { this.v = v }
+	get(): T { return this.v }
+}
+function id[T](x: T): T { return x }
+function use(): i32 { return new Box[i32](id(1)).get() }`) == `module main.bob [Box, id, use] inits [] deps []
+class Box[T]
+var Box.v: T
+function Box.constructor: (T) => null
+	locals readonly this: Box[T], v: T
+	Local 0
+	Local 1
+	SetMember Box.v
+End
+function Box.get: () => T
+	locals readonly this: Box[T]
+	Local 0
+	Member Box.v
+	Return
+End
+function id[T]: (T) => T
+	locals x: T
+	Local 0
+	Return
+End
+function use: () => i32
+	Int i32 1
+	Call id [i32]
+	New Box[i32]
+	Call Box.get [i32]
+	Return
+End
+`
+}
+
+test "loops are blocks that br leaves" {
+	assert lowered(`function f(xs: i32[]): i32 {
+	let s = 0
+	for (const i of 0 ... 3) {
+		if (i == 1) { continue }
+		s += i
+	}
+	for (const x of xs) { break }
+	while (s < 10) { s++ }
+	return s
+}`) == `module main.bob [f] inits [] deps []
+function f: (i32[]) => i32
+	locals xs: i32[], s: i32, _: i32, _: i32, readonly i: i32, readonly x: i32
+	Int i32 0
+	SetLocal 1
+	Block none
+		Int i32 0
+		SetLocal 2
+		Int i32 3
+		SetLocal 3
+		Local 2
+		Local 3
+		Gt
+		BrIf 0
+		Loop
+			Block none
+				Local 2
+				SetLocal 4
+				Local 4
+				Int i32 1
+				Eq
+				If none
+					Br 1
+				End
+				Local 1
+				Local 4
+				Add
+				SetLocal 1
+			End
+			Local 2
+			Local 3
+			Eq
+			BrIf 1
+			Local 2
+			Int i32 1
+			Add
+			SetLocal 2
+			Br 0
+		End
+	End
+	Block none
+		Local 0
+		Each 5
+			Br 1
+		End
+	End
+	Block none
+		Loop
+			Local 1
+			Int i32 10
+			Lt
+			Not
+			BrIf 1
+			Local 1
+			Int i32 1
+			Add
+			SetLocal 1
+			Br 0
+		End
+	End
+	Local 1
+	Return
+End
+`
+}
+
+test "a switch is a chain of Ifs on a readonly subject" {
+	assert lowered(`function f(s: i32): string {
+	switch (s) {
+		case 1, 2: return "a"
+		default: s = 1
+	}
+	return switch (s) {
+		case 0 ... 9: "digit"
+		default: "b"
+	}
+}`) == `module main.bob [f] inits [] deps []
+function f: (i32) => string
+	locals s: i32, readonly _: i32, readonly _: i32
+	Local 0
+	SetLocal 1
+	Local 1
+	Int i32 1
+	Eq
+	Local 1
+	Int i32 2
+	Eq
+	Or
+	If none
+		Str "a"
+		Return
+	Else
+		Int i32 1
+		SetLocal 0
+	End
+	Local 0
+	SetLocal 2
+	Local 2
+	Int i32 0
+	Ge
+	If bool
+		Local 2
+		Int i32 9
+		Le
+	Else
+		False
+	End
+	If string
+		Str "digit"
+	Else
+		Str "b"
+	End
+	Return
+End
+`
+}
+
+test "try, catch and finally" {
+	assert lowered(`function f(): i32 {
+	try {
+		throw "x"
+	} catch (e: string) {
+		print(e)
+	} finally {
+		return 2
+	}
+}`) == `module main.bob [f] inits [] deps [builtin/io.bob]
+function f: () => i32
+	locals _: string, e: string
+	Try
+		Str "x"
+		Throw
+	Catch string 0
+		Local 0
+		SetLocal 1
+		Local 1
+		Call print [string]
+		Drop
+	Finally
+		Int i32 2
+		Return
+	End
+	Unreachable
+End
+`
+}
+
+test "closures capture locals by reference, after their params" {
+	assert lowered(`function f(): () => i32 {
+	let n = 1
+	const add = (k: i32) => { n += k }
+	function get(): i32 { return n }
+	add(2)
+	return get
+}`) == `module main.bob [f] inits [] deps []
+function f: () => () => i32
+	locals n: i32, readonly add: (i32) => null, get: () => i32
+	Fresh 0
+	Int i32 1
+	SetLocal 0
+	Closure f.59 [0]
+	SetLocal 1
+	Closure f.get [0]
+	SetLocal 2
+	Local 1
+	Int i32 2
+	CallRef 1
+	Drop
+	Local 2
+	Return
+End
+function f.59: (i32) => null
+	locals k: i32, n: i32
+	captures 1
+	Local 1
+	Local 0
+	Add
+	SetLocal 1
+End
+function f.get: () => i32
+	locals n: i32
+	captures 0
+	Local 0
+	Return
+End
+`
+}
+
+test "calls convert their args, pass Missing for defaults and pack rest args" {
+	assert lowered(`function f(x: i32 | null, y = 2, ...zs: i32[]): i32 { return x ?? y }
+function g(): i32 { return f(1) + f(null, 3, 4, 5) }`) == `module main.bob [f, g] inits [] deps []
+function f: (i32 | null, optional i32, ...i32[]) => i32
+	locals x: i32 | null, y: i32, zs: i32[], _: i32 | null
+	Default 1
+		Int i32 2
+	End
+	Local 0
+	SetLocal 3
+	Local 3
+	Is null
+	If i32
+		Local 1
+	Else
+		Local 3
+		Cast i32
+	End
+	Return
+End
+function g: () => i32
+	Int i32 1
+	Cast i32 | null
+	Missing optional i32
+	Array i32[] 0 []
+	Call f
+	Null
+	Cast i32 | null
+	Int i32 3
+	Int i32 4
+	Int i32 5
+	Array i32[] 2 []
+	Call f
+	Add
+	Return
+End
+`
+}
+
+test "a compound assignment reads its target before its operand" {
+	assert lowered(`let n = 1
+function g(): i32 { n = 5; return 1 }
+function f() { n += g() }`) == `module main.bob [n, g, f] inits [n] deps []
+var n: i32
+	Int i32 1
+End
+function g: () => i32
+	Int i32 5
+	SetGlobal n
+	Int i32 1
+	Return
+End
+function f: () => null
+	Global n
+	Call g
+	Add
+	SetGlobal n
+End
+`
+}
+
+test "an object literal sets its parts in source order; an embedded field's initializer is copied into place" {
+	assert lowered(`class P {
+	x = 1
+}
+class Q {
+	p: ...P = { x: 2 }
+}
+function f(a: { x: i32 }, b: { z: i32 }): i32 {
+	const o = { ...a, y: 1, ...b }
+	return o.x
+}`) == `module main.bob [P, Q, f] inits [] deps []
+class P
+var P.x: i32
+	locals readonly this: P
+	Int i32 1
+End
+class Q
+embed var Q.p: P
+	locals readonly this: Q
+	Local 0
+	Int i32 2
+	Object { x: i32 } 1 []
+	SetField "p"
+	Local 0
+	Field "p"
+End
+function f: ({ x: i32 }, { z: i32 }) => i32
+	locals a: { x: i32 }, b: { z: i32 }, readonly o: { x: i32, y: i32, z: i32 }, _: { x: i32, y: i32, z: i32 }
+	Local 0
+	Object { x: i32, y: i32, z: i32 } 1 [0]
+	SetLocal 3
+	Local 3
+	Int i32 1
+	SetField "y"
+	Local 3
+	Local 1
+	Object { x: i32, y: i32, z: i32 } 2 [0, 1]
+	SetLocal 3
+	Local 3
+	SetLocal 2
+	Local 2
+	Field "x"
+	Return
+End
+`
+}
+
+test "patterns, optional chains, ?? and templates" {
+	assert lowered([
+		"function f(p: [i32, string], o: {a: i32, b: string | null} | null): string {",
+		"\tconst [x, s] = p",
+		"\tconst {a, b = \"d\"} = o ?? {a: 1, b: null}",
+		"\tconst v: i32 | string | null = x",
+		"\treturn `${s}:${o?.b ?? \"none\"}${v == null}`",
+		"}",
+	].join("\n")) == `module main.bob [f] inits [] deps [builtin/show.bob]
+function f: ([i32, string], null | { a: i32, b: null | string }) => string
+	locals p: [i32, string], o: null | { a: i32, b: null | string }, _: [i32, string], readonly x: i32, readonly s: string, _: null | { a: i32, b: null | string }, _: { a: i32, b: null | string }, readonly a: i32, _: null | string, readonly b: string, readonly v: i32 | null | string, _: null | string
+	Local 0
+	SetLocal 2
+	Local 2
+	Field "0"
+	SetLocal 3
+	Local 2
+	Field "1"
+	SetLocal 4
+	Local 1
+	SetLocal 5
+	Local 5
+	Is null
+	If { a: i32, b: null | string }
+		Int i32 1
+		Null
+		Cast null | string
+		Object { a: i32, b: null | string } 2 []
+	Else
+		Local 5
+		Cast { a: i32, b: null | string }
+	End
+	SetLocal 6
+	Local 6
+	Field "a"
+	SetLocal 7
+	Local 6
+	Field "b"
+	SetLocal 8
+	Local 8
+	Is null
+	If string
+		Str "d"
+	Else
+		Local 8
+		Cast string
+	End
+	SetLocal 9
+	Local 3
+	Cast i32 | null | string
+	SetLocal 10
+	Local 4
+	Str ":"
+	Add
+	Block null | string
+		Local 1
+		BrNull 0
+		Field "b"
+	End
+	SetLocal 11
+	Local 11
+	Is null
+	If string
+		Str "none"
+	Else
+		Local 11
+		Cast string
+	End
+	Add
+	Local 10
+	Is null
+	Call show [bool]
+	Add
+	Return
+End
+`
+}
+
+test "a static switch, and a static called through a type param" {
+	assert lowered(`class Auto[K] {
+	static hash(k: K): u64 {
+		switch (K.kind) {
+			case "int": return k as u64
+			default: return 0
+		}
+	}
+}
+interface Hasher[K] { static hash(k: K): u64 }
+function h[K, H extends Hasher[K]](k: K): u64 { return H.hash(k) + Auto[K].hash(k) }`) == `module main.bob [Auto, Hasher, h] inits [] deps []
+class Auto[K]
+static function Auto.hash: (K) => u64
+	locals k: K, readonly _: "string" | "null" | "literal" | "interface" | "class" | "async" | "int" | "tuple" | "array" | "object" | "union" | "type" | "function" | "fixed" | "float" | "bool"
+	Type K
+	Field "kind"
+	SetLocal 1
+	Local 1
+	Str "int"
+	Cast "string" | "null" | "literal" | "interface" | "class" | "async" | "int" | "tuple" | "array" | "object" | "union" | "type" | "function" | "fixed" | "float" | "bool"
+	Eq
+	If none
+		Local 0
+		Cast u64
+		Return
+	Else
+		Int u64 0
+		Return
+	End
+	Unreachable
+End
+interface Hasher[K]
+static function Hasher.hash: (K) => u64
+function h[K, H extends Hasher[K]]: (K) => u64
+	locals k: K
+	Type H
+	Local 0
+	CallMethod "hash" 1
+	Local 0
+	Call Auto.hash [K]
+	Add
+	Return
+End
+`
+}
+
+test "a static if is an If, an unrolled for an Each of a readonly local" {
+	assert lowered(`function f[T](x: T): string {
+	if (T == i32) { return "int" }
+	const xs: [i32, string] = [1, "a"]
+	for (const m of xs) { print(m) }
+	return "other"
+}
+function g(): string { return f(1) }
+function names(o: {a: i32, b: string}) {
+	for (const f of (typeof o).fields) { print(f.name) }
+}`) == `module main.bob [f, g, names] inits [] deps [builtin/io.bob]
+function f[T]: (T) => string
+	locals x: T, readonly xs: [i32, string], readonly m: i32 | string
+	Type T
+	Type i32
+	Eq
+	If none
+		Str "int"
+		Return
+	Else
+		Int i32 1
+		Str "a"
+		Array [i32, string] 2 []
+		SetLocal 1
+		Block none
+			Local 1
+			Each 2
+				Local 2
+				Call print [i32 | string]
+				Drop
+			End
+		End
+		Str "other"
+		Return
+	End
+	Unreachable
+End
+function g: () => string
+	Int i32 1
+	Call f [i32]
+	Return
+End
+function names: ({ a: i32, b: string }) => null
+	locals o: { a: i32, b: string }, readonly f: { name: string, type: Type, readonly: bool, doc: string, tags: Type[] }
+	Block none
+		Type { a: i32, b: string }
+		Field "fields"
+		Each 1
+			Local 1
+			Field "name"
+			Call print [string]
+			Drop
+		End
+	End
+End
+`
+}
+
+test "a promoted member is reached through the field embedding it; a tuple's element by its index's value" {
+	assert lowered(`class E {
+	x = 1
+	get(): i32 { return this.x }
+}
+class O { ...E }
+function f(o: O, t: [i32, string]): i32 {
+	o.x = t[0x0]
+	return o.get() + t[(1)].length
+}`) == `module main.bob [E, O, f] inits [] deps []
+class E
+var E.x: i32
+	locals readonly this: E
+	Int i32 1
+End
+function E.get: () => i32
+	locals readonly this: E
+	Local 0
+	Member E.x
+	Return
+End
+class O
+embed var O.E: E
+function f: (O, [i32, string]) => i32
+	locals o: O, t: [i32, string]
+	Local 0
+	Member O.E
+	Local 1
+	Field "0"
+	SetMember E.x
+	Local 0
+	Member O.E
+	Call E.get
+	Local 1
+	Field "1"
+	Field "length"
+	Add
+	Return
+End
+`
+}
+
+test "a subscript of types not known statically is read at run time" {
+	assert lowered("function f(ts: Type[]): Type { return ts[0] }") == `module main.bob [f] inits [] deps []
+function f: (Type[]) => Type
+	locals readonly ts: Type[]
+	Local 0
+	Int i32 0
+	Subscript
+	Return
+End
+`
+}
+
+test "each op carries the position of its construct" {
+	const p = lower(["main.bob"], [], path => if (path == "main.bob") "function f(): i32 {\n\treturn 1 + 2\n}" else null)
+	const c = p.decls[p.find(p.module("main.bob"), -1, "f")].code!
+	const ps: string[] = []
+	for (const i of 0 ... c.ops.length - 1) {
+		ps.push(`${op.names[c.ops[i]]} ${c.pos[i]}`)
+	}
+	assert ps.join(", ") == "Int 28, Int 32, Add 30, Return 21, End 18"
+}
+
+test "a closure in an Each's body captures the local a type param it narrows to is Of" {
+	assert lowered(`function w[T](v: T) {
+	for (const M of T.members) {
+		if (v instanceof M) {
+			const g = (x: M, n: i32): M => x
+			print(g(v, 1))
+		}
+	}
+}`) == `module main.bob [w] inits [] deps [builtin/io.bob]
+function w[T]: (T) => null
+	locals v: T, readonly M: Type, readonly g: (Of 1, i32) => Of 1
+	Block none
+		Type T
+		Field "members"
+		Each 1
+			Local 0
+			Is Of 1
+			If none
+				Closure w.107 [T] [1]
+				SetLocal 2
+				Local 2
+				Local 0
+				Cast Of 1
+				Int i32 1
+				CallRef 2
+				Call print [Of 1]
+				Drop
+			End
+		End
+	End
+End
+function w.107: (Of 2, i32) => Of 2
+	locals x: Of 2, n: i32, readonly M: Type
+	captures 2
+	Local 0
+	Return
+End
+`
+}
+
+test "spawn is not lowered" {
+	assert lowered("function g(): null {\n\tconst h = spawn g()\n}") throws new CompileError("main.bob:2:12: unsupported: spawn")
+}
