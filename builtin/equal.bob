@@ -1,0 +1,53 @@
+//! Equality by value, which == and != in an assert are lowered to (§5.5), and the string literal a string spells.
+
+import { trap, zero } from "./mem"
+
+/// Whether a and b hold the same value: as == compares them, or else arrays and tuples element by element, objects and
+/// classes field by field, and a union's members by tag and then value.
+export function equal[T](a: T, b: T): bool {
+	if (a == b) {
+		return true
+	}
+	const t = typeof a
+	switch (t.kind) {
+		case "union":
+			for (const M of t.members) {
+				if (a instanceof M) {
+					return b instanceof M && equal(a, b)
+				}
+			}
+			return false
+		case "array":
+			if (a.length != b.length) {
+				return false
+			}
+			for (const i of 0 ... a.length - 1) {
+				if (!equal(a[i], b[i])) {
+					return false
+				}
+			}
+			return true
+		case "tuple", "object", "class", "interface":
+			for (const f of t.fields) {
+				if (!equal(a[f.name], b[f.name])) {
+					return false
+				}
+			}
+			return true
+		default: return false
+	}
+}
+
+/// The literal of T, a string literal type or a union of them, that s spells: the program's one value of it (§4.2),
+/// which s as T is; traps if there is none.
+export function literal[T](s: string): T {
+	for (const M of T.members) {
+		if (M.kind == "literal") {
+			if (s == M.value) {
+				return M.value
+			}
+		}
+	}
+	trap("not a literal of the type")
+	return zero[T]()
+}

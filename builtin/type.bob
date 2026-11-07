@@ -1,5 +1,7 @@
 //! Type, what a type used as a value is (§4.11), which only the compiler makes.
 
+import { array, load } from "./mem"
+
 /// What kind of type a Type is, `"type"` that of Type itself.
 export type Kind = "null" | "bool" | "int" | "float" | "string" | "literal" | "array" | "fixed" | "tuple" | "object"
 	| "class" | "interface" | "function" | "async" | "union" | "type"
@@ -19,14 +21,14 @@ export type Field = { name: string, type: Type, readonly: bool, doc: string, tag
 /// holding a static value, the binding of an unrolled `for`, a member or subscript of a static value, or `!`, `&&`,
 /// `||`, `==` or `!=` of static operands. Only a static `Type` stands for a type where one is expected. A `for` over a
 /// static array or tuple is *unrolled*: its body is compiled once per element, in order, with the binding static. An
-/// `if` or `switch` whose condition or subject is static and depends on a `Type` compiles only the branch it takes; the
-/// others are parsed but not checked. Such an `if` without `else` whose block ends in `return`, `throw`, `break` or
+/// `if` or `switch` whose condition or subject is static and depends on a `Type` takes its branch when compiling; every
+/// branch is checked. Such an `if` without `else` whose block ends in `return`, `throw`, `break` or
 /// `continue` has the statements after it in its block as its `else`. Where the branch is taken by a type parameter's
-/// `kind`, the parameter is narrowed within it: to `string`, `bool` or `null`, to an array of its `elem` or a fixed
+/// `kind`, the parameter is narrowed within it: to `string`, `bool`, `null` or `Type`, to an array of its `elem` or a fixed
 /// array of it where it has a zero value (§5.1), to the number types of its kind, to a literal, or to the types of its
 /// kind in its type set, else its constraint; with several labels, to any of what each makes it. An operation on a
-/// value of the parameter's type shall be allowed for every type it may be. Such a `switch` shall cover every value of
-/// its subject or have a `default` (§6.7).
+/// value of the parameter's type shall be allowed for every type it may be, as for a type set's parameter (§4.9).
+/// Such a `switch` shall cover every value of its subject or have a `default` (§6.7).
 /// A subscript of an object, class or tuple by a static string is the field it names, as with `.`.
 ///
 /// ```
@@ -70,8 +72,67 @@ export interface Type {
 	members: Type[]
 	/// An array's or fixed array's element.
 	elem: Type
-	/// A fixed array's n.
+	/// A fixed array's n, a function's number of params, else 0.
 	length: i32
-	/// A literal's value.
-	value: string | bool | null
+	/// A literal's value; an integer literal's as an i64, which a u64 above its range wraps to.
+	value: string | bool | i64 | null
+}
+
+// In a program as lowered, as a debug build's is, a Type is the address of its descriptor, src/rt.h's bober_type, from
+// which emit reads a field of one by the function here of its name, t that address: kind by typeKind, and so on. Mono
+// leaves no Type, and these out.
+
+export function typeKind(t: u64): string { return load[string](t + 88) }
+
+export function typeName(t: u64): string { return load[string](t + 40) }
+
+export function typeDoc(t: u64): string { return load[string](t + 64) }
+
+export function typeElem(t: u64): Type { return load[Type](t + 112) }
+
+export function typeBase(t: u64): Type { return load[Type](t + 120) }
+
+export function typeLength(t: u64): i32 {
+	const k = typeKind(t)
+	return if (k == "fixed" || k == "function") load[i64](t + 128) as i32 else 0
+}
+
+export function typeValue(t: u64): string | bool | i64 | null {
+	if (typeKind(t) != "literal") {
+		return null
+	}
+	switch (typeKind(load[u64](t + 112))) {
+		case "string": return load[string](t + 136)
+		case "bool": return load[i64](t + 128) != 0
+		case "int": return load[i64](t + 128)
+	}
+	return null
+}
+
+export function typeMembers(t: u64): Type[] { return if (typeKind(t) == "union") parts(t) else [] }
+
+export function typeArgs(t: u64): Type[] { return if (typeKind(t) == "class" || typeKind(t) == "interface") parts(t) else [] }
+
+export function typeTags(t: u64): Type[] { return types(load[i64](t + 256), load[u64](t + 264)) }
+
+export function typeFields(t: u64): Field[] {
+	const fs = array[Field](load[i64](t + 176))
+	for (const i of 0 ... load[i64](t + 176) - 1) {
+		const f = load[u64](t + 184) + (i as u64) * 88
+		const readonly = (load[i64](f + 56) & 8) != 0
+		const tags = types(load[i64](f + 72), load[u64](f + 80))
+		fs[i] = { name: load[string](f), type: load[Type](f + 48), readonly: readonly, doc: load[string](f + 24), tags: tags }
+	}
+	return fs
+}
+
+function parts(t: u64): Type[] { return types(load[i64](t + 160), load[u64](t + 168)) }
+
+/// The n Types listed at p.
+function types(n: i64, p: u64): Type[] {
+	const ts = array[Type](n)
+	for (const i of 0 ... n - 1) {
+		ts[i] = load[Type](p + (i as u64) * 8)
+	}
+	return ts
 }

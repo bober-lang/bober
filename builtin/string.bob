@@ -1,0 +1,152 @@
+//! string (§4.3): its methods, and what the compiler lowers its operators to. A string is 24 bytes held in place,
+//! the last 8 a ref: one of up to 15 bytes has its length in byte 0, its bytes after it and a null ref; a longer one
+//! has 0xff in byte 0 and its length in the 7 bytes after, then where its bytes are in the buffer the ref refers to,
+//! or their address if it is null.
+
+import { elements } from "./array"
+import { Ref, addr, alloc, deref, load, memcmp, memcpy, store, trap } from "./mem"
+
+/// The methods of a string, which is this.
+///
+/// ## Strings
+///
+/// Strings are immutable sequences of code units: `u8` for `string`, `u16` for `string16`, `u32` for `string32`.
+/// `s.length` is the number of code units as an `i32`, `s[i]` is code unit `i` and traps out of range, `s.at(i)` is it
+/// or `null` out of range, `+` concatenates, and the comparison operators compare code units. A string literal is a
+/// `string`. Equal string literals are one value (§4.2).
+export class String {
+	/// How many code units it has, read from its header by the compiler.
+	readonly length: i32
+
+	/// The code unit at i, or null outside the string.
+	at(i: i32): u8 | null {
+		return if (i >= 0 && i < this.length) this[i] else null
+	}
+
+	/// It in bytes of its own, as a long slice shares those of the string it is of, keeping it alive.
+	copy(): string {
+		const p = addr(this)
+		if (load[u8](p) != 0xff) {
+			return this
+		}
+		const n = lenAt(p)
+		const buf = full(n)
+		memcpy(deref(buf) + 16, bytesAt(p), n as u64) // where they are once allocating may have moved them
+		return shared(buf, 16, n)
+	}
+
+	/// The code units from from up to to; a long piece shares this's bytes.
+	slice(from: i32, to: i32): string {
+		const p = addr(this)
+		if (from < 0 || from > to || (to as i64) > lenAt(p)) {
+			trap("slice out of range")
+		}
+		const n = (to - from) as i64
+		return if (n <= 15) copy(bytesAt(p) + (from as u64), n) else shared(load[Ref](p + 16), load[u64](p + 8) + (from as u64), n)
+	}
+}
+
+/// The length of the string at p.
+export function lenAt(p: u64): i64 {
+	const h = load[u64](p)
+	return if ((h & 0xff) == 0xff) (h >> 8) as i64 else (h & 0xff) as i64
+}
+
+/// Where the bytes of the string at p are.
+export function bytesAt(p: u64): u64 { return if (load[u8](p) == 0xff) deref(load[Ref](p + 16)) + load[u64](p + 8) else p + 1 }
+
+/// A string of a copy of the n bytes at p, which the collector does not move: in place if they fit, else in a new buffer.
+export function copy(p: u64, n: i64): string {
+	if (n > 15) {
+		const buf = full(n)
+		memcpy(deref(buf) + 16, p, n as u64)
+		return shared(buf, 16, n)
+	}
+	let w: u64[3]
+	const q = addr(w)
+	store[u8](q, n as u8)
+	memcpy(q + 1, p, n as u64)
+	return load[string](q)
+}
+
+/// A long string of the n bytes at offset at in buf, or at address at if buf is null, which shall never change.
+export function shared(buf: Ref, at: u64, n: i64): string {
+	let w: u64[3]
+	const q = addr(w)
+	store[u64](q, ((n as u64) << 8) | 0xff)
+	store[u64](q + 8, at)
+	store[Ref](q + 16, buf)
+	return load[string](q)
+}
+
+/// a + b. A long one is b appended in place to a's buffer if a ends where it is used up and it has room, so that a
+/// string grown by += takes amortized constant time per append; else both in a new buffer of twice the room needed.
+/// A buffer is its capacity, how much is used and the bytes.
+export function concat(a: string, b: string): string {
+	const an = lenAt(addr(a))
+	const bn = lenAt(addr(b))
+	const n = an + bn
+	if (n <= 15) {
+		let w: u8[15]
+		memcpy(addr(w), bytesAt(addr(a)), an as u64)
+		memcpy(addr(w) + (an as u64), bytesAt(addr(b)), bn as u64)
+		return copy(addr(w), n)
+	}
+	const pa = addr(a)
+	let buf = load[Ref](pa + 16)
+	const old = deref(buf)
+	if (old == 0 || load[u64](pa + 8) + (an as u64) != 16 + load[u64](old + 8) || load[i64](old + 8) + bn > load[i64](old)) {
+		buf = alloc[u8](16 + 2 * n + 16)
+		const q = deref(buf)
+		store[i64](q, 2 * n + 16)
+		store[i64](q + 8, an)
+		memcpy(q + 16, bytesAt(addr(a)), an as u64)
+	}
+	const q = deref(buf)
+	const used = load[u64](q + 8)
+	memcpy(q + 16 + used, bytesAt(addr(b)), bn as u64)
+	store[u64](q + 8, used + (bn as u64))
+	return shared(buf, 16 + used - (an as u64), n)
+}
+
+/// A buffer as concat's for n bytes, all used, for the caller to put at 16 on. Every long string's buffer is one,
+/// lest concat take the first 16 of its bytes for a capacity and use with room to append in place.
+function full(n: i64): Ref {
+	const buf = alloc[u8](16 + n)
+	store[i64](deref(buf), n)
+	store[i64](deref(buf) + 8, n)
+	return buf
+}
+
+/// a == b.
+export function strEq(a: string, b: string): bool {
+	const pa = addr(a)
+	const pb = addr(b)
+	const n = lenAt(pa)
+	return n == lenAt(pb) && memcmp(bytesAt(pa), bytesAt(pb), n as u64) == 0
+}
+
+/// Below, at or above 0 as a is before, equal to or after b, by code units.
+export function strCompare(a: string, b: string): i32 {
+	const pa = addr(a)
+	const pb = addr(b)
+	const an = lenAt(pa)
+	const bn = lenAt(pb)
+	const c = memcmp(bytesAt(pa), bytesAt(pb), (if (an < bn) an else bn) as u64)
+	return if (c != 0) c else if (an < bn) -1 else if (an > bn) 1 else 0
+}
+
+/// The string of the code unit c.
+export function chr(c: u8): string {
+	let b: u8[1]
+	b[0] = c
+	return copy(addr(b), 1)
+}
+
+/// The string of the bytes, copied.
+export function fromBytes(bytes: u8[]): string {
+	const n = bytes.length as i64
+	const buf = full(n)
+	memcpy(deref(buf) + 16, elements(addr(bytes)), n as u64)
+	return shared(buf, 16, n)
+}

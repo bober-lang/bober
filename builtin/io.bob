@@ -1,0 +1,80 @@
+//! The prelude's I/O, on the run time's (src/rt.h).
+
+import { BOBER_ARCH, BOBER_OS, bober_arg, bober_free, bober_id, bober_malloc, bober_now, bober_random, bober_realloc,
+	bober_io_close, bober_io_open, bober_io_read, bober_io_write } from "../src/rt.h"
+
+import { fromC, fromCN } from "./c"
+import { addr } from "./mem"
+import { bytesAt, lenAt } from "./string"
+
+export function print[T](x: T) { put(1, `${x}\n`) }
+
+/// Writes s to fd; whether all of it was.
+function put(fd: i32, s: string): bool {
+	const p = addr(s)
+	let at = bytesAt(p)
+	let n = lenAt(p)
+	while (n > 0) {
+		const w = bober_io_write(fd, at, n as u64)
+		if (w <= 0) {
+			return false
+		}
+		at += w as u64
+		n -= w
+	}
+	return true
+}
+
+/// The bytes of the file at path, or null if it cannot be read.
+export function readFile(path: string): string | null {
+	const fd = bober_io_open(path, "r") as i32
+	if (fd < 0) {
+		return null
+	}
+	let cap: u64 = 1 << 16
+	let buf = bober_malloc(cap)
+	let n: u64 = 0
+	while (true) {
+		const r = bober_io_read(fd, buf + n, cap - n)
+		if (r <= 0) {
+			bober_io_close(fd)
+			const s = if (r < 0) null else fromCN(buf, n)
+			bober_free(buf)
+			return s
+		}
+		n += r as u64
+		if (n == cap) {
+			cap *= 2
+			buf = bober_realloc(buf, cap)
+		}
+	}
+}
+
+/// Makes the file at path hold s; whether it does.
+export function writeFile(path: string, s: string): bool {
+	const fd = bober_io_open(path, "w") as i32
+	if (fd < 0) {
+		return false
+	}
+	const ok = put(fd, s)
+	return bober_io_close(fd) == 0 && ok
+}
+
+/// The program's arguments after its name.
+export function args(): string[] {
+	const r: string[] = []
+	let i = 1
+	while (bober_arg(i) != 0) {
+		r.push(fromC(bober_arg(i)))
+		i += 1
+	}
+	return r
+}
+
+export function targetOs(): string { return BOBER_OS }
+export function targetArch(): string { return BOBER_ARCH }
+export function now(): i64 { return bober_now() }
+export function random(): u64 { return bober_random() }
+/// A number, from 1, that is x's alone while x lives, however the collector moves it: the identity == compares of a
+/// class instance, array or object. Of a string, number or other value it means nothing, and is never freed.
+export function idOf[T](x: T): u64 { return bober_id(addr(x)) }
