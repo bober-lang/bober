@@ -1,0 +1,139 @@
+import { decode, Short } from "../std/encoding/optarg"
+
+// Carves a maze with a randomized depth-first search, then solves it with BFS.
+// usage: bober run examples/maze.bob [-w width] [-h height] [-s seed]
+class Rng {
+	s: u64
+
+	constructor(seed: u64) { this.s = seed | 1 }
+
+	next(): u64 {
+		this.s ^= this.s << 13
+		this.s ^= this.s >> 7
+		this.s ^= this.s << 17
+		return this.s
+	}
+
+	below(n: i32): i32 { return (this.next() % (n as u64)) as i32 }
+}
+
+class Maze {
+	w: i32
+	h: i32
+	// the grid is (2w+1) x (2h+1) chars; cells sit at odd coordinates
+	open: bool[]
+
+	constructor(w: i32, h: i32) {
+		this.w = w
+		this.h = h
+		this.open = new bool[]((2 * w + 1) * (2 * h + 1))
+	}
+
+	cols(): i32 { return 2 * this.w + 1 }
+	at(x: i32, y: i32): i32 { return y * this.cols() + x }
+
+	carve(rng: Rng) {
+		const dx = [2, -2, 0, 0]
+		const dy = [0, 0, 2, -2]
+		const stack: i32[] = [this.at(1, 1)]
+		this.open[this.at(1, 1)] = true
+		while (stack.length > 0) {
+			const p = stack[stack.length - 1]
+			const x = p % this.cols()
+			const y = p / this.cols()
+			const choices: i32[] = []
+			for (const d of 0 ... 3) {
+				const nx = x + dx[d]
+				const ny = y + dy[d]
+				if (nx > 0 && ny > 0 && nx < 2 * this.w && ny < 2 * this.h && !this.open[this.at(nx, ny)]) {
+					choices.push(d)
+				}
+			}
+			if (choices.length == 0) {
+				stack.pop()
+			} else {
+				const d = choices[rng.below(choices.length)]
+				this.open[this.at(x + dx[d] / 2, y + dy[d] / 2)] = true
+				this.open[this.at(x + dx[d], y + dy[d])] = true
+				stack.push(this.at(x + dx[d], y + dy[d]))
+			}
+		}
+	}
+
+	// returns the grid indices on the shortest path from top-left to bottom-right
+	solve(): i32[] {
+		// where each visited index was reached from; 0, a wall, means not yet
+		const from = new i32[](this.open.length)
+		const start = this.at(1, 1)
+		const goal = this.at(2 * this.w - 1, 2 * this.h - 1)
+		const steps = [1, -1, this.cols(), -this.cols()]
+		const queue: i32[] = [start]
+		from[start] = start
+		let head = 0
+		while (head < queue.length && from[goal] == 0) {
+			const p = queue[head]
+			head++
+			for (const s of steps) {
+				const q = p + s
+				if (this.open[q] && from[q] == 0) {
+					from[q] = p
+					queue.push(q)
+				}
+			}
+		}
+		const path: i32[] = []
+		let p = goal
+		while (p != start) {
+			path.push(p)
+			p = from[p]
+		}
+		path.push(start)
+		return path
+	}
+
+	render(path: i32[]): string {
+		const onPath = new bool[](this.open.length)
+		for (const p of path) {
+			onPath[p] = true
+		}
+		const rows: string[] = []
+		for (const y of 0 ... 2 * this.h) {
+			let row = ""
+			for (const x of 0 ... 2 * this.w) {
+				const i = this.at(x, y)
+				row += if (!this.open[i]) "██" else if (onPath[i]) "\x1b[33m··\x1b[0m" else "  "
+			}
+			rows.push(row)
+		}
+		return rows.join("\n")
+	}
+}
+
+class Opts {
+	width: i32 @Short["w"] = 20
+	height: i32 @Short["h"] = 10
+	seed: i64 @Short["s"] = 0
+}
+
+function main() {
+	const o = decode[Opts](args())
+	const seed = if (o.seed != 0) o.seed else now()
+	const m = new Maze(o.width, o.height)
+	m.carve(new Rng(seed as u64))
+	const path = m.solve()
+	print(m.render(path))
+	// the path also steps through the gaps between cells
+	print(`${o.width}x${o.height} maze, seed ${seed}: the way out is ${(path.length + 1) / 2} cells long`)
+}
+
+test "every cell is reachable and the path joins the corners" {
+	const m = new Maze(7, 5)
+	m.carve(new Rng(3))
+	for (const y of 0 ... 4) {
+		for (const x of 0 ... 6) {
+			assert m.open[m.at(2 * x + 1, 2 * y + 1)]
+		}
+	}
+	const path = m.solve()
+	assert path[0] == m.at(13, 9) && path[path.length - 1] == m.at(1, 1)
+}
