@@ -11,6 +11,8 @@
 #endif
 #include <math.h>
 #include <pthread.h>
+#define GC_THREADS  // so that pthread_create registers the thread with the collector
+#include <gc.h>
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -54,7 +56,7 @@ static Val thrown, retval;
 static Node *thrownat;
 static int depth, argc_;
 static char **argv_;
-static Mod *mods, *prelude, *strmethods, *arrmethods;
+static Mod *mods, *prelude, *strmethods, *arrmethods, *mem;
 static Sym *s_length, *s_toString, *s_constructor, *s_main, *s_members, *s_value, *s_kind, *s_name, *s_fields, *s_elem, *s_tags, *s_base, *s_args, *s_field[4];
 static const char *primnames[] = {"null", "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "", "f32", "f64", "",
   "string"};
@@ -76,22 +78,14 @@ static Val call(Fn *fn, Val self, Val *args, int na, Node *site);
 static Class *instance(Class *c, Node *n, Frame *f);
 static Class *origin(Class *c) { return c->generic ? c->generic : c; }
 static Type *evaltype(Node *n, Frame *f);
+static Type *typeofv(Val v);
 static Val conv(Type *t, Val v);
 static Str *tostr(Val v);
 static Str *cat(Str *a, Str *b);
 static Val decl(Node *d, Frame *f);
 
-void *alloc(long n) {
-  static char *p, *end;
-  n = (n + 15) & ~15;
-  if (p + n > end) {
-    long size = n > (1 << 20) ? n : 1 << 20;
-    p = calloc(1, size), end = p + size;
-  }
-  void *r = p;
-  p += n;
-  return r;
-}
+// Zeroed memory from Boehm's collector, which finds pointers to it in stacks, globals and collected memory, not in malloc's.
+void *alloc(long n) { return GC_MALLOC(n); }
 
 Sym *intern(const char *s, int len) {
   static Sym *tab[4096];
@@ -334,7 +328,8 @@ static int dyn(Node *n) {
 
 static Type *evaltype(Node *n, Frame *f) {
   if (n->tc) return n->tc;
-  Type *t = totype(eval(n, f));
+  // In a type, | unites, also integer consts, which are literal types there.
+  Type *t = n->k == N_BIN && n->op == '|' ? unite(evaltype(n->a, f), evaltype(n->b, f)) : totype(eval(n, f));
   if (!(n->flags & F_DYN) && !dyn(n)) n->tc = t;
   n->flags |= F_DYN;
   return t;
@@ -430,6 +425,7 @@ static Type *pick(Type *t, Val v) {
   Type *num = 0, *flt = 0;
   for (int i = 0; i < t->n; i++) {
     Type *m = t->mem[i];
+    if (m->tk == T_LIT && isint(m->lit.k) && isint(v.k)) m = typeofv(m->lit); // stored as its base
     if (m->tk == T_PRIM ? m->prim == v.k : m->tk != T_LIT && is(v, m)) return m;
     if (m->tk != T_PRIM || !isnum(v.k) || !isnum(m->prim)) continue;
     if (!num && isflt(m->prim) == isflt(v.k)) num = m;
@@ -635,7 +631,7 @@ static Val member(Val o, Node *n, int bind) {
     if (s == s_fields) return A(fields(o.t, n));
     if (s == s_tags) return A(o.t->tk == T_CLASS ? tags(o.t->cls->def->d, o.t->cls->frame) : mkarr(0));
     if (s == s_args) return A(o.t->args ? o.t->args : mkarr(0));
-    if (o.t->base && s == s_base) return TY(o.t->base);
+    if (s == s_base) return TY(o.t->base ? o.t->base : o.t);
     if (o.t->tk == T_ARR && s == s_elem) return TY(o.t->elem ? o.t->elem : anytype);
     if (o.t->tk == T_ARR && o.t->n >= 0 && s == s_length) return I(K_I32, o.t->n);
     if (o.t->tk == T_LIT && s == s_value) return o.t->lit;
@@ -655,6 +651,11 @@ static Val member(Val o, Node *n, int bind) {
 }
 
 static int idx(Val i, int len, Node *n) {
+  if (i.k == K_STR) { // a tuple's field by the name fields gives it, its index
+    int k = 0;
+    for (int j = 0; j < i.s->len; j++) k = k * 10 + i.s->p[j] - '0';
+    i = I(K_I32, k);
+  }
   if (!isint(i.k) || i.i < 0 || i.i >= len) trap(n, "index out of range");
   return i.i;
 }
@@ -667,11 +668,6 @@ static Val subscript(Val o, Node *n, Frame *f) {
     return FN(fn);
   }
   Val i = n->n ? eval(n->v[0], f) : I(K_I32, -1);
-  if (n->n && o.k == K_ARR && i.k == K_STR) { // a tuple's field by the name fields gives it, its index
-    int k = 0;
-    for (int j = 0; j < i.s->len; j++) k = k * 10 + i.s->p[j] - '0';
-    i = I(K_I32, k);
-  }
   if (n->n && o.k == K_ARR) return o.a->v[idx(i, o.a->len, n)];
   if (n->n && o.k == K_OBJ && i.k == K_STR) {
     int k = field(o.o, intern(i.s->p, i.s->len), 0);
@@ -1066,7 +1062,7 @@ static Val decl(Node *d, Frame *f) {
 
 static Val call(Fn *fn, Val self, Val *args, int na, Node *site) {
   if (fn->self.k) self = fn->self;
-  if (fn->bi) return fn->bi(self, args, na, site);
+  if (fn->bi) return fn->bi(fn->nt ? fn->targs[0] : self, args, na, site);  // load[T] gets T as its self
   if (fn->sym) return ccall(fn, args, na, site);
   Node *d = fn->def;
   if (++depth > 100000) trap(site, "stack overflow");
@@ -1384,8 +1380,9 @@ static Val bi_writeFile(Val self, Val *a, int n, Node *site) {
 }
 
 static Val bi_args(Val self, Val *a, int n, Node *site) {
-  Arr *r = mkarr(argc_ - 3);
-  for (int i = 0; i < r->len; i++) r->v[i] = S(mkstr(argv_[i + 3], strlen(argv_[i + 3])));
+  int from = argc_ > 3 && !strcmp(argv_[3], "--") ? 4 : 3;  // as native bober, a -- after the file is dropped
+  Arr *r = mkarr(argc_ - from);
+  for (int i = 0; i < r->len; i++) r->v[i] = S(mkstr(argv_[i + from], strlen(argv_[i + from])));
   return A(r);
 }
 
@@ -1431,6 +1428,10 @@ static Val bi_fromBytes(Val self, Val *a, int n, Node *site) {
   return S(s);
 }
 
+/// std/c's C memory, which rt.c gives and boot does not link; bi_toC's strndup must match it.
+void *bober_malloc(uint64_t n) { return malloc(n ? n : 1); }
+void bober_free(void *p) { free(p); }
+
 static Val bi_toC(Val self, Val *a, int n, Node *site) {
   if (!n || a[0].k != K_STR || memchr(a[0].s->p, 0, a[0].s->len)) trap(site, "not a C string");
   return I(K_U64, (intptr_t)strndup(a[0].s->p, a[0].s->len));
@@ -1467,6 +1468,22 @@ static Val bi_poke(Val self, Val *a, int n, Node *site) {
   return NUL;
 }
 
+/// builtin/mem's addr: the address of a copy of x, as C holds it.
+static Val bi_addr(Val self, Val *a, int n, Node *site) {
+  if (!n) trap(site, "addr needs a value");
+  Type *t = typeofv(a[0]);
+  ffi_type *ct = cty(t, 1, site);
+  char *p = alloc(ct->size);
+  put(t, ct, a[0], p, site);
+  return I(K_U64, (intptr_t)p);
+}
+
+/// builtin/mem's load[T]: the T at address a[0], as C holds it.
+static Val bi_load(Val self, Val *a, int n, Node *site) {
+  if (self.k != K_TYPE || !n || !a[0].i) trap(site, "load from null");
+  return get(self.t, cty(self.t, 1, site), (char *)(intptr_t)a[0].i);
+}
+
 static Val bi_slice(Val self, Val *a, int n, Node *site) {
   int len = self.k == K_STR ? self.s->len : self.a->len;
   if (n < 2 || !isint(a[0].k) || !isint(a[1].k) || a[0].i < 0 || a[0].i > a[1].i || a[1].i > len)
@@ -1490,6 +1507,8 @@ static Val bi_at(Val self, Val *a, int n, Node *site) {
   return self.k == K_STR ? I(K_U8, (uint8_t)self.s->p[a[0].i]) : self.a->v[a[0].i];
 }
 
+static Val bi_copy(Val self, Val *a, int n, Node *site) { return self; }  // what it keeps alive does not matter here
+
 static Val bi_push(Val self, Val *a, int n, Node *site) {
   Arr *r = self.a;
   if (n != 1 && !(site->flags & F_SPREAD)) trap(site, "push takes one element");
@@ -1498,6 +1517,12 @@ static Val bi_push(Val self, Val *a, int n, Node *site) {
     r->v[r->len++] = conv(r->elem, a[i]);
   }
   return NUL;
+}
+
+static Val bi_append(Val self, Val *a, int n, Node *site) {
+  if (n != 1 || a[0].k != K_ARR) trap(site, "append takes an array");
+  Arr *xs = a[0].a;
+  return bi_push(self, xs->v, xs->len, &(Node){.flags = F_SPREAD});
 }
 
 static Val bi_map(Val self, Val *a, int n, Node *site) {
@@ -1541,6 +1566,13 @@ static Val bi_equals(Val self, Val *a, int n, Node *site) {
   for (int i = 0; i < self.a->len; i++)
     if (!eq(self.a->v[i], a[0].a->v[i])) return B(0);
   return B(1);
+}
+
+static Val bi_includes(Val self, Val *a, int n, Node *site) {
+  if (n != 1) trap(site, "includes takes a value");
+  for (int i = 0; i < self.a->len; i++)
+    if (eq(self.a->v[i], a[0])) return B(1);
+  return B(0);
 }
 
 static Val bi_pop(Val self, Val *a, int n, Node *site) {
@@ -1587,17 +1619,23 @@ static void init(void) {
   builtin(prelude, "toCN", bi_toCN);
   builtin(prelude, "peek", bi_peek);
   builtin(prelude, "poke", bi_poke);
+  mem = alloc(sizeof(Mod));
+  builtin(mem, "addr", bi_addr);
+  builtin(mem, "load", bi_load);
   builtin(strmethods, "slice", bi_slice);
   builtin(strmethods, "at", bi_at);
+  builtin(strmethods, "copy", bi_copy);
   builtin(arrmethods, "slice", bi_slice);
   builtin(arrmethods, "at", bi_at);
   builtin(arrmethods, "push", bi_push);
+  builtin(arrmethods, "append", bi_append);
   builtin(arrmethods, "map", bi_map);
   builtin(arrmethods, "filter", bi_filter);
   builtin(arrmethods, "some", bi_some);
   builtin(arrmethods, "every", bi_every);
   builtin(arrmethods, "find", bi_find);
   builtin(arrmethods, "equals", bi_equals);
+  builtin(arrmethods, "includes", bi_includes);
   builtin(arrmethods, "pop", bi_pop);
   builtin(arrmethods, "join", bi_join);
   s_length = intern("length", 6), s_toString = intern("toString", 8), s_members = intern("members", 7), s_value = intern("value", 5);
@@ -1615,10 +1653,12 @@ static void fatal(Node *n, const char *msg, const char *arg) {
 }
 
 static Mod *module(Mod *m, Str *src, int header);
+static char *rooted(const char *path);
 
 static Mod *load(const char *path, Node *site) {
   char *real = realpath(path, 0);
   if (!real) fatal(site, "cannot open ", path);
+  if (!strcmp(real, rooted("/builtin/mem.bob"))) return mem;  // its intrinsics have no body
   Mod **tail = &mods;
   for (; *tail; tail = &(*tail)->next) if (!strcmp((*tail)->path, real)) return *tail;
   Mod *m = *tail = alloc(sizeof(Mod));
@@ -1658,7 +1698,7 @@ static void glue(Mod *m, Node *s, Mod *bind, Val includes) {
   Str *path = cat(mkstr(s->file, slash ? slash + 1 - s->file : 0), s->val.s);
   Str *c = call(gval(lookup(bind, intern("glue", 4))).fn, NUL, (Val[]){S(path), A(syms)}, 2, s).s;
   if (!c->len) return;
-  Arr *dirs = call(gval(lookup(bind, intern("includesOf", 10))).fn, NUL, (Val[]){S(path), includes}, 2, s).a;
+  Arr *dirs = call(gval(lookup(bind, intern("includesOf", 10))).fn, NUL, (Val[]){S(tstr(s->file)), includes}, 2, s).a;
   char dir[] = "/tmp/boberXXXXXX", src[64], so[64];
   if (!mkdtemp(dir)) trap(s, "cannot make %s", dir);
   snprintf(src, sizeof src, "%s/glue.c", dir), snprintf(so, sizeof so, "%s/glue.so", dir);
@@ -1790,9 +1830,20 @@ static void *run(void *unused) {
   exit(isint(r.k) ? (int)r.i : 0);
 }
 
+long bober_io_run(const char *file, char *const *argv, const char *out);
+
+/// Stands in for src/backend/llvm/lld.cpp by running the system's linker args[0], ld.lld or ld64.lld, since the
+/// system's libLLVM has no LLD.
+int bober_lld(int n, const char **args) {
+  const char *argv[n + 1];
+  memcpy(argv, args, n * sizeof *args), argv[n] = 0;
+  return bober_io_run(args[0], (char *const *)argv, 0);
+}
+
 int main(int argc, char **argv) {
   pthread_attr_t attr;
   pthread_t t;
+  GC_INIT();
   argc_ = argc, argv_ = argv;
   setvbuf(stdout, 0, _IOLBF, 0);  // so lines keep their order with writes to fd 1 through src/io.c
   pthread_attr_init(&attr);
