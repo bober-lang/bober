@@ -1,0 +1,72 @@
+//! Futures, which `async c` makes (src/lower.bob): each of a call run on a fiber of its own (src/fiber.c).
+
+import { bober_fiber, bober_park, bober_self, bober_wake } from "../src/rt.h"
+import { Ref, addr } from "./mem"
+
+/// What a call threw, laid out as the union it is held as (src/emit.bob), for each await of its future to throw again.
+class Thrown {
+	tag: u64 = 0
+	bits: u64 = 0
+	ref: Ref | null = null
+}
+
+/// Calls f, keeping what it throws in into; whether it threw. An intrinsic (src/emit.bob).
+function catching(f: () => null, into: Thrown): bool
+/// Throws what from holds, where it was first thrown. An intrinsic (src/emit.bob).
+function rethrow(from: Thrown)
+
+/// The future of a call, an `async T`: once done, its result or what it threw.
+export class Future[T] {
+	done = false
+	result: T[] = []
+	thrown: Thrown | null = null
+	/// The fibers parked awaiting it.
+	waiters: u64[] = []
+}
+
+/// Runs f on a new fiber at once, until it parks: f's future.
+export function start[T](f: () => T): Future[T] {
+	const fut = new Future[T]()
+	// The fiber calls the closure before anything allocates, so its address holds until then.
+	bober_fiber(addr(() => {
+		const into = new Thrown()
+		if (catching(() => { fut.result.push(f()) }, into)) {
+			fut.thrown = into
+		}
+		fut.done = true
+		for (const w of fut.waiters) {
+			bober_wake(w)
+		}
+	}))
+	return fut
+}
+
+/// What fibers wait on for a change: wait parks the caller until the next wake, which readies all waiting.
+export class Signal {
+	private waiters: u64[] = []
+
+	wait() {
+		this.waiters.push(bober_self())
+		bober_park()
+	}
+
+	wake() {
+		const w = this.waiters
+		this.waiters = []
+		for (const f of w) {
+			bober_wake(f)
+		}
+	}
+}
+
+/// Parks until fut is done: its result, or throws what its call threw.
+export function wait[T](fut: Future[T]): T {
+	while (!fut.done) {
+		fut.waiters.push(bober_self())
+		bober_park()
+	}
+	if (fut.thrown != null) {
+		rethrow(fut.thrown!)
+	}
+	return fut.result[0]
+}

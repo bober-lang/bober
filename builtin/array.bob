@@ -1,0 +1,145 @@
+//! T[] (spec 4.5): its methods, and what new T[](n) is lowered to. An array is a ref to its length, capacity and a ref
+//! to its elements, which it is made with in one cell and which push moves to a block of their own once full
+//! (src/emit.bob).
+
+import { Ref, addr, alloc, array, deref, load, memcpy, sizeOf, store, trap, zero } from "./mem"
+
+/// The methods of an array, which is this.
+export class Array[T] {
+	/// How many elements it has, read from its header by the compiler.
+	readonly length: i32
+
+	/// x stored after the last element, the elements moved to a block of twice the room if full.
+	push(x: T) {
+		const n = load[i64](addr(this))
+		const size = sizeOf[T]()
+		if (n == load[i64](addr(this) + 8)) {
+			const cap = 2 * n + 8
+			const data = alloc[T](cap)
+			const a = addr(this)
+			memcpy(deref(data), elements(a), (n * size) as u64)
+			store[Ref](a + 16, data)
+			store[i64](a + 8, cap)
+		}
+		const a = addr(this)
+		store[T](elements(a) + ((n * size) as u64), x)
+		store[i64](a, n + 1)
+	}
+
+	/// push(...xs) of the elements xs has at the call, so xs.push(...xs) doubles xs.
+	append(xs: T[]) {
+		for (const i of 0 ... xs.length - 1) {
+			this.push(xs[i])
+		}
+	}
+
+	/// The last element, removed.
+	pop(): T {
+		const a = addr(this)
+		const n = load[i64](a) - 1
+		if (n < 0) {
+			trap("pop of an empty array")
+		}
+		store[i64](a, n)
+		return load[T](elements(a) + ((n * sizeOf[T]()) as u64))
+	}
+
+	/// The element at i, or null outside the array.
+	at(i: i32): T | null { return if (i >= 0 && i < this.length) this[i] else null }
+
+	/// A copy of the elements from from up to to.
+	slice(from: i32, to: i32): T[] {
+		if (from < 0 || from > to || to > this.length) {
+			trap("slice out of range")
+		}
+		const r = array[T]((to - from) as i64)
+		const size = sizeOf[T]()
+		memcpy(elements(addr(r)), elements(addr(this)) + (((from as i64) * size) as u64),
+			(((to - from) as i64) * size) as u64)
+		return r
+	}
+
+	/// The elements as a template converts them, sep between each two.
+	join(sep: string): string {
+		let s = ""
+		for (const i of 0 ... this.length - 1) {
+			s += if (i > 0) `${sep}${this[i]}` else `${this[i]}`
+		}
+		return s
+	}
+
+	map[U](f: (x: T) => U): U[] {
+		const r = array[U](this.length as i64)
+		for (const i of 0 ... this.length - 1) {
+			r[i] = f(this[i])
+		}
+		return r
+	}
+
+	/// The elements f holds for, in order.
+	filter(f: (x: T) => bool): T[] {
+		const r: T[] = []
+		for (const x of this) {
+			if (f(x)) {
+				r.push(x)
+			}
+		}
+		return r
+	}
+
+	/// Whether f holds for an element.
+	some(f: (x: T) => bool): bool {
+		for (const x of this) {
+			if (f(x)) {
+				return true
+			}
+		}
+		return false
+	}
+
+	/// The first element f holds for, null if none.
+	find(f: (x: T) => bool): T | null {
+		for (const x of this) {
+			if (f(x)) {
+				return x
+			}
+		}
+		return null
+	}
+
+	/// Whether f holds for each element.
+	every(f: (x: T) => bool): bool { return !this.some(x => !f(x)) }
+
+	/// Whether v is an element.
+	includes(v: T): bool { return this.some(x => x == v) }
+
+	/// Whether o has as many elements, each == the one here.
+	equals(o: T[]): bool {
+		if (this.length != o.length) {
+			return false
+		}
+		for (const i of 0 ... this.length - 1) {
+			if (this[i] != o[i]) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+/// new T[](n): n zero values.
+export function newArray[T](n: i32): T[] {
+	if (n < 0) {
+		trap("negative length")
+	}
+	const r = array[T](n as i64)
+	const z = zero[T]()
+	for (const i of 0 ... n - 1) {
+		r[i] = z
+	}
+	return r
+}
+
+/// Where the elements of the array at a are.
+export function elements(a: u64): u64 { return deref(load[Ref](a + 16)) }
+

@@ -1,0 +1,79 @@
+//! Values as a template converts them (spec 6.9), which a template's pieces are lowered to.
+
+import { formatFloat } from "../std/float"
+import { quoted } from "../std/string"
+import { addr } from "./mem"
+import { copy } from "./string"
+
+/// x as a template converts it when its type has no toString of its own: by its structure, as JSON writes it.
+///
+/// ## Templates
+///
+/// Each `${v}` is converted by `v.toString()`. Every type has `toString(): string`; one it does not declare shows a
+/// string as is, an integer in decimal, a float in the shortest decimal that round-trips, a bool as `true`/`false`,
+/// `null` as `null`, a `Type` by its name, an array, fixed array or tuple as `[a, b]`, and an object or class as `{"k": v}`, its
+/// elements and fields each by their own `toString`, strings among them quoted.
+///
+/// ```
+/// class P { x = 0; toString(): string { return `P(${this.x})` } }
+/// `${new P()}` == "P(0)"
+/// `${[{ a: "x", p: new P() }]}` == `[{"a": "x", "p": P(0)}]`
+/// ```
+export function show[T](x: T): string {
+	switch (T.kind) {
+		case "null": return "null"
+		case "bool": return if (x) "true" else "false"
+		case "int": return if (x < 0) "-" + showUint((0 - (x as i64)) as u64) else showUint(x as u64)
+		case "float": return formatFloat(x)
+		case "string": return x
+		case "literal": return show[string | bool | i64 | null](T.value)
+		case "type": return x.name
+		case "array", "fixed":
+			const es: string[] = []
+			for (const e of x) {
+				es.push(item(e))
+			}
+			return `[${es.join(", ")}]`
+		case "tuple":
+			const es: string[] = []
+			for (const f of T.fields) {
+				es.push(item(x[f.name]))
+			}
+			return `[${es.join(", ")}]`
+		case "object", "class":
+			const fs: string[] = []
+			for (const f of T.fields) {
+				if (f.type.kind != "function") {
+					fs.push(`${quoted(f.name)}: ${item(x[f.name])}`)
+				}
+			}
+			return `{${fs.join(", ")}}`
+		case "union":
+			for (const M of T.members) {
+				if (x instanceof M) {
+					return `${x}`
+				}
+			}
+	}
+	return T.kind
+}
+
+/// x as an element or field of what show shows: a string quoted, else by its toString.
+function item[T](x: T): string {
+	if (T.kind == "string") {
+		return quoted(x)
+	}
+	return `${x}`
+}
+
+function showUint(n: u64): string {
+	let digits: u8[20]
+	let i = 20
+	let v = n
+	while (i == 20 || v > 0) {
+		i -= 1
+		digits[i] = ((v % 10) as u8) + 0x30
+		v /= 10
+	}
+	return copy(addr(digits) + (i as u64), (20 - i) as i64)
+}

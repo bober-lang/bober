@@ -1,0 +1,76 @@
+//! The prelude's bridge to C (§3.1), which std/c builds on.
+
+import { bober_free, bober_malloc } from "../src/rt.h"
+import { elements } from "./array"
+import { Ref, addr, deref, load, memcpy, store, trap } from "./mem"
+import { bytesAt, copy, lenAt } from "./string"
+
+/// s and a NUL, in memory from C's malloc, for the caller to free. toC traps if s holds a NUL.
+export function toCN(s: string): u64 {
+	const p = addr(s)
+	const n = lenAt(p) as u64
+	const q = bober_malloc(n + 1)
+	memcpy(q, bytesAt(p), n)
+	store[u8](q + n, 0)
+	return q
+}
+
+export function toC(s: string): u64 {
+	const p = addr(s)
+	const n = lenAt(p) as u64
+	if (nul(bytesAt(p), n) != n) {
+		trap("not a C string")
+	}
+	return toCN(s)
+}
+
+/// The n bytes at p; fromC up to its NUL. Traps if p is 0 and n is not.
+export function fromCN(p: u64, n: u64): string {
+	if (p == 0 && n != 0) {
+		trap("null C string")
+	}
+	return copy(p, n as i64)
+}
+
+export function fromC(p: u64): string {
+	if (p == 0) {
+		trap("null C string")
+	}
+	return copy(p, nul(p, 0xffff_ffff_ffff_ffff) as i64)
+}
+
+/// Where the first NUL of the n bytes at p is, n if they hold none.
+function nul(p: u64, n: u64): u64 {
+	let i: u64 = 0
+	while (i < n && load[u8](p + i) != 0) {
+		i += 1
+	}
+	return i
+}
+
+/// The 8 bytes at p. Traps if p is 0.
+export function peek(p: u64): u64 {
+	if (p == 0) {
+		trap("load from null")
+	}
+	return load[u64](p)
+}
+
+export function poke(p: u64, v: u64) {
+	if (p == 0) {
+		trap("store to null")
+	}
+	store[u64](p, v)
+}
+
+/// What C is given for the argument of a pointer param, a union's bits and ref: of kind 1, a string boxed in ref, a
+/// copy of its bytes and a NUL, which cDone frees; of kind 2, an array: its elements; else bits.
+export function cPtr(kind: i32, bits: u64, ref: Ref): u64 {
+	return if (kind == 1) toCN(load[string](deref(ref))) else if (kind == 2) elements(deref(ref)) else bits
+}
+
+export function cDone(kind: i32, p: u64) {
+	if (kind == 1) {
+		bober_free(p)
+	}
+}

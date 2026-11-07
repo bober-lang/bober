@@ -1,0 +1,41 @@
+//! The intrinsics, functions without a body that the compiler emits in place, which the rest of builtin/ reaches the
+//! layout of values through (src/emit.bob).
+
+import { bober_trap } from "../src/rt.h"
+
+/// A ref, a pointer the collector knows (src/rt.h), to what it does not know the type of.
+export class Ref {}
+
+/// A ref to n new zeroed values of T.
+export function alloc[T](n: i64): Ref
+/// A new array of n zeroed values of T, held with its length, capacity and data in one cell.
+export function array[T](n: i64): T[]
+/// The address of what ref r refers to, or 0 if null. An address, as any from addr, holds only until what may collect,
+/// the next alloc, moves what is there.
+export function deref(r: Ref): u64
+/// The bytes a value of T takes.
+export function sizeOf[T](): i64
+/// The value of T at address p.
+export function load[T](p: u64): T
+/// Stores x at address p.
+export function store[T](p: u64, x: T)
+/// The address of x's elements if a T[n], of its fields if an array, class instance or object, else of a copy of x
+/// that lives as long as the call's frame.
+export function addr[T](x: T): u64
+/// The zero value of T (spec 5.1).
+export function zero[T](): T
+/// C's memcpy: copies the n bytes at from to to, which do not overlap.
+export function memcpy(to: u64, from: u64, n: u64)
+/// C's memcmp: below, at or above 0 as the n bytes at a are before, equal to or after those at b.
+export function memcmp(a: u64, b: u64, n: u64): i32
+/// Traps with what; where it is called is lost.
+///
+/// ## Traps
+///
+/// These stop the isolate: a false `assert`; a subscript out of range; a negative length in `new`; an array pattern
+/// longer than its array; integer division by zero; an integer `**` with a negative exponent; a cast from a union to a
+/// type that is not its tag; a throw leaving the first isolate or a top-level initializer; writing frozen data; a value
+/// that cannot cross isolates, or spawning too early (§6.10); exhausted memory or stack; `Unreachable` in bytecode
+/// (§8.4). A conforming implementation reports which, and where. Awaiting the future of a trapped isolate throws a
+/// `Trap`, a standard library class whose `message: string` says which, and where.
+export function trap(what: string) { bober_trap(what, 0, -1) }
