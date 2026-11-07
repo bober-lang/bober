@@ -1,0 +1,62 @@
+import { Reader, Writer } from "./binary"
+import { ParseError } from "../parse"
+
+test "fixed" {
+	const w = new Writer()
+	w.u8(0xab)
+	w.fixed(0x1234, 2)
+	w.fixed(0xdeadbeef, 4)
+	w.fixed(0xffffffffffffffff, 8)
+	assert w.bytes == "\xab\x34\x12\xef\xbe\xad\xde\xff\xff\xff\xff\xff\xff\xff\xff"
+	const r = new Reader(w.bytes)
+	assert r.u8() == 0xab
+	assert r.fixed(2) == 0x1234
+	assert r.fixed(4) == 0xdeadbeef
+	assert r.fixed(8) == 0xffffffffffffffff
+	assert r.pos == w.bytes.length
+}
+
+test "uleb" {
+	const cases: [u64, string][] = [[0, "\0"], [127, "\x7f"], [128, "\x80\x01"], [624485, "\xe5\x8e\x26"],
+		[0xffffffffffffffff, "\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01"]]
+	for (const [v, s] of cases) {
+		const w = new Writer()
+		w.uleb(v)
+		assert w.bytes == s
+		assert new Reader(s).uleb() == v
+	}
+}
+
+test "sleb" {
+	const cases: [i64, string][] = [[0, "\0"], [63, "\x3f"], [64, "\xc0\0"], [-64, "\x40"], [-65, "\xbf\x7f"],
+		[-123456, "\xc0\xbb\x78"], [0x7fffffffffffffff, "\xff\xff\xff\xff\xff\xff\xff\xff\xff\0"],
+		[-0x7fffffffffffffff - 1, "\x80\x80\x80\x80\x80\x80\x80\x80\x80\x7f"]]
+	for (const [v, s] of cases) {
+		const w = new Writer()
+		w.sleb(v)
+		assert w.bytes == s
+		assert new Reader(s).sleb() == v
+	}
+}
+
+test "raw" {
+	const w = new Writer()
+	w.raw("ab")
+	w.raw("")
+	w.raw("\0c")
+	const r = new Reader(w.bytes)
+	assert r.raw(1) == "a"
+	assert r.raw(0) == ""
+	assert r.raw(3) == "b\0c"
+}
+
+test "past the end" {
+	assert new Reader("").u8() throws new ParseError("syntax", 0)
+	assert new Reader("\x01\x02\x03").fixed(4) throws new ParseError("syntax", 3)
+	assert new Reader("\x80\x80").uleb() throws new ParseError("syntax", 2)
+	assert new Reader("\xff").sleb() throws new ParseError("syntax", 1)
+	assert new Reader("ab").raw(3) throws new ParseError("syntax", 2)
+	const r = new Reader("ab")
+	r.raw(2)
+	assert r.u8() throws new ParseError("syntax", 2)
+}

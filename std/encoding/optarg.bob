@@ -1,0 +1,204 @@
+//! Values of a class as command-line arguments, as getopt and GNU take them: each field an option, `-n` for a name of
+//! one letter, else `--name`. A bool field is a flag; another takes a value, the rest of its argument after a long
+//! option's `=` or a short one's letter, else the next argument, and an array field one each time it is given. Short
+//! options go several to an argument. Options end at the first operand, or at a `--`, which is dropped; the arguments
+//! from there go to the field tagged Rest. Decoding is strict as json's: no unknown options, a class it makes takes no
+//! arguments, fields not given keep their initial values, and a union's value is the first member that fits.
+//! Fields take ../encoding's tags too.
+
+import { minus } from "../ascii"
+import * as encoding from "../encoding"
+import { parseFloat } from "../float"
+import { ParseError, parseInt } from "../parse"
+import { indexOf } from "../string"
+import { has, New, tag } from "../types"
+
+/// Tags a class whose options are spelled as cc's: one dash before any name, never several options to an argument,
+/// a value attached, as -Ifoo, only to a name of one letter, and operands among the options. The options it has not go
+/// to Rest with the operands, in order, for the options of cc whose order matters.
+export class Cc {}
+/// Tags a field to be the option named S, as `dryRun: bool @Name["dry-run"]`.
+export class Name[S extends string] {}
+/// ../encoding's Skip, for optarg alone.
+export class Skip {}
+/// ../encoding's OmitEmpty, for optarg alone.
+export class OmitEmpty {}
+/// Tags a field to be the option -C too.
+export class Short[C extends string] {}
+/// Tags a field whose value comes only attached, as -O2 or --opt=2, else is V.
+export class Optional[V = ""] {}
+/// Tags the string[] field that takes the operands.
+export class Rest {}
+
+/// A field whose type no argument holds, by its option.
+export class EncodeError {
+	name: string
+
+	constructor(name: string) { this.name = name }
+}
+
+export function encode[T extends New](v: T): string[] throws EncodeError {
+	const out: string[] = []
+	let rest: string[] = []
+	for (const f of T.fields) {
+		if (has(f.tags, Rest) && f.type == string[]) {
+			rest = v[f.name]
+		} else if (!encoding.omits(f.tags, Skip, OmitEmpty, v[f.name])) {
+			option(out, flag(encoding.key(f.tags, Name, f.name), has(T.tags, Cc)), v[f.name], has(f.tags, Optional))
+		}
+	}
+	if (rest.some(a => a.length > 1 && a[0] == minus)) {
+		out.push("--")
+	}
+	return [...out, ...rest]
+}
+
+/// A ParseError's at is the index of the argument at fault.
+export function decode[T extends New](argv: string[]): T throws ParseError {
+	const r = new T()
+	let operands: string[] = []
+	let i = 0
+	while (i < argv.length) {
+		const a = argv[i]
+		i++
+		const operand = a.length < 2 || a[0] != minus
+		if (a == "--" || (operand && !has(T.tags, Cc))) {
+			operands = [...operands, ...argv.slice(if (a == "--") i else i - 1, argv.length)]
+			break
+		}
+		const next = if (operand) null else options[T](r, argv, i, a)
+		if (next != null) {
+			i = next
+		} else if (has(T.tags, Cc)) {
+			operands.push(a)
+		} else {
+			throw new ParseError("syntax", i - 1)
+		}
+	}
+	if (operands.length == 0) {
+		return r
+	}
+	for (const f of T.fields) {
+		if (has(f.tags, Rest) && f.type == string[]) {
+			r[f.name] = operands
+			return r
+		}
+	}
+	throw new ParseError("syntax", argv.length - operands.length)
+}
+
+/// Sets the fields of r that a, an argument of options given before argv[i], names. Returns the index of the argument
+/// after, or null if T has not the option.
+function options[T extends New](r: T, argv: string[], i: i32, a: string): i32 | null throws ParseError {
+	let next: i32 | null = null
+	if (has(T.tags, Cc)) {
+		next = take[T](r, argv, i, a.slice(1, a.length), null)
+		if (next == null && a.length > 2) {
+			next = short[T](r, argv, i, a.slice(1, a.length))
+		}
+	} else if (a[1] == minus) {
+		const eq = if (indexOf(a, "=") < 0) a.length else indexOf(a, "=")
+		if (eq > 3) {
+			next = take[T](r, argv, i, a.slice(2, eq), if (eq < a.length) a.slice(eq + 1, a.length) else null)
+		}
+	} else {
+		next = short[T](r, argv, i, a.slice(1, a.length))
+	}
+	return next
+}
+
+/// Takes letters as a short option with the rest attached.
+function short[T extends New](r: T, argv: string[], i: i32, letters: string): i32 | null throws ParseError {
+	return take[T](r, argv, i, letters.slice(0, 1), if (letters.length > 1) letters.slice(1, letters.length) else null)
+}
+
+/// Sets the field of r that is option o, given before argv[i], to the value attached to it, or else to argv[i]; a
+/// short flag's attached text is more options. Returns the index of the argument after, or null if T has not the option.
+function take[T extends New](r: T, argv: string[], i: i32, o: string,
+	attached: string | null): i32 | null throws ParseError {
+	for (const f of T.fields) {
+		if (!has(f.tags, Rest) && !encoding.skips(f.tags, Skip)
+				&& (o == encoding.key(f.tags, Name, f.name) || o == tag(f.tags, Short, ""))) {
+			if (f.type.kind == "bool") {
+				if (has(T.tags, Cc) && attached != null) {
+					return null
+				}
+				if (attached != null && o.length > 1) {
+					throw new ParseError("syntax", i - 1)
+				}
+				r[f.name] = true
+				return if (attached == null) i else short[T](r, argv, i, attached)
+			}
+			if (has(f.tags, Optional) && attached == null) {
+				attached = tag(f.tags, Optional, "")
+			}
+			if (attached == null && i == argv.length) {
+				throw new ParseError("syntax", i - 1)
+			}
+			const at = if (attached == null) i else i - 1
+			r[f.name] = add[f.type](r[f.name], attached ?? argv[i], at)
+			return at + 1
+		}
+	}
+	return null
+}
+
+/// The option named name, in cc's spelling or else GNU's.
+function flag(name: string, cc: bool): string { return if (cc || name.length == 1) `-${name}` else `--${name}` }
+/// Option o with the value v attached.
+function attach(o: string, v: string): string { return if (o[1] == minus) `${o}=${v}` else o + v }
+
+/// Adds v, given as option o, to out, attached to it if joined.
+function option[T](out: string[], o: string, v: T, joined: bool): void throws EncodeError {
+	const t = typeof v
+	switch (t.kind) {
+		case "null": return
+		case "bool": if (v) {
+			out.push(o)
+		}
+		case "union": for (const M of t.members) {
+			if (v instanceof M) {
+				option(out, o, v, joined)
+			}
+		}
+		case "array": for (const x of v) {
+			option(out, o, x, joined)
+		}
+		case "string", "int", "float", "literal": if (joined) {
+			out.push(attach(o, `${v}`))
+		} else {
+			out.push(o)
+			out.push(`${v}`)
+		}
+		default: throw new EncodeError(o)
+	}
+}
+
+/// v with the value s, argument at, set, or added if v is an array.
+function add[T](v: T, s: string, at: i32): T throws ParseError {
+	if (T.kind == "array") {
+		v.push(value[T.elem](s, at))
+		return v
+	}
+	return value[T](s, at)
+}
+
+function value[T](s: string, at: i32): T throws ParseError {
+	switch (T.kind) {
+		case "string": return s
+		case "int", "float": try {
+			return if (T.kind == "int") parseInt[T](s) else parseFloat[T](s)
+		} catch (e: ParseError) {
+			throw new ParseError(e.kind, at)
+		}
+		case "literal": if (s == `${T.value}`) {
+			return T.value
+		}
+		case "union": for (const M of T.members) {
+			try {
+				return value[M](s, at)
+			} catch {}
+		}
+	}
+	throw new ParseError("syntax", at)
+}

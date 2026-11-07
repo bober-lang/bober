@@ -1,0 +1,41 @@
+//! Acyclic values as s-expressions, for dumps: a class instance as (Name field: value …) in declaration order, an
+//! object as {field: value …}, an array or tuple as [items…], and a string quoted with bober's escapes. A union's
+//! value is tagged as (Member value), unless it names its member itself: a class instance, null or a literal.
+
+import { quoted } from "../string"
+
+export function encode[T](v: T): string {
+	const t = typeof v
+	const items: string[] = []
+	switch (t.kind) {
+		case "null", "bool", "int", "float": return `${v}`
+		case "string": return quoted(v)
+		case "literal":
+			const x: string | bool | null = t.value
+			return if (x instanceof string) quoted(x) else `${x}`
+		case "union":
+			for (const M of t.members) {
+				if (v instanceof M) {
+					return if (M.kind == "class" || M.kind == "null" || M.kind == "literal") encode(v)
+						else `(${M.name} ${encode(v)})`
+				}
+			}
+			return ""
+		case "array", "fixed":
+			for (const x of v) {
+				items.push(encode(x))
+			}
+			return `[${items.join(" ")}]`
+		case "tuple":
+			for (const f of t.fields) {
+				items.push(encode(v[f.name]))
+			}
+			return `[${items.join(" ")}]`
+		case "class", "object", "interface":
+			for (const f of t.fields) {
+				items.push(`${f.name}: ${encode(v[f.name])}`)
+			}
+			return if (t.kind == "class") `(${[t.name, ...items].join(" ")})` else `{${items.join(" ")}}`
+		default: return t.name
+	}
+}

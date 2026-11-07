@@ -4,7 +4,7 @@
 //! Decoding is strict as json's: no unknown keys, a class it makes takes no arguments, fields left out keep their
 //! initial values, a union's value is a member that fits, an integer if one does, and a key path through a union
 //! takes its first class. A Rest field takes the unknown keys, an unknown table's under its dotted path. A key or
-//! table defined twice is rejected. Dates and times are not supported.
+//! table defined twice is rejected. Dates and times are not supported. Fields take ../encoding's tags too.
 
 import * as ascii from "../ascii"
 import { startsWith } from "../algo"
@@ -16,6 +16,12 @@ import { quoted, Unknown } from "./json"
 import { ParseError, parseInt, utf8 } from "../string"
 import { Decodable, Float, has, Integral } from "../types"
 
+/// ../encoding's Name, for TOML alone.
+export class Name[K extends string] {}
+/// ../encoding's Skip, for TOML alone.
+export class Skip {}
+/// ../encoding's OmitEmpty, for TOML alone.
+export class OmitEmpty {}
 /// Tags an Unknown[] field to take the keys no other field takes, and to encode them back.
 export class Rest {}
 
@@ -71,8 +77,8 @@ function table[T](v: T, path: string): string throws EncodeError {
 					for (const [k, text] of v[f.name]) {
 						keys.push(`${k} = ${text}\n`)
 					}
-				} else {
-					field(keys, tables, path, f.name, v[f.name])
+				} else if (!encoding.omits(f.tags, Skip, OmitEmpty, v[f.name])) {
+					field(keys, tables, path, encoding.key(f.tags, Name, f.name), v[f.name])
 				}
 			}
 		default: throw new EncodeError(path)
@@ -152,8 +158,9 @@ function value[T](v: T, path: string): string throws EncodeError {
 					for (const [k, text] of v[f.name]) {
 						items.push(`${k} = ${text}`)
 					}
-				} else {
-					items.push(`${key(f.name)} = ${value(v[f.name], `${path}.${key(f.name)}`)}`)
+				} else if (!encoding.omits(f.tags, Skip, OmitEmpty, v[f.name])) {
+					const k = key(encoding.key(f.tags, Name, f.name))
+					items.push(`${k} = ${value(v[f.name], `${path}.${k}`)}`)
 				}
 			}
 			return `{${items.join(", ")}}`
@@ -215,7 +222,8 @@ class Decoder {
 					}
 				} else {
 					for (const f of T.fields) {
-						if (path[i] == f.name && !has(f.tags, Rest)) {
+						if (path[i] == encoding.key(f.tags, Name, f.name)
+								&& !encoding.skips(f.tags, Skip) && !has(f.tags, Rest)) {
 							v[f.name] = this.walk[f.type](v[f.name], path, i + 1, leaf, at)
 							return v
 						}

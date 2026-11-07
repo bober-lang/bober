@@ -22,6 +22,28 @@ class Num @Name["n"] {
 	e: i32 | f64 = 0
 }
 
+class Tags @encoding.Name["t"] {
+	a: i32 @Name["A"] @encoding.Name["x"] = 1
+	b: i32 @encoding.Name["B"] = 2
+	c: i32 @encoding.Skip = 3
+	d: string @encoding.OmitEmpty = ""
+	e: string @OmitEmpty = ""
+	s: string @Text @Skip = ""
+}
+
+class Own @Name["o"] @encoding.Name["x"] {}
+
+test "xml's own tags over ../encoding's" {
+	assert encode(new Tags()) == "<t><A>1</A><B>2</B></t>" && encode(new Own()) == "<o/>"
+	const t = decode[Tags]("<t><A>4</A><B>5</B></t>")
+	assert t.a == 4 && t.b == 5 && t.c == 3
+	assert decode[Tags]("<t><x>4</x></t>") throws new ParseError("syntax", 3)
+	assert decode[Tags]("<t><c>4</c></t>") throws new ParseError("syntax", 3)
+	assert decode[Tags]("<t>s</t>") throws new ParseError("syntax", 3)
+	t.d = "x"
+	assert encode(t) == "<t><A>4</A><B>5</B><d>x</d></t>"
+}
+
 test "parse and serialize" {
 	const doc = parse(`<?xml version="1.0"?><!-- c --><a x='1' y="&lt;&#65;"><b/>t&amp;<![CDATA[<c>]]><?p d?></a>`)
 	assert serialize(doc) == `<!-- c --><a x="1" y="&lt;A"><b/>t&amp;&lt;c&gt;<?p d?></a>`

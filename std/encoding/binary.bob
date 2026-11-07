@@ -1,0 +1,101 @@
+//! Bytes, little-endian integers and LEB128, written to and read from a string of bytes, as files hold them.
+
+import { ParseError } from "../parse"
+
+/// Appends to bytes.
+export class Writer {
+	/// What was written.
+	bytes = ""
+
+	u8(v: u8) { this.bytes += chr(v) }
+
+	/// v's low n bytes, little-endian.
+	fixed(v: u64, n: i32) {
+		for (const i of 0 ... n - 1) {
+			this.u8((v >> 8 * i) as u8)
+		}
+	}
+
+	/// v as unsigned LEB128.
+	uleb(v: u64) {
+		let x = v
+		while (x >= 0x80) {
+			this.u8((x | 0x80) as u8)
+			x = x >> 7
+		}
+		this.u8(x as u8)
+	}
+
+	/// v as signed LEB128.
+	sleb(v: i64) {
+		let x = v
+		while (x < -64 || x > 63) {
+			this.u8((x | 0x80) as u8)
+			x = x >> 7
+		}
+		this.u8((x & 0x7f) as u8)
+	}
+
+	raw(s: string) { this.bytes += s }
+}
+
+/// Reads bytes from pos on; reading past their end is a syntax error at the end.
+export class Reader {
+	bytes: string
+	/// Where the next read starts.
+	pos = 0
+
+	constructor(bytes: string) { this.bytes = bytes }
+	u8(): u8 throws ParseError { return this.bytes[this.take(1)] }
+
+	/// The next n bytes as a little-endian integer.
+	fixed(n: i32): u64 throws ParseError {
+		const at = this.take(n)
+		let v: u64 = 0
+		for (const i of 0 ... n - 1) {
+			v = v | (this.bytes[at + i] as u64) << 8 * i
+		}
+		return v
+	}
+
+	uleb(): u64 throws ParseError {
+		let v: u64 = 0
+		let shift = 0
+		while (true) {
+			const b = this.u8()
+			v = v | ((b & 0x7f) as u64) << shift
+			shift += 7
+			if (b < 0x80) {
+				return v
+			}
+		}
+	}
+
+	sleb(): i64 throws ParseError {
+		let v: i64 = 0
+		let shift = 0
+		while (true) {
+			const b = this.u8()
+			v = v | ((b & 0x7f) as i64) << shift
+			shift += 7
+			if (b < 0x80) {
+				return if (shift < 64 && (b & 0x40) != 0) v | (-1 as i64) << shift else v
+			}
+		}
+	}
+
+	/// The next n bytes.
+	raw(n: i32): string throws ParseError {
+		const at = this.take(n)
+		return this.bytes.slice(at, at + n)
+	}
+
+	/// pos, moved n bytes on.
+	private take(n: i32): i32 throws ParseError {
+		if (n > this.bytes.length - this.pos) {
+			throw new ParseError("syntax", this.bytes.length)
+		}
+		this.pos += n
+		return this.pos - n
+	}
+}
