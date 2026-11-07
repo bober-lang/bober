@@ -1,0 +1,50 @@
+import { arg } from "./util"
+import { Response, json, serve } from "../std/http"
+import { Router } from "../std/http/router"
+import { IoError } from "../std/io"
+import { ParseError } from "../std/parse"
+
+class Item {
+	sku = ""
+	qty = 0
+	price = 0.0
+}
+
+class Order {
+	id: i64 = 0
+	user = ""
+	items: Item[] = []
+	note = ""
+}
+
+class Reply {
+	id: i64 = 0
+	user = ""
+	count = 0
+	total = 0.0
+	ok = true
+}
+
+function main(): i32 {
+	const r = new Router()
+	r.get("/ping", (req, p) => new Response(200, "pong"))
+	r.post("/api/orders/:id", (req, p) => {
+		const o = req.body.json[Order]()
+		const reply = new Reply()
+		reply.id = o.id
+		reply.user = o.user
+		reply.count = o.items.length
+		for (const it of o.items) {
+			reply.total += (it.qty as f64) * it.price
+		}
+		reply.ok = `${o.id}` == (p.get("id") ?? "")
+		return json(reply)
+	})
+	try {
+		serve(r.handle, `:${arg(0, 8081)}`)
+	} catch (e: IoError | ParseError) {
+		print(`serve failed: ${e}`)
+		return 1
+	}
+	return 0
+}

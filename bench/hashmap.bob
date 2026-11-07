@@ -1,0 +1,53 @@
+import { arg, report } from "./util"
+import { HashMap } from "../std/collections/hashmap"
+
+function main(): i32 {
+	const n = arg(0, 2_000_000) as i32
+	let t0 = now()
+	const m = new HashMap[u64, u64]()
+	let x: u64 = 88172645463325252
+	for (const i of 0 ... n - 1) {
+		x ^= x << 13
+		x ^= x >> 7
+		x ^= x << 17
+		m.set(x, i as u64)
+	}
+	let check: u64 = 0
+	x = 88172645463325252
+	for (const i of 0 ... 5 * n - 1) {
+		x ^= x << 13
+		x ^= x >> 7
+		x ^= x << 17
+		const v = m.get(x)
+		if (v != null) {
+			check += v
+		}
+		if (i % 7 == 3) {
+			x = 88172645463325252 + (i as u64)
+		}
+	}
+	report("hashmap-u64", t0, check as i64)
+
+	const k = n / 4
+	const keys = new string[](k)
+	for (const i of 0 ... k - 1) {
+		keys[i] = `user:${(i as i64) * 7919 % (k as i64)}:session`
+	}
+	t0 = now()
+	const sm = new HashMap[string, i32]()
+	for (const i of 0 ... k - 1) {
+		const c = sm.get(keys[i])
+		sm.set(keys[i], if (c == null) 1 else c + 1)
+	}
+	let found: i64 = 0
+	for (const r of 1 ... 4) {
+		for (const i of 0 ... k - 1) {
+			const c = sm.get(keys[i])
+			if (c != null) {
+				found += c
+			}
+		}
+	}
+	report("hashmap-string", t0, found + sm.size)
+	return 0
+}

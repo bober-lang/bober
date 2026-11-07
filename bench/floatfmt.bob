@@ -1,0 +1,34 @@
+import { arg, report } from "./util"
+import { parseFloat } from "../std/float"
+import { ParseError } from "../std/parse"
+
+function main(): i32 {
+	const n = arg(0, 1_000_000) as i32
+	let x: u64 = 88172645463325252
+	const xs = new f64[](n)
+	for (const i of 0 ... n - 1) {
+		x ^= x << 13
+		x ^= x >> 7
+		x ^= x << 17
+		xs[i] = ((x >> 20) as f64) / 1024.0 + 0.5
+	}
+	let t0 = now()
+	const ss = new string[](n)
+	let len: i64 = 0
+	for (const i of 0 ... n - 1) {
+		ss[i] = `${xs[i]}`
+		len += ss[i].length
+	}
+	report("float-format", t0, len)
+	t0 = now()
+	let sum = 0.0
+	for (const i of 0 ... n - 1) {
+		try {
+			sum += parseFloat(ss[i])
+		} catch (e: ParseError) {
+			return 1
+		}
+	}
+	report("float-parse", t0, sum as i64)
+	return 0
+}
