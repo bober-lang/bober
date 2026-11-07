@@ -1,0 +1,290 @@
+//! bobcc, a C compiler like cc: it compiles each C file to an object, assembly, LLVM assembly or preprocessed text, or
+//! else links the objects, with the other files and the C library of -isysroot, into an executable through LLD
+//! in its own process.
+//!
+//!     bobcc [-c | -S | -E | -emit-llvm | -shared] [-ftpde] [-o out] [-O...] [-I dir] [-D x[=y]] [-U x] [-isysroot dir]
+//!          [-L dir] [-l lib] [-Wl,args] [-z keyword] [-x language] files...
+//!
+//! The files are C, preprocessed C (.i) or assembly (.s, or .S to preprocess), as their extension or the -x before them
+//! says; - is standard input. -ftpde compiles through TPDE instead of LLVM. Other flags cc takes are ignored.
+
+import * as c from "../../std/c"
+import { remove } from "../../std/fs"
+import { IoError } from "../../std/io"
+import { Cc, decode, Name, Optional, Rest } from "../../std/encoding/optarg"
+import { ext, stem } from "../../std/fs/path"
+import { min } from "../../std/math"
+import { arch, os } from "../../std/os"
+import { ParseError } from "../../std/parse"
+import { indexOf, split, startsWith } from "../../std/string"
+import { Backend } from "../backend/backend"
+import { LLVM, options } from "../backend/llvm"
+import { Tpde } from "../backend/tpde"
+import { CompileError } from "../error"
+import { library } from "./builtins"
+import { CError, File, Lexer } from "./lex"
+import { Parser, Tokens } from "./parse"
+import { Preprocessor, render } from "./pp"
+import { bober_lld } from "../backend/llvm/lld.h"
+import { free, malloc } from "stdlib.h"
+import { ctime } from "time.h"
+import { getpid } from "unistd.h"
+
+/// The options of cc that bobcc takes whose order does not matter.
+class Options @Cc {
+	c: bool = false
+	S: bool = false
+	E: bool = false
+	emitLLVM: bool @Name["emit-llvm"] = false
+	ftpde: bool = false
+	shared: bool = false
+	out: string @Name["o"] = ""
+	/// -Os, -Oz, -Ofast and -Og optimize as -O2.
+	O: u8 | "s" | "z" | "fast" | "g" @Optional["2"] = 0
+	I: string[] = []
+	isystem: string[] = []
+	idirafter: string[] = []
+	iquote: string[] = []
+	isysroot: string = ""
+	mllvm: string[] = []
+	/// Ignored, but options so that their arguments are not taken for files.
+	MF: string[] = []
+	MT: string[] = []
+	MQ: string[] = []
+	arch: string[] = []
+	target: string[] = []
+	Xclang: string[] = []
+	/// The files and the other options, in order.
+	rest: string[] @Rest = []
+}
+
+/// C, preprocessed C, assembly, or assembly to preprocess.
+type Language = "c" | "i" | "s" | "S"
+
+/// What the files and the options of cc whose order matters come to.
+class Ordered {
+	/// The files to compile, with their language.
+	files: [string, Language][] = []
+	/// What the linker takes after their objects: the other files, and the arguments of -L, -l and -Wl.
+	link: string[] = []
+	/// -D and -U: a name with a body, or null to undefine it.
+	macros: [string, string | null][] = []
+	common = false
+}
+
+/// Takes args, the files and options decode leaves, in order; ignores the options bobcc has not.
+function ordered(args: string[]): Ordered {
+	const r = new Ordered()
+	// The language -x gives the files after it, null to tell it by their extension.
+	let lang: Language | null = null
+	let i = 0
+	while (i < args.length) {
+		const a = args[i]
+		i++
+		const flag = a.slice(0, min(a.length, 2))
+		if (flag == "-D" || flag == "-U" || flag == "-L" || flag == "-l") {
+			let m = a.slice(2, a.length)
+			if (m == "" && i < args.length) {
+				m = args[i]
+				i++
+			}
+			const eq = indexOf(m, "=")
+			if (flag == "-L" || flag == "-l") {
+				r.link.push(flag + m)
+			} else if (m != "") {
+				r.macros.push(if (flag == "-U") [m, null]
+					else if (eq < 0) [m, "1"]
+					else [m.slice(0, eq), m.slice(eq + 1, m.length)])
+			}
+		} else if (startsWith(a, "-Wl,")) {
+			r.link = [...r.link, ...split(a.slice(4, a.length), ",")]
+		} else if (a == "-z" && i < args.length) {
+			r.link.push(a)
+			r.link.push(args[i])
+			i++
+		} else if (a == "-fcommon" || a == "-fno-common") {
+			r.common = a == "-fcommon"
+		} else if (flag == "-x") {
+			let x = a.slice(2, a.length)
+			if (x == "" && i < args.length) {
+				x = args[i]
+				i++
+			}
+			lang = language(x)
+		} else if (a == "-" || !startsWith(a, "-")) {
+			const kind = lang ?? language(ext(a))
+			if (kind == null) {
+				r.link.push(a)
+			} else {
+				r.files.push([if (a == "-") "/dev/stdin" else a, kind])
+			}
+		}
+	}
+	return r
+}
+
+/// The language that -x x or the file extension x names, null for one bobcc does not compile.
+function language(x: string): Language | null {
+	switch (x) {
+		case "c", ".c": return "c"
+		case "cpp-output", ".i": return "i"
+		case "assembler", ".s": return "s"
+		case "assembler-with-cpp", ".S": return "S"
+		default: return null
+	}
+}
+
+function main(): i32 {
+	const argv = args()
+	let o = new Options()
+	try {
+		o = decode[Options](argv)
+	} catch (e: ParseError) {
+		print(`bobcc: bad option ${argv[e.at]}`)
+		return 1
+	}
+	const a = ordered(o.rest)
+	if (o.emitLLVM && o.ftpde) {
+		print("bobcc: -emit-llvm needs LLVM, not -ftpde")
+		return 1
+	}
+	const linking = !o.c && !o.S && !o.E && !o.emitLLVM
+	if (linking && o.isysroot == "") {
+		print("bobcc: linking needs -isysroot, whose C library it links")
+		return 1
+	}
+	const exe = if (o.out == "") "a.out" else o.out
+	const objects: string[] = []
+	options(o.mllvm)
+	const optimize = (if (o.O instanceof u8) min(o.O, 3) else 2) as u32
+	o.I = [...o.I, ...o.isystem, ...(if (o.isysroot == "") [] else [o.isysroot + "/usr/include"]), ...o.idirafter]
+	const named = o.out != "" && a.files.length == 1
+	for (const k of 0 ... a.files.length - 1) {
+		const [src, kind] = a.files[k]
+		const llvm = if (o.ftpde) null else new LLVM(src, optimize)
+		const m: Backend = llvm ?? new Tpde(src)
+		try {
+			const asm = kind == "s" || kind == "S"
+			const pp = if (kind == "i" || kind == "s") null else preprocessor(o, a.macros, src, kind == "S")
+			if (pp != null && o.E) {
+				if (o.out == "") {
+					print(render(pp))
+				} else {
+					writeFile(o.out, render(pp))
+				}
+				continue
+			}
+			if (asm) {
+				// Assembly is the module's top-level asm, which LLVM assembles as it emits.
+				m.moduleAsm(if (pp == null) readFile(src) ?? "" else render(pp))
+			} else {
+				parse(pp ?? new Lexer(new File(src, readFile(src) ?? "")), m, a.common)
+			}
+		} catch (e: CError | CompileError) {
+			// A back end's error, as TPDE's on what it cannot compile, carries no source position.
+			print(if (e instanceof CError) `bobcc: ${e.where()}` else `bobcc: ${src}: ${e.msg}`)
+			return 1
+		}
+		const base = stem(src)
+		if (o.emitLLVM) {
+			writeFile(if (named) o.out else base + ".ll", llvm!.text())
+			continue
+		}
+		const obj = if (linking) `/tmp/bobcc-${getpid()}.${k}.o`
+			else if (named) o.out
+			else base + (if (o.S) ".s" else ".o")
+		try {
+			m.emit(obj, o.S)
+		} catch (e: CompileError) {
+			print(`bobcc: ${src}: ${e.msg}`)
+			return 1
+		}
+		objects.push(obj)
+	}
+	if (!linking) {
+		return 0
+	}
+	const status = link(o.isysroot, [...objects, ...a.link], exe, o.shared)
+	for (const f of objects) {
+		try {
+			remove(f)
+		} catch (e: IoError) {}
+	}
+	return status
+}
+
+/// Compiles the C of tokens into m; prints its warnings.
+function parse(tokens: Tokens, m: Backend, common: bool) throws CError {
+	const p = new Parser(tokens, m)
+	p.library = library()
+	p.common = common
+	p.unit()
+	for (const w of p.warnings) {
+		print(`bobcc: warning: ${w.where()}`)
+	}
+}
+
+/// Compiles the C file src by LLVM at -O2 into the object out, as bobcc -c does, with the headers of dirs, then those of
+/// sysroot's C library, and the macros defined; throws a CompileError.
+export function object(sysroot: string, src: string, out: string, dirs: string[],
+	macros: [string, string][] = []) throws CompileError {
+	const o = new Options()
+	o.I = [...dirs, sysroot + "/usr/include"]
+	const m = new LLVM(src)
+	try {
+		const pp = preprocessor(o, [], src, false)
+		for (const [name, body] of macros) {
+			pp.define(name, body)
+		}
+		parse(pp, m, false)
+	} catch (e: CError) {
+		throw new CompileError(e.where())
+	}
+	m.emit(out, false)
+}
+
+/// Links args, objects and the linker's options, into the executable out with the C library of sysroot, static but on
+/// macOS, or into a shared library, as ld.lld or on macOS ld64.lld does; returns its exit status.
+export function link(sysroot: string, args: string[], out: string, shared = false): i32 {
+	const lib = sysroot + "/usr/lib" // musl's
+	const argv = if (os == "macos") [
+		"ld64.lld", if (shared) "-dylib" else "-execute", "-arch", arch, "-platform_version", "macos", "11.0", "11.0",
+		"-syslibroot", sysroot, "-o", out, ...args, "-lSystem",
+	] else [
+		"ld.lld", ...(if (shared) ["-shared"] else ["-static", `${lib}/crt1.o`]), "--eh-frame-hdr", "-o", out,
+		`${lib}/crti.o`, ...args, `-L${lib}`, "--start-group", "-lc", "-lunwind", `${lib}/libclang_rt.builtins.a`,
+		"--end-group", `${lib}/crtn.o`,
+	]
+	const strings = argv.map(a => c.toCString(a))
+	return c.withArray(strings, p => bober_lld(strings.length, p) as u64) as i32
+}
+
+/// The preprocessor of src, with the macros defined, and __ASSEMBLER__ if it is assembly.
+function preprocessor(o: Options, macros: [string, string | null][], src: string, asm: bool): Preprocessor {
+	const pp = new Preprocessor(src, o.iquote, o.I, p => readFile(p))
+	pp.date = date()
+	if (asm) {
+		pp.define("__ASSEMBLER__")
+	}
+	// TPDE has no integers wider than 64 bits, so code that can do without __int128 does.
+	if (!o.ftpde) {
+		pp.define("__SIZEOF_INT128__", "16")
+	}
+	for (const [name, body] of macros) {
+		if (body == null) {
+			pp.undef(name)
+		} else {
+			pp.define(name, body)
+		}
+	}
+	return pp
+}
+
+/// The time, as ctime has it.
+function date(): string {
+	const p = malloc(8)
+	poke(p, (now() / 1000000000) as u64)
+	const s = c.fromCString(ctime(p))
+	free(p)
+	return s
+}

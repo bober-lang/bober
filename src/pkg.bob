@@ -27,7 +27,8 @@ export class CLib {
 	/// The files compiled, less those exclude matches.
 	sources: Glob[] = []
 	exclude: Glob[] = []
-	/// The headers an importer includes; private's only compiling it does.
+	/// The headers an importer includes, in src or a fetched CMake project's install tree; private's only compiling it
+	/// does.
 	include: Dir[] = []
 	private: Dir[] = []
 	/// The macros it is compiled with, by name.
@@ -35,6 +36,9 @@ export class CLib {
 	cmake: Preset = new Preset()
 	/// The patches applied to a copy of src before it is built, as patch -p1 takes them.
 	patches: string[] = []
+	/// A CMake project's toolchain file, which follows bober's defaults for the target and so may override them, as to
+	/// choose its compilers.
+	toolchain: string = ""
 }
 
 /// The configure preset that builds a CMake project, in the version of CMakePresets.json it is written in, but for its
@@ -59,8 +63,8 @@ export function nearest(path: string, read: (path: string) => string | null = p 
 	return d
 }
 
-/// The package of the bober.pkg in d, with its C libraries' src and patches joined onto d, their other paths onto their
-/// src or a CMake project's install tree.
+/// The package of the bober.pkg in d, with its C libraries' src, patches and toolchain joined onto d, their other paths
+/// onto their src if a directory, else onto the install tree of the CMake project fetched.
 export function load(d: Dir, read: (path: string) => string | null = p => readFile(p)): Package throws CompileError {
 	const path = join(d, "bober.pkg")
 	let p = new Package()
@@ -77,9 +81,10 @@ export function load(d: Dir, read: (path: string) => string | null = p => readFi
 		} else if (!cmake) {
 			throw new CompileError(`${path}: ${name}: only a CMake project is fetched`)
 		}
-		const root = if (cmake) out(p.name, name) else c.src as string
+		const root = if (c.src instanceof string) c.src else out(p.name, name)
 		const at = (xs: string[]) => xs.map(x => join(root, x))
 		c.patches = c.patches.map(x => join(d, x))
+		c.toolchain = if (c.toolchain == "") "" else join(d, c.toolchain)
 		c.sources = at(c.sources)
 		c.exclude = at(c.exclude)
 		c.include = at(c.include)

@@ -1,0 +1,32 @@
+//! Where bober finds its own files: builtin/, std/ with the C it links, the run time's C (src/rt.h) and the C sysroot
+//! (build/musl). Those of the repo it runs in, else those beside the bin/ or build/ that holds it: a repo, or the package
+//! dist.sh makes.
+
+import { readLink } from "../std/fs"
+import { dir, join } from "../std/fs/path"
+import { IoError } from "../std/io"
+import { startsWith } from "../std/string"
+
+/// The directory of bober's files: "." in the repo, so that their paths stay relative.
+export let root = find()
+let builtins = join(root, "builtin") + "/"
+
+/// Whether the module at path is one of builtin/'s.
+export function builtin(path: string): bool { return startsWith(path, builtins) }
+
+/// The path of builtin/'s module name.
+export function builtinPath(name: string): string { return `${builtins}${name}.bob` }
+
+function find(): string {
+	if (readFile("builtin/array.bob") != null) { // the prelude's, which boot has before it binds src/rt.h
+		return "."
+	}
+	try {
+		const d = dir(dir(readLink("/proc/self/exe")))
+		if (readFile(join(d, "builtin/array.bob")) != null) {
+			return d
+		}
+	} catch (e: IoError) {}
+	print("bober: finds no builtin/ here nor beside the directory holding it")
+	return "."
+}

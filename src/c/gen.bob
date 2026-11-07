@@ -1,0 +1,733 @@
+//! The values of C expressions and the code computing them. The parser decides what to compute; Gen
+//! emits it through the back end, folding what is known while compiling.
+
+import * as abi from "../backend/abi"
+import { Backend, Binary, Block, Cast, Cmp, FCmp, Type as Held, Operand, Unary, Value } from "../backend/backend"
+import { contains } from "../../std/algo"
+import { isDigit, plus, zero } from "../../std/ascii"
+import { max } from "../../std/math"
+import { trim } from "../../std/string"
+import { Numeric } from "../../std/types"
+import * from "./type"
+
+/// An expression's value. An lvalue's v is the base of its address, and off is added to it; so is an
+/// address constant's, a global. A constant also knows its value: known is "int", "float" or "addr".
+export class Val {
+	ty: Type
+	/// The back end's value: an rvalue's, or the address an lvalue or address constant is at; 0 for a
+	/// constant number, which is made where it is used.
+	v: Value
+	lv = false
+	off: i64 = 0
+	known = ""
+	n: i64 = 0
+	x: f64 = 0.0
+	/// The symbol an address constant is the global of; "" for a literal's.
+	sym = ""
+	/// Whether that global is weak, so that its address may be null.
+	weak = false
+	/// The bitfield an lvalue is.
+	bit: Field | null = null
+
+	constructor(ty: Type, v: Value) {
+		this.ty = ty
+		this.v = v
+	}
+}
+
+/// The integer constant n, cut to t.
+export function int(n: i64, t: Type): Val {
+	const v = new Val(t, 0)
+	v.known = "int"
+	v.n = wrap(n, t)
+	return v
+}
+
+export function float(x: f64, t: Type): Val {
+	const v = new Val(t, 0)
+	v.known = "float"
+	v.x = if (t.size == 4) (x as f32) as f64 else x
+	return v
+}
+
+/// An lvalue at the address v.
+export function object(t: Type, v: Value): Val {
+	const o = new Val(t, v)
+	o.lv = true
+	return o
+}
+
+/// An lvalue at the constant address v: the global sym's, or a literal's for "".
+export function global(t: Type, v: Value, sym: string = ""): Val {
+	const o = object(t, v)
+	o.known = "addr"
+	o.sym = sym
+	return o
+}
+
+/// The function being defined: its value and type, the entry block its allocas gather in, and the block
+/// its code starts in.
+export class Func {
+	v: Value
+	ty: Fn
+	entry: Block
+	body: Block
+
+	constructor(v: Value, ty: Fn, entry: Block, body: Block) {
+		this.v = v
+		this.ty = ty
+		this.entry = entry
+		this.body = body
+	}
+}
+
+export class Gen implements abi.Frame {
+	b: Backend
+	/// The function being defined; outside one, only constants can be computed.
+	f: Func | null = null
+	private scratches = 0
+
+	constructor(b: Backend) { this.b = b }
+
+	fn(): Func { return this.f! }
+
+	/// The back end type t is held as.
+	ty(t: Type): Held { return abi.held(this.b, t) }
+
+	/// A private constant of the bytes s.
+	bytes(s: string): Value { return this.b.constant(this.b.constBytes(s)) }
+
+	/// A new local object of type t, held as held when that is given, and aligned to at least align. A variable
+	/// length array is allocated here, until the function returns.
+	temp(t: Type, held: Held = 0, align = 1): Val {
+		if (isVla(t)) {
+			return object(t, this.b.stackAlloc(this.op(this.size(t))))
+		}
+		const f = this.fn()
+		const back = this.b.here()
+		this.b.at(f.entry)
+		const a = this.b.alloca(if (held == 0) this.ty(t) else held, max(align, t.align) as u32)
+		this.b.at(back)
+		return object(t, a)
+	}
+
+	/// The size of t in bytes, an unsigned long, which the code computes for a variable length array.
+	size(t: Type): Val { return if (isVla(t)) new Val(ULong, (t as Arr).bytes) else int(t.size, ULong) }
+
+	/// The array of len ts, of variable length where len or t's size is known only as the code runs.
+	array(t: Type, len: Val): Arr {
+		if (len.known == "int" && !isVla(t)) {
+			return new Arr(t, len.n as i32)
+		}
+		return new Arr(t, null, this.op(this.binary("*", this.cast(len, ULong), this.size(t))))
+	}
+
+	/// An aggregate held as its coerced type is aligned to 8, as the registers it is loaded for are.
+	alloca(t: Type, held: Held): Value { return this.temp(t, held, if (held == 0) 1 else 8).v }
+
+	// Blocks
+	/// A new block of the function being defined, which start opens.
+	label(): Block { return this.b.block(this.fn().v) }
+
+	/// Opens the block l, which the current one falls into unless it has ended.
+	start(l: Block) {
+		if (!this.b.ended()) {
+			this.b.br(l)
+		}
+		this.b.at(l)
+	}
+
+	/// A terminator ends the block; code after it, which nothing reaches, goes to a block of its own.
+	private end(terminate: () => void) {
+		terminate()
+		this.b.at(this.label())
+	}
+
+	br(l: Block) { this.end(() => this.b.br(l)) }
+	cbr(c: Value, yes: Block, no: Block) { this.end(() => this.b.condBr(c, yes, no)) }
+	unreachable() { this.end(() => this.b.unreachable()) }
+
+	trap() {
+		this.b.trap()
+		this.unreachable()
+	}
+
+	/// Jumps to the target of the case whose value v is, or of the range lo ... hi it is in, else to dflt.
+	switch(v: Val, cases: i64[], targets: Block[], ranges: [i64, i64, Block][], dflt: Block) {
+		const b = this.b
+		const t = this.ty(v.ty)
+		const x = this.op(v)
+		for (const [lo, hi, target] of ranges) {
+			const next = this.label()
+			b.condBr(b.icmp("ule", b.binary("sub", x, b.constInt(t, lo)), b.constInt(t, hi - lo)), target, next)
+			b.at(next)
+		}
+		this.end(() => b.switch(x, cases, targets, dflt))
+	}
+
+	/// The address an lvalue or a pointer designates.
+	addr(v: Val): Value {
+		if (v.off == 0) {
+			return v.v
+		}
+		if (v.known == "addr") {
+			return this.b.constOffset(v.v, v.off)
+		}
+		return this.b.gep(this.b.int(8), v.v, [this.b.constInt(this.b.int(64), v.off)])
+	}
+
+	/// An rvalue as the back end's value.
+	op(v: Val): Value {
+		const t = v.ty
+		if (v.known == "int") {
+			if (t.kind != "ptr") {
+				return this.b.constInt(this.ty(t), v.n)
+			}
+			return if (v.n == 0) this.b.constZero(this.b.ptr())
+				else this.b.constCast("inttoptr", this.b.constInt(this.b.int(64), v.n), this.b.ptr())
+		}
+		if (v.known == "float") {
+			return this.b.constFloat(this.ty(t), v.x)
+		}
+		if (t.kind == "ptr") {
+			return this.addr(v)
+		}
+		if (v.known == "addr") {
+			return this.b.constCast("ptrtoint", this.addr(v), this.ty(t))
+		}
+		return v.v
+	}
+
+	/// v after lvalue conversion: loaded, or an array or function decayed to a pointer. A struct stays
+	/// where it is.
+	rv(v: Val): Val {
+		const t = v.ty
+		if (!v.lv || t instanceof Record) {
+			return v
+		}
+		if (t.kind == "array" || t.kind == "func") {
+			const p = retype(v, decay(t))
+			p.lv = false
+			return p
+		}
+		if (v.bit != null) {
+			return this.loadBit(v, v.bit!)
+		}
+		return new Val(t, this.load(t, this.addr(v)))
+	}
+
+	/// Stores v converted to dst's type, and returns what was stored.
+	store(dst: Val, v: Val): Val {
+		const t = dst.ty
+		const x = this.cast(this.rv(v), t)
+		if (dst.bit != null) {
+			this.storeBit(dst, dst.bit!, x)
+			return this.rv(dst)
+		}
+		if (t instanceof Record) {
+			this.copy(dst, x, t.size)
+		} else {
+			this.b.store(this.op(x), this.addr(dst), isVolatile(t))
+		}
+		return x
+	}
+
+	/// Loads a t from addr, a volatile one as such.
+	private load(t: Type, addr: Value): Value { return this.b.load(this.ty(t), addr, isVolatile(t)) }
+
+	copy(dst: Val, src: Val, size: i64) { this.b.copy(this.addr(dst), this.addr(src), size) }
+	zero(dst: Val, size: i64) { this.b.zero(this.addr(dst), size) }
+
+	/// A bitfield's value; one narrower than an int promotes to an int, whatever its type, as in clang.
+	private loadBit(v: Val, b: Field): Val {
+		const t = this.ty(b.ty)
+		const u = this.load(v.ty, this.addr(v))
+		const bits = b.ty.size * 8
+		const c = (n: i64) => this.b.constInt(t, n)
+		const shifted = if (isUnsigned(b.ty)) this.b.binary("lshr", u, c(b.shift))
+			else this.b.binary("shl", u, c(bits - b.shift - b.width))
+		const x = if (isUnsigned(b.ty)) this.b.binary("and", shifted, c(wrap(mask(b.width), b.ty)))
+			else this.b.binary("ashr", shifted, c(bits - b.width))
+		return this.cast(new Val(b.ty, x), if (b.width < 32) Int else b.ty)
+	}
+
+	private storeBit(dst: Val, b: Field, x: Val) {
+		const t = this.ty(b.ty)
+		const a = this.addr(dst)
+		const m = mask(b.width)
+		const c = (n: i64) => this.b.constInt(t, n)
+		const kept = this.b.binary("and", this.load(dst.ty, a), c(wrap(~(m << b.shift), b.ty)))
+		const bits = this.b.binary("shl", this.b.binary("and", this.op(x), c(wrap(m, b.ty))), c(b.shift))
+		this.b.store(this.b.binary("or", kept, bits), a, isVolatile(dst.ty))
+	}
+
+	/// v converted to t, as by a cast.
+	cast(v: Val, t: Type): Val {
+		const s = v.ty
+		if (t.kind == "void") {
+			return new Val(t, 0)
+		}
+		if (isCompatible(s, t) || t instanceof Record || s.kind == "ptr" && t.kind == "ptr") {
+			return retype(v, t)
+		}
+		if (t.kind == "bool") {
+			const known = this.truth(v)
+			if (known != null) {
+				return int(if (known) 1 else 0, t)
+			}
+			return new Val(t, this.b.cast("zext", this.cond(v), this.b.int(8)))
+		}
+		if (v.known == "int" && exact(v, t)) {
+			return if (t.kind == "float") float(if (isUnsigned(s)) (v.n as u64) as f64 else v.n as f64, t) else int(v.n, t)
+		}
+		if (v.known == "float") {
+			return if (t.kind == "float") float(v.x, t) else int(if (isUnsigned(t)) (v.x as u64) as i64 else v.x as i64, t)
+		}
+		if (isInt(s) && t.kind == "int" && s.size == t.size || v.known == "addr" && t.size == 8) {
+			return retype(v, t)
+		}
+		return new Val(t, this.b.cast(conversion(s, t), this.op(v), this.ty(t)))
+	}
+
+	/// Whether v is nonzero, if known while compiling.
+	truth(v: Val): bool | null {
+		return switch (v.known) {
+			case "int": v.n != 0
+			case "float": v.x != 0.0
+			case "addr": if (v.weak) null else true
+			default: null
+		}
+	}
+
+	/// Whether the rvalue v is nonzero, as an i1.
+	cond(v: Val): Value {
+		const known = this.truth(v)
+		if (known != null) {
+			return this.b.constInt(this.b.int(1), if (known) 1 else 0)
+		}
+		const t = v.ty
+		return switch (t.kind) {
+			case "float": this.b.fcmp("une", v.v, this.b.constFloat(this.ty(t), 0.0))
+			case "ptr": this.b.icmp("ne", this.op(v), this.b.constZero(this.b.ptr()))
+			default: this.b.icmp("ne", v.v, this.b.constInt(this.ty(t), 0))
+		}
+	}
+
+	/// a op b, for C's arithmetic, bitwise, shift and comparison operators, on rvalues.
+	binary(op: string, a: Val, b: Val): Val {
+		const pa = a.ty.kind == "ptr"
+		const pb = b.ty.kind == "ptr"
+		if (op == "+" && pb) {
+			return this.offset(b, a, false)
+		}
+		if ((op == "+" || op == "-") && pa && !pb) {
+			return this.offset(a, b, op == "-")
+		}
+		if (op == "-" && pa) {
+			return this.diff(a, b)
+		}
+		if (pa || pb) {
+			return this.compare(op, this.cast(a, if (pa) a.ty else b.ty), this.cast(b, if (pa) a.ty else b.ty))
+		}
+		const t = if (op == "<<" || op == ">>") promote(a.ty) else common(a.ty, b.ty)
+		const x = this.cast(a, t)
+		const y = this.cast(b, t)
+		if (compares(op)) {
+			return this.compare(op, x, y)
+		}
+		if (x.known == "int" && y.known == "int" && t.size < 16 && !((op == "/" || op == "%") && y.n == 0)) {
+			return int(foldInt(op, x.n, y.n, isUnsigned(t)), t)
+		}
+		if (x.known == "float" && y.known == "float") {
+			return float(foldFloat(op, x.x, y.x), t)
+		}
+		return new Val(t, this.b.binary(instruction(op, t), this.op(x), this.op(y)))
+	}
+
+	private compare(op: string, x: Val, y: Val): Val {
+		const t = x.ty
+		const unsigned = isUnsigned(t) || t.kind == "ptr"
+		if (x.known == "int" && y.known == "int") {
+			return boolean(foldCompare(op, x.n, y.n, unsigned))
+		}
+		if (x.known == "float" && y.known == "float") {
+			return boolean(foldCompare(op, x.x, y.x, false))
+		}
+		if (x.known == "addr" && y.known == "addr" && x.v == y.v) {
+			return boolean(foldCompare(op, x.off, y.off, false))
+		}
+		const r = if (t.kind == "float") this.b.fcmp(floatPredicate(op), this.op(x), this.op(y))
+			else this.b.icmp(intPredicate(op, unsigned), this.op(x), this.op(y))
+		return new Val(Int, this.b.cast("zext", r, this.b.int(32)))
+	}
+
+	/// The pointer p moved by i elements, backwards if minus.
+	private offset(p: Val, i: Val, minus: bool): Val {
+		const e = element(p.ty)
+		const size = this.size(e)
+		if (size.known != "int") {
+			return retype(this.offset(retype(p, new Ptr(Char)), this.binary("*", i, size), minus), p.ty)
+		}
+		if (i.known == "int" && p.known == "int") {
+			return int(p.n + (if (minus) -i.n else i.n) * e.size, p.ty)
+		}
+		if (i.known == "int") {
+			const r = retype(p, p.ty)
+			r.off = p.off + (if (minus) -i.n else i.n) * e.size
+			return r
+		}
+		let n = this.op(this.cast(i, Long))
+		if (minus) {
+			n = this.b.binary("sub", this.b.constInt(this.b.int(64), 0), n)
+		}
+		return new Val(p.ty, this.b.gep(this.ty(e), this.op(p), [n]))
+	}
+
+	private diff(a: Val, b: Val): Val {
+		const s = this.size(element(a.ty))
+		if (s.known != "int") {
+			const bytes = new Ptr(Char)
+			return this.binary("/", this.diff(retype(a, bytes), retype(b, bytes)), this.cast(s, Long))
+		}
+		const size = s.n
+		if (a.known == "int" && b.known == "int") {
+			return int((a.n - b.n) / size, Long)
+		}
+		if (a.known == "addr" && b.known == "addr" && a.v == b.v) {
+			return int((a.off - b.off) / size, Long)
+		}
+		const i64 = this.b.int(64)
+		const d = this.b.binary("sub", this.b.cast("ptrtoint", this.op(a), i64), this.b.cast("ptrtoint", this.op(b), i64))
+		return new Val(Long, this.b.binary("sdiv", d, this.b.constInt(i64, size)))
+	}
+
+	/// -v, ~v or !v of an rvalue.
+	unary(op: string, v: Val): Val {
+		if (op == "!") {
+			return this.compare("==", v, this.cast(int(0, Int), v.ty))
+		}
+		const x = this.cast(v, promote(v.ty))
+		if (op == "~") {
+			return this.binary("^", x, int(-1, x.ty))
+		}
+		if (x.known == "float") {
+			return float(-x.x, x.ty)
+		}
+		if (x.ty.kind == "float") {
+			return new Val(x.ty, this.b.unary("fneg", x.v))
+		}
+		return this.binary("-", int(0, x.ty), x)
+	}
+
+	/// The object the pointer p points to.
+	deref(p: Val): Val {
+		const v = retype(p, pointee(p.ty))
+		v.lv = true
+		return v
+	}
+
+	/// A pointer to the lvalue v.
+	addressOf(v: Val): Val {
+		const p = retype(v, new Ptr(v.ty))
+		p.lv = false
+		return p
+	}
+
+	/// Member f of the struct or union lvalue v, volatile if v is. At a constant address, as in
+	/// &((T *)0)->m, it is one too.
+	member(v: Val, f: Field): Val {
+		const ty = if (isVolatile(v.ty)) volatile(f.ty) else f.ty
+		const m = if (v.known == "int") this.deref(int(v.n + f.off, new Ptr(ty))) else retype(v, ty)
+		if (v.known != "int") {
+			m.off = v.off + f.off
+		}
+		if (f.width >= 0) {
+			m.bit = f
+		}
+		return m
+	}
+
+	/// Calls the function or function pointer target with args, converted as its type says.
+	call(target: Val, args: Val[]): Val {
+		const p = this.rv(target)
+		const ft = callee(p.ty)!
+		// An unprototyped call's arguments are promoted, as a variadic one's are past its parameters.
+		const types: Type[] = []
+		const xs: Value[] = []
+		for (const i of 0 ... args.length - 1) {
+			const v = this.rv(args[i])
+			const x = this.cast(v, if (i < ft.params.length) ft.params[i][0] else abi.promoteArg(v.ty))
+			types.push(x.ty)
+			xs.push(if (x.ty instanceof Record) this.addr(x) else this.op(x))
+		}
+		if (contains(["setjmp", "_setjmp", "sigsetjmp"], p.sym)) {
+			this.b.attr(p.v, -1, "returns_twice", 0)
+		}
+		const r = ft.result
+		const x = abi.call(this.b, this, this.op(p), ft, types, xs)
+		return if (r.kind == "void") new Val(Void, 0) else if (r instanceof Record) object(r, x) else new Val(r, x)
+	}
+
+	/// The function sym declared as ft, local to the module or not.
+	declare(sym: string, ft: Fn, local: bool): Value {
+		const f = this.b.function(sym, abi.signature(this.b, ft), local)
+		abi.attrs(this.b, f, ft)
+		return f
+	}
+
+	/// A function of no consequence, whose code is parsed for its type alone and then removed.
+	scratch(): Value {
+		this.scratches++
+		return this.b.function(`.scratch${this.scratches}`, this.b.fn(this.b.void(), []), true)
+	}
+
+	/// Starts defining the function v of type ft, and returns its parameters as locals.
+	begin(ft: Fn, v: Value): Val[] {
+		const entry = this.b.block(v)
+		const body = this.b.block(v)
+		this.f = new Func(v, ft, entry, body)
+		this.b.at(body)
+		const locals: Val[] = []
+		const ps = abi.params(this.b, this, v, ft)
+		for (const i of 0 ... ps.length - 1) {
+			locals.push(object(ft.params[i][0], ps[i]))
+		}
+		return locals
+	}
+
+	/// Returns v, or nothing, from the function being defined.
+	ret(v: Val | null) {
+		const f = this.fn()
+		const r = f.ty.result
+		const x = if (v == null || r.kind == "void") 0 else if (r instanceof Record) this.addr(v) else this.op(this.cast(this.rv(v), r))
+		this.end(() => abi.ret(this.b, this, f.v, f.ty, x))
+	}
+
+	/// Returns where the code falls off the function's end: main returns 0.
+	fallOff(main: bool) {
+		if (main) {
+			this.end(() => this.b.ret(this.b.constInt(this.b.int(32), 0)))
+		} else {
+			this.ret(null)
+		}
+	}
+
+	/// Ends the function being defined. The block its last terminator opened is empty.
+	define() {
+		const f = this.fn()
+		this.b.unreachable()
+		this.b.at(f.entry)
+		this.b.br(f.body)
+		this.f = null
+	}
+
+	/// Loads the object p points to atomically, or stores v to it.
+	atomic(p: Val, v: Val | null): Val {
+		const x = this.rv(p)
+		const t = pointee(x.ty)
+		if (v == null) {
+			return new Val(t, this.b.atomicLoad(this.ty(t), this.op(x)))
+		}
+		this.b.atomicStore(this.op(this.cast(this.rv(v), t)), this.op(x))
+		return new Val(Void, 0)
+	}
+
+	/// The intrinsic op, bswap, ctlz, cttz, ctpop or fabs, on v as a t. Counts are ints.
+	intrinsic(op: Unary, t: Type, v: Val): Val {
+		const r = new Val(t, this.b.unary(op, this.op(this.cast(v, t))))
+		return if (op == "bswap" || op == "fabs") r else this.cast(r, Int)
+	}
+
+	/// GNU's asm statement: outputs are lvalues under constraints like "=r", or "+r" for one read too, as an
+	/// input tied to it after the others; clobbers are names like memory. An operand in memory, "m", goes
+	/// by its address.
+	asm(text: string, outs: [string, Val][], ins: [string, Val][], clobbers: string[]) {
+		const outputs: Operand[] = []
+		const inputs: Operand[] = []
+		const tied: [Val, Val][] = []
+		for (const i of 0 ... outs.length - 1) {
+			const [c, v] = outs[i]
+			const r = c.slice(1, c.length)
+			outputs.push(new Operand(r, if (r == "m") this.addr(v) else 0, this.ty(v.ty)))
+			if (c[0] == plus) {
+				ins.push([if (r == "m") "m" else `${i}`, v])
+			}
+		}
+		for (const [c, v] of ins) {
+			if (c == "m") {
+				inputs.push(new Operand(c, this.addr(v), this.ty(v.ty)))
+				continue
+			}
+			const x = this.rv(v)
+			if (c.length == 1 && isDigit(c[0])) {
+				tied.push([outs[c[0] - zero][1], x])
+			}
+			inputs.push(new Operand(c, this.op(x), this.ty(x.ty)))
+		}
+		// An empty template only keeps the optimizer off its operands: a back end without inline assembly
+		// leaves it out, and each output takes the input tied to it.
+		if (!this.b.hasAsm() && trim(text) == "") {
+			for (const [o, x] of tied) {
+				this.store(o, x)
+			}
+			return
+		}
+		const rs = this.b.asm(text, outputs, inputs, clobbers)
+		let k = 0
+		for (const [c, v] of outs) {
+			if (c.slice(1, c.length) != "m") {
+				this.store(v, new Val(v.ty, rs[k]))
+				k++
+			}
+		}
+	}
+
+	/// The address of the va_list ap, which but on Apple arm64 is an array and as a parameter has decayed
+	/// to a pointer to it.
+	private list(ap: Val): Value { return if (abi.vaList instanceof Arr) this.op(this.rv(ap)) else this.addr(ap) }
+
+	vaStart(ap: Val) { this.b.vaStart(this.list(ap)) }
+
+	vaCopy(to: Val, from: Val) {
+		if (abi.vaList instanceof Arr) {
+			this.b.copy(this.list(to), this.list(from), abi.vaList.size)
+		} else {
+			this.store(to, from)
+		}
+	}
+
+	/// The next variadic argument from the va_list ap, a t.
+	vaArg(ap: Val, t: Type): Val { return object(t, abi.vaArg(this.b, this, this.list(ap), t)) }
+}
+
+function retype(v: Val, t: Type): Val {
+	const c = new Val(t, v.v)
+	c.lv = v.lv
+	c.off = v.off
+	c.known = v.known
+	c.n = v.n
+	c.x = v.x
+	c.sym = v.sym
+	c.weak = v.weak
+	return c
+}
+
+function boolean(b: bool): Val { return int(if (b) 1 else 0, Int) }
+
+function element(p: Type): Type {
+	const e = pointee(p)
+	return if (e.kind == "void" || e.kind == "func") Char else e
+}
+
+export function mask(width: i32): i64 { return if (width >= 64) -1 else ((1 as i64) << width) - 1 }
+
+function compares(op: string): bool {
+	return op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">="
+}
+
+function conversion(s: Type, t: Type): Cast {
+	if (s.kind == "float" && t.kind == "float") {
+		return if (t.size > s.size) "fpext" else "fptrunc"
+	}
+	if (s.kind == "float") {
+		return if (isUnsigned(t)) "fptoui" else "fptosi"
+	}
+	if (t.kind == "float") {
+		return if (isUnsigned(s)) "uitofp" else "sitofp"
+	}
+	if (s.kind == "ptr") {
+		return "ptrtoint"
+	}
+	if (t.kind == "ptr") {
+		return "inttoptr"
+	}
+	if (t.size < s.size) {
+		return "trunc"
+	}
+	return if (isUnsigned(s)) "zext" else "sext"
+}
+
+function instruction(op: string, t: Type): Binary {
+	const fp = t.kind == "float"
+	const u = isUnsigned(t)
+	return switch (op) {
+		case "+": if (fp) "fadd" else "add"
+		case "-": if (fp) "fsub" else "sub"
+		case "*": if (fp) "fmul" else "mul"
+		case "/": if (fp) "fdiv" else if (u) "udiv" else "sdiv"
+		case "%": if (fp) "frem" else if (u) "urem" else "srem"
+		case "<<": "shl"
+		case ">>": if (u) "lshr" else "ashr"
+		case "&": "and"
+		case "|": "or"
+		default: "xor"
+	}
+}
+
+function intPredicate(op: string, unsigned: bool): Cmp {
+	return switch (op) {
+		case "==": "eq"
+		case "!=": "ne"
+		case "<": if (unsigned) "ult" else "slt"
+		case ">": if (unsigned) "ugt" else "sgt"
+		case "<=": if (unsigned) "ule" else "sle"
+		default: if (unsigned) "uge" else "sge"
+	}
+}
+
+function floatPredicate(op: string): FCmp {
+	return switch (op) {
+		case "==": "oeq"
+		case "!=": "une"
+		case "<": "olt"
+		case ">": "ogt"
+		case "<=": "ole"
+		default: "oge"
+	}
+}
+
+/// Whether folding v's value, kept in 64 bits, as a t is exact: not where an unsigned value past 2^63
+/// is or becomes 128 bits wide.
+function exact(v: Val, t: Type): bool {
+	return !(isUnsigned(v.ty) && v.n < 0 && (t.size == 16 || v.ty.size == 16 && t.kind == "float"))
+}
+
+function foldInt(op: string, a: i64, b: i64, unsigned: bool): i64 {
+	const x = a as u64
+	const y = b as u64
+	return switch (op) {
+		case "+": a + b
+		case "-": a - b
+		case "*": a * b
+		case "/": if (unsigned) (x / y) as i64 else a / b
+		case "%": if (unsigned) (x % y) as i64 else a % b
+		case "<<": a << b
+		case ">>": if (unsigned) (x >> y) as i64 else a >> b
+		case "&": a & b
+		case "|": a | b
+		default: a ^ b
+	}
+}
+
+function foldFloat(op: string, a: f64, b: f64): f64 {
+	return switch (op) {
+		case "+": a + b
+		case "-": a - b
+		case "*": a * b
+		default: a / b
+	}
+}
+
+function foldCompare[T extends Numeric](op: string, a: T, b: T, unsigned: bool): bool {
+	if (unsigned) {
+		return foldCompare(op, a as u64, b as u64, false)
+	}
+	return switch (op) {
+		case "==": a == b
+		case "!=": a != b
+		case "<": a < b
+		case ">": a > b
+		case "<=": a <= b
+		default: a >= b
+	}
+}

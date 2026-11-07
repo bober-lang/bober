@@ -1,0 +1,55 @@
+//! chibicc's tests, vendor/chibicc/test/*.c, each compiled by bobcc's front end with test/common, linked and run.
+//! common's assert exits on failure. Tests that hold for chibicc but not for C, as those of its stack layout, have been
+//! removed from them.
+
+import { slash } from "../../std/ascii"
+import { glob } from "../../std/fs"
+import { arch } from "../../std/os"
+import { base, isAbs, stem } from "../../std/fs/path"
+import { run } from "../../std/process"
+import { LLVM } from "../backend/llvm"
+import { sysroot, system } from "./bind"
+import { library } from "./builtins"
+import { Parser } from "./parse"
+import { Preprocessor } from "./pp"
+import { link } from "./bobcc"
+
+/// chibicc's directory, which the tests name their files from, as test/macro.c does.
+const root = "vendor/chibicc"
+
+test "chibicc" {
+	const common = compile("test/common").text()
+	for (const f of glob(`${root}/test/*.c`)) {
+		// Its asm is x86-64's.
+		if (arch != "x86_64" && base(f) == "asm.c") {
+			continue
+		}
+		// Its <stdatomic.h> is the compiler's, and bobcc has none.
+		if (base(f) == "atomic.c") {
+			continue
+		}
+		test `${base(f)}` {
+			const m = compile(`test/${base(f)}`)
+			m.include(common)
+			const out = `build/chibicc-${stem(f)}`
+			m.emit(out + ".o", false)
+			assert link(sysroot, [out + ".o"], out) == 0
+			assert run([out], "/dev/null") == 0
+		}
+	}
+}
+
+/// The module of the C at path in root. Its <> includes search test, as macro.c's do, then the system's, relative to
+/// root unless absolute, as macOS's SDK is; "" includes also search root, as pragma-once.c's do.
+function compile(path: string): LLVM {
+	const m = new LLVM(path, 0)
+	const sys = if (isAbs(system)) system else `../../${system}`
+	const pp = new Preprocessor(path, ["."], ["test", sys],
+		p => readFile(if (p[0] == slash) p else `${root}/${p}`))
+	const p = new Parser(pp, m)
+	p.library = library()
+	// commonsym.c's tentative definition of common_ext2 merges with common's, as with -fcommon.
+	p.common = true
+	p.unit()
+	return m
+}

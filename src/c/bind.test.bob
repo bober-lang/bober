@@ -1,0 +1,114 @@
+import { HashMap } from "../../std/collections/hashmap"
+import { bind, glue, includesOf } from "./bind"
+import { CompileError } from "../error"
+
+const header = `#include "inner.h"
+#define VERSION "3.1\\n"
+#define FLAG (1u << 31)
+#define NEG (-2)
+#define HALF 0.5f
+#define NONE ((void *)0)
+#define open open_v2
+#define inner_alias inner
+#define twice(x) ((x) * 2)
+enum color { RED, GREEN = 5 };
+typedef struct { int quot; int rem; } div_t;
+struct point { double x, y; };
+struct box { struct point min, max; char tag[4]; float m[2][3]; };
+typedef unsigned long size;
+div_t div(int, int);
+struct box grow(struct box b, _Bool all, const char *name);
+void *open_v2(const char *path, size n);
+void nothing(void);
+int printf(const char *, ...);
+int old();
+extern int counter;
+extern struct point corners[2];
+extern int unsized[];
+union u { int i; float f; };
+union u pun(void);
+struct packed { char c; int i; } __attribute__((packed));
+struct packed squash(void);
+long double ld(void);
+struct point *nearest(const struct point *p, struct packed *q, struct opaque *o);
+void fill(int *xs, char **out, void (*f)(void));
+static inline int half(int x) { return x / 2; }
+`
+
+function b(...names: string[]): string {
+	const fs = new HashMap[string, string]()
+	fs.set("dir/t.h", header)
+	fs.set("dir/inner.h", "int inner(int);\n")
+	return bind("dir/m.bob", "t.h", names, [], p => fs.get(p))
+}
+
+function error(...names: string[]): string {
+	try {
+		b(...names)
+	} catch (e: CompileError) {
+		return e.msg
+	}
+	return ""
+}
+
+test "functions take bober types of the C widths" {
+	assert b("inner", "nothing", "ld")
+		== "export function inner(a0: i32): i32\nexport function nothing()\nexport function ld(): f64\n"
+}
+
+test "structs are classes, by value embedded, with nested structs embedded and arrays in place" {
+	assert b("div", "div_t")
+		== "export class div_t { quot: i32; rem: i32 }\nexport function div(a0: i32, a1: i32): div_t\n"
+	assert b("grow")
+		== "export class C2 { x: f64; y: f64 }\nexport class C1 { min: ...C2; max: ...C2; tag: i8[4]; m: f32[3][2] }\nexport function grow(a0: ...C1, a1: bool, a2: string | u8[] | u64): C1\n"
+	assert b("point", "size") == "export class point { x: f64; y: f64 }\nexport type size = u64\n"
+}
+
+test "a pointer to a struct that is a class is the class, as a parameter" {
+	assert b("point", "nearest")
+		== "export class point { x: f64; y: f64 }\nexport function nearest(a0: point, a1: u64, a2: u64): u64\n"
+}
+
+test "a pointer to a scalar takes an array of it, one to a byte or void a string too" {
+	assert b("fill") == "export function fill(a0: i32[] | u64, a1: u64[] | u64, a2: u64)\n"
+}
+
+test "a static function is declared as an alias, which glue defines" {
+	assert b("half") == "export function bober_inline_half(a0: i32): i32\nexport const half = bober_inline_half\n"
+	assert glue("dir/t.h", ["bober_inline_half", "div"])
+		== "#include \"dir/t.h\"\nextern __typeof__(half) bober_inline_half __attribute__((weak, alias(\"half\")));\n"
+	assert glue("dir/t.h", ["div"]) == ""
+}
+
+test "include directories come from the importer's bober.pkg" {
+	const fs = new HashMap[string, string]()
+	fs.set("a/bober.pkg", `{"c": {"z": {"src": "z", "include": ["include", "../x"]}}}`)
+	assert includesOf("a/b/m.bob", ["sys"], p => fs.get(p)).join(" ") == "sys a/z/include a/x"
+	assert includesOf("c/m.bob", ["sys"], p => fs.get(p)).join(" ") == "sys"
+}
+
+test "constants come from enums and macros" {
+	assert b("RED", "GREEN", "VERSION", "FLAG", "NEG", "HALF", "NONE")
+		== "export const RED: i32 = 0\nexport const GREEN: i32 = 5\nexport const VERSION = \"3.1\\x0A\"\nexport const FLAG: u32 = 2147483648\nexport const NEG: i32 = -2\nexport const HALF: f32 = 0.5\nexport const NONE: u64 = 0\n"
+}
+
+test "objects are consts, arrays of structs included" {
+	assert b("counter", "corners")
+		== "export const counter: i32\nexport class C1 { x: f64; y: f64 }\nexport const corners: C1[2]\n"
+}
+
+test "a macro naming a function aliases it" {
+	assert b("open") == "export function open_v2(a0: string | u8[] | u64, a1: u64): u64\nexport const open = open_v2\n"
+	assert b("inner", "inner_alias") == "export function inner(a0: i32): i32\nexport const inner_alias = inner\n"
+}
+
+test "names bober cannot declare" {
+	assert error("printf") == "t.h: printf: variadic"
+	assert error("old") == "t.h: old: without a prototype"
+	assert error("unsized") == "t.h: unsized: an array of unknown length"
+	assert error("missing") == "t.h: missing: not declared"
+	assert error("twice") == "t.h: twice: not declared"
+	assert error("pun") == "t.h: pun: a union"
+	assert error("u") == "t.h: u: a union"
+	assert error("squash") == "t.h: squash: C1 is packed"
+}

@@ -30,6 +30,14 @@ class Global {
 	tentative = false
 	/// Whether every declaration of the function makes its definition one only for inlining.
 	inlineOnly = true
+	/// Whether a declaration has the weak attribute.
+	weak = false
+	/// Whether a declaration has the visibility attribute hidden or internal.
+	hidden = false
+	/// The string literal naming what a declaration's alias attribute makes it another name of, if one has it.
+	alias: Tok | null = null
+	/// The LLVM attributes of the function its declarations give.
+	fn: string[] = []
 
 	constructor(v: Val, local: bool, tls: bool) {
 		this.v = v
@@ -43,7 +51,11 @@ class Attrs {
 	align = 0
 	asm = ""
 	gnuInline = false
-	alwaysInline = false
+	weak = false
+	hidden = false
+	alias: Tok | null = null
+	/// The LLVM attributes of the function, as noreturn.
+	fn: string[] = []
 	/// The integer mode of the mode attribute, as intMode numbers it, or 0 for none.
 	mode = 0
 }
@@ -94,7 +106,15 @@ export class Parser {
 	private order: Global[] = []
 	/// The function being defined.
 	private fname = ""
+	/// Its value, 0 outside one, whose blocks && takes the address of, also from code that is discarded.
+	private fn: Value = 0
 	private labels = new HashMap[string, Block]()
+	/// The labels used but not yet defined, by the token first using each.
+	private pending = new HashMap[string, Tok]()
+	/// The labels whose address && takes; and the block computed gotos jump through, with the slot of the address
+	/// they jump to, which can be any of those, known only at the function's end.
+	private taken: Block[] = []
+	private dispatch: [Block, Val] | null = null
 	private breaks: Block[] = []
 	private continues: Block[] = []
 	private sw: Switch | null = null
@@ -105,6 +125,9 @@ export class Parser {
 	private inStatic = false
 	/// Whether the next suffix is a parameter's outermost one, whose array length may use earlier parameters.
 	private paramSuffix = false
+	/// Whether the code parsed is not run, as in parameter lists, members and what is discarded, where array
+	/// lengths are constant.
+	private unrun = false
 	/// The library functions an undeclared __builtin_X may call as X, by name.
 	library = new HashMap[string, Type]()
 	/// Whether external tentative definitions are common, as with -fcommon.
@@ -148,17 +171,38 @@ export class Parser {
 
 	/// Keeps a function's definition for inlining only if every declaration says so (C11 6.7.4p7).
 	/// Defines a tentative global as zeros, an array of unknown length as one element, common if external and asked.
+	/// Makes one an alias, a defined external one weak, or any hidden, and gives a function its attributes, if a
+	/// declaration said so.
 	private finish(g: Global) {
 		const t = g.v.ty
 		const b = this.g.b
+		for (const a of if (t instanceof Fn) g.fn else []) {
+			b.attr(g.v.v, -1, a, 0)
+		}
 		if (g.defined && t instanceof Fn && g.inlineOnly && !g.local) {
 			b.inlineOnly(g.v.v)
-		} else if (g.tentative && !g.defined) {
+			return
+		}
+		if (g.tentative && !g.defined) {
 			const size = if (t instanceof Arr && t.len == null) t.base.size else t.size
 			this.defineGlobal(g.v, new Data().value(b, size), g.local, g.tls, max(g.align, t.align))
 			if (this.common && !g.local && !g.tls) {
 				b.common(g.v.v)
 			}
+		}
+		const alias = g.alias
+		if (alias != null) {
+			const to = this.globals.get(alias.text.slice(1, alias.text.length - 1))
+			if (to == null || !to.defined && !to.tentative && to.alias == null) {
+				throw CError.at(alias, `${alias.text} is not defined here`)
+			}
+			g.v.v = b.alias(g.v.v, to.v.v)
+		}
+		if (g.weak && !g.local && (g.defined || g.tentative || alias != null)) {
+			b.overridable(g.v.v)
+		}
+		if (g.hidden && !g.local) {
+			b.hidden(g.v.v)
 		}
 	}
 
@@ -229,12 +273,21 @@ export class Parser {
 		const outer = g.f
 		const back = g.b.here()
 		g.begin(new Fn(Void), g.scratch())
-		const t = f()
+		const t = this.unrunning(f)
 		g.b.remove(g.fn().v)
 		g.f = outer
 		if (outer != null) {
 			g.b.at(back)
 		}
+		return t
+	}
+
+	/// Parses with f as code that is not run.
+	private unrunning[T](f: () => T): T {
+		const outer = this.unrun
+		this.unrun = true
+		const t = f()
+		this.unrun = outer
 		return t
 	}
 
@@ -282,6 +335,13 @@ export class Parser {
 		this.eat("__extension__")
 		if (this.eat("_Static_assert")) {
 			this.staticAssert()
+			return
+		}
+		if (isAsm(this.peek().text) && this.peek(1).is("(")) {
+			this.next(2)
+			this.g.b.moduleAsm(this.asmString())
+			this.expect(")")
+			this.expect(";")
 			return
 		}
 		const s = this.specs()
@@ -347,12 +407,18 @@ export class Parser {
 		if (ty.kind == "func" || s.storage == "extern" || this.g.f == null) {
 			const g = this.declareGlobal(name, ty, s, a)
 			if (this.eat("=")) {
+				if (g.defined) {
+					throw CError.at(this.peek(), `redefinition of ${name}`)
+				}
 				this.initStatic(g.v, g.local, g.tls, g.align, true)
 				g.defined = true
 			} else if (s.storage != "extern" && ty.kind != "func") {
 				g.tentative = true
 			}
 			return
+		}
+		if (!isComplete(ty)) {
+			throw CError.at(this.peek(), `${name} has an incomplete type`)
 		}
 		if (s.storage == "static") {
 			const v = global(ty, 0, `${this.fname}.${name}`)
@@ -363,6 +429,9 @@ export class Parser {
 		if (!this.eat("=")) {
 			this.scopes.set(name, this.g.temp(ty, 0, a.align))
 			return
+		}
+		if (isVla(ty)) {
+			throw CError.at(this.peek(), "a variable length array may not be initialized")
 		}
 		if (ty instanceof Arr && ty.len == null) {
 			this.scopes.set(name, this.unsized(ty, a.align, name))
@@ -384,6 +453,8 @@ export class Parser {
 			g = new Global(global(ty, v, sym), local, s.tls)
 			this.globals.set(name, g)
 			this.order.push(g)
+		} else if (!isCompatible(g.v.ty, ty)) {
+			throw CError.at(this.peek(), `conflicting types for ${name}`)
 		} else if (!(ty instanceof Fn && !ty.prototyped || ty instanceof Arr && ty.len == null)) {
 			// A redeclaration refines the type, unless it says less.
 			g.v.ty = ty
@@ -395,6 +466,14 @@ export class Parser {
 			g.inlineOnly = g.inlineOnly && inlineOnly
 		}
 		g.align = max(g.align, a.align)
+		g.weak = g.weak || s.attrs.weak || a.weak
+		if (g.weak && !g.local) {
+			g.v.weak = true
+			this.g.b.overridable(g.v.v) // before a use, which would take its address as nonzero
+		}
+		g.hidden = g.hidden || s.attrs.hidden || a.hidden
+		g.alias = a.alias ?? s.attrs.alias ?? g.alias
+		g.fn = [...g.fn, ...s.attrs.fn, ...a.fn]
 		this.scopes.set(name, g.v)
 		return g
 	}
@@ -406,7 +485,11 @@ export class Parser {
 		g.defined = true
 		this.fname = name
 		this.labels = new HashMap[string, Block]()
+		this.taken = []
+		this.dispatch = null
+		this.pending = new HashMap[string, Tok]()
 		this.redeclare(g, ty)
+		this.fn = g.v.v
 		const params = this.g.begin(ty, g.v.v)
 		this.scopes.enter()
 		for (const i of 0 ... params.length - 1) {
@@ -416,9 +499,11 @@ export class Parser {
 			}
 		}
 		this.block()
+		this.endLabels()
 		this.scopes.leave()
 		this.g.fallOff(name == "main")
-		this.g.define(s.attrs.alwaysInline || a.alwaysInline)
+		this.g.define()
+		this.fn = 0
 	}
 
 	/// Declares the function g anew as ft where its declaration has another type, as after int f().
@@ -478,7 +563,8 @@ export class Parser {
 			case "void", "_Bool", "char", "short", "int", "long", "float", "double", "unsigned", "__int128":
 				s.words.push(w as Word)
 			case "signed", "__signed", "__signed__": s.words.push("signed")
-			// Qualifiers, auto, register and _Noreturn: only volatile changes anything here.
+			case "_Noreturn": s.attrs.fn.push("noreturn")
+			// Qualifiers, auto and register: only volatile changes anything here.
 			default: s.volatile = s.volatile || isVolatileWord(w)
 		}
 		return true
@@ -538,7 +624,26 @@ export class Parser {
 		switch (name) {
 			case "packed": a.packed = true
 			case "gnu_inline": a.gnuInline = true
-			case "always_inline": a.alwaysInline = true
+			case "weak": a.weak = true
+			case "alias":
+				this.expect("(")
+				a.alias = this.next()
+				this.expect(")")
+			case "always_inline": a.fn.push("alwaysinline")
+			case "noreturn", "noinline", "cold", "returns_twice": a.fn.push(name)
+			case "visibility":
+				this.expect("(")
+				const v = this.next().text
+				a.hidden = v == `"hidden"` || v == `"internal"`
+				this.expect(")")
+			// What only checks the code, or lets it be optimized, but changes nothing it does.
+			case "const", "pure", "hot", "nothrow", "malloc", "may_alias", "format", "format_arg", "nonnull", "returns_nonnull",
+				"warn_unused_result", "deprecated", "warning", "error", "unused", "maybe_unused", "nodiscard", "sentinel",
+				"access", "leaf", "artificial", "nonstring", "alloc_size", "alloc_align", "assume_aligned", "fallthrough",
+				"no_sanitize":
+				if (this.is("(")) {
+					this.skipParens()
+				}
 			case "vector_size": throw CError.at(t, "vector types are not supported")
 			case "mode":
 				this.expect("(")
@@ -597,7 +702,7 @@ export class Parser {
 		}
 		const t = if (own instanceof Record && own.fields == null) own else this.newTag(kind, name)
 		const open = this.peek()
-		const fields = this.members()
+		const fields = this.unrunning(() => this.members())
 		this.attrs(a)
 		try {
 			layout(t, fields, if (a.packed) 1 else this.pack, a.align)
@@ -752,7 +857,7 @@ export class Parser {
 		const param = this.paramSuffix
 		this.paramSuffix = false
 		if (open || this.eat("(")) {
-			const f = this.params()
+			const f = this.unrunning(() => this.params())
 			return ty => {
 				f.result = ty
 				return f
@@ -768,16 +873,22 @@ export class Parser {
 		if (this.is("*") && this.peek(1).is("]")) {
 			this.next()
 		}
-		// A parameter's array is a pointer, so a length there need not be constant, as in int a[n].
+		// A parameter's array is a pointer, so a length there need not be constant, as in int a[n]. Elsewhere in a
+		// function, it makes a variable length array, the length computed here.
 		const t = this.peek()
-		const len = if (this.is("]")) null else this.discard(() => this.g.rv(this.ternary()))
-		if (len != null && len.known != "int" && !param) {
+		const live = this.g.f != null && !param && !this.unrun
+		const read = () => this.g.rv(this.ternary())
+		const len = if (this.is("]")) null else if (live) read() else this.discard(read)
+		if (len != null && len.known != "int" && !live && !param) {
 			throw CError.at(t, "expected an integer constant")
+		}
+		if (len != null && len.known == "int" && len.n < 0) {
+			throw CError.at(t, "array size is negative")
 		}
 		const n = if (len == null || len.known != "int") null else len.n as i32
 		this.expect("]")
 		const rest = this.suffix(false)
-		return ty => new Arr(rest(ty), n)
+		return ty => if (live && len != null) this.g.array(rest(ty), len!) else new Arr(rest(ty), n)
 	}
 
 	/// A parameter list after its (, as the type of a function, whose result the caller sets. Arrays and
@@ -909,7 +1020,14 @@ export class Parser {
 		const t = this.peek()
 		if (t.kind == "ident" && this.peek(1).is(":") && t.text != "default") {
 			this.next(2)
-			this.g.start(this.label(t.text))
+			const l = this.label(t)
+			if (!this.unrun) {
+				if (this.pending.get(t.text) == null) {
+					throw CError.at(t, `duplicate label ${t.text}`)
+				}
+				this.pending.delete(t.text)
+			}
+			this.g.start(l)
 			// A label may carry attributes; but an __asm__ after it is a statement, not an asm label.
 			if (!isAsm(this.peek().text)) {
 				this.attrs(new Attrs())
@@ -936,7 +1054,11 @@ export class Parser {
 			case "continue": this.jump(this.continues)
 			case "goto":
 				this.next()
-				this.g.br(this.label(this.next().text))
+				if (this.eat("*")) {
+					this.computedGoto(this.g.rv(this.expr()))
+				} else {
+					this.g.br(this.label(this.next()))
+				}
 				this.expect(";")
 			case "asm", "__asm", "__asm__": this.asmStmt()
 			case "return":
@@ -957,15 +1079,17 @@ export class Parser {
 	/// asm qualifiers ( template : outputs : inputs : clobbers ); each list may be left out. Without them,
 	/// the template's % are its own, doubled for the extended syntax.
 	private asmStmt() {
-		this.next()
+		const at = this.next()
 		while (this.peek().kind == "ident") {
 			this.next()
 		}
 		this.expect("(")
 		const template = this.asmString()
-		const text = if (this.is(":")) template else split(template, "%").join("%%")
-		const outs = this.asmOperands()
-		const ins = this.asmOperands()
+		const extended = this.is(":")
+		const names: string[] = []
+		const outs = this.asmOperands(names)
+		const ins = this.asmOperands(names)
+		const text = if (extended) numbered(at, template, names) else split(template, "%").join("%%")
 		const clobbers: string[] = []
 		if (this.eat(":")) {
 			while (this.peek().kind == "string") {
@@ -978,13 +1102,19 @@ export class Parser {
 		this.g.asm(text, outs, ins, clobbers)
 	}
 
-	/// After a :, the operands "constraint" (expression).
-	private asmOperands(): [string, Val][] {
+	/// After a :, the operands [name] "constraint" (expression), each name, or "", pushed to names.
+	private asmOperands(names: string[]): [string, Val][] {
 		const ops: [string, Val][] = []
 		if (!this.eat(":")) {
 			return ops
 		}
-		while (this.peek().kind == "string") {
+		while (this.peek().kind == "string" || this.is("[")) {
+			let name = ""
+			if (this.eat("[")) {
+				name = this.next().text
+				this.expect("]")
+			}
+			names.push(name)
 			const c = this.asmString()
 			this.expect("(")
 			ops.push([c, this.expr()])
@@ -1000,15 +1130,51 @@ export class Parser {
 		return s.slice(0, s.length - 1)
 	}
 
-	/// The block of the label name in the function being defined.
-	private label(name: string): Block {
-		const l = this.labels.get(name)
+	/// The block of the label named by t, made in the function fn, or else in the one code is emitted to. In code
+	/// that is not run, but for fn, it is a block of no label.
+	private label(t: Tok, fn: Value = 0): Block {
+		if (fn == 0 && this.unrun) {
+			return this.g.label()
+		}
+		const l = this.labels.get(t.text)
 		if (l != null) {
 			return l
 		}
-		const fresh = this.g.label()
-		this.labels.set(name, fresh)
+		const fresh = if (fn == 0) this.g.label() else this.g.b.block(fn)
+		this.labels.set(t.text, fresh)
+		this.pending.set(t.text, t)
 		return fresh
+	}
+
+	/// goto *p: through the block of the function's computed gotos. In code that is not run, it goes nowhere.
+	private computedGoto(p: Val) {
+		const g = this.g
+		if (this.unrun) {
+			g.unreachable()
+			return
+		}
+		this.dispatch ??= [g.label(), g.temp(new Ptr(Void))]
+		const [d, slot] = this.dispatch!
+		g.store(slot, p)
+		g.br(d)
+	}
+
+	/// Checks that each label used is defined, and ends the block computed gotos jump through, if any, with the
+	/// jump to the address they left, a label taken.
+	private endLabels() {
+		const missing = this.pending.values()
+		if (missing.length > 0) {
+			throw CError.at(missing[0], `undefined label ${missing[0].text}`)
+		}
+		const d = this.dispatch
+		if (d == null) {
+			return
+		}
+		const b = this.g.b
+		const back = b.here()
+		b.at(d[0])
+		b.indirectBr(this.g.op(this.g.rv(d[1])), this.taken)
+		b.at(back)
 	}
 
 	private jump(targets: Block[]) {
@@ -1159,9 +1325,14 @@ export class Parser {
 					sw.ranges.push([lo, hi, l])
 				}
 			} else {
+				if (sw.cases.includes(lo)) {
+					throw CError.at(t, "duplicate case value")
+				}
 				sw.cases.push(lo)
 				sw.targets.push(l)
 			}
+		} else if (sw.dflt != 0) {
+			throw CError.at(t, "multiple default labels in one switch")
 		} else {
 			sw.dflt = l
 		}
@@ -1359,7 +1530,7 @@ export class Parser {
 			switch (t.text) {
 				case "sizeof":
 					this.next()
-					return int(this.operandType().size, ULong)
+					return g.size(this.operandType())
 				case "_Alignof", "__alignof__", "__alignof":
 					this.next()
 					return int(this.operandType().align, ULong)
@@ -1370,6 +1541,16 @@ export class Parser {
 			}
 		}
 		const op = t.kind
+		// GNU's address of a label, which goto * jumps to.
+		if (op == "&&") {
+			const name = this.next(2)
+			if (this.fn == 0) {
+				throw CError.at(name, "the address of a label outside a function")
+			}
+			const l = this.label(name, this.fn)
+			this.taken.push(l)
+			return g.addressOf(global(Void, g.b.blockAddress(this.fn, l)))
+		}
 		if (op == "++" || op == "--") {
 			this.next()
 			const v = this.unary()
@@ -1412,10 +1593,16 @@ export class Parser {
 				v = g.deref(this.pointer(t, g.binary("+", p, g.rv(this.expr()))))
 				this.expect("]")
 			} else if (this.eat("(")) {
-				if (callee(v.ty) == null) {
+				const ft = callee(v.ty)
+				if (ft == null) {
 					throw CError.at(t, "called object is not a function")
 				}
-				v = g.call(v, this.args())
+				const args = this.args()
+				const n = ft.params.length
+				if (ft.prototyped && (args.length < n || args.length > n && !ft.variadic)) {
+					throw CError.at(t, `${if (args.length < n) "too few" else "too many"} arguments to the function`)
+				}
+				v = g.call(v, args)
 			} else if (this.eat(".")) {
 				v = this.field(v)
 			} else if (this.eat("->")) {
@@ -2170,4 +2357,34 @@ function joined(a: Type, b: Type): Type {
 		return common(a, b)
 	}
 	return if (a.kind != "ptr" && b.kind == "ptr") b else a
+}
+
+/// The extended asm template text, of the asm at, with each %[name], or %x[name] after a modifier x, as its
+/// operand's number.
+function numbered(at: Tok, text: string, names: string[]): string {
+	let out = ""
+	let i = 0
+	let p = indexOf(text, "%")
+	while (p >= 0 && p + 1 < text.length) {
+		let j = p + 1
+		if (text[j] == percent) {
+			p = indexOf(text, "%", j + 1)
+			continue
+		}
+		if (isAlphabetic(text[j])) {
+			j++
+		}
+		if (j < text.length && text[j] == lbracket) {
+			const end = indexOf(text, "]", j)
+			const n = if (end < 0) -1 else position(names, text.slice(j + 1, end))
+			if (n < 0) {
+				throw CError.at(at, "no asm operand of that name")
+			}
+			out += text.slice(i, j) + `${n}`
+			i = end + 1
+			j = i
+		}
+		p = indexOf(text, "%", j)
+	}
+	return out + text.slice(i, text.length)
 }
