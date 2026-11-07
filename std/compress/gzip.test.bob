@@ -1,0 +1,69 @@
+import { IoError } from "../io"
+import { ParseError } from "../parse"
+import { Once } from "./deflate"
+import { Gunzipper, crc32, gunzip, gzip } from "./gzip"
+
+const rndgz = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x0d\xce\x4b\x16\x44\x11\x0c\x00\xd1\xad\xd8\x1a\x41\x78\xc4\x3f\x82\xd5\x77\x0f\x6b\x72\x4f\x8d\xd0\x96\xc9\xb8\xe9\x93\x43\xb3\x32\x36\x7d\x39\xc1\xd5\x76\x9f\xe4\x2b\x8f\x9e\x7d\xea\xba\x71\xfd\xc8\x78\x9d\x79\x23\xc8\xb8\x65\x86\x68\x42\x29\x58\xee\x8e\x47\x8a\xe3\x96\xee\x4b\x42\xc3\x1a\x5b\xfa\x2a\xc8\x0c\xd6\x76\x51\x13\xc2\x9c\x7f\x3f"
+	+ "\x9f\x1a\x57\x22\x0e\xd4\xbb\x3c\xfd\x2f\x1a\x7f\xa4\x99\x35\x9c\xc7\xe3\x03\x56\x67\x32\x19\xf7\x29\x73\x08\x66\x81\xb4\xec\x30\x03\x6d\x71\x02\xa5\x3a\x9c\x61\x24\x51\x72\xa2\x57\x88\x63\x3c\x3f\x88\x92\x88\xb1\x47\xfb\xa2\x71\xe9\x32\xb7\xcd\x69\x3a\x38\xa9\x0a\xc9\x08\xf8\x1e\xd0\x67\x47\xf7\x2b\xaf\x0d\x72\x2d\xf1\x1f\x9c\x05\xa9\x5c\xc5\x79\x9d\x90\xe0\xc4\x77\xc7\xab\xf5\x3f"
+	+ "\x17\x1a\xda\xa1\xaa\xea\xea\xd4\x9d\x8d\x6c\xcf\x7b\x9e\xd9\x59\xca\xd7\x67\x3f\x8d\xe1\x55\x2e\x1b\x42\xf4\x66\x5d\x97\xce\xb2\xdf\x6d\x99\x93\xbf\x3a\x00\xe3\x10\x98\x91\x55\x5a\xdb\xd1\x87\xc5\xb0\x71\xa9\x81\xec\x50\x21\x91\x46\xa6\x58\x45\x87\xa8\x6c\x6e\xdd\x81\x9a\xaf\x7b\xe3\x61\xed\xd8\xdc\x6e\x88\xbd\xd1\x0f\x80\x12\x36\x78\x90\x01\x00\x00"
+
+const flagged = "\x1f\x8b\x08\x1e\x00\x00\x00\x00\x00\x03\x04\x00\x61\x62\x63\x64\x6e\x61\x6d\x65\x00\x63\x6f\x6d\x6d\x65\x6e\x74\x00\xe2\x48\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00"
+
+/// As deflate.test.bob makes it.
+function noise(n: i32): string {
+	let x: i64 = 1
+	let s = ""
+	for (const i of 1 ... n) {
+		x = (x * 1103515245 + 12345) & 0x7fffffff
+		const k = ((x >> 16) % 27) as i32
+		s += chr((if (k == 26) 32 else 97 + k) as u8)
+	}
+	return s
+}
+
+test "crc32" {
+	assert crc32("") == 0 && crc32("hello") == 0x3610a686 && crc32("lo", crc32("hel")) == 0x3610a686
+}
+
+test "gzip round trips and reads python's" {
+	const text = noise(400)
+	assert gunzip(gzip(text)) == text && gunzip(gzip("")) == ""
+	assert gunzip(rndgz) == text
+	assert gunzip("\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00")
+		== "hello"
+	assert gunzip(flagged) == "hello"
+	assert gunzip("") == "" && new Gunzipper(new Once("")).read(1) == null
+	const r = new Gunzipper(new Once(gzip(text, 1)))
+	assert r.read(10) == text.slice(0, 10) && r.read(1000) == text.slice(10, 400) && r.read(1) == null
+}
+
+test "a wrong trailer or header is an error" {
+	const good = gzip("hello")
+	const bad = good.slice(0, good.length - 8) + "\x00\x00\x00\x00" + good.slice(good.length - 4, good.length)
+	assert gunzip(bad) throws new ParseError("syntax", good.length)
+	assert gunzip("\x1f\x8c" + good.slice(2, good.length)) throws new ParseError("syntax", 2)
+	assert gunzip(good.slice(0, 3) + "\x20" + good.slice(4, good.length)) throws new ParseError("syntax", 4)
+	assert gunzip(good.slice(0, good.length - 1)) throws new ParseError("syntax", good.length - 1)
+	const r = new Gunzipper(new Once(bad))
+	assert r.read(100) == "hello"
+	assert r.read(100) throws new IoError("Protocol", "gunzip", `byte ${good.length}`)
+	assert r.read(100) throws new IoError("Protocol", "gunzip", `byte ${good.length}`)
+	assert gunzip(good + "x") throws new ParseError("syntax", good.length + 1)
+}
+
+test "members one after another are their contents one after another, each checked, none reaching into another" {
+	const good = gzip("hello")
+	assert gunzip(good + gzip("") + good) == "hellohello"
+	// Many, read in a loop, not a call each.
+	let empties = ""
+	for (const i of 1 ... 40000) {
+		empties += gzip("")
+	}
+	assert gunzip(empties + good) == "hello"
+	const r = new Gunzipper(new Once(good + good))
+	assert r.read(100) == "hello" && r.read(100) == "hello" && r.read(100) == null
+	assert gunzip(good + good.slice(0, good.length - 1)) throws new ParseError("syntax", 2 * good.length - 1)
+	// A copy of 5 from 5 back, all of the second member: "hello" again, were the first member's bytes in reach.
+	const back = good.slice(0, 10) + "\x03\x13\x00" + good.slice(good.length - 8, good.length)
+	assert gunzip(good + back) throws new ParseError("syntax", good.length + 12)
+}

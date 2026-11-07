@@ -1,0 +1,543 @@
+//! Deflate (RFC 1951): inflate, whole or streaming over any Reader, and deflate by LZ77 over hash chains with the
+//! fixed Huffman code. Inflate keeps a 32 KiB window and what a read did not take; it does not bound
+//! its output, the reader of it does.
+
+import { IoError, Reader } from "../io"
+import { ParseError } from "../parse"
+
+const lenBase = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163,
+	195, 227, 258]
+
+const lenExtra = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+
+const distBase = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073,
+	4097, 6145, 8193, 12289, 16385, 24577]
+
+const distExtra = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+/// The order code length code lengths are sent in.
+const order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+/// A Reader of one string, handed over whole; what gzip reads a string through.
+export class Once implements Reader {
+	private s: string | null
+
+	constructor(s: string) { this.s = s }
+
+	read(n: i32): string | null throws IoError {
+		const s = this.s
+		this.s = null
+		return s
+	}
+}
+
+/// Bits of a Reader, least significant first, counting the bytes taken. Once the source throws, every call after
+/// throws the same: the bits its caller took before it are lost.
+export class Bits {
+	private src: Reader
+	private buf = ""
+	private at = 0
+	private acc = 0
+	private n = 0
+	private failed: IoError | null = null
+	/// Bytes taken so far.
+	pos = 0
+
+	constructor(src: Reader) { this.src = src }
+
+	/// The next k ≤ 16 bits; the end of the source before them is a syntax error there.
+	bits(k: i32): i32 throws IoError | ParseError {
+		const f = this.failed
+		if (f != null) {
+			throw f
+		}
+		while (this.n < k) {
+			while (this.at >= this.buf.length) {
+				const s = this.more()
+				if (s == null) {
+					throw new ParseError("syntax", this.pos)
+				}
+				this.buf = s
+				this.at = 0
+			}
+			this.acc |= (this.buf[this.at] as i32) << this.n
+			this.at += 1
+			this.pos += 1
+			this.n += 8
+		}
+		const v = this.acc & (1 << k) - 1
+		this.acc >>= k
+		this.n -= k
+		return v
+	}
+
+	/// Whether the source has ended, at a byte boundary.
+	ended(): bool throws IoError {
+		while (this.n == 0 && this.at >= this.buf.length) {
+			const s = this.more()
+			if (s == null) {
+				return true
+			}
+			this.buf = s
+			this.at = 0
+		}
+		return false
+	}
+
+	/// Drops the bits before the next byte.
+	align() {
+		this.acc >>= this.n & 7
+		this.n -= this.n & 7
+	}
+
+	private more(): string | null throws IoError {
+		const f = this.failed
+		if (f != null) {
+			throw f
+		}
+		try {
+			return this.src.read(1 << 16)
+		} catch (e: IoError) {
+			this.failed = e
+			throw e
+		}
+	}
+}
+
+/// A canonical Huffman code, decoded a bit at a time as in zlib's puff.
+class Huff {
+	private count = new i32[](16)
+	private symbol: i32[]
+	/// Whether the lengths claim more codes than fit.
+	readonly over: bool
+
+	constructor(lengths: i32[]) {
+		this.symbol = new i32[](lengths.length)
+		for (const l of lengths) {
+			this.count[l] += 1
+		}
+		this.count[0] = 0
+		let left = 1
+		const offs = new i32[](16)
+		for (const l of 1 ... 15) {
+			left = (left << 1) - this.count[l]
+			offs[l] = if (l == 1) 0 else offs[l - 1] + this.count[l - 1]
+		}
+		this.over = left < 0
+		for (const i of 0 ... lengths.length - 1) {
+			if (lengths[i] != 0) {
+				this.symbol[offs[lengths[i]]] = i
+				offs[lengths[i]] += 1
+			}
+		}
+	}
+
+	decode(b: Bits): i32 throws IoError | ParseError {
+		let code = 0
+		let first = 0
+		let index = 0
+		for (const len of 1 ... 15) {
+			code |= b.bits(1)
+			const count = this.count[len]
+			if (code - count < first) {
+				return this.symbol[index + code - first]
+			}
+			index += count
+			first = (first + count) << 1
+			code <<= 1
+		}
+		throw new ParseError("syntax", b.pos)
+	}
+}
+
+function fixedLengths(): [i32[], i32[]] {
+	const lit = new i32[](288)
+	for (const i of 0 ... 287) {
+		lit[i] = if (i < 144) 8 else if (i < 256) 9 else if (i < 280) 7 else 8
+	}
+	const dist = new i32[](30)
+	for (const i of 0 ... 29) {
+		dist[i] = 5
+	}
+	return [lit, dist]
+}
+
+const fixed = fixedLengths()
+const fixedLit = new Huff(fixed[0])
+const fixedDist = new Huff(fixed[1])
+
+/// Inflates a Reader as it is read; with zlib, the stream has a zlib header, which is checked, and an Adler-32
+/// trailer, which is checked at the end, as is that no byte follows it.
+export class Inflater implements Reader {
+	/// The source; a trailer can be read from it once read gives null.
+	readonly bits: Bits
+	private head: bool
+	private zlib: bool
+	private adler: u32 = 1
+	private window = new u8[](1 << 15)
+	private wpos = 0
+	/// Bytes the window holds, up to its size.
+	private filled = 0
+	private out: u8[] = []
+	/// -1 between blocks, 0 in a stored block, 1 in a coded one.
+	private kind = -1
+	private left = 0
+	private last = false
+	private done = false
+	private lit = fixedLit
+	private dist = fixedDist
+
+	constructor(src: Reader, zlib = false) {
+		this.bits = new Bits(src)
+		this.head = zlib
+		this.zlib = zlib
+	}
+
+	/// Ready for another stream on the bits, once this one is done: one not to reach back into this one's bytes.
+	again() {
+		this.last = false
+		this.done = false
+		this.filled = 0
+	}
+
+	/// As read, but a bad stream is a ParseError at its byte.
+	next(n: i32): string | null throws IoError | ParseError {
+		while (this.out.length < n && !this.done) {
+			this.step()
+		}
+		if (this.out.length == 0) {
+			if (this.zlib) {
+				this.trailer()
+			}
+			return null
+		}
+		const k = if (n < this.out.length) n else this.out.length
+		const s = fromBytes(this.out.slice(0, k))
+		this.out = this.out.slice(k, this.out.length)
+		if (this.zlib) {
+			this.adler = adler32(s, this.adler)
+		}
+		return s
+	}
+
+	/// Up to n bytes of the output; a bad stream is a Protocol error.
+	read(n: i32): string | null throws IoError {
+		try {
+			return this.next(n)
+		} catch (e: ParseError) {
+			throw new IoError("Protocol", "inflate", `byte ${e.at}`)
+		}
+	}
+
+	private emit(c: u8) {
+		this.window[this.wpos] = c
+		this.wpos = this.wpos + 1 & 0x7fff
+		if (this.filled < 1 << 15) {
+			this.filled += 1
+		}
+		this.out.push(c)
+	}
+
+	/// Checks the Adler-32 after the last block and the end after it, once.
+	private trailer() throws IoError | ParseError {
+		const b = this.bits
+		b.align()
+		let v: u32 = 0
+		for (const k of 1 ... 4) {
+			v = v << 8 | (b.bits(8) as u32)
+		}
+		if (v != this.adler || !b.ended()) {
+			throw new ParseError("syntax", b.pos)
+		}
+		this.zlib = false
+	}
+
+	private bad(): ParseError { return new ParseError("syntax", this.bits.pos) }
+
+	/// One block header, stored byte or code.
+	private step() throws IoError | ParseError {
+		const b = this.bits
+		if (this.head) {
+			this.head = false
+			// Deflate with a window of at most 32 KiB, the pair a multiple of 31, no preset dictionary.
+			const cmf = b.bits(8)
+			const flg = b.bits(8)
+			if ((cmf & 0x8f) != 8 || (cmf << 8 | flg) % 31 != 0 || (flg & 0x20) != 0) {
+				throw this.bad()
+			}
+		}
+		if (this.kind < 0) {
+			if (this.last) {
+				this.done = true
+				return
+			}
+			this.last = b.bits(1) == 1
+			const t = b.bits(2)
+			if (t == 0) {
+				b.align()
+				this.left = b.bits(16)
+				if (b.bits(16) != (~this.left & 0xffff)) {
+					throw this.bad()
+				}
+			} else if (t == 1) {
+				this.lit = fixedLit
+				this.dist = fixedDist
+			} else if (t == 2) {
+				this.tables()
+			} else {
+				throw this.bad()
+			}
+			this.kind = if (t == 0) 0 else 1
+			return
+		}
+		if (this.kind == 0) {
+			if (this.left == 0) {
+				this.kind = -1
+				return
+			}
+			this.emit(b.bits(8) as u8)
+			this.left -= 1
+			return
+		}
+		const sym = this.lit.decode(b)
+		if (sym < 256) {
+			this.emit(sym as u8)
+			return
+		}
+		if (sym == 256) {
+			this.kind = -1
+			return
+		}
+		if (sym > 285) {
+			throw this.bad()
+		}
+		const len = lenBase[sym - 257] + b.bits(lenExtra[sym - 257])
+		const d = this.dist.decode(b)
+		if (d > 29) {
+			throw this.bad()
+		}
+		const dist = distBase[d] + b.bits(distExtra[d])
+		if (dist > this.filled) {
+			throw this.bad()
+		}
+		for (const i of 1 ... len) {
+			this.emit(this.window[this.wpos - dist & 0x7fff])
+		}
+	}
+
+	private table(lengths: i32[]): Huff throws ParseError {
+		const h = new Huff(lengths)
+		if (h.over) {
+			throw this.bad()
+		}
+		return h
+	}
+
+	/// The codes of a dynamic block.
+	private tables() throws IoError | ParseError {
+		const b = this.bits
+		const hlit = b.bits(5) + 257
+		const hdist = b.bits(5) + 1
+		const hclen = b.bits(4) + 4
+		const cl = new i32[](19)
+		for (const i of 0 ... hclen - 1) {
+			cl[order[i]] = b.bits(3)
+		}
+		const code = this.table(cl)
+		const lengths = new i32[](hlit + hdist)
+		let i = 0
+		while (i < lengths.length) {
+			const sym = code.decode(b)
+			if (sym < 16) {
+				lengths[i] = sym
+				i += 1
+				continue
+			}
+			let v = 0
+			let rep = 0
+			if (sym == 16) {
+				if (i == 0) {
+					throw this.bad()
+				}
+				v = lengths[i - 1]
+				rep = 3 + b.bits(2)
+			} else if (sym == 17) {
+				rep = 3 + b.bits(3)
+			} else {
+				rep = 11 + b.bits(7)
+			}
+			if (i + rep > lengths.length) {
+				throw this.bad()
+			}
+			for (const j of 1 ... rep) {
+				lengths[i] = v
+				i += 1
+			}
+		}
+		if (lengths[256] == 0) {
+			throw this.bad()
+		}
+		this.lit = this.table(lengths.slice(0, hlit))
+		this.dist = this.table(lengths.slice(hlit, lengths.length))
+	}
+}
+
+/// The Adler-32 of s after what adler covered.
+function adler32(s: string, adler: u32): u32 {
+	let a = adler & 0xffff
+	let b = adler >> 16
+	for (const i of 0 ... s.length - 1) {
+		a = (a + (s[i] as u32)) % 65521
+		b = (b + a) % 65521
+	}
+	return b << 16 | a
+}
+
+/// All of a deflate stream.
+export function inflate(s: string): string throws ParseError {
+	const r = new Inflater(new Once(s))
+	let out = ""
+	try {
+		while (true) {
+			const c = r.next(1 << 16)
+			if (c == null) {
+				return out
+			}
+			out += c
+		}
+	} catch (e: IoError) {
+		throw new ParseError("syntax", r.bits.pos)
+	}
+}
+
+class BitWriter {
+	out: u8[] = []
+	private acc = 0
+	private n = 0
+
+	/// The low k ≤ 16 bits of v.
+	put(v: i32, k: i32) {
+		this.acc |= v << this.n
+		this.n += k
+		while (this.n >= 8) {
+			this.out.push((this.acc & 0xff) as u8)
+			this.acc >>= 8
+			this.n -= 8
+		}
+	}
+
+	/// Pads to the next byte.
+	align() {
+		if (this.n > 0) {
+			this.put(0, 8 - this.n)
+		}
+	}
+}
+
+/// The index of the base at most v in a base table.
+function code(bases: i32[], v: i32): i32 {
+	let c = bases.length - 1
+	while (bases[c] > v) {
+		c -= 1
+	}
+	return c
+}
+
+/// The low k bits of c reversed, as a Huffman code is written: most significant first.
+function rev(c: i32, k: i32): i32 {
+	let r = 0
+	let v = c
+	for (const i of 1 ... k) {
+		r = r << 1 | v & 1
+		v >>= 1
+	}
+	return r
+}
+
+/// Symbol sym of the fixed literal and length code.
+function symbol(w: BitWriter, sym: i32) {
+	if (sym < 144) {
+		w.put(rev(0x30 + sym, 8), 8)
+	} else if (sym < 256) {
+		w.put(rev(0x190 + sym - 144, 9), 9)
+	} else if (sym < 280) {
+		w.put(rev(sym - 256, 7), 7)
+	} else {
+		w.put(rev(0xc0 + sym - 280, 8), 8)
+	}
+}
+
+/// A deflate stream of s: one block of fixed Huffman codes. Level 0 stores; 1 to 9 search ever longer hash chains
+/// for the longest match.
+export function deflate(s: string, level = 6): string {
+	const w = new BitWriter()
+	const n = s.length
+	if (level <= 0 || n == 0) {
+		let at = 0
+		while (true) {
+			const len = if (n - at > 0xffff) 0xffff else n - at
+			w.put(if (at + len == n) 1 else 0, 3)
+			w.align()
+			w.put(len, 16)
+			w.put(~len & 0xffff, 16)
+			for (const i of at ... at + len - 1) {
+				w.out.push(s[i])
+			}
+			at += len
+			if (at == n) {
+				return fromBytes(w.out)
+			}
+		}
+	}
+	const chain = [4, 8, 16, 32, 64, 128, 256, 1024, 4096][if (level > 9) 8 else level - 1]
+	// Positions plus one of the latest 3 bytes hashing alike, and of the one before each.
+	const head = new i32[](1 << 15)
+	const prev = new i32[](1 << 15)
+	w.put(3, 3)
+	let i = 0
+	while (i < n) {
+		let best = 0
+		let bestDist = 0
+		if (i + 2 < n) {
+			const h = ((s[i] as i32) << 10 ^ (s[i + 1] as i32) << 5 ^ (s[i + 2] as i32)) & 0x7fff
+			const max = if (n - i > 258) 258 else n - i
+			let p = head[h] - 1
+			let tries = chain
+			while (p >= 0 && i - p <= 1 << 15 && tries > 0 && best < max) {
+				if (s[p + best] == s[i + best]) {
+					let l = 0
+					while (l < max && s[p + l] == s[i + l]) {
+						l += 1
+					}
+					if (l > best) {
+						best = l
+						bestDist = i - p
+					}
+				}
+				p = prev[p & 0x7fff] - 1
+				tries -= 1
+			}
+		}
+		if (best >= 3) {
+			const l = code(lenBase, best)
+			symbol(w, 257 + l)
+			w.put(best - lenBase[l], lenExtra[l])
+			const d = code(distBase, bestDist)
+			w.put(rev(d, 5), 5)
+			w.put(bestDist - distBase[d], distExtra[d])
+		} else {
+			symbol(w, s[i] as i32)
+		}
+		const step = if (best >= 3) best else 1
+		for (const j of i ... i + step - 1) {
+			if (j + 2 < n) {
+				const h = ((s[j] as i32) << 10 ^ (s[j + 1] as i32) << 5 ^ (s[j + 2] as i32)) & 0x7fff
+				prev[j & 0x7fff] = head[h]
+				head[h] = j + 1
+			}
+		}
+		i += step
+	}
+	symbol(w, 256)
+	w.align()
+	return fromBytes(w.out)
+}

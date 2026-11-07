@@ -1,0 +1,135 @@
+//! gzip (RFC 1952): members one after another, each a deflate stream between a header and a CRC32 and length trailer.
+
+import { IoError, Reader } from "../io"
+import { ParseError } from "../parse"
+import { Inflater, Once, deflate } from "./deflate"
+
+function table(): u32[] {
+	const t = new u32[](256)
+	for (const n of 0 ... 255) {
+		let c = n as u32
+		for (const k of 1 ... 8) {
+			c = if ((c & 1) == 1) 0xedb88320 ^ c >> 1 else c >> 1
+		}
+		t[n] = c
+	}
+	return t
+}
+
+const crcTable = table()
+
+/// The CRC32 of s after what crc covered.
+export function crc32(s: string, crc: u32 = 0): u32 {
+	let c = crc ^ 0xffffffff
+	for (const i of 0 ... s.length - 1) {
+		c = crcTable[((c ^ (s[i] as u32)) & 0xff) as i32] ^ c >> 8
+	}
+	return c ^ 0xffffffff
+}
+
+function le32(v: u32): string {
+	let s = ""
+	for (const k of 0 ... 3) {
+		s += chr((v >> 8 * k & 0xff) as u8)
+	}
+	return s
+}
+
+/// s as a gzip member, at deflate's level.
+export function gzip(s: string, level = 6): string {
+	return "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03" + deflate(s, level) + le32(crc32(s)) + le32(s.length as u32)
+}
+
+/// Inflates gzip members as they are read, checking each trailer, their contents one after another; an empty source is
+/// empty content.
+export class Gunzipper implements Reader {
+	private inner: Inflater
+	private crc: u32 = 0
+	private size: u32 = 0
+	private started = false
+	private done = false
+
+	constructor(src: Reader) { this.inner = new Inflater(src) }
+
+	/// As read, but a bad stream is a ParseError at its byte.
+	next(n: i32): string | null throws IoError | ParseError {
+		const b = this.inner.bits
+		while (!this.done) {
+			if (!this.started) {
+				this.started = true
+				if (b.ended()) {
+					this.done = true
+					return null
+				}
+				if (b.bits(16) != 0x8b1f || b.bits(8) != 8) {
+					throw new ParseError("syntax", b.pos)
+				}
+				const flg = b.bits(8)
+				if ((flg & 0xe0) != 0) {
+					throw new ParseError("syntax", b.pos)
+				}
+				b.bits(16)
+				b.bits(16)
+				b.bits(16)
+				if ((flg & 4) != 0) {
+					const xlen = b.bits(16)
+					for (const i of 1 ... xlen) {
+						b.bits(8)
+					}
+				}
+				for (const bit of [8, 16]) {
+					if ((flg & bit) != 0) {
+						while (b.bits(8) != 0) {}
+					}
+				}
+				if ((flg & 2) != 0) {
+					b.bits(16)
+				}
+			}
+			const s = this.inner.next(n)
+			if (s != null) {
+				this.crc = crc32(s, this.crc)
+				this.size += s.length as u32
+				return s
+			}
+			b.align()
+			const crc = (b.bits(16) as u32) | (b.bits(16) as u32) << 16
+			const size = (b.bits(16) as u32) | (b.bits(16) as u32) << 16
+			if (crc != this.crc || size != this.size) {
+				throw new ParseError("syntax", b.pos)
+			}
+			// The next member, if any.
+			this.started = false
+			this.crc = 0
+			this.size = 0
+			this.inner.again()
+		}
+		return null
+	}
+
+	/// Up to n bytes of the content; a bad stream is a Protocol error.
+	read(n: i32): string | null throws IoError {
+		try {
+			return this.next(n)
+		} catch (e: ParseError) {
+			throw new IoError("Protocol", "gunzip", `byte ${e.at}`)
+		}
+	}
+}
+
+/// The content of gzip members.
+export function gunzip(s: string): string throws ParseError {
+	const r = new Gunzipper(new Once(s))
+	let out = ""
+	try {
+		while (true) {
+			const c = r.next(1 << 16)
+			if (c == null) {
+				return out
+			}
+			out += c
+		}
+	} catch (e: IoError) {
+		throw new ParseError("syntax", 0)
+	}
+}
