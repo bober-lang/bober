@@ -1,0 +1,731 @@
+//! Bytecode files (§8.4): a module of a Program as bytes, to cache and to package, and read back by linking it into a
+//! Program.
+//!
+//! ## File
+//!
+//! A file holds one module. Its ids are its own, numbered densely in the order it first uses each, and it holds the
+//! parts of each thing before the thing, so that reading is linking: each string, int, names entry and type read is
+//! interned into the Program, each decl of another module it uses is looked up once by its module, owner and name, and
+//! so each id it then reads is one lookup in the tables read so far. String 0, `""`, int 0, names entry 0, the empty
+//! one, and types 0 to 18, the primitives, are the Program's own and not written. Its decls are numbered first, then
+//! those it imports.
+//!
+//! A file is its header, then its sections in a fixed order, each its size in bytes, then a count and its items, or
+//! for defs, one item per decl. Integers are ULEB128, signed ones SLEB128 and hashes 8
+//! bytes little-endian; a string is its length and its bytes, a list its length and its items, and an owner 0 for
+//! none, else 1 + its decl. A type's parts, an op's immediates and a def's fields are each written as what it is: a
+//! type, decl, string, int or names entry as its id, a list of types inline, a number as it is.
+//!
+//! ```
+//! header   "bober", compiler hash, source hash, ABI hash, path
+//! deps     per module whose decls it uses: path, ABI hash
+//! strings  per string: its bytes
+//! ints     per int: SLEB
+//! names    per names entry: its (Str, mods) pairs
+//! decls    per decl of its own, in the order made: Str name, kind byte, owner
+//! imports  per decl of another module it uses: dep, owner, Str name, nth of that name in its owner
+//! types    per type, after its parts: kind byte, a and b as its kind says
+//! defs     per decl: mods, type params (Str name, constraint, default), type, supers, tags, Str doc, 0 or 1 and its
+//!          code; then the module's decls, inits and deps, and where its lines end, each after the one before
+//! ```
+//!
+//! A code is its locals (Str name, type, mods), captures and code lists, then its op count and per op its source
+//! offset less the op before's, SLEB, its byte and its immediates by shape.
+//!
+//! A file is fresh while its compiler and source hashes are the current ones and the ABI hash it has of each dep is
+//! that dep's; reading a stale one is a miss. A changed compiler makes each stale, so the format has no version. The
+//! source hash is 0 in a package. Files are read as a set, as modules of builtin/ and std/ import each other, and are
+//! first linked into a scratch Program, so that a malformed one leaves the Program as it was.
+//!
+//! ## ABI
+//!
+//! A module's ABI hash is of what the modules using it are compiled against: the signatures of its exported decls, of
+//! the members of its classes and interfaces among them and of its decls their types name, the code of its consts
+//! among them, which users fold, and the ABI hashes of the other modules they name. So it changes with the layout of a
+//! class, also of one two modules away, but not with a function's body. Modules whose signatures name each other have
+//! one hash, of all of theirs.
+
+import { contains } from "../../std/algo"
+import { HashMap } from "../../std/collections/hashmap"
+import { Reader, Writer } from "../../std/encoding/binary"
+import { combine, fnv } from "../../std/hash"
+import { min } from "../../std/math"
+import { ParseError } from "../../std/parse"
+import { sort } from "../../std/sort"
+import * as decl from "./decl"
+import * as kind from "./kind"
+import * as op from "./op"
+import { Code, Program } from "./program"
+
+const magic = "bober"
+const seed: u64 = 14695981039346656037
+
+/// A names entry, as a part of an Object type.
+const Names: u8 = 9
+
+/// What a type's part or an op's immediate is, and so how a file holds it.
+type Part = op.Imm | Names
+
+/// The parts of a type of kind k, its a and b, a Literal's b by its base a.
+function parts(k: kind.Kind, a: i32): Part[] {
+	return switch (k) {
+		case kind.FixedArray: [op.TypeId, op.Num]
+		case kind.Tuple, kind.Union: [op.TypeList]
+		case kind.Object: [op.TypeList, Names]
+		case kind.Func: [op.TypeList, op.TypeId]
+		case kind.Named: [op.DeclId, op.TypeList]
+		case kind.Param: [op.DeclId, op.Num]
+		case kind.Literal: [op.TypeId, if (a == kind.String) op.StrId else if (a == kind.Bool) op.Num else op.IntId]
+		case kind.Of: [op.Num, op.StrId]
+		case kind.Member: [op.TypeId, op.StrId]
+		default: [op.TypeId]
+	}
+}
+
+/// The file of module m of p as lowered, of the hash of the compiler.
+export function write(p: Program, m: i32, compiler: u64): string { return new Out(p, m).file(compiler) }
+
+/// The modules of files, linked into p, each of whose deps p holds or is among them; null if one is stale, or made by
+/// another compiler or of another source than its hash in sources (sourceHash).
+export function read(p: Program, files: string[], compiler: u64, sources: u64[]): i32[] | null throws ParseError {
+	const abis = new HashMap[string, u64]()
+	const heads: In[] = []
+	for (const i of 0 ... files.length - 1) {
+		heads.push(new In(p, files[i]))
+		if (heads[i].compiler != compiler || heads[i].source != sources[i]) {
+			return null
+		}
+		abis.set(heads[i].path, heads[i].abi)
+	}
+	const scratch = new Program()
+	for (const x of heads) {
+		for (const i of 0 ... x.paths.length - 1) {
+			const m = p.module(x.paths[i])
+			const h = abis.get(x.paths[i]) ?? (if (m < 0) 0 else abi(p, m))
+			if (h == 0 || x.hashes[i] != h) {
+				return null
+			}
+			if (!abis.has(x.paths[i]) && scratch.module(x.paths[i]) < 0) {
+				const s = scratch.addModule(x.paths[i])
+				for (const d of p.modules[m].decls) {
+					declare(scratch, s, -1, p, d)
+				}
+			}
+		}
+	}
+	link(scratch, files) // which throws for a malformed file before p changes
+	return link(p, files)
+}
+
+/// Declares in module m of q, in owner, decl d of p and the decls it owns, without their parts.
+function declare(q: Program, m: i32, owner: i32, p: Program, d: i32): void {
+	const x = p.decls[d]
+	const y = q.decl(m, owner, p.strings[x.name], x.kind)
+	for (const z of x.members) {
+		declare(q, m, y, p, z)
+	}
+}
+
+/// The modules of files, linked into p.
+function link(p: Program, files: string[]): i32[] throws ParseError {
+	const ins: In[] = []
+	for (const f of files) {
+		const x = new In(p, f)
+		x.m = p.addModule(x.path)
+		p.modules[x.m].abi = x.abi
+		p.modules[x.m].source = x.source
+		ins.push(x)
+	}
+	for (const x of ins) {
+		x.declare()
+	}
+	for (const x of ins) {
+		x.link()
+	}
+	return ins.map(x => x.m)
+}
+
+/// Module m's ABI hash, memoized in it, as those of the modules its signatures reach.
+export function abi(p: Program, m: i32): u64 {
+	if (p.modules[m].abi == 0) {
+		new Abis(p).visit(m)
+	}
+	return p.modules[m].abi
+}
+
+/// The ids a file gives the entries of a table of the Program it uses, and their section, each entry after those it
+/// is made of. Those below fixed are the Program's own, the same in every Program, and not written.
+class Table {
+	private fixed: i32
+	private ids = new HashMap[i32, i32]()
+	private out = new Writer()
+
+	constructor(fixed: i32) { this.fixed = fixed }
+
+	/// The file's id of x, if it is fixed or has its entry.
+	find(x: i32): i32 | null { return if (x < this.fixed) x else this.ids.get(x) }
+
+	/// The file's id of x, of a new entry that entry writes, adding the entries it is made of first.
+	add(x: i32, entry: (w: Writer) => void): i32 {
+		const w = new Writer()
+		entry(w)
+		this.out.raw(w.bytes)
+		this.ids.set(x, this.fixed + this.ids.size)
+		return this.fixed + this.ids.size - 1
+	}
+
+	/// The count of entries, then them.
+	section(): string {
+		const w = new Writer()
+		uleb(w, this.ids.size)
+		w.raw(this.out.bytes)
+		return w.bytes
+	}
+}
+
+/// Module m's file being written.
+class Out {
+	p: Program
+	m: i32
+	/// Its decls, in the order made.
+	private order: i32[] = []
+	private own = new HashMap[i32, i32]()
+	/// The decls of other modules it uses, numbered after its own.
+	private imports = new Table(0)
+	private deps = new Table(0)
+	private strings = new Table(1)
+	private ints = new Table(1)
+	private names = new Table(1)
+	private types = new Table((kind.Float as i32) + 1)
+
+	constructor(p: Program, m: i32) {
+		this.p = p
+		this.m = m
+		for (const d of p.modules[m].decls) {
+			this.collect(d)
+		}
+		sort(this.order)
+		for (const i of 0 ... this.order.length - 1) {
+			this.own.set(this.order[i], i)
+		}
+	}
+
+	file(compiler: u64): string {
+		const p = this.p
+		const decls = new Writer()
+		const defs = new Writer()
+		uleb(decls, this.order.length)
+		for (const d of this.order) {
+			const x = p.decls[d]
+			uleb(decls, this.str(x.name))
+			decls.u8(x.kind)
+			this.owner(decls, x.owner)
+			uleb(defs, x.mods)
+			uleb(defs, x.params.length)
+			for (const t of x.params) {
+				uleb(defs, this.str(t.name))
+				uleb(defs, this.type(t.constraint))
+				uleb(defs, this.type(t.fallback))
+			}
+			uleb(defs, this.type(x.type))
+			this.part(defs, op.TypeList, x.supers)
+			this.part(defs, op.TypeList, x.tags)
+			uleb(defs, this.str(x.doc))
+			defs.u8(if (x.code == null) 0 else 1)
+			if (x.code != null) {
+				this.code(defs, x.code!)
+			}
+		}
+		const mod = p.modules[this.m]
+		ids(defs, mod.decls.map(d => this.decl(d)))
+		ids(defs, mod.inits.map(d => this.decl(d)))
+		ids(defs, mod.deps.map(d => this.dep(d)))
+		let line = -1
+		ids(defs, mod.newlines.map(n => {
+			const d = n - line
+			line = n
+			return d
+		}))
+		const w = new Writer()
+		w.raw(magic)
+		w.fixed(compiler, 8)
+		w.fixed(mod.source, 8)
+		w.fixed(abi(p, this.m), 8)
+		text(w, mod.path)
+		for (const s of [this.deps.section(), this.strings.section(), this.ints.section(), this.names.section(), decls.bytes,
+			this.imports.section(), this.types.section(), defs.bytes]) {
+			text(w, s)
+		}
+		return w.bytes
+	}
+
+	/// Adds d and the decls it owns.
+	private collect(d: i32) {
+		this.order.push(d)
+		for (const x of this.p.decls[d].members) {
+			this.collect(x)
+		}
+	}
+
+	private code(w: Writer, c: Code) {
+		uleb(w, c.locals.length)
+		for (const l of c.locals) {
+			uleb(w, this.str(l.name))
+			uleb(w, this.type(l.type))
+			uleb(w, l.mods)
+		}
+		ids(w, c.captures)
+		ids(w, c.lists.slice(1, c.lists.length))
+		uleb(w, c.ops.length)
+		let at = -1
+		for (const i of 0 ... c.ops.length - 1) {
+			const s = op.shape[c.ops[i]]
+			w.sleb(c.pos[i] - at)
+			at = c.pos[i]
+			w.u8(c.ops[i])
+			for (const j of 0 ... s.length - 1) {
+				this.part(w, s[j], c.imm(i, j))
+			}
+		}
+	}
+
+	/// Writes x, a part of kind k: a list of types inline, a number as it is, else the file's id of it.
+	private part(w: Writer, k: Part, x: i32) {
+		switch (k) {
+			case op.TypeList: ids(w, this.p.lists[x].map(t => this.type(t)))
+			case op.TypeId: uleb(w, this.type(x))
+			case op.DeclId: uleb(w, this.decl(x))
+			case op.StrId: uleb(w, this.str(x))
+			case op.IntId: uleb(w, this.int(x))
+			case Names: uleb(w, this.nameList(x))
+			default: uleb(w, x) // a local, a count or a depth, or a code list of them
+		}
+	}
+
+	private type(t: i32): i32 {
+		return this.types.find(t) ?? this.types.add(t, w => {
+			const k = this.p.kind(t)
+			const s = parts(k, this.p.a(t))
+			w.u8(k)
+			this.part(w, s[0], this.p.a(t))
+			if (s.length > 1) {
+				this.part(w, s[1], this.p.b(t))
+			}
+		})
+	}
+
+	private decl(d: i32): i32 {
+		return this.own.get(d) ?? (this.order.length + (this.imports.find(d) ?? this.imports.add(d, w => {
+			const x = this.p.decls[d]
+			uleb(w, this.dep(x.module))
+			this.owner(w, x.owner)
+			uleb(w, this.str(x.name))
+			uleb(w, x.nth)
+		})))
+	}
+
+	private owner(w: Writer, o: i32) { uleb(w, if (o < 0) 0 else this.decl(o) + 1) }
+
+	private nameList(n: i32): i32 {
+		return this.names.find(n) ?? this.names.add(n, w => {
+			const xs = this.p.names[n]
+			uleb(w, xs.length / 2)
+			for (const i of 0 ... xs.length / 2 - 1) {
+				uleb(w, this.str(xs[2 * i]))
+				uleb(w, xs[2 * i + 1])
+			}
+		})
+	}
+
+	private dep(m: i32): i32 {
+		return this.deps.find(m) ?? this.deps.add(m, w => {
+			text(w, this.p.modules[m].path)
+			w.fixed(abi(this.p, m), 8)
+		})
+	}
+
+	private str(s: i32): i32 { return this.strings.find(s) ?? this.strings.add(s, w => text(w, this.p.strings[s])) }
+	private int(x: i32): i32 { return this.ints.find(x) ?? this.ints.add(x, w => w.sleb(this.p.ints[x])) }
+}
+
+function uleb(w: Writer, x: i32) { w.uleb(x as u64) }
+
+function ids(w: Writer, xs: i32[]) {
+	uleb(w, xs.length)
+	for (const x of xs) {
+		uleb(w, x)
+	}
+}
+
+function text(w: Writer, s: string) {
+	uleb(w, s.length)
+	w.raw(s)
+}
+
+/// A file being read into p: its header and deps, read when made, then the Program's id of each id of its tables.
+class In {
+	p: Program
+	r: Reader
+	path = ""
+	compiler: u64 = 0
+	source: u64 = 0
+	abi: u64 = 0
+	/// Its deps' paths and the ABI hash it has of each.
+	paths: string[] = []
+	hashes: u64[] = []
+	/// Its module, once added.
+	m = -1
+	private deps: i32[] = []
+	private strings: i32[] = [0]
+	private ints: i32[] = [0]
+	private names: i32[] = [0]
+	private types: i32[] = []
+	/// Its decls, then those it imports.
+	private decls: i32[] = []
+	private own = 0
+	/// Where the section being read ends.
+	private end = 0
+
+	constructor(p: Program, bytes: string) throws ParseError {
+		this.p = p
+		this.r = new Reader(bytes)
+		for (const t of 0 ... (kind.Float as i32)) {
+			this.types.push(t)
+		}
+		if (this.r.raw(5) != magic) {
+			throw this.bad()
+		}
+		this.compiler = this.r.fixed(8)
+		this.source = this.r.fixed(8)
+		this.abi = this.r.fixed(8)
+		this.path = this.text()
+		this.end = this.r.pos
+		this.next()
+		for (const _ of 1 ... this.n()) {
+			this.paths.push(this.text())
+			this.hashes.push(this.r.fixed(8))
+		}
+	}
+
+	/// Reads the strings, ints, names entries and decls, made in its module.
+	declare() throws ParseError {
+		const p = this.p
+		this.table(this.strings, () => p.intern(this.text()))
+		this.table(this.ints, () => p.int(this.r.sleb()))
+		this.table(this.names, () => {
+			const pairs: i32[] = []
+			for (const _ of 1 ... this.n()) {
+				pairs.push(this.str())
+				pairs.push(this.n())
+			}
+			return p.nameList(pairs)
+		})
+		this.table(this.decls, () => {
+			const name = p.strings[this.str()]
+			const k = this.r.u8()
+			if (k > decl.Test) {
+				throw this.bad()
+			}
+			return p.decl(this.m, this.owner(), name, k as decl.Kind)
+		})
+		this.own = this.decls.length
+	}
+
+	/// Reads the rest, the decls it imports linked.
+	link() throws ParseError {
+		const p = this.p
+		this.deps = this.paths.map(path => p.module(path))
+		this.table(this.decls, () => {
+			const m = this.deps[this.id(this.deps.length)]
+			const d = p.find(m, this.owner(), p.strings[this.str()], this.n())
+			if (d < 0) {
+				throw this.bad()
+			}
+			return d
+		})
+		this.table(this.types, () => {
+			const k = this.r.u8()
+			if (k <= kind.Float || k > kind.Member) {
+				throw this.bad()
+			}
+			const a = this.part(parts(k as kind.Kind, 0)[0])
+			const s = parts(k as kind.Kind, a)
+			return p.type(k as kind.Kind, a, if (s.length > 1) this.part(s[1]) else 0)
+		})
+		this.next()
+		const own = this.decls.slice(0, this.own)
+		for (const d of own) {
+			const x = p.decls[d]
+			x.mods = this.n()
+			for (const _ of 1 ... this.n()) {
+				x.params.push({ name: this.str(), constraint: this.type(), fallback: this.type() })
+			}
+			x.type = this.type()
+			x.supers = this.part(op.TypeList)
+			x.tags = this.part(op.TypeList)
+			x.doc = this.str()
+			if (this.r.u8() == 1) {
+				x.code = this.code()
+			}
+		}
+		const mod = p.modules[this.m]
+		mod.decls = this.list(() => this.of(own))
+		mod.inits = this.list(() => this.of(own))
+		mod.deps = this.list(() => this.of(this.deps))
+		let line = -1
+		mod.newlines = this.list(() => {
+			line += this.n()
+			return line
+		})
+		if (this.r.pos != this.end || this.end != this.r.bytes.length) {
+			throw this.bad()
+		}
+	}
+
+	private code(): Code throws ParseError {
+		const c = new Code()
+		for (const _ of 1 ... this.n()) {
+			c.local(this.str(), this.type(), this.n())
+		}
+		c.captures = this.list(() => this.n())
+		c.lists.append(this.list(() => this.n()))
+		for (const _ of 1 ... this.n()) {
+			c.at += this.r.sleb() as i32
+			const o = this.r.u8()
+			if (o >= op.names.length) {
+				throw this.bad()
+			}
+			const s = op.shape[o]
+			c.add(o as op.Opcode, this.imm(s, 0), this.imm(s, 1), this.imm(s, 2))
+		}
+		return c
+	}
+
+	/// Immediate j of an op of shape s, 0 if it has none.
+	private imm(s: op.Imm[], j: i32): i32 throws ParseError { return if (j < s.length) this.part(s[j]) else 0 }
+
+	/// A part of kind k: a list of types inline, a number as it is, else the Program's id of the file's id next.
+	private part(k: Part): i32 throws ParseError {
+		switch (k) {
+			case op.TypeList: return this.p.list(this.list(() => this.type()))
+			case op.TypeId: return this.of(this.types)
+			case op.DeclId: return this.of(this.decls)
+			case op.StrId: return this.of(this.strings)
+			case op.IntId: return this.of(this.ints)
+			case Names: return this.of(this.names)
+		}
+		return this.n()
+	}
+
+	private type(): i32 throws ParseError { return this.of(this.types) }
+	private str(): i32 throws ParseError { return this.of(this.strings) }
+	/// The next owner: -1 for none, else a decl.
+	private owner(): i32 throws ParseError {
+		const o = this.id(this.decls.length + 1)
+		return if (o == 0) -1 else this.decls[o - 1]
+	}
+	private text(): string throws ParseError { return this.r.raw(this.n()) }
+
+	/// The item of xs the next integer indexes.
+	private of(xs: i32[]): i32 throws ParseError { return xs[this.id(xs.length)] }
+
+	/// The next list, each item read by item.
+	private list(item: () => i32 throws ParseError): i32[] throws ParseError {
+		const out: i32[] = []
+		for (const _ of 1 ... this.n()) {
+			out.push(item())
+		}
+		return out
+	}
+
+	/// Reads the next section, a table, into xs, each entry by entry.
+	private table(xs: i32[], entry: () => i32 throws ParseError) throws ParseError {
+		this.next()
+		for (const _ of 1 ... this.n()) {
+			xs.push(entry())
+		}
+	}
+
+	/// The next integer, an index below n.
+	private id(n: i32): i32 throws ParseError {
+		const x = this.n()
+		if (x >= n) {
+			throw this.bad()
+		}
+		return x
+	}
+
+	/// The next integer, which fits an i32.
+	private n(): i32 throws ParseError {
+		const x = this.r.uleb()
+		if (x > 0x7fffffff) {
+			throw this.bad()
+		}
+		return x as i32
+	}
+
+	/// Checks that the section read ends where it says, and reads where the next ends.
+	private next() throws ParseError {
+		if (this.r.pos != this.end) {
+			throw this.bad()
+		}
+		this.end = this.n() + this.r.pos
+	}
+
+	private bad(): ParseError { return new ParseError("syntax", this.r.pos) }
+}
+
+/// The ABI hashes being made of the modules reached from one: Tarjan's strongly connected components of the modules
+/// whose signatures name each other, each hashed as one once those it reaches are.
+class Abis {
+	p: Program
+	private index = new HashMap[i32, i32]()
+	private stack: i32[] = []
+	private made = new HashMap[i32, Abi]()
+
+	constructor(p: Program) { this.p = p }
+
+	/// Makes the ABI hash of module m, unvisited, unless it is in a component not done; returns the least index on the
+	/// stack it reaches.
+	visit(m: i32): i32 {
+		const i = this.index.size
+		this.index.set(m, i)
+		this.stack.push(m)
+		const a = new Abi(this.p, m)
+		this.made.set(m, a)
+		let low = i
+		for (const u of a.uses) {
+			if (this.p.modules[u].abi == 0) {
+				low = min(low, this.index.get(u) ?? this.visit(u))
+			}
+		}
+		if (low == i) {
+			const c: i32[] = []
+			while (!contains(c, m)) {
+				c.push(this.stack.pop())
+			}
+			let own: u64 = 0
+			let others: u64 = 0
+			for (const x of c) {
+				own += this.made.get(x)!.h
+				for (const u of this.made.get(x)!.uses) {
+					others += if (contains(c, u)) 0 else this.p.modules[u].abi
+				}
+			}
+			const h = combine(own, others)
+			for (const x of c) {
+				this.p.modules[x].abi = if (h == 0) 1 else h
+			}
+		}
+		return low
+	}
+}
+
+/// Module m's signatures being hashed, and the other modules they name.
+class Abi {
+	p: Program
+	m: i32
+	h = seed
+	uses: i32[] = []
+	private done = new HashMap[i32, bool]()
+	private seen = new HashMap[i32, bool]()
+
+	constructor(p: Program, m: i32) {
+		this.p = p
+		this.m = m
+		for (const d of p.modules[m].decls) {
+			if ((p.decls[d].mods & decl.Export) != 0) {
+				this.decl(d)
+			}
+		}
+	}
+
+	/// Adds the signature of decl d, of its members if a class or interface, its code if a const.
+	private decl(d: i32) {
+		if (this.done.has(d)) {
+			return
+		}
+		this.done.set(d, true)
+		const x = this.p.decls[d]
+		this.h = combine(combine(combine(this.h, x.hash), x.kind), x.mods)
+		for (const t of x.params) {
+			this.h = combine(this.h, fnv(this.p.strings[t.name]))
+			this.type(t.constraint)
+			this.type(t.fallback)
+		}
+		this.type(x.type)
+		this.list(x.supers)
+		this.list(x.tags)
+		if (x.kind == decl.Var && (x.mods & decl.Readonly) != 0 && x.code != null) {
+			this.code(x.code!)
+		}
+		if (x.kind == decl.Class || x.kind == decl.Interface) {
+			for (const y of x.members) {
+				this.decl(y)
+			}
+		}
+	}
+
+	private code(c: Code) {
+		for (const l of c.locals) {
+			this.type(l.type)
+		}
+		for (const i of 0 ... c.ops.length - 1) {
+			this.h = combine(this.h, c.ops[i])
+			const s = op.shape[c.ops[i]]
+			for (const j of 0 ... s.length - 1) {
+				const x = c.imm(i, j)
+				switch (s[j]) {
+					case op.TypeId: this.type(x)
+					case op.TypeList: this.list(x)
+					case op.DeclId:
+						this.h = combine(this.h, this.p.decls[x].hash)
+						this.named(x)
+					case op.StrId: this.h = combine(this.h, fnv(this.p.strings[x]))
+					case op.IntId: this.h = combine(this.h, this.p.ints[x])
+					case op.LocalList, op.NumList:
+						for (const y of c.items(x)) {
+							this.h = combine(this.h, y)
+						}
+					default: this.h = combine(this.h, x)
+				}
+			}
+		}
+	}
+
+	private list(l: i32) {
+		for (const t of this.p.lists[l]) {
+			this.type(t)
+		}
+	}
+
+	private type(t: i32) {
+		this.h = combine(this.h, this.p.hash(t))
+		this.walk(t)
+	}
+
+	/// Notes the decls t and its parts name.
+	private walk(t: i32) {
+		if (this.seen.has(t)) {
+			return
+		}
+		this.seen.set(t, true)
+		const k = this.p.kind(t)
+		if (k == kind.Named || k == kind.Param) {
+			this.named(this.p.a(t))
+		}
+		for (const x of this.p.parts(t)) {
+			this.walk(x)
+		}
+	}
+
+	/// Adds decl d if of this module, else notes its module.
+	private named(d: i32) {
+		const m = this.p.decls[d].module
+		if (m == this.m) {
+			this.decl(d)
+		} else if (!contains(this.uses, m)) {
+			this.uses.push(m)
+		}
+	}
+}

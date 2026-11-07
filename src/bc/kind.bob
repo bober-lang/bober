@@ -1,0 +1,94 @@
+//! Type kinds (§8.2): what a type row of the Program is, and so what its parts a and b are. Kinds 0 to 18 are the
+//! primitives, each its own type id and without parts.
+
+/// No value: a block without a result, an untyped catch's local.
+export const None: u8 = 0
+export const Null: u8 = 1
+export const Bool: u8 = 2
+export const I8: u8 = 3
+export const I16: u8 = 4
+export const I32: u8 = 5
+export const I64: u8 = 6
+export const U8: u8 = 7
+export const U16: u8 = 8
+export const U32: u8 = 9
+export const U64: u8 = 10
+export const F32: u8 = 11
+export const F64: u8 = 12
+export const String: u8 = 13
+export const String16: u8 = 14
+export const String32: u8 = 15
+/// The type of types as values (§4.11), a value of which is a descriptor until mono knows it.
+export const Type: u8 = 16
+/// An untyped integer constant (§4.1): a Var of one is a const its users fold to the type they need.
+export const Int: u8 = 17
+/// An untyped float constant.
+export const Float: u8 = 18
+/// a the element.
+export const Array: u8 = 19
+/// a the type of a defaulted param, which holds Missing when left out.
+export const Optional: u8 = 20
+/// a the Array of a function's last param or a tuple's last element, `...T`.
+export const Rest: u8 = 21
+/// a the class of a param of an extern function that C takes by value, §3.1's `...T`.
+export const Embed: u8 = 22
+/// a the element, b the length.
+export const FixedArray: u8 = 23
+/// a the list of its elements.
+export const Tuple: u8 = 24
+/// a the list of its members, flattened, each once, ordered by hash: only Program.union makes one. The union of none
+/// is never, the type of no value.
+export const Union: u8 = 25
+/// a the list of its field types, b the names entry of their names and mods, in order.
+export const Object: u8 = 26
+/// a the list of its param types, b its result.
+export const Func: u8 = 27
+/// A class or interface, the one form of one, generic or an instance: a its decl, b the list of the args of each of
+/// its and its owners' type params, outermost first, 0 for none. Of a generic decl without args it is the generic
+/// itself, which reflection's `base` gives. An alias is never a type, as lower expands it, and neither is a class, an
+/// interface or a generic itself: their members, supertypes, type sets and params are their decl's. Once mono
+/// instances it, an instance is its own decl, of no params, and its type that decl's without args.
+export const Named: u8 = 28
+/// A type param: a the decl declaring it, b its index there.
+export const Param: u8 = 29
+/// The type of one value: a its base, String, Bool or an integer, b the value: a Str, 0 or 1, or an ints entry.
+export const Literal: u8 = 30
+/// The Type a local holds, which the checker found static (§4.11): a the local, b 0 for the local itself, else the Str
+/// of the field of the record it holds that holds the Type.
+export const Of: u8 = 31
+/// What member b, a Str, of Type a is, as `T.elem`.
+export const Member: u8 = 32
+
+export type Kind = None | Null | Bool | I8 | I16 | I32 | I64 | U8 | U16 | U32 | U64 | F32 | F64 | String | String16
+	| String32 | Type | Int | Float | Array | Optional | Rest | Embed | FixedArray | Tuple | Union | Object | Func
+	| Named | Param | Literal | Of | Member
+
+/// Whether type t is a primitive, whose id is its kind.
+export function isPrimitive(t: i32): bool { return t <= Float }
+
+/// Whether t, a kind or a type, is an integer type, untyped Int included.
+export function isInt(t: i32): bool { return t >= I8 && t <= U64 || t == Int }
+
+/// Whether t, a kind or a type, is a float type, untyped Float included.
+export function isFloat(t: i32): bool { return t == F32 || t == F64 || t == Float }
+
+/// Whether t is an untyped constant's, a const its users fold.
+export function untyped(t: i32): bool { return t == Int || t == Float }
+
+export function isSigned(t: i32): bool { return t >= I8 && t <= I64 || t == Int }
+
+/// The bits of a number of primitive t, 64 for an untyped one, 1 for a bool.
+export function width(t: i32): i32 {
+	return switch (t) {
+		case I8, U8: 8
+		case I16, U16: 16
+		case I32, U32, F32: 32
+		case I64, U64, F64, Int, Float: 64
+		default: 1
+	}
+}
+
+/// Whether a number of kind s widens to one of kind t (§4.1).
+export function widens(s: i32, t: i32): bool {
+	return width(t) > width(s) && (isInt(s) && isInt(t) && (isSigned(t) || !isSigned(s)) || isFloat(s) && isFloat(t))
+}

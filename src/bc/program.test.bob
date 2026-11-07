@@ -1,0 +1,101 @@
+import * as decl from "./decl"
+import * as kind from "./kind"
+import * as op from "./op"
+import { Code, Program } from "./program"
+import { show, showType } from "./show"
+
+test "interning" {
+	const p = new Program()
+	assert p.intern("a") == p.intern("a") && p.intern("") == 0
+	assert p.int(-5) == p.int(-5) && p.ints[p.int(-5)] == -5
+	assert p.list([]) == 0 && p.list([kind.I32, kind.Bool]) == p.list([kind.I32, kind.Bool])
+	const t = p.type(kind.Array, kind.I32)
+	assert p.type(kind.Array, kind.I32) == t && t != p.type(kind.Array, kind.I64)
+	assert p.kind(kind.U8) == kind.U8 && p.kind(t) == kind.Array && p.a(t) == kind.I32
+	assert p.closed(t) && showType(p, p.type(kind.FixedArray, t, 4)) == "i32[][4]"
+}
+
+test "union" {
+	const p = new Program()
+	const s = p.type(kind.Array, kind.String)
+	const u = p.union([kind.I32, p.union([s, kind.Null]), kind.I32])
+	assert p.union([kind.Null, s, kind.I32]) == u && p.items(u).length == 3
+	assert p.union([s, s]) == s && p.type(kind.Union, p.list([kind.Bool, kind.Null])) == p.union([kind.Null, kind.Bool])
+	// The order is by hash, so the same in a program that made the types in another order.
+	const q = new Program()
+	const v = q.union([kind.I32, kind.Null, q.type(kind.Array, kind.String)])
+	assert showType(q, v) == showType(p, u)
+	// Distinct types hash apart, so that the order is total: literals of one value by their base too.
+	const one = p.type(kind.Literal, kind.I32, p.int(1))
+	assert p.hash(one) != p.hash(p.type(kind.Literal, kind.Bool, 1)) && p.hash(one) != p.hash(p.type(kind.Literal, kind.I64, p.int(1)))
+}
+
+test "subst" {
+	const p = new Program()
+	const m = p.addModule("a.bob")
+	const box = p.decl(m, -1, "Box", decl.Class)
+	p.decls[box].params = [{ name: p.intern("T"), constraint: 0, fallback: 0 }]
+	const get = p.decl(m, box, "get", decl.Function)
+	p.decls[get].params = [{ name: p.intern("U"), constraint: 0, fallback: 0 }]
+	assert p.find(m, box, "get") == get && p.find(m, -1, "get") == -1
+	const t = p.type(kind.Param, box, 0)
+	const u = p.type(kind.Param, get, 0)
+	const f = p.type(kind.Func, p.list([t, u]), p.union([t, kind.I32]))
+	assert !p.closed(f) && !p.reflected(f)
+	const env = p.list([kind.I32, kind.Bool])
+	const g = p.subst(f, env)
+	assert showType(p, g) == "(i32, bool) => i32" && p.subst(f, env) == g
+	assert p.subst(kind.I32, env) == kind.I32 && p.subst(g, env) == g
+	// A type param's Member resolves once its arg is known.
+	const elem = p.type(kind.Member, t, p.intern("elem"))
+	assert p.reflected(elem) && p.subst(elem, p.list([p.type(kind.Array, kind.U8)])) == kind.U8
+	// The class instance.
+	const n = p.type(kind.Named, box, p.list([t]))
+	assert showType(p, p.subst(n, p.list([kind.String]))) == "Box[string]"
+}
+
+test "code" {
+	const p = new Program()
+	const m = p.addModule("a.bob")
+	const f = p.decl(m, -1, "f", decl.Function)
+	const d = p.decls[f]
+	d.mods = decl.Export
+	d.type = p.type(kind.Func, p.list([kind.I32]), kind.I32)
+	const c = new Code()
+	c.local(p.intern("x"), kind.I32)
+	c.local(0, kind.Bool)
+	c.add(op.Local, 0)
+	c.add(op.Int, kind.I32, p.int(0))
+	c.add(op.Gt)
+	const at = c.add(op.If, kind.I32)
+	c.add(op.Local, 0)
+	c.add(op.Fresh, 1)
+	c.add(op.Else)
+	c.add(op.Float, kind.F64, p.int(4611686018427387904))
+	c.add(op.Cast, kind.I32)
+	c.add(op.End)
+	c.add(op.Closure, f, 0, c.list([1, 0]))
+	c.add(op.Drop)
+	c.add(op.Return)
+	c.add(op.End)
+	assert c.next(at) == 6 && c.next(6) == 9
+	c.retain(i => c.ops[i] != op.Fresh)
+	assert c.next(at) == 5 && c.b(1) == p.int(0)
+	d.code = c
+	assert show(p, m) == `export function f: (i32) => i32
+	locals x: i32, _: bool
+	Local 0
+	Int i32 0
+	Gt
+	If i32
+		Local 0
+	Else
+		Float f64 2
+		Cast i32
+	End
+	Closure f [1, 0]
+	Drop
+	Return
+End
+`
+}
