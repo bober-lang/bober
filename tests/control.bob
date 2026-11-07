@@ -1,0 +1,179 @@
+import { a, nine, underscore, z, zero } from "../std/ascii"
+
+function classify(c: i32): i32 {
+	let s = 0
+	switch (c) {
+		case 1: s = 10
+		case 2, -3:
+			s += 1
+			s += 1
+		default: s = -1
+	}
+	return s
+}
+
+function grade(n: i32): string {
+	return switch (n) {
+		case 90 ... 100: "A"
+		case 80 ... 89, 79: "B"
+		default: "F"
+	}
+}
+
+function charClass(c: u8): string {
+	return switch (c) {
+		case a ... z, underscore: "ident"
+		case zero ... nine: "digit"
+		default: "other"
+	}
+}
+
+test "if expression" {
+	let x = -3
+	assert (if (x > 0) x else -x) == 3
+	const c = true
+	const d: i32 = if (!c) 1 else 2 + 3
+	assert d == 5
+}
+
+test "short-circuit" {
+	let calls = 0
+	function hit(): bool {
+		calls += 1
+		return true
+	}
+	assert !(false && hit())
+	assert true || hit()
+	assert calls == 0
+}
+
+test "while with break and continue" {
+	let i = 0
+	let s = 0
+	while (true) {
+		i += 1
+		if (i > 10) {
+			break
+		}
+		if (i % 2 == 0) {
+			continue
+		}
+		s += i
+	}
+	assert s == 25
+}
+
+test "break leaves only the inner loop" {
+	let n = 0
+	for (const i of 1 ... 3) {
+		for (const x of [10, 20]) {
+			if (x == 20) {
+				break
+			}
+			n += i
+		}
+	}
+	assert n == 6
+}
+
+test "inclusive ranges" {
+	let calls = 0
+	function four(): i32 {
+		calls += 1
+		return 4
+	}
+	let s = 0
+	for (const i of 1 ... four()) {
+		s += i
+	}
+	assert s == 10 && calls == 1
+	for (const _ of 4 ... 1) {
+		s = 0
+	}
+	assert s == 10
+}
+
+test "range up to the maximum of its kind" {
+	let hi: u8 = 255
+	let count = 0
+	for (const i of 254 ... hi) {
+		count += 1
+	}
+	assert count == 2
+	for (const i of hi ... hi) {
+		assert i + 1 == 0
+	}
+}
+
+test "for with patterns" {
+	let s = 0
+	for (const [a, b] of [[1, 2], [3, 4]]) {
+		s += a * b
+	}
+	assert s == 14
+	for (let x of [1, 2]) {
+		x *= 10
+		s += x
+	}
+	assert s == 44
+}
+
+test "for over a string yields u8 code units" {
+	let s = 0
+	for (const c of "hi\xff") {
+		assert c instanceof u8
+		s += c
+	}
+	assert s == 104 + 105 + 255
+	for (const _ of "") {
+		assert false
+	}
+}
+
+test "switch statement does not fall through" {
+	assert classify(1) == 10
+	assert classify(-3) == 2
+	assert classify(4) == -1
+	let s = 1
+	switch (s) {
+		case 2: s = 5
+	}
+	assert s == 1
+}
+
+test "switch expression labels" {
+	assert grade(100) == "A" && grade(80) == "B" && grade(79) == "B" && grade(78) == "F"
+	const s = "a_9 "
+	assert charClass(s[0]) == "ident" && charClass(s[1]) == "ident"
+	assert charClass(s[2]) == "digit" && charClass(s[3]) == "other"
+	const kw: i32 = switch (s) {
+		case "let", "a_9 ": 1
+		default: 0
+	}
+	assert kw == 1
+}
+
+test "switch evaluates its subject once" {
+	let calls = 0
+	function subject(): i32 {
+		calls += 1
+		return 3
+	}
+	const r = switch (subject()) {
+		case 1: "a"
+		case 3: "c"
+		default: "d"
+	}
+	assert r == "c" && calls == 1
+}
+
+test "continue inside a case" {
+	let s = 0
+	for (const i of 1 ... 5) {
+		switch (i % 2) {
+			case 0: continue
+			default: s += i
+		}
+	}
+	assert s == 9
+}

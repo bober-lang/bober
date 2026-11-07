@@ -1,0 +1,189 @@
+import { sizeOf } from "../builtin/mem"
+
+class Square {
+	side: f64
+
+	constructor(side: f64) { this.side = side }
+}
+
+class Circle {
+	r: f64
+
+	constructor(r: f64) { this.r = r }
+}
+
+class Link {
+	v = 1
+	info = { w: 2 }
+	next: Link | null = null
+}
+
+interface HasSide {
+	side: f64
+}
+
+type Shape = Square | Circle
+type Ev = { kind: "key", code: i32 } | { kind: "move", x: i32, y: i32 }
+
+function area(s: Shape): f64 {
+	return switch (s) {
+		case Square: s.side * s.side
+		case Circle: 3.0 * s.r * s.r
+	}
+}
+
+function size(v: i32 | string | null): i32 {
+	return switch (v) {
+		case null: -1
+		case string: v.length
+		case i32: v
+	}
+}
+
+function weight(e: Ev): i32 {
+	return switch (e.kind) {
+		case "key": e.code
+		case "move": e.x + e.y
+	}
+}
+
+test "instanceof on primitive members matches the kind exactly" {
+	const text = (v: i32 | string) => v instanceof (string | bool)
+	assert text("one") && !text(1)
+	const narrow = (u: i32 | i64) => u instanceof i32
+	const x: i64 = 5
+	assert narrow(1) && !narrow(x)
+}
+
+test "instanceof on classes and interfaces" {
+	const kinds = (s: Shape) => [s instanceof Circle, s instanceof Square, s instanceof HasSide]
+	assert kinds(new Circle(1.0)) == [true, false, false]
+	assert kinds(new Square(2.0)) == [false, true, true]
+}
+
+test "switch on type labels" {
+	assert area(new Square(2.0)) == 4.0
+	assert area(new Circle(1.0)) == 3.0
+	assert size(null) == -1
+	assert size("abc") == 3
+	assert size(7) == 7
+}
+
+test "switch on a discriminating field" {
+	assert weight({ kind: "key", code: 4 }) == 4
+	assert weight({ kind: "move", x: 2, y: 3 }) == 5
+}
+
+test "?? and ??=" {
+	const ns: (i32 | null)[] = [null, 5]
+	ns[0] ??= 7
+	ns[1] ??= 7
+	assert ns == [7, 5]
+	let calls = 0
+	function f(): i32 {
+		calls += 1
+		return 1
+	}
+	assert (ns[1] ?? f()) == 5 && calls == 0 && (ns[0] ?? f()) == 7
+}
+
+test "?. skips the rest of the chain" {
+	const none: Link | null = null
+	assert none?.v == null
+	assert none?.info.w == null
+	const some: Link | null = new Link()
+	assert some?.v == 1
+	assert some?.next?.v == null
+}
+
+test "?.[ and ?.(" {
+	const xs: i32[] | null = null
+	assert xs?.[0] == null
+	const ys: i32[] | null = [7]
+	assert ys?.[0] == 7
+	let calls = 0
+	function bump(): i32 {
+		calls += 1
+		return 1
+	}
+	const f: ((x: i32) => i32) | null = null
+	assert f?.(bump()) == null
+	assert calls == 0
+	const g: ((x: i32) => i32) | null = (x: i32) => x + 1
+	assert g?.(bump()) == 2
+}
+
+test "postfix ! and as unwrap" {
+	const n: i32 | null = 5
+	assert n! == 5
+	const l: Link | null = new Link()
+	assert l!.v == 1
+	const v: i32 | string = 4
+	assert (v as i32) + 1 == 5
+}
+
+test "stores convert to the declared type, not the current kind" {
+	let wide: i64 | null = null
+	wide = 0
+	wide = wide! + 2147483647
+	wide = wide! + 1
+	assert wide! > 0
+	const o: { b: u8 | null } = { b: null }
+	o.b = 255
+	o.b = o.b! + 1
+	assert o.b == 0
+	const xs = new (i64 | null)[](1)
+	xs[0] = 2147483647
+	xs[0] = xs[0]! + 1
+	assert xs[0]! > 0
+	const y: f64 | null = 1.0
+	assert y! / 2.0 == 0.5
+}
+
+test "a type refers to itself through a class, not an alias" {
+	class List {
+		v = 0
+		next: List | null = null
+	}
+	const l = new List()
+	l.next = new List()
+	l.next!.v = 2
+	assert l.next!.v == 2 && l.next!.next == null
+}
+
+test "a literal union reflects its members and their values" {
+	type Mode = "fast" | "safe"
+	let s = ""
+	for (const m of Mode.members) {
+		s += m.value
+	}
+	assert s == "fastsafe" || s == "safefast" // in the canonical order, unspecified (4.9)
+}
+
+test "a union is packed: its widest member, its tag in a byte none uses, else appended" {
+	assert sizeOf[i32[] | null]() == 8 // null is the zero ref
+	assert sizeOf[i32 | i32[]]() == 8 // the tag in the top byte of the ref
+	assert sizeOf[string | null]() == 24 // in that of a string's ref
+	assert sizeOf[f64 | string | null]() == 24
+	assert sizeOf[i32 | null]() == 8
+	assert sizeOf[i64 | i32[]]() == 16
+	assert sizeOf[bool | null]() == 2
+	assert sizeOf[i8 | i16]() == 4
+}
+
+test "packed unions hold their members in fields and elements" {
+	const o: { a: i32 | i32[], s: string | null, w: i64 | string } = { a: 1, s: null, w: 2 }
+	assert o.a == 1 && o.s == null && o.w == 2
+	o.a = [3, 4]
+	o.s = "a string longer than fifteen bytes"
+	o.w = "short"
+	assert (o.a as i32[])[1] == 4 && o.s == "a string longer than fifteen bytes" && o.w == "short"
+	const xs: (string | i32[] | null)[] = []
+	for (const i of 0 ... 9999) {
+		xs.push(if (i % 3 == 0) null else if (i % 3 == 1) `string ${i} that is long` else [i])
+	}
+	for (const i of 0 ... 9999) {
+		const x = xs[i]
+		assert if (i % 3 == 0) x == null else if (i % 3 == 1) x == `string ${i} that is long` else (x as i32[])[0] == i
+	}
+}

@@ -1,0 +1,115 @@
+test "literals, shorthand and nesting" {
+	const x = 3
+	const p = { x, y: 4, inner: { v: [1, 2] } }
+	assert p.x + p.y == 7
+	assert p.inner.v[1] == 2
+}
+
+test "fields are shared through references" {
+	const p = { x: 1 }
+	const q = p
+	q.x = 5
+	assert p.x == 5
+	assert p == { x: 5 }
+}
+
+test "spread copies fields" {
+	const p = { x: 1, y: 2 }
+	const q = { ...p, z: 3 }
+	assert q.x == 1 && q.y == 2 && q.z == 3
+	q.x = 9
+	assert p.x == 1
+}
+
+class V {
+	x = 1
+	y = 2
+
+	sum(): i32 { return this.x + this.y }
+}
+
+test "spreading a class value copies it" {
+	const v = new V()
+	const w = { ...v, y: 5 }
+	v.x = 10
+	assert w.sum() == 6 && v.sum() == 12
+}
+
+test "compound assignment on fields" {
+	const p = { n: 2 }
+	p.n += 3
+	p.n *= 2
+	p.n++
+	assert p.n == 11
+}
+
+test "declared field kinds convert" {
+	const o: { b: u8 } = { b: 255 }
+	o.b += 1
+	assert o.b == 0
+}
+
+function widen(a: { x: i32 }): i32 {
+	const o = { ...a, y: 1 }
+	return o.x + o.y
+}
+
+test "spreading a value of an object type copies its fields" {
+	assert widen({ x: 5 }) == 6
+}
+
+class N { k = 1 }
+
+function count(ps: (N | string | null)[]): i32 {
+	let c = 0
+	for (const p of ps) {
+		if (p instanceof N) {
+			c += p.k
+		}
+	}
+	return c
+}
+
+test "a spread's elements convert to the element type" {
+	const ps: (N | null)[] = [null]
+	ps.push(...[new N()])
+	assert count(["a", ...[new N()], ...ps]) == 2
+}
+
+class Pos {
+	at: i32
+	constructor(at: i32 = 7) {
+		this.at = at
+	}
+}
+
+class Holder {
+	p: ...Pos
+}
+
+test "an embedded field's constructor takes its defaults" {
+	assert new Holder().p.at == 7
+}
+
+function make(): N { return new N() }
+
+function first(f: () => N | string, g: (n: N) => i32): bool { return f() instanceof N && g(new N()) == 1 }
+
+test "a function converts to a type of a wider result or narrower params" {
+	assert first(make, (x: N | null) => 1)
+}
+
+test "idOf is an object's alone while it lives, however the collector moves it" {
+	const a = new N()
+	const b = new N()
+	const ids = [idOf(a), idOf(b)]
+	assert ids[0] != ids[1] && idOf(a) == ids[0]
+	let last = ids[1]
+	for (const i of 0 ... 1000000) {
+		const xs = [i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i]
+		const id = idOf(xs) // each new, though xs may be where a dead one was
+		assert id > last
+		last = id
+	}
+	assert idOf(a) == ids[0] && idOf(b) == ids[1]
+}

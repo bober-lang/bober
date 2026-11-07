@@ -1,0 +1,122 @@
+//! lexical elements, 2.1-2.6
+
+/// integer literals in every base
+test "integer literals" {
+	let n: i32 = 1_000
+	assert n == 1000
+	n = 0xAb_C
+	assert n == 2748
+	n = 0o17
+	assert n == 15
+	n = 0b1010
+	assert n == 10
+}
+
+test "float literals" {
+	let f = 1e3
+	assert f == 1000.0
+	f = 2.5E-1
+	assert f == 0.25
+	f = 1_0.2_5
+	assert f == 10.25
+}
+
+test "single quotes make strings, and one character casts to its code point" {
+	assert 'a' == "a"
+	assert ("a" as u8) == 97
+	assert ("\u{1F600}" as u32) == 0x1F600
+	assert ('\'' as i32) == 39
+	assert ("\x41" as u8) == 65
+}
+
+test "string escapes" {
+	assert "\x41\u{42}" == "AB"
+	assert "a\tb".length == 3
+	assert "\0"[0] == 0
+	assert "\$\`\"'" == "$`" + "\"'"
+	assert "\u{e9}" == "é"
+	assert "\u{1F600}".length == 4
+}
+
+test "templates" {
+	let b = 5
+	assert `a${b}c` == "a5c"
+	assert `${`<${b}>`}` == "<5>"
+	assert `${"}"}` == "}"
+	assert `\${x}` == "${x}"
+	assert `${{ v: 2 }.v}` == "2"
+	assert `${b - 6} ${2.5} ${true} ${null}` == "-1 2.5 true null"
+}
+
+test "keywords as keys and after ." {
+	const o = { if: 1, class: 2, default: 3 }
+	assert o.if + o.class + o.default == 6
+}
+
+test "longest match" {
+	let s = 0
+	for (const i of 1 ... 3) {
+		s += i
+	}
+	assert s == 6
+}
+
+test "newline before a binary operator, . or ?. continues" {
+	let b: i32 = 5 - 1
+	assert b == 4
+	const o = { inner: { v: 3 } }
+	const v = o.inner?.v
+	assert v == 3
+}
+
+test "newline after an operator, comma or comment continues" {
+	const xs = [1, 2]
+	assert xs.length == 2
+	const a: i32 = 1 + 1 // comment
+	assert a == 2
+}
+
+test "newline before [ or ( ends the statement" {
+	let a = 1
+	let b = 2
+	[a, b] = [b, a]
+	assert a == 2
+	let calls = 0
+	const g = () => {
+		calls += 1
+	}
+	const h = g
+	(g)()
+	assert calls == 1
+}
+
+test "newline before else, catch and finally continues" {
+	let s = ""
+	if (s == "x") {} else {
+		s = "e"
+	}
+	try {
+		throw "t"
+	} catch {
+		s += "c"
+	} finally {
+		s += "f"
+	}
+	assert s == "ecf"
+}
+
+test "return always ends at a newline" {
+	function early(): i32 | null {
+		return
+		early()
+	}
+	assert early() == null
+}
+
+test "subtest named by a template" {
+	let a = 1
+	a++
+	test `sub ${a}` {
+		assert a == 2
+	}
+}

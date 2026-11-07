@@ -1,0 +1,192 @@
+import { caret, lparen, minus, nine, percent, plus, rparen, slash, space, star, zero } from "../../std/ascii"
+
+class NumTok {
+	value: i64
+
+	constructor(value: i64) { this.value = value }
+}
+
+class OpTok {
+	op: u8
+
+	constructor(op: u8) { this.op = op }
+}
+
+class EndTok {}
+
+type Token = NumTok | OpTok | EndTok
+
+class Num {
+	value: i64
+
+	constructor(value: i64) { this.value = value }
+}
+
+class Neg {
+	arg: Expr
+
+	constructor(arg: Expr) { this.arg = arg }
+}
+
+class Bin {
+	op: u8
+	left: Expr
+	right: Expr
+
+	constructor(op: u8, left: Expr, right: Expr) {
+		this.op = op
+		this.left = left
+		this.right = right
+	}
+}
+
+// Of classes, as an alias cannot refer to itself.
+type Expr = Num | Neg | Bin
+
+function isDigit(c: u8): bool { return zero <= c <= nine }
+
+function prec(op: u8): i32 {
+	return switch (op) {
+		case plus, minus: 1
+		case star, slash, percent: 2
+		case caret: 3
+		default: 0
+	}
+}
+
+function describe(t: Token): string {
+	return switch (t) {
+		case NumTok: `${t.value}`
+		case OpTok: chr(t.op)
+		case EndTok: "end"
+	}
+}
+
+function tokenize(src: string): Token[] {
+	let toks: Token[] = []
+	let i = 0
+	while (i < src.length) {
+		const c = src[i]
+		if (c == space) {
+			i++
+		} else if (isDigit(c)) {
+			let v: i64 = 0
+			while (i < src.length && isDigit(src[i])) {
+				v = v * 10 + ((src[i] - zero) as i64)
+				i++
+			}
+			toks = [...toks, new NumTok(v)]
+		} else if (prec(c) > 0 || c == lparen || c == rparen) {
+			toks = [...toks, new OpTok(c)]
+			i++
+		} else {
+			throw `unexpected '${chr(c)}' at ${i}`
+		}
+	}
+	return [...toks, new EndTok()]
+}
+
+class Parser {
+	toks: Token[] = []
+	pos = 0
+
+	constructor(toks: Token[]) { this.toks = toks }
+	peek(): Token { return this.toks[this.pos] }
+
+	expr(minPrec: i32): Expr {
+		let left = this.unary()
+		let t = this.peek()
+		while (t instanceof OpTok && prec(t.op) >= minPrec) {
+			this.pos++
+			const p = prec(t.op)
+			const right = this.expr(if (t.op == caret) p else p + 1)
+			left = new Bin(t.op, left, right)
+			t = this.peek()
+		}
+		return left
+	}
+
+	unary(): Expr {
+		const t = this.peek()
+		this.pos++
+		if (t instanceof NumTok) {
+			return new Num(t.value)
+		}
+		if (t instanceof OpTok && t.op == minus) {
+			return new Neg(this.unary())
+		}
+		if (t instanceof OpTok && t.op == lparen) {
+			const e = this.expr(1)
+			this.expect(rparen)
+			return e
+		}
+		throw `unexpected ${describe(t)}`
+	}
+
+	expect(op: u8) {
+		const t = this.peek()
+		if (t instanceof OpTok && t.op == op) {
+			this.pos++
+		} else {
+			throw `expected '${chr(op)}'`
+		}
+	}
+}
+
+function parse(src: string): Expr {
+	const p = new Parser(tokenize(src))
+	const e = p.expr(1)
+	const t = p.peek()
+	if (!(t instanceof EndTok)) {
+		throw `unexpected ${describe(t)}`
+	}
+	return e
+}
+
+function apply(op: u8, a: i64, b: i64): i64 {
+	if ((op == slash || op == percent) && b == 0) {
+		throw "division by zero"
+	}
+	return switch (op) {
+		case plus: a + b
+		case minus: a - b
+		case star: a * b
+		case slash: a / b
+		case percent: a % b
+		default: a ** b
+	}
+}
+
+function evaluate(e: Expr): i64 {
+	return switch (e) {
+		case Num: e.value
+		case Neg: -evaluate(e.arg)
+		case Bin: apply(e.op, evaluate(e.left), evaluate(e.right))
+	}
+}
+
+function show(e: Expr): string {
+	return switch (e) {
+		case Num: `${e.value}`
+		case Neg: `(neg ${show(e.arg)})`
+		case Bin: `(${chr(e.op)} ${show(e.left)} ${show(e.right)})`
+	}
+}
+
+function main() {
+	let line = ""
+	for (const t of tokenize("12 * (3 - 4)")) {
+		line += `[${describe(t)}]`
+	}
+	print(line)
+	const inputs = ["1 + 2 * 3", "(1 + 2) * 3", "2 ^ 3 ^ 2", "-2 ^ 2", "-7 % 3", "2 ^ 62 + 2 ^ 62", "1 +", "2 * (3",
+		"1 2", "7 / (2 - 2)", "4 $ 4"]
+	for (const src of inputs) {
+		try {
+			const e = parse(src)
+			print(`${src} => ${show(e)} = ${evaluate(e)}`)
+		} catch (err: string) {
+			print(`${src} => error: ${err}`)
+		}
+	}
+}

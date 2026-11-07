@@ -1,0 +1,144 @@
+function sum(...xs: i32[]): i32 {
+	let s = 0
+	for (const x of xs) {
+		s += x
+	}
+	return s
+}
+
+function add(a: i32, b: i32 = 5): i32 { return a + b }
+function orFive(x: i32 | null = 5): i32 | null { return x }
+function fact(n: i64): i64 { return if (n == 0) 1 else n * fact(n - 1) }
+const factorial: (n: i64) => i64 = n => if (n == 0) 1 else n * factorial(n - 1)
+function isEven(n: i32): bool { return n == 0 || isOdd(n - 1) }
+function isOdd(n: i32): bool { return n != 0 && isEven(n - 1) }
+function id[T](x: T): T { return x }
+function low(x: u8): u8 { return x }
+
+function wide(): i64 {
+	const x: i32 = 2147483647
+	return x
+}
+
+function helper(): i32 { return 1 }
+function apply(f: (x: i32) => i32, x: i32): i32 { return f(x) }
+function norm([x, y]: i32[]): i32 { return x * x + y * y }
+
+function makeCounter() {
+	let c = 0
+	return { inc: () => {
+		c += 1
+	}, get: () => c }
+}
+
+test "defaults fill left-out arguments, not null" {
+	assert add(1) == 6
+	assert add(1, 2) == 3
+	assert orFive() == 5
+	assert orFive(null) == null
+}
+
+test "defaults are evaluated per call, only when left out" {
+	let calls = 0
+	function next(): i32 {
+		calls += 1
+		return calls
+	}
+	function f(x: i32 = next()): i32 { return x }
+	assert f() == 1
+	assert f() == 2
+	assert f(10) == 10
+	assert calls == 2
+}
+
+test "rest and spread" {
+	assert sum() == 0
+	assert sum(1, ...[2, 3]) == 6
+	const xs = [4, 5]
+	assert sum(...xs, 1, ...xs) == 19
+}
+
+test "parameter and result kinds convert" {
+	assert low(255) + 1 == 0
+	assert wide() + 1 == 2147483648
+}
+
+test "pattern parameters" {
+	assert norm([3, 4]) == 25
+}
+
+test "closures share enclosing locals" {
+	let n = 0
+	const inc = () => {
+		n += 1
+	}
+	function incTwice() {
+		inc()
+		inc()
+	}
+	incTwice()
+	assert n == 2
+	n = 10
+	inc()
+	assert n == 11
+}
+
+test "closures outlive their frame" {
+	const a = makeCounter()
+	const b = makeCounter()
+	a.inc()
+	a.inc()
+	b.inc()
+	assert a.get() == 2
+	assert b.get() == 1
+}
+
+test "recursion" {
+	assert fact(20) == 2432902008176640000
+	assert isEven(10) && isOdd(7) && !isEven(7)
+}
+
+test "a closure may use the variable it initializes" {
+	const fib: (n: i32) => i32 = n => if (n < 2) n else fib(n - 1) + fib(n - 2)
+	assert factorial(20) == 2432902008176640000
+	assert fib(10) == 55
+}
+
+test "arrows" {
+	const adder = (a: i32) => (b: i32) => a + b
+	const wrap = (x: i32) => ({ v: x })
+	assert adder(2)(3) == 5
+	assert wrap(3).v == 3
+	assert apply(x => x * 3, 2) == 6
+}
+
+test "functions are values" {
+	const fs = [(x: i32) => x + 1, (x: i32) => x * 10]
+	let r = 1
+	for (const f of fs) {
+		r = f(r)
+	}
+	assert r == 20
+	const g = add
+	assert g(1) == 6
+}
+
+test "generic functions take type arguments, else infer them" {
+	assert id[i32](5) == 5
+	assert id("a") == "a"
+}
+
+test "nested functions are visible from their declaration on" {
+	function helper(): i32 { return 2 }
+	function a(): i32 { return helper() }
+	function even(n: i32): bool { return n == 0 || !even(n - 1) }
+	assert a() == 2 && even(4) && !even(3)
+}
+
+test "a closure made in a closure sees what is assigned after it is made" {
+	let got = 0
+	const f = () => () => got
+	const g = f()
+	got = 1
+	assert g() == 1
+}

@@ -1,0 +1,170 @@
+import { nine, x, zero } from "../std/ascii"
+
+class ParseError {
+	msg: string
+
+	constructor(msg: string) { this.msg = msg }
+}
+
+function digit(c: u8): i32 {
+	if (c < zero || c > nine) {
+		throw new ParseError(`bad ${c}`)
+	}
+	return (c - zero) as i32
+}
+
+function outer(): i32 { return digit(x) + 1 }
+
+test "throw and catch a class instance through calls" {
+	let msg = ""
+	try {
+		outer()
+	} catch (e: ParseError) {
+		msg = e.msg
+	}
+	assert msg == "bad 120"
+}
+
+test "any value can be thrown" {
+	let n = 0
+	try {
+		throw 1
+	} catch (e: i32) {
+		n = e
+	}
+	assert n == 1
+	let code = 0
+	try {
+		throw { code: 7 }
+	} catch (e: { code: i32 }) {
+		code = e.code
+	}
+	assert code == 7
+}
+
+interface Named {
+	name(): string
+}
+
+class Failure {
+	name(): string { return "failure" }
+}
+
+test "a catch of an interface takes a class thrown as itself" {
+	let got = ""
+	try {
+		throw new Failure()
+	} catch (e: Named) {
+		got = e.name()
+	}
+	assert got == "failure"
+}
+
+test "a typed catch passes other types on" {
+	let hits = 0
+	for (const i of 0 ... 2) {
+		try {
+			try {
+				if (i == 0) {
+					throw 5
+				}
+				if (i == 1) {
+					throw "five"
+				}
+				throw true
+			} catch (e: i32 | string) {
+				hits += 1
+			}
+		} catch (e: bool) {
+			hits += 10
+		}
+	}
+	assert hits == 12
+}
+
+test "finally after body and after handler" {
+	let log = ""
+	try {
+		log += "t"
+	} finally {
+		log += "f"
+	}
+	try {
+		throw 1
+	} catch {
+		log += "c"
+	} finally {
+		log += "g"
+	}
+	assert log == "tfcg"
+}
+
+test "finally runs on return" {
+	let n = 0
+	function f(): i32 {
+		try {
+			return n
+		} finally {
+			n = 5
+		}
+	}
+	assert f() == 0
+	assert n == 5
+}
+
+test "finally runs on break and continue" {
+	let log = ""
+	for (const i of 1 ... 3) {
+		try {
+			if (i == 2) {
+				continue
+			}
+			if (i == 3) {
+				break
+			}
+			log += "b"
+		} finally {
+			log += `${i}`
+		}
+	}
+	assert log == "b123"
+}
+
+test "finally runs on throw and rethrow, which then propagate" {
+	let log = ""
+	try {
+		try {
+			throw "x"
+		} finally {
+			log += "f"
+		}
+	} catch (e: string) {
+		log += e
+	}
+	try {
+		try {
+			throw "y"
+		} catch (e: string) {
+			throw e + "!"
+		} finally {
+			log += "g"
+		}
+	} catch (e: string) {
+		log += e
+	}
+	assert log == "fxgy!"
+}
+
+test "a throw from finally replaces the pending one" {
+	let got = ""
+	try {
+		try {
+			throw "first"
+		} finally {
+			throw "second"
+		}
+	} catch (e: string) {
+		got = e
+	}
+	assert got == "second"
+}

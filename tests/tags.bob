@@ -1,0 +1,35 @@
+class Short[S extends string] {}
+class Alias[S extends string, V extends string] {}
+
+class Build @Alias["b", "build"] {
+	target: "debug" | "release" @Alias["rel", "release"] = "debug"
+	jobs: i32 | null @Short["j"]
+	verbose: bool @Short["v" | "V"] @Alias["loud", "verbose"]
+	run(): i32 @Short["r"] { return 1 }
+}
+
+function describe[T](v: T): string {
+	let s = ""
+	for (const f of T.fields) {
+		s += `${f.name}:`
+		for (const A of f.tags) {
+			s += ` ${A.name}`
+			for (const a of A.args) {
+				s += `[${a.name}]`
+			}
+		}
+		s += "\n"
+	}
+	for (const A of T.tags) {
+		s += `class: ${A.name}\n`
+	}
+	return s
+}
+
+test "tags are reflected on fields and on the type, with their args" {
+	assert describe(new Build()) == `target: Alias["rel", "release"]["rel"]["release"]
+jobs: Short["j"]["j"]
+verbose: Short["V" | "v"]["V" | "v"] Alias["loud", "verbose"]["loud"]["verbose"]
+class: Alias["b", "build"]
+`
+}
