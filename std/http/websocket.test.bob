@@ -1,0 +1,223 @@
+import { Request, Response, Server, get } from "../http"
+import { accept, connect } from "./websocket"
+import { IoError } from "../io"
+import { ParseError } from "../parse"
+import { Signal } from "../../builtin/fiber"
+
+/// What /flood's second send came to, once its first has timed out.
+let flooded = ""
+const stalled = new Signal()
+
+function app(req: Request): Response throws IoError | ParseError {
+	switch (req.url.path) {
+		case "/echo": return accept(req, ws => {
+			while (true) {
+				const m = ws.receive()
+				if (m == null) {
+					break
+				}
+				if (m.kind == "text") {
+					ws.send(m.data)
+				} else {
+					ws.sendBinary(m.data)
+				}
+			}
+		}, ["chat", "echo"])
+		case "/bye": return accept(req, ws => {
+			ws.send("so long")
+			const q = req.url.query
+			ws.close(1001, if (q.has("long")) repeat("é", 100) else if (q.has("bare")) repeat("\x80", 124) else "going away")
+		})
+		// A close of one byte.
+		case "/close": return accept(req, ws => { ws.stream.write("\x88\x01\x03") })
+		// Half a message, the rest and a close once the client's close is in.
+		case "/half": return accept(req, ws => {
+			ws.stream.write("\x81\x05he")
+			ws.stream.read(1 << 16)
+			ws.stream.write("llo\x88\x02\x03\xe8")
+		})
+		// A 101 with the query's pairs as headers, such as a subprotocol or an extension the client did not offer.
+		case "/rogue":
+			const res = accept(req, ws => {})
+			for (const e of req.url.query.entries) {
+				res.headers.set(e[0], e[1])
+			}
+			return res
+		// 16 MiB to a client that reads none of it within the 100 ms a write may take, then a word.
+		case "/flood": return accept(req, ws => {
+			ws.stream.timeout = 100_000_000
+			try {
+				ws.send(repeat(repeat("x", 1 << 12), 1 << 12))
+			} catch (e: IoError) {}
+			stalled.wake()
+			try {
+				ws.send("x")
+				flooded = "sent"
+			} catch (e: IoError) {
+				flooded = e.kind
+			}
+		})
+		// A peer that never answers.
+		case "/mute": return accept(req, ws => { while (ws.stream.read(1 << 16) != null) {} })
+		default: return new Response(404)
+	}
+}
+
+function repeat(piece: string, n: i32): string {
+	let s = ""
+	for (const i of 1 ... n) {
+		s += piece
+	}
+	return s
+}
+
+function server(): Server {
+	const s = new Server()
+	s.addr = "127.0.0.1:0"
+	return s
+}
+
+test "text and binary echo, with a subprotocol" {
+	const s = server()
+	const job = async s.serve(app)
+	const ws = connect(`ws://${s.addr}/echo`, null, ["echo", "chat"])
+	assert ws.protocol == "chat"
+	ws.send("hi")
+	const m = ws.receive()!
+	assert m.kind == "text" && m.data == "hi"
+	ws.sendBinary("\x00\xff")
+	const b = ws.receive()!
+	assert b.kind == "binary" && b.data == "\x00\xff"
+	let big = "0123456789abcdef"
+	while (big.length < 2 << 20) {
+		big += big
+	}
+	ws.send(big)
+	assert ws.receive()!.data == big
+	ws.close()
+	assert ws.code == 1000 && ws.receive() == null
+	s.close()
+	await job
+}
+
+test "fragments and pings" {
+	const s = server()
+	const job = async s.serve(app)
+	const ws = connect(`http://${s.addr}/echo`)
+	assert ws.protocol == null
+	// Frames by hand, masked with a key of zeros: a text's first fragment, a ping between, and the last fragment.
+	ws.stream.write("\x01\x83\0\0\0\0abc\x89\x81\0\0\0\0?\x80\x83\0\0\0\0def")
+	assert ws.stream.read(3) == "\x8a\x01?"
+	assert ws.receive()!.data == "abcdef"
+	ws.ping("x")
+	assert ws.stream.read(3) == "\x8a\x01x"
+	ws.close()
+	s.close()
+	await job
+}
+
+test "the server closes too" {
+	const s = server()
+	const job = async s.serve(app)
+	const ws = connect(`ws://${s.addr}/bye`)
+	assert ws.receive()!.data == "so long"
+	assert ws.receive() == null && ws.code == 1001 && ws.reason == "going away"
+	// A reason too long for a control frame is cut, on a character.
+	const long = connect(`ws://${s.addr}/bye?long`)
+	assert long.receive()!.data == "so long"
+	assert long.receive() == null && long.code == 1001 && long.reason == repeat("é", 61)
+	// One of continuation bytes alone is cut to nothing.
+	const bare = connect(`ws://${s.addr}/bye?bare`)
+	assert bare.receive()!.data == "so long"
+	assert bare.receive() == null && bare.code == 1001 && bare.reason == ""
+	s.close()
+	await job
+}
+
+test "a close of one byte, or with a code not to be sent, is a fault answered by 1002" {
+	const s = server()
+	const job = async s.serve(app)
+	for (const bad of ["\x88\x81\0\0\0\0\x03", "\x88\x82\0\0\0\0\x03\xec"]) {
+		const ws = connect(`ws://${s.addr}/echo`)
+		ws.stream.write(bad)
+		assert ws.receive() == null && ws.code == 1002
+	}
+	assert connect(`ws://${s.addr}/close`).receive() throws new IoError("Protocol", "read", "close")
+	s.close()
+	await job
+}
+
+test "close waits a second at most, and ends the socket even when sending fails" {
+	const s = server()
+	const job = async s.serve(app)
+	const mute = connect(`ws://${s.addr}/mute`)
+	mute.stream.timeout = 0
+	const from = now()
+	mute.close()
+	assert now() - from < 2_000_000_000 && mute.receive() == null
+	const reset = connect(`ws://${s.addr}/echo`)
+	reset.stream.close()
+	try {
+		reset.close()
+		assert false
+	} catch (e: IoError) {}
+	assert reset.receive() == null
+	s.close()
+	await job
+}
+
+test "a send that times out ends the socket, never to start a frame inside it" {
+	const s = server()
+	const job = async s.serve(app)
+	const ws = connect(`ws://${s.addr}/flood`)
+	stalled.wait()
+	assert ws.receive() throws new IoError("ConnectionReset", "read", "websocket")
+	assert flooded == "BadResource"
+	s.close()
+	await job
+}
+
+test "a close while another fiber receives leaves the reading to it" {
+	const s = server()
+	const job = async s.serve(app)
+	const ws = connect(`ws://${s.addr}/half`)
+	const reader = async ws.receive()
+	ws.close()
+	assert (await reader)!.data == "hello"
+	assert ws.receive() == null && ws.code == 1000
+	// A receive while close reads for the peer's close is left out: a ping waits for close's frame to be written, past
+	// which close reads.
+	const again = connect(`ws://${s.addr}/half`)
+	const closing = async again.close()
+	again.ping()
+	assert again.receive() == null
+	await closing
+	assert again.code == 1000
+	s.close()
+	await job
+}
+
+test "bad handshakes and limits" {
+	const s = server()
+	const job = async s.serve(app)
+	assert get(`http://${s.addr}/echo`).status == 400
+	assert connect(`ws://${s.addr}/none`) throws new IoError("Protocol", "connect", "404")
+	assert connect(`ftp://${s.addr}/echo`) throws new IoError("Unsupported", "connect", "ftp")
+	const rogue = `ws://${s.addr}/rogue?`
+	for (const q of ["sec-websocket-protocol=mqtt", "upgrade=h2c", "connection=close",
+		"sec-websocket-extensions=permessage-deflate"]) {
+		assert connect(rogue + q) throws new IoError("Protocol", "connect", "101")
+	}
+	assert connect(rogue + "sec-websocket-protocol=mqtt", null, ["chat"]) throws new IoError("Protocol", "connect", "101")
+	connect(rogue + "upgrade=WebSocket&connection=keep-alive,%20UPGRADE").close()
+	const ws = connect(`ws://${s.addr}/echo`)
+	ws.maxMessage = 4
+	ws.send("hello")
+	assert ws.receive() throws new IoError("TooLarge", "read", "frame")
+	// A length with its top bit set ends the socket, as the server's own frame limit.
+	const raw = connect(`ws://${s.addr}/echo`)
+	raw.stream.write("\x82\xff\x80\0\0\0\0\0\0\0\0\0\0\0")
+	assert raw.receive() throws new IoError("ConnectionReset", "read", "websocket")
+	s.close()
+	await job
+}

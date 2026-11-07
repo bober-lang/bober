@@ -1,0 +1,131 @@
+//! Routes requests by method and path, after Hono: a pattern's segments match a path's, `:name` taking one of them
+//! and `*name` the rest; middleware wraps every route, outermost first. A literal segment wins over `:`, which wins
+//! over `*`; a path known with the wrong method is 405 with Allow; HEAD falls back to GET; `/a` and `/a/` differ.
+
+import { HashMap } from "../collections/hashmap"
+import { Handler, Middleware, Request, Response, wrap } from "../http"
+import { IoError } from "../io"
+import { ParseError } from "../parse"
+import { split, startsWith } from "../string"
+
+export type Params = HashMap[string, string]
+export type Route = (req: Request, params: Params) => Response throws IoError | ParseError
+
+/// A pattern's segments: those of "/a/:b" are ["a", ":b"], of "/" [""].
+function segments(path: string): string[] {
+	const parts = split(path, "/")
+	return parts.slice(1, parts.length)
+}
+
+class Entry {
+	/// "" for any.
+	method: string
+	pattern: string
+	segments: string[]
+	/// A digit per segment, 0 a literal, 1 a `:`, 2 a `*`, so that the lower rank wins.
+	rank: string
+	route: Route
+
+	constructor(method: string, pattern: string, route: Route) {
+		this.method = method
+		this.pattern = pattern
+		this.segments = segments(pattern)
+		this.rank = this.segments.map(s => if (startsWith(s, "*")) "2"
+			else if (startsWith(s, ":")) "1"
+			else "0").join("")
+		this.route = route
+	}
+
+	/// The params of path if it matches.
+	match(path: string[]): Params | null {
+		const p = new HashMap[string, string]()
+		for (const i of 0 ... this.segments.length - 1) {
+			const s = this.segments[i]
+			if (startsWith(s, "*")) {
+				p.set(s.slice(1, s.length), path.slice(i, path.length).join("/"))
+				return p
+			}
+			if (i >= path.length) {
+				return null
+			}
+			if (startsWith(s, ":")) {
+				p.set(s.slice(1, s.length), path[i])
+			} else if (s != path[i]) {
+				return null
+			}
+		}
+		return if (path.length == this.segments.length) p else null
+	}
+}
+
+export class Router {
+	/// By rank, then in the order added.
+	private routes: Entry[] = []
+	private mws: Middleware[] = []
+
+	get(pattern: string, route: Route) { this.add("GET", pattern, route) }
+	post(pattern: string, route: Route) { this.add("POST", pattern, route) }
+	put(pattern: string, route: Route) { this.add("PUT", pattern, route) }
+	patch(pattern: string, route: Route) { this.add("PATCH", pattern, route) }
+	delete(pattern: string, route: Route) { this.add("DELETE", pattern, route) }
+	head(pattern: string, route: Route) { this.add("HEAD", pattern, route) }
+	options(pattern: string, route: Route) { this.add("OPTIONS", pattern, route) }
+	any(pattern: string, route: Route) { this.add("", pattern, route) }
+	/// Wraps every route, and the 404s and 405s, inside those added before it.
+	use(mw: Middleware) { this.mws.push(mw) }
+
+	/// Adds r's routes under prefix, each wrapped in r's middleware.
+	mount(prefix: string, r: Router) {
+		for (const e of r.routes) {
+			this.add(e.method, prefix + e.pattern, (req, p) => wrap(r.mws, q => e.route(q, p))(req))
+		}
+	}
+
+	private add(method: string, pattern: string, route: Route) {
+		const e = new Entry(method, pattern, route)
+		let i = 0
+		while (i < this.routes.length && this.routes[i].rank <= e.rank) {
+			i++
+		}
+		this.routes = [...this.routes.slice(0, i), e, ...this.routes.slice(i, this.routes.length)]
+	}
+
+	/// The router as a handler.
+	handle(req: Request): Response throws IoError | ParseError { return wrap(this.mws, q => this.route(q))(req) }
+
+	private route(req: Request): Response throws IoError | ParseError {
+		const path = segments(req.url.path)
+		const allow: string[] = []
+		let get: Entry | null = null
+		let getParams: Params | null = null
+		for (const e of this.routes) {
+			// A GET serves a HEAD unless a route as specific serves it.
+			if (get != null && e.rank != get.rank) {
+				break
+			}
+			const p = e.match(path)
+			if (p == null) {
+				continue
+			}
+			if (e.method == "" || e.method == req.method) {
+				return e.route(req, p)
+			}
+			if (req.method == "HEAD" && e.method == "GET" && get == null) {
+				get = e
+				getParams = p
+			}
+			if (!allow.includes(e.method)) {
+				allow.push(e.method)
+			}
+		}
+		if (get != null) {
+			return get.route(req, getParams!)
+		}
+		if (allow.length == 0) {
+			return new Response(404)
+		}
+		const res = new Response(405)
+		res.headers.set("allow", allow.join(", "))
+		return res
+	}
+}
