@@ -5,10 +5,13 @@
 #include <string.h>
 #include "ast.h"
 #define YYLTYPE int
+#define YYSTACK_USE_ALLOCA 1  // where the collector sees the nodes on it
 #define YYLLOC_DEFAULT(C, R, N) ((C) = (N) ? YYRHSLOC(R, 1) : YYRHSLOC(R, 0))
 %}
 
 %define parse.error detailed
+/* The throws after a nested arrow function type, as in () => () => T throws E, is the inner one's. */
+%expect 1
 %locations
 %union { Node *n; Sym *s; int i; }
 
@@ -358,7 +361,7 @@ fndecl: FUNCTION IDENT { $<n>$ = open(N_FN, $2, @1); } tparams '(' params ')' op
 
 arrow: IDENT ARROW { Node *fn = open(N_FN, 0, @1); $<n>$ = push(fn, node(N_PARAM, @1, 0, 0, pid($1, @1))); } body {
     $$ = close($<n>3, 0, 0, $4); }
-  | LPA { $<n>$ = open(N_FN, 0, @1); } params ')' ARROW body { $$ = close($<n>2, $3, 0, $6); }
+  | LPA { $<n>$ = open(N_FN, 0, @1); } params ')' ARROW body throws { $$ = close($<n>2, $3, 0, $6); }
   ;
 
 body: LBLOCK { hoist(@1 + 1); } stmts '}' { $$ = $3; } | expr ;

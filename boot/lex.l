@@ -155,11 +155,14 @@ void kwinit(void) {
 
 static void emit(Tok t) {
   static int cap;
-  if (ntoks == cap) toks = realloc(toks, (cap = 2 * cap + 1024) * sizeof(Tok));
+  // In collected memory, where the collector sees the nodes in it.
+  if (ntoks == cap) toks = memcpy(alloc((cap = 2 * cap + 1024) * sizeof(Tok)), toks, ntoks * sizeof(Tok));
   toks[ntoks++] = t;
 }
 
 void lexall(const char *src, long len) {
+  char nest[1024];
+  int ns = 0;
   line = col = 1, braces = nt = nl = ntoks = 0;
   YY_BUFFER_STATE b = yy_scan_bytes(src, len);
   for (int t = 1; t;) {
@@ -169,8 +172,12 @@ void lexall(const char *src, long len) {
     int p = ntoks ? toks[ntoks - 1].t : -1;
     if (tsym && tsym->tok && (p == '.' || p == QDOT)) t = IDENT;
     if (t == AS && (nl || !in(p, ender)) && p != '*') t = IDENT;
-    if (nl && (p == RETURN || p == BREAK || p == CONTINUE || (in(p, ender) && (!in(t, joiner) || (tsym && tsym->tok && keyahead())))))
+    // A newline ends a statement only in a block, not within ( ) or [ ].
+    if (nl && (!ns || nest[ns - 1] == '{') &&
+        (p == RETURN || p == BREAK || p == CONTINUE || (in(p, ender) && (!in(t, joiner) || (tsym && tsym->tok && keyahead())))))
       emit((Tok){';', tl, tc});
+    if ((t == '(' || t == '[' || t == '{') && ns < (int)sizeof nest) nest[ns++] = t;
+    else if ((t == ')' || t == ']' || t == '}') && ns) ns--;
     emit((Tok){t, tl, tc, top, tsym, tnode});
     nl = 0;
   }
