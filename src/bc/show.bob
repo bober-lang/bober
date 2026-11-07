@@ -1,0 +1,151 @@
+//! The bytecode as text, close to bober's syntax, for tests and `bober bc`.
+
+import { fromBits } from "../../std/float"
+import { quoted } from "../../std/string"
+import * as decl from "./decl"
+import * as kind from "./kind"
+import * as op from "./op"
+import { Code, Program } from "./program"
+
+/// Module m of p: each decl of it in the order made, a line of it and the ops of its code, one per line, indented by
+/// block.
+export function show(p: Program, m: i32): string {
+	let s = ""
+	for (const i of 0 ... p.decls.length - 1) {
+		const d = p.decls[i]
+		if (d.module != m) {
+			continue
+		}
+		if (d.doc != 0) {
+			s += `/// ${p.strings[d.doc]}\n`
+		}
+		s += `${mods(d.mods)}${decl.names[d.kind]} ${qualified(p, i)}${params(p, i)}`
+		if (d.type != 0) {
+			s += `${if (d.kind == decl.Interface) " =" else ":"} ${showType(p, d.type)}`
+		}
+		if (d.supers != 0) {
+			s += ` ${if (d.kind == decl.Class) "implements" else "extends"} ${types(p, d.supers, ", ")}`
+		}
+		s += "\n"
+		if (d.code != null) {
+			s += showCode(p, d.code!)
+		}
+	}
+	return s
+}
+
+/// Code c's locals on a line, if any, and its captures, then its ops, one per line, indented by block.
+export function showCode(p: Program, c: Code): string {
+	let s = ""
+	if (c.locals.length > 0) {
+		s += `\tlocals ${c.locals.map(l => `${mods(l.mods)}${if (l.name == 0) "_" else p.strings[l.name]}: ${showType(p, l.type)}`).join(", ")}\n`
+	}
+	if (c.captures.length > 0) {
+		s += `\tcaptures ${c.captures.join(", ")}\n`
+	}
+	let depth = 1
+	for (const i of 0 ... c.ops.length - 1) {
+		const o = c.ops[i]
+		depth -= if (o == op.End) 1 else 0
+		let line = op.names[o]
+		const sh = op.shape[o]
+		for (const j of 0 ... sh.length - 1) {
+			const x = c.imm(i, j)
+			const imm = switch (sh[j]) {
+				case op.TypeId: showType(p, x)
+				case op.TypeList: if (x == 0) "" else `[${types(p, x, ", ")}]`
+				case op.DeclId: qualified(p, x)
+				case op.StrId: quoted(p.strings[x])
+				case op.IntId: if (o == op.Float) `${fromBits(p.ints[x] as u64)}` else `${p.ints[x]}`
+				case op.LocalList, op.NumList: `[${c.items(x).join(", ")}]`
+				case op.LocalId, op.Num: `${x}`
+			}
+			line += if (imm == "") "" else " " + imm
+		}
+		for (const _ of 1 ... (if (op.splits[o]) depth - 1 else depth)) {
+			s += "\t"
+		}
+		s += line + "\n"
+		depth += if (op.opens[o]) 1 else 0
+	}
+	return s
+}
+
+/// Type t as text.
+export function showType(p: Program, t: i32): string {
+	const a = p.a(t)
+	const b = p.b(t)
+	return switch (p.kind(t)) {
+		case kind.Array: `${inner(p, a)}[]`
+		case kind.Optional: `optional ${inner(p, a)}`
+		case kind.Rest, kind.Embed: `...${inner(p, a)}` // a Rest is a Func's last param, an Embed an extern one's
+		case kind.FixedArray: `${inner(p, a)}[${b}]`
+		case kind.Tuple: `[${types(p, a, ", ")}]`
+		case kind.Union: types(p, a, " | ")
+		case kind.Object: fields(p, a, b)
+		case kind.Func:
+`(${types(p, a, ", ")}) => ${showType(p, b)}`
+		case kind.Named: qualified(p, a) + (if (b == 0) "" else `[${types(p, b, ", ")}]`)
+		case kind.Param: if (b < p.decls[a].params.length) p.strings[p.decls[a].params[b].name] else `?${b}`
+		case kind.Literal: if (a == kind.String) quoted(p.strings[b]) else if (a == kind.Bool) `${b == 1}` else `${p.ints[b]}`
+		case kind.Of: `Of ${a}${if (b == 0) "" else `.${p.strings[b]}`}`
+		case kind.Member: `${inner(p, a)}.${p.strings[b]}`
+		default: primitives[t]
+	}
+}
+
+const primitives = ["none", "null", "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "string",
+	"string16", "string32", "Type", "int", "float"]
+
+/// A type in a postfix or prefix position, parenthesized unless it binds tighter.
+function inner(p: Program, t: i32): string {
+	const k = p.kind(t)
+	return if (k == kind.Union || k == kind.Func) `(${showType(p, t)})` else showType(p, t)
+}
+
+/// The types of the list from index from on, joined by sep.
+function types(p: Program, list: i32, sep: string, from: i32 = 0): string {
+	const ts = p.lists[list]
+	return ts.slice(from, ts.length).map(t => showType(p, t)).join(sep)
+}
+
+/// An object type of the list of field types and names entry.
+function fields(p: Program, list: i32, names: i32): string {
+	const ts = p.lists[list]
+	const ns = p.names[names]
+	const fs: string[] = []
+	for (const i of 0 ... ts.length - 1) {
+		fs.push(`${mods(ns[2 * i + 1])}${p.strings[ns[2 * i]]}: ${showType(p, ts[i])}`)
+	}
+	return `{ ${fs.join(", ")} }`
+}
+
+/// Decl d's name after its owners', an instance's with its own args.
+export function qualified(p: Program, d: i32): string {
+	const x = p.decls[d]
+	const args = if (x.generic < 0) [] as i32[] else p.lists[x.env]
+	const own = args.slice(args.length - (if (x.generic < 0) 0 else p.decls[x.generic].params.length), args.length)
+	return (if (x.owner < 0) "" else qualified(p, x.owner) + ".") + p.strings[x.name]
+		+ (if (own.length == 0) "" else `[${own.map(t => showType(p, t)).join(", ")}]`)
+}
+
+/// Decl d's type params, if any.
+function params(p: Program, d: i32): string {
+	const ps = p.decls[d].params
+	if (ps.length == 0) {
+		return ""
+	}
+	return `[${ps.map(x => p.strings[x.name] + (if (x.constraint == 0) "" else ` extends ${showType(p, x.constraint)}`)
+		+ (if (x.fallback == 0) "" else ` = ${showType(p, x.fallback)}`)).join(", ")}]`
+}
+
+/// Each of the mods, followed by a space.
+function mods(m: i32): string {
+	let s = ""
+	for (const b of 0 ... decl.modNames.length - 1) {
+		if ((m >> b & 1) != 0) {
+			s += decl.modNames[b] + " "
+		}
+	}
+	return s
+}

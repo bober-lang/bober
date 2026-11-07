@@ -1,0 +1,192 @@
+//! Tests of src/bc/file.bob: modules lowered, written, and read back into another Program.
+
+import { ParseError } from "../../std/parse"
+import { lower } from "../lower"
+import * as decl from "./decl"
+import { abi, read, write } from "./file"
+import * as kind from "./kind"
+import { Program } from "./program"
+import { show } from "./show"
+
+/// The modules of main.bob of source src, where it imports lib.bob of source lib.
+function lowered(src: string, lib: string = ""): Program {
+	return lower(["main.bob"], [], path => if (path == "main.bob") src else if (path == "lib.bob") lib else null)
+}
+
+/// Module m of p shown, with its top-level decls, inits and deps.
+function shown(p: Program, m: i32): string {
+	const x = p.modules[m]
+	const names = (ds: i32[]) => ds.map(d => p.strings[p.decls[d].name]).join(", ")
+	return `[${names(x.decls)}] [${names(x.inits)}] [${x.deps.map(d => p.modules[d].path).join(", ")}]\n${show(p, m)}`
+}
+
+/// Writes each module of p, reads them all into a new Program, and asserts each reads back as it was written, of the
+/// same ABI hash.
+function roundTrip(p: Program) {
+	const files: string[] = []
+	const sources: u64[] = []
+	for (const m of 0 ... p.modules.length - 1) {
+		files.push(write(p, m, 1))
+		sources.push(p.modules[m].source)
+	}
+	const q = new Program()
+	const ms = read(q, files, 1, sources)!
+	for (const m of 0 ... p.modules.length - 1) {
+		assert shown(q, ms[m]) == shown(p, m)
+		assert q.modules[ms[m]].abi == abi(p, m) && q.modules[ms[m]].source == sources[m]
+	}
+}
+
+/// Whether reading bytes, of source hash 0, into a new Program throws a ParseError.
+function malformed(bytes: string): bool {
+	try {
+		read(new Program(), [bytes], 1, [0])
+		return false
+	} catch (e: ParseError) {
+		return true
+	}
+}
+
+test "a module reads back as written" {
+	roundTrip(lowered(`import { Box, twice } from "./lib"
+/// Doubles.
+export function f(b: Box[i32]): i32 { return twice(b.v) + g[i32](1) }
+function g[T](x: T): T { return (() => x)() }
+export const k: "a" | "b" = "a"
+test "f" { assert f(new Box[i32](2)) == 5 }`, `export class Box[T] {
+	v: T
+	constructor(v: T) { this.v = v }
+}
+export function twice(x: i32): i32 { return 2 * x }`))
+}
+
+test "std/encoding/json and the compiler read back as written" {
+	roundTrip(lower(["std/encoding/json.bob"]))
+	roundTrip(lower(["src/bober.bob"]))
+}
+
+test "a truncated or corrupt file is malformed" {
+	const p = lowered(`export function f(x: i32): i32 { return x + 1 }`)
+	p.modules[0].source = 0
+	const f = write(p, 0, 1)
+	for (const n of 0 ... f.length - 1) {
+		assert malformed(f.slice(0, n))
+	}
+	assert malformed(f + "x")
+	assert malformed("rebob" + f.slice(5, f.length))
+	assert !malformed(f)
+}
+
+test "a file of another compiler or source, or of a dep since changed, is stale" {
+	const lib = `export class P { x: i32 = 0 }`
+	const main = `import { P } from "./lib"
+export function f(p: P): P { return p }`
+	const p = lowered(main, lib)
+	const m = p.module("main.bob")
+	const lib1 = write(p, p.module("lib.bob"), 1)
+	const main1 = write(p, m, 1)
+	const sources = [p.modules[p.module("lib.bob")].source, p.modules[m].source]
+	assert read(new Program(), [lib1], 0, [sources[0]]) == null
+	assert read(new Program(), [lib1], 1, [0]) == null
+	assert read(new Program(), [main1], 1, [sources[1]]) == null
+	const q = lowered(main, `export class P { x: i64 = 0 }`)
+	const lib2 = write(q, q.module("lib.bob"), 1)
+	assert read(new Program(), [lib2, main1], 1, [q.modules[q.module("lib.bob")].source, sources[1]]) == null
+	assert read(new Program(), [lib1, main1], 1, sources) != null
+}
+
+test "a malformed file leaves the Program as it was" {
+	const p = lowered(`import { P } from "./lib"
+export function f(p: P): P { return p }`, `export class P { x: i32 = 0 }`)
+	const main = write(p, p.module("main.bob"), 1)
+	const source = p.modules[p.module("main.bob")].source
+	const q = new Program()
+	read(q, [write(p, p.module("lib.bob"), 1)], 1, [p.modules[p.module("lib.bob")].source])
+	const modules = q.modules.length
+	const decls = q.decls.length
+	try {
+		read(q, [main.slice(0, main.length - 1)], 1, [source])
+		assert false
+	} catch (e: ParseError) {}
+	assert q.modules.length == modules && q.decls.length == decls
+	assert read(q, [main], 1, [source]) != null
+}
+
+/// Modules a.bob and b.bob of exported classes A and B, of fields of each other's type, the one of B of type t, made
+/// by t.
+function cycle(t: (p: Program, a: i32) => i32): Program {
+	const p = new Program()
+	const ms = [p.addModule("a.bob"), p.addModule("b.bob")]
+	const cs = [p.decl(ms[0], -1, "A", decl.Class), p.decl(ms[1], -1, "B", decl.Class)]
+	p.decls[p.decl(ms[0], cs[0], "b", decl.Var)].type = p.type(kind.Named, cs[1])
+	p.decls[p.decl(ms[1], cs[1], "a", decl.Var)].type = t(p, cs[0])
+	for (const i of 0 ... 1) {
+		p.decls[cs[i]].mods = decl.Export
+		p.modules[ms[i]].decls = [cs[i]]
+	}
+	return p
+}
+
+test "modules whose signatures name each other have one ABI hash, whatever order it is made in" {
+	const named = (p: Program, a: i32) => p.type(kind.Named, a)
+	const p = cycle(named)
+	const q = cycle(named)
+	assert abi(q, 1) == abi(p, 0) && abi(p, 1) == abi(p, 0)
+	assert abi(cycle((p: Program, a: i32) => p.type(kind.Array, p.type(kind.Named, a))), 0) != abi(p, 0)
+}
+
+/// The ABI hashes of lib.bob of source lib and of main.bob, which uses its class P.
+function abis(lib: string): [u64, u64] {
+	const p = lowered(`import { P } from "./lib"
+export function g(p: P): i32 { return 0 }`, lib)
+	return [abi(p, p.module("lib.bob")), abi(p, p.module("main.bob"))]
+}
+
+test "the ABI hash changes with signatures and consts, also of a dep, not with bodies" {
+	const base = abis(`export class P { x: i32 = 0 }
+export const n = 1
+export function f(): i32 { return h() }
+function h(): i32 { return 1 }`)
+	assert abis(`export class P { x: i32 = 0 }
+export const n = 1
+export function f(): i32 { return h() + 1 }
+function h(): i32 { return 2 }
+function k() {}`) == base
+	const layout = abis(`export class P { x: i64 = 0 }
+export const n = 1
+export function f(): i32 { return h() }
+function h(): i32 { return 1 }`)
+	assert layout[0] != base[0] && layout[1] != base[1]
+	const n = abis(`export class P { x: i32 = 0 }
+export const n = 2
+export function f(): i32 { return h() }
+function h(): i32 { return 1 }`)
+	assert n[0] != base[0]
+	assert abis(`export class P { x: i32 = 0 }
+export const n = 1
+export function f(): i64 { return 1 }`)[0] != base[0]
+}
+
+test "the ABI hash changes with what a const's code lists" {
+	const lib = (xs: string) => abis(`export class P { x: i32 = 0 }
+const a = [1]
+const b = [2]
+export const xs: (i32 | i32[])[] = ${xs}`)[0]
+	assert lib("[...a, b]") != lib("[a, ...b]")
+}
+
+test "a decl imported is the one of its name and nth in its owner" {
+	const p = new Program()
+	const a = p.addModule("a.bob")
+	const b = p.addModule("b.bob")
+	const f = p.decl(a, -1, "f", decl.Function)
+	const first = p.decl(a, f, "C", decl.Class)
+	p.decl(a, f, "C", decl.Class)
+	p.modules[a].decls = [f]
+	const v = p.decl(b, -1, "v", decl.Var)
+	p.decls[v].type = p.type(kind.Named, first)
+	p.modules[b].decls = [v]
+	const q = new Program()
+	const ms = read(q, [write(p, a, 1), write(p, b, 1)], 1, [0, 0])!
+	assert q.decls[q.a(q.decls[q.modules[ms[1]].decls[0]].type)].nth == 0
+}

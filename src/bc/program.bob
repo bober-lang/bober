@@ -1,0 +1,620 @@
+//! The program as bytecode (§8): the modules of a whole program, held as one Program that the stages build and
+//! rewrite, lower → mono → emit, and that files are read into.
+//!
+//! ## Program
+//!
+//! A Program holds the strings, ints, lists, types and decls of every module, each interned once, so equal ones share
+//! an id, which means the same in every module: comparing types is `==` on ids, and no stage translates one between
+//! modules. An interned entry is never changed in place. A Module is a view of it: its path, its top-level decls and
+//! its deps. Ids are local only in a file, which is written parts first, so that reading it is linking: each type it
+//! holds costs one lookup of parts already read.
+//!
+//! A type is a row (kind, a, b), of the parts its kind says (src/bc/kind.bob), hash-consed. Alongside each is its hash,
+//! made of its kind and its parts' hashes, a decl's being of its module's path and its name, the same in every run; and
+//! whether a Param occurs in it, or an Of or a Member, which make it depend on args or on what locals hold. A type
+//! with neither is closed. An Of names a local of the code it is in, so a type with one means something only there. An interned list holds types only, an object's names and mods are a names entry, and the
+//! lists ops use are their code's.
+//!
+//! The checker's types (src/type.bob) are still apart: lower translates them into Program types. Once they are one,
+//! a module read from a file needs no checking; that comes with the cache.
+//!
+//! ## Generics
+//!
+//! Generic code is held once, its types open. A decl's type params are its own; a nested decl, a member or a function
+//! in a function, has none of its own but those it declares, and uses its owners' Params. An env is the interned list
+//! of the args of each of a decl's owners with params, outermost first, then of its own: a function instance is keyed
+//! by its decl and env, and a class instance is its Named type, whose args are its env. subst substitutes an env.
+
+import { HashMap } from "../../std/collections/hashmap"
+import { combine, fnv } from "../../std/hash"
+import { sort, sortBy } from "../../std/sort"
+import { CompileError } from "../error"
+import { builtin } from "../root"
+import * as decl from "./decl"
+import * as kind from "./kind"
+import { End, Opcode, opens, splits } from "./op"
+
+/// A type param: its name, its constraint and its default, each 0 for none.
+export type TypeParam = { name: i32, constraint: i32, fallback: i32 }
+
+/// What a declaration declares (src/bc/decl.bob).
+export class Decl {
+	/// Its name; a member's or nested decl's without its owner's. Fixed, as find looks it up.
+	readonly name: i32
+	readonly kind: decl.Kind
+	readonly module: i32
+	/// The class or interface it is a member of, or the decl it is nested in; -1 for a top-level one.
+	readonly owner: i32
+	/// How it hashes in types: of its owner's hash, else its module's path, its name and nth, the same in every run.
+	readonly hash: u64
+	mods = 0
+	params: TypeParam[] = []
+	/// A Var's type, a Function's or Test's Func, an interface's type set; else 0.
+	type = 0
+	/// The decls it owns, in order: a class's or interface's members, the functions and classes nested in a function's,
+	/// var's or test's code.
+	members: i32[] = []
+	/// The list of the types a class implements or an interface extends.
+	supers = 0
+	/// A Var's initializer or a Function's or Test's body; null for none.
+	code: Code | null = null
+	/// Its doc comment, a Str.
+	doc = 0
+	/// The list of its tags (§5.3).
+	tags = 0
+	/// How many decls of its name its owner has before it.
+	nth = 0
+	/// Of an instance mono makes, the decl it instantiates and its env; else -1 and 0.
+	generic = -1
+	env = 0
+
+	constructor(name: i32, k: decl.Kind, module: i32, owner: i32, hash: u64) {
+		this.name = name
+		this.kind = k
+		this.module = module
+		this.owner = owner
+		this.hash = hash
+	}
+}
+
+export class Module {
+	readonly path: string
+	/// Its top-level decls, which own the rest.
+	decls: i32[] = []
+	/// Its vars and static fields in the order they are initialized: consts, then lets, each after those it depends on
+	/// (§3).
+	inits: i32[] = []
+	/// The modules it imports, whose init runs before its own.
+	deps: i32[] = []
+	/// Its ABI hash (src/bc/file.bob) once known, else 0.
+	abi: u64 = 0
+	/// The hash of its source, as sourceHash makes it.
+	source: u64 = 0
+	/// The byte offsets of the line feeds in its source, ascending, which make a code's positions lines.
+	newlines: i32[] = []
+
+	constructor(path: string) { this.path = path }
+}
+
+/// Of a type: whether a Param occurs in it, and whether an Of or a Member does.
+const params: u8 = 1
+const reflected: u8 = 2
+const seed: u64 = 14695981039346656037
+
+export class Program {
+	modules: Module[] = []
+	decls: Decl[] = []
+	/// Str 0 is "", int 0 is 0, list 0 and names 0 are empty.
+	strings: string[] = []
+	ints: i64[] = []
+	lists: i32[][] = []
+	/// Per entry, (Str name, mods) pairs.
+	names: i32[][] = []
+	/// Each instance, by pair(its generic decl, env), which mono makes.
+	instances = new HashMap[i64, i32]()
+
+	private kinds: kind.Kind[] = []
+	private as: i32[] = []
+	private bs: i32[] = []
+	private hashes: u64[] = []
+	private flags: u8[] = []
+	private listHashes: u64[] = []
+	private listFlags: u8[] = []
+	private nameHashes: u64[] = []
+	/// Per kind, each type by pair(a, b).
+	private typeIds: HashMap[i64, i32][] = []
+	private stringIds = new HashMap[string, i32]()
+	private intIds = new HashMap[i64, i32]()
+	private listIds = new HashMap[i32[], i32]()
+	private nameIds = new HashMap[i32[], i32]()
+	private paths = new HashMap[string, i32]()
+	/// Per module, each decl by pair(owner, Str name).
+	private scopes: HashMap[i64, i32][] = []
+	private substs = new HashMap[i64, i32]()
+	/// Per decl, its identity once made.
+	private identities = new HashMap[i32, i32[]]()
+	/// Per tuple element index, its name, a Str.
+	private elements: i32[] = []
+	private langs = new HashMap[string, i32]()
+
+	constructor() {
+		for (const _ of 0 ... (kind.Member as i32)) {
+			this.typeIds.push(new HashMap[i64, i32]())
+		}
+		this.intern("")
+		this.int(0)
+		this.list([])
+		this.nameList([])
+		for (const k of 0 ... (kind.Float as i32)) {
+			this.row(k as kind.Kind, 0, 0)
+		}
+	}
+
+	intern(s: string): i32 {
+		const found = this.stringIds.get(s)
+		if (found != null) {
+			return found
+		}
+		const own = s.copy() // as it outlives the source
+		this.strings.push(own)
+		this.stringIds.set(own, this.strings.length - 1)
+		return this.strings.length - 1
+	}
+
+	int(v: i64): i32 {
+		const found = this.intIds.get(v)
+		if (found != null) {
+			return found
+		}
+		this.ints.push(v)
+		this.intIds.set(v, this.ints.length - 1)
+		return this.ints.length - 1
+	}
+
+	/// The list of types ts.
+	list(ts: i32[]): i32 {
+		const found = this.listIds.get(ts)
+		if (found != null) {
+			return found
+		}
+		let h = combine(seed, ts.length)
+		let f: u8 = 0
+		for (const t of ts) {
+			h = combine(h, this.hashes[t])
+			f = f | this.flags[t]
+		}
+		const own = ts.slice(0, ts.length) // as the caller may change ts
+		this.lists.push(own)
+		this.listHashes.push(h)
+		this.listFlags.push(f)
+		this.listIds.set(own, this.lists.length - 1)
+		return this.lists.length - 1
+	}
+
+	/// The names entry of (Str name, mods) pairs.
+	nameList(pairs: i32[]): i32 {
+		const found = this.nameIds.get(pairs)
+		if (found != null) {
+			return found
+		}
+		let h = seed
+		for (const x of 0 ... pairs.length / 2 - 1) {
+			h = combine(combine(h, fnv(this.strings[pairs[2 * x]])), pairs[2 * x + 1])
+		}
+		const own = pairs.slice(0, pairs.length)
+		this.names.push(own)
+		this.nameHashes.push(h)
+		this.nameIds.set(own, this.names.length - 1)
+		return this.names.length - 1
+	}
+
+	/// The type of kind k and parts a and b; a union's as union makes it, a Member resolved where its type tells it.
+	type(k: kind.Kind, a: i32 = 0, b: i32 = 0): i32 {
+		return if (k == kind.Union) this.union(this.lists[a]) else if (k == kind.Member) this.typeMember(a, b) else this.row(k, a, b)
+	}
+
+	kind(t: i32): kind.Kind { return this.kinds[t] }
+	a(t: i32): i32 { return this.as[t] }
+	b(t: i32): i32 { return this.bs[t] }
+	hash(t: i32): u64 { return this.hashes[t] }
+	/// Whether no Param, Of or Member occurs in t, so that nothing changes it.
+	closed(t: i32): bool { return this.flags[t] == 0 }
+	/// Whether an Of or a Member occurs in t, so that it depends on what locals hold.
+	reflected(t: i32): bool { return (this.flags[t] & reflected) != 0 }
+
+	/// The union of ts: flattened, each member once, sorted by hash, which no two types share (headOf), so in the same
+	/// order in every run and src/type.c, but by a 64-bit collision, which the id orders; one type stands for itself.
+	union(ts: i32[]): i32 {
+		const ms: i32[] = []
+		for (const t of ts) {
+			if (this.kinds[t] == kind.Union) {
+				ms.append(this.lists[this.as[t]])
+			} else {
+				ms.push(t)
+			}
+		}
+		sortBy(ms, (x, y) => this.hashes[x] < this.hashes[y] || this.hashes[x] == this.hashes[y] && x < y)
+		const out: i32[] = []
+		for (const m of ms) {
+			if (out.length == 0 || out[out.length - 1] != m) {
+				out.push(m)
+			}
+		}
+		return if (out.length == 1) out[0] else this.row(kind.Union, this.list(out), 0)
+	}
+
+	/// t with each type it is made of mapped by f, a union's members made one again, a Member of a type now known
+	/// resolved; t itself if it is made of none.
+	map(t: i32, f: (t: i32) => i32): i32 {
+		const k = this.kinds[t]
+		const a = this.as[t]
+		const b = this.bs[t]
+		const each = (l: i32) => this.list(this.lists[l].map(f))
+		return switch (k) {
+			case kind.Array, kind.Optional, kind.Rest, kind.Embed, kind.FixedArray: this.row(k, f(a), b)
+			case kind.Tuple, kind.Object: this.row(k, each(a), b)
+			case kind.Union: this.union(this.lists[a].map(f))
+			case kind.Func: this.row(k, each(a), f(b))
+			case kind.Named: this.row(k, a, each(b))
+			case kind.Member: this.typeMember(f(a), b)
+			default: t
+		}
+	}
+
+	/// t with the args of env for the params it names, of a decl env is an env of or of its owners; memoized, and t
+	/// itself at once if no Param occurs in it.
+	subst(t: i32, env: i32): i32 {
+		if ((this.flags[t] & params) == 0) {
+			return t
+		}
+		const key = pair(t, env)
+		const found = this.substs.get(key)
+		if (found != null) {
+			return found
+		}
+		const r = if (this.kinds[t] == kind.Param) this.arg(t, env) else this.map(t, x => this.subst(x, env))
+		this.substs.set(key, r)
+		return r
+	}
+
+	/// The arg in env of Param t, or t if env has none for it.
+	private arg(t: i32, env: i32): i32 {
+		const d = this.as[t]
+		const i = this.identity(d).length - this.decls[d].params.length + this.bs[t]
+		const args = this.lists[env]
+		return if (i < args.length) args[i] else t
+	}
+
+	/// The Params an env of decl d gives args for: its owners', outermost first, then its own; memoized.
+	identity(d: i32): i32[] {
+		const found = this.identities.get(d)
+		if (found != null) {
+			return found
+		}
+		const o = this.decls[d].owner
+		const r = if (o < 0) [] as i32[] else this.identity(o).slice(0, this.identity(o).length)
+		for (const k of 0 ... this.decls[d].params.length - 1) {
+			r.push(this.row(kind.Param, d, k))
+		}
+		this.identities.set(d, r)
+		return r
+	}
+
+	/// The types t lists: a function's params, a tuple's or object's parts, a union's members.
+	items(t: i32): i32[] { return this.lists[this.as[t]] }
+
+	/// The members of t, a union, in canonical order, which src/type.c's is too, by hash; else t itself.
+	members(t: i32): i32[] { return if (this.kinds[t] == kind.Union) this.lists[this.as[t]] else [t] }
+
+	/// The member of union t a number of kind k that t lacks converts to (§4.1): of those an untyped constant fits, any
+	/// of its family, or a typed number widens to, the one of the lowest id, which is the narrowest of its family and
+	/// the checker's order (src/type.bob), whatever the union's; t if it is no union or has none.
+	numberIn(t: i32, k: i32): i32 {
+		const ms = this.members(t).filter(x => if (kind.untyped(k)) x != k && (kind.isInt(x) && kind.isInt(k) || kind.isFloat(x) && kind.isFloat(k)) else kind.widens(k, x))
+		sort(ms)
+		return if (this.kinds[t] != kind.Union || ms.length == 0) t else ms[0]
+	}
+
+	/// The types t is made of.
+	parts(t: i32): i32[] {
+		const a = this.as[t]
+		return switch (this.kinds[t]) {
+			case kind.Array, kind.Optional, kind.Rest, kind.Embed, kind.FixedArray, kind.Literal, kind.Member: [a]
+			case kind.Tuple, kind.Union, kind.Object: this.lists[a]
+			case kind.Func: [...this.lists[a], this.bs[t]]
+			case kind.Named: this.lists[this.bs[t]]
+			default: []
+		}
+	}
+
+	/// The index of field name, a Str, of object or tuple type t, -1 if it has none.
+	field(t: i32, name: i32): i32 {
+		const n = this.lists[this.as[t]].length
+		for (const i of 0 ... n - 1) {
+			if ((if (this.kinds[t] == kind.Object) this.names[this.bs[t]][2 * i] else this.elementName(i)) == name) {
+				return i
+			}
+		}
+		return -1
+	}
+
+	/// The name of a tuple's element i, `"0"`, `"1"`, …, a Str.
+	elementName(i: i32): i32 {
+		while (this.elements.length <= i) {
+			this.elements.push(this.intern(`${this.elements.length}`))
+		}
+		return this.elements[i]
+	}
+
+	/// Member name of t where t tells it, as reflection gives it (§4.11): an array's or fixed array's elem, a generic's
+	/// instance's base the generic, another closed type's itself; else the Member.
+	private typeMember(t: i32, name: i32): i32 {
+		const k = this.kinds[t]
+		const s = this.strings[name]
+		if (s == "elem" && (k == kind.Array || k == kind.FixedArray)) {
+			return this.as[t]
+		}
+		if (s == "base" && k == kind.Named && this.decls[this.as[t]].params.length > 0) {
+			return this.row(k, this.as[t], 0)
+		}
+		if (s == "base" && this.closed(t)) {
+			return t
+		}
+		return this.row(kind.Member, t, name)
+	}
+
+	/// The hash of t's kind and its data besides its types, which, followed by theirs in order, makes its hash, so that
+	/// src/type.c hashes a type it forms as here. It is of all that tells types apart, so that distinct ones hash apart:
+	/// a literal's of its base too, a decl's of its owner, name and nth (decl), an instance's of its env.
+	head(t: i32): u64 { return this.headOf(this.kinds[t], this.as[t], this.bs[t]) }
+
+	private headOf(k: kind.Kind, a: i32, b: i32): u64 {
+		const h = combine(seed, k)
+		return switch (k) {
+			case kind.FixedArray: combine(h, b)
+			case kind.Object: combine(h, this.nameHashes[b])
+			case kind.Named: combine(h, this.decls[a].hash)
+			case kind.Param: combine(combine(h, this.decls[a].hash), b)
+			case kind.Literal: combine(combine(h, a), if (a == kind.String) fnv(this.strings[b]) else if (kind.isInt(a)) this.ints[b] as u64 else b as u64)
+			case kind.Of: combine(combine(h, a), fnv(this.strings[b]))
+			case kind.Member: combine(h, fnv(this.strings[b]))
+			default: h
+		}
+	}
+
+	/// The type row (k, a, b), made with its hash and flags on first use.
+	private row(k: kind.Kind, a: i32, b: i32): i32 {
+		const key = pair(a, b)
+		const found = this.typeIds[k].get(key)
+		if (found != null) {
+			return found
+		}
+		let h = this.headOf(k, a, b)
+		let f: u8 = if (k == kind.Param) params else if (k == kind.Of || k == kind.Member) reflected else 0
+		const part = (t: i32) => {
+			h = combine(h, this.hashes[t])
+			f = f | this.flags[t]
+		}
+		const list = (l: i32) => {
+			h = combine(h, this.listHashes[l])
+			f = f | this.listFlags[l]
+		}
+		switch (k) {
+			case kind.Array, kind.Optional, kind.Rest, kind.Embed, kind.FixedArray, kind.Literal, kind.Member:
+				part(a)
+			case kind.Tuple, kind.Union, kind.Object: list(a)
+			case kind.Func:
+				list(a)
+				part(b)
+			case kind.Named: list(b)
+		}
+		this.kinds.push(k)
+		this.as.push(a)
+		this.bs.push(b)
+		this.hashes.push(h)
+		this.flags.push(f)
+		this.typeIds[k].set(key, this.kinds.length - 1)
+		return this.kinds.length - 1
+	}
+
+	/// The module of the path, -1 if there is none.
+	module(path: string): i32 { return this.paths.get(path) ?? -1 }
+
+	addModule(path: string): i32 {
+		this.modules.push(new Module(path))
+		this.scopes.push(new HashMap[i64, i32]())
+		this.paths.set(path, this.modules.length - 1)
+		return this.modules.length - 1
+	}
+
+	/// A new decl of module m, nested in or a member of owner, -1 for none, and so the last of its members.
+	decl(m: i32, owner: i32, name: string, k: decl.Kind): i32 {
+		const s = this.intern(name)
+		const before = this.scopes[m].get(pair(owner, s))
+		const nth = if (before == null) 0 else this.decls[before!].nth + 1
+		const h = combine(combine(if (owner >= 0) this.decls[owner].hash else fnv(this.modules[m].path), fnv(name)), nth)
+		const d = this.decls.length
+		this.decls.push(new Decl(s, k, m, owner, h))
+		this.decls[d].nth = nth
+		this.scopes[m].set(pair(owner, s), d)
+		if (owner >= 0) {
+			this.decls[owner].members.push(d)
+		}
+		return d
+	}
+
+	/// The decl of module m in owner of the name, the last declared of those there are, or in an owner the nth, else -1.
+	find(m: i32, owner: i32, name: string, nth = -1): i32 {
+		const s = this.stringIds.get(name)
+		const d = if (s == null) -1 else this.scopes[m].get(pair(owner, s!)) ?? -1
+		if (d < 0 || nth < 0 || this.decls[d].nth == nth || owner < 0) {
+			return d
+		}
+		for (const x of this.decls[owner].members) {
+			if (this.decls[x].name == s && this.decls[x].nth == nth) {
+				return x
+			}
+		}
+		return -1
+	}
+
+	/// The member of class or interface decl c named name, a Str, or -1; of an instance, the instance of its generic's
+	/// member, -1 while it is not instanced.
+	member(c: i32, name: i32): i32 {
+		const x = this.decls[c]
+		if (x.generic >= 0) {
+			const g = this.member(x.generic, name)
+			return if (g < 0) -1 else this.instances.get(pair(g, x.env)) ?? -1
+		}
+		return this.scopes[x.module].get(pair(c, name)) ?? -1
+	}
+
+	/// The instance of decl g for env, owned by owner, the instance of g's owner: g itself for the empty env, else a
+	/// decl of g's name and module, not found by its name, whose members mono lists; for n > 0 the nth one for known
+	/// values (src/resolve.bob), named g's name and {n}, not one of instances.
+	instance(g: i32, env: i32, owner: i32, n = 0): i32 {
+		let d = g
+		if (env != 0 || n > 0) {
+			const x = this.decls[g]
+			d = this.decls.length
+			const name = if (n == 0) x.name else this.intern(`${this.strings[x.name]}{${n}}`)
+			const h = combine(x.hash, this.listHashes[env])
+			const y = new Decl(name, x.kind, x.module, owner, if (n == 0) h else combine(h, n))
+			y.nth = x.nth
+			y.generic = g
+			y.env = env
+			y.mods = x.mods
+			y.doc = x.doc
+			y.type = this.subst(x.type, env)
+			this.decls.push(y)
+		}
+		if (n == 0) {
+			this.instances.set(pair(g, env), d)
+		}
+		return d
+	}
+
+	/// The class or interface decl d is a member of, or -1.
+	classOf(d: i32): i32 {
+		const o = this.decls[d].owner
+		return if (o >= 0 && (this.decls[o].kind == decl.Class || this.decls[o].kind == decl.Interface)) o else -1
+	}
+
+	/// Whether d is a method or field of its class's instances, which a call of it passes as `this`.
+	method(d: i32): bool { return this.classOf(d) >= 0 && (this.decls[d].mods & decl.Static) == 0 }
+
+	/// The function or var builtin/ exports by the name; memoized.
+	lang(name: string): i32 throws CompileError {
+		const found = this.langs.get(name)
+		if (found != null) {
+			return found
+		}
+		for (const m of 0 ... this.modules.length - 1) {
+			const d = if (builtin(this.modules[m].path)) this.find(m, -1, name) else -1
+			if (d >= 0) {
+				this.langs.set(name, d)
+				return d
+			}
+		}
+		throw new CompileError(`builtin/ does not export ${name}`)
+	}
+}
+
+/// The key of a and b, as one int.
+export function pair(a: i32, b: i32): i64 { return (a as i64) << 32 | ((b as i64) & 0xffffffff) }
+
+/// The hash of the source src of the module at path.
+export function sourceHash(path: string, src: string): u64 { return combine(fnv(path), fnv(src)) }
+
+/// A local of a code: its name, a Str, 0 for a temporary, its type and its mods.
+export type Local = { name: i32, type: i32, mods: i32 }
+
+/// A code (src/bc/op.bob): its locals, its ops, and the lists of its ops' immediates. An op is its index: its opcode is
+/// in ops, its immediates a, b and c, as shape gives them and 0 where it has none, and its source position in pos.
+export class Code {
+	locals: Local[] = []
+	ops: Opcode[] = []
+	/// Per op, the byte offset in the source it comes from, -1 for none.
+	pos: i32[] = []
+	/// The code lists, each a count and its items, which an immediate is the index of; 0 is the empty one.
+	lists: i32[] = [0]
+	/// The source position of the ops added next.
+	at = -1
+	/// Of a closure's code, per local it captures, in the order its Closure lists them, the local here holding it.
+	captures: i32[] = []
+	private imms: i32[] = []
+	/// Per op opening or splitting a block, the op that next splits or ends it, made on first use.
+	private nexts: i32[] | null = null
+
+	local(name: i32, t: i32, mods: i32 = 0): i32 {
+		this.locals.push({ name: name, type: t, mods: mods })
+		return this.locals.length - 1
+	}
+
+	/// Adds op o of the immediates at position at, and returns it.
+	add(o: Opcode, a: i32 = 0, b: i32 = 0, c: i32 = 0): i32 {
+		this.ops.push(o)
+		this.imms.push(a)
+		this.imms.push(b)
+		this.imms.push(c)
+		this.pos.push(this.at)
+		this.nexts = null
+		return this.ops.length - 1
+	}
+
+	a(i: i32): i32 { return this.imms[3 * i] }
+	b(i: i32): i32 { return this.imms[3 * i + 1] }
+	c(i: i32): i32 { return this.imms[3 * i + 2] }
+	/// Immediate j of op i: its a, b or c.
+	imm(i: i32, j: i32): i32 { return this.imms[3 * i + j] }
+
+	/// The code list of xs.
+	list(xs: i32[]): i32 {
+		if (xs.length == 0) {
+			return 0
+		}
+		this.lists.push(xs.length)
+		this.lists.append(xs)
+		return this.lists.length - xs.length - 1
+	}
+
+	items(l: i32): i32[] { return this.lists.slice(l + 1, l + 1 + this.lists[l]) }
+
+	/// The Else, Catch, Finally or End after op i, which opens or splits a block, that splits or ends it.
+	next(i: i32): i32 {
+		if (this.nexts == null) {
+			const ns = new i32[](this.ops.length)
+			const open: i32[] = []
+			for (const j of 0 ... this.ops.length - 1) {
+				const o = this.ops[j]
+				if ((o == End || splits[o]) && open.length > 0) {
+					ns[open.pop()] = j
+				}
+				if (opens[o] || splits[o]) {
+					open.push(j)
+				}
+			}
+			this.nexts = ns
+		}
+		return this.nexts![i]
+	}
+
+	/// Keeps only the ops keep gives true for, in order; keep sees each op before any after it moves.
+	retain(keep: (i: i32) => bool) {
+		let n = 0
+		for (const i of 0 ... this.ops.length - 1) {
+			if (keep(i)) {
+				this.ops[n] = this.ops[i]
+				this.pos[n] = this.pos[i]
+				for (const j of 0 ... 2) {
+					this.imms[3 * n + j] = this.imms[3 * i + j]
+				}
+				n++
+			}
+		}
+		this.ops = this.ops.slice(0, n)
+		this.pos = this.pos.slice(0, n)
+		this.imms = this.imms.slice(0, 3 * n)
+		this.nexts = null
+	}
+}

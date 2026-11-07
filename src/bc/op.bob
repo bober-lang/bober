@@ -1,0 +1,280 @@
+//! Opcodes (§8.3): each op's number, its immediates, and what it does, by what it pops → what it pushes; T stands
+//! for the type an immediate names, or that the operands have.
+//!
+//! ## Code
+//!
+//! A code is a function's, method's or test's body, or a variable's initializer: its locals, params first and `this`
+//! first in a method, then ops up to the End that closes it, which yields an initializer's value. Locals other than
+//! params start at their zero value (§5.1); one of a type without one is stored before it is loaded. An op pops its
+//! operands, pushed in source order, and pushes its result; only ops that make a value with a layout name its type. A
+//! `Local`, `Global`, `Member`, `Field` or `Subscript` that yields a FixedArray names its place, which the `SetLocal`,
+//! `SetGlobal`, `SetMember`, `SetField` or `SetSubscript` consuming it writes in place.
+//!
+//! Control flow is WebAssembly's. `Block`, `Loop`, `If`, `Each`, `Try`, `Test` and `Default` open a block to its `End`;
+//! `Br n` leaves the n-th enclosing block, carrying its result if it has one, or restarts a `Loop`, or goes on to an
+//! `Each`'s next element. Nothing follows `Unreachable`, `Br`, `Return` or `Throw` before the next `Else`,
+//! `Catch`, `Finally` or `End`.
+//!
+//! A `Try` is its body, then a `Catch`, a `Finally` or both, in that order. A throw unwinds to the innermost `Try` of
+//! the fiber whose `Catch` handles the value, running the `Finally` of each `Try` it leaves on the way. A `Finally`
+//! runs once its `Try`'s body or handler is left: at the end, by a throw, or by a `Br` or `Return` out of it; at its
+//! `End` what left resumes, unless the finally itself throws, branches or returns, which replaces it. A trap runs no
+//! `Finally`.
+//!
+//! Operators take their type from their operands, of one type after any widening `Cast` for numbers. Integers wrap and
+//! take signedness from their type, floats are IEEE 754, and `~x` is `Xor` with all ones. A union holds its value with
+//! the type it was cast from, which `Is`, `BrNull` and `Eq` test.
+//!
+//! Code means what a debug build runs, so there are no static ops: what is static (§4.11) is the checker's rule, not
+//! a form here. A static `if` or `switch` is an `If`, an unrolled `for` an `Each`, and a subscript of an object, class
+//! or tuple by a string the field it names. A release build gets the same by value: mono knows what some `Readonly`
+//! locals hold, as lower makes each switch subject and `Each` local one, and keeps only the branch an `If` it knows
+//! takes, unrolls an `Each` over a tuple or a known array, and evaluates a call whose params holding Types get known
+//! args.
+
+/// Closes a block; the last one ends the code and returns.
+export const End: u8 = 0
+/// Traps.
+export const Unreachable: u8 = 1
+/// → T at End: opens a block; None for no result.
+export const Block: u8 = 2
+/// Opens a block that Br restarts.
+export const Loop: u8 = 3
+/// bool → T at End: runs to Else if true, else from it.
+export const If: u8 = 4
+/// Splits an If.
+export const Else: u8 = 5
+/// array, fixed array or tuple →: opens a block run per element, in order, the local holding it, a new variable
+/// each time, as by Fresh.
+export const Each: u8 = 6
+/// Opens a block of a body, a Catch and a Finally.
+export const Try: u8 = 7
+/// Handles a thrown value whose carried type fits T, stored in the local; None handles every value.
+export const Catch: u8 = 8
+/// Runs whenever the body or handler is left.
+export const Finally: u8 = 9
+/// v →: throws v, carrying its static type, or its tag if a union.
+export const Throw: u8 = 10
+/// [T] →: branches out of the block at the depth.
+export const Br: u8 = 11
+/// bool →: branches if true.
+export const BrIf: u8 = 12
+/// T | null → T: branches carrying null if null, else unwraps.
+export const BrNull: u8 = 13
+/// Opens a block run only when the param was left out, whose result is stored in it (§5.2).
+export const Default: u8 = 14
+/// T →: returns from the function.
+export const Return: u8 = 15
+/// args → T: calls a function with the type args; a method takes its receiver and its class's type args first.
+export const Call: u8 = 16
+/// obj, args → T: calls a method by name with that many args: of an interface or object by its tag, or of a type
+/// param, once instantiated.
+export const CallMethod: u8 = 17
+/// fn, args → T: calls a function value with that many args.
+export const CallRef: u8 = 18
+/// string →: opens a block run as the subtest of that name, which a runner may skip (§5.5).
+export const Test: u8 = 19
+/// v →
+export const Drop: u8 = 20
+/// → T: loads.
+export const Local: u8 = 21
+/// T →: stores.
+export const SetLocal: u8 = 22
+/// → T: loads a Var, or a Function as a value, with the type args.
+export const Global: u8 = 23
+/// T →: stores a Var.
+export const SetGlobal: u8 = 24
+/// → bool
+export const False: u8 = 25
+/// → bool
+export const True: u8 = 26
+/// → T: an integer, wrapped to T, or converted if a float, as a param of one is.
+export const Int: u8 = 27
+/// → T: an f64, by its bits, rounded to T.
+export const Float: u8 = 28
+/// → string
+export const Str: u8 = 29
+/// → null
+export const Null: u8 = 30
+/// → Optional: a left-out argument.
+export const Missing: u8 = 31
+/// → Type: the type as a value, as typeof makes (§4.11).
+export const Type: u8 = 32
+/// obj → T: reads a class field; an embedded one as a reference into obj.
+export const Member: u8 = 33
+/// obj, v →: writes a class field; an embedded one by copying v in.
+export const SetMember: u8 = 34
+/// obj → T: a field of an object, tuple ("0", "1", …) or Type (§4.11), or a length; a method bound.
+export const Field: u8 = 35
+/// obj, v →: writes it.
+export const SetField: u8 = 36
+/// arr, k → T: an element of an array or fixed array, or a string's code unit, trapping outside; with a string k, the
+/// field of an object, class or tuple it names.
+export const Subscript: u8 = 37
+/// arr, k, v →: writes it.
+export const SetSubscript: u8 = 38
+/// arr → arr: an array or tuple pattern's check: traps on fewer elements than the count (§5.1).
+export const Unpack: u8 = 39
+/// elems → T: makes an array or tuple of that many; one at a listed index is an array spread into it.
+export const Array: u8 = 40
+/// values → T: makes an object of T's fields in order; one at a listed index is spread into it.
+export const Object: u8 = 41
+/// args → T: constructs a class instance, tuple or array (§6.3).
+export const New: u8 = 42
+/// → fn: the function with the type args, capturing the listed locals by reference, which follow its params.
+export const Closure: u8 = 43
+/// v → T: every conversion and narrowing, a! included; traps as §6.6 says.
+export const Cast: u8 = 44
+/// v → bool: whether the type of a union's, object's or interface's tag fits T.
+export const Is: u8 = 45
+/// bool →: traps if false.
+export const Assert: u8 = 46
+/// bool → bool
+export const Not: u8 = 47
+/// a, b → bool: numbers by value, strings by code units, refs by identity, unions by tag, then value.
+export const Eq: u8 = 48
+/// a, b → bool: !Eq.
+export const Ne: u8 = 49
+/// a, b → bool: of numbers, or of strings by code units.
+export const Lt: u8 = 50
+export const Gt: u8 = 51
+export const Le: u8 = 52
+export const Ge: u8 = 53
+/// a, b → T: of numbers, or strings concatenated.
+export const Add: u8 = 54
+/// a, b → T: of numbers (§6.5).
+export const Sub: u8 = 55
+export const Mul: u8 = 56
+/// a, b → T: an integer one traps on zero.
+export const Div: u8 = 57
+/// a, b → T: an integer one traps on zero; a float's is fmod.
+export const Rem: u8 = 58
+/// a, b → T: traps on a negative integer exponent.
+export const Pow: u8 = 59
+/// a, b → T: of integers or bools.
+export const And: u8 = 60
+export const Or: u8 = 61
+export const Xor: u8 = 62
+/// a, b → T: of integers, the count modulo the width.
+export const Shl: u8 = 63
+/// a, b → T: as Shl, arithmetic for signed types.
+export const Shr: u8 = 64
+/// a → T: of a number; a float's sign flips, zero's too.
+export const Neg: u8 = 65
+/// Starts a new variable in the local where declared; closures made before keep the old one (§5.1).
+export const Fresh: u8 = 66
+/// a, b → bool: an Eq of strings that are each a literal, by identity, as equal ones are one (§4.2).
+export const Same: u8 = 67
+
+export type Opcode = End | Unreachable | Block | Loop | If | Else | Each | Try | Catch | Finally | Throw | Br | BrIf
+	| BrNull | Default | Return | Call | CallMethod | CallRef | Test | Drop | Local | SetLocal | Global
+	| SetGlobal | False | True | Int | Float | Str | Null | Missing | Type | Member | SetMember | Field | SetField
+	| Subscript | SetSubscript | Unpack | Array | Object | New | Closure | Cast | Is | Assert | Not | Eq | Ne | Lt | Gt | Le
+	| Ge | Add | Sub | Mul | Div | Rem | Pow | And | Or | Xor | Shl | Shr | Neg | Fresh | Same
+
+/// What an immediate is: an id of a table of the Program or of the Code, or a number.
+export const TypeId: u8 = 0
+/// An interned list of types, 0 for none.
+export const TypeList: u8 = 1
+export const DeclId: u8 = 2
+export const StrId: u8 = 3
+/// An entry of the Program's ints: an Int's value, or a Float's bits.
+export const IntId: u8 = 4
+export const LocalId: u8 = 5
+/// A list of the Code of locals.
+export const LocalList: u8 = 6
+/// A count or a depth.
+export const Num: u8 = 7
+/// A list of the Code of counts or depths.
+export const NumList: u8 = 8
+
+export type Imm = TypeId | TypeList | DeclId | StrId | IntId | LocalId | LocalList | Num | NumList
+
+/// Per opcode, its name and its immediates a, b and c, those left out 0.
+const table: [string, Imm[]][] = [
+	["End", []],
+	["Unreachable", []],
+	["Block", [TypeId]],
+	["Loop", []],
+	["If", [TypeId]],
+	["Else", []],
+	["Each", [LocalId]],
+	["Try", []],
+	["Catch", [TypeId, LocalId]],
+	["Finally", []],
+	["Throw", []],
+	["Br", [Num]],
+	["BrIf", [Num]],
+	["BrNull", [Num]],
+	["Default", [LocalId]],
+	["Return", []],
+	["Call", [DeclId, TypeList]],
+	["CallMethod", [StrId, Num]],
+	["CallRef", [Num]],
+	["Test", []],
+	["Drop", []],
+	["Local", [LocalId]],
+	["SetLocal", [LocalId]],
+	["Global", [DeclId, TypeList]],
+	["SetGlobal", [DeclId, TypeList]],
+	["False", []],
+	["True", []],
+	["Int", [TypeId, IntId]],
+	["Float", [TypeId, IntId]],
+	["Str", [StrId]],
+	["Null", []],
+	["Missing", [TypeId]],
+	["Type", [TypeId]],
+	["Member", [DeclId]],
+	["SetMember", [DeclId]],
+	["Field", [StrId]],
+	["SetField", [StrId]],
+	["Subscript", []],
+	["SetSubscript", []],
+	["Unpack", [Num]],
+	["Array", [TypeId, Num, NumList]],
+	["Object", [TypeId, Num, NumList]],
+	["New", [TypeId]],
+	["Closure", [DeclId, TypeList, LocalList]],
+	["Cast", [TypeId]],
+	["Is", [TypeId]],
+	["Assert", []],
+	["Not", []],
+	["Eq", []],
+	["Ne", []],
+	["Lt", []],
+	["Gt", []],
+	["Le", []],
+	["Ge", []],
+	["Add", []],
+	["Sub", []],
+	["Mul", []],
+	["Div", []],
+	["Rem", []],
+	["Pow", []],
+	["And", []],
+	["Or", []],
+	["Xor", []],
+	["Shl", []],
+	["Shr", []],
+	["Neg", []],
+	["Fresh", [LocalId]],
+	["Same", []],
+]
+
+/// Each opcode's name and immediates.
+export const names = table.map(r => r[0])
+export const shape = table.map(r => r[1])
+
+/// The ops that open a block, that split one, and after which the rest of the block is unreachable.
+export const opens = flags([Block, Loop, If, Each, Try, Test, Default])
+export const splits = flags([Else, Catch, Finally])
+export const jumps = flags([Unreachable, Br, Return, Throw])
+
+function flags(os: Opcode[]): bool[] {
+	const f = new bool[](table.length)
+	for (const o of os) {
+		f[o] = true
+	}
+	return f
+}
