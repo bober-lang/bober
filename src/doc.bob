@@ -1,0 +1,82 @@
+//! bober doc: the spec, gathered from doc comments. A doc comment's Markdown heading, a line of `#`s and a space, starts a
+//! section, which runs to the comment's end or its next heading; the lines before it document the declaration as usual.
+//! Each section has one place, the declaration that does what it says, or a module's doc. The sections print as
+//! Markdown in the order of the files and their lines, each followed by where it is: `bober doc src/*.bob src/c/bind.bob
+//! builtin/*.bob` prints the spec of the language and its bytecode.
+
+import { hash, space } from "../std/ascii"
+import { startsWith, trim } from "../std/string"
+import { CompileError } from "./error"
+import { Parser, leads } from "./parse"
+
+export class Section {
+	/// Its heading line.
+	head = ""
+	/// Markdown, a line each.
+	text = ""
+	/// The path and line of its heading.
+	at = ""
+}
+
+/// The spec in the files at paths, as Markdown; throws a file that cannot be read or parsed as a CompileError.
+export function doc(paths: string[]): string {
+	const all: Section[] = []
+	for (const path of paths) {
+		const src = readFile(path)
+		if (src == null) {
+			throw new CompileError(`${path}: cannot read`)
+		}
+		all.push(...sections(path, src))
+	}
+	return markdown(all)
+}
+
+/// The sections in the doc comments of src, the file at path.
+export function sections(path: string, src: string): Section[] {
+	const p = new Parser(src, true) // builtin/ has functions without a body
+	while (p.parse() != null) {}
+	const out: Section[] = []
+	let s: Section | null = null
+	let last = 0
+	for (const c of p.comments) {
+		const [line, _] = p.lineCol(c.loc.pos)
+		const text = src.slice(c.loc.pos, c.loc.end())
+		if (!(startsWith(text, "///") || startsWith(text, "//!")) || !leads(src, c.loc.pos)) {
+			s = null
+			continue
+		}
+		if (line != last + 1) {
+			s = null
+		}
+		last = line
+		const body = text.slice(if (text.length > 3 && text[3] == space) 4 else 3, text.length)
+		if (heading(body)) {
+			s = new Section()
+			s.head = body
+			s.at = `${path}:${line}`
+			out.push(s)
+		} else if (s != null) {
+			s.text += body + "\n"
+		}
+	}
+	return out
+}
+
+/// The sections, each followed by where it is.
+export function markdown(all: Section[]): string {
+	let out = ""
+	for (const s of all) {
+		const text = trim(s.text)
+		out += `${s.head}\n\n${if (text == "") "" else text + "\n\n"}*${s.at}*\n\n`
+	}
+	return out
+}
+
+/// Whether line is a Markdown heading: `#`s, then a space.
+function heading(line: string): bool {
+	let i = 0
+	while (i < line.length && line[i] == hash) {
+		i++
+	}
+	return i > 0 && i < line.length && line[i] == space
+}

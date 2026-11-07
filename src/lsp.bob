@@ -1,0 +1,265 @@
+//! bober lsp: a language server for editors, over stdin and stdout. It checks the files open in the editor together on
+//! each change and reports their errors, and answers hover with a construct's type, definition with where a top-level
+//! value is declared, and formatting with the file formatted. A declaration with an error is not handed on, so neither
+//! answers inside it. A position counts a line's characters in utf-16 units, as the protocol does.
+
+import { getcwd } from "unistd.h"
+import { fromCString } from "../std/c"
+import { lf } from "../std/ascii"
+import { HashMap } from "../std/collections/hashmap"
+import { Rest, Unknown, decode, quoted } from "../std/encoding/json"
+import { IoError, stdin, stdout } from "../std/io"
+import { ParseError, parseInt } from "../std/parse"
+import { endsWith, indexOf, startsWith } from "../std/string"
+import { Checked, Node, check, operands, patternNames, show } from "./check"
+import { format } from "./format"
+import { Loc, SyntaxError } from "./lex"
+
+const capabilities = `{"capabilities":{"textDocumentSync":1,"hoverProvider":true,`
+	+ `"definitionProvider":true,"documentFormattingProvider":true}}`
+
+/// Serves the messages on stdin until exit or its end, checking with the C headers of includes.
+export function serve(includes: string[]) {
+	const s = new Server(includes)
+	let buf = ""
+	try {
+		while (true) {
+			const head = indexOf(buf, "\r\n\r\n")
+			if (head >= 0) {
+				const at = indexOf(buf, "Content-Length: ") + 16
+				const n = parseInt(buf.slice(at, indexOf(buf, "\r\n", at)))
+				if (buf.length >= head + 4 + n) {
+					if (!s.serve(buf.slice(head + 4, head + 4 + n))) {
+						return
+					}
+					buf = buf.slice(head + 4 + n, buf.length)
+					continue
+				}
+			}
+			const c = stdin.read(1 << 16)
+			if (c == null) {
+				return
+			}
+			buf += c
+		}
+	} catch (e: IoError | ParseError) {
+	}
+}
+
+/// A message, its id and params left as text.
+class Message {
+	method = ""
+	rest: Unknown[] @Rest = []
+}
+
+class Doc {
+	uri = ""
+	text = ""
+	rest: Unknown[] @Rest = []
+}
+
+class Pos {
+	line: i32 = 0
+	character: i32 = 0
+}
+
+/// The params of each message served, with the fields it has.
+class Params {
+	textDocument = new Doc()
+	position = new Pos()
+	contentChanges: Doc[] = []
+	rest: Unknown[] @Rest = []
+}
+
+class Server implements Checked {
+	private root = fromCString(getcwd(0, 0)) + "/"
+	private includes: string[]
+	/// The open files' text, by path.
+	private open = new HashMap[string, string]()
+	private paths: string[] = []
+	/// From the last check: each module's source and checked top-level declarations, and where each top-level name is
+	/// declared, by symbol.
+	private srcs = new HashMap[string, string]()
+	private decls = new HashMap[string, Node[]]()
+	private defs = new HashMap[string, [string, Node]]()
+
+	constructor(includes: string[]) { this.includes = includes }
+
+	done(path: string) {}
+	declare(n: Node, path: string, src: string) {}
+	decl(n: Node, path: string, src: string) {
+		if (indexOf(path, ": ") >= 0) {
+			return // a C header's, which has no file of its own (src/check.bob, Modules.header)
+		}
+		this.srcs.set(path, src)
+		const ds = this.decls.get(path)
+		if (ds == null) {
+			this.decls.set(path, [n])
+		} else {
+			ds.push(n)
+		}
+		if (n.kind != "test") {
+			for (const t of patternNames(operands(n)[0])) {
+				this.defs.set(t.symbol, [path, t])
+			}
+		}
+	}
+
+	/// Serves the message body; false on exit.
+	serve(body: string): bool throws IoError {
+		let m = new Message()
+		let p = new Params()
+		let id = ""
+		try {
+			m = decode[Message](body)
+			for (const [k, v] of m.rest) {
+				if (k == "id") {
+					id = v
+				} else if (k == "params" && startsWith(v, "{")) {
+					p = decode[Params](v)
+				}
+			}
+		} catch (e: ParseError) {
+			m.method = "" // still answered, if a request
+		}
+		const path = this.path(p.textDocument.uri)
+		let result = "null"
+		switch (m.method) {
+			case "initialize": result = capabilities
+			case "exit": return false
+			case "textDocument/didOpen":
+				this.open.set(path, p.textDocument.text)
+				this.paths.push(path)
+				this.check()
+			case "textDocument/didChange":
+				this.open.set(path, p.contentChanges[p.contentChanges.length - 1].text)
+				this.check()
+			case "textDocument/didClose":
+				this.open.delete(path)
+				this.paths = this.paths.filter(q => q != path)
+				this.publish(path, [])
+			case "textDocument/hover":
+				const t = this.find(path, p.position, n => n.type != null)
+				if (t != null) {
+					result = `{"contents":{"kind":"markdown","value":${quoted("```bober\n" + show(t.type!) + "\n```")}}}`
+				}
+			case "textDocument/definition":
+				const u = this.find(path, p.position, n => n.symbol != "")
+				if (u != null) {
+					// A namespace's symbol is its module's path and the colon.
+					const d = this.defs.get(u.symbol)
+					result = if (endsWith(u.symbol, ":")) this.location(u.symbol.slice(0, u.symbol.length - 1), new Loc())
+						else if (d != null) this.location(d[0], d[1].t.loc) else "null"
+				}
+			case "textDocument/formatting":
+				const src = this.open.get(path) ?? ""
+				try {
+					result = `[{"range":${range(src, Loc.at(0, src.length))},"newText":${quoted(format(src))}}]`
+				} catch (e: SyntaxError) {
+				}
+		}
+		if (id != "") {
+			this.send(`{"jsonrpc":"2.0","id":${id},"result":${result}}`)
+		}
+		return true
+	}
+
+	/// Checks the open files and publishes their errors.
+	private check() throws IoError {
+		this.srcs = new HashMap[string, string]()
+		this.decls = new HashMap[string, Node[]]()
+		this.defs = new HashMap[string, [string, Node]]()
+		const errors = check(this.paths, this.includes, q => this.open.get(q), this)
+		for (const path of this.paths) {
+			const src = this.open.get(path)!
+			const ds: string[] = []
+			for (const e of errors) {
+				if (e.path == path) {
+					ds.push(`{"range":${range(src, e.loc)},"severity":${if (e.warning) 2 else 1},"source":"bober","message":${quoted(e.msg)}}`)
+				}
+			}
+			this.publish(path, ds)
+		}
+	}
+
+	private publish(path: string, diagnostics: string[]) throws IoError {
+		this.send(`{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":${quoted(this.uri(path))},`
+			+ `"diagnostics":[${diagnostics.join(",")}]}}`)
+	}
+
+	private send(body: string) throws IoError { stdout.write(`Content-Length: ${body.length}\r\n\r\n${body}`) }
+
+	/// The innermost construct or token of path's declarations at pos that has what it takes.
+	private find(path: string, pos: Pos, has: (n: Node) => bool): Node | null {
+		const at = offset(this.open.get(path) ?? "", pos)
+		for (const n of this.decls.get(path) ?? []) {
+			const f = innermost(n, at, has)
+			if (f != null) {
+				return f
+			}
+		}
+		return null
+	}
+
+	private location(path: string, loc: Loc): string {
+		return `{"uri":${quoted(this.uri(path))},"range":${range(this.srcs.get(path) ?? "", loc)}}`
+	}
+
+	/// The path of a file's uri, relative to the directory the server runs in, as the checker's paths are.
+	private path(uri: string): string {
+		const p = if (startsWith(uri, "file://")) uri.slice(7, uri.length) else uri
+		return if (startsWith(p, this.root)) p.slice(this.root.length, p.length) else p
+	}
+
+	private uri(path: string): string { return "file://" + (if (startsWith(path, "/")) "" else this.root) + path }
+}
+
+/// The innermost of n and its parts whose token covers at and that has what it takes.
+function innermost(n: Node, at: i32, has: (n: Node) => bool): Node | null {
+	for (const p of n.parts) {
+		const f = innermost(p, at, has)
+		if (f != null) {
+			return f
+		}
+	}
+	return if (n.t.loc.pos <= at && at <= n.t.loc.end() && has(n)) n else null
+}
+
+/// The byte offset in src of a position.
+function offset(src: string, p: Pos): i32 {
+	let i = 0
+	let line = 0
+	while (line < p.line && i < src.length) {
+		if (src[i] == lf) {
+			line++
+		}
+		i++
+	}
+	let units = 0
+	while (i < src.length && src[i] != lf && (units < p.character || utf16(src[i]) == 0)) {
+		units += utf16(src[i])
+		i++
+	}
+	return i
+}
+
+function range(src: string, loc: Loc): string { return `{"start":${position(src, loc.pos)},"end":${position(src, loc.end())}}` }
+
+function position(src: string, pos: i32): string {
+	let line = 0
+	let units = 0
+	let i = 0
+	while (i < pos && i < src.length) {
+		if (src[i] == lf) {
+			line++
+			units = 0
+		} else {
+			units += utf16(src[i])
+		}
+		i++
+	}
+	return `{"line":${line},"character":${units}}`
+}
+
+/// How many utf-16 units the character that the utf-8 byte b starts takes: none if b continues one.
+function utf16(b: u8): i32 { return if ((b & 0xc0) == 0x80) 0 else if (b >= 0xf0) 2 else 1 }

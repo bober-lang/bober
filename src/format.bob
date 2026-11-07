@@ -1,0 +1,606 @@
+//! bober format: rewrites a file in place in the one layout of its syntax tree. Comments
+//! keep their place among the statements and members around them.
+
+import { contains } from "../std/algo"
+import { isBlank, isSpace, lf } from "../std/ascii"
+import { CompileError } from "./error"
+import { SyntaxError, Tok, keyword, prec } from "./lex"
+import { Parser, Syntax, Tree } from "./parse"
+
+/// Rewrites the file at path in place; throws why it cannot, as a CompileError.
+export function formatFile(path: string) throws CompileError {
+	const src = readFile(path)
+	if (src == null) {
+		throw new CompileError(`${path}: cannot read`)
+	}
+	const p = new Parser(src, true) // builtin/ has functions without a body
+	let out = ""
+	try {
+		out = new Formatter(src, p).file()
+	} catch (e: SyntaxError) {
+		const [line, col] = p.lineCol(e.loc.pos)
+		throw new CompileError(`${path}:${line}:${col}: ${e.msg}`)
+	}
+	if (out != src && !writeFile(path, out)) {
+		throw new CompileError(`cannot write ${path}`)
+	}
+}
+
+export function format(src: string): string throws SyntaxError {
+	return new Formatter(src, new Parser(src, true)).file()
+}
+
+const Width = 120
+const Tab = 4
+
+/// Text, bodies whose lines nest one tab deeper, groups that may wrap, and trailing comments.
+type Doc = (string | Body | Group | Comment)[]
+
+/// A short body of one line stays on its opening line where it fits.
+class Body {
+	lines: (Doc | Gap)[] = []
+	short = false
+}
+
+/// Between two items of a loose body, followed by the comments that lead the next.
+class Gap {
+	differ: bool
+	leads: i32
+
+	constructor(differ: bool, leads: i32) {
+		this.differ = differ
+		this.leads = leads
+	}
+}
+
+/// Pieces apart by a space where they fit on the line, else one tab deeper on lines of their own or, filling,
+/// of as many as fit.
+class Group {
+	fill: bool
+	pieces: Doc[]
+
+	constructor(fill: bool, pieces: Doc[]) {
+		this.fill = fill
+		this.pieces = pieces
+	}
+}
+
+/// A construct's or token's layout and, for a declaration, its keyword. A case's body keeps its
+/// statements.
+class Node {
+	kind = ""
+	doc: Doc = []
+	items: Node[] = []
+}
+
+class Comment {
+	text: string
+	/// Whether a token comes before it on its line.
+	trailing: bool
+
+	constructor(src: string, t: Tok) {
+		let end = t.loc.end()
+		while (isSpace(src[end - 1])) {
+			end--
+		}
+		this.text = src.slice(t.loc.pos, end)
+		let i = t.loc.pos
+		while (i > 0 && isBlank(src[i - 1])) {
+			i--
+		}
+		this.trailing = i > 0 && src[i - 1] != lf
+	}
+}
+
+type Part = Node | Comment
+
+/// A construct's parts other than comments, taken in order after its modifiers. Past the last, as where a
+/// syntax error cut a construct short, each part is empty.
+class Reader {
+	mods = ""
+	private xs: Node[]
+	private i = 0
+
+	constructor(xs: Node[]) {
+		this.xs = xs
+		while (this.more() && isModifier(xs[this.i].kind)) {
+			this.i++
+		}
+		for (const m of ["export", "static", "private", "readonly"]) {
+			for (const x of xs.slice(0, this.i)) {
+				if (x.kind == m) {
+					this.mods += m + " "
+				}
+			}
+		}
+	}
+
+	more(): bool { return this.i < this.xs.length }
+
+	next(): Node {
+		this.i++
+		return if (this.i > this.xs.length) new Node() else this.xs[this.i - 1]
+	}
+
+	take(kind: string): Node | null { return if (this.more() && this.xs[this.i].kind == kind) this.next() else null }
+
+	/// The part after a token of kind, laid out after before.
+	opt(kind: string, before: string): Node | null {
+		return if (this.take(kind) == null) null else n([before, this.next()])
+	}
+
+	/// The tags next, each laid out after " @".
+	tags(): Node {
+		let x = n([])
+		while (this.take("@") != null) {
+			x = n([x, " @", this.next()])
+		}
+		return x
+	}
+
+	/// The parts up to end or a tag.
+	until(end: i32): Node[] {
+		const ys: Node[] = []
+		while (this.i < end && this.xs[this.i].kind != "@") {
+			ys.push(this.next())
+		}
+		return ys
+	}
+}
+
+class Formatter {
+	private src: string
+	/// The parser, read a construct at a time. The comments left in it are not yet laid out.
+	private p: Parser
+
+	constructor(src: string, p: Parser) {
+		this.src = src
+		this.p = p
+	}
+
+	file(): string {
+		const top: Part[] = []
+		let t = this.p.parse()
+		while (t != null) {
+			this.take(top, 0, start(t))
+			top.push(this.node(t, this.parts(t), null))
+			t = this.p.parse()
+		}
+		this.take(top, 0, this.src.length)
+		let s = ""
+		let i = 0
+		while (i < top.length && isDoc(top[i])) {
+			s += (top[i] as Comment).text + "\n"
+			i++
+		}
+		if (s != "") {
+			s += "\n"
+		}
+		const body = block(this.lines(top.slice(i, top.length), true), -1)
+		return if (body == "") s else s + body.slice(1, body.length) + "\n"
+	}
+
+	/// f's parts laid out. Where f holds lines or items in brackets, so do the comments in it. Its parts that hold
+	/// lines take theirs first, and the rest follow the line they are in.
+	private parts(f: Tree): Part[] {
+		const lines = f.kind == "block" || f.kind == "members" || f.kind == "switch" || f.kind == "switchExpr"
+			|| f.kind == "array" || f.kind == "object" || f.kind == "params" || f.kind == "typeParams" || f.kind == "call"
+			|| f.kind == "index" || f.kind == "new"
+		const out: Part[] = []
+		for (const p of f.parts) {
+			if (lines) {
+				this.take(out, f.t.loc.end(), start(p))
+			}
+			out.push(if (p instanceof Tree) this.node(p, this.parts(p), f.kind) else n([this.t(p)], p.kind))
+		}
+		if (lines) {
+			this.take(out, f.t.loc.end(), f.end)
+		}
+		return out
+	}
+
+	/// Adds to out the comments from lo to before hi.
+	private take(out: Part[], lo: i32, hi: i32) {
+		const rest: Tok[] = []
+		for (const c of this.p.comments) {
+			if (c.loc.pos >= lo && c.loc.pos < hi) {
+				out.push(new Comment(this.src, c))
+			} else {
+				rest.push(c)
+			}
+		}
+		this.p.comments = rest
+	}
+
+	private node(f: Tree, parts: Part[], parent: Syntax | null): Node {
+		const xs: Node[] = []
+		for (const p of parts) {
+			if (p instanceof Node) {
+				xs.push(p)
+			}
+		}
+		const r = new Reader(xs)
+		const t = this.t(f.t)
+		switch (f.kind) {
+			case "import":
+				const names = if (xs.length > 1) n([r.next(), " from "]) else null
+				return n(["import ", names, r.next()], "import")
+			case "test": return n(["test ", r.next(), " ", r.next()], "test")
+			case "var": return n([r.mods, t, " ", r.next(), r.opt(":", ": "), r.tags(), r.opt("=", " = ")], f.t.kind)
+			case "function", "method":
+				const name = if (f.kind == "function") n(["function ", r.next()]) else n([t])
+				const params = n([r.take("typeParams"), r.next()])
+				const sig = n([r.mods, name, params, r.opt(":", ": "), r.opt("throws", " throws "), r.tags()], "function")
+				if (!r.more()) {
+					return sig
+				}
+				const body = r.next()
+				for (const p of body.doc) {
+					if (p instanceof Body) {
+						p.short = true
+					}
+				}
+				return n([sig, " ", body], "function")
+			case "typeParams": return n(["[", this.items(parts, xs), "]"], "typeParams")
+			case "typeParam": return n([t, r.opt("extends", " extends "), r.opt("=", " = ")])
+			case "params": return if (f.t.kind == "(") n(["(", this.items(parts, xs), ")"]) else list(xs)
+			case "param": return n([r.next(), r.opt(":", ": "), r.opt("=", " = ")])
+			case "class":
+				const head = n([r.mods, t, " ", r.next(), r.take("typeParams")])
+				const sup = if (f.t.kind == "class") "implements" else "extends"
+				const supers = if (r.take(sup) == null) null else n([` ${sup} `, list(r.until(xs.length - 1))])
+				return n([head, supers, r.tags(), " {", r.next(), "}"], f.t.kind)
+			case "members": return n([this.lines(parts, true)])
+			case "type": return n([r.mods, "type ", r.next(), r.take("typeParams"), r.tags(), " = ", r.next()], "type")
+			case "block":
+				if (f.t.kind == "{") {
+					return n(["{", this.lines(parts, false), "}"])
+				}
+				const stmts = n([this.lines(parts, false)])
+				stmts.items = xs
+				return stmts
+			case "assign": return if (xs.length == 1) n([xs[0], t]) else n([xs[0], ` ${t} `, xs[1]])
+			case "if": return n(["if (", r.next(), ") ", r.next(), r.opt("else", " else ")])
+			case "for": return n(["for (", r.next(), " ", r.next(), " of ", r.next(), ") ", r.next()])
+			case "while": return n(["while (", r.next(), ") ", r.next()])
+			case "switch", "switchExpr":
+				const subject = r.next()
+				const cases: Part[] = []
+				for (const p of parts) {
+					if (p != subject) {
+						cases.push(p)
+					}
+				}
+				return n(["switch (", subject, ") {", this.lines(cases, false), "}"])
+			case "case":
+				const labels = list(r.until(xs.length - 1))
+				const head = if (f.t.kind == "default") n(["default:"]) else n(["case ", labels, ":"])
+				const body = r.next()
+				if (parent == "switchExpr") {
+					return n([head, " ", body])
+				}
+				const short = body.items.length == 1 && (body.doc[0] as Body).lines.length == 1
+				return if (short) n([head, " ", body.items[0]]) else n([head, body])
+			case "try":
+				const body = r.next()
+				const handler = r.take("catch")
+				const caught = if (handler == null) null else n([" ", handler])
+				return n(["try ", body, caught, r.opt("finally", " finally ")])
+			case "catch":
+				if (xs.length == 1) {
+					return n(["catch ", xs[0]], "catch")
+				}
+				return n(["catch (", r.next(), r.opt(":", ": "), ") ", r.next()], "catch")
+			case "jump": return if (xs.length == 0) n([t]) else n([t, " ", r.next(), r.opt("throws", " throws ")])
+			case "template":
+				const x = n([t, ...xs])
+				x.doc = flatten(x.doc)
+				return x
+			case "paren": return n(["(", xs[0], ")"])
+			case "unary":
+				const gap = keyword(f.t.kind) != null || f.t.kind == "-" && xs[0].doc[0] == "-"
+				return n([t, if (gap) " " else null, xs[0]])
+			case "postfix": return n([xs[0], t])
+			case "binary", "chain":
+				if (keyword(f.t.kind) != null) {
+					return n([xs[0], ` ${t} `, xs[1]], f.t.kind)
+				}
+				const chained = prec(f.t.kind) > 0 && prec(xs[0].kind) == prec(f.t.kind)
+				const g = if (chained) xs[0].doc[0] as Group else new Group(true, [xs[0].doc])
+				g.pieces.push([t + " ", ...xs[1].doc])
+				return n([g], f.t.kind)
+			case "member": return n([xs[0], t, xs[1]])
+			case "index": return n([xs[0], if (f.t.kind == "?.") "?.[" else "[", this.items(parts, xs.slice(1, xs.length)), "]"])
+			case "call": return n([xs[0], if (f.t.kind == "?.") "?.(" else "(", this.items(parts, xs.slice(1, xs.length)), ")"])
+			case "array": return n(["[", this.items(parts, xs), "]"])
+			case "object":
+				const items = this.items(parts, xs)
+				return if (xs.length == 0) n(["{}"]) else if (items.doc[0] instanceof Body) n(["{", items, "}"])
+					else n(["{ ", items, " }"])
+			case "prop": return n([r.mods, t, r.opt(":", ": "), r.tags(), r.opt("=", " = ")], "prop")
+			case "arrow": return n([r.next(), r.opt(":", ": "), " => ", r.next(), r.opt("throws", " throws ")])
+			case "ifExpr":
+				const head = n(["if (", xs[0], ") ", xs[1]]).doc
+				const rest = if (xs[2].kind == "if") (xs[2].doc[0] as Group).pieces else [xs[2].doc]
+				return n([new Group(false, [head, ["else ", ...rest[0]], ...rest.slice(1, rest.length)])], "if")
+			case "new": return n(["new ", xs[0], "(", this.items(parts, xs.slice(1, xs.length)), ")"])
+		}
+		return n([])
+	}
+
+	/// One per line with the comments among them, and where loose, gaps.
+	private lines(parts: Part[], loose: bool): Body {
+		const b = new Body()
+		let prev: Node | null = null
+		let lead: Doc[] = []
+		for (const p of parts) {
+			if (p instanceof Comment) {
+				if (p.trailing && prev != null && lead.length == 0) {
+					prev.doc.push(p)
+				} else {
+					lead.push([p])
+				}
+				continue
+			}
+			if (loose && prev != null) {
+				b.lines.push(new Gap(prev.kind != p.kind, lead.length))
+			}
+			for (const d of lead) {
+				b.lines.push(d)
+			}
+			lead = []
+			b.lines.push(p.doc)
+			prev = p
+		}
+		for (const d of lead) {
+			b.lines.push(d)
+		}
+		return b
+	}
+
+	/// Items xs of parts as list lays them out, but where comments are among them, one per line with the comments.
+	private items(parts: Part[], xs: Node[]): Node {
+		const kept: Part[] = []
+		for (const p of parts) {
+			if (p instanceof Comment || p instanceof Node && contains(xs, p)) {
+				kept.push(p)
+			}
+		}
+		if (kept.length == xs.length) {
+			return list(xs)
+		}
+		for (const x of xs.slice(0, xs.length - 1)) {
+			x.doc.push(",")
+		}
+		return n([this.lines(kept, false)])
+	}
+
+	private t(t: Tok): string { return this.src.slice(t.loc.pos, t.loc.end()) }
+}
+
+function n(parts: (Node | string | Body | Group | null)[], kind = ""): Node {
+	const x = new Node()
+	x.kind = kind
+	for (const p of parts) {
+		if (p instanceof Node) {
+			for (const q of p.doc) {
+				x.doc.push(q)
+			}
+		} else if (p != null) {
+			x.doc.push(p)
+		}
+	}
+	return x
+}
+
+/// The items apart by commas, filling lines.
+function list(xs: Node[]): Node {
+	const x = new Node()
+	if (xs.length > 0) {
+		const g = new Group(true, [])
+		for (const i of 0 ... xs.length - 1) {
+			g.pieces.push(if (i == xs.length - 1) xs[i].doc else [...xs[i].doc, ","])
+		}
+		x.doc = [g]
+	}
+	return x
+}
+
+/// Where p's first token is: its token's or, as parts go in source order, its first part's.
+function start(p: Tree | Tok): i32 {
+	if (p instanceof Tok) {
+		return p.loc.pos
+	}
+	return if (p.parts.length > 0 && start(p.parts[0]) < p.t.loc.pos) start(p.parts[0]) else p.t.loc.pos
+}
+
+function isModifier(k: string): bool { return k == "export" || k == "static" || k == "private" || k == "readonly" }
+function isDoc(p: Part): bool { return p instanceof Comment && p.text.length >= 3 && p.text.slice(0, 3) == "//!" }
+
+/// A template's groups on one line.
+function flatten(doc: Doc): Doc {
+	const out: Doc = []
+	for (const p of doc) {
+		if (!(p instanceof Group)) {
+			out.push(p)
+			continue
+		}
+		for (const piece of p.pieces) {
+			if (piece != p.pieces[0]) {
+				out.push(" ")
+			}
+			for (const q of flatten(piece)) {
+				out.push(q)
+			}
+		}
+	}
+	return out
+}
+
+/// The lines, each after a newline, with a blank one at a gap whose kinds differ or whose neighbours
+/// span several lines.
+function block(b: Body, depth: i32): string {
+	const text: string[] = []
+	for (const line of b.lines) {
+		text.push(if (line instanceof Gap) "" else tabs(depth + 1) + render(line, depth + 1))
+	}
+	let s = ""
+	let i = 0
+	for (const line of b.lines) {
+		if (!(line instanceof Gap)) {
+			s += "\n" + text[i]
+		} else if (line.differ || multi(text[i - 1]) || multi(text[i + 1 + line.leads])) {
+			s += "\n"
+		}
+		i++
+	}
+	return s
+}
+
+function render(doc: Doc, depth: i32): string {
+	const p = new Printer()
+	p.col = depth * Tab
+	p.doc(doc, depth, 0, false)
+	return p.s
+}
+
+class Printer {
+	s = ""
+	col = 0
+
+	/// Lays out doc on a line of depth, with after more columns up to where the line may next wrap.
+	doc(doc: Doc, depth: i32, after: i32, flat: bool) {
+		let broken = false
+		let i = 0
+		for (const p of doc) {
+			i++
+			if (p instanceof Body) {
+				const line = inline(p, depth, this.col)
+				if (line != null) {
+					this.text(line)
+					continue
+				}
+				this.s += block(p, depth)
+				broken = p.lines.length > 0
+				continue
+			}
+			if (broken) {
+				this.newline(depth)
+				broken = false
+			}
+			if (p instanceof Group) {
+				this.group(p, depth, rest(doc, i, after), flat)
+			} else if (p instanceof Comment) {
+				this.text(if (this.s == "") p.text else " " + p.text)
+			} else {
+				this.text(p)
+			}
+		}
+	}
+
+	/// A filling group keeps a piece on the line where wrapping it wouldn't make it fit either, and then
+	/// keeps the piece itself flat.
+	group(g: Group, depth: i32, after: i32, flat: bool) {
+		const fits = flat || this.col + width([g]) + after <= Width
+		let i = 0
+		for (const p of g.pieces) {
+			const tail = if (i == g.pieces.length - 1) after else 0
+			let keep = fits
+			if (i > 0) {
+				const w = width(p)
+				const room = this.col + 1 + w + tail <= Width
+				const helps = this.col + 1 + w > Width || (depth + 1) * Tab + w + tail <= Width
+				const wrap = !fits && (!g.fill || !room && helps)
+				keep = fits || !wrap && !room
+				if (wrap) {
+					this.newline(depth + 1)
+				} else {
+					this.text(" ")
+				}
+			}
+			this.doc(p, depth, tail, keep)
+			i++
+		}
+	}
+
+	text(t: string) {
+		this.s += t
+		this.col = advance(this.col, t)
+	}
+
+	newline(depth: i32) {
+		this.s += "\n" + tabs(depth)
+		this.col = depth * Tab
+	}
+}
+
+/// A short body's line as " line ", where it fits on one at col.
+function inline(b: Body, depth: i32, col: i32): string | null {
+	if (!b.short || b.lines.length != 1) {
+		return null
+	}
+	const line = b.lines[0] as Doc
+	for (const p of line) {
+		if (p instanceof Comment) {
+			return null
+		}
+	}
+	const s = " " + render(line, depth) + " "
+	return if (multi(s) || col + s.length + 1 > Width) null else s
+}
+
+/// The width of doc on one line, up to a body.
+function width(doc: Doc): i32 {
+	let w = 0
+	for (const p of doc) {
+		if (p instanceof Body) {
+			return w
+		}
+		if (p instanceof Group) {
+			for (const piece of p.pieces) {
+				w += width(piece) + 1
+			}
+			w--
+		} else if (!(p instanceof Comment)) {
+			w += p.length
+		}
+	}
+	return w
+}
+
+/// The width of doc from i up to a body, or else with after more past its end.
+function rest(doc: Doc, i: i32, after: i32): i32 {
+	let w = 0
+	for (const p of doc.slice(i, doc.length)) {
+		if (p instanceof Body) {
+			return w
+		}
+		w += width([p])
+	}
+	return w + after
+}
+
+function advance(col: i32, s: string): i32 {
+	let c = col
+	for (const ch of s) {
+		c = if (ch == lf) 0 else c + 1
+	}
+	return c
+}
+
+function multi(s: string): bool {
+	for (const ch of s) {
+		if (ch == lf) {
+			return true
+		}
+	}
+	return false
+}
+
+function tabs(n: i32): string {
+	let s = ""
+	while (s.length < n) {
+		s += "\t"
+	}
+	return s
+}
