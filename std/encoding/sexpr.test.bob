@@ -1,0 +1,42 @@
+import { encode } from "./sexpr"
+
+class Point {
+	x: i32
+	y: f64 = 0.5
+
+	constructor(x: i32) { this.x = x }
+}
+
+class Shape {
+	name = "box"
+	corners: Point[] = [new Point(1), new Point(-2)]
+	parent: Shape | null = null
+	kind: "open" | "closed" = "open"
+}
+
+test "scalars and strings" {
+	assert encode(null) == "null"
+	assert encode(true) == "true"
+	assert encode(-3) == "-3"
+	assert encode(255 as u8) == "255"
+	assert encode(1.25) == "1.25"
+	assert encode("a\nb") == `"a\\nb"`
+}
+
+test "arrays, objects and classes" {
+	assert encode([1, 2, 3]) == "[1 2 3]"
+	assert encode([] as i32[]) == "[]"
+	assert encode({ a: 1, b: "x" }) == `{a: 1 b: "x"}`
+	assert encode(new Point(3)) == "(Point x: 3 y: 0.5)"
+	assert encode(new Shape())
+		== `(Shape name: "box" corners: [(Point x: 1 y: 0.5) (Point x: -2 y: 0.5)] parent: null kind: "open")`
+}
+
+test "unions" {
+	const n: i32 | string = 3
+	const p: Point | null = new Point(1)
+	const k: "open" | "closed" = "closed"
+	assert encode(n) == "(i32 3)"
+	assert encode(p) == "(Point x: 1 y: 0.5)"
+	assert encode(k) == `"closed"`
+}

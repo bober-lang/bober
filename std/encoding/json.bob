@@ -1,11 +1,14 @@
 //! Values as JSON: a class, object or interface as an object of its fields in declaration order, an array, fixed
 //! array or tuple as an array, and a union's value untagged, which decoding reads as a member that fits, an integer
 //! if one does. Decoding is strict: no unknown keys, a class it makes takes no arguments, and fields left out keep
-//! their initial values. Tags on a field (spec 5.3) change its key, leave it out, or take the unknown keys.
+//! their initial values. Tags on a field (spec 5.3) change its key, leave it out, take the unknown keys, or
+//! hold an object as its entries; ../encoding's count too.
 
-import { backslash, colon, comma, cr, digit, dot, isControl, isDigit, lbrace, lbracket, lf, minus, nul, plus, quote, rbrace, rbracket,
-	slash, space, tab, zero } from "../ascii"
+import { backslash, colon, comma, cr, digit, dot, isControl, isDigit, lbrace, lbracket, lf, minus, nul, plus, quote,
+	rbrace, rbracket, slash, space, tab, zero } from "../ascii"
+
 import * as ascii from "../ascii"
+import * as encoding from "../encoding"
 import { parseFloat } from "../float"
 import { isFinite } from "../math"
 import { ParseError, parseInt, utf8 } from "../string"
@@ -13,15 +16,14 @@ import { Decodable, Float, has, Integral, tag } from "../types"
 
 /// Tags a field to encode and decode under the key K instead of its name.
 export class Name[K extends string] {}
-
 /// Tags a field to leave out of encoding and decoding.
 export class Skip {}
-
 /// Tags a field to leave out of encoding when it is empty: null, false, zero, "" or [].
 export class OmitEmpty {}
-
 /// Tags an Unknown[] field to take the keys no other field takes, and to encode them back.
 export class Rest {}
+/// Tags a [K, V][] field to hold an object as its entries, in order; a key twice fails decoding.
+export class Mapping {}
 
 /// A key and its value's text, as a Rest field holds them.
 export type Unknown = [string, string]
@@ -69,13 +71,29 @@ export function encode[T](v: T): string throws EncodeError {
 					for (const [k, text] of x) {
 						items.push(`${quoted(k)}:${text}`)
 					}
-				} else if (!has(f.tags, Skip) && !(has(f.tags, OmitEmpty) && empty(x))) {
-					items.push(`${quoted(tag(f.tags, Name, f.name))}:${encode(x)}`)
+				} else if (!encoding.omits(f.tags, Skip, OmitEmpty, x)) {
+					const k = quoted(encoding.key(f.tags, Name, f.name))
+					items.push(`${k}:${if (has(f.tags, Mapping)) entries(x) else encode(x)}`)
 				}
 			}
 			return `{${items.join(",")}}`
 		default: return quoted(t.name)
 	}
+}
+
+/// A Mapping field's entries as an object.
+function entries[T](xs: T): string throws EncodeError {
+	const items: string[] = []
+	switch (T.kind) {
+		case "array": for (const e of xs) {
+			const kv: string[] = []
+			for (const f of T.elem.fields) {
+				kv.push(encode(e[f.name]))
+			}
+			items.push(kv.join(":"))
+		}
+	}
+	return `{${items.join(",")}}`
 }
 
 export function decode[T extends Decodable](s: string): T throws ParseError {
@@ -88,26 +106,23 @@ export function decode[T extends Decodable](s: string): T throws ParseError {
 	return v
 }
 
-function empty[T](v: T): bool {
-	const t = typeof v
-	switch (t.kind) {
-		case "null": return true
-		case "bool": return !v
-		case "int": return v == 0
-		case "float": return v == 0.0
-		case "string", "array": return v.length == 0
-		case "union":
-			for (const M of t.members) {
-				if (v instanceof M) {
-					return empty(v)
-				}
-			}
-			return false
+/// Whether the JSON of a T may start with byte c.
+function starts[T](c: u8): bool {
+	switch (T.kind) {
+		case "null": return c == ascii.n
+		case "bool": return c == ascii.t || c == ascii.f
+		case "int", "float": return c == minus || isDigit(c)
+		case "string": return c == quote
+		case "literal": return starts[string](c) || starts[bool](c)
+		case "array", "fixed", "tuple": return c == lbracket
+		case "class": return c == lbrace
 		default: return false
 	}
 }
 
 const hex = "0123456789abcdef"
+/// The most arrays and objects decoding nests, as each takes a few KiB of a fiber's 1 MiB stack in a debug build.
+const maxDepth = 128
 
 /// s as a JSON string.
 export function quoted(s: string): string {
@@ -125,14 +140,15 @@ export function quoted(s: string): string {
 	return `"${q}"`
 }
 
-/// An object of any keys.
-class Keys {
+/// An object of any keys, each with its value's text for decode to read.
+export class Keys {
 	all: Unknown[] @Rest = []
 }
 
 class Decoder {
 	s: string
 	i = 0
+	depth = 0 // arrays and objects open
 
 	constructor(s: string) { this.s = s }
 
@@ -153,38 +169,45 @@ class Decoder {
 				}
 				return T.value
 			case "union":
-				// Integers first, as 1 fits a float too and the members are in canonical order (§4.4), not as written.
+				// The members the next byte may start, integers first, as 1 fits a float too and the members are in
+				// canonical order (§4.4), not as written; if none decodes, the last one's error.
+				const c = this.peek()
+				const depth = this.depth
+				let last: ParseError | null = null
 				for (const ints of [true, false]) {
 					for (const M of T.members) {
-						if ((M.kind == "int") == ints) {
+						if ((M.kind == "int") == ints && starts[M](c)) {
 							try {
 								return this.value[M]()
-							} catch {
+							} catch (e: ParseError) {
+								last = e
 								this.i = at
+								this.depth = depth
 							}
 						}
 					}
 				}
-				throw this.error()
+				throw last ?? this.error()
 			case "array":
 				const xs: T = []
-				this.expect(lbracket)
+				this.open(lbracket)
 				while (this.more(rbracket, xs.length)) {
 					xs.push(this.value[T.elem]())
 				}
 				return xs
 			case "fixed":
 				let fixed: T
-				this.expect(lbracket)
+				this.open(lbracket)
 				for (const i of 0 ... T.length - 1) {
 					this.comma(i)
 					fixed[i] = this.value[T.elem]()
 				}
 				this.close(rbracket)
+				this.depth--
 				return fixed
 			case "tuple":
 				const tuple = new T()
-				this.expect(lbracket)
+				this.open(lbracket)
 				let i = 0
 				for (const f of T.fields) {
 					this.comma(i)
@@ -192,10 +215,11 @@ class Decoder {
 					i++
 				}
 				this.close(rbracket)
+				this.depth--
 				return tuple
 			case "class":
 				const r = new T()
-				this.expect(lbrace)
+				this.open(lbrace)
 				let n = 0
 				while (this.more(rbrace, n)) {
 					const k = this.i
@@ -203,8 +227,9 @@ class Decoder {
 					this.close(colon)
 					let known = false
 					for (const f of T.fields) {
-						if (!has(f.tags, Skip) && !has(f.tags, Rest) && name == tag(f.tags, Name, f.name)) {
-							r[f.name] = this.value[f.type]()
+						if (!encoding.skips(f.tags, Skip) && !has(f.tags, Rest)
+								&& name == encoding.key(f.tags, Name, f.name)) {
+							r[f.name] = if (has(f.tags, Mapping)) this.entries[f.type]() else this.value[f.type]()
 							known = true
 						}
 					}
@@ -228,18 +253,62 @@ class Decoder {
 		}
 	}
 
+	/// An object as a Mapping field's entries.
+	entries[T extends Decodable](): T throws ParseError {
+		switch (T.kind) {
+			case "array":
+				const xs: T = []
+				const keys: string[] = []
+				this.space()
+				this.open(lbrace)
+				while (this.more(rbrace, xs.length)) {
+					const at = this.i
+					const key = this.string()
+					if (keys.includes(key)) {
+						throw new ParseError("syntax", at)
+					}
+					keys.push(key)
+					this.i = at
+					xs.push(this.entry[T.elem]())
+				}
+				return xs
+			default: throw this.error()
+		}
+	}
+
+	/// A key and its value as a tuple.
+	entry[T extends Decodable](): T throws ParseError {
+		switch (T.kind) {
+			case "tuple":
+				const e = new T()
+				let i = 0
+				for (const f of T.fields) {
+					if (i == 1) {
+						this.close(colon)
+					}
+					e[f.name] = this.value[f.type]()
+					i++
+				}
+				return e
+			default: throw this.error()
+		}
+	}
+
 	/// Moves past a value of any type.
 	skip() {
 		switch (this.peek()) {
 			case lbracket:
-				this.i++
+				this.open(lbracket)
 				let n = 0
 				while (this.more(rbracket, n)) {
 					this.skip()
 					n++
 				}
 			case lbrace: this.value[Keys]()
-			default: this.value[string | f64 | bool | null]()
+			case quote: this.string()
+			case ascii.t, ascii.f: this.bool()
+			case ascii.n: this.word("null")
+			default: this.number()
 		}
 	}
 
@@ -352,10 +421,20 @@ class Decoder {
 		return v
 	}
 
+	/// Moves past ch, which opens an array or object, unless maxDepth are open.
+	open(ch: u8) {
+		if (this.depth == maxDepth) {
+			throw new ParseError("range", this.i)
+		}
+		this.expect(ch)
+		this.depth++
+	}
+
 	/// Whether another item comes before close, past the comma that follows the nth.
 	more(close: u8, n: i32): bool {
 		this.space()
 		if (this.eat(close)) {
+			this.depth--
 			return false
 		}
 		this.comma(n)

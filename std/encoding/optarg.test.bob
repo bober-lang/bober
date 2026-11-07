@@ -1,0 +1,108 @@
+import * as encoding from "../encoding"
+import { Cc, decode, encode, EncodeError, Name, OmitEmpty, Optional, Rest, Short, Skip } from "./optarg"
+import { ParseError } from "../parse"
+
+class Flags {
+	v: bool = false
+	I: string[] = []
+	jobs: i32 @Short["j"] = 1
+	mode: "fast" | "safe" = "fast"
+	out: string | null = null
+	color: string @Optional = "never"
+	rest: string[] @Rest = []
+}
+
+class Gcc @Cc {
+	c: bool = false
+	emitLLVM: bool @Name["emit-llvm"] = false
+	O: u8 | "s" @Optional["2"] = 0
+	D: string[] = []
+	isystem: string[] = []
+	files: string[] @Rest = []
+}
+
+class Plain {
+	v: bool = false
+}
+
+class Nested {
+	plain = new Plain()
+}
+
+test "decode" {
+	const want = new Flags()
+	want.v = true
+	want.I = ["a", "b", "c"]
+	want.jobs = 3
+	want.mode = "safe"
+	want.out = ""
+	want.rest = ["x", "-v"]
+	assert decode[Flags](["-v", "-I", "a", "-Ib", "-vIc", "--jobs=3", "--mode", "safe", "--out=", "x", "-v"]) == want
+	assert decode[Flags](["-j4", "--", "-v"]).jobs == 4
+	assert decode[Flags](["--", "-v"]).rest == ["-v"]
+	assert decode[Flags](["-", "-v"]).rest == ["-", "-v"]
+	assert !decode[Flags](["-"]).v
+	assert decode[Flags](["--color"]).color == ""
+	assert decode[Flags](["--color=always", "x"]).color == "always"
+}
+
+test "decode as cc" {
+	const f = decode[Gcc](["a.c", "-c", "-O", "-Dx=1", "-emit-llvm", "-isystem", "d", "-Wall", "-D", "y", "b.o", "--",
+		"-c"])
+	assert f.c && f.emitLLVM && f.O == 2
+	assert f.D == ["x=1", "y"]
+	assert f.isystem == ["d"]
+	assert f.files == ["a.c", "-Wall", "b.o", "-c"]
+	assert encode(f)
+		== ["-c", "-emit-llvm", "-O2", "-D", "x=1", "-D", "y", "-isystem", "d", "--", "a.c", "-Wall", "b.o", "-c"]
+	assert decode[Gcc](["-O3"]).O == 3
+	assert decode[Gcc](["-Os"]).O == "s"
+	assert decode[Gcc](["-O", "2"]).files == ["2"]
+	assert decode[Gcc](["-coverage", "-cO"]).files == ["-coverage", "-cO"]
+	assert decode[Gcc](["-isystem"]) throws new ParseError("syntax", 0)
+}
+
+class Tags {
+	a: i32 @Name["all"] @encoding.Name["x"] = 1
+	b: i32 @encoding.Name["both"] = 2
+	c: i32 @encoding.Skip = 3
+	d: i32 @Skip = 4
+	e: string @encoding.OmitEmpty = ""
+	f: string @OmitEmpty = ""
+}
+
+test "optarg's own tags over ../encoding's" {
+	assert encode(new Tags()) == ["--all", "1", "--both", "2"]
+	const t = decode[Tags](["--all", "4", "--both=5", "-e", "x"])
+	assert t.a == 4 && t.b == 5 && encode(t) == ["--all", "4", "--both", "5", "-e", "x"]
+	assert decode[Tags](["--x", "4"]) throws new ParseError("syntax", 0)
+	assert decode[Tags](["-c", "4"]) throws new ParseError("syntax", 0)
+	assert decode[Tags](["-d", "4"]) throws new ParseError("syntax", 0)
+}
+
+test "decode errors" {
+	assert decode[Flags](["-x"]) throws new ParseError("syntax", 0)
+	assert decode[Flags](["-vx"]) throws new ParseError("syntax", 0)
+	assert decode[Flags](["-v-j3"]) throws new ParseError("syntax", 0)
+	assert decode[Flags](["--v"]) throws new ParseError("syntax", 0)
+	assert decode[Flags](["--mode=slow"]) throws new ParseError("syntax", 0)
+	assert decode[Flags](["--rest", "a"]) throws new ParseError("syntax", 0)
+	assert decode[Flags](["-v", "-I"]) throws new ParseError("syntax", 1)
+	assert decode[Flags](["-j", "x"]) throws new ParseError("syntax", 1)
+	assert decode[Flags](["--jobs=99999999999"]) throws new ParseError("range", 0)
+	assert decode[Plain](["a"]) throws new ParseError("syntax", 0)
+}
+
+test "encode" {
+	const f = new Flags()
+	f.I = ["a", "b c"]
+	f.rest = ["-x", "y"]
+	assert encode(f) == ["-I", "a", "-I", "b c", "--jobs", "1", "--mode", "fast", "--color=never", "--", "-x", "y"]
+	f.v = true
+	f.out = "o"
+	f.rest = ["x"]
+	const args = encode(f)
+	assert args == ["-v", "-I", "a", "-I", "b c", "--jobs", "1", "--mode", "fast", "--out", "o", "--color=never", "x"]
+	assert encode(decode[Flags](args)) == args
+	assert encode(new Nested()) throws new EncodeError("--plain")
+}

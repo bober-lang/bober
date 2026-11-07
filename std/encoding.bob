@@ -1,0 +1,43 @@
+//! Field tags every format in std/encoding reads, besides its own of the same names. A format's own Name wins, as
+//! `json.Name` over `encoding.Name` in JSON; Skip and OmitEmpty count if either is on a field. Tag a field with these
+//! where all formats agree, and with a format's own where one differs.
+
+import { has, tag } from "./types"
+
+/// Tags a field to encode and decode under the key K instead of its name.
+export class Name[K extends string] {}
+/// Tags a field to leave out of encoding and decoding.
+export class Skip {}
+/// Tags a field to leave out of encoding when it is empty: null, false, zero, "" or [].
+export class OmitEmpty {}
+
+/// The key of a field of tags and name, in a format whose own Name tag is N.
+export function key(tags: Type[], N: Type, name: string): string { return tag(tags, N, tag(tags, Name, name)) }
+
+/// Whether a field of tags is left out, in a format whose own Skip tag is S.
+export function skips(tags: Type[], S: Type): bool { return has(tags, S) || has(tags, Skip) }
+
+/// Whether a field of tags holding v is left out of encoding, in a format whose own tags are S and O.
+export function omits[T](tags: Type[], S: Type, O: Type, v: T): bool {
+	return skips(tags, S) || (has(tags, O) || has(tags, OmitEmpty)) && empty(v)
+}
+
+/// Whether v is empty: null, false, zero, "" or [].
+function empty[T](v: T): bool {
+	const t = typeof v
+	switch (t.kind) {
+		case "null": return true
+		case "bool": return !v
+		case "int": return v == 0
+		case "float": return v == 0.0
+		case "string", "array": return v.length == 0
+		case "union":
+			for (const M of t.members) {
+				if (v instanceof M) {
+					return empty(v)
+				}
+			}
+			return false
+		default: return false
+	}
+}

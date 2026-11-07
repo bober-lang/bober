@@ -2,8 +2,9 @@
 //! Documents are UTF-8 and are not validated. Of the DOCTYPE only the internal subset's general entities are read; a
 //! reference to an external entity, or to one an external declaration could declare, is left out.
 //! As a value, a class is an element with a child element per field in order, an array field one per item and a null
-//! one none; a scalar is its element's text. Tags make a field an attribute, the text, rename it or skip it. Decoding
-//! is strict and takes a union's member as json's does, and ignores whitespace between a class's children.
+//! one none; a scalar is its element's text. Tags make a field an attribute, the text, rename it, skip it or leave it
+//! out when empty, and ../encoding's count too. Decoding is strict and takes a union's member as json's does, and
+//! ignores whitespace between a class's children.
 
 import { indexOf, occurs, startsWith } from "../algo"
 import { ampersand as amp, colon, digit, dot, greater, isAlphanumeric, isDigit, less, minus, quote,
@@ -141,13 +142,17 @@ export class Text {}
 export class Name[K extends string] {}
 /// Tags a field to leave out of encoding and decoding.
 export class Skip {}
+/// ../encoding's OmitEmpty, for XML alone.
+export class OmitEmpty {}
 
-export function encode[T](v: T): string { return serialize(element(tag((typeof v).tags, Name, (typeof v).name), v)) }
+export function encode[T](v: T): string {
+	return serialize(element(encoding.key((typeof v).tags, Name, (typeof v).name), v))
+}
 
 export function decode[T extends Decodable](s: string, limit = defaultLimit): T throws ParseError {
 	for (const n of parse(s, limit).children) {
 		if (n.kind == "element") {
-			if (T.kind != "union" && n.name != tag(T.tags, Name, T.name)) {
+			if (T.kind != "union" && n.name != encoding.key(T.tags, Name, T.name)) {
 				throw new ParseError("syntax", n.at)
 			}
 			return value[T](n)
@@ -945,8 +950,8 @@ function element[T](n: string, v: T): Node {
 			}
 		}
 		case "class", "object", "interface": for (const f of t.fields) {
-			const k = tag(f.tags, Name, f.name)
-			if (has(f.tags, Skip)) {
+			const k = encoding.key(f.tags, Name, f.name)
+			if (encoding.omits(f.tags, Skip, OmitEmpty, v[f.name])) {
 				continue
 			} else if (has(f.tags, Attr)) {
 				const s = format(v[f.name])
@@ -1018,7 +1023,8 @@ function value[T extends Decodable](n: Node): T throws ParseError {
 			for (const a of n.attrs) {
 				let known = a.ns == xmlnsNS
 				for (const f of T.fields) {
-					if (has(f.tags, Attr) && !has(f.tags, Skip) && a.name == tag(f.tags, Name, f.name)) {
+					if (has(f.tags, Attr) && !encoding.skips(f.tags, Skip)
+							&& a.name == encoding.key(f.tags, Name, f.name)) {
 						r[f.name] = scalar[f.type](a.value, n.at)
 						known = true
 					}
@@ -1030,14 +1036,16 @@ function value[T extends Decodable](n: Node): T throws ParseError {
 			for (const c of n.children) {
 				let known = c.kind == "comment" || c.kind == "instruction" || c.kind == "text" && trim(c.data) == ""
 				for (const f of T.fields) {
-					if (has(f.tags, Text) && f.type == string) {
+					if (encoding.skips(f.tags, Skip)) {
+						continue
+					} else if (has(f.tags, Text) && f.type == string) {
 						if (c.kind == "text") {
 							const t: string = r[f.name]
 							r[f.name] = t + c.data
 							known = true
 						}
-					} else if (!has(f.tags, Attr) && !has(f.tags, Skip)) {
-						if (c.kind == "element" && c.name == tag(f.tags, Name, f.name)) {
+					} else if (!has(f.tags, Attr)) {
+						if (c.kind == "element" && c.name == encoding.key(f.tags, Name, f.name)) {
 							if (f.type.kind == "array") {
 								const xs: f.type = r[f.name]
 								xs.push(value[f.type.elem](c))

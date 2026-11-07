@@ -1,14 +1,22 @@
 //! Values as INI: plain fields as `key = value`, class fields as [sections], arrays as repeated keys.
-//! Decoding is strict as json's; a Rest field takes the unknown keys, an unknown section's under its path.
+//! Decoding is strict as json's; a Rest field takes the unknown keys, an unknown section's under its path. Fields take
+//! ../encoding's tags too.
 
 import { dot, equal, hash, isControl, isSpace, lbracket, lf, quote, rbracket, semicolon } from "../ascii"
 import { Set } from "../collections/set"
+import * as encoding from "../encoding"
 import * as json from "./json"
 import { Unknown } from "./json"
 import { isFinite } from "../math"
 import { ParseError, lower } from "../string"
 import { Decodable, has, New } from "../types"
 
+/// ../encoding's Name, for INI alone.
+export class Name[K extends string] {}
+/// ../encoding's Skip, for INI alone.
+export class Skip {}
+/// ../encoding's OmitEmpty, for INI alone.
+export class OmitEmpty {}
 /// Tags an Unknown[] field to take the keys no other field takes, and to encode them back.
 export class Rest {}
 
@@ -68,8 +76,8 @@ function section[T](v: T, path: string): string throws EncodeError {
 					for (const [k, text] of v[f.name]) {
 						keys.push(`${k} = ${text}\n`)
 					}
-				} else {
-					field(keys, sections, path, f.name, v[f.name])
+				} else if (!encoding.omits(f.tags, Skip, OmitEmpty, v[f.name])) {
+					field(keys, sections, path, encoding.key(f.tags, Name, f.name), v[f.name])
 				}
 			}
 		default: throw new EncodeError(path)
@@ -111,7 +119,7 @@ function value[T](v: T, path: string): string throws EncodeError {
 				return `${v}`
 			}
 		case "string": return if (plain(v)) v else json.quoted(v)
-		case "literal": return value[string | bool | null](t.value, path)
+		case "literal": return value[string | bool | i64 | null](t.value, path)
 		case "union":
 			for (const M of t.members) {
 				if (v instanceof M) {
@@ -164,7 +172,8 @@ class Decoder {
 					return v
 				}
 				for (const f of T.fields) {
-					if (path[i] == f.name && !has(f.tags, Rest)) {
+					if (path[i] == encoding.key(f.tags, Name, f.name)
+							&& !encoding.skips(f.tags, Skip) && !has(f.tags, Rest)) {
 						v[f.name] = this.walk[f.type](v[f.name], path, i + 1, key, at)
 						return v
 					}
