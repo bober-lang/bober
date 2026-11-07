@@ -1,0 +1,203 @@
+//! TLS on a std/net Conn, by Mbed TLS (std/tls/tls.h): a client's, the peer's certificate checked against roots and
+//! host, or a server's with a certificate of its own. A failure throws an IoError: the socket's, or one of kind Tls
+//! whose code is Mbed TLS's.
+
+import { fromCBytes, fromCString } from "./c"
+import { HashMap } from "./collections/hashmap"
+import { readFile } from "./fs"
+import { IoError, ReadWriter, failure } from "./io"
+import * as net from "./net"
+import { endsWith } from "./string"
+import { Signal } from "../builtin/fiber"
+import { free, malloc } from "stdlib.h"
+
+import { MBEDTLS_ERR_NET_RECV_FAILED, MBEDTLS_ERR_NET_SEND_FAILED, bober_tls_alpn, bober_tls_alpn_of, bober_tls_chain,
+	bober_tls_close, bober_tls_errno, bober_tls_error, bober_tls_free, bober_tls_handshake, bober_tls_new, bober_tls_own,
+	bober_tls_read, bober_tls_shutdown, bober_tls_trust, bober_tls_write } from "./tls/tls.h"
+
+export class Config {
+	/// PEM roots a client trusts; null is the system's, /etc/ssl/certs/ca-certificates.crt.
+	roots: string | null = null
+	/// A server's PEM chain and key.
+	cert: string | null = null
+	key: string | null = null
+	/// The protocols offered, or accepted, in order of preference.
+	alpn: string[] = []
+	/// Trusts any certificate.
+	insecure = false
+}
+
+export class Conn implements ReadWriter {
+	/// The protocol agreed on, or null.
+	readonly alpn: string | null
+	/// For each read and write; the socket's at first.
+	timeout: i64
+	private c: net.Conn
+	private t: u64
+	private what: string
+	private busy = 0
+	private closed = false
+	private reads = new Lane()
+	private writes = new Lane()
+
+	constructor(c: net.Conn, t: u64, what: string) {
+		this.c = c
+		this.t = t
+		this.what = what
+		this.timeout = c.timeout
+		const p = bober_tls_alpn_of(t)
+		this.alpn = if (p == 0) null else fromCString(p)
+	}
+
+	/// Up to n > 0 bytes, or null once the peer has closed; a peer gone without saying so is ConnectionReset.
+	read(n: i32): string | null throws IoError {
+		const p = malloc(n as u64)
+		try {
+			const got = this.call(this.reads, t => bober_tls_read(t, p, n as u64, this.timeout), "read")
+			return if (got == 0) null else fromCBytes(p, got as u64)
+		} finally {
+			free(p)
+		}
+	}
+
+	/// Sends all of s. Once a write has failed, every one after fails the same, as Go's: the record it left is half sent.
+	write(s: string) throws IoError {
+		this.call(this.writes, t => bober_tls_write(t, s, s.length as u64, this.timeout), "write")
+	}
+
+	/// Tells the peer the connection is closing, after the writes in flight; it reads an end.
+	shutdown() throws IoError { this.call(this.writes, t => bober_tls_shutdown(t, this.timeout), "shutdown") }
+
+	/// Tells the peer, as shutdown does, then ends the reads and writes in flight, which wake to an end or an error,
+	/// and closes the socket once they have; again, nothing.
+	close() throws IoError {
+		if (!this.closed) {
+			this.closed = true
+			this.busy += 1  // the telling parks, and a read that wakes meanwhile must not free the context
+			bober_tls_close(this.t, this.timeout)
+			this.busy -= 1
+			this.release()
+		}
+	}
+
+	/// f's result on the context, in its turn on lane; close frees the context once no call is in it.
+	private call(lane: Lane, f: (t: u64) => i32, op: string): i32 throws IoError {
+		lane.take()
+		try {
+			if (this.closed) {
+				throw new IoError("BadResource", op, this.what)
+			}
+			this.busy += 1
+			const r = f(this.t)
+			const e = if (r < 0) fail(r, op, this.t, this.what) else null
+			this.busy -= 1
+			this.release()
+			if (e != null) {
+				throw e
+			}
+			return r
+		} finally {
+			lane.drop()
+		}
+	}
+
+	private release() throws IoError {
+		if (this.closed && this.busy == 0) {
+			bober_tls_free(this.t)
+			this.t = 0
+			this.c.close()
+		}
+	}
+}
+
+/// One fiber at a time in Mbed TLS's reads, and one in its writes: a second call while the first is parked in a BIO
+/// would go on from the record it left half sent, or half read.
+class Lane {
+	private held = false
+	private freed = new Signal()
+
+	take() {
+		while (this.held) {
+			this.freed.wait()
+		}
+		this.held = true
+	}
+
+	drop() {
+		this.held = false
+		this.freed.wake()
+	}
+}
+
+/// A client's connection over c to host, whose certificate is checked against cfg's roots; a trailing dot, which
+/// names the root, is neither sent nor checked.
+export function client(c: net.Conn, host: string, cfg: Config = new Config()): Conn throws IoError {
+	return context(c, false, cfg, host, t => {
+		bober_tls_trust(t, if (cfg.insecure) 0 else roots(cfg.roots, host))
+		return handshake(c, t, if (endsWith(host, ".")) host.slice(0, host.length - 1) else host, host)
+	})
+}
+
+/// A server's connection over c, with cfg's certificate.
+export function server(c: net.Conn, cfg: Config): Conn throws IoError {
+	const what = `${c.remote}`
+	return context(c, true, cfg, what, t => {
+		const cert = cfg.cert ?? ""
+		const key = cfg.key ?? ""
+		check(bober_tls_own(t, cert, (cert.length + 1) as u64, key, (key.length + 1) as u64), "certificate", t, what)
+		return handshake(c, t, null, what)
+	})
+}
+
+/// What f makes of a context on c, with cfg's protocols; freed if f throws.
+function context(c: net.Conn, server: bool, cfg: Config, what: string, f: (t: u64) => Conn throws IoError): Conn throws IoError {
+	const t = bober_tls_new(c.fd, if (server) 1 else 0)
+	if (t == 0) {
+		throw new IoError("OutOfResources", "tls", what)
+	}
+	try {
+		for (const p of cfg.alpn) {
+			check(bober_tls_alpn(t, p), "alpn", t, what)
+		}
+		return f(t)
+	} catch (e: IoError) {
+		bober_tls_free(t)
+		throw e
+	}
+}
+
+function handshake(c: net.Conn, t: u64, host: string | null, what: string): Conn throws IoError {
+	check(bober_tls_handshake(t, host ?? (0 as u64), c.timeout), "handshake", t, what)
+	return new Conn(c, t, what)
+}
+
+/// The chains parsed, by their PEM, "" for the system's; a parse is slow, and a chain is read-only, so one serves
+/// every connection.
+let chains = new HashMap[string, u64]()
+
+function roots(pem: string | null, what: string): u64 throws IoError {
+	const key = pem ?? ""
+	const known = chains.get(key)
+	if (known != null) {
+		return known
+	}
+	const text = pem ?? readFile("/etc/ssl/certs/ca-certificates.crt")
+	const out = new u64[](1)
+	check(bober_tls_chain(text, (text.length + 1) as u64, out), "roots", 0, what)
+	chains.set(key, out[0])
+	return out[0]
+}
+
+function check(r: i32, op: string, t: u64, what: string) throws IoError {
+	if (r < 0) {
+		throw fail(r, op, t, what)
+	}
+}
+
+/// What Mbed TLS's code r from op means: the socket's error, or one of kind Tls.
+function fail(r: i32, op: string, t: u64, what: string): IoError {
+	if (t != 0 && (r == MBEDTLS_ERR_NET_RECV_FAILED || r == MBEDTLS_ERR_NET_SEND_FAILED)) {
+		return failure(-(bober_tls_errno(t) as i64), op, what)
+	}
+	return new IoError("Tls", op, `${what}: ${fromCString(bober_tls_error(r))}`)
+}

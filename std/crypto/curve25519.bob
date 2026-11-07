@@ -1,0 +1,49 @@
+//! Signatures with Ed25519 and key agreement with X25519, by Monocypher. Keys are raw bytes: an Ed25519 key pair is
+//! its 32-byte seed, an X25519 secret is any 32 bytes, as from random.bytes(32).
+
+import { CryptoError, sized } from "./error"
+import { crypto_wipe, crypto_x25519, crypto_x25519_public_key } from "../../vendor/monocypher/monocypher.h"
+import { crypto_ed25519_check, crypto_ed25519_key_pair,
+	crypto_ed25519_sign } from "../../vendor/monocypher/monocypher-ed25519.h"
+
+export function ed25519PublicKey(seed: string): string throws CryptoError {
+	sized(seed, 32, "seed")
+	const pub = new u8[](32)
+	const secret = new u8[](64)
+	crypto_ed25519_key_pair(secret, pub, seed)
+	crypto_wipe(secret, 64)
+	return fromBytes(pub)
+}
+
+/// The 64-byte signature of msg by the key of seed.
+export function ed25519Sign(seed: string, msg: string): string throws CryptoError {
+	sized(seed, 32, "seed")
+	const secret = new u8[](64)
+	crypto_ed25519_key_pair(secret, new u8[](32), seed)
+	const sig = new u8[](64)
+	crypto_ed25519_sign(sig, secret, msg, msg.length as u64)
+	crypto_wipe(secret, 64)
+	return fromBytes(sig)
+}
+
+/// Whether sig is msg's by the key whose public key is pub.
+export function ed25519Verify(pub: string, msg: string, sig: string): bool throws CryptoError {
+	sized(pub, 32, "public key")
+	return sig.length == 64 && crypto_ed25519_check(sig, pub, msg, msg.length as u64) == 0
+}
+
+export function x25519PublicKey(secret: string): string throws CryptoError {
+	sized(secret, 32, "secret")
+	const pub = new u8[](32)
+	crypto_x25519_public_key(pub, secret)
+	return fromBytes(pub)
+}
+
+/// The 32 bytes secret shares with the holder of pub, for a KDF to make keys of.
+export function x25519(secret: string, pub: string): string throws CryptoError {
+	sized(secret, 32, "secret")
+	sized(pub, 32, "public key")
+	const shared = new u8[](32)
+	crypto_x25519(shared, secret, pub)
+	return fromBytes(shared)
+}
