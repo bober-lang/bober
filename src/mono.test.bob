@@ -1,0 +1,425 @@
+import { bits } from "../std/float"
+import * as decl from "./bc/decl"
+import { F64, I32, Int, None, Null, String, Type, U8 } from "./bc/kind"
+import * as kind from "./bc/kind"
+import * as op from "./bc/op"
+import { Code, Program } from "./bc/program"
+import { qualified, showCode, showType } from "./bc/show"
+import { mono } from "./mono"
+
+function fn(p: Program, params: i32[], result: i32): i32 { return p.type(kind.Func, p.list(params), result) }
+
+/// A decl of module m in owner, -1 for none, of type t and code c, generic over params if any are named.
+function add(p: Program, m: i32, owner: i32, name: string, k: decl.Kind, t: i32, c: Code | null = null, params: string[] = []): i32 {
+	const d = p.decl(m, owner, name, k)
+	p.decls[d].type = t
+	p.decls[d].code = c
+	p.decls[d].params = params.map(x => ({ name: p.intern(x), constraint: 0, fallback: 0 }))
+	if (owner < 0) {
+		p.modules[m].decls.push(d)
+	}
+	if (k == decl.Var && owner < 0) {
+		p.modules[m].inits.push(d)
+	}
+	return d
+}
+
+/// Code of the locals, named and typed, and ops, each an opcode and its immediates.
+function code(p: Program, locals: [string, i32][], ops: i32[][]): Code {
+	const c = new Code()
+	for (const [name, t] of locals) {
+		c.local(p.intern(name), t)
+	}
+	for (const o of ops) {
+		c.add(o[0] as op.Opcode, o.at(1) ?? 0, o.at(2) ?? 0, o.at(3) ?? 0)
+	}
+	return c
+}
+
+/// Module m as mono leaves it: each decl it lists, then its members.
+function out(p: Program, m: i32): string { return p.modules[m].decls.map(d => entry(p, d)).join("") }
+
+function entry(p: Program, d: i32): string {
+	const x = p.decls[d]
+	const mods = if ((x.mods & decl.Export) != 0) "export " else ""
+	return `${mods}${decl.names[x.kind]} ${qualified(p, d)}${if (x.type == 0) "" else ": " + showType(p, x.type)}\n`
+		+ (if (x.code == null) "" else showCode(p, x.code!)) + x.members.map(y => entry(p, y)).join("")
+}
+
+/// `function id[T](x: T): T { return x }` and a main calling it with an i32 and a string.
+test "a generic function gets an instance per type arg" {
+	const p = new Program()
+	const m = p.addModule("main")
+	const id = add(p, m, -1, "id", decl.Function, 0, code(p, [], []), ["T"])
+	const t = p.type(kind.Param, id, 0)
+	p.decls[id].type = fn(p, [t], t)
+	p.decls[id].code = code(p, [["x", t]], [[op.Local, 0], [op.Return], [op.End]])
+	add(p, m, -1, "main", decl.Function, fn(p, [], I32), code(p, [], [
+		[op.Int, I32, p.int(1)], [op.Call, id, p.list([I32])], [op.Drop],
+		[op.Str, p.intern("a")], [op.Call, id, p.list([String])], [op.Drop],
+		[op.Int, I32, p.int(0)], [op.Return], [op.End]]))
+	mono(p, m)
+	assert out(p, m) == `function id[i32]: (i32) => i32
+	locals x: i32
+	Local 0
+	Return
+End
+function id[string]: (string) => string
+	locals x: string
+	Local 0
+	Return
+End
+function main: () => i32
+	Int i32 1
+	Call id[i32]
+	Drop
+	Str "a"
+	Call id[string]
+	Drop
+	Int i32 0
+	Return
+End
+`
+}
+
+test "an untyped constant cast to a union takes its first number type, whatever the union's order" {
+	const p = new Program()
+	const m = p.addModule("main")
+	const u = p.union([U8, Null, I32])
+	add(p, m, -1, "main", decl.Function, fn(p, [], I32), code(p, [], [
+		[op.Int, Int, p.int(3)], [op.Cast, u], [op.Drop], [op.Int, I32, p.int(0)], [op.Return], [op.End]]))
+	mono(p, m)
+	assert out(p, m) == `function main: () => i32
+	Int i32 3
+	Cast ${showType(p, u)}
+	Drop
+	Int i32 0
+	Return
+End
+`
+}
+
+/// `class Box[T] { item: T; get(): T { return this.item } }`, and a main making a Box[i32] and getting its item.
+test "a generic class gets an instance with its members" {
+	const p = new Program()
+	const m = p.addModule("main")
+	const box = add(p, m, -1, "Box", decl.Class, 0, null, ["T"])
+	const t = p.type(kind.Param, box, 0)
+	const item = add(p, m, box, "item", decl.Var, t)
+	add(p, m, box, "get", decl.Function, fn(p, [], t),
+		code(p, [["this", p.type(kind.Named, box, p.list([t]))]], [[op.Local, 0], [op.Member, item], [op.Return], [op.End]]))
+	const b = p.type(kind.Named, box, p.list([I32]))
+	add(p, m, -1, "main", decl.Function, fn(p, [], I32), code(p, [["b", b]], [
+		[op.New, b], [op.SetLocal, 0], [op.Local, 0], [op.Int, I32, p.int(7)], [op.SetMember, item],
+		[op.Local, 0], [op.CallMethod, p.intern("get"), 0], [op.Return], [op.End]]))
+	mono(p, m)
+	assert out(p, m) == `class Box[i32]
+var Box[i32].item: i32
+function Box[i32].get: () => i32
+	locals this: Box[i32]
+	Local 0
+	Member Box[i32].item
+	Return
+End
+function main: () => i32
+	locals b: Box[i32]
+	New Box[i32]
+	SetLocal 0
+	Local 0
+	Int i32 7
+	SetMember Box[i32].item
+	Local 0
+	Call Box[i32].get
+	Return
+End
+`
+}
+
+/// `function describe[T](x: T): string`, which is "an int" for an int and its fields' names joined for another type,
+/// by a switch on T.kind, its subject a const, and a for over T.fields.
+test "what is known folds per instance" {
+	const p = new Program()
+	const m = p.addModule("main")
+	const pair = add(p, m, -1, "Pair", decl.Class, 0)
+	add(p, m, pair, "a", decl.Var, I32)
+	add(p, m, pair, "b", decl.Var, String)
+	const describe = add(p, m, -1, "describe", decl.Function, 0, null, ["T"])
+	const t = p.type(kind.Param, describe, 0)
+	p.decls[describe].type = fn(p, [t], String)
+	const field = p.type(kind.Object, p.list([String, Type]), p.nameList([p.intern("name"), 0, p.intern("type"), 0]))
+	const c = code(p, [["x", t], ["s", String], ["k", String], ["f", field]], [
+		[op.Type, t], [op.Field, p.intern("kind")], [op.SetLocal, 2],
+		[op.Local, 2], [op.Str, p.intern("int")], [op.Eq], [op.If, None],
+		[op.Str, p.intern("an int")], [op.Return],
+		[op.Else],
+		[op.Type, t], [op.Field, p.intern("fields")], [op.Each, 3],
+		[op.Local, 1], [op.Local, 3], [op.Field, p.intern("name")], [op.Add], [op.SetLocal, 1],
+		[op.End],
+		[op.Local, 1], [op.Return],
+		[op.End],
+		[op.Unreachable], [op.End]])
+	c.locals[2].mods = decl.Readonly
+	c.locals[3].mods = decl.Readonly
+	p.decls[describe].code = c
+	const pt = p.type(kind.Named, pair, 0)
+	add(p, m, -1, "main", decl.Function, fn(p, [], I32), code(p, [], [
+		[op.Int, I32, p.int(1)], [op.Call, describe, p.list([I32])], [op.Drop],
+		[op.New, pt], [op.Call, describe, p.list([pt])], [op.Drop],
+		[op.Int, I32, p.int(0)], [op.Return], [op.End]]))
+	mono(p, m)
+	assert out(p, m) == `class Pair
+var Pair.a: i32
+var Pair.b: string
+function describe[i32]: (i32) => string
+	locals x: i32, s: string, readonly k: string, readonly f: none
+	Str "int"
+	SetLocal 2
+	Block none
+		Str "an int"
+		Return
+	End
+	Unreachable
+End
+function describe[Pair]: (Pair) => string
+	locals x: Pair, s: string, readonly k: string, readonly f: none
+	Str "class"
+	SetLocal 2
+	Block none
+		Block none
+			Local 1
+			Str "a"
+			Add
+			SetLocal 1
+		End
+		Block none
+			Local 1
+			Str "b"
+			Add
+			SetLocal 1
+		End
+		Local 1
+		Return
+	End
+	Unreachable
+End
+function main: () => i32
+	Int i32 1
+	Call describe[i32]
+	Drop
+	New Pair
+	Call describe[Pair]
+	Drop
+	Int i32 0
+	Return
+End
+`
+}
+
+/// A class of m with a method area() returning v.
+function shape(p: Program, m: i32, name: string, v: f64): i32 {
+	const d = add(p, m, -1, name, decl.Class, 0)
+	add(p, m, d, "area", decl.Function, fn(p, [], F64),
+		code(p, [["this", p.type(kind.Named, d, 0)]], [[op.Float, F64, p.int(bits(v) as i64)], [op.Return], [op.End]]))
+	return d
+}
+
+/// `interface Shape { area(): f64 }`, implemented by two classes, and a main calling area through a Shape.
+test "an interface is the union of the classes converted to it" {
+	const p = new Program()
+	const m = p.addModule("main")
+	const iface = add(p, m, -1, "Shape", decl.Interface, 0)
+	add(p, m, iface, "area", decl.Function, fn(p, [], F64))
+	const s = p.type(kind.Named, iface, 0)
+	const ops: i32[][] = []
+	for (const c of [shape(p, m, "Square", 1.0), shape(p, m, "Circle", 3.0)]) {
+		ops.append([[op.New, p.type(kind.Named, c, 0)], [op.Cast, s], [op.SetLocal, 0],
+			[op.Local, 0], [op.CallMethod, p.intern("area"), 0], [op.Drop]])
+	}
+	ops.append([[op.Int, I32, p.int(0)], [op.Return], [op.End]])
+	add(p, m, -1, "main", decl.Function, fn(p, [], I32), code(p, [["s", s]], ops))
+	mono(p, m)
+	const u = p.decls[p.modules[m].decls[2]].code!.locals[0].type
+	const [first, second] = if (showType(p, u) == "Square | Circle") ["Square", "Circle"] else ["Circle", "Square"]
+	const branch = (c: string) => `	Local 0
+	Is ${c}
+	If none
+		Local 0
+		Cast ${c}
+		Call ${c}.area
+		Return
+	End
+`
+	assert out(p, m) == `class Square
+function Square.area: () => f64
+	locals this: Square
+	Float f64 1
+	Return
+End
+class Circle
+function Circle.area: () => f64
+	locals this: Circle
+	Float f64 3
+	Return
+End
+function main: () => i32
+	locals s: ${first} | ${second}
+	New Square
+	Cast ${first} | ${second}
+	SetLocal 0
+	Local 0
+	Call .area()[Shape]
+	Drop
+	New Circle
+	Cast ${first} | ${second}
+	SetLocal 0
+	Local 0
+	Call .area()[Shape]
+	Drop
+	Int i32 0
+	Return
+End
+function .area()[Shape]: (${first} | ${second}) => f64
+	locals this: ${first} | ${second}
+${branch(first)}${branch(second)}	Unreachable
+End
+`
+}
+
+/// Interfaces of one name in modules a and b, each with a class converted into it, and a main calling area on each.
+test "a dispatch function is per type, whatever its name" {
+	const p = new Program()
+	const m = p.addModule("main")
+	const ops: i32[][] = []
+	const locals: [string, i32][] = []
+	for (const [path, size] of [["a", 1.0], ["b", 3.0]] as [string, f64][]) {
+		const lib = p.addModule(path)
+		const iface = add(p, lib, -1, "Shape", decl.Interface, 0)
+		add(p, lib, iface, "area", decl.Function, fn(p, [], F64))
+		const s = p.type(kind.Named, iface, 0)
+		locals.push([path, s])
+		ops.append([[op.New, p.type(kind.Named, shape(p, lib, "Square", size), 0)], [op.Cast, s], [op.SetLocal, locals.length - 1],
+			[op.Local, locals.length - 1], [op.CallMethod, p.intern("area"), 0], [op.Drop]])
+	}
+	ops.append([[op.Int, I32, p.int(0)], [op.Return], [op.End]])
+	add(p, m, -1, "main", decl.Function, fn(p, [], I32), code(p, locals, ops))
+	mono(p, m)
+	const calls = p.decls[p.modules[m].decls[0]].code!
+	const targets: i32[] = []
+	for (const i of 0 ... calls.ops.length - 1) {
+		if (calls.ops[i] == op.Call) {
+			targets.push(calls.a(i))
+		}
+	}
+	assert targets.length == 2 && targets[0] != targets[1]
+}
+
+/// A module lib exporting `wrap[T](x: T): T[]`, and a main calling it with a class of its own; builtin/io.bob's print,
+/// called by neither.
+test "an instance lives in its generic's module" {
+	const p = new Program()
+	const lib = p.addModule("lib")
+	const wrap = add(p, lib, -1, "wrap", decl.Function, 0, null, ["T"])
+	const t = p.type(kind.Param, wrap, 0)
+	p.decls[wrap].mods = decl.Export
+	p.decls[wrap].type = fn(p, [t], p.type(kind.Array, t))
+	p.decls[wrap].code = code(p, [["x", t]], [[op.Local, 0], [op.Array, p.type(kind.Array, t), 1], [op.Return], [op.End]])
+	const io = p.addModule("builtin/io.bob")
+	const print = add(p, io, -1, "print", decl.Function, fn(p, [String], Null), code(p, [["x", String]], [[op.Null], [op.Return], [op.End]]))
+	p.decls[print].mods = decl.Export
+	const m = p.addModule("main")
+	const foo = p.type(kind.Named, add(p, m, -1, "Foo", decl.Class, 0), 0)
+	add(p, m, -1, "main", decl.Function, fn(p, [], I32), code(p, [], [
+		[op.New, foo], [op.Call, wrap, p.list([foo])], [op.Drop], [op.Int, I32, p.int(0)], [op.Return], [op.End]]))
+	mono(p, m)
+	assert out(p, m) + out(p, lib) + out(p, io) == `class Foo
+function main: () => i32
+	New Foo
+	Call wrap[Foo]
+	Drop
+	Int i32 0
+	Return
+End
+export function wrap[Foo]: (Foo) => Foo[]
+	locals x: Foo
+	Local 0
+	Array Foo[] 1 []
+	Return
+End
+export function print: (string) => null
+	locals x: string
+	Null
+	Return
+End
+`
+}
+
+/// A local of type { x: i32 } holding a literal of it and one of { x: i32, y: i32 }, whose x is read.
+test "an object type is the union of its literals and what is converted to it" {
+	const p = new Program()
+	const m = p.addModule("main")
+	const x = p.intern("x")
+	const a = p.type(kind.Object, p.list([I32]), p.nameList([x, 0]))
+	const b = p.type(kind.Object, p.list([I32, I32]), p.nameList([x, 0, p.intern("y"), 0]))
+	add(p, m, -1, "main", decl.Function, fn(p, [], I32), code(p, [["p", a]], [
+		[op.Int, I32, p.int(1)], [op.Object, a, 1], [op.SetLocal, 0],
+		[op.Int, I32, p.int(1)], [op.Int, I32, p.int(2)], [op.Object, b, 2], [op.Cast, a], [op.SetLocal, 0],
+		[op.Local, 0], [op.Field, x], [op.Return], [op.End]]))
+	mono(p, m)
+	const u = showType(p, p.union([a, b]))
+	const branch = (t: i32) => `	Local 0
+	Is ${showType(p, t)}
+	If none
+		Local 0
+		Cast ${showType(p, t)}
+		Field "x"
+		Return
+	End
+`
+	assert out(p, m) == `function main: () => i32
+	locals p: ${u}
+	Int i32 1
+	Object { x: i32 } 1 []
+	Cast ${u}
+	SetLocal 0
+	Int i32 1
+	Int i32 2
+	Object { x: i32, y: i32 } 2 []
+	Cast ${u}
+	SetLocal 0
+	Local 0
+	Call .x[{ x: i32 }]
+	Return
+End
+function .x[{ x: i32 }]: (${u}) => i32
+	locals this: ${u}
+${p.items(p.union([a, b])).map(branch).join("")}	Unreachable
+End
+`
+}
+
+/// `function count(t: Type): i32 { return t.fields.length }`, and a main returning count(Pair).
+test "a call of a function taking a Type calls its instance for the Type given, known as what it returns" {
+	const p = new Program()
+	const m = p.addModule("main")
+	const pair = add(p, m, -1, "Pair", decl.Class, 0)
+	add(p, m, pair, "a", decl.Var, I32)
+	const count = add(p, m, -1, "count", decl.Function, fn(p, [Type], I32), code(p, [["t", Type]], [
+		[op.Local, 0], [op.Field, p.intern("fields")], [op.Field, p.intern("length")], [op.Return], [op.End]]))
+	add(p, m, -1, "main", decl.Function, fn(p, [], I32), code(p, [], [
+		[op.Type, p.type(kind.Named, pair, 0)], [op.Call, count], [op.Return], [op.End]]))
+	mono(p, m)
+	assert out(p, m) == `class Pair
+var Pair.a: i32
+function count{1}: () => i32
+	locals t: none
+	Int i32 1
+	Return
+End
+function main: () => i32
+	Call count{1}
+	Drop
+	Int i32 1
+	Return
+End
+`
+}

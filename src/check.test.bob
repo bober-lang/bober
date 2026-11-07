@@ -1,0 +1,484 @@
+import { contains } from "../std/algo"
+import { Checked, Node, check, show } from "./check"
+
+/// The errors of main.bob of source src, as pos: msg separated by "; ", where it imports the modules of files, each
+/// a path and its source.
+function errors(src: string, files: string[] = []): string {
+	const ms: string[] = []
+	for (const e of check(["main.bob"], [], p => source(p, src, files))) {
+		ms.push(`${if (e.path == "main.bob") "" else e.path + ":"}${e.loc.pos}: ${if (e.warning) "warning: " else ""}${e.msg}`)
+	}
+	return ms.join("; ")
+}
+
+function source(path: string, src: string, files: string[]): string | null {
+	if (path == "main.bob") {
+		return src
+	}
+	for (const i of 0 ... files.length / 2 - 1) {
+		if (files[2 * i] == path) {
+			return files[2 * i + 1]
+		}
+	}
+	return null
+}
+
+/// Each declaration of main.bob it receives, as (kind:type parts) with tokens by their text, leaving out untyped tokens.
+class Render implements Checked {
+	src: string
+	out: string[] = []
+
+	constructor(src: string) { this.src = src }
+	done(path: string) {}
+	declare(n: Node, path: string, src: string) {}
+	decl(n: Node, path: string, src: string) {
+		if (path == "main.bob") {
+			this.out.push(this.render(n))
+		}
+	}
+
+	private render(n: Node): string {
+		const nt = n.type
+		const t = if (nt == null) "" else ":" + show(nt)
+		if (n.kind == "token") {
+			return this.src.slice(n.t.loc.pos, n.t.loc.end()) + t
+		}
+		let s = "(" + n.kind + t
+		for (const p of n.parts) {
+			if (p.kind != "token" || p.type != null) {
+				s += " " + this.render(p)
+			}
+		}
+		return s + ")"
+	}
+}
+
+/// The declarations of src in the order handed on.
+function typed(src: string): string {
+	const r = new Render(src)
+	check(["main.bob"], [], p => source(p, src, []), r)
+	return r.out.join(" ")
+}
+
+test "each declaration is handed on typed once checked" {
+	assert typed("const b: i64 = 2\nconst a = b + 1")
+		== "(var:2 b:2 i64:i64 2:i64) (var:i64 a:i64 (binary:i64 b:2 1:i64))"
+	assert typed("const a = b + 1\nconst b: i64 = 2")
+		== "(var:2 b:2 i64:i64 2:i64) (var:i64 a:i64 (binary:i64 b:2 1:i64))"
+	assert typed("function f(x: u8): bool { return x == 1 && g(x) }\nfunction g(x: u8): bool { return false }")
+		== "(function:(u8) => bool f:(u8) => bool (params:(u8) => bool (param:u8 x:u8 u8:u8)) bool:bool (block (jump (binary:bool (binary:bool x:u8 1:u8) (call:bool g:(u8) => bool x:u8))))) (function:(u8) => bool g:(u8) => bool (params:(u8) => bool (param:u8 x:u8 u8:u8)) bool:bool (block (jump false:bool)))"
+	assert typed("class A {\n\tb: B | null = null\n}\n\nconst x: A | null = null\n\nclass B {}")
+		== "(class:A A:A (members (prop:B | null (binary:B | null B:B null:null) null:null))) (var:A | null x:A | null (binary:A | null A:A null:null) null:null) (class:B B:B (members))"
+	assert typed("const c: i64 = [1, 2][0]\nfunction f(c: bool): i64 | string { return if (c) 1 else \"s\" }")
+		== "(var:i64 c:i64 i64:i64 (index:i64 (array:i64[] 1:i64 2:i64) 0:i32)) (function:(bool) => i64 | string f:(bool) => i64 | string (params:(bool) => i64 | string (param:bool c:bool bool:bool)) (binary:i64 | string i64:i64 string:string) (block (jump (ifExpr:i64 | string c:bool 1:i64 \"s\":\"s\"))))"
+	assert typed("const a = 2.75 as i32\nconst b = 3 as u8")
+		== "(var:i32 a:i32 (binary:i32 2.75:f64 i32:i32)) (var:u8 b:u8 (binary:u8 3:u8 u8:u8))"
+	assert typed("test \"t\" {\n\tprint(1.5)\n}") == "(test \"t\":\"t\" (block (call:null print:(f64) => null 1.5:f64)))"
+	assert typed("const a = [1, 2]\nconst o = { k: -1 }")
+		== "(var:i32[] a:i32[] (array:i32[] 1:i32 2:i32)) (var:{ k: i32 } o:{ k: i32 } (object:{ k: i32 } (prop:i32 (unary:i32 1:i32))))"
+}
+
+test "values fit their declared types" {
+	assert errors("const a: i32 = 1\nconst b: i32 | null = null\nconst c: string = \"s\"") == ""
+	assert errors("const a: i32 = \"s\"") == "15: expected i32, got \"s\""
+	assert errors("type Mode = \"fast\" | \"safe\"\nconst m: Mode = \"fast\"\nconst n: Mode = \"slow\"")
+		== "67: expected \"fast\" | \"safe\", got \"slow\""
+	assert errors("const xs: u8[] = [1, 2]\nconst t: [i32, string] = [1, \"a\"]\nconst f: u8[2] = [1, 2, 3]")
+		== "75: expected 2 elements, got 3"
+	assert errors("const a = [1, \"s\"]") == "14: untyped int and \"s\" have no common type"
+	assert errors("const a: { x: i32 } = { y: 1 }") == "22: expected { x: i32 }, got { y: untyped int }"
+	assert errors("const a: 1 + 1 = 2") == "9: expected a type"
+	assert errors("const b = 1\nconst a = [b = 1]") == "25: a default is only in a pattern"
+	assert errors("const a = { b: 1 }\nconst { c } = a") == "27: { b: i32 } has no member c"
+}
+
+test "a const of an integer or string constant names its literal type, a union of them stored as their base" {
+	const ops = "const End: u8 = 0\nconst Block: u8 = 2\ntype Op = End | Block\n"
+	assert errors(ops + "const a: Op = End\nconst b: u8 = a + 1\nconst c = 7 as Op\nconst d = switch (a) { case End: 1; case Block: 2 }") == ""
+	assert errors(ops + "function f(o: Op) { o++ }") == "80: expected 0 | 2, got u8"
+	assert errors(ops + "function f(o: Op): i32 { return switch (o) { case End: 1 } }")
+		== "92: a switch expression needs a default or a case for each value"
+	assert errors("const N = -5\nconst S = \"s\"\nconst T: string = \"t\"\nconst a: N = 3 as N\nconst b: S | T = T") == ""
+	assert errors("let n = 0\nconst a: n = 0\nfunction f(p: \"a\") { const b: p = p }") == "19: n is not a type; 55: p is not a type"
+}
+
+test "numbers widen, and constants take their context" {
+	assert errors("const d: i32 = 1\nconst e: i64 = d + 1\nconst big: i64 = 1 << 40") == ""
+	assert errors("const A = 1\nconst x: u32 = A | 2 | 4\nconst p: u16 = 1\nconst q = (p & 1 << 9) != 0") == ""
+	assert errors("const n: u8 = 9\nconst a: i64 = 1 << n\nconst b = 1 << n")
+		== "50: << of untyped constants needs a type from its context"
+	assert errors("let a: u8 = 300") == "12: 300 is not representable as u8"
+	assert errors("const a: i8 = -129") == "14: -129 is not representable as i8"
+	assert errors("const a: i64 = 9223372036854775807\nconst b: u64 = 0xffff_ffff_ffff_ffff") == ""
+	assert errors("const a = 300 as u8") == "10: 300 is not representable as u8"
+	assert errors("let x: f64 = 1") == "13: expected f64, got untyped int"
+	assert errors("const d: i32 = 1\nconst g: u32 = 1\nconst h = d + g") == "46: i32 and u32 do not widen to one type"
+	assert errors("const a = true * 2") == "15: * needs numbers, got bool and untyped int"
+	assert errors("const a = 1.5 & 1") == "14: & needs integers, got untyped float and untyped int"
+	assert errors("const a = 1 + \"s\"") == "12: + needs numbers, got untyped int and \"s\""
+	assert errors("let a: u8 = 1.5") == "12: expected u8, got untyped float"
+	assert errors("const a = !1") == "11: expected bool, got untyped int"
+}
+
+test "operators that mix need parentheses" {
+	const decls = "const b: bool | null = true\nconst c = 2\nconst d = 3\nconst p = true\nconst q = false\n"
+	assert errors(decls + "const a = 1 < c > 0") == "99: > needs parentheses around an operand"
+	assert errors(decls + "const a = b != p != q") == "100: != needs parentheses around an operand"
+	assert errors(decls + "const a = b ?? p || q") == "95: ?? needs parentheses around an operand"
+	assert errors(decls + "const a: i32 = -2 ** 2") == "101: ** needs parentheses around an operand"
+	assert errors(decls + "const a = c as u8 + 1") == "101: + needs parentheses around an operand"
+	assert errors(decls + "const a = c + d as u8") == "95: + needs parentheses around an operand"
+	assert errors(decls + "const a = c == d < 1 < 2") == "100: < needs parentheses around an operand"
+	assert errors(decls + "function f() { if (p == q as bool) {} }") == "104: == needs parentheses around an operand"
+	assert errors(decls + "const a = (b ?? p) || q\nconst e: i32 = (-2) ** 2\nconst f = 1 < c <= d") == ""
+}
+
+test "null is checked and narrowed" {
+	assert errors("function f(n: i32 | null): i32 { return n + 1 }")
+		== "42: + needs numbers, got i32 | null and untyped int"
+	assert errors("function f(a: { b: i32 } | null): i32 { return a.b }") == "47: a may be null"
+	assert errors("function f(a: { b: i32 } | null): i32 | null { return a?.b }") == ""
+	assert errors("function f(n: i32 | null): i32 { return n ?? 0 }") == ""
+	assert errors("function f(n: i32): i32 { return n ?? 0 }") == "35: i32 is never null"
+	assert errors("function f(n: i32 | null): i32 { return n ?? \"s\" }") == "42: i32 and \"s\" have no common type"
+	assert errors("function f(a: i32[] | null): i32 { return a[0] }") == "42: a may be null"
+	assert errors("function f(s: string | null): i32 { return if (s == null) 0 else s.length }") == ""
+	assert errors("function f(s: string | null): i32 {\n\tif (s == null) {\n\t\treturn 0\n\t}\n\treturn s.length\n}") == ""
+	assert errors("function f(s: string | null): bool { return s != null && s.length > 0 }") == ""
+	assert errors("function f(s: string | null): i32 {\n\tif (s != null) {\n\t\ts = null\n\t\treturn s.length\n\t}\n\treturn 0\n}")
+		== "74: s may be null"
+	assert errors("class A {\n\tx: i32 | null = null\n\n\tf(): i32 { return if (this.x == null) 0 else this.x }\n}") == ""
+	const member = "function f(a: { b: i32 | null }, c: bool): i32 {\n\tif (a.b == null) {\n\t\treturn 0\n\t}\n"
+	assert errors(member + "\treturn a.b\n}") == ""
+	assert errors(member + "\ta = { b: null }\n\treturn a.b\n}") == "108: expected i32, got i32 | null"
+	assert errors(member + "\ta.b = null\n\treturn a.b\n}") == "103: expected i32, got null"
+	assert errors(member + "\twhile (c) {\n\t\ta.b = null\n\t}\n\treturn a.b\n}") == "120: expected i32, got i32 | null"
+	assert errors(member + "\tconst g = () => a.b + 1\n\treturn 0\n}") == "104: + needs numbers, got i32 | null and untyped int"
+	assert errors("function f(a: { v: i32 | string }): i32 { return if (a.v instanceof string) a.v.length else a.v }") == ""
+	const assigned = "function f(x: i32 | null, c: bool): i32 {\n\tif (x == null) {\n\t\treturn 0\n\t}\n"
+	assert errors(assigned + "\tif (c) {\n\t\tx = null\n\t}\n\treturn x\n}") == "106: expected i32, got i32 | null"
+	assert errors(assigned + "\tif (c) {\n\t\treturn 1\n\t} else {\n\t\tx = null\n\t}\n\treturn x\n}")
+		== "127: expected i32, got null"
+	assert errors("function f(x: i32 | null): i32 {\n\tif (x != null) {\n\t\tconst g = () => x + 1\n\t}\n\treturn 0\n}")
+		== "71: + needs numbers, got i32 | null and untyped int"
+	assert errors("function f(c: bool) {\n\tlet x = if (c) \"a\" else null\n\tx = \"b\"\n}") == ""
+	const s = "function f(c: bool): i32 {\n\tlet s: i32[] | null = null\n"
+	assert errors(s + "\tif (s == null) {\n\t\ts = []\n\t}\n\treturn s.length\n}") == ""
+	assert errors(s + "\tif (c) {\n\t\ts = [1]\n\t}\n\treturn s.length\n}") == "86: s may be null"
+	assert errors(s + "\ts = [1]\n\twhile (c) {\n\t\tconst n = s.length\n\t\ts = null\n\t}\n\treturn 0\n}") == "89: s may be null"
+	assert errors(s + "\tif (s == null) {\n\t\treturn 0\n\t}\n\tif (c) {\n\t\ts = [1]\n\t} else {\n\t\tconst t: i32[] = s\n\t}\n\treturn s.length\n}") == ""
+	assert errors(s + "\tif (s == null) {\n\t\treturn 0\n\t}\n\twhile (c) {\n\t\tlet s: i32[] | null = null\n\t\ts = []\n\t}\n\treturn s.length\n}") == ""
+}
+
+test "instanceof narrows unions" {
+	assert errors("function f(v: i32 | string): i32 { return if (v instanceof string) v.length else v }") == ""
+	assert errors("function f(v: i32 | string): bool { return v instanceof bool }") == "45: i32 | string is never bool"
+	assert errors("let a = 1\nconst b = a instanceof a") == "33: a is not a type"
+	const set = "interface S extends string | bool {}\nfunction f[T extends S](v: T): bool { return v instanceof "
+	assert errors(set + "string }") == ""
+	assert errors(set + "i32 }") == "84: T is never i32"
+}
+
+test "a discriminating field narrows unions" {
+	const ab = "class A { kind: \"a\" | \"c\" = \"a\"; n = 1 }\nclass B { kind: \"b\" = \"b\"; m = 2 }\n"
+	assert errors(ab + "function f(t: A | B): i32 { return if (t.kind == \"b\") t.m else t.n }") == ""
+	assert errors(ab + "function f(t: A | B): i32 { return if (t.kind != \"a\") t.m else t.n }") == "132: A | B has no member m"
+	assert errors(ab + "function f(t: A | B): i32 {\n\tswitch (t.kind) {\n\t\tcase \"a\", \"c\": return t.n\n\t\tdefault: return t.m\n\t}\n}")
+		== "171: A | B has no member m"
+	assert errors("class C { kind: \"c\" = \"c\" }\n" + ab + "function f(t: A | B | C): i32 { return if (t.kind == \"a\" || t.kind == \"b\") t.n else 0 }")
+		== "181: A | B has no member n"
+	assert errors(ab + "function f(t: A | B | null): i32 { return if (t == null || t.kind == \"b\") 0 else t.n }") == ""
+	assert errors("function f(x: i32 | string | null): i32 { return if (x != null && x instanceof i32) x else x?.length ?? 0 }") == ""
+}
+
+test "calls" {
+	assert errors("function f(x: i32): i32 { return f(1, 2) }") == "34: expected 1 arguments, got 2"
+	assert errors("function f(a: i32, b = 5, ...c: string[]): i32 { return f() + f(1, 2, \"x\", 3) }")
+		== "57: expected 1 to any arguments, got 0"
+	assert errors("const a = 1\nconst b = a()") == "23: cannot call untyped int"
+	assert errors("function apply(f: (x: i32) => i32, x: i32): i32 { return f(x) }\nconst y = apply(x => x * 3, 2)") == ""
+	assert errors("const f = (x: i32) => x\nconst b = f(\"s\")") == "36: expected i32, got \"s\""
+	assert errors("function f(n: i32) { return f(n) }") == "28: f calls itself, so it needs a result type"
+	assert errors("function f(): string { return 1 }") == "30: expected string, got untyped int"
+	assert errors("function f(a: i32, b: i32): i32 { return a }\nconst g: (a: i32, b: i32 = 0) => i32 = f")
+		== "84: expected (i32, i32) => i32, got (i32, i32) => i32"
+	assert errors("const xs = [1]\nconst ys: i64[] = [2]\nfunction f() { xs.push(...xs); xs.push(...ys) }")
+		== "79: expected i32[], got i64[]"
+	assert errors("const xs = [1]\nfunction f() { xs.push(...xs, 1) }") == "38: a spread goes only into a rest param"
+	assert errors("function f(...xs: i32) {}") == "11: a rest param is an array, got i32"
+	assert errors("const f: (...xs: i32[]) => i32 = (...xs) => xs.length") == ""
+	assert errors("function g[T](v: T, f: (x: T) => T): T { return f(v) }\nconst y = g(3, if (true) (x => x * 2) else (x => x))") == ""
+	assert errors("function f(x: bool): i32 {\n\tif (x) {\n\t\treturn 1\n\t}\n}") == "25: missing return of i32"
+}
+
+test "async takes a call, and await an async" {
+	const f = "function f(): i32 { return 1 }\n"
+	assert errors(f + "const a = async 1\nconst b = async x => x\nconst c = async f()!")
+		== "47: expected a call after async; 65: expected a call after async; 88: expected a call after async"
+	assert errors(f + "const a: async string = async f()") == "55: expected async string, got async i32"
+	assert errors(f + "const a = await f()") == "47: expected an async, got i32"
+}
+
+test "classes and interfaces" {
+	assert errors("interface Shape {\n\tname: string\n\n\tarea(): f64\n}\n\nclass Square implements Shape {\n\tname = \"square\"\n\tside = 1.0\n\n\tarea(): f64 { return this.side * this.side }\n}\n\nconst s: Shape = new Square()")
+		== ""
+	assert errors("interface I {\n\tf(): void\n}\n\nclass A implements I {}") == "47: A does not implement I"
+	assert errors("class A {\n\tx: i32 = 0\n}\n\nconst b = new A().y") == "43: A has no member y"
+	assert errors("class A {}\nclass B {}\n\nconst a: A = new B()") == "36: expected A, got B"
+	assert errors("class A {\n\tx: i32 = \"s\"\n}") == "20: expected i32, got \"s\""
+	assert errors("class A {\n\tf(): string { return this.x }\n\tx: i32 = 0\n}") == "32: expected string, got i32"
+	assert errors("class A {\n\tx: i32 = 1\n\ty = this.x\n}\nconst b: string = new A().y") == "54: expected string, got i32"
+	assert errors("interface I {\n\ta: i32\n}\nconst a: I = { a: \"s\" }") == "42: expected i32, got \"s\""
+	assert errors("class A {\n\tx = 1\n}\n\nconst a: A = { x: 1 }") == "33: expected A, got { x: untyped int }"
+	assert errors("class P {\n\tx = 1\n}\n\nclass Q {\n\tp: ...P = { x: 2 }\n\n\tf() { this.p = { ...new P() } }\n}") == ""
+	assert errors("class P {\n\tx = 1\n}\n\nconst p: P = { ...new P(), x: 2 }\nconst o: { x: i32 } = { ...p }") == ""
+	assert errors("class P {\n\tx = 1\n}\n\nconst p: P = { ...new P(), z: 2 }") == "47: P has no field z"
+	assert errors("class P {\n\tx = 1\n}\nclass Q {\n\tx = 1\n}\n\nconst p = { ...new P(), ...new Q() }") == "63: cannot spread Q into P"
+	assert errors("class A {\n\tb = 1\n\ta: string = \"\"\n}\n\nconst x: { b: i32, a: string } = new A()\nconst y: string = new A()")
+		== "95: expected string, got A"
+	assert errors("class M {\n\tm: M\n}") == "11: M has no zero value"
+	assert errors("class M {\n\tm: M\n\n\tconstructor(m: M) { this.m = m }\n}") == ""
+	assert errors("class P {\n\tconstructor(x: i32) {}\n}\n\nconst p = new P()") == "47: expected 1 arguments, got 0"
+	assert errors("function g(): i32 {\n\tclass L {\n\t\tb = 1\n\t}\n\n\treturn [new L()][0].a\n}") == "64: L has no member a"
+}
+
+test "private members are seen only in their class and in tests" {
+	const c = "class A {\n\tprivate x = 1\n\tprivate static n = 0\n\n\tf(): i32 { return this.x + A.n }\n}\n\n"
+	assert errors(c) == ""
+	assert errors(c + "const a = new A().x\nconst b = A.n") == "103: x is private to A; 117: n is private to A"
+	assert errors(c + "test \"t\" {\n\tassert new A().x == A.n + 1\n}") == ""
+	assert errors(c + "class E {\n\ta: ...A = {x: 0}\n\n\tg(): i32 { return this.x }\n}\n") == "138: x is private to A"
+}
+
+test "readonly fields are assigned only by their initializer or, on this, by their class's constructor" {
+	const c = "class A {\n\treadonly x = 1\n\tstatic readonly n = 0\n\n\tconstructor(a: A | null) {\n\t\tthis.x += 1\n\t\tif (a != null) {\n\t\t\ta.x = 2\n\t\t}\n\t}\n\n\tf() { this.x = 3 }\n}\n"
+	assert errors(c + "function g(a: A) {\n\ta.x++\n\tA.n = 1\n\ta[\"x\"] = 2\n}") == "116: x is readonly; 142: x is readonly; 174: x is readonly; 181: n is readonly; 190: x is readonly"
+	const d = "class P { x = 0 }\nclass B {\n\treadonly p: ...P = {x: 0}\n\n\tconstructor() {\n\t\tclass L { constructor() {} }\n\t\tthis.p = {x: 1}\n\t\tconst f = () => { this.p = {x: 2} }\n\t}\n\n\tm() { const o = { constructor() { this.p = {x: 3} } } }\n}\n"
+	assert errors(d + "function g(b: B) { b.p = {x: 3}; b.p.x = 4 }") == "147: p is readonly; 204: p is readonly; 244: p is readonly"
+	assert errors("class Q {\n\treadonly x = 0\n}\nclass F {\n\tq: ...Q = {x: 0}\n\n\tconstructor() { this.x = 1 }\n}\nfunction h(f: F) { f.x = 2 }") == "79: x is readonly; 110: x is readonly"
+}
+
+test "names" {
+	assert errors("function f() { a = 2 }") == "15: a is not declared"
+	assert errors("const a = 1\nconst a = 2") == "18: a is declared twice"
+	assert errors("function f() {\n\tconst a = 1\n\ta = 2\n}") == "29: a is not assignable"
+	assert errors("const a = 1\nfunction f() { a = 2 }") == "27: a is not assignable"
+	assert errors("class C {\n\tf(): i32 { return 1 }\n\tf(): i32 { return 2 }\n}") == "34: f is declared twice"
+	assert errors("interface I {\n\tx: i32\n\tx: string\n}") == "23: x is declared twice"
+	assert errors("function main(): u8 { return 3 }") == "9: main takes no parameters and returns an i32 or nothing"
+}
+
+test "modules" {
+	const m = ["m.bob", "export const k = 2\nexport type T = i32 | null\nexport function f(t: T): i32 { return t ?? k }\nconst hidden = 1"]
+	assert errors("import { f, k as K } from \"./m\"\nconst a: i32 = f(K)", m) == ""
+	assert errors("import * from \"m\"\nconst a: T = f(k)", m) == ""
+	assert errors("import \"m.bob\"\nconst a: m.T = m.f(m.k)\nconst b: string = m.f(1)", m) == "57: expected string, got i32"
+	assert errors("import { hidden } from \"m\"", m) == "9: m does not export hidden"
+	assert errors("import { f } from \"m\"\nconst f = 1", m) == "28: f is declared twice"
+	assert errors("import { a } from \"n\"") == "18: cannot read n.bob"
+	assert errors("import \"d/n\"\nconst a: i32 = n.b", ["d/n.bob", "import { c } from \"../main\"\nexport const b = c"])
+		== "d/n.bob:18: import cycle through main.bob; d/n.bob:45: c is not declared"
+	assert errors("import * as c from \"stdlib.h\"") == "19: a C header's names are imported by name"
+}
+
+test "tags are types" {
+	assert errors("class S[T extends string] {}\nclass B @S[\"b\"] {\n\ta: i32 @S[\"a\"] @Nope\n\tb: bool @S[i32]\n}")
+		== "64: Nope is not declared; 79: i32 does not fit T's constraint string"
+}
+
+test "a use of a @Deprecated or @Experimental declaration or member from another module is a warning" {
+	const lib = `export function parse(s: string): i32 { return 0 }
+export function old(s: string): i32 @Deprecated[{ use: typeof parse, why: "it ignores signs" }] { return parse(s) }
+export const one: i32 @Deprecated = 1
+export type Id @Deprecated["use i64"] = i32
+export class Box @Experimental {
+	n = old("1")
+
+	get(): i32 @Deprecated[{ use: Box }] { return this.n }
+}`
+	assert errors("import { old, one, Id, Box } from \"lib\"\nconst a: Id = old(\"1\") + one\nconst b = new Box().get()", ["lib.bob", lib])
+		== "49: warning: Id is deprecated: use i64; 54: warning: old is deprecated: it ignores signs; use parse; "
+		+ "65: warning: one is deprecated; 83: warning: Box is experimental; 89: warning: get is deprecated; use Box"
+	assert errors("import * as lib from \"lib\"\nconst a = lib.one", ["lib.bob", lib]) == "41: warning: one is deprecated"
+	assert errors("function f() @Deprecated[{ why: i32 }] {}") == "25: @Deprecated takes a string, or { use: T, why: string }"
+	const gen = "export class G[T] {\n\told(): i32 @Deprecated { return 1 }\n\tstatic make(): i32 @Experimental { return 1 }\n}"
+	assert errors("import { G } from \"lib\"\nconst a = new G[i32]().old() + G.make()", ["lib.bob", gen])
+		== "47: warning: old is deprecated; 57: warning: make is experimental"
+	assert errors("function f() {\n\tconst a: i32 @Deprecated = 1\n}") == "30: a local declaration has no tags"
+}
+
+test "generics" {
+	const id = "function id[T](x: T): T { return x }\n"
+	assert errors(id + "const a: i32 = id(5)\nconst b: string = id(5)\nconst c = id[i64](5)") == "76: expected string, got i32"
+	assert errors("type Opt[T] = T | null\ntype Pair[A, B = A] = [A, B]\nconst o: Opt[i32] = null\nconst p: Pair[i32] = [1, 2]\nconst q: Pair = [1, 2]")
+		== "114: Pair needs a type argument for A"
+	assert errors("interface Signed extends i8 | i16 | i32 | i64 {}\nfunction neg[T extends Signed](x: T): T { return -x }\nconst a = neg(1 as u8)\nlet s: Signed")
+		== "116: u8 does not fit T's constraint Signed; 133: Signed has no zero value"
+	assert errors("function h[T extends i8 | i16](x: T) {}") == "21: a constraint is not a union; name a type set"
+	assert errors("class Box[T] {\n\titem: T\n\n\tconstructor(item: T) { this.item = item }\n\n\tget(): T { return this.item }\n}\n\nconst n: i32 = new Box[i32](1).get()\nconst s: string = new Box[i32](1).get()")
+		== "158: expected string, got i32"
+	assert errors("function map[T, U](xs: T[], f: (x: T) => U): U[] {\n\tconst out: U[] = []\n\tfor (const x of xs) {\n\t\tout.push(f(x))\n\t}\n\treturn out\n}\n\nconst s: string[] = map([1, 2], x => `${x * 2}`)")
+		== ""
+	assert errors("function less[T](a: T, b: T): bool { return a < b }\nfunction f[T]() {}\nconst a = f()") == "46: < needs numbers or strings, got T and T; 82: cannot infer T"
+	assert errors("class Box[T] {\n\titem: T\n\n\tconstructor(item: T) { this.item = item }\n}\nclass Empty[T] { x: T | null = null }\n\nconst s: string = new Box(\"s\").item\nconst e: Empty[i32] = new Empty()\nconst f = new Empty()")
+		== "189: cannot infer T"
+	assert errors("class Node[T] {\n\tvalue: T\n\n\tconstructor(v: T) { this.value = v }\n\n\tpush(v: T): Node[T] { return new Node[T](v) }\n}\n\nconst v: i32 = new Node[i32](1).push(2).value")
+		== ""
+	assert errors("interface W extends i32 | i64 {}\nfunction max[T extends W](a: T, b: T): T { return a }\nconst m: i64 = max(1 as i32, 2 as i64)") == ""
+	assert errors("function g[T, U extends T](u: U): T { return u }\nfunction ok[T](x: T): bool { return true }\nfunction h[T](x: T) {\n\tif (ok(x)) {\n\t\tconst s: string = 1\n\t}\n}")
+		== "148: expected string, got untyped int"
+	assert errors("function size[T](v: T): i32 {\n\tswitch (T.kind) {\n\t\tcase \"string\": return v.length\n\t\tdefault: return 0\n\t}\n}") == ""
+}
+
+test "a type set holds the classes that fit its interfaces, if their fields are in it, and arrays of it" {
+	const set = "interface N { constructor() }\ninterface D extends i32 | N | D[] {}\nfunction d[T extends D](): i32 { return 0 }\n"
+	assert errors(set + "class A {\n\ta: A[] = []\n}\nclass B {\n\tb = \"\"\n}\nclass C {\n\tconstructor(x: i32) {}\n}\nconst a = d[A[]]()\nconst b = d[B]()\nconst c = d[C]()")
+		== "221: B does not fit T's constraint D; 238: C does not fit T's constraint D"
+	assert errors("interface D extends i32 | D {}") == "20: a type set holds itself only in an array or tuple"
+	assert errors("interface A extends i32 | B {}\ninterface B extends A | string {}") == "51: a type set holds itself only in an array or tuple"
+	assert errors(set + "class K {\n\tstatic n = 0\n}\nconst k = d[K]()\nconst f = d[i32[2]]()\nconst g = d[i32[2][3]]()")
+		== "147: K does not fit T's constraint D; 186: i32[2][3] does not fit T's constraint D"
+}
+
+test "F-bounded constraint" {
+	const key = "interface Eq[T] {\n\tequals(o: T): bool\n}\ninterface Key[T] extends i32 | Eq[T] {}\n"
+	const f = "function f[K extends Key[K]](a: K, b: K): bool { return if (K.kind == \"class\") a.equals(b) else a == b }\n"
+	const classes = "class P {\n\tx = 0\n\n\tequals(o: P): bool { return this.x == o.x }\n}\nclass Q {\n\tx = 0\n}\n"
+	assert errors(key + f + classes + "const a = f(new P(), new P())\nconst b = f(1, 2)\nconst c = f(new Q(), new Q())\nconst d = f(\"a\", \"b\")")
+		== "328: Q does not fit K's constraint Key[Q]; 358: string does not fit K's constraint Key[string]"
+}
+
+test "a default's constraint is checked where the default is used" {
+	const decls = "interface Small extends i8 | i16 {}\nclass Auto[K extends Small] {}\nclass Box[K, H = Auto[K]] {}\n"
+	assert errors(decls + "const a = new Box[i8]()\nconst b = new Box[f64, i32]()\nconst c = new Box[f64]()") == "164: f64 does not fit K's constraint Small"
+}
+
+test "an interface of statics constrains a type param, through which its statics are called" {
+	const hasher = "interface Hasher[K] {\n\tstatic hash(k: K): u64\n}\n"
+	const auto = "class Auto[K] {\n\tstatic hash(k: K): u64 { return 1 }\n}\n"
+	const bad = "class Bad {\n\tstatic hash(k: i32): u64 { return 1 }\n}\n"
+	const map = "class Map[K, H extends Hasher[K] = Auto[K]] {\n\th(k: K): u64 { return H.hash(k) }\n\n\tn(k: K): u64 { return H.size }\n}\n"
+	assert errors(hasher + auto + bad + map + "const a = new Map[string]()\nconst b = new Map[string, Bad]()\nconst c = new Auto[i32]()")
+		== "263: H has no member size; 314: Bad does not fit H's constraint Hasher[string]; 347: Auto[i32] has only statics; it is not instantiated"
+	const sized = "interface S { static size(): i32 }\ninterface G extends S {}\nfunction f[T extends G](): i32 { return T.size() }\n"
+	assert errors(sized + "class A {\n\tstatic size(): i32 { return 1 }\n}\nclass B {}\nconst a = f[A]()\nconst b = f[B]()") == "194: B does not fit T's constraint G"
+}
+
+test "a static branch on a type param's kind narrows the param to what its labels' kinds make it" {
+	const hash = "function hash[K](k: K): u64 {\n\tswitch (K.kind) {\n\t\tcase \"string\": return k.length as u64\n\t\tcase \"int\": return k as u64\n\t\tdefault: return 0\n\t}\n}\n"
+	assert errors(hash + "function eq[K](a: K, b: K): bool { return if (K.kind == \"string\") a.length == b.length else a == b }") == ""
+	assert errors("function f[K](k: K): u64 {\n\tswitch (K.kind) {\n\t\tcase \"int\", \"bool\": return k as u64\n\t\tdefault: return k.hash()\n\t}\n}") == "77: cannot cast K to u64; 104: K has no member hash"
+	assert errors("interface S extends string | S[] | [...S[]] {}\nfunction f[T extends S](v: T): i32 {\n\tswitch (T.kind) {\n\t\tcase \"string\", \"array\": return v.length\n\t\tcase \"tuple\": return f(new T())\n\t\tdefault: return 0\n\t}\n}") == ""
+	assert errors("interface S extends i32 | S[] {}\nfunction f[T extends S](v: T): T {\n\tswitch (T.kind) {\n\t\tcase \"array\", \"fixed\":\n\t\t\tfor (const x of v) {}\n\t\tcase \"fixed\":\n\t\t\tlet a: T\n\t\t\tfor (const i of 0 ... T.length - 1) {\n\t\t\t\ta[i] = v[i]\n\t\t\t}\n\t\t\treturn a\n\t}\n\treturn v\n}") == ""
+	assert errors("function f[T]() {\n\tif (T.kind == \"fixed\") {\n\t\tlet a: T\n\t}\n}") == "53: T has no zero value"
+	assert errors("function f[T](s: string | bool | null, v: T): bool {\n\tswitch (T.kind) {\n\t\tcase \"literal\": return s == T.value\n\t\tcase \"union\":\n\t\t\tfor (const M of T.members) {\n\t\t\t\tif (M.kind == \"class\") {\n\t\t\t\t\treturn v instanceof M\n\t\t\t\t}\n\t\t\t}\n\t}\n\treturn false\n}") == ""
+	assert errors("function f[K](k: K): i32 {\n\tif (K.kind != \"string\") {\n\t\treturn 0\n\t}\n\treturn k.length\n}") == ""
+	assert errors("interface H { static f(): i32 }\nclass X {\n\ty = 1\n\n\tstatic f(): i32 { return 1 }\n}\nconst h: H = new X()") == "95: a value never fits H, which has only statics"
+}
+
+test "a statement ends at its first error, and a variable it leaves untyped fails where used" {
+	assert errors("function f(): i32 {\n\tconst a = g(1) + h\n\tconst b = a + 1\n\treturn b\n}") == "31: g is not declared"
+	assert errors("const a = [x, y]\nconst b = a.length") == "11: x is not declared"
+	assert errors("class A {\n\tx = y\n\tz = 1\n}\n\nconst n: i32 = new A().z\nconst m = new A().x") == "15: y is not declared"
+	assert errors("function f() {\n\tconst xs = []\n}") == "27: an empty array needs a type"
+	assert errors("function f(xs: i32[], y: Foo) {\n\tfor (const x of nope) {\n\t\tconst s: string = 1\n\t}\n\tif (nope) {\n\t\tconst s: string = 1\n\t}\n\tconst n: string = y\n}")
+		== "25: Foo is not declared; 49: nope is not declared; 77: expected string, got untyped int; 87: nope is not declared; 115: expected string, got untyped int"
+	assert errors("function f(x: i32 | null): i32 {\n\tfunction g(y) {}\n\tconst a = if (x != null) x + nope else 0\n\tg(1)\n\treturn x\n}")
+		== "45: a param needs a type; 81: nope is not declared; 107: expected i32, got i32 | null"
+	assert errors("interface I { m(x): i32 }\nclass A implements I {\n\tm(x: i32): i32 { return x }\n}\nconst i: I = new A()") == "16: a param needs a type"
+	assert errors("type O = { m(x: i32): i32 }\nfunction f(o: O): i32 {\n\tassert nope\n\treturn o.m(1)\n}") == "60: nope is not declared"
+	assert errors("function first[T](xs: T[]): T { return xs[0] }\nconst a = first([nope])") == "64: nope is not declared"
+	assert errors("function f(x: i32 | null): i32 {\n\tif (x != null && nope) {\n\t\treturn x\n\t}\n\treturn 0\n}") == "51: nope is not declared"
+}
+
+test "values once unknown have types" {
+	assert errors("test \"t\" {\n\tprint(300)\n\tprint(true)\n\tprint(null)\n}") == ""
+	assert errors("function f(o: { a: i32, b: string, c: bool }): bool {\n\tconst { a, ...rest } = o\n\treturn rest.c\n}") == ""
+	assert errors("function f(a: i32, b: i32) {\n\tlet x = a\n\tlet y = b\n\t[x, y] = [y, x]\n}") == ""
+	assert errors("function g(): i32 { return 1 }\nfunction f() {\n\tconst [i, v] = await ...[async g(), async g()]\n\tconst n: i32 = v + i\n}") == ""
+	assert errors("type K = \"a\" | \"b\"\nfunction f(): K | null {\n\tfor (const k of K.members) {\n\t\treturn k.value\n\t}\n\treturn null\n}") == ""
+}
+
+test "a variable is read in its own initializer only in the function literal that is all of it, and only if it declares its type" {
+	assert errors("const fact: (n: i64) => i64 = n => if (n == 0) 1 else n * fact(n - 1)\nconst n: i32 = n + 1\nconst loop = () => loop()")
+		== "76: n depends on itself; 110: loop needs a type to be used in its own initializer"
+	assert errors("function f() {\n\tconst g: () => i32 = () => g()\n\tconst n: i32 = n + 1\n\tconst h = () => h()\n\tconst x: i32 = (() => x)()\n}")
+		== "63: n depends on itself; 86: h needs a type to be used in its own initializer; 113: x depends on itself"
+	assert errors("let x = 1\nfunction f() { const x = x + 1 }") == "35: x depends on itself"
+}
+
+test "top-level variables do not depend on themselves" {
+	assert errors("const total = double(base) + 1\nconst base = 20\n\nfunction double(x: i32): i32 { return x * 2 }") == ""
+	assert errors("function even(n: i32): bool { return n == 0 || odd(n - 1) }\nfunction odd(n: i32): bool { return n != 0 && even(n - 1) }")
+		== ""
+	assert errors("const c = d\nconst d = c") == "6: c depends on itself"
+	assert errors("const c: i32 = d\nconst d: i32 = c") == "6: c depends on itself; 23: d depends on itself"
+	assert errors("const e = () => g()\nconst g = () => e()") == "36: e needs a type to be used in its own initializer"
+	assert errors("const e: () => i32 = () => g()\nconst g: () => i32 = () => e()") == ""
+	assert errors("const k: i32 = h()\nfunction h(): i32 { return k }") == "6: k depends on itself"
+	assert errors("const k: i32 = (() => k)()") == "6: k depends on itself"
+	assert errors("const k: i32 = apply(() => k)\nfunction apply(f: () => i32): i32 { return f() }") == "6: k depends on itself"
+	assert errors("const i = 1\nlet j = f()\n\nfunction f(): i32 { return if (i == 2) j else 0 }") == "16: j depends on itself"
+	assert errors("let n = 0\nconst m = f()\n\nfunction f(): i32 { return n }") == "16: m is a const that depends on a let"
+	assert errors("let n = 0\nconst f: () => i32 = () => n") == ""
+	assert errors("class P { ps: P[] = none }\nconst none: P[] = []") == ""
+	assert errors("const k: i32 = new C().m()\nclass C { m(): i32 { return k } }") == "6: k depends on itself"
+	assert errors("const u = new U()\nclass U {\n\tf(): U { return U.make() }\n\tstatic make(): U { return u }\n}") == ""
+	assert errors("const q = new Q()\nclass Q { q: Q | null = q }") == "6: q depends on itself"
+	assert errors("const r = new R()\nclass R { ...S }\nclass S { s: R | null = r }") == "6: r depends on itself"
+	assert errors("type A = Q\nconst q = new A()\nclass Q { q: Q | null = q }") == "17: q depends on itself"
+	assert errors("const x = make[P]()\nfunction make[T extends P](): T { return new T() }\nclass P { p: P | null = x }")
+		== "6: x depends on itself"
+	assert errors("const v: i32 = get(new P())\nfunction get[T extends P](x: T): i32 { return x.m() }\nclass P { m(): i32 { return v } }")
+		== "6: v depends on itself"
+	assert errors("const v: i32 = new B().m()\nclass A { m(): i32 { return v } }\nclass B { ...A }") == "6: v depends on itself"
+	assert errors("const s: string = `${new T()}`\nclass T { toString(): string { return s } }") == "6: s depends on itself"
+	assert errors("const empty = new R()\nclass R { x = 0; static none(): R { return empty } }") == ""
+	assert errors("const s = S.none()\nclass S { static none(): S { return s } }") == "6: s depends on itself"
+	assert errors("class E { x = 0; static y = e }\nconst e = new E()") == ""
+	assert errors("class K { static n = 0; static readonly m = K.n }") == "40: m is a const that depends on a let"
+}
+
+test "statements" {
+	assert errors("function f() { if (1) {} }") == "19: expected bool, got untyped int"
+	assert errors("function f() { for (const x of 1) {} }") == "31: cannot iterate i32"
+	assert errors("function f(a: bool) { while (a) { switch (1) { case 1: break } } }") == "55: break inside a case"
+	assert errors("function f() { break }") == "15: break outside a loop"
+	assert errors("function f(): i32 {\n\treturn 1\n\tf()\n}") == "31: warning: unreachable"
+	assert errors("function f() { test \"t\" {} }") == "15: a test is only at the top level or in a test"
+	assert errors("test \"t\" { const f = () => { test \"u\" {} } }") == "29: a test is only at the top level or in a test"
+	assert errors("test \"t\" {\n\tconst s = \"x\"\n\ttest `sub ${s}` {}\n}") == ""
+	assert errors("function f() { try { g() } catch (e) {} }\nfunction g() {}") == "34: a caught value needs a type"
+	assert errors("function f(s: string) { s[0] = 1 }") == "25: strings are immutable"
+	assert errors("class A { constructor(x: i32) {} }\nclass B { a: ...A }")
+		== "45: A takes constructor arguments, which an embedded one is not given"
+	assert errors("function f(x: i32 | string): i32 {\n\tswitch (x) {\n\t\tcase string: return x.length\n\t\tcase i32: return x\n\t}\n\treturn 0\n}")
+		== ""
+}
+
+test "an error a function lists, or shall, but lets escape is warned of once, where it first escapes" {
+	assert errors("class E {}\nfunction f() { throw new E() }\nfunction g() { f() }\nexport function h() {\n\tg()\n\tf()\n}\nexport function k() throws E { h(); g() }")
+		== "87: warning: E is neither caught nor listed"
+	assert errors("class E {}\nclass F {}\nfunction f(): i32 throws E | F { return 0 }\nfunction main() {\n\ttry { f() } catch (e: E) {}\n\ttry { f() } catch {}\n\tconst x = async f()\n\tconst g = f\n\tg()\n}")
+		== "92: warning: F is neither caught nor listed"
+	assert errors("export class C {\n\tconstructor() { throw 1 }\n\tprivate p() { throw 1 }\n\tq() { this.p() }\n}")
+		== "34: warning: i32 is neither caught nor listed; 82: warning: i32 is neither caught nor listed"
+	const lib = "export function g() throws i32 { throw 1 }"
+	assert errors("import * as lib from \"lib\"\nexport function f() { lib.g() }\nfunction t[T](x: T) { throw x }\nexport function h() { t(1) }", ["lib.bob", lib])
+		== "54: warning: i32 is neither caught nor listed"
+	assert errors("function g[X](x: X): i32 throws X | i32 { throw x }\nexport function f(): i32 { return g[i32](1) }")
+		== "92: warning: i32 is neither caught nor listed"
+}
+
+test "the compiler's own source checks" {
+	const files = ["src/lex.bob", "src/parse.bob", "src/format.bob", "src/type.bob", "src/check.bob",
+		"src/check.test.bob", "std/algo.bob", "std/ascii.bob", "std/math.bob", "std/string.bob", "std/parse.bob",
+		"std/collections/hashmap.bob", "std/collections/scopedmap.bob", "std/encoding/json.bob"]
+	let failed = ""
+	for (const e of check(files, [])) {
+		if (contains(files, e.path)) {
+			failed += `${e.path}:${e.loc.pos}: ${e.msg}\n`
+		}
+	}
+	assert failed == ""
+}
