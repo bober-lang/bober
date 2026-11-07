@@ -1,0 +1,78 @@
+//! A string-keyed map whose bindings vanish when their scope is left, after qcp's Scope.
+
+import { HashMap } from "./hashmap"
+
+type Binding[V] = { level: u32, generation: u32, value: V }
+
+/// Leaving a scope is O(1): bindings of left scopes are recognized by a stale generation and popped lazily,
+/// so each key's stack stays as deep as the scope nesting.
+export class ScopedMap[V] {
+	level: u32 = 0
+	private generations: u32[] = [0]
+	private bindings = new HashMap[string, Binding[V][]]()
+
+	enter() {
+		this.level++
+		if (this.level == (this.generations.length as u32)) {
+			this.generations.push(0)
+		} else {
+			this.generations[this.level]++
+		}
+	}
+
+	leave() {
+		assert this.level > 0
+		this.level--
+	}
+
+	get(k: string): V | null {
+		const b = this.binding(k)
+		return if (b == null) null else b.value
+	}
+
+	/// The value k is bound to in the current scope, ignoring outer scopes.
+	local(k: string): V | null {
+		const b = this.binding(k)
+		return if (b == null || b.level != this.level) null else b.value
+	}
+
+	has(k: string): bool { return this.get(k) != null }
+
+	/// Binds k in the current scope, shadowing outer scopes; false if k is already bound in it.
+	insert(k: string, v: V): bool {
+		let s = this.bindings.get(k)
+		if (s == null) {
+			s = []
+			this.bindings.set(k, s)
+		}
+		const b = this.top(s)
+		if (b != null && b.level == this.level) {
+			return false
+		}
+		s.push({ level: this.level, generation: this.generations[this.level], value: v })
+		return true
+	}
+
+	/// Binds k in the current scope, replacing its binding there.
+	set(k: string, v: V) {
+		if (!this.insert(k, v)) {
+			this.binding(k)!.value = v
+		}
+	}
+
+	private binding(k: string): Binding[V] | null {
+		const s = this.bindings.get(k)
+		return if (s == null) null else this.top(s)
+	}
+
+	private top(s: Binding[V][]): Binding[V] | null {
+		while (s.length > 0) {
+			const b = s[s.length - 1]
+			if (b.level <= this.level && b.generation == this.generations[b.level]) {
+				return b
+			}
+			s.pop()
+		}
+		return null
+	}
+}

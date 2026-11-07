@@ -1,0 +1,100 @@
+//! Hash maps of any key type.
+
+import { Auto, Hasher } from "../hash"
+
+/// Open addressing with linear probing, kept at most half full. H hashes and compares the keys; the slot a hash
+/// starts at is its top bits after a Fibonacci multiply, which spreads hashes that are small or near each other.
+export class HashMap[K, V, H extends Hasher[K] = Auto[K]] {
+	size = 0
+	private keys: (K | null)[] = new (K | null)[](8)
+	private vals: (V | null)[] = new (V | null)[](8)
+	/// 64 less the bits a slot index has.
+	private shift = 61
+
+	get(k: K): V | null {
+		const i = this.slot(k)
+		return if (this.keys[i] == null) null else this.vals[i]
+	}
+
+	has(k: K): bool { return this.keys[this.slot(k)] != null }
+
+	set(k: K, v: V) {
+		const i = this.slot(k)
+		if (this.keys[i] == null) {
+			this.keys[i] = k
+			this.size++
+		}
+		this.vals[i] = v
+		if (this.size * 2 > this.keys.length) {
+			this.grow()
+		}
+	}
+
+	delete(k: K) {
+		let i = this.slot(k)
+		if (this.keys[i] == null) {
+			return
+		}
+		this.keys[i] = null
+		this.vals[i] = null
+		this.size--
+		const mask = (this.keys.length - 1) as u32
+		let j = i
+		while (true) {
+			j = (j + 1) & mask
+			const kj = this.keys[j]
+			if (kj == null) {
+				return
+			}
+			if ((j - this.home(kj) & mask) >= (j - i & mask)) {
+				this.keys[i] = kj
+				this.vals[i] = this.vals[j]
+				this.keys[j] = null
+				this.vals[j] = null
+				i = j
+			}
+		}
+	}
+
+	/// The values, in no order.
+	values(): V[] {
+		const out: V[] = []
+		for (const i of 0 ... this.keys.length - 1) {
+			if (this.keys[i] != null) {
+				out.push(this.vals[i]!)
+			}
+		}
+		return out
+	}
+
+	/// The slot k is in, or the empty one it goes into.
+	private slot(k: K): u32 {
+		const mask = (this.keys.length - 1) as u32
+		let i = this.home(k)
+		while (true) {
+			const ki = this.keys[i]
+			if (ki == null || H.eq(ki, k)) {
+				return i
+			}
+			i = (i + 1) & mask
+		}
+	}
+
+	/// The slot k's probing starts at.
+	private home(k: K): u32 { return (H.hash(k) * 11400714819323198485 >> this.shift) as u32 }
+
+	private grow() {
+		const keys = this.keys
+		const vals = this.vals
+		this.keys = new (K | null)[](keys.length * 2)
+		this.vals = new (V | null)[](keys.length * 2)
+		this.shift--
+		this.size = 0
+		for (const i of 0 ... keys.length - 1) {
+			const k = keys[i]
+			if (k != null) {
+				this.set(k, vals[i]!)
+			}
+		}
+	}
+}

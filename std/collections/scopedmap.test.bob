@@ -1,0 +1,48 @@
+import { ScopedMap } from "./scopedmap"
+
+test "inner scopes shadow and leaving restores" {
+	const m = new ScopedMap[i32]()
+	assert m.insert("x", 1)
+	m.enter()
+	assert m.get("x") == 1
+	assert m.insert("x", 2)
+	assert m.insert("y", 3)
+	assert m.get("x") == 2
+	m.leave()
+	assert m.get("x") == 1
+	assert !m.has("y")
+}
+
+test "a key binds once per scope" {
+	const m = new ScopedMap[i32]()
+	assert m.insert("x", 1)
+	assert !m.insert("x", 2)
+	assert m.get("x") == 1
+}
+
+test "re-entering a level does not revive left bindings" {
+	const m = new ScopedMap[i32]()
+	m.enter()
+	m.enter()
+	assert m.insert("x", 1)
+	m.leave()
+	m.leave()
+	m.enter()
+	m.enter()
+	assert !m.has("x")
+	assert m.insert("x", 2)
+	assert m.get("x") == 2
+	assert m.level == 2
+}
+
+test "set replaces in the current scope and local ignores outer ones" {
+	const m = new ScopedMap[i32]()
+	m.set("x", 1)
+	m.set("x", 2)
+	m.enter()
+	assert m.local("x") == null
+	m.set("x", 3)
+	assert m.local("x") == 3
+	m.leave()
+	assert m.get("x") == 2
+}
