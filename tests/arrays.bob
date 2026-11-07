@@ -1,0 +1,122 @@
+test "element assignment" {
+	const xs = [1, 2, 3]
+	xs[0] = 9
+	xs[1] += 5
+	xs[2]++
+	assert xs[0] == 9 && xs[1] == 7 && xs[2] == 4
+}
+
+test "arrays are shared references" {
+	const xs = [1, 2, 3]
+	const ws = xs
+	ws[0] = 9
+	assert xs[0] == 9
+	const same = ws == xs && [1] != [1] // by identity, as outside an assert
+	assert same
+}
+
+test "spread copies" {
+	const xs = [1, 2]
+	const ys = [0, ...xs, 3]
+	assert ys.length == 4 && ys[1] == 1 && ys[3] == 3
+	ys[1] = 5
+	assert xs[0] == 1
+}
+
+test "new fills with zero values" {
+	const ns = new i32[](3)
+	assert ns.length == 3 && ns[2] == 0
+	assert new string[](2)[1] == ""
+	assert !new bool[](1)[0]
+	assert new (i32 | null)[](2)[0] == null
+}
+
+test "elements take the declared kind" {
+	const ys: u8[] = [255, 1]
+	assert ys[0] + ys[1] == 0
+	const buf = new u8[](1)
+	buf[0] = 255
+	buf[0] += 1
+	assert buf[0] == 0
+}
+
+test "nested arrays and slices" {
+	const m = [[1, 2], [3, 4]]
+	m[0][1] = 7
+	assert m[0][1] == 7 && m[1][0] == 3
+	const ys = m[1].slice(1, 2)
+	assert ys.length == 1 && ys[0] == 4
+	assert m.slice(0, 0).length == 0
+}
+
+test "at" {
+	const xs = [1, 2]
+	assert xs.at(1) == 2 && xs.at(2) == null && xs.at(-1) == null
+	assert (xs.at(5) ?? 7) == 7
+}
+
+test "push and pop" {
+	const xs: u8[] = []
+	for (const i of 0 ... 19) {
+		xs.push(i as u8)
+	}
+	const ys = xs
+	ys.push(200)
+	assert xs.length == 21 && xs[19] == 19 && xs.pop() == 200
+	assert xs.pop() == 19 && ys.length == 19
+	const zs: i64[] = [1, 2]
+	const ws = zs.slice(0, 1)
+	ws.push(5_000_000_000)
+	assert ws[1] == 5_000_000_000
+	ws.push(...zs)
+	ws.push(...ws)
+	assert ws.length == 8 && ws[2] == 1 && ws[3] == 2 && ws[7] == 2
+}
+
+test "map" {
+	const xs = [1, 2, 3]
+	const ys = xs.map(x => `${x * 2}`)
+	assert ys.length == 3 && ys[0] == "2" && ys[2] == "6"
+	const big: i64[] = xs.map(x => (x as i64) * 5_000_000_000)
+	assert big[1] == 10_000_000_000
+	assert ys.map(s => s.length).length == 3
+	const ns: (i32 | null)[] = xs.map(x => x) // U from what the result is wanted as
+	ns.push(null)
+	assert ns.length == 4
+	const os: i32[] | null = xs
+	const zs = os?.map(x => x + 1)
+	assert zs != null && zs[2] == 4
+}
+
+test "tuples are arrays" {
+	const t: [i32, string] = [1, "a"]
+	assert t[0] == 1 && t[1] == "a"
+}
+
+test "patterns" {
+	const [a, b] = [1, 2]
+	assert a == 1 && b == 2
+	const [f, ...rest] = [5, 6, 7]
+	assert f == 5 && rest.length == 2 && rest[1] == 7
+	const { c, d: e } = { c: 3, d: 4 }
+	assert c == 3 && e == 4
+	const { g: [h, i] } = { g: [8, 9] }
+	assert h == 8 && i == 9
+}
+
+test "pattern defaults replace null" {
+	const [p = 5, q = 6] = [null, 1]
+	assert p == 5 && q == 1
+	const obj: { s: i32 | null, k: i32, m: i32 } = { s: null, k: 2, m: 3 }
+	const { s: t = 1, ...u } = obj
+	assert t == 1 && u.k == 2 && u.m == 3
+	const { k = 9 } = obj
+	assert k == 2
+}
+
+test "array types of object, tuple and function types" {
+	const objs: { a: i32 }[] = [{ a: 1 }]
+	const pairs: [i32, string][] = [[1, "a"]]
+	const fs = new ((() => i32) | null)[](2)
+	assert objs[0].a == 1 && pairs[0][1] == "a" && fs.length == 2 && fs[0] == null
+}

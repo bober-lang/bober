@@ -1,0 +1,452 @@
+//! bober, the compiler's driver. Paths are relative to the directory it runs in, the repo's. It runs as build/bober, built
+//! by itself or bootstrapped by build/boot (boot/README.md).
+//!
+//! # Introduction
+//!
+//! Bober is a statically typed, compiled language with the surface of TypeScript and the object layout of C. This spec
+//! defines its syntax and semantics; the standard library, which defines `Trap` (§7.7) and `process`, is specified
+//! elsewhere. Grammar is given in `grammar` blocks, examples in plain ones.
+//!
+//! An implementation shall reject a program that violates a rule stated with *shall* with a diagnostic, except noted
+//! otherwise. A *trap* stops the isolate that hits it (§7.7); it cannot be caught. A *throw* is an exception a `try`
+//! can catch. *implementation-defined* behavior is chosen by the implementation; a program shall not depend on
+//! implementation-defined behavior.
+
+import { endsWith, indexOf, split, startsWith } from "../std/string"
+import { fromCString } from "../std/c"
+import { Keys, Rest, Unknown, decode as decodeJson, encode, quoted } from "../std/encoding/json"
+import { decode } from "../std/encoding/optarg"
+import { exists, glob, mkdirAll, open, readFile, remove, removeAll, rename, stat } from "../std/fs"
+import { dir as parent, join, rel } from "../std/fs/path"
+import { fnv } from "../std/hash"
+import { IoError } from "../std/io"
+import { arch } from "../std/os"
+import { ParseError } from "../std/parse"
+import { write } from "./bc/file"
+import { Program } from "./bc/program"
+import { show } from "./bc/show"
+import { glue, includesOf } from "./c/bind"
+import { doc } from "./doc"
+import { Facts, emit, learn } from "./emit"
+import { Flags, check, normal } from "./check"
+import { CompileError } from "./error"
+import { formatFile } from "./format"
+import { Backend } from "./backend/backend"
+import { LLVM } from "./backend/llvm"
+import { Tpde } from "./backend/tpde"
+import { lower } from "./lower"
+import { serve } from "./lsp"
+import { mono } from "./mono"
+import { CLib, Package, load, nearest, out } from "./pkg"
+import * as process from "../std/process"
+import { getcwd } from "unistd.h"
+
+const usage = `usage: bober <command> [-I dir]... args
+  build <main.bob> [linker args]  compile a program into build/<name>
+  run <main.bob> [args]           build it and run it with args
+  test <main.bob> [args]          build the main module's tests into build/<name>.test and run them
+  check <file>...                report the type errors of the files and the modules they import; also lint
+  format <file>...               rewrite each file in place in the one layout of its syntax tree
+  lower <file>...                print the bytecode of each file
+  doc <file>...                  print the spec in the files' doc comments as Markdown
+  lsp                            serve the language server protocol on stdin and stdout
+Its options are taken anywhere on the line, as a C compiler's, up to a --; the arguments after go to the program.
+-I adds a directory C headers are found in, as a C compiler takes it, before those of the nearest bober.pkg's C libraries.
+-release builds with LLVM, the whole program at -O2, for build, run and test; else each module with TPDE, to debug, once
+as lowered: a generic's code takes its type args' descriptors.`
+
+const dir = "build"
+
+const triple = `${if (arch == "arm64") "aarch64" else arch}-linux-musl`
+
+/// The flags of the system's clang for the target, with the musl sysroot of src/backend/llvm/Makefile.
+const target = [`--target=${triple}`, "--sysroot=build/musl"]
+
+export const cc = ["clang", ...target]
+
+/// How cc compiles C++ with the sysroot at root: with its libc++'s headers, not those of clang's own, which it finds
+/// first.
+const cxx = (root: string) => `-stdlib++-isystem${root}/usr/include/c++/v1`
+
+/// How cc links a static executable: with compiler-rt's builtins, libunwind and libc++.
+const static = ["-static", "-fuse-ld=lld", "-rtlib=compiler-rt", "-unwindlib=libunwind", "-stdlib=libc++"]
+
+/// cc as the linker of a static executable, as clang++ to link the C++ runtime when C++ code needs it, dropping unused
+/// sections and folding identical ones, but for the collector's (src/rt.ld), with a build ID (compilerId).
+export const ld = ["clang++", ...target, ...static, "-Wl,--gc-sections,--icf=all,--build-id,-T,src/rt.ld"]
+
+/// The CMake toolchain file of the target, for cc and ld with the sysroot at root.
+const toolchain = (root: string) => `set(CMAKE_C_COMPILER clang)
+set(CMAKE_CXX_COMPILER clang++)
+set(CMAKE_C_COMPILER_TARGET ${triple})
+set(CMAKE_CXX_COMPILER_TARGET ${triple})
+set(CMAKE_ASM_COMPILER_TARGET ${triple})
+set(CMAKE_SYSROOT "${root}")
+set(CMAKE_CXX_FLAGS_INIT "${cxx(root)}")
+set(CMAKE_EXE_LINKER_FLAGS_INIT "${static.join(" ")}")
+`
+
+function main(): i32 {
+	const argv = args()
+	if (argv.length == 0) {
+		print(usage)
+		return 2
+	}
+	let f = new Flags()
+	try {
+		f = decode[Flags](argv.slice(1, argv.length))
+	} catch (e: ParseError) {
+		print(`bad option ${argv[e.at + 1]}`)
+		return 2
+	}
+	if (f.args.length == 0 && argv[0] != "lsp") {
+		print(usage)
+		return 2
+	}
+	try {
+		return command(argv[0], f)
+	} catch (e: CompileError | IoError) {
+		print(if (e instanceof IoError) e.message() else e.msg)
+		return 1
+	}
+}
+
+/// Runs the command cmd with the options and arguments f; returns the exit status or throws a CompileError or IoError.
+function command(cmd: string, f: Flags): i32 {
+	const argv = f.args
+	const dirs = f.I
+	switch (cmd) {
+		case "build", "run", "test":
+			const tests = cmd == "test"
+			const exe = `${dir}/${name(argv[0])}${if (tests) ".test" else ""}`
+			const rest = argv.slice(1, argv.length)
+			build(argv[0], exe, tests, if (cmd == "build") rest else [], dirs, f.release)
+			if (cmd == "build") {
+				print(exe)
+				return 0
+			}
+			return process.run([exe, ...rest])
+		case "check", "lint":
+			let status = 0
+			for (const e of check(argv, dirs)) {
+				print(`${e.path}:${e.line}:${e.col}: ${if (e.warning) "warning: " else ""}${e.msg}`)
+				status = if (e.warning) status else 1
+			}
+			return status
+		case "format":
+			let status = 0
+			for (const path of argv) {
+				try {
+					formatFile(path)
+				} catch (e: CompileError) {
+					print(e.msg)
+					status = 1
+				}
+			}
+			return status
+		case "doc":
+			print(doc(argv))
+			return 0
+		case "lsp":
+			serve(dirs)
+			return 0
+		case "lower":
+			const p = lower(argv, dirs)
+			for (const path of argv) {
+				print(show(p, p.module(normal(path))))
+			}
+			return 0
+	}
+	print(usage)
+	return 2
+}
+
+/// The hash of the compiler's build ID, a hash of its content that ld has the linker put in its first page.
+function compilerId(): u64 throws IoError {
+	const f = open("/proc/self/exe")
+	const page = f.read(4096) ?? ""
+	f.close()
+	const i = indexOf(page, "\x03\x00\x00\x00GNU\x00") // the note's type, NT_GNU_BUILD_ID, and owner
+	return fnv(page.slice(i + 8, i + 8 + page[i - 4]))
+}
+
+/// Compiles the program of main into the executable exe, linked with the link args: each module once by TPDE, fast to
+/// compile, or if release all as one, monomorphized, by LLVM at -O2; throws the errors, or what failed, as a CompileError
+/// or IoError.
+export function build(main: string, exe: string, tests: bool, link: string[] = [], includes: string[] = [],
+	release = false) {
+	const home = nearest(main)
+	if (home != null) {
+		cmake(load(home))
+	}
+	const p = lower([main], includes)
+	// The packages of its modules but headers, whose C libraries' headers compile its headers' glue.
+	const packages: [string, string[]][] = []
+	const headers: string[] = []
+	const cIncludes = includes.slice(0, includes.length)
+	for (const m of p.modules) {
+		const path = split(m.path, ": ")[0]
+		if (path != m.path) {
+			headers.push(path)
+			continue
+		}
+		const d = nearest(path)
+		if (d != null && !packages.some(e => e[0] == d)) {
+			packages.push([d, includesOf(path, [])])
+			cIncludes.push(...packages[packages.length - 1][1])
+		}
+	}
+	mkdirAll(dir)
+	const compiler = compilerId()
+	for (const m of 0 ... p.modules.length - 1) {
+		const path = p.modules[m].path
+		save(`${file(path)}.bobc`, write(p, m, compiler))
+	}
+	const o = { main: p.module(normal(main)), tests: tests, dyn: !release }
+	if (release) {
+		mono(p, o.main)
+	}
+	const objects: string[] = []
+	const whole = if (release) new LLVM(main) else null
+	const facts = if (release) learn(p, o, m => new LLVM(p.modules[m].path)) else new Facts()
+	for (const m of 0 ... p.modules.length - 1) {
+		const path = p.modules[m].path
+		const b: Backend = if (release) new LLVM(path) else new Tpde(path)
+		emit(p, m, b, o, facts)
+		b.verify() // which also finishes it, before it is linked
+		if (b instanceof LLVM) {
+			whole!.link(b)
+		} else {
+			b.emit(`${file(path)}.o`, false)
+			objects.push(`${file(path)}.o`)
+		}
+		const c = glued(p, m, cIncludes)
+		if (c != null) {
+			objects.push(c)
+		}
+	}
+	if (whole != null) {
+		whole.emit(`${exe}.o`, false)
+		objects.push(`${exe}.o`)
+	}
+	// All C libraries of each package one of whose headers it imports, which lld takes in any order, and of which it
+	// links what it uses.
+	const libs: string[] = []
+	for (const [d, dirs] of packages) {
+		if (!headers.some(h => dirs.some(i => startsWith(h, `${i}/`)))) {
+			continue
+		}
+		const p = load(d)
+		for (const [name, c] of p.c) {
+			if (c.cmake.version > 0) {
+				libs.push(...split(readFile(`${out(p.name, name)}/libs`), "\n").filter(l => l != ""))
+			} else if (c.sources.length > 0) {
+				libs.push(archive(c, out(p.name, name), join(d, "bober.pkg"), dirs))
+			}
+		}
+	}
+	run([...ld, ...objects, ...runtime(dir), ...libs, ...link, "-o", exe])
+}
+
+/// The run time's objects, src/rt.c's, src/gc.c's, src/fiber.c's, src/io.c's and src/type.c's, compiled at -O2 into out
+/// where older than their source or src/rt.h.
+export function runtime(out: string): string[] {
+	const objects: string[] = []
+	for (const c of ["rt", "gc", "fiber", "io", "type"]) {
+		const o = `${out}/${c}.c.o` // not a program's, out/<name>.o
+		if (!newer(o, [`src/${c}.c`, "src/rt.h"])) {
+			run([...cc, "-c", "-fexceptions", "-O2", `src/${c}.c`, "-o", o])
+		}
+		objects.push(o)
+	}
+	return objects
+}
+
+/// The archive out.a of c's sources, each compiled at -O2 into out, with c's private headers and those of includes,
+/// where older than it, or all where pkg, its bober.pkg, or a header of c's is newer than the archive. C++ is C++20.
+function archive(c: CLib, out: string, pkg: string, includes: string[]): string {
+	const a = `${out}.a`
+	const skip = globs(c.exclude)
+	const all = !newer(a, [pkg, ...globs([...c.include, ...c.private].map(d => `${d}/**/*.h`))])
+	const flags = [...[...c.private, ...includes].map(d => `-I${d}`), ...c.defines.map(e => `-D${e[0]}=${e[1]}`)]
+	const objects: string[] = []
+	for (const s of globs(c.sources).filter(s => !skip.includes(s))) {
+		const o = `${out}/${rel(c.src as string, s)!}.o`
+		if (all || !newer(o, [s])) {
+			mkdirAll(parent(o))
+			const std: string[] = if (endsWith(s, ".cpp")) ["-std=c++20", cxx("build/musl")] else []
+			run([...cc, "-c", "-O2", ...std, ...flags, s, "-o", o])
+		}
+		objects.push(o)
+	}
+	if (!newer(a, objects)) {
+		if (exists(a)) {
+			remove(a)
+		}
+		run(["ar", "rcs", a, ...objects])
+	}
+	return a
+}
+
+/// Builds and installs each CMake project of p into its out, listing the static libraries it installs in out/libs,
+/// unless its entry in p, its patches and the toolchain are what they were last: its src, copied or fetched with its
+/// hash checked to out/src, patched, and configured afresh with its preset "bober" and the target's toolchain file,
+/// finding those of p before it, in out/build, which is kept, as the archive fetched.
+function cmake(p: Package) {
+	const cwd = fromCString(getcwd(0, 0))
+	const tools = toolchain(`${cwd}/build/musl`)
+	for (const [name, c] of p.c) {
+		const o = out(p.name, name)
+		const entry = encode(c.src) + encode(c.cmake) + c.patches.map(x => readFile(x)).join("") + tools
+		if (c.cmake.version == 0 || exists(`${o}/stamp`) && readFile(`${o}/stamp`) == entry) {
+			continue
+		}
+		let root = `${o}/src`
+		if (exists(root)) {
+			removeAll(root)
+		}
+		mkdirAll(o)
+		const src = c.src
+		if (src instanceof string) {
+			run(["cmake", "-E", "copy_directory", src, root])
+		} else {
+			// Its one directory as out/src, the same for any URL.
+			const url = split(src[0], "#")
+			save(`${o}/fetch.cmake`, `file(DOWNLOAD "${url[0]}" "${o}/src.tar" EXPECTED_HASH SHA256=${src[1]})
+file(ARCHIVE_EXTRACT INPUT "${o}/src.tar" DESTINATION "${o}/fetch")`)
+			run(["cmake", "-P", `${o}/fetch.cmake`])
+			rename(glob(`${o}/fetch/*`)[0], root)
+			if (url.length > 1) {
+				root = join(root, url[1])
+			}
+		}
+		for (const x of c.patches) {
+			run(["patch", "-s", "-p1", "-d", root, "-i", `${cwd}/${x}`])
+		}
+		const preset = [...c.cmake.fields.map(e => `${quoted(e[0])}:${e[1]}`), `"name":"bober"`, `"generator":"Ninja"`]
+		save(`${root}/CMakeUserPresets.json`,
+			`{"version":${c.cmake.version},"configurePresets":[{${preset.join(",")}}]}`)
+		save(`${dir}/${triple}.cmake`, tools)
+		mkdirAll(`${o}/build/.cmake/api/v1/query`)
+		save(`${o}/build/.cmake/api/v1/query/codemodel-v2`, "")
+		run(["cmake", "-S", root, "-B", `${o}/build`, "--fresh", "--preset", "bober", "--toolchain",
+			`${cwd}/${dir}/${triple}.cmake`, `-DCMAKE_PREFIX_PATH=${cwd}/${out(p.name, "")}`])
+		run(["cmake", "--build", `${o}/build`])
+		run(["cmake", "--install", `${o}/build`, "--prefix", o])
+		save(`${o}/libs`, installed(`${o}/build`).join("\n"))
+		save(`${o}/stamp`, entry)
+	}
+}
+
+/// A target of a CMake project, as its file API describes it.
+class Target {
+	type: string = ""
+	artifacts: Artifact[] = []
+	install: Keys = new Keys()
+	rest: Unknown[] @Rest = []
+}
+
+class Artifact {
+	path: string = ""
+}
+
+/// The static libraries the CMake project built in build installs, as its file API tells.
+function installed(build: string): string[] {
+	const libs: string[] = []
+	for (const f of glob(`${build}/.cmake/api/v1/reply/target-*.json`)) {
+		let t = new Target()
+		try {
+			t = decodeJson[Target](readFile(f))
+		} catch (e: ParseError) {
+			throw new CompileError(`${f}: ${e.kind} error at byte ${e.at}`)
+		}
+		if (t.type == "STATIC_LIBRARY" && t.install.all.length > 0) {
+			libs.push(...t.artifacts.map(a => join(build, a.path)))
+		}
+	}
+	return libs
+}
+
+/// The paths that match any of patterns.
+function globs(patterns: string[]): string[] {
+	const out: string[] = []
+	for (const p of patterns) {
+		out.push(...glob(p))
+	}
+	return out
+}
+
+/// Whether the file at path exists and is newer than each of sources, so that it need not be made again.
+function newer(path: string, sources: string[]): bool {
+	if (!exists(path)) {
+		return false
+	}
+	const t = stat(path).modified
+	for (const s of sources) {
+		if (stat(s).modified >= t) {
+			return false
+		}
+	}
+	return true
+}
+
+/// The object of the C that defines the static functions of module m of p, if a C header's module, whose path is the header's and
+/// the names imported (src/check.bob, Modules.header), or null.
+function glued(p: Program, m: i32, includes: string[]): string | null {
+	const path = p.modules[m].path
+	const at = indexOf(path, ": ")
+	if (at < 0) {
+		return null
+	}
+	const c = glue(path.slice(0, at), p.modules[m].decls.map(d => p.strings[p.decls[d].name]))
+	if (c == "") {
+		return null
+	}
+	const f = file(path)
+	save(`${f}.c`, c)
+	run([...cc, "-c", "-iquote", ".", ...includes.map(d => `-I${d}`), `${f}.c`, "-o", `${f}.c.o`])
+	return `${f}.c.o`
+}
+
+/// The executable's name for main: its file's, without .bob or .test.bob.
+function name(main: string): string {
+	let n = main
+	for (const suffix of [".bob", ".test"]) {
+		if (endsWith(n, suffix)) {
+			n = n.slice(0, n.length - suffix.length)
+		}
+	}
+	let i = n.length
+	while (i > 0 && n[i - 1] != 0x2f) {
+		i--
+	}
+	return n.slice(i, n.length)
+}
+
+/// Where the files of the module at path go, without extension: its path in the build directory, each / a _. A C
+/// header's module is named by its path and the names imported from it, which would be too long a file name, so they
+/// are hashed instead.
+function file(path: string): string {
+	const space = indexOf(path, " ")
+	let s = ""
+	for (const c of if (space < 0) path else path.slice(0, space)) {
+		s += if (c == 0x2f) "_" else chr(c)
+	}
+	if (space >= 0) {
+		s += `.${fnv(path)}`
+	}
+	return `${dir}/${s}`
+}
+
+function save(path: string, s: string) {
+	if (!writeFile(path, s)) {
+		throw new CompileError(`cannot write ${path}`)
+	}
+}
+
+/// Runs argv; throws if it fails.
+function run(argv: string[]) {
+	if (process.run(argv) != 0) {
+		throw new CompileError(`failed: ${argv.join(" ")}`)
+	}
+}

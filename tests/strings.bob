@@ -1,0 +1,99 @@
+test "length and indexing count bytes" {
+	const s = "héllo"
+	assert s.length == 6
+	assert s[0] == ("h" as u8)
+	assert s[1] == 0xC3
+	assert s[5] == ("o" as u8)
+	assert s[1] + 0x40 == 3
+}
+
+test "concatenation and equality" {
+	let t = "ab" + "c"
+	t += "d"
+	assert t == "abcd"
+	assert t != "abce"
+	assert "a" != "A"
+}
+
+test "ordering compares bytes" {
+	assert "ab" < "abc"
+	assert "B" < "a"
+	assert "b" > "abc"
+	assert "\xff" > "a"
+}
+
+test "slice" {
+	const s = "hello"
+	assert s.slice(1, 3) == "el"
+	assert s.slice(0, 0) == ""
+	assert s.slice(0, 5) == s
+}
+
+test "at" {
+	const s = "hi"
+	assert s.at(1) == 105 && s.at(2) == null && s.at(-1) == null
+	assert (s.at(5) ?? 0) == 0
+}
+
+test "chr" {
+	assert chr(65) == "A"
+	assert chr(0).length == 1
+	assert chr(200)[0] == 200
+	let r = ""
+	for (const i of 0 ... 2) {
+		r = chr("abc"[i]) + r
+	}
+	assert r == "cba"
+}
+
+test "a template shows a union's value" {
+	const xs: (i32 | null)[] = [3, null]
+	assert `${xs[0]} ${xs[1]}` == "3 null"
+}
+
+function str[T](x: T): string { return `${x}` }
+
+test "a template shows a literal's value" {
+	const m: "fast" | "safe" = "fast"
+	assert str(m) == "fast"
+}
+
+/// The sum of the bytes of s, read in place across calls that allocate enough for a collection, which moves s.
+function sumAcross(s: string): i64 {
+	let sum: i64 = 0
+	let held: u8[][] = []
+	for (const i of 0 ... s.length - 1) {
+		sum += s[i]
+		held = [new u8[](1 << 20)]
+	}
+	return sum + held.length - 1
+}
+
+test "a string read in place survives a collection moving it" {
+	let s = ""
+	let want: i64 = 0
+	for (const i of 0 ... 99) {
+		s += chr((97 + i % 26) as u8)
+		want += 97 + i % 26
+	}
+	assert sumAcross(s) == want
+}
+
+test "appending to a string of bytes leaves other strings be" {
+	// Bytes that concat would read as a buffer's capacity, 2^63 - 1, and use, 8, with room to append in place.
+	const b = new u8[](24)
+	const zeros = new u8[](24)
+	for (const i of 0 ... 6) {
+		b[i] = 0xff
+	}
+	b[7] = 0x7f
+	b[8] = 8
+	const s = fromBytes(b)
+	const other = fromBytes(zeros)
+	const more = "0123456789abcdef0123456789abcdef"
+	const t = s + more
+	assert t.slice(0, 24) == s && t.slice(24, 56) == more
+	for (const i of 0 ... 23) {
+		assert other[i] == 0
+	}
+}

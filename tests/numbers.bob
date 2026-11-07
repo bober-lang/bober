@@ -1,0 +1,164 @@
+import { Numeric } from "../std/types"
+
+test "kinds: untyped defaults, wrapping, widening" {
+	let i = 2147483647
+	i += 1
+	assert i == -2147483648
+	let a: i8 = 127
+	assert a + 1 == -128
+	let b: u8 = 255
+	assert b + 1 == 0
+	assert -b == 1
+	let e: u32 = 4294967295
+	assert e * e == 1
+	let w: i32 = 100
+	assert a + w == 227
+	let h: f32 = 1.5
+	let f: f64 = 2.25
+	assert h + f == 3.75
+}
+
+test "untyped constants take their context" {
+	const k = 10
+	let b: u8 = 250
+	assert b + k == 4
+}
+
+test "64-bit unsigned" {
+	let m: u64 = 0
+	m -= 1
+	assert m > 1
+	assert m / 2 == 9223372036854775807
+	let d: i64 = 9223372036854775807
+	assert d + 1 < 0
+}
+
+test "precedence" {
+	let x: i32 = 1 + 2 * 3
+	assert x == 7
+	x = 2 ** 3 ** 2
+	assert x == 512
+	x = 1 << 2 + 1
+	assert x == 8
+	x = 1 | 2 ^ 3 & 1
+	assert x == 3
+	x = (-2) ** 3
+	assert x == -8
+}
+
+test "integer division truncates, remainder takes the dividend's sign" {
+	let a = 7
+	let n = -7
+	assert n / 2 == -3
+	assert a / -2 == -3
+	assert n % 2 == -1
+	assert a % -2 == 1
+	assert a / 2 * 2 + a % 2 == 7
+}
+
+test "division of the minimum by -1 wraps" {
+	let m: i32 = -2147483648
+	let neg = -1
+	assert m / neg == m
+	assert m % neg == 0
+	let l: i64 = -9223372036854775807 - 1
+	let lneg: i64 = -1
+	assert l / lneg == l
+}
+
+test "floats and power" {
+	let f = 7.0
+	assert f / 2.0 == 3.5
+	let z = 0.0
+	assert f / z > 1e308
+	const nan = z / z
+	assert nan != nan
+	let big: f32 = 16777216.0
+	assert big + 1.0 == big
+	let b = 3
+	assert b ** 4 == 81
+	let u: u8 = 2
+	assert u ** 8 == 0
+	let two = 2.0
+	assert two ** -1.0 == 0.5
+	assert 1.0 / -z < 0.0
+	assert 1.0 / neg(z) < 0.0 && 1.0 / neg(-z) > 0.0 && neg(b) == -3
+}
+
+/// -x of a type parameter, which keeps a float's sign of zero.
+function neg[T extends Numeric](x: T): T { return -x }
+
+test "bitwise and shifts" {
+	let m: i32 = 0b1100
+	assert m & 0b1010 == 0b1000 // & binds tighter than ==
+	assert ~m == -13
+	let one: i32 = 1
+	assert one << 33 == 2
+	let neg: i32 = -8
+	assert neg >> 1 == -4
+	let top: u32 = 0x8000_0000
+	assert top >> 31 == 1
+	let b: u8 = 0x81
+	assert b << 1 == 2
+	let x: i64 = 3
+	assert x << 64 == 3
+}
+
+test "comparison chains" {
+	let a = 1
+	let b = 2
+	assert a < b <= 2
+	assert b >= b > a
+	assert !(a < b < b)
+	let calls = 0
+	function mid(): i32 {
+		calls += 1
+		return 5
+	}
+	assert 1 < mid() <= 5
+	assert calls == 1
+}
+
+test "integer casts truncate and extend" {
+	let n: i32 = 300
+	assert (n as u8) == 44
+	let m = -1
+	assert (m as u32) == 4294967295
+	assert (m as i64) == -1
+	let b: u8 = 255
+	assert (b as i8) == -1
+	assert (b as i32) == 255
+}
+
+test "float casts truncate and saturate; bool is != 0" {
+	let f = 1e20
+	assert (f as i32) == 2147483647
+	assert (-f as u32) == 0
+	let g = 2.9
+	assert (-g as i32) == -2
+	let z = 0.0
+	assert ((z / z) as i32) == 0
+	let i = 7
+	assert (i as f64) / 2.0 == 3.5
+	assert i as bool
+	assert !(z as bool)
+}
+
+test "compound assignment" {
+	let x = 10
+	x -= 3
+	x *= 2
+	x /= 4
+	x **= 2
+	x <<= 1
+	x |= 1
+	x &= 7
+	x ^= 2
+	x >>= 1
+	x %= 2
+	assert x == 0
+	x++
+	x--
+	x--
+	assert x == -1
+}

@@ -1,0 +1,73 @@
+//! Bugs the tpde-bober port hit; every test passes.
+
+const A = 1
+const B = 2
+/// Named as a test, whose symbol does not clash with it.
+const t = "0123456789"
+
+interface V { k: i32 }
+class P { k = 1 }
+class Q { k = 2; q = 7 }
+
+/// Q is never converted to V, so V does not hold it.
+function q(v: V): i32 { return if (v instanceof Q) v.q else 0 }
+
+class Fixed {
+	lc: u8[4]
+	m: u8[2][3]
+	ps: (P | null)[2]
+}
+
+test "t" { assert t.length == 10 }
+
+test "untyped constants take their context through a chain" {
+	const x: u32 = A | B | 4
+	let y: u32 = 0
+	y += 6 * 8 + 8 * 16
+	assert x == 7 && y == 176 && y == 100 + 70 + 6
+	const p: u16 = 512
+	const cls: u8 = 9
+	assert (p & (1 << 9)) != 0 && new u16[](1 << cls).length == 512
+}
+
+test "case labels, test as a name, arrow results and templates" {
+	const test = 82 as u8
+	const r = switch (test) {
+		case "R" as u8: 1
+		default: 2
+	}
+	const big = (a: i32, b: i32): i64 => (a as i64) * (b as i64)
+	assert r == 1 && big(1 << 20, 1 << 20) == 1 << 40 && `${1e21}|${1.5}` == "1e+21|1.5"
+}
+
+test "assignment to an array pattern" {
+	let a = 1
+	let b = 2
+	[a, b] = [b, a]
+	assert a == 2 && b == 1
+	const p = new P()
+	const xs = [10, 20]
+	[p.k, xs[1], [a, b]] = [xs[0], p.k, [5, 6]]
+	assert p.k == 10 && xs[1] == 1 && a == 5 && b == 6
+}
+
+test "instanceof a class an interface does not hold" { assert q(new P()) == 0 }
+
+test "fixed arrays: zero values and updates in place" {
+	const f = new Fixed()
+	assert f.ps[1] == null
+	f.lc[1] = 5
+	f.lc[1]--
+	f.lc[1] -= 1
+	f.m[2][1] += 4
+	f.m[2][1]++
+	let l: u8[2] = [5, 5]
+	l[1]++
+	assert f.lc[1] == 3 && f.m[2][1] == 5 && f.m[0][1] == 0 && l[1] == 6
+}
+
+test "array methods" {
+	const xs = [1, 2, 3, 4]
+	assert xs.filter(x => x % 2 == 0).join(",") == "2,4" && xs.some(x => x > 3) && !xs.some(x => x > 4)
+	assert xs.every(x => x > 0) && !xs.every(x => x > 1) && xs.includes(3) && !xs.includes(5)
+}

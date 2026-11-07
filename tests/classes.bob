@@ -1,0 +1,131 @@
+class Counter {
+	n = 0
+	step: i32
+	label: string
+	done: bool
+	byte: u8
+	static created = 0
+
+	constructor(step: i32) {
+		this.step = step
+		Counter.created += 1
+	}
+
+	inc() { this.n += this.step }
+	value(): i32 { return this.n }
+	twice(): i32 { return this.value() * 2 }
+	static make(): Counter { return new Counter(1) }
+}
+
+class Chain {
+	a = 1
+	b = this.a + 1
+	c: i32
+
+	constructor() { this.c = this.b * 10 }
+}
+
+interface Shape {
+	area(): f64
+}
+
+class Sq implements Shape {
+	private readonly side = 1.0
+
+	constructor(side: f64) { this.side = side }
+	area(): f64 { return this.side * this.side }
+}
+
+class Box[T] {
+	item: T | null = null
+
+	constructor(item: T) { this.item = item }
+}
+
+test "fields start at zero values and keep their kind" {
+	const c = new Counter(2)
+	assert c.n == 0 && c.step == 2
+	assert c.label == "" && !c.done && c.byte == 0
+	c.byte = 255
+	c.byte += 1
+	assert c.byte == 0
+}
+
+test "methods see this; instances are references" {
+	const c = new Counter(2)
+	const d = c
+	c.inc()
+	d.inc()
+	assert c.twice() == 8
+	const same = c == d && c != new Counter(2) // by identity, as outside an assert
+	assert same
+}
+
+test "initializers run in order, then the constructor" {
+	const ch = new Chain()
+	assert ch.a == 1 && ch.b == 2 && ch.c == 20
+}
+
+test "statics" {
+	const before = Counter.created
+	assert Counter.make().step == 1
+	assert Counter.created == before + 1
+}
+
+test "methods are values bound to their object" {
+	const c = new Counter(3)
+	const f = c.inc
+	f()
+	f()
+	function call(h: () => i32): i32 { return h() }
+	assert call(c.value) == 6
+}
+
+test "interfaces" {
+	const s: Shape = new Sq(2.0)
+	assert s.area() == 4.0
+}
+
+test "generic classes take type arguments, else infer them from the constructor" {
+	assert new Box[i32](5).item == 5
+	assert new Box("s").item == "s"
+}
+
+test "local classes" {
+	function make(v: i32): bool {
+		class L {
+			v = 0
+			get(): i32 { return this.v }
+		}
+		class M {}
+		const l = new L()
+		l.v = v
+		return l instanceof (L | M) && l.get() == v
+	}
+	assert make(1) && make(2)
+}
+
+class Pt {
+	x = 0
+	y = 0
+}
+
+class Seg {
+	a: ...Pt
+	b: ...Pt = { x: 1, y: 2 }
+}
+
+test "embedded fields copy, never alias" {
+	const p = new Pt()
+	const s = new Seg()
+	s.a = { ...p }
+	p.x = 5
+	assert s.a.x == 0 && s.b.y == 2
+	s.b = { ...p }
+	assert s.b.x == 5 && s.b instanceof Pt
+	s.b = { ...new Pt(), y: 3 }
+	assert s.b.x == 0 && s.b.y == 3
+	[s.a] = [{ ...p }]
+	p.x = 6
+	assert s.a.x == 5
+}

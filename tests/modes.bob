@@ -1,0 +1,215 @@
+//! Cases debug and release builds have disagreed on, each run in both.
+
+import { Signal } from "../builtin/fiber"
+
+test "a closure in a for over an array or tuple captures that element" {
+	const fs: (() => i32)[] = []
+	const t: [i32, i32, i32] = [1, 2, 3]
+	for (const x of t) {
+		fs.push(() => x)
+	}
+	let ys: i32[] = [4, 5]
+	for (const y of ys) {
+		fs.push(() => y)
+	}
+	assert `${fs[0]()}${fs[1]()}${fs[2]()}${fs[3]()}${fs[4]()}` == "12345"
+}
+
+test "a for over an array sees elements pushed while it runs" {
+	const xs: i32[] = [1]
+	let n = 0
+	for (const x of xs) {
+		n++
+		if (x < 3) {
+			xs.push(x + 1)
+		}
+	}
+	assert n == 3
+}
+
+type A = "a"
+
+function which(x: "a" | "b" | i32): string {
+	return switch (x) {
+		case A: "A"
+		default: "other"
+	}
+}
+
+test "a case of a literal type matches only that literal" {
+	assert `${which("b")} ${which("a")} ${which(1)}` == "other A other"
+}
+
+function withDefault[T](x: T): Type {
+	const f = (a: T, b: T = x) => b
+	return typeof f
+}
+
+test "a generic closure with a defaulted param has its type" {
+	const c = (a: i32, b: i32 = 1) => b
+	assert withDefault[i32](1) == typeof c
+	assert withDefault[i32](1) != withDefault[string]("s")
+}
+
+function direct[T](): string {
+	const t: Type = T
+	return t.name
+}
+
+function viaClosure[T](): string {
+	const f = () => {
+		const t: Type = T
+		return t.name
+	}
+	return f()
+}
+
+type AB = "a" | "b"
+
+test "a closure sees its type args as written" {
+	assert direct[AB]() == viaClosure[AB]()
+	assert direct[[AB, i32]]() == viaClosure[[AB, i32]]()
+}
+
+const Z = -0.0
+const NZ: f64 = -0.0
+
+test "floats compare by value" {
+	assert 0.0 == -0.0
+	assert Z == 0.0 && NZ == 0.0
+	const u: f64 | null = -0.0
+	assert u == 0.0
+}
+
+let effects = 0
+
+function named(t: Type): string {
+	effects++
+	return t.name
+}
+
+test "a call with a known Type arg keeps its effects" {
+	assert named(i32) == "i32"
+	assert effects == 1
+}
+
+class K {
+	n: i32 = 1
+
+	name(x: i32, t: Type): string { return `${x}${t.name}` }
+}
+
+test "a method with a Type param" {
+	assert new K().name(1, i32) == "1i32"
+}
+
+type P = { x: i32, y: i32 }
+
+function pairs[T](v: T): string[] {
+	const out: string[] = []
+	for (const f of T.fields) {
+		const g = () => `${f.name}=${v[f.name]}`
+		out.push(g())
+	}
+	return out
+}
+
+test "a closure over the field of an unrolled for" {
+	const p: P = { x: 1, y: 2 }
+	assert pairs(p).join(",") == "x=1,y=2"
+}
+
+interface Waker {
+	wake(): null
+}
+
+test "a builtin class reached only through an interface" {
+	const w: Waker = new Signal()
+	w.wake()
+}
+
+class Mark {}
+
+class Rec {
+	name: string @Mark = "n"
+	n: i32 = 1
+}
+
+function tagged(tags: Type[], A: Type): bool {
+	for (const B of tags) {
+		if (B == A) {
+			return true
+		}
+	}
+	return false
+}
+
+function marked[T](v: T): string {
+	let out = ""
+	for (const f of T.fields) {
+		if (tagged(f.tags, Mark) && f.type == string) {
+			const s: string = v[f.name]
+			out = out + s
+		}
+	}
+	return out
+}
+
+test "a call taking Types is known as what it returns, so an if of it takes its branch" {
+	assert marked(new Rec()) == "n"
+}
+
+function id[T](x: T): T { return x }
+function apply[T](f: () => T): T { return f() }
+
+function unmarked(tags: Type[]): bool {
+	for (const B of tags) {
+		if (B == Mark) {
+			return false
+		}
+	}
+	return apply(() => apply(() => true))
+}
+
+function shown[T](x: T): string { return `${T}` }
+
+test "a Type shows as its name, as an element too, and through a type param" {
+	assert `${i32} ${[Mark, string[]]} ${shown(1)}` == "i32 [Mark, string[]] i32"
+}
+
+test "Types are known through an array literal, a generic, and a closure of a call taking them" {
+	assert unmarked([i32, string]) && unmarked(id(Rec.fields[1].tags)) && !unmarked(id(Rec.fields[0].tags))
+}
+
+function each(ts: Type[], f: (t: Type, i: i32) => string): string[] {
+	const out: string[] = []
+	let i = 0
+	for (const t of ts) {
+		out.push(f(t, i))
+		i++
+	}
+	return out
+}
+
+function both(f: (t: Type) => string): string { return f(i32) + f(string) }
+
+test "a closure taking or giving a Type is known as its code, its captures and other args at run time" {
+	let sep = ":"
+	assert `${each([i32, string], (t, i) => `${i}${sep}${t}`)}` == `["0:i32", "1:string"]`
+	assert both(t => both(u => `${t}${sep}${u} `)) == "i32:i32 i32:string string:i32 string:string "
+	assert apply(() => Rec.fields[0].tags).length == 1
+	let n = 0
+	assert both(t => {
+		n++
+		return `${t}${n}`
+	}) == "i321string2" && n == 2
+}
+
+const Lo: u8 = 19
+const Hi: u8 = 20
+type Level = Lo | Hi
+
+test "a union of integer literals shows its value" {
+	const x: Level = Lo
+	assert `${x}` == "19"
+}
