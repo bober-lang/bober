@@ -1,0 +1,377 @@
+//! The code generator as the compilers see it: a module's types, constants, functions and globals, the
+//! instructions of its blocks, and at last its object file. Types, values and blocks are handles of the
+//! generator's own, meaningless outside it. LLVM (src/backend/llvm.bob) and TPDE (src/backend/tpde.bob) are the
+//! generators, each through a C API of this shape, so that no IR of either is built or named in the compilers.
+
+import { HashMap } from "../../std/collections/hashmap"
+
+export type Type = u64
+export type Value = u64
+export type Block = u64
+
+/// Arithmetic on two values of one type; the f ops on floats, the others on integers.
+export type Binary = "add" | "sub" | "mul" | "udiv" | "sdiv" | "urem" | "srem" | "shl" | "lshr" | "ashr" | "and" | "or"
+	| "xor" | "fadd" | "fsub" | "fmul" | "fdiv" | "frem" | "fpow"
+/// Conversions between widths and kinds.
+export type Cast = "trunc" | "zext" | "sext" | "fptoui" | "fptosi" | "uitofp" | "sitofp" | "fptrunc" | "fpext"
+	| "ptrtoint" | "inttoptr" | "bitcast"
+/// Integer comparisons; u and s the unsigned and signed orders.
+export type Cmp = "eq" | "ne" | "ugt" | "uge" | "ult" | "ule" | "sgt" | "sge" | "slt" | "sle"
+/// Float comparisons; the o ones false and the u ones true when an operand is NaN.
+export type FCmp = "oeq" | "ogt" | "oge" | "olt" | "ole" | "one" | "ord" | "ueq" | "ugt" | "uge" | "ult" | "ule" | "une"
+	| "uno"
+
+/// fneg of a float, or a bit intrinsic on an integer, as a value of its type.
+export type Unary = "fneg" | "bswap" | "ctlz" | "cttz" | "ctpop" | "fabs"
+
+/// An operand of inline assembly, under the constraint c as GCC spells it: an input's value, or the address
+/// of one in memory, m, with t the type there; an output in a register has only the type it is given.
+export class Operand {
+	c: string
+	v: Value
+	t: Type
+
+	constructor(c: string, v: Value, t: Type) {
+		this.c = c
+		this.v = v
+		this.t = t
+	}
+}
+
+export interface Backend {
+	void(): Type
+	int(bits: u32): Type
+	f32(): Type
+	f64(): Type
+	ptr(): Type
+	/// A pointer the collector knows (src/rt.c): into collected memory, which it may move, or else anywhere.
+	ref(): Type
+	fn(result: Type, params: Type[]): Type
+	/// A function type taking more arguments after params.
+	variadic(result: Type, params: Type[]): Type
+	struct(fields: Type[]): Type
+	array(elem: Type, n: u64): Type
+
+	/// n, sign extended to t where that is wider.
+	constInt(t: Type, n: i64): Value
+	constFloat(t: Type, x: f64): Value
+	/// The integer of digits in radix, wrapped to t.
+	constIntOf(t: Type, digits: string, radix: u8): Value
+	/// The float a decimal literal stands for.
+	constFloatOf(t: Type, text: string): Value
+	/// The zero of t: 0, null, or all fields or elements zero.
+	constZero(t: Type): Value
+	/// An array of s's bytes, without a NUL.
+	constBytes(s: string): Value
+	constStruct(fields: Value[]): Value
+	constArray(elem: Type, elems: Value[]): Value
+	/// A packed struct constant: its fields byte after byte, with no padding.
+	constPacked(fields: Value[]): Value
+	/// The size of t in bytes, an i64 constant.
+	sizeOf(t: Type): Value
+	/// The size of t in bytes, as the target lays it out.
+	bytes(t: Type): u64
+	/// The constant address bytes past the constant one p.
+	constOffset(p: Value, bytes: i64): Value
+	/// The constant v converted by op, which is trunc, ptrtoint, inttoptr or bitcast.
+	constCast(op: Cast, v: Value, to: Type): Value
+
+	/// The function of that name, declared until blocks define it. A local one is seen only in this module.
+	function(name: string, t: Type, local: bool): Value
+	/// The function or else global of that name, or 0.
+	named(name: string): Value
+	/// A variable starting as the constant init, aligned to align bytes, or as the type wants for 0.
+	global(name: string, init: Value, local: bool, align: u32): Value
+	/// A variable of type t defined elsewhere.
+	extern(name: string, t: Type): Value
+	/// Gives the function, or call, fn the attribute name, as LLVM spells it, on its parameter index counted
+	/// from 1, its result for 0, or itself for -1; t is the attribute's type, as byval and sret take, or 0.
+	attr(fn: Value, index: i32, name: string, t: Type)
+	/// Marks the function fn as an allocator: it returns new memory, zeroed, that nothing else points into, so a call
+	/// whose result is not otherwise used may be dropped.
+	allocator(fn: Value)
+	/// A private global holding the constant init, at an address of no meaning, as for a string literal.
+	constant(init: Value): Value
+	/// The program's one constant of that name, which each module using it defines alike as init.
+	literal(name: string, init: Value): Value
+	/// Whether the function or global g is declared only.
+	declared(g: Value): bool
+	/// Whether v is a constant, as the back end may fold one from constant operands. LLVM folds, so a static
+	/// initializer bobcc cannot fold itself (like __int128 arithmetic) works there, poison such as x/0 included;
+	/// TPDE does not fold and says false.
+	isConstant(v: Value): bool
+	/// Puts the function or global by in old's place, with its uses and name, and deletes old.
+	replace(old: Value, by: Value)
+	remove(fn: Value)
+	/// Makes p the personality that unwinds through fn.
+	personality(fn: Value, p: Value)
+	/// Lets the function or global g be defined in other modules too, all alike, one of which is kept.
+	weak(g: Value)
+	/// Makes the function or global g weak, as C's weak attribute: a definition yields to one elsewhere that is not
+	/// weak, and a declaration is null unless a definition is linked in.
+	overridable(g: Value)
+	/// Hides the function or global g from outside the executable or shared library it is linked into.
+	hidden(g: Value)
+	/// Puts an alias of the function or global to, another name of it, in the declaration g's place, with its uses and
+	/// name, as C's alias attribute; returns it.
+	alias(g: Value, to: Value): Value
+	/// Makes the global g, all zeros, common: other modules may define it too, and their definition, or else the
+	/// largest, is kept, as with C's tentative definitions under -fcommon.
+	common(g: Value)
+	threadLocal(g: Value)
+	/// Keeps the function fn's body for inlining only; the symbol is defined in another module.
+	inlineOnly(fn: Value)
+
+	param(fn: Value, i: u32): Value
+	typeOf(v: Value): Type
+	/// The result type of the function type t.
+	resultOf(t: Type): Type
+	/// The type of the function f, or of the value a global holds.
+	valueType(f: Value): Type
+
+	/// A new block at the end of fn.
+	block(fn: Value): Block
+	/// Appends what follows to b.
+	at(b: Block)
+	/// The block being appended to.
+	here(): Block
+	/// Whether the block being appended to has its terminator.
+	ended(): bool
+
+	ret(v: Value)
+	retVoid()
+	br(to: Block)
+	condBr(cond: Value, yes: Block, no: Block)
+	/// Jumps to the target of the case whose value v is, or to otherwise.
+	switch(v: Value, cases: i64[], targets: Block[], otherwise: Block)
+	/// The constant address of the block b of the function fn, which indirectBr jumps to.
+	blockAddress(fn: Value, b: Block): Value
+	/// Jumps to the address p, of one of targets.
+	indirectBr(p: Value, targets: Block[])
+	unreachable()
+
+	binary(op: Binary, a: Value, b: Value): Value
+	icmp(pred: Cmp, a: Value, b: Value): Value
+	fcmp(pred: FCmp, a: Value, b: Value): Value
+	cast(op: Cast, v: Value, to: Type): Value
+	/// The float v as the integer type to, signed or not, clamped to its range, NaN as 0.
+	saturate(signed: bool, v: Value, to: Type): Value
+	unary(op: Unary, v: Value): Value
+	select(cond: Value, yes: Value, no: Value): Value
+	/// A local of type t, aligned to align bytes, or as t wants for 0. Only those in the entry block are
+	/// promoted to registers.
+	alloca(t: Type, align: u32): Value
+	/// bytes, an i64, of the stack, aligned to 16, from here until the function returns, as alloca has them.
+	stackAlloc(bytes: Value): Value
+	load(t: Type, p: Value, volatile: bool): Value
+	store(v: Value, p: Value, volatile: bool): Value
+	/// Marks access, a load or store, as of memory not stored to again once stored to, so that what a load of it
+	/// gives may be kept across calls.
+	invariant(access: Value)
+	/// Marks alloca p live from here if live, else dead, so that no access of it moves past that.
+	lifetime(p: Value, live: bool)
+	/// Marks access, a load or store, as of an array's header if header, else of its elements, which never overlap, so
+	/// that a store to one does not spoil what was loaded from the other.
+	aliasing(access: Value, header: bool)
+	/// The address of field i of the struct of type t at p.
+	field(t: Type, p: Value, i: u32): Value
+	/// The address indices lead to from p, an array of t.
+	gep(t: Type, p: Value, indices: Value[]): Value
+	/// Element i of the struct or array v.
+	extract(v: Value, i: u32): Value
+	/// The struct or array v with e as its element i.
+	insert(v: Value, e: Value, i: u32): Value
+	/// A value of t that is nothing in particular, for insert to fill.
+	undef(t: Type): Value
+	call(fnType: Type, fn: Value, args: Value[]): Value
+	/// A call that goes on at then, or at unwind if fn throws.
+	invoke(fnType: Type, fn: Value, args: Value[], then: Block, unwind: Block): Value
+	/// Copies bytes from src to dst, which do not overlap.
+	copy(dst: Value, src: Value, bytes: i64)
+	/// Sets bytes at dst to zero.
+	zero(dst: Value, bytes: i64)
+	/// Loads a t from p, or stores v to it, atomically and sequentially consistent, aligned to its size.
+	atomicLoad(t: Type, p: Value): Value
+	atomicStore(v: Value, p: Value)
+	/// A fence that is sequentially consistent.
+	fence()
+	/// Aborts the program.
+	trap()
+	/// States, for the optimizer, that the n bytes at p can be read here, and that p is aligned to align.
+	readable(p: Value, n: Value, align: i64)
+	/// Starts the va_list at ap for the variadic function being defined.
+	vaStart(ap: Value)
+	/// The address of the frame of the function being defined, which its frame pointer holds.
+	frameAddress(): Value
+	/// GNU's asm statement, with side effects: text in GCC's template syntax, its outputs and then its inputs,
+	/// a digit constraining an input to an output's place, and clobbers like memory. The register outputs'
+	/// values, in order.
+	asm(text: string, outs: Operand[], ins: Operand[], clobbers: string[]): Value[]
+	/// Whether asm takes inline assembly.
+	hasAsm(): bool
+	/// Appends text, assembly as is, to the module's, as C's file-scope asm does.
+	moduleAsm(text: string)
+	/// Where an invoke unwinds to, catching the C++ exceptions of typeinfo, or every one for a null pointer; it gives
+	/// no value, the personality passing the exception some other way. Its function needs a personality.
+	landingPad(typeinfo: Value)
+
+	// Debug information, which a generator may drop. Instructions get the line set last, within the function
+	// debugged last; a function debugged has one until the next is.
+	/// Names the file the module is compiled from, and the compiler, as producer.
+	source(path: string, producer: string)
+	/// Lets the debugger see fn as the function named as it is, defined at line of the source.
+	debugFunction(fn: Value, line: u32)
+	/// The line and column the instructions appended next come from; a line of 0 is no place.
+	line(n: u32, col: u32)
+	/// Lets the debugger see the slot p of the function debugged as its local name, of type t, declared at line.
+	debugLocal(name: string, p: Value, t: Type, line: u32)
+
+	/// Has the collector walk the frames of the module's functions: each ref they hold across a call is kept where
+	/// it finds and updates it.
+	collected()
+	/// Whether a value of t holds a ref.
+	holdsRef(t: Type): bool
+	/// Where the refs in a value of t are, the layout bober_alloc takes (src/rt.h), or null if it holds none.
+	layout(t: Type): Value
+	/// Has the collector scan global g for refs.
+	root(g: Value)
+	/// Lists global g, a type's descriptor, in section bober_types, for src/rt.c to find by its key.
+	described(g: Value)
+	/// Throws what is wrong with the module, if anything.
+	verify()
+	/// Writes the module as an object file, or as assembly, optimized at the level it was made with.
+	emit(path: string, asm: bool)
+}
+
+/// A back end that makes nothing, for compiling a C header only for what it declares, as the type checker
+/// does. Its handles are distinct, so that addresses compare as they would.
+export class Nothing implements Backend {
+	private n: u64 = 0
+
+	private fresh(): u64 {
+		this.n++
+		return this.n
+	}
+
+	void(): Type { return this.fresh() }
+	int(bits: u32): Type { return this.fresh() }
+	f32(): Type { return this.fresh() }
+	f64(): Type { return this.fresh() }
+	ptr(): Type { return this.fresh() }
+	ref(): Type { return this.fresh() }
+	fn(result: Type, params: Type[]): Type { return this.fresh() }
+	variadic(result: Type, params: Type[]): Type { return this.fresh() }
+	struct(fields: Type[]): Type { return this.fresh() }
+	array(elem: Type, n: u64): Type { return this.fresh() }
+	constInt(t: Type, n: i64): Value { return this.fresh() }
+	constFloat(t: Type, x: f64): Value { return this.fresh() }
+	constIntOf(t: Type, digits: string, radix: u8): Value { return this.fresh() }
+	constFloatOf(t: Type, text: string): Value { return this.fresh() }
+	constZero(t: Type): Value { return this.fresh() }
+	constBytes(s: string): Value { return this.fresh() }
+	constStruct(fields: Value[]): Value { return this.fresh() }
+	constArray(elem: Type, elems: Value[]): Value { return this.fresh() }
+	sizeOf(t: Type): Value { return this.fresh() }
+	bytes(t: Type): u64 { return 0 }
+	constOffset(p: Value, bytes: i64): Value { return this.fresh() }
+	constCast(op: Cast, v: Value, to: Type): Value { return this.fresh() }
+	function(name: string, t: Type, local: bool): Value { return this.fresh() }
+	named(name: string): Value { return 0 }
+	global(name: string, init: Value, local: bool, align: u32): Value { return this.fresh() }
+	extern(name: string, t: Type): Value { return this.fresh() }
+	attr(fn: Value, index: i32, name: string, t: Type) {}
+	allocator(fn: Value) {}
+	constant(init: Value): Value { return this.fresh() }
+	literal(name: string, init: Value): Value { return this.fresh() }
+	declared(g: Value): bool { return false }
+	isConstant(v: Value): bool { return false }
+	replace(old: Value, by: Value) {}
+	remove(fn: Value) {}
+	personality(fn: Value, p: Value) {}
+	weak(g: Value) {}
+	overridable(g: Value) {}
+	hidden(g: Value) {}
+	alias(g: Value, to: Value): Value { return g }
+	param(fn: Value, i: u32): Value { return this.fresh() }
+	typeOf(v: Value): Type { return this.fresh() }
+	resultOf(t: Type): Type { return this.fresh() }
+	valueType(f: Value): Type { return this.fresh() }
+	block(fn: Value): Block { return this.fresh() }
+	at(b: Block) {}
+	here(): Block { return this.fresh() }
+	ended(): bool { return false }
+	ret(v: Value) {}
+	retVoid() {}
+	br(to: Block) {}
+	condBr(cond: Value, yes: Block, no: Block) {}
+	unreachable() {}
+	binary(op: Binary, a: Value, b: Value): Value { return this.fresh() }
+	icmp(pred: Cmp, a: Value, b: Value): Value { return this.fresh() }
+	fcmp(pred: FCmp, a: Value, b: Value): Value { return this.fresh() }
+	cast(op: Cast, v: Value, to: Type): Value { return this.fresh() }
+	saturate(signed: bool, v: Value, to: Type): Value { return this.fresh() }
+	select(cond: Value, yes: Value, no: Value): Value { return this.fresh() }
+	alloca(t: Type, align: u32): Value { return this.fresh() }
+	stackAlloc(bytes: Value): Value { return this.fresh() }
+	load(t: Type, p: Value, volatile: bool): Value { return this.fresh() }
+	store(v: Value, p: Value, volatile: bool): Value { return this.fresh() }
+	invariant(access: Value) {}
+	lifetime(p: Value, live: bool) {}
+	aliasing(access: Value, header: bool) {}
+	field(t: Type, p: Value, i: u32): Value { return this.fresh() }
+	gep(t: Type, p: Value, indices: Value[]): Value { return this.fresh() }
+	extract(v: Value, i: u32): Value { return this.fresh() }
+	insert(v: Value, e: Value, i: u32): Value { return this.fresh() }
+	undef(t: Type): Value { return this.fresh() }
+	call(fnType: Type, fn: Value, args: Value[]): Value { return this.fresh() }
+	invoke(fnType: Type, fn: Value, args: Value[], then: Block, unwind: Block): Value { return this.fresh() }
+	landingPad(typeinfo: Value) {}
+	constPacked(fields: Value[]): Value { return this.fresh() }
+	switch(v: Value, cases: i64[], targets: Block[], otherwise: Block) {}
+	blockAddress(fn: Value, b: Block): Value { return this.fresh() }
+	indirectBr(p: Value, targets: Block[]) {}
+	unary(op: Unary, v: Value): Value { return this.fresh() }
+	copy(dst: Value, src: Value, bytes: i64) {}
+	zero(dst: Value, bytes: i64) {}
+	atomicLoad(t: Type, p: Value): Value { return this.fresh() }
+	atomicStore(v: Value, p: Value) {}
+	fence() {}
+	trap() {}
+	readable(p: Value, n: Value, align: i64) {}
+	vaStart(ap: Value) {}
+	frameAddress(): Value { return this.fresh() }
+	asm(text: string, outs: Operand[], ins: Operand[], clobbers: string[]): Value[] {
+		const out: Value[] = []
+		for (const o of outs) {
+			if (o.c != "m") {
+				out.push(this.fresh())
+			}
+		}
+		return out
+	}
+	hasAsm(): bool { return true }
+	moduleAsm(text: string) {}
+	common(g: Value) {}
+	threadLocal(g: Value) {}
+	inlineOnly(fn: Value) {}
+	source(path: string, producer: string) {}
+	debugFunction(fn: Value, line: u32) {}
+	line(n: u32, col: u32) {}
+	debugLocal(name: string, p: Value, t: Type, line: u32) {}
+	collected() {}
+	holdsRef(t: Type): bool { return false }
+	layout(t: Type): Value { return this.fresh() }
+	root(g: Value) {}
+	described(g: Value) {}
+	verify() {}
+	emit(path: string, asm: bool) {}
+}
+
+/// A generator's codes for the Backend's names, from the pairs of its table.
+export function codes(pairs: [string, i32][]): HashMap[string, i32] {
+	const m = new HashMap[string, i32]()
+	for (const [k, v] of pairs) {
+		m.set(k, v)
+	}
+	return m
+}

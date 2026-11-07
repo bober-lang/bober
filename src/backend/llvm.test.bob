@@ -1,0 +1,107 @@
+import { Backend } from "./backend"
+import { remove } from "../../std/fs"
+import { run } from "../../std/process"
+import { LLVM } from "./llvm"
+import { CompileError } from "../error"
+import { ld } from "../bober"
+import { indexOf } from "../../std/string"
+import { getpid } from "unistd.h"
+
+test "a module is built, verified and printed" {
+	const m = new LLVM("m")
+	const i32 = m.int(32)
+	const f = m.function("twice", m.fn(i32, [i32]), true)
+	m.at(m.block(f))
+	m.ret(m.binary("add", m.param(f, 0), m.param(f, 0)))
+	m.constant(m.constBytes("a\0b"))
+	m.global("size", m.sizeOf(m.struct([i32, m.ptr()])), false, 0)
+	m.verify()
+	const text = m.text()
+	assert indexOf(text, "define internal i32 @twice(i32 %0)") >= 0
+	assert indexOf(text, "add i32 %0, %0") >= 0
+	assert indexOf(text, `private unnamed_addr constant [3 x i8] c"a\\00b"`) >= 0
+	assert indexOf(text, "@size = global i64 ptrtoint (ptr getelementptr ({ i32, ptr }, ptr null, i32 1) to i64)") >= 0
+}
+
+test "a broken module does not verify" {
+	const m = new LLVM("m")
+	m.at(m.block(m.function("f", m.fn(m.void(), []), false)))
+	try {
+		m.verify()
+		assert false
+	} catch (e: CompileError) {
+		assert indexOf(e.msg, "terminator") >= 0
+	}
+}
+
+test "a module compiles, links and runs, through the Backend" {
+	const m: Backend = new LLVM("m")
+	const i32 = m.int(32)
+	const square = m.fn(i32, [i32])
+	const sq = m.function("square", square, false)
+	m.at(m.block(sq))
+	m.ret(m.binary("mul", m.param(sq, 0), m.param(sq, 0)))
+
+	const main = m.function("main", m.fn(i32, []), false)
+	const entry = m.block(main)
+	const below = m.block(main)
+	const above = m.block(main)
+	const done = m.block(main)
+	m.at(entry)
+	const slot = m.alloca(i32, 0)
+	const n = m.call(square, sq, [m.constInt(i32, 7)])
+	m.store(n, slot, false)
+	m.switch(m.cast("zext", m.icmp("slt", n, m.constInt(i32, 50)), i32), [0, 1], [above, below], done)
+	m.at(below)
+	m.store(m.binary("add", n, m.constInt(i32, 2)), slot, false)
+	m.br(done)
+	m.at(above)
+	m.store(m.constInt(i32, 1), slot, false)
+	m.br(done)
+	m.at(done)
+	m.ret(m.load(i32, slot, false))
+	m.verify()
+	const out = `/tmp/bober-llvm${getpid()}`
+	m.emit(out + ".o", false)
+	assert run([...ld, out + ".o", "-o", out]) == 0
+	assert run([out]) == 51
+	remove(out + ".o")
+	remove(out)
+}
+
+test "a module unwinds through landing pads" {
+	const m = new LLVM("m")
+	m.include(`
+		@_ZTIm = external constant ptr
+		declare ptr @__cxa_allocate_exception(i64)
+		declare void @__cxa_throw(ptr, ptr, ptr)
+		define void @throw(i64 %v) {
+			%e = call ptr @__cxa_allocate_exception(i64 8)
+			store i64 %v, ptr %e
+			call void @__cxa_throw(ptr %e, ptr @_ZTIm, ptr null)
+			unreachable
+		}`)
+	const i64 = m.int(64)
+	const throwType = m.fn(m.void(), [i64])
+	const f = m.function("f", m.fn(i64, [i64]), false)
+	m.personality(f, m.function("__gxx_personality_v0", m.fn(m.int(32), []), false))
+	m.at(m.block(f))
+	const ok = m.block(f)
+	const caught = m.block(f)
+	m.invoke(throwType, m.function("throw", throwType, false), [m.param(f, 0)], ok, caught)
+	m.at(ok)
+	m.ret(m.constInt(i64, 0))
+	m.at(caught)
+	m.landingPad(m.constZero(m.ptr()))
+	m.ret(m.binary("mul", m.param(f, 0), m.constInt(i64, 2)))
+	const main = m.function("main", m.fn(m.int(32), []), false)
+	m.at(m.block(main))
+	m.ret(m.cast("trunc", m.call(m.fn(i64, [i64]), f, [m.constInt(i64, 21)]), m.int(32)))
+	m.verify()
+	const out = `/tmp/bober-llvm${getpid()}`
+	m.emit(out + ".o", false)
+	assert run([...ld, out + ".o", "-o", out]) == 0
+	assert run([out]) == 42
+	remove(out + ".o")
+	remove(out)
+}

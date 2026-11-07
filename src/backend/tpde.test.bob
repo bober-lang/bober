@@ -1,0 +1,191 @@
+import { Backend, Value } from "./backend"
+import { remove } from "../../std/fs"
+import { run } from "../../std/process"
+import { Tpde } from "./tpde"
+import { CompileError } from "../error"
+import { Parser } from "../c/parse"
+import { File, Lexer } from "../c/lex"
+import { indexOf } from "../../std/string"
+import { getpid } from "unistd.h"
+
+test "a broken module does not verify" {
+	const m = new Tpde("m", 0)
+	m.at(m.block(m.function("f", m.fn(m.void(), []), false)))
+	try {
+		m.verify()
+		assert false
+	} catch (e: CompileError) {
+		assert indexOf(e.msg, "terminator") >= 0
+	}
+}
+
+test "what TPDE cannot do is thrown" {
+	const m = new Tpde("m", 0)
+	assert m.emit("/tmp/never.s", true) throws new CompileError("assembly output is not supported by TPDE")
+	m.int(128)
+	assert m.verify() throws new CompileError("integers wider than 64 bits are not supported by TPDE")
+}
+
+test "a module compiles, links and runs, through the Backend" {
+	const m: Backend = new Tpde("m", 0)
+	const i32 = m.int(32)
+	const square = m.fn(i32, [i32])
+	const sq = m.function("square", square, false)
+	m.at(m.block(sq))
+	m.ret(m.binary("mul", m.param(sq, 0), m.param(sq, 0)))
+
+	const main = m.function("main", m.fn(i32, []), false)
+	const entry = m.block(main)
+	const below = m.block(main)
+	const above = m.block(main)
+	const done = m.block(main)
+	m.at(entry)
+	const slot = m.alloca(i32, 0)
+	const n = m.call(square, sq, [m.constInt(i32, 7)])
+	m.store(n, slot, false)
+	m.switch(m.cast("zext", m.icmp("slt", n, m.constInt(i32, 50)), i32), [0, 1], [above, below], done)
+	m.at(below)
+	m.store(m.binary("add", n, m.constInt(i32, 2)), slot, false)
+	m.br(done)
+	m.at(above)
+	m.store(m.constInt(i32, 1), slot, false)
+	m.br(done)
+	m.at(done)
+	m.ret(m.load(i32, slot, false))
+	m.verify()
+	assert link(m, "") == 51
+}
+
+test "floats, globals, aggregates and C calls" {
+	const m: Backend = new Tpde("m", 0)
+	const i32 = m.int(32)
+	const f64 = m.f64()
+	const pair = m.struct([i32, f64])
+	const g = m.global("g", m.constStruct([m.constInt(i32, 30), m.constFloat(f64, 2.5)]), true, 0)
+	const text = m.constant(m.constBytes("abc\0"))
+	const strlen = m.fn(m.int(64), [m.ptr()])
+	const main = m.function("main", m.fn(i32, []), false)
+	m.at(m.block(main))
+	const p = m.load(pair, g, false)
+	const x = m.binary("fmul", m.extract(p, 1), m.constFloatOf(f64, "4"))
+	const y = m.cast("zext", m.fcmp("ogt", x, m.constFloat(f64, 9.5)), i32)
+	const copy = m.alloca(pair, 0)
+	m.store(m.insert(p, m.cast("fptosi", x, i32), 0), copy, false)
+	const len = m.call(strlen, m.function("strlen", strlen, false), [text])
+	const sum = m.binary("add", m.load(i32, g, false), m.load(i32, m.field(pair, copy, 0), false))
+	m.ret(m.binary("add", m.binary("add", sum, m.cast("trunc", len, i32)), m.select(m.icmp("eq", y, y), y, sum)))
+	assert link(m, "") == 44 // 30 + 10 + 3 + 1
+}
+
+test "a module unwinds through landing pads, catching by type" {
+	const m = new Tpde("m", 0)
+	const i64 = m.int(64)
+	const throwType = m.fn(m.void(), [i64])
+	const f = m.function("f", m.fn(i64, [i64]), false)
+	m.personality(f, m.function("__gxx_personality_v0", m.fn(m.int(32), []), false))
+	m.at(m.block(f))
+	const ok = m.block(f)
+	const caught = m.block(f)
+	m.invoke(throwType, m.function("throwIt", throwType, false), [m.param(f, 0)], ok, caught)
+	m.at(ok)
+	m.ret(m.constInt(i64, 0))
+	m.at(caught)
+	m.landingPad(m.extern("_ZTIm", m.ptr()))
+	m.ret(m.binary("mul", m.param(f, 0), m.constInt(i64, 2)))
+	const main = m.function("main", m.fn(m.int(32), []), false)
+	m.at(m.block(main))
+	m.ret(m.cast("trunc", m.call(m.fn(i64, [i64]), f, [m.constInt(i64, 21)]), m.int(32)))
+	m.verify()
+	assert link(m, `extern "C" void throwIt(unsigned long v) { throw v; }`) == 42
+}
+
+test "local symbols may share a name" {
+	const m: Backend = new Tpde("m", 0)
+	const i32 = m.int(32)
+	const a = m.global("x", m.constInt(i32, 40), true, 0)
+	const b = m.global("x", m.constInt(i32, 2), true, 0)
+	m.at(m.block(m.function("main", m.fn(i32, []), false)))
+	m.ret(m.binary("add", m.load(i32, a, false), m.load(i32, b, false)))
+	assert link(m, "") == 42
+}
+
+test "a variadic function starts its va_list, which a pointer in a register points to" {
+	const m: Backend = new Tpde("m", 0)
+	const i32 = m.int(32)
+	const vaList = m.struct([i32, i32, m.ptr(), m.ptr()])
+	const nth = m.fn(i32, [i32, m.ptr()])
+	const f = m.function("f", m.variadic(i32, [i32]), false)
+	m.at(m.block(f))
+	const ap = m.alloca(vaList, 0)
+	const slot = m.alloca(m.ptr(), 0)
+	m.store(ap, slot, false)
+	m.vaStart(m.load(m.ptr(), slot, false))
+	m.ret(m.call(nth, m.function("nth", nth, false), [m.param(f, 0), ap]))
+	const main = m.function("main", m.fn(i32, []), false)
+	m.at(m.block(main))
+	const args: Value[] = []
+	for (const n of [6, 1, 2, 3, 4, 5, 6, 42]) {
+		args.push(m.constInt(i32, n))
+	}
+	m.ret(m.call(m.variadic(i32, [i32]), f, args))
+	const cpp = `extern "C" int nth(int n, __builtin_va_list ap) {
+		int v = 0;
+		for (int i = 0; i <= n; i++) v = __builtin_va_arg(ap, int);
+		return v;
+	}`
+	assert link(m, cpp) == 42
+}
+
+test "an empty asm template is left out, its outputs taking their tied inputs" {
+	const m = new Tpde("t.c", 0)
+	const src = `int main(void) { int x = 3, y = 0; asm volatile("" ::: "memory"); asm("" : "+r"(x) : "g"(y));
+		asm("" : "=r"(y) : "0"(x + 39)); return y; }`
+	new Parser(new Lexer(new File("t.c", src)), m).unit()
+	assert link(m, "") == 42
+}
+
+test "va_arg takes aggregates as clang passes them, in registers while enough are left, else on the stack" {
+	const m = new Tpde("t.c", 0)
+	const src = `struct W { double d; long l; }; struct U { long a, b, c; };
+		int f(int n, ...) { __builtin_va_list ap; __builtin_va_start(ap, n); int s = 0;
+		for (int i = 0; i < n; i++) { struct W w = __builtin_va_arg(ap, struct W); s += w.d * w.l; }
+		struct U u = __builtin_va_arg(ap, struct U); return s + u.a + u.b + u.c; }`
+	new Parser(new Lexer(new File("t.c", src)), m).unit()
+	const cpp = `struct W { double d; long l; }; struct U { long a, b, c; };
+		extern "C" int f(int n, ...);
+		int main() { W w{1.5, 2}; return f(6, w, w, w, w, w, w, U{8, 8, 8}); }`
+	assert link(m, cpp) == 42
+}
+
+test "a local aligned past 16 bytes, which TPDE allocates as a value, lives through the function" {
+	const m = new Tpde("t.c", 0)
+	const src = `struct W { double a; long b; }; void g(int x, ...) {}
+		int main(void) { union { double e[4]; struct W w; } __attribute__((aligned(32))) u = {{42}};
+		g(0, u.w); return u.e[0] + ((long)&u & 31); }`
+	new Parser(new Lexer(new File("t.c", src)), m).unit()
+	assert link(m, "") == 42
+}
+
+test "an empty struct takes no register, as a parameter or a result" {
+	const m = new Tpde("t.c", 0)
+	const src = `static float a = 1; static double b = 2; static union E {} e; static union F { float q; } u = {3};
+		static struct G { double t; } g = {5}; static long h[1] = {42}; static long long i = 6;
+		static long f(float a, double b, union E c, union F d, struct G x, long *p, long long i) { return p[0]; }
+		static union E z(union E c) { return c; }
+		int main(void) { e = z(e); return f(a, b, e, u, g, h, i); }`
+	new Parser(new Lexer(new File("t.c", src)), m).unit()
+	assert link(m, "") == 42
+}
+
+/// The exit status of m linked with the C++ source cpp, if any, and run.
+function link(m: Backend, cpp: string): i32 {
+	const out = `/tmp/bober-tpde${getpid()}`
+	m.emit(out + ".o", false)
+	writeFile(out + ".cc", cpp)
+	assert run(["clang++", out + ".cc", out + ".o", "-o", out]) == 0
+	const status = run([out])
+	for (const f of [".o", ".cc", ""]) {
+		remove(out + f)
+	}
+	return status
+}
