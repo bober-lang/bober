@@ -1,0 +1,139 @@
+import { arg, report } from "./util"
+import { decode, encode } from "../std/encoding/json"
+import { ParseError } from "../std/parse"
+import { split, startsWith } from "../std/string"
+
+class Item {
+	sku = ""
+	qty = 0
+	price = 0.0
+}
+
+class Order {
+	id: i64 = 0
+	user = ""
+	items: Item[] = []
+	note = ""
+}
+
+class Reply {
+	id: i64 = 0
+	user = ""
+	count = 0
+	total = 0.0
+	ok = true
+}
+
+/// What a request carries through the middleware chain.
+class Ctx {
+	method: string
+	path: string
+	auth: string
+	body: string
+	status = 200
+	out = ""
+	user = ""
+
+	constructor(method: string, path: string, auth: string, body: string) {
+		this.method = method
+		this.path = path
+		this.auth = auth
+		this.body = body
+	}
+}
+
+type Handler = (c: Ctx) => void throws ParseError
+type Middleware = (c: Ctx, next: Handler) => void throws ParseError
+
+function chain(mws: Middleware[], h: Handler): Handler {
+	let next = h
+	for (const i of 0 ... mws.length - 1) {
+		const mw = mws[mws.length - 1 - i]
+		const inner = next
+		next = c => mw(c, inner)
+	}
+	return next
+}
+
+let logged: i64 = 0
+
+const auth: Middleware = (c, next) => {
+	if (!startsWith(c.auth, "Bearer ")) {
+		c.status = 401
+		c.out = `{"error":"unauthorized"}`
+		return
+	}
+	c.user = c.auth.slice(7, c.auth.length)
+	next(c)
+}
+
+const logging: Middleware = (c, next) => {
+	next(c)
+	logged += c.out.length + c.path.length
+}
+
+const recover: Middleware = (c, next) => {
+	try {
+		next(c)
+	} catch (e: ParseError) {
+		c.status = 400
+		c.out = `{"error":"bad json"}`
+	}
+}
+
+function orders(c: Ctx) throws ParseError {
+	const segs = split(c.path, "/")
+	// "", "api", "orders", id
+	if (segs.length != 4 || segs[1] != "api" || segs[2] != "orders" || c.method != "POST") {
+		c.status = 404
+		c.out = `{"error":"not found"}`
+		return
+	}
+	const o = decode[Order](c.body)
+	const r = new Reply()
+	r.id = o.id
+	r.user = o.user
+	r.count = o.items.length
+	for (const it of o.items) {
+		r.total += (it.qty as f64) * it.price
+	}
+	r.ok = `${o.id}` == segs[3] && o.user == c.user
+	c.out = encode(r)
+}
+
+function respond(c: Ctx): string {
+	const reason = if (c.status == 200) "OK" else if (c.status == 404) "Not Found" else "Error"
+	return `HTTP/1.1 ${c.status} ${reason}\r\nContent-Type: application/json\r\nContent-Length: ${c.out.length}\r\nX-Request-Id: ${logged}\r\nConnection: keep-alive\r\n\r\n${c.out}`
+}
+
+function main(): i32 {
+	const n = arg(0, 200_000) as i32
+	const h = chain([recover, logging, auth], orders)
+	const t0 = now()
+	let bytes: i64 = 0
+	let cents: i64 = 0
+	for (const i of 0 ... n - 1) {
+		const items: string[] = []
+		for (const j of 1 ... 1 + i % 5) {
+			items.push(`{"sku":"SKU-${i % 1000}-${j}","qty":${j},"price":${((i % 97) as f64) + 0.5}}`)
+		}
+		const body = `{"id":${i},"user":"user${i % 100}","items":[${items.join(",")}],"note":"order number ${i} from a loyal customer"}`
+		const c = new Ctx("POST", `/api/orders/${i}`, `Bearer user${i % 100}`, body)
+		if (i % 50 == 0) {
+			c.auth = "nope"
+		} else if (i % 50 == 1) {
+			c.path = "/api/missing"
+		} else if (i % 50 == 2) {
+			c.body = "{\"id\": oops}"
+		}
+		h(c)
+		const res = respond(c)
+		bytes += res.length
+		if (c.status == 200) {
+			const r = decode[Reply](c.out)
+			cents += (r.total * 100.0) as i64
+		}
+	}
+	report("backend", t0, bytes + cents + logged)
+	return 0
+}

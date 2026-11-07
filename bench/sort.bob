@@ -1,0 +1,128 @@
+import { arg, report } from "./util"
+import { sortBy } from "../std/sort"
+
+class Rng {
+	s: u64
+
+	constructor(seed: u64) { this.s = seed | 1 }
+
+	next(): u64 {
+		this.s ^= this.s << 13
+		this.s ^= this.s >> 7
+		this.s ^= this.s << 17
+		return this.s
+	}
+}
+
+function quicksort(xs: i32[], lo: i32, hi: i32): void {
+	while (hi - lo > 16) {
+		const p = xs[(lo + hi) / 2]
+		let i = lo
+		let j = hi
+		while (i <= j) {
+			while (xs[i] < p) {
+				i++
+			}
+			while (xs[j] > p) {
+				j--
+			}
+			if (i <= j) {
+				const t = xs[i]
+				xs[i] = xs[j]
+				xs[j] = t
+				i++
+				j--
+			}
+		}
+		if (j - lo < hi - i) {
+			quicksort(xs, lo, j)
+			lo = i
+		} else {
+			quicksort(xs, i, hi)
+			hi = j
+		}
+	}
+	for (const i of lo + 1 ... hi) {
+		const v = xs[i]
+		let j = i - 1
+		while (j >= lo && xs[j] > v) {
+			xs[j + 1] = xs[j]
+			j--
+		}
+		xs[j + 1] = v
+	}
+}
+
+class Item {
+	key: i64
+	name: string
+	weight: f64
+
+	constructor(key: i64, name: string, weight: f64) {
+		this.key = key
+		this.name = name
+		this.weight = weight
+	}
+}
+
+/// A merge sort of items by before, the same in Go.
+function mergeSort(xs: Item[], before: (a: Item, b: Item) => bool): Item[] {
+	if (xs.length < 2) {
+		return xs
+	}
+	const mid = xs.length / 2
+	const a = mergeSort(xs.slice(0, mid), before)
+	const b = mergeSort(xs.slice(mid, xs.length), before)
+	const out: Item[] = []
+	let i = 0
+	let j = 0
+	for (const k of 0 ... xs.length - 1) {
+		if (j == b.length || i < a.length && !before(b[j], a[i])) {
+			out.push(a[i])
+			i++
+		} else {
+			out.push(b[j])
+			j++
+		}
+	}
+	return out
+}
+
+function main(): i32 {
+	const n = arg(0, 5_000_000) as i32
+	const rng = new Rng(42)
+	const xs = new i32[](n)
+	for (const i of 0 ... n - 1) {
+		xs[i] = (rng.next() >> 33) as i32
+	}
+	let t0 = now()
+	quicksort(xs, 0, n - 1)
+	let check: i64 = 0
+	for (const i of 0 ... n - 1) {
+		check = check * 31 + xs[i]
+	}
+	report("sort-quick-i32", t0, check)
+
+	const m = n / 5
+	const items: Item[] = []
+	for (const i of 0 ... m - 1) {
+		const k = rng.next() >> 40
+		items.push(new Item(k as i64, `item${k}`, (k as f64) / 3.0))
+	}
+	t0 = now()
+	const sorted = mergeSort(items, (a, b) => a.key < b.key)
+	check = 0
+	for (const i of 0 ... m - 1) {
+		check = check * 31 + sorted[i].key
+	}
+	report("sort-merge-objects", t0, check)
+
+	t0 = now()
+	sortBy(items, (a, b) => a.key < b.key)
+	check = 0
+	for (const i of 0 ... m - 1) {
+		check = check * 31 + items[i].key
+	}
+	report("sort-std-objects", t0, check)
+	return 0
+}
