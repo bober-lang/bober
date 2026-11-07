@@ -1,0 +1,64 @@
+//! C's types at the widths bober fixes for them, and strings to and from C. An implementation rejects a
+//! target whose C types have other widths. char is left out: its signedness varies, so pick schar or uchar.
+
+import { bober_free, bober_malloc } from "../src/rt.h"
+
+export type schar = i8
+export type uchar = u8
+export type short = i16
+export type ushort = u16
+export type int = i32
+export type uint = u32
+export type long = i64
+export type ulong = u64
+export type longlong = i64
+export type ulonglong = u64
+export type size_t = u64
+export type ssize_t = i64
+export type ptrdiff_t = i64
+export type intptr_t = i64
+export type uintptr_t = u64
+export type float = f32
+export type double = f64
+export type ptr = u64
+
+/// s and a NUL, in memory from C's malloc, for the caller to free. Traps if s holds a NUL.
+export function toCString(s: string): ptr { return toC(s) }
+/// The bytes at p up to its NUL. Traps if p is 0.
+export function fromCString(p: ptr): string { return fromC(p) }
+/// The n bytes at p, NULs included. Traps if p is 0 and n is not.
+export function fromCBytes(p: ptr, n: size_t): string { return fromCN(p, n) }
+/// s and a NUL, NULs included, in memory from C's malloc, for the caller to free.
+export function toCBytes(s: string): ptr { return toCN(s) }
+/// The 8 bytes at p. Traps if p is 0.
+export function load(p: ptr): u64 { return peek(p) }
+/// Sets the 8 bytes at p to v. Traps if p is 0.
+export function store(p: ptr, v: u64) { poke(p, v) }
+/// The 8 bytes f leaves at the address it is given, which start as 0.
+export function out(f: (p: ptr) => void): u64 {
+	const p = bober_malloc(8)
+	store(p, 0)
+	f(p)
+	const v = load(p)
+	bober_free(p)
+	return v
+}
+
+/// What f returns given s as a C string, which lives for the call.
+export function withString(s: string, f: (p: ptr) => u64): u64 {
+	const p = toCString(s)
+	const r = f(p)
+	bober_free(p)
+	return r
+}
+
+/// What f returns given refs as a C array, which lives for the call.
+export function withArray(refs: u64[], f: (p: ptr) => u64): u64 {
+	const p = bober_malloc(8 * (refs.length as u64))
+	for (const i of 0 ... refs.length - 1) {
+		store(p + 8 * (i as u64), refs[i])
+	}
+	const r = f(p)
+	bober_free(p)
+	return r
+}

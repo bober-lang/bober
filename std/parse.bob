@@ -1,0 +1,55 @@
+//! Integers from text, strictly: ASCII digits only, an optional `-`, no whitespace, prefixes or `_`.
+
+import { digit, minus } from "./ascii"
+import { Integral } from "./types"
+
+/// at is the offending character; for "range", the number's start.
+export class ParseError {
+	kind: "syntax" | "range"
+	at: i32
+
+	constructor(kind: "syntax" | "range", at: i32) {
+		this.kind = kind
+		this.at = at
+	}
+}
+
+/// s whole as an integer in radix 2…36.
+export function parseInt[T extends Integral = i32](s: string, radix: i32 = 10): T throws ParseError {
+	const [v, end] = scanInt[T](s, 0, radix)
+	if (end != s.length) {
+		throw new ParseError("syntax", end)
+	}
+	return v
+}
+
+/// The integer at s[start] in radix 2…36, and the index after its last digit.
+export function scanInt[T extends Integral = i32](s: string, start: i32 = 0,
+	radix: i32 = 10): [T, i32] throws ParseError {
+	assert radix >= 2 && radix <= 36
+	const zero = 0 as T
+	const neg = start < s.length && s[start] == minus
+	if (neg && zero - 1 > zero) {
+		throw new ParseError("syntax", start)
+	}
+	const r = radix as T
+	let v = zero
+	const first = if (neg) start + 1 else start
+	let i = first
+	while (i < s.length) {
+		const d = digit(s[i])
+		if (d == null || d >= radix) {
+			break
+		}
+		const next = if (neg) v * r - (d as T) else v * r + (d as T)
+		if (next / r != v) {
+			throw new ParseError("range", start)
+		}
+		v = next
+		i += 1
+	}
+	if (i == first) {
+		throw new ParseError("syntax", i)
+	}
+	return [v, i]
+}

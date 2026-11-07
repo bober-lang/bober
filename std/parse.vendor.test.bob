@@ -1,0 +1,118 @@
+//! parse.bob against the vendored integer suites in vendor/parse-tests, read from their C source: each row of a file's
+//! `int_case` table (cases.h) is `{S("in"), TYPE, radix, ERR, at, value}`, value a C constant expression src/c evaluates.
+
+import { Nothing } from "../src/backend/backend"
+import { system } from "../src/c/bind"
+import { Parser } from "../src/c/parse"
+import { Preprocessor } from "../src/c/pp"
+import { backslash, quote } from "./ascii"
+import { ParseError, parseInt, scanInt } from "./parse"
+import { indexOf, split, startsWith, trim, unquoted } from "./string"
+import { Integral } from "./types"
+
+const files = ["openbsd/strtoltest.c", "openbsd/strtonumtest.c", "netbsd/t_strtol.c", "netbsd/t_strtoi.c",
+	"freebsd/sscanf_test.c", "go/atoi.c"]
+
+class Row {
+	in = ""
+	type = ""
+	radix = 10
+	/// null for OK
+	err: "syntax" | "range" | null = null
+	at = 0
+	value: u64 = 0
+}
+
+/// The rows of the int_case table of the C file at path, but wide ones, which wait for string16 and string32.
+function rows(path: string, c: C): Row[] {
+	const lines = split(readFile(path)!, "\n")
+	let i = 0
+	while (indexOf(lines[i], "int_case") < 0) {
+		i++
+	}
+	const r: Row[] = []
+	for (const line of lines.slice(i + 1, lines.length)) {
+		const l = trim(line)
+		if (startsWith(l, "};")) {
+			break
+		}
+		if (startsWith(l, "{S(")) {
+			r.push(row(l, c))
+		}
+	}
+	return r
+}
+
+/// The row of l, `{S("in"), …}`.
+function row(l: string, c: C): Row {
+	let end = 4
+	while (l[end] != quote) {
+		end += if (l[end] == backslash) 2 else 1
+	}
+	const f = split(l.slice(indexOf(l, ",", end) + 1, indexOf(l, "}", end)), ",").map(trim)
+	const r = new Row()
+	r.in = unquoted(l.slice(3, end + 1))
+	r.type = f[0]
+	r.radix = parseInt(f[1])
+	r.err = switch (f[2]) {
+		case "SYNTAX": "syntax"
+		case "RANGE": "range"
+		default: null
+	}
+	r.at = parseInt(f[3])
+	r.value = c.value(f[4])
+	return r
+}
+
+/// C's integer constant expressions, with stdint.h's and limits.h's macros, as src/c evaluates them.
+class C {
+	private pp: Preprocessor
+	private p: Parser
+
+	constructor() {
+		const main = "<limits>"
+		this.pp = new Preprocessor(main, [], [system],
+			path => if (path == main) "#include <stdint.h>\n#include <limits.h>\n" else readFile(path))
+		this.p = new Parser(this.pp, new Nothing())
+		this.p.unit()
+	}
+
+	/// The value of the expression e, converted to uint64_t.
+	value(e: string): u64 {
+		this.pp.define("V", e)
+		return this.p.value(this.pp.expansion("V")!).n as u64
+	}
+}
+
+function check[T extends Integral](r: Row) {
+	const e = r.err
+	if (e == null) {
+		const [v, end] = scanInt[T](r.in, 0, r.radix)
+		assert (v as u64) == r.value
+		assert end == r.at
+	} else {
+		assert scanInt[T](r.in, 0, r.radix) throws new ParseError(e, r.at)
+	}
+}
+
+test "vendored ints" {
+	const c = new C()
+	for (const file of files) {
+		test `${file}` {
+			for (const r of rows(`vendor/parse-tests/${file}`, c)) {
+				test `"${r.in}" as ${r.type} radix ${r.radix}` {
+					switch (r.type) {
+						case "I8": check[i8](r)
+						case "I16": check[i16](r)
+						case "I32": check[i32](r)
+						case "I64": check[i64](r)
+						case "U8": check[u8](r)
+						case "U16": check[u16](r)
+						case "U32": check[u32](r)
+						case "U64": check[u64](r)
+					}
+				}
+			}
+		}
+	}
+}

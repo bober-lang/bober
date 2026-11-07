@@ -1,0 +1,41 @@
+//! Sorting arrays, stably: equal elements keep their order.
+
+import { less } from "./functional"
+import { Ordered } from "./types"
+
+/// Sorts xs in place by before, which says whether a goes before b, ascending by default.
+export function sort[T extends Ordered](xs: T[], before: (a: T, b: T) => bool = less[T]) { sortBy(xs, before) }
+
+/// Sorts xs in place by before, which says whether a goes before b. A merge sort: n log n.
+export function sortBy[T](xs: T[], before: (a: T, b: T) => bool) {
+	const s = sorted(xs, before)
+	for (const i of 0 ... xs.length - 1) {
+		xs[i] = s[i]
+	}
+}
+
+/// xs sorted by before: a new array, but xs itself if it has fewer than two elements.
+function sorted[T](xs: T[], before: (a: T, b: T) => bool): T[] {
+	if (xs.length < 2) {
+		return xs
+	}
+	const mid = xs.length / 2
+	return merge(sorted(xs.slice(0, mid), before), sorted(xs.slice(mid, xs.length), before), before)
+}
+
+/// The elements of xs and ys, each sorted by before, as one sorted array; of equal ones, those of xs first.
+export function merge[T](xs: T[], ys: T[], before: (a: T, b: T) => bool): T[] {
+	const out: T[] = []
+	let i = 0
+	let j = 0
+	while (i < xs.length || j < ys.length) {
+		if (j == ys.length || i < xs.length && !before(ys[j], xs[i])) {
+			out.push(xs[i])
+			i++
+		} else {
+			out.push(ys[j])
+			j++
+		}
+	}
+	return out
+}

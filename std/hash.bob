@@ -1,0 +1,90 @@
+//! Hashing keys: the Hasher a HashMap takes, and Auto, the one a key type gets unless given another.
+
+import { Integral } from "./types"
+
+/// Hashes and compares keys of K: a type with two statics, which nothing instantiates.
+export interface Hasher[K] {
+	static hash(k: K): u64
+	static eq(a: K, b: K): bool
+}
+
+/// The Hasher of a key by its value to depth one: an array or tuple by its elements, an object or class by its fields,
+/// a union by its member, and any other as == compares it. The hash is not mixed; a HashMap spreads it over its slots
+/// itself.
+export class Auto[K] {
+	static hash(k: K): u64 {
+		let h: u64 = 14695981039346656037
+		switch (K.kind) {
+			case "array":
+				for (const x of k) {
+					h = combine(h, part(x))
+				}
+				return h
+			case "tuple", "object", "class", "interface":
+				for (const f of K.fields) {
+					h = combine(h, part(k[f.name]))
+				}
+				return h
+			case "union":
+				for (const M of K.members) {
+					if (k instanceof M) {
+						return Auto[M].hash(k)
+					}
+				}
+				return 0
+			default: return part(k)
+		}
+	}
+
+	static eq(a: K, b: K): bool {
+		switch (K.kind) {
+			case "array": return a.equals(b)
+			case "tuple", "object", "class", "interface":
+				for (const f of K.fields) {
+					if (a[f.name] != b[f.name]) {
+						return false
+					}
+				}
+				return true
+			case "union":
+				for (const M of K.members) {
+					if (a instanceof M) {
+						return b instanceof M && Auto[M].eq(a, b)
+					}
+				}
+				return false
+			default: return a == b
+		}
+	}
+}
+
+/// The hash of x as == compares it: a string by its bytes, an int or bool by its value, a union by its member, an
+/// array, tuple or class by its identity, and any other as 0, as an object or interface may be held as a union.
+function part[T](x: T): u64 {
+	switch (T.kind) {
+		case "string": return fnv(x)
+		case "int": return x as u64
+		case "bool": return if (x) 1 else 0
+		case "array", "tuple", "class": return idOf(x)
+		case "union":
+			for (const M of T.members) {
+				if (x instanceof M) {
+					return part(x)
+				}
+			}
+			return 0
+		default: return 0
+	}
+}
+
+/// FNV-1a of the bytes of s.
+export function fnv(s: string): u64 {
+	let h: u64 = 14695981039346656037
+	for (const c of s) {
+		h = combine(h, c)
+	}
+	return h
+}
+
+/// h with x combined into it by a step of FNV-1a, to hash several values into one.
+export function combine[T extends Integral](h: u64, x: T): u64 { return (h ^ (x as u64)) * 1099511628211 }

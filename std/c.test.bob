@@ -1,0 +1,58 @@
+import * as c from "./c"
+import { atoi, div, div_t, free, labs, ldiv, malloc, strtod } from "stdlib.h"
+import { ldexpf, M_PI } from "math.h"
+import { memset, strlen } from "string.h"
+import { in_addr, inet_ntoa, INADDR_LOOPBACK } from "arpa/inet.h"
+
+test "strings go to C and back" {
+	const p = c.toCString("héllo")
+	assert strlen(p) == 6
+	assert c.fromCString(p) == "héllo"
+	assert c.fromCBytes(p, 3) == "h\xc3\xa9" && c.fromCBytes(p, 7) == "héllo\0" && c.fromCBytes(0, 0) == ""
+	free(p)
+}
+
+test "a pointer param takes a string or an array" {
+	assert strlen("héllo") == 6 && strlen("a\0b") == 1
+	const end = new u64[](1)
+	assert strtod("2.5x", end) == 2.5 && end[0] != 0
+	const xs = new u8[](4)
+	memset(xs, 7, 3)
+	assert fromBytes(xs) == "\x07\x07\x07\0"
+}
+
+test "memory is read and written by words" {
+	const p = c.toCBytes("a\0b")
+	assert c.fromCBytes(p, 4) == "a\0b\0"
+	free(p)
+	const q = malloc(16)
+	c.store(q, 0x0102030405060708)
+	c.store(q + 8, 0xffffffffffffffff)
+	assert c.load(q) == 0x0102030405060708 && c.load(q + 8) == 0xffffffffffffffff
+	assert c.fromCBytes(q, 1) == "\x08"
+	free(q)
+}
+
+test "numbers cross at their C widths" {
+	const p = c.toCString("-2.5e3")
+	assert strtod(p, 0) == -2500.0
+	assert atoi(p) == -2
+	free(p)
+	assert labs(-5_000_000_000) == 5_000_000_000
+	assert ldexpf(1.5, 4) == 24.0
+}
+
+test "structs cross as classes by value" {
+	const d: div_t = div(17, 5)
+	assert d.quot == 3 && d.rem == 2
+	const l = ldiv(-17_000_000_000, 5)
+	assert l.quot == -3_400_000_000 && l.rem == 0
+	const a = new in_addr()
+	a.s_addr = 0x0100007f
+	assert c.fromCString(inet_ntoa(a)) == "127.0.0.1"
+}
+
+test "macros and enums are constants" {
+	assert INADDR_LOOPBACK == 0x7f000001
+	assert M_PI == 3.14159265358979323846
+}

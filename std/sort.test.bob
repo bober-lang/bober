@@ -1,0 +1,41 @@
+import { merge, sort, sortBy } from "./sort"
+import { greater } from "./functional"
+
+test "numbers and strings" {
+	const xs = [5, 3, 9, 1, 3, 0]
+	sort(xs)
+	assert xs == [0, 1, 3, 3, 5, 9]
+	sort(xs, greater[i32])
+	assert xs == [9, 5, 3, 3, 1, 0]
+	const ss = ["pear", "fig", "apple", ""]
+	sort(ss)
+	assert ss == ["", "apple", "fig", "pear"]
+	const none: i32[] = []
+	sort(none)
+	const one = [1]
+	sort(one)
+	assert none == [] && one == [1]
+}
+
+test "merge" {
+	const before = (a: i32, b: i32) => a < b
+	assert merge([1, 4, 6], [2, 4, 7, 8], before) == [1, 2, 4, 4, 6, 7, 8]
+	assert merge([], [1, 2], before) == [1, 2] && merge([3], [], before) == [3]
+	const xs: [i32, string][] = [[1, "x"], [2, "x"]]
+	const ys: [i32, string][] = [[1, "y"], [2, "y"]]
+	assert merge(xs, ys, (a, b) => a[0] < b[0]) == [[1, "x"], [1, "y"], [2, "x"], [2, "y"]]
+}
+
+test "stable and long" {
+	const xs: [i32, i32][] = []
+	let seed: u32 = 7
+	for (const i of 0 ... 999) {
+		seed = seed * 1664525 + 1013904223
+		xs.push([((seed >> 24) as i32) % 10, i])
+	}
+	sortBy(xs, (a, b) => a[0] < b[0])
+	for (const i of 1 ... xs.length - 1) {
+		const [a, b] = [xs[i - 1], xs[i]]
+		assert a[0] < b[0] || a[0] == b[0] && a[1] < b[1]
+	}
+}

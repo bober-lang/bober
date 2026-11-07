@@ -1,0 +1,125 @@
+//! Semantic versions (semver.org 2.0.0): major.minor.patch, a pre-release after -, build metadata after +.
+
+import { dot, isAlphanumeric, isDigit, minus, plus, zero } from "./ascii"
+import { min } from "./math"
+import { ParseError, scanInt } from "./parse"
+
+export class Version {
+	major: u64
+	minor: u64
+	patch: u64
+	/// The dot-separated identifiers after -; none for a release.
+	pre: string[]
+	/// The dot-separated identifiers after +, which do not order versions.
+	build: string[]
+
+	constructor(major: u64, minor: u64, patch: u64, pre: string[] = [], build: string[] = []) {
+		this.major = major
+		this.minor = minor
+		this.patch = patch
+		this.pre = pre
+		this.build = build
+	}
+
+	toString(): string {
+		const pre = if (this.pre.length > 0) `-${this.pre.join(".")}` else ""
+		const build = if (this.build.length > 0) `+${this.build.join(".")}` else ""
+		return `${this.major}.${this.minor}.${this.patch}${pre}${build}`
+	}
+
+	/// Negative, zero or positive as this precedes, equals or follows other; build metadata is ignored.
+	compare(other: Version): i32 {
+		for (const [a, b] of [[this.major, other.major], [this.minor, other.minor], [this.patch, other.patch]]) {
+			if (a != b) {
+				return if (a < b) -1 else 1
+			}
+		}
+		if (this.pre.length == 0 || other.pre.length == 0) {
+			return other.pre.length - this.pre.length
+		}
+		for (const i of 0 ... min(this.pre.length, other.pre.length) - 1) {
+			const c = compareIdentifiers(this.pre[i], other.pre[i])
+			if (c != 0) {
+				return c
+			}
+		}
+		return this.pre.length - other.pre.length
+	}
+}
+
+/// Numeric identifiers precede others and are compared as numbers, having no leading zeros as parsed; others are
+/// compared as ASCII.
+function compareIdentifiers(a: string, b: string): i32 {
+	const [na, nb] = [numeric(a), numeric(b)]
+	if (na != nb) {
+		return if (na) -1 else 1
+	}
+	if (na && a.length != b.length) {
+		return a.length - b.length
+	}
+	return if (a < b) -1 else if (a > b) 1 else 0
+}
+
+function numeric(s: string): bool {
+	for (const ch of s) {
+		if (!isDigit(ch)) {
+			return false
+		}
+	}
+	return true
+}
+
+/// s whole as a Version: a syntax error at an unexpected character, a range error at a number past u64.
+export function parse(s: string): Version throws ParseError {
+	const [major, i] = number(s, 0)
+	const [minor, j] = number(s, expect(s, i, dot))
+	const [patch, k] = number(s, expect(s, j, dot))
+	const v = new Version(major, minor, patch)
+	let at = k
+	if (s.at(at) == minus) {
+		at = identifiers(s, at + 1, v.pre, true)
+	}
+	if (s.at(at) == plus) {
+		at = identifiers(s, at + 1, v.build, false)
+	}
+	if (at != s.length) {
+		throw new ParseError("syntax", at)
+	}
+	return v
+}
+
+function expect(s: string, at: i32, ch: u8): i32 throws ParseError {
+	if (s.at(at) != ch) {
+		throw new ParseError("syntax", at)
+	}
+	return at + 1
+}
+
+/// The number at s[at] and the index after it; it has no leading zero.
+function number(s: string, at: i32): [u64, i32] throws ParseError {
+	if (!isDigit(s.at(at) ?? 0) || s[at] == zero && isDigit(s.at(at + 1) ?? 0)) {
+		throw new ParseError("syntax", at)
+	}
+	return scanInt[u64](s, at)
+}
+
+/// Appends the dot-separated identifiers at s[at] to out and returns the index after them; in a pre-release a
+/// numeric one has no leading zero.
+function identifiers(s: string, at: i32, out: string[], pre: bool): i32 throws ParseError {
+	let i = at
+	while (true) {
+		const start = i
+		while (isAlphanumeric(s.at(i) ?? 0) || s.at(i) == minus) {
+			i++
+		}
+		const id = s.slice(start, i)
+		if (id.length == 0 || pre && id.length > 1 && id[0] == zero && numeric(id)) {
+			throw new ParseError("syntax", start)
+		}
+		out.push(id)
+		if (s.at(i) != dot) {
+			return i
+		}
+		i++
+	}
+}

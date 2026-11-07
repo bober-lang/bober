@@ -1,0 +1,22 @@
+import { readFile, remove } from "./fs"
+import { IoError } from "./io"
+import { run } from "./process"
+
+test "exit status" {
+	assert run(["true"]) == 0
+	assert run(["sh", "-c", "exit 3"]) == 3
+	assert run(["sh", "-c", "kill -9 $$"]) == 128 + 9
+}
+
+test "arguments are not split or expanded" {
+	const out = "build/process.test.out"
+	assert run(["printf", "%s|", "a b", "$HOME", "'"], out) == 0
+	assert readFile(out) == "a b|$HOME|'|"
+	assert run(["sh", "-c", "echo err >&2"], out) == 0
+	assert readFile(out) == "err\n"
+	remove(out)
+}
+
+test "a missing program" {
+	assert run(["build/none"]) throws new IoError("NotFound", "run", "build/none")
+}

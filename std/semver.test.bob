@@ -1,0 +1,49 @@
+import { parse, Version } from "./semver"
+import { ParseError } from "./parse"
+
+test "parse and print" {
+	for (const s of ["0.0.0", "1.2.3", "1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-0.3.7", "1.0.0-x.7.z.92",
+		"1.0.0-x-y-z.--", "1.0.0-alpha+001", "1.0.0+20130313144700", "1.0.0-beta+exp.sha.5114f85",
+		"1.0.0+21AF26D3----117B344092BD", "18446744073709551615.0.0", "1.2.3-0", "1.2.3-00a", "1.2.3+007"]) {
+		test `${s}` {
+			assert parse(s).toString() == s
+		}
+	}
+	const v = parse("1.2.3-rc.1+b.2")
+	assert v.major == 1 && v.minor == 2 && v.patch == 3 && v.pre == ["rc", "1"] && v.build == ["b", "2"]
+}
+
+test "rejects" {
+	assert parse("") throws new ParseError("syntax", 0)
+	assert parse("1") throws new ParseError("syntax", 1)
+	assert parse("1.2") throws new ParseError("syntax", 3)
+	assert parse("v1.2.3") throws new ParseError("syntax", 0)
+	assert parse("1.2.3 ") throws new ParseError("syntax", 5)
+	assert parse("01.2.3") throws new ParseError("syntax", 0)
+	assert parse("1.02.3") throws new ParseError("syntax", 2)
+	assert parse("1.2.3-") throws new ParseError("syntax", 6)
+	assert parse("1.2.3-01") throws new ParseError("syntax", 6)
+	assert parse("1.2.3-a..b") throws new ParseError("syntax", 8)
+	assert parse("1.2.3++") throws new ParseError("syntax", 6)
+	assert parse("1.2.3-a_b") throws new ParseError("syntax", 7)
+	assert parse("1.2.3-é") throws new ParseError("syntax", 6)
+	assert parse("18446744073709551616.0.0") throws new ParseError("range", 0)
+	assert parse("1.2.3.4") throws new ParseError("syntax", 5)
+	assert parse("-1.2.3") throws new ParseError("syntax", 0)
+	assert parse("1.2.3-a+") throws new ParseError("syntax", 8)
+	assert parse("1.2.3+a.") throws new ParseError("syntax", 8)
+}
+
+test "precedence" {
+	/// From semver.org §11, ascending.
+	const order = ["1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-alpha.beta", "1.0.0-beta", "1.0.0-beta.2", "1.0.0-beta.11",
+		"1.0.0-rc.1", "1.0.0", "1.0.1", "1.1.0", "2.0.0", "2.1.0", "2.1.1"]
+	for (const i of 0 ... order.length - 1) {
+		for (const j of 0 ... order.length - 1) {
+			const c = parse(order[i]).compare(parse(order[j]))
+			assert (if (i < j) c < 0 else if (i > j) c > 0 else c == 0)
+		}
+	}
+	assert parse("1.0.0+a").compare(parse("1.0.0+b")) == 0 && parse("1.0.0-a.10").compare(parse("1.0.0-a.9")) > 0
+	assert parse("1.0.0-1").compare(parse("1.0.0-a")) < 0 && parse("1.0.0-a").compare(parse("1.0.0-a.b")) < 0
+}
