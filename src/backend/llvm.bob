@@ -1,0 +1,994 @@
+//! LLVM as the Backend (src/backend/backend.bob), through its C API: a module in the context all share, so that
+//! they link, a builder, and the target machine of bober's own OS and CPU. Types, values and blocks are LLVM's references as
+//! they are. Errors are thrown as strings. A program using it links the C libraries of bober.pkg; the boot
+//! interpreter has the system's.
+
+import { HashMap } from "../../std/collections/hashmap"
+import { CompileError } from "../error"
+import { Backend, Binary, Block, Cast, Cmp, FCmp, Operand, Type, Unary, Value, codes } from "./backend"
+import { dollar, isAlphabetic, isDigit, percent } from "../../std/ascii"
+import { indexOf } from "../../std/string"
+import { arch, os } from "../../std/os"
+import * as c from "../../std/c"
+import { out, withArray, withString } from "../../std/c"
+import {
+	LLVMAdd, LLVMAddAttributeAtIndex, LLVMAddCallSiteAttribute, LLVMAddCase, LLVMAddClause, LLVMAddDestination, LLVMAddFunction,
+	LLVMAddGlobal, LLVMAddModuleFlag, LLVMAnd, LLVMAppendBasicBlockInContext, LLVMAppendModuleInlineAsm, LLVMAppendingLinkage, LLVMArrayType2, LLVMArrayTypeKind,
+	LLVMAShr, LLVMAtomicOrderingSequentiallyConsistent, LLVMAttributeFunctionIndex, LLVMAvailableExternallyLinkage,
+	LLVMBitCast, LLVMBlockAddress, LLVMBuildAlloca, LLVMBuildArrayAlloca, LLVMBuildBinOp, LLVMBuildBr, LLVMBuildCall2, LLVMBuildCast,
+	LLVMBuildCondBr, LLVMBuildExtractValue, LLVMBuildFCmp, LLVMBuildFence, LLVMBuildFNeg, LLVMBuildGEP2, LLVMBuildICmp, LLVMBuildIndirectBr,
+	LLVMBuildInsertValue, LLVMBuildInvoke2, LLVMBuildLandingPad, LLVMBuildLoad2, LLVMBuildMemCpy, LLVMBuildMemSet,
+	LLVMAddAlias2, LLVMBuildCallWithOperandBundles, LLVMCreateOperandBundle, LLVMDisposeOperandBundle,
+	LLVMBuildRet, LLVMBuildRetVoid, LLVMBuildSelect, LLVMBuildStore, LLVMBuildStructGEP2, LLVMBuildSwitch,
+	LLVMBuildUnreachable, LLVMClearInsertionPosition, LLVMCommonLinkage, LLVMConstArray2, LLVMConstBitCast,
+	LLVMConstGEP2, LLVMConstInt, LLVMConstIntOfString, LLVMConstIntToPtr, LLVMConstNull, LLVMConstPtrToInt,
+	LLVMConstReal, LLVMConstRealOfString,
+	LLVMConstStringInContext2, LLVMConstStructInContext, LLVMConstTrunc, LLVMContextCreate, LLVMCountStructElementTypes,
+	LLVMCreateBuilderForModule, LLVMCreateEnumAttribute, LLVMCreateMemoryBufferWithMemoryRangeCopy,
+	LLVMCountParams, LLVMCreateStringAttribute, LLVMCreateTypeAttribute, LLVMDeleteFunction, LLVMDeleteGlobal, LLVMDisposeMessage,
+	LLVMDoubleTypeInContext, LLVMDoubleTypeKind, LLVMGetDataLayoutStr, LLVMGetEntryBasicBlock, LLVMGetFirstBasicBlock,
+	LLVMGetFirstFunction, LLVMGetFirstInstruction, LLVMGetFirstUse, LLVMGetIncomingBlock, LLVMGetMDKindIDInContext, LLVMGetInstructionOpcode,
+	LLVMGetNextBasicBlock, LLVMGetNextFunction, LLVMGetNextInstruction, LLVMGetInstructionParent, LLVMGetNextUse, LLVMGetNormalDest,
+	LLVMGetNumOperands, LLVMGetOperand, LLVMGetPointerAddressSpace, LLVMGetUser, LLVMInvoke, LLVMLandingPad, LLVMPHI,
+	LLVMPositionBuilderBefore, LLVMSetDataLayout, LLVMSetGC, LLVMSetOperand, LLVMFAdd, LLVMFDiv, LLVMFloatTypeInContext, LLVMFloatTypeKind, LLVMFMul,
+	LLVMFPExt, LLVMFPToSI, LLVMFPToUI, LLVMFPTrunc, LLVMFRem, LLVMFSub, LLVMFunctionType, LLVMGetArrayLength2,
+	LLVMGetBasicBlockParent, LLVMGetBasicBlockTerminator, LLVMGetElementType, LLVMGetEnumAttributeKindForName,
+	LLVMGetInlineAsm, LLVMGetInsertBlock, LLVMGetIntrinsicDeclaration, LLVMGetNamedFunction, LLVMGetNamedGlobal,
+	LLVMGetLinkage, LLVMGetParam, LLVMGetPoison, LLVMGetReturnType, LLVMGetTypeKind, LLVMGetValueName2, LLVMGlobalGetValueType,
+	LLVMGlobalUnnamedAddr, LLVMHiddenVisibility, LLVMInlineAsmDialectATT, LLVMIntegerTypeKind, LLVMIntEQ, LLVMInternalLinkage, LLVMIntNE,
+	LLVMIntSGE, LLVMIntSGT, LLVMIntSLE, LLVMIntSLT, LLVMIntToPtr, LLVMIntTypeInContext, LLVMIntUGE, LLVMIntUGT,
+	LLVMInstructionEraseFromParent, LLVMIntULE, LLVMIntULT, LLVMIsAFunction, LLVMIsAInstruction, LLVMIsConstant, LLVMIsDeclaration,
+	LLVMLookupIntrinsicID, LLVMLShr, LLVMMDNodeInContext2, LLVMMDStringInContext2, LLVMMetadataAsValue, LLVMModuleCreateWithNameInContext, LLVMModuleFlagBehaviorWarning, LLVMMul, LLVMOr,
+	LLVMPointerTypeInContext, LLVMPointerTypeKind, LLVMPositionBuilderAtEnd, LLVMPrintModuleToString, LLVMPrivateLinkage,
+	LLVMPtrToInt, LLVMRealOEQ, LLVMRealOGE, LLVMRealOGT, LLVMRealOLE, LLVMRealOLT, LLVMRealONE, LLVMRealORD, LLVMRealUEQ,
+	LLVMRealUGE, LLVMRealUGT, LLVMRealULE, LLVMRealULT, LLVMRealUNE, LLVMRealUNO, LLVMReplaceAllUsesWith, LLVMSDiv,
+	LLVMSetAlignment, LLVMSetCurrentDebugLocation2, LLVMSetGlobalConstant, LLVMSetInitializer, LLVMSetIsNewDbgInfoFormat,
+	LLVMSetLinkage, LLVMSetMetadata, LLVMSetOrdering, LLVMSetPersonalityFn, LLVMSetSection, LLVMSetTarget, LLVMSetThreadLocal, LLVMSetUnnamedAddress, LLVMSetVisibility,
+	LLVMSetValueName2, LLVMSetVolatile, LLVMSExt, LLVMShl, LLVMSIToFP, LLVMSizeOf, LLVMSRem, LLVMStructGetTypeAtIndex,
+	LLVMStructTypeInContext, LLVMStructTypeKind, LLVMSub, LLVMTokenTypeInContext, LLVMTrunc, LLVMTypeOf, LLVMUDiv, LLVMUIToFP, LLVMURem,
+	LLVMValueAsMetadata, LLVMVoidTypeInContext, LLVMWeakAnyLinkage, LLVMExternalWeakLinkage, LLVMWeakODRLinkage, LLVMXor, LLVMZExt,
+} from "llvm-c/Core.h"
+import { LLVMReturnStatusAction, LLVMVerifyModule } from "llvm-c/Analysis.h"
+import { LLVMDisposeErrorMessage, LLVMGetErrorMessage } from "llvm-c/Error.h"
+import { LLVMParseIRInContext } from "llvm-c/IRReader.h"
+import { LLVMParseCommandLineOptions } from "llvm-c/Support.h"
+import { LLVMLinkModules2 } from "llvm-c/Linker.h"
+import {
+	LLVMInitializeAArch64AsmParser, LLVMInitializeAArch64AsmPrinter, LLVMInitializeAArch64Target,
+	LLVMInitializeAArch64TargetInfo, LLVMInitializeAArch64TargetMC, LLVMInitializeWebAssemblyAsmParser,
+	LLVMInitializeWebAssemblyAsmPrinter, LLVMInitializeWebAssemblyTarget, LLVMInitializeWebAssemblyTargetInfo,
+	LLVMInitializeWebAssemblyTargetMC, LLVMInitializeX86AsmParser, LLVMInitializeX86AsmPrinter, LLVMInitializeX86Target,
+	LLVMInitializeX86TargetInfo, LLVMInitializeX86TargetMC,
+} from "llvm-c/Target.h"
+// The data layout's functions are Target.h's up to LLVM 19 and Core.h's after; TargetMachine.h includes either.
+import {
+	LLVMABIAlignmentOfType, LLVMABISizeOfType, LLVMAssemblyFile, LLVMCodeModelDefault, LLVMCreateTargetDataLayout,
+	LLVMCreateTargetMachine, LLVMGetTargetFromTriple, LLVMObjectFile, LLVMOffsetOfElement,
+	LLVMRelocPIC, LLVMSetModuleDataLayout, LLVMTargetMachineEmitToFile,
+} from "llvm-c/TargetMachine.h"
+import { LLVMCreatePassBuilderOptions, LLVMRunPasses } from "llvm-c/Transforms/PassBuilder.h"
+import {
+	LLVMCreateDIBuilder, LLVMDebugMetadataVersion, LLVMDIBuilderCreateArrayType, LLVMDIBuilderCreateAutoVariable,
+	LLVMDIBuilderCreateBasicType, LLVMDIBuilderCreateCompileUnit, LLVMDIBuilderCreateDebugLocation,
+	LLVMDIBuilderCreateExpression, LLVMDIBuilderCreateFile, LLVMDIBuilderCreateFunction, LLVMDIBuilderCreateMemberType,
+	LLVMDIBuilderCreatePointerType, LLVMDIBuilderCreateStructType, LLVMDIBuilderCreateSubroutineType,
+	LLVMDIBuilderFinalize, LLVMDIBuilderGetOrCreateSubrange, LLVMDIBuilderInsertDeclareRecordAtEnd, LLVMDWARFEmissionFull,
+	LLVMDWARFSourceLanguageC, LLVMGetSubprogram, LLVMSetSubprogram,
+} from "llvm-c/DebugInfo.h"
+import { free } from "stdlib.h"
+
+const noName = c.toCString("")
+
+/// The target triple of bober's OS and CPU.
+export const triple = `${if (arch == "arm64") "aarch64" else arch}-${switch (os) {
+	case "macos": "apple-macos"
+	case "linux": "linux-musl"
+	case "freebsd": "unknown-freebsd"
+	case "windows": "pc-windows-msvc"
+}}`
+const target = c.toCString(triple)
+
+/// The name of section s of data: on Mach-O in segment __DATA.
+const section = (s: string) => if (os == "macos") `__DATA,${s}` else s
+
+/// The context of every module, so that one can be linked into another.
+const context = LLVMContextCreate()
+
+export class LLVM implements Backend {
+	private ctx = context
+	private m: u64
+	private b: u64
+	private tm: u64
+	private td: u64
+	private level: u32
+	/// The debug info builder, its file, the subprogram of the function being appended to, and the debug types by
+	/// LLVM type, all 0 until source names one.
+	private di: u64 = 0
+	private file: u64 = 0
+	private sp: u64 = 0
+	private debugTypes = new HashMap[Type, u64]()
+	/// Whether collected was called; the layouts made, by type, and the entries of the roots.
+	private gc = false
+	private layouts = new HashMap[Type, Value]()
+	private roots: Value[] = []
+	/// The access tags of an array's header and of its elements, once aliasing made them.
+	private tbaa: u64[] = []
+
+	/// The module name, for this machine, to be optimized at level, from 0 to 3 as -O takes.
+	constructor(name: string, level: u32 = 2) {
+		this.m = withString(name, p => LLVMModuleCreateWithNameInContext(p, this.ctx))
+		this.b = LLVMCreateBuilderForModule(this.m)
+		this.level = level
+		native()
+		const t = out(t => checked(err => LLVMGetTargetFromTriple(target, t, err) as u64))
+		this.tm = LLVMCreateTargetMachine(t, target, noName, noName, level, LLVMRelocPIC as u32,
+			LLVMCodeModelDefault as u32)
+		LLVMSetTarget(this.m, target)
+		this.td = LLVMCreateTargetDataLayout(this.tm)
+		LLVMSetModuleDataLayout(this.m, this.td)
+	}
+
+	void(): Type { return LLVMVoidTypeInContext(this.ctx) }
+	int(bits: u32): Type { return LLVMIntTypeInContext(this.ctx, bits) }
+	f32(): Type { return LLVMFloatTypeInContext(this.ctx) }
+	f64(): Type { return LLVMDoubleTypeInContext(this.ctx) }
+	ptr(): Type { return LLVMPointerTypeInContext(this.ctx, 0) }
+	/// In address space 1, the one of LLVM's statepoint-example GC.
+	ref(): Type { return LLVMPointerTypeInContext(this.ctx, 1) }
+	fn(result: Type, params: Type[]): Type {
+		return withArray(params, p => LLVMFunctionType(result, p, params.length as u32, 0))
+	}
+	variadic(result: Type, params: Type[]): Type {
+		return withArray(params, p => LLVMFunctionType(result, p, params.length as u32, 1))
+	}
+	struct(fields: Type[]): Type {
+		return withArray(fields, p => LLVMStructTypeInContext(this.ctx, p, fields.length as u32, 0))
+	}
+	array(elem: Type, n: u64): Type { return LLVMArrayType2(elem, n) }
+
+	constInt(t: Type, n: i64): Value { return LLVMConstInt(t, n as u64, 1) }
+	constFloat(t: Type, x: f64): Value { return LLVMConstReal(t, x) }
+	constIntOf(t: Type, digits: string, radix: u8): Value {
+		return withString(digits, p => LLVMConstIntOfString(t, p, radix))
+	}
+	constFloatOf(t: Type, text: string): Value { return withString(text, p => LLVMConstRealOfString(t, p)) }
+	constZero(t: Type): Value { return LLVMConstNull(t) }
+	constBytes(s: string): Value {
+		const p = c.toCBytes(s)
+		const v = LLVMConstStringInContext2(this.ctx, p, s.length as u64, 1)
+		free(p)
+		return v
+	}
+	constStruct(fields: Value[]): Value {
+		return withArray(fields, p => LLVMConstStructInContext(this.ctx, p, fields.length as u32, 0))
+	}
+	constArray(elem: Type, elems: Value[]): Value {
+		return withArray(elems, p => LLVMConstArray2(elem, p, elems.length as u64))
+	}
+	sizeOf(t: Type): Value { return LLVMSizeOf(t) }
+	bytes(t: Type): u64 { return LLVMABISizeOfType(this.td, t) }
+	constOffset(p: Value, bytes: i64): Value {
+		return withArray([this.constInt(this.int(64), bytes)], i => LLVMConstGEP2(this.int(8), p, i, 1))
+	}
+	constCast(op: Cast, v: Value, to: Type): Value {
+		return switch (op) {
+			case "trunc": LLVMConstTrunc(v, to)
+			case "ptrtoint": LLVMConstPtrToInt(v, to)
+			case "inttoptr": LLVMConstIntToPtr(v, to)
+			default: LLVMConstBitCast(v, to)
+		}
+	}
+
+	function(name: string, t: Type, local: bool): Value {
+		const f = this.named(name)
+		if (f != 0) {
+			return f
+		}
+		const fn = linkage(withString(name, p => LLVMAddFunction(this.m, p, t)), local)
+		// Unoptimized, a function keeps its frame pointer, as with clang, for debuggers and code that walks frames.
+		if (this.level == 0) {
+			LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex as u32, this.stringAttr("frame-pointer", "all"))
+		}
+		return fn
+	}
+	/// The attribute key="value", one LLVM has no enum for.
+	private stringAttr(key: string, value: string): u64 {
+		return withString(key, k => withString(value, v =>
+			LLVMCreateStringAttribute(this.ctx, k, key.length as u32, v, value.length as u32)))
+	}
+	named(name: string): Value {
+		const f = withString(name, p => LLVMGetNamedFunction(this.m, p))
+		return if (f != 0) f else withString(name, p => LLVMGetNamedGlobal(this.m, p))
+	}
+	global(name: string, init: Value, local: bool, align: u32): Value {
+		const g = withString(name, p => LLVMAddGlobal(this.m, LLVMTypeOf(init), p))
+		LLVMSetInitializer(g, init)
+		aligned(g, align)
+		return linkage(g, local)
+	}
+	extern(name: string, t: Type): Value { return withString(name, p => LLVMAddGlobal(this.m, t, p)) }
+	attr(fn: Value, index: i32, name: string, t: Type) {
+		const kind = withString(name, p => LLVMGetEnumAttributeKindForName(p, name.length as u64) as u64) as u32
+		const a = if (kind == 0) this.stringAttr(name, "")
+			else if (t == 0) LLVMCreateEnumAttribute(this.ctx, kind, 0) else LLVMCreateTypeAttribute(this.ctx, kind, t)
+		if (LLVMIsAInstruction(fn) != 0) {
+			LLVMAddCallSiteAttribute(fn, index as u32, a)
+		} else {
+			LLVMAddAttributeAtIndex(fn, index as u32, a)
+		}
+	}
+	allocator(fn: Value) {
+		this.attr(fn, 0, "noalias", 0)
+		const kind = withString("allockind", p => LLVMGetEnumAttributeKindForName(p, 9) as u64) as u32
+		LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex as u32, LLVMCreateEnumAttribute(this.ctx, kind, 17)) // alloc, zeroed
+	}
+	constant(init: Value): Value {
+		const g = LLVMAddGlobal(this.m, LLVMTypeOf(init), noName)
+		LLVMSetInitializer(g, init)
+		LLVMSetGlobalConstant(g, 1)
+		LLVMSetLinkage(g, LLVMPrivateLinkage as u32)
+		LLVMSetUnnamedAddress(g, LLVMGlobalUnnamedAddr as u32)
+		return g
+	}
+	literal(name: string, init: Value): Value {
+		const g = withString(name, p => LLVMAddGlobal(this.m, LLVMTypeOf(init), p))
+		LLVMSetInitializer(g, init)
+		LLVMSetGlobalConstant(g, 1)
+		this.weak(g)
+		return g
+	}
+	declared(g: Value): bool { return LLVMIsDeclaration(g) != 0 }
+	isConstant(v: Value): bool { return LLVMIsConstant(v) != 0 }
+	replace(old: Value, by: Value) {
+		LLVMReplaceAllUsesWith(old, by)
+		let p: c.ptr = 0
+		const n = out(n => { p = LLVMGetValueName2(old, n) })
+		const name = c.fromCBytes(p, n)
+		if (LLVMIsAFunction(old) != 0) {
+			LLVMDeleteFunction(old)
+		} else {
+			LLVMDeleteGlobal(old)
+		}
+		withString(name, p => {
+			LLVMSetValueName2(by, p, name.length as u64)
+			return 0
+		})
+	}
+	remove(fn: Value) {
+		// The builder may be in it, and must not stay in a deleted block.
+		LLVMClearInsertionPosition(this.b)
+		LLVMDeleteFunction(fn)
+	}
+	personality(fn: Value, p: Value) { LLVMSetPersonalityFn(fn, p) }
+	weak(g: Value) { LLVMSetLinkage(g, LLVMWeakODRLinkage as u32) }
+	overridable(g: Value) {
+		LLVMSetLinkage(g, (if (this.declared(g)) LLVMExternalWeakLinkage else LLVMWeakAnyLinkage) as u32)
+	}
+	hidden(g: Value) { LLVMSetVisibility(g, LLVMHiddenVisibility as u32) }
+	alias(g: Value, to: Value): Value {
+		const a = LLVMAddAlias2(this.m, LLVMGlobalGetValueType(to), 0, to, noName)
+		LLVMSetLinkage(a, LLVMGetLinkage(g)) // internal if static
+		this.replace(g, a)
+		return a
+	}
+	param(fn: Value, i: u32): Value { return LLVMGetParam(fn, i) }
+	typeOf(v: Value): Type { return LLVMTypeOf(v) }
+	resultOf(t: Type): Type { return LLVMGetReturnType(t) }
+	valueType(f: Value): Type { return LLVMGlobalGetValueType(f) }
+
+	block(fn: Value): Block { return LLVMAppendBasicBlockInContext(this.ctx, fn, noName) }
+	at(b: Block) {
+		LLVMPositionBuilderAtEnd(this.b, b)
+		const sp = LLVMGetSubprogram(LLVMGetBasicBlockParent(b))
+		if (sp != this.sp) {
+			this.sp = sp
+			this.line(0, 0)
+		}
+	}
+	here(): Block { return LLVMGetInsertBlock(this.b) }
+	ended(): bool { return LLVMGetBasicBlockTerminator(this.here()) != 0 }
+
+	ret(v: Value) { LLVMBuildRet(this.b, v) }
+	retVoid() { LLVMBuildRetVoid(this.b) }
+	br(to: Block) { LLVMBuildBr(this.b, to) }
+	condBr(cond: Value, yes: Block, no: Block) { LLVMBuildCondBr(this.b, cond, yes, no) }
+	unreachable() { LLVMBuildUnreachable(this.b) }
+
+	binary(op: Binary, a: Value, b: Value): Value {
+		return if (op == "fpow") this.intrinsic("llvm.pow", [LLVMTypeOf(a)], [a, b])
+			else LLVMBuildBinOp(this.b, binaries.get(op)! as u32, a, b, noName)
+	}
+	icmp(pred: Cmp, a: Value, b: Value): Value { return LLVMBuildICmp(this.b, cmps.get(pred)! as u32, a, b, noName) }
+	fcmp(pred: FCmp, a: Value, b: Value): Value { return LLVMBuildFCmp(this.b, fcmps.get(pred)! as u32, a, b, noName) }
+	cast(op: Cast, v: Value, to: Type): Value {
+		if (op == "ptrtoint" && this.gc && LLVMTypeOf(v) == this.ref()) {
+			return this.call(this.fn(this.int(64), [this.ref()]), this.address(), [v])
+		}
+		return LLVMBuildCast(this.b, casts.get(op)! as u32, v, to, noName)
+	}
+	/// What a ref's address is taken by until statepoints: a call that reads memory, so that, unlike a ptrtoint,
+	/// LLVM does not reuse the address across one that may collect, leaving the ref dead there and so not reloaded.
+	private address(): Value {
+		const have = this.named("bober.address")
+		if (have != 0) {
+			return have
+		}
+		const f = this.function("bober.address", this.fn(this.int(64), [this.ref()]), false)
+		for (const a of ["nounwind", "willreturn", "gc-leaf-function"]) {
+			this.attr(f, LLVMAttributeFunctionIndex as i32, a, 0)
+		}
+		const read = withString("memory", p => LLVMGetEnumAttributeKindForName(p, 6) as u64) as u32
+		LLVMAddAttributeAtIndex(f, LLVMAttributeFunctionIndex as u32, LLVMCreateEnumAttribute(this.ctx, read, 21))
+		return f
+	}
+	select(cond: Value, yes: Value, no: Value): Value { return LLVMBuildSelect(this.b, cond, yes, no, noName) }
+	alloca(t: Type, align: u32): Value {
+		return aligned(LLVMBuildAlloca(this.b, t, noName), align)
+	}
+	stackAlloc(bytes: Value): Value { return aligned(LLVMBuildArrayAlloca(this.b, this.int(8), bytes, noName), 16) }
+	load(t: Type, p: Value, volatile: bool): Value {
+		const l = aligned(LLVMBuildLoad2(this.b, t, p, noName), loose(p))
+		LLVMSetVolatile(l, volatile as i32)
+		return l
+	}
+	store(v: Value, p: Value, volatile: bool): Value {
+		const s = aligned(LLVMBuildStore(this.b, v, p), loose(p))
+		LLVMSetVolatile(s, volatile as i32)
+		return s
+	}
+	invariant(access: Value) {
+		const kind = withString("invariant.group", p => LLVMGetMDKindIDInContext(this.ctx, p, 15) as u64) as u32
+		LLVMSetMetadata(access, kind, LLVMMetadataAsValue(this.ctx, LLVMMDNodeInContext2(this.ctx, 0, 0)))
+	}
+	field(t: Type, p: Value, i: u32): Value { return LLVMBuildStructGEP2(this.b, t, p, i, noName) }
+	gep(t: Type, p: Value, indices: Value[]): Value {
+		return withArray(indices, a => LLVMBuildGEP2(this.b, t, p, a, indices.length as u32, noName))
+	}
+	extract(v: Value, i: u32): Value { return LLVMBuildExtractValue(this.b, v, i, noName) }
+	insert(v: Value, e: Value, i: u32): Value { return LLVMBuildInsertValue(this.b, v, e, i, noName) }
+	undef(t: Type): Value { return LLVMGetPoison(t) }
+	call(fnType: Type, fn: Value, args: Value[]): Value {
+		return withArray(args, a => LLVMBuildCall2(this.b, fnType, fn, a, args.length as u32, noName))
+	}
+	invoke(fnType: Type, fn: Value, args: Value[], then: Block, unwind: Block): Value {
+		return withArray(args, a => LLVMBuildInvoke2(this.b, fnType, fn, a, args.length as u32, then, unwind, noName))
+	}
+	landingPad(typeinfo: Value) {
+		LLVMAddClause(LLVMBuildLandingPad(this.b, LLVMTokenTypeInContext(this.ctx), 0, 1, noName), typeinfo)
+	}
+
+	constPacked(fields: Value[]): Value {
+		return withArray(fields, p => LLVMConstStructInContext(this.ctx, p, fields.length as u32, 1))
+	}
+	switch(v: Value, cases: i64[], targets: Block[], otherwise: Block) {
+		const s = LLVMBuildSwitch(this.b, v, otherwise, cases.length as u32)
+		for (const k of 0 ... cases.length - 1) {
+			LLVMAddCase(s, LLVMConstInt(LLVMTypeOf(v), cases[k] as u64, 1), targets[k])
+		}
+	}
+	blockAddress(fn: Value, b: Block): Value { return LLVMBlockAddress(fn, b) }
+	indirectBr(p: Value, targets: Block[]) {
+		const br = LLVMBuildIndirectBr(this.b, p, targets.length as u32)
+		for (const t of targets) {
+			LLVMAddDestination(br, t)
+		}
+	}
+	saturate(signed: bool, v: Value, to: Type): Value {
+		return this.intrinsic(`llvm.fpto${if (signed) "s" else "u"}i.sat`, [to, LLVMTypeOf(v)], [v])
+	}
+	unary(op: Unary, v: Value): Value {
+		if (op == "fneg") {
+			return LLVMBuildFNeg(this.b, v, noName)
+		}
+		const args = if (op == "ctlz" || op == "cttz") [v, this.constInt(this.int(1), 0)] else [v]
+		return this.intrinsic(`llvm.${op}`, [LLVMTypeOf(v)], args)
+	}
+	lifetime(p: Value, live: bool) {
+		this.intrinsic(if (live) "llvm.lifetime.start" else "llvm.lifetime.end", [this.ptr()], [p])
+	}
+	aliasing(access: Value, header: bool) {
+		if (this.tbaa.length == 0) {
+			// Two scalar types under one root, each its own access tag, as type-based alias analysis has them.
+			const node = (ms: u64[]) => withArray(ms, p => LLVMMDNodeInContext2(this.ctx, p, ms.length as u64))
+			const root = node([this.mdString("bober")])
+			for (const name of ["array header", "array element"]) {
+				const t = node([this.mdString(name), root])
+				this.tbaa.push(node([t, t, LLVMValueAsMetadata(this.constInt(this.int(64), 0))]))
+			}
+		}
+		const kind = withString("tbaa", p => LLVMGetMDKindIDInContext(this.ctx, p, 4) as u64) as u32
+		LLVMSetMetadata(access, kind, LLVMMetadataAsValue(this.ctx, this.tbaa[if (header) 0 else 1]))
+	}
+	private mdString(s: string): u64 { return withString(s, p => LLVMMDStringInContext2(this.ctx, p, s.length as u64)) }
+	copy(dst: Value, src: Value, bytes: i64) {
+		LLVMBuildMemCpy(this.b, dst, 1, src, 1, this.constInt(this.int(64), bytes))
+	}
+	zero(dst: Value, bytes: i64) {
+		LLVMBuildMemSet(this.b, dst, this.constInt(this.int(8), 0), this.constInt(this.int(64), bytes), 1)
+	}
+	atomicLoad(t: Type, p: Value): Value { return this.ordered(LLVMBuildLoad2(this.b, t, p, noName), t) }
+	atomicStore(v: Value, p: Value) { this.ordered(LLVMBuildStore(this.b, v, p), LLVMTypeOf(v)) }
+	fence() { LLVMBuildFence(this.b, LLVMAtomicOrderingSequentiallyConsistent as u32, 0, noName) }
+	trap() { this.intrinsic("llvm.trap", [], []) }
+	readable(p: Value, n: Value, align: i64) {
+		const f = withArray([] as Type[], q => LLVMGetIntrinsicDeclaration(this.m, withString("llvm.assume", s =>
+			LLVMLookupIntrinsicID(s, 11) as u64) as u32, q, 0))
+		const bundles = [bundle("dereferenceable", [p, n])]
+		if (align > 1) {
+			bundles.push(bundle("align", [p, this.constInt(this.int(64), align)]))
+		}
+		withArray([this.constInt(this.int(1), 1)], args => withArray(bundles, bs =>
+			LLVMBuildCallWithOperandBundles(this.b, LLVMGlobalGetValueType(f), f, args, 1, bs, bundles.length as u32, noName)))
+		for (const b of bundles) {
+			LLVMDisposeOperandBundle(b)
+		}
+	}
+	vaStart(ap: Value) { this.intrinsic("llvm.va_start", [this.ptr()], [ap]) }
+	frameAddress(): Value { return this.intrinsic("llvm.frameaddress", [this.ptr()], [this.constInt(this.int(32), 0)]) }
+	/// An operand in memory is an indirect one, *m, passed by its pointer, whose elementtype is what is there.
+	asm(text: string, outs: Operand[], ins: Operand[], clobbers: string[]): Value[] {
+		let cons = ""
+		const types: Type[] = []
+		const args: Value[] = []
+		const argTypes: Type[] = []
+		const memory: [i32, Type][] = []
+		const constraint = (c: string) => {
+			cons += (if (cons == "") "" else ",") + c
+		}
+		const operand = (o: Operand, out: bool) => {
+			constraint((if (out) "=" else "") + (if (o.c == "m") "*m" else register(o.c)))
+			if (out && o.c != "m") {
+				types.push(o.t)
+				return
+			}
+			if (o.c == "m") {
+				memory.push([args.length, o.t])
+			}
+			args.push(o.v)
+			argTypes.push(if (o.c == "m") this.ptr() else o.t)
+		}
+		for (const o of outs) {
+			operand(o, true)
+		}
+		for (const i of ins) {
+			operand(i, false)
+		}
+		for (const c of clobbers) {
+			constraint(`~{${c}}`)
+		}
+		const rt = if (types.length == 0) this.void() else if (types.length == 1) types[0] else this.struct(types)
+		const ft = this.fn(rt, argTypes)
+		const template = asmText(text)
+		const callee = withString(template, t => withString(cons, c =>
+			LLVMGetInlineAsm(ft, t, template.length as u64, c, cons.length as u64, 1, 0, LLVMInlineAsmDialectATT as u32, 0)))
+		const r = this.call(ft, callee, args)
+		for (const [k, t] of memory) {
+			this.attr(r, k + 1, "elementtype", t)
+		}
+		const out: Value[] = []
+		for (const i of 0 ... types.length - 1) {
+			out.push(if (types.length == 1) r else this.extract(r, i as u32))
+		}
+		return out
+	}
+	hasAsm(): bool { return true }
+	moduleAsm(text: string) {
+		withString(text, p => {
+			LLVMAppendModuleInlineAsm(this.m, p, text.length as u64)
+			return 0
+		})
+	}
+	common(g: Value) { LLVMSetLinkage(g, LLVMCommonLinkage as u32) }
+	threadLocal(g: Value) { LLVMSetThreadLocal(g, 1) }
+	inlineOnly(fn: Value) { LLVMSetLinkage(fn, LLVMAvailableExternallyLinkage as u32) }
+
+	/// A call of the intrinsic name overloaded on types, with args.
+	private intrinsic(name: string, types: Type[], args: Value[]): Value {
+		const id = withString(name, p => LLVMLookupIntrinsicID(p, name.length as u64) as u64) as u32
+		const f = withArray(types, p => LLVMGetIntrinsicDeclaration(this.m, id, p, types.length as u64))
+		return this.call(LLVMGlobalGetValueType(f), f, args)
+	}
+
+	/// The load or store inst made sequentially consistent, aligned to the size of t.
+	private ordered(inst: Value, t: Type): Value {
+		LLVMSetOrdering(inst, LLVMAtomicOrderingSequentiallyConsistent as u32)
+		LLVMSetAlignment(inst, LLVMABISizeOfType(this.td, t) as u32)
+		return inst
+	}
+
+	source(path: string, producer: string) {
+		this.di = LLVMCreateDIBuilder(this.m)
+		this.file = withString(path, p => LLVMDIBuilderCreateFile(this.di, p, path.length as u64, noName, 0))
+		withString(producer, p => LLVMDIBuilderCreateCompileUnit(this.di, LLVMDWARFSourceLanguageC as u32, this.file, p,
+			producer.length as u64, 0, noName, 0, 0, noName, 0, LLVMDWARFEmissionFull as u32, 0, 0, 0, noName, 0, noName, 0))
+		const version = LLVMValueAsMetadata(this.constInt(this.int(32), LLVMDebugMetadataVersion() as i64))
+		withString("Debug Info Version", p => {
+			LLVMAddModuleFlag(this.m, LLVMModuleFlagBehaviorWarning as u32, p, 18, version)
+			return 0
+		})
+		LLVMSetIsNewDbgInfoFormat(this.m, 1)
+	}
+	debugFunction(fn: Value, line: u32) {
+		const t = withArray([], p => LLVMDIBuilderCreateSubroutineType(this.di, this.file, p, 0, 0))
+		let name: c.ptr = 0
+		const n = out(len => { name = LLVMGetValueName2(fn, len) })
+		LLVMSetSubprogram(fn, LLVMDIBuilderCreateFunction(this.di, this.file, name, n, name, n, this.file, line, t, 0, 1,
+			line, 0, 0))
+	}
+	line(n: u32, col: u32) { LLVMSetCurrentDebugLocation2(this.b, this.location(n, col)) }
+	debugLocal(name: string, p: Value, t: Type, line: u32) {
+		if (this.sp == 0) {
+			return
+		}
+		const v = withString(name, s => LLVMDIBuilderCreateAutoVariable(this.di, this.sp, s, name.length as u64, this.file,
+			line, this.debugType(t), 1, 0, 0))
+		LLVMDIBuilderInsertDeclareRecordAtEnd(this.di, p, v, LLVMDIBuilderCreateExpression(this.di, 0, 0),
+			this.location(line, 0), this.here())
+	}
+
+	/// The place in the function being appended to, or none outside one debugged.
+	private location(line: u32, col: u32): u64 {
+		return if (this.sp == 0) 0 else LLVMDIBuilderCreateDebugLocation(this.ctx, line, col, this.sp, 0)
+	}
+
+	/// The debug type for the LLVM type t: integers signed, pointers to anything, aggregates by their layout.
+	private debugType(t: Type): u64 {
+		const known = this.debugTypes.get(t)
+		if (known != null) {
+			return known
+		}
+		const di = this.di
+		const bits = LLVMABISizeOfType(this.td, t) * 8
+		const align = LLVMABIAlignmentOfType(this.td, t) * 8
+		const kind = LLVMGetTypeKind(t) as i32
+		const basic = (name: string, encoding: u32) =>
+			withString(name, p => LLVMDIBuilderCreateBasicType(di, p, name.length as u64, bits, encoding, 0))
+		// A struct's members, or an array's one range; its element type.
+		const parts: u64[] = []
+		let elem: u64 = 0
+		if (kind == LLVMStructTypeKind) {
+			for (const i of 0 ... (LLVMCountStructElementTypes(t) as i32) - 1) {
+				const f = LLVMStructGetTypeAtIndex(t, i as u32)
+				const name = `_${i}`
+				parts.push(withString(name, p => LLVMDIBuilderCreateMemberType(di, this.file, p, name.length as u64,
+					this.file, 0, LLVMABISizeOfType(this.td, f) * 8, LLVMABIAlignmentOfType(this.td, f) * 8,
+					LLVMOffsetOfElement(this.td, t, i as u32) * 8, 0, this.debugType(f))))
+			}
+		} else if (kind == LLVMArrayTypeKind) {
+			parts.push(LLVMDIBuilderGetOrCreateSubrange(di, 0, LLVMGetArrayLength2(t) as i64))
+			elem = this.debugType(LLVMGetElementType(t))
+		}
+		const d = if (kind == LLVMIntegerTypeKind) basic(`i${bits}`, if (bits == 8) 0x02 else 0x05)
+			else if (kind == LLVMFloatTypeKind || kind == LLVMDoubleTypeKind) basic(`f${bits}`, 0x04)
+			else if (kind == LLVMPointerTypeKind) LLVMDIBuilderCreatePointerType(di, 0, bits, align, 0, noName, 0)
+			else if (kind == LLVMArrayTypeKind) withArray(parts, p => LLVMDIBuilderCreateArrayType(di, bits, align, elem, p, 1))
+			else withArray(parts, p => LLVMDIBuilderCreateStructType(di, this.file, noName, 0, this.file, 0, bits,
+				align, 0, 0, p, parts.length as u32, 0, 0, noName, 0))
+		this.debugTypes.set(t, d)
+		return d
+	}
+
+	/// Completes the debug information, after which no more is taken.
+	private finish() {
+		if (this.di != 0) {
+			LLVMDIBuilderFinalize(this.di)
+			this.di = 0
+		}
+		if (this.roots.length > 0) {
+			// Kept, unreferenced as they are, through optimizing and LTO to the linker.
+			const t = LLVMArrayType2(this.ptr(), this.roots.length as u64)
+			const used = withString("llvm.compiler.used", p => LLVMAddGlobal(this.m, t, p))
+			LLVMSetInitializer(used, this.constArray(this.ptr(), this.roots))
+			LLVMSetLinkage(used, LLVMAppendingLinkage as u32)
+			withString("llvm.metadata", p => {
+				LLVMSetSection(used, p)
+				return 0
+			})
+			this.roots = []
+		}
+	}
+
+	/// Pointers in address space 1 are made non-integral, so that LLVM keeps them pointers, which only a ref's
+	/// casts turn into integers.
+	collected() {
+		this.gc = true
+		withString(c.fromCString(LLVMGetDataLayoutStr(this.m)) + "-ni:1", p => {
+			LLVMSetDataLayout(this.m, p)
+			return 0
+		})
+	}
+
+	holdsRef(t: Type): bool { return holdsRef(t) }
+	layout(t: Type): Value {
+		if (!holdsRef(t)) {
+			return LLVMConstNull(this.ptr())
+		}
+		const have = this.layouts.get(t)
+		if (have != null) {
+			return have
+		}
+		const size = this.bytes(t)
+		const words: u64[] = []
+		for (const _ of 1 ... (((size / 8 + 63) / 64) as i32)) {
+			words.push(0)
+		}
+		this.mark(words, t, 0)
+		const word = this.int(64)
+		const bits = words.map(w => this.constInt(word, w as i64))
+		const l = this.constant(this.constStruct([this.constInt(word, size as i64), this.constArray(word, bits)]))
+		this.layouts.set(t, l)
+		return l
+	}
+
+	/// Each in section bober_roots, which src/gc.c reads, as the global and its layout.
+	root(g: Value) {
+		const t = LLVMGlobalGetValueType(g)
+		if (holdsRef(t)) {
+			this.collect(this.constStruct([g, this.layout(t)]), "bober_roots")
+		}
+	}
+	described(g: Value) { this.collect(this.constStruct([g]), "bober_types") }
+
+	/// A constant of init in the section s, which the run time reads between the bounds the linker defines (src/rt.h).
+	private collect(init: Value, s: string) {
+		const e = this.constant(init)
+		withString(section(s), p => {
+			LLVMSetSection(e, p)
+			return 0
+		})
+		withString("bober.root", p => {
+			LLVMSetValueName2(e, p, 9) // as llvm.compiler.used takes, which LLVM makes unique
+			return 0
+		})
+		this.roots.push(e)
+	}
+
+	/// Sets in words, a bit for each 8 bytes, those of the refs in a value of t at offset at.
+	private mark(words: u64[], t: Type, at: u64) {
+		const kind = LLVMGetTypeKind(t) as i32
+		if (kind == LLVMPointerTypeKind && LLVMGetPointerAddressSpace(t) == 1) {
+			words[(at / 512) as i32] |= (1 as u64) << (at / 8 % 64)
+		} else if (kind == LLVMArrayTypeKind && holdsRef(LLVMGetElementType(t))) {
+			const e = LLVMGetElementType(t)
+			for (const i of 0 ... (LLVMGetArrayLength2(t) as i32) - 1) {
+				this.mark(words, e, at + (i as u64) * this.bytes(e))
+			}
+		} else if (kind == LLVMStructTypeKind) {
+			for (const i of 0 ... (LLVMCountStructElementTypes(t) as i32) - 1) {
+				this.mark(words, LLVMStructGetTypeAtIndex(t, i as u32), at + LLVMOffsetOfElement(this.td, t, i as u32))
+			}
+		}
+	}
+
+	verify() {
+		this.finish()
+		checked(err => LLVMVerifyModule(this.m, LLVMReturnStatusAction as u32, err) as u64)
+	}
+	emit(path: string, asm: bool) {
+		this.finish()
+		this.optimize()
+		this.statepoints()
+		const kind = if (asm) LLVMAssemblyFile else LLVMObjectFile
+		checked(err => withString(path, p => LLVMTargetMachineEmitToFile(this.tm, this.m, p, kind as u32, err) as u64))
+	}
+
+	/// Moves the module of other, verified, into this one, to be optimized with it as one.
+	link(other: LLVM) {
+		if (other.gc && !this.gc) {
+			this.collected()
+		}
+		if (LLVMLinkModules2(this.m, other.m) != 0) {
+			throw new CompileError("cannot link the modules")
+		}
+	}
+
+	/// Runs LLVM's default pass pipeline at this module's level.
+	optimize() {
+		failed(withString(`default<O${this.level}>`, p => LLVMRunPasses(this.m, p, this.tm, LLVMCreatePassBuilderOptions())))
+	}
+
+	/// If collected, gives each function defined LLVM's statepoint-example GC, after optimizing it, as a call
+	/// lowered so is no longer inlined: rewrite-statepoints-for-gc then has each call record where the refs live
+	/// across it are, in the stack maps rt.c reads, and reload them after it, as the collector may have moved what
+	/// they point to. It reloads refs only, not a struct or array holding some, so sroa first splits each such value,
+	/// as spill has it. Each address taken is then a ptrtoint again. The stack map, if any, is listed by the address of
+	/// its label in section bober_stackmaps, as ELF has no bounds of section .llvm_stackmaps, which src/gc.c reads.
+	private statepoints() {
+		if (!this.gc) {
+			return
+		}
+		let f = LLVMGetFirstFunction(this.m)
+		while (f != 0) {
+			if (LLVMIsDeclaration(f) == 0) {
+				withString("statepoint-example", p => {
+					LLVMSetGC(f, p)
+					return 0
+				})
+				this.spillAll(f)
+			}
+			f = LLVMGetNextFunction(f)
+		}
+		failed(withString("function(sroa),rewrite-statepoints-for-gc", p =>
+			LLVMRunPasses(this.m, p, this.tm, LLVMCreatePassBuilderOptions())))
+		LLVMSetModuleDataLayout(this.m, this.td) // the target's, which codegen and LTO take, now no ref is hidden
+		if (this.named("llvm.experimental.gc.statepoint.p0") != 0) {
+			this.moduleAsm(`.pushsection ${section("bober_stackmaps")}${if (os == "macos") "" else `,"aw"`}
+.p2align 3
+.quad __LLVM_StackMaps
+.popsection`)
+		}
+		const marker = this.named("bober.address")
+		if (marker != 0) {
+			let u = LLVMGetFirstUse(marker)
+			while (u != 0) {
+				const call = LLVMGetUser(u)
+				u = LLVMGetNextUse(u)
+				LLVMPositionBuilderBefore(this.b, call)
+				LLVMReplaceAllUsesWith(call, LLVMBuildCast(this.b, LLVMPtrToInt as u32, LLVMGetOperand(call, 0), this.int(64), noName))
+				LLVMInstructionEraseFromParent(call)
+			}
+			LLVMDeleteFunction(marker)
+		}
+	}
+
+	/// Spills each value of fn that is a struct or array holding a ref.
+	private spillAll(fn: Value) {
+		const values: Value[] = []
+		for (const i of 0 ... (LLVMCountParams(fn) as i32) - 1) {
+			values.push(LLVMGetParam(fn, i as u32))
+		}
+		let bb = LLVMGetFirstBasicBlock(fn)
+		while (bb != 0) {
+			let i = LLVMGetFirstInstruction(bb)
+			while (i != 0) {
+				values.push(i)
+				i = LLVMGetNextInstruction(i)
+			}
+			bb = LLVMGetNextBasicBlock(bb)
+		}
+		for (const v of values) {
+			const t = LLVMTypeOf(v)
+			const kind = LLVMGetTypeKind(t) as i32
+			if ((kind == LLVMStructTypeKind || kind == LLVMArrayTypeKind) && holdsRef(t)) {
+				this.spill(fn, v)
+			}
+		}
+	}
+
+	/// Stores v to a slot of its own where it is made, and has each use load it there instead, so that v lives
+	/// only up to the store, its fields in the slot, which sroa splits. A phi's use loads at the end of the block it
+	/// comes from, except an invoke's own, which takes v as it is. An invoke's v is stored in its normal block, which
+	/// emit gives each its own.
+	private spill(fn: Value, v: Value) {
+		const users: Value[] = []
+		let u = LLVMGetFirstUse(v)
+		let plain = false
+		while (u != 0) {
+			const user = LLVMGetUser(u)
+			if (users.length == 0 || users[users.length - 1] != user) {
+				users.push(user)
+			}
+			plain = plain || !isOp(user, LLVMPHI)
+			u = LLVMGetNextUse(u)
+		}
+		const invoke = LLVMIsAInstruction(v) != 0 && isOp(v, LLVMInvoke)
+		if (users.length == 0 || invoke && !plain) {
+			return
+		}
+		const t = LLVMTypeOf(v)
+		const entry = LLVMGetEntryBasicBlock(fn)
+		LLVMPositionBuilderBefore(this.b, LLVMGetFirstInstruction(entry))
+		const slot = LLVMBuildAlloca(this.b, t, noName)
+		if (LLVMIsAInstruction(v) == 0) {
+			LLVMPositionBuilderBefore(this.b, LLVMGetNextInstruction(slot))
+		} else if (invoke) {
+			LLVMPositionBuilderBefore(this.b, body(LLVMGetNormalDest(v)))
+		} else if (isOp(v, LLVMPHI)) {
+			LLVMPositionBuilderBefore(this.b, body(LLVMGetInstructionParent(v)))
+		} else {
+			LLVMPositionBuilderBefore(this.b, LLVMGetNextInstruction(v))
+		}
+		LLVMBuildStore(this.b, v, slot)
+		for (const user of users) {
+			const phi = isOp(user, LLVMPHI)
+			for (const k of 0 ... LLVMGetNumOperands(user) - 1) {
+				if (LLVMGetOperand(user, k as u32) != v) {
+					continue
+				}
+				if (phi) {
+					const end = LLVMGetBasicBlockTerminator(LLVMGetIncomingBlock(user, k as u32))
+					if (end == v) {
+						continue
+					}
+					LLVMPositionBuilderBefore(this.b, end)
+				} else {
+					LLVMPositionBuilderBefore(this.b, user)
+				}
+				LLVMSetOperand(user, k as u32, LLVMBuildLoad2(this.b, t, slot, noName))
+			}
+		}
+	}
+
+	/// Adds the functions and globals of ir, LLVM assembly.
+	include(ir: string) {
+		const buf = withString(ir, p =>
+			withString("ir", name => LLVMCreateMemoryBufferWithMemoryRangeCopy(p, ir.length as u64, name)))
+		// LLVMParseIRInContext takes buf.
+		const m = out(m => checked(err => LLVMParseIRInContext(this.ctx, buf, m, err) as u64))
+		LLVMSetModuleDataLayout(m, LLVMCreateTargetDataLayout(this.tm))
+		if (LLVMLinkModules2(this.m, m) != 0) {
+			throw new CompileError("cannot link the included ir")
+		}
+	}
+
+	/// The module as LLVM assembly.
+	text(): string { return message(LLVMPrintModuleToString(this.m)) }
+}
+
+/// LLVM's codes for the Backend's names.
+const binaries = codes([["add", LLVMAdd], ["sub", LLVMSub], ["mul", LLVMMul], ["udiv", LLVMUDiv], ["sdiv", LLVMSDiv],
+	["urem", LLVMURem], ["srem", LLVMSRem], ["shl", LLVMShl], ["lshr", LLVMLShr], ["ashr", LLVMAShr], ["and", LLVMAnd],
+	["or", LLVMOr], ["xor", LLVMXor], ["fadd", LLVMFAdd], ["fsub", LLVMFSub], ["fmul", LLVMFMul], ["fdiv", LLVMFDiv],
+	["frem", LLVMFRem]])
+const casts = codes([["trunc", LLVMTrunc], ["zext", LLVMZExt], ["sext", LLVMSExt], ["fptoui", LLVMFPToUI],
+	["fptosi", LLVMFPToSI], ["uitofp", LLVMUIToFP], ["sitofp", LLVMSIToFP], ["fptrunc", LLVMFPTrunc], ["fpext", LLVMFPExt],
+	["ptrtoint", LLVMPtrToInt], ["inttoptr", LLVMIntToPtr], ["bitcast", LLVMBitCast]])
+const cmps = codes([["eq", LLVMIntEQ], ["ne", LLVMIntNE], ["ugt", LLVMIntUGT], ["uge", LLVMIntUGE], ["ult", LLVMIntULT],
+	["ule", LLVMIntULE], ["sgt", LLVMIntSGT], ["sge", LLVMIntSGE], ["slt", LLVMIntSLT], ["sle", LLVMIntSLE]])
+const fcmps = codes([["oeq", LLVMRealOEQ], ["ogt", LLVMRealOGT], ["oge", LLVMRealOGE], ["olt", LLVMRealOLT],
+	["ole", LLVMRealOLE], ["one", LLVMRealONE], ["ord", LLVMRealORD], ["ueq", LLVMRealUEQ], ["ugt", LLVMRealUGT],
+	["uge", LLVMRealUGE], ["ult", LLVMRealULT], ["ule", LLVMRealULE], ["une", LLVMRealUNE], ["uno", LLVMRealUNO]])
+
+/// Sets LLVM's own options, as clang's -mllvm does: once in a process, before its first module.
+export function options(args: string[]) {
+	const argv = ["llvm", ...args].map(a => c.toCString(a))
+	withArray(argv, p => {
+		LLVMParseCommandLineOptions(argv.length, p, noName)
+		return 0
+	})
+}
+
+/// Registers the targets bober compiles for, arm64, x86-64 and wasm, with their inline assembly parsers.
+function native() {
+	LLVMInitializeAArch64TargetInfo()
+	LLVMInitializeAArch64Target()
+	LLVMInitializeAArch64TargetMC()
+	LLVMInitializeAArch64AsmPrinter()
+	LLVMInitializeAArch64AsmParser()
+	LLVMInitializeWebAssemblyTargetInfo()
+	LLVMInitializeWebAssemblyTarget()
+	LLVMInitializeWebAssemblyTargetMC()
+	LLVMInitializeWebAssemblyAsmPrinter()
+	LLVMInitializeWebAssemblyAsmParser()
+	LLVMInitializeX86TargetInfo()
+	LLVMInitializeX86Target()
+	LLVMInitializeX86TargetMC()
+	LLVMInitializeX86AsmPrinter()
+	LLVMInitializeX86AsmParser()
+}
+
+/// Throws the message of LLVM's error e, if it is one.
+function failed(e: u64) {
+	if (e != 0) {
+		const p = LLVMGetErrorMessage(e)
+		const msg = c.fromCString(p)
+		LLVMDisposeErrorMessage(p)
+		throw new CompileError(msg)
+	}
+}
+
+/// The message LLVM made at p, which is disposed; "" for none.
+function message(p: c.ptr): string {
+	if (p == 0) {
+		return ""
+	}
+	const s = c.fromCString(p)
+	LLVMDisposeMessage(p)
+	return s
+}
+
+/// Whether the type t is or holds a ref.
+function holdsRef(t: Type): bool {
+	const kind = LLVMGetTypeKind(t) as i32
+	if (kind == LLVMPointerTypeKind) {
+		return LLVMGetPointerAddressSpace(t) == 1
+	} else if (kind == LLVMArrayTypeKind) {
+		return holdsRef(LLVMGetElementType(t))
+	} else if (kind == LLVMStructTypeKind) {
+		for (const i of 0 ... (LLVMCountStructElementTypes(t) as i32) - 1) {
+			if (holdsRef(LLVMStructGetTypeAtIndex(t, i as u32))) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+/// The first instruction of block b after its phis and landing pad.
+function body(b: Block): Value {
+	let i = LLVMGetFirstInstruction(b)
+	while (isOp(i, LLVMPHI) || isOp(i, LLVMLandingPad)) {
+		i = LLVMGetNextInstruction(i)
+	}
+	return i
+}
+
+/// Whether the instruction i is of opcode op.
+/// An operand bundle, as an assume takes them.
+function bundle(tag: string, args: Value[]): u64 {
+	return withArray(args, a => withString(tag, t => LLVMCreateOperandBundle(t, tag.length as u64, a, args.length as u32)))
+}
+
+function isOp(i: Value, op: i32): bool {
+	const o = LLVMGetInstructionOpcode(i) as i32
+	return o == op
+}
+
+/// 1 for an address made from an integer, as the load and store intrinsics take, which promises no alignment; else 0.
+function loose(p: Value): u32 { return if (isOp(p, LLVMIntToPtr)) 1 else 0 }
+
+/// v aligned to align bytes, unless align is 0.
+function aligned(v: Value, align: u32): Value {
+	if (align != 0) {
+		LLVMSetAlignment(v, align)
+	}
+	return v
+}
+
+function linkage(v: Value, local: bool): Value {
+	if (local) {
+		LLVMSetLinkage(v, LLVMInternalLinkage as u32)
+	}
+	return v
+}
+
+/// Calls f with a place for LLVM's message, which is thrown if f returns nonzero.
+function checked(f: (err: c.ptr) => u64) {
+	let bad: u64 = 0
+	const msg = message(out(err => { bad = f(err) }))
+	if (bad != 0) {
+		throw new CompileError(msg)
+	}
+}
+
+/// The constraint c as LLVM spells it: g, any operand, is a register, and on x86-64 the letters a, b, c, d, S
+/// and D name one register each.
+function register(c: string): string {
+	let out = ""
+	for (const ch of c) {
+		const k = if (arch == "x86_64") indexOf("abcdSD", chr(ch)) else -1
+		out += if (chr(ch) == "g") "r" else if (k < 0) chr(ch) else ["{ax}", "{bx}", "{cx}", "{dx}", "{si}", "{di}"][k]
+	}
+	return out
+}
+
+/// GCC's asm template in LLVM's syntax: operand n, with a modifier m as in %w0, is ${n:m}.
+function asmText(s: string): string {
+	let out = ""
+	let i = 0
+	while (i < s.length) {
+		const c = s[i]
+		i++
+		if (c == dollar) {
+			out += "$$"
+		} else if (c != percent || i == s.length) {
+			out += chr(c)
+		} else if (s[i] == percent) {
+			out += "%"
+			i++
+		} else {
+			let m = ""
+			if (isAlphabetic(s[i])) {
+				m = ":" + chr(s[i])
+				i++
+			}
+			let j = i
+			while (j < s.length && isDigit(s[j])) {
+				j++
+			}
+			out += `\${${s.slice(i, j)}${m}}`
+			i = j
+		}
+	}
+	return out
+}

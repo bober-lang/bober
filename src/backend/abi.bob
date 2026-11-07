@@ -1,0 +1,427 @@
+//! The parts of the calling conventions, System V's on x86-64 and AAPCS64 on arm64, Apple's or the standard
+//! one, that LLVM leaves to the front end: how aggregates cross a call, and the extension of narrow integers,
+//! which System V and Apple have the sender do; how C types are held in the back end and function types
+//! signed with those; and the code of a call, a function's parameters and return, and va_arg. bobcc compiles
+//! C with it, and bober's own emitter is meant to share it, since every bober value is a C object.
+
+import { Backend, Block, Type as Held, Value } from "./backend"
+import { Arr, Char, Double, Fn, Ptr, Record, Type, ULong, Void, isInt, isUnsigned, promote } from "../c/type"
+import { alignUp, max, min } from "../../std/math"
+import { arch, os } from "../../std/os"
+
+/// Whether the convention is the standard AAPCS64, as on arm64 but Apple's.
+export const aapcs = arch == "arm64" && os != "macos"
+
+/// The function being defined, as far as its convention's code needs it: a local of type t, held as held
+/// unless that is 0; and a new block.
+export interface Frame {
+	alloca(t: Type, held: Held): Value
+	label(): Block
+}
+
+/// The back end type a C type is held as: an integer of its width, a float, a pointer for a pointer or a
+/// function, an array of its elements, and a struct or union as its bytes.
+export function held(b: Backend, t: Type): Held {
+	if (t instanceof Arr) {
+		return b.array(held(b, t.base), (t.len ?? 0) as u64)
+	}
+	return switch (t.kind) {
+		case "void": b.void()
+		case "bool": b.int(8)
+		case "int": b.int((t.size * 8) as u32)
+		case "float": if (t.size == 4) b.f32() else b.f64()
+		case "ptr", "func": b.ptr()
+		default: b.array(b.int(8), t.size as u64)
+	}
+}
+
+/// The type an aggregate crosses a call as, in registers, or 0 when it goes through memory. On x86-64, as
+/// System V has it, each eightbyte is a float or a double if it holds floats alone, else an integer, and an
+/// empty aggregate is an empty struct, which takes no register. On arm64, an array of its floats if it is
+/// made of at most four of one float type, else one or two i64 up to 16 bytes, or an i128 if 16-aligned.
+function coerce(b: Backend, t: Type): Held {
+	if (arch == "x86_64") {
+		const sse = eightbytes(t)
+		const parts: Held[] = []
+		for (const k of 0 ... sse.length - 1) {
+			const n = min(8, t.size - 8 * k)
+			parts.push(if (!sse[k]) b.int((n * 8) as u32) else if (n > 4) b.f64() else b.f32())
+		}
+		return if (parts.length == 1) parts[0] else if (parts.length > 0 || t.size == 0) b.struct(parts) else 0
+	}
+	const [size, n] = floats(t)
+	if (size > 0 && n <= 4) {
+		return b.array(if (size == 4) b.f32() else b.f64(), n as u64)
+	}
+	return if (t.size > 16) 0 else if (t.align == 16) b.int(128) else if (t.size > 8) b.array(b.int(64), 2) else b.int(64)
+}
+
+/// Whether an aggregate goes through memory: as an argument, the address of a copy, which on x86-64 the
+/// call copies to the stack (byval); as a result, an sret pointer to where it goes.
+function inMemory(t: Type): bool {
+	if (arch == "x86_64") {
+		return t instanceof Record && t.size > 0 && eightbytes(t).length == 0
+	}
+	const [size, n] = floats(t)
+	return t instanceof Record && !(size > 0 && n <= 4) && t.size > 16
+}
+
+/// For each parameter of ft, whether it goes through memory; on x86-64 also an aggregate that would go in
+/// registers, but not in those the parameters before it leave of the six general and eight float ones.
+function inMemoryParams(ft: Fn): bool[] {
+	let gp = if (inMemory(ft.result)) 5 else 6
+	let fp = 8
+	const memory: bool[] = []
+	for (const [t] of ft.params) {
+		const [ints, sses] = registers(t)
+		const fits = arch != "x86_64" || ints <= gp && sses <= fp
+		if (fits) {
+			gp -= ints
+			fp -= sses
+		}
+		memory.push(inMemory(t) || t instanceof Record && !fits)
+	}
+	return memory
+}
+
+/// The general and float registers t takes on x86-64, one for each of its eightbytes.
+function registers(t: Type): [i32, i32] {
+	const sse = eightbytes(t)
+	let n = 0
+	for (const s of sse) {
+		n += if (s) 1 else 0
+	}
+	return [sse.length - n, n]
+}
+
+/// For each eightbyte of t, whether System V's x86-64 convention classes it SSE, holding floats alone,
+/// rather than INTEGER; none if t goes in memory, being over 16 bytes or holding a member off its alignment.
+function eightbytes(t: Type): bool[] {
+	const sse: bool[] = []
+	for (const k of 0 ... (t.size + 7) / 8 - 1) {
+		sse.push(true)
+	}
+	return if (t.size <= 16 && classify(t, 0, sse)) sse else []
+}
+
+/// Marks the eightbytes of sse that t, at off in them, holds anything but floats in; false if it is not
+/// aligned there.
+function classify(t: Type, off: i32, sse: bool[]): bool {
+	if (off % t.align != 0) {
+		return false
+	}
+	if (t instanceof Arr) {
+		for (const k of 0 ... (t.len ?? 0) - 1) {
+			if (!classify(t.base, off + k * t.base.size, sse)) {
+				return false
+			}
+		}
+	} else if (t instanceof Record) {
+		for (const f of t.fields ?? []) {
+			if (!classify(f.ty, off + f.off, sse)) {
+				return false
+			}
+		}
+	} else if (t.kind != "float") {
+		for (const k of off / 8 ... (off + t.size - 1) / 8) {
+			sse[k] = false
+		}
+	}
+	return true
+}
+
+/// The attribute extending a parameter or result narrower than 32 bits, else "".
+function ext(t: Type): string {
+	if (!isInt(t) || t.size >= 4 || aapcs) {
+		return ""
+	}
+	return if (isUnsigned(t)) "zeroext" else "signext"
+}
+
+/// The type a result of type t comes back as; void if through sret.
+function result(b: Backend, t: Type): Held {
+	return if (!(t instanceof Record)) held(b, t) else if (inMemory(t)) b.void() else coerce(b, t)
+}
+
+/// The function type of ft: the sret pointer first if it has one, variadic if it is.
+export function signature(b: Backend, ft: Fn): Held {
+	const params: Held[] = []
+	if (inMemory(ft.result)) {
+		params.push(b.ptr())
+	}
+	const memory = inMemoryParams(ft)
+	for (const i of 0 ... ft.params.length - 1) {
+		const t = ft.params[i][0]
+		params.push(if (!(t instanceof Record)) held(b, t) else if (memory[i]) b.ptr() else coerce(b, t))
+	}
+	const r = result(b, ft.result)
+	return if (ft.variadic) b.variadic(r, params) else b.fn(r, params)
+}
+
+/// Gives the function or call f of type ft its sret and extension attributes.
+export function attrs(b: Backend, f: Value, ft: Fn) {
+	const sret = inMemory(ft.result)
+	if (sret) {
+		b.attr(f, 1, "sret", held(b, ft.result))
+	} else if (ext(ft.result) != "") {
+		b.attr(f, 0, ext(ft.result), 0)
+	}
+	const memory = inMemoryParams(ft)
+	for (const i of 0 ... ft.params.length - 1) {
+		const t = ft.params[i][0]
+		const k = i + 1 + (if (sret) 1 else 0)
+		if (ext(t) != "") {
+			b.attr(f, k, ext(t), 0)
+		} else if (arch == "x86_64" && memory[i]) {
+			b.attr(f, k, "byval", held(b, t))
+		}
+	}
+}
+
+/// The aggregate at p, of type t, as it crosses a call or return: a copy, loaded as its coerced type, or in
+/// memory, its address.
+function argument(b: Backend, f: Frame, t: Type, p: Value, memory: bool): Value {
+	const c = if (memory) 0 else coerce(b, t)
+	const tmp = f.alloca(t, c)
+	b.copy(tmp, p, t.size)
+	return if (c == 0) tmp else b.load(c, tmp, false)
+}
+
+/// Calls callee, of type ft, with args of the types given, scalars as values and aggregates by address; an
+/// unprototyped or variadic call's attributes come from its arguments. The result: an aggregate as the
+/// address of a copy, void as 0.
+export function call(b: Backend, f: Frame, callee: Value, ft: Fn, types: Type[], args: Value[]): Value {
+	const r = ft.result
+	const called = new Fn(r)
+	for (const t of types) {
+		called.params.push([t, ""])
+	}
+	const out = if (inMemory(r)) f.alloca(r, 0) else 0
+	const memory = inMemoryParams(called)
+	const list: Value[] = if (out == 0) [] else [out]
+	for (const i of 0 ... args.length - 1) {
+		list.push(if (types[i] instanceof Record) argument(b, f, types[i], args[i], memory[i]) else args[i])
+	}
+	const x = b.call(signature(b, if (ft.variadic) ft else called), callee, list)
+	attrs(b, x, called)
+	if (r.kind == "void" || out != 0) {
+		return out
+	}
+	if (!(r instanceof Record)) {
+		return x
+	}
+	const tmp = f.alloca(r, coerce(b, r))
+	b.store(x, tmp, false)
+	return tmp
+}
+
+/// The parameters of the function fn, of type ft, as locals: the addresses they are at.
+export function params(b: Backend, f: Frame, fn: Value, ft: Fn): Value[] {
+	const sret = if (inMemory(ft.result)) 1 else 0
+	const memory = inMemoryParams(ft)
+	const out: Value[] = []
+	for (const i of 0 ... ft.params.length - 1) {
+		const t = ft.params[i][0]
+		const p = b.param(fn, (i + sret) as u32)
+		if (memory[i]) {
+			out.push(p)
+			continue
+		}
+		const local = f.alloca(t, if (t instanceof Record) coerce(b, t) else 0)
+		b.store(p, local, false)
+		out.push(local)
+	}
+	return out
+}
+
+/// Returns v, a scalar as it is and an aggregate by address, from the function fn of type ft. A v of 0
+/// returns nothing, or undef where a value is due.
+export function ret(b: Backend, f: Frame, fn: Value, ft: Fn, v: Value) {
+	const r = ft.result
+	if (r.kind == "void" || v == 0 && inMemory(r)) {
+		b.retVoid()
+	} else if (v == 0) {
+		b.ret(b.undef(result(b, r)))
+	} else if (!(r instanceof Record)) {
+		b.ret(v)
+	} else if (inMemory(r)) {
+		b.copy(b.param(fn, 0), v, r.size)
+		b.retVoid()
+	} else {
+		b.ret(argument(b, f, r, v, false))
+	}
+}
+
+/// What __builtin_va_list is: on x86-64 an array of one struct of gp_offset and fp_offset, 4 bytes each,
+/// then overflow_arg_area and reg_save_area, held here as 3 longs; on Apple arm64 a char *; on other arm64
+/// a struct of __stack, __gr_top and __vr_top, then __gr_offs and __vr_offs, 4 bytes each, held as an array
+/// of 4 longs, as a parameter the pointer to it that the struct, being over 16 bytes, is passed as.
+export const vaList: Type = if (arch == "x86_64") new Arr(ULong, 3) else if (aapcs) new Arr(ULong, 4) else new Ptr(Char)
+
+/// The address of the next variadic argument, a t, from the va_list at list, which is taken the way a call
+/// passes it. On x86-64 a scalar comes from the registers saved at reg_save_area while there are any, else
+/// from the stack, and an aggregate as vaAggregate says; on other arm64 as vaRegisters says; on Apple arm64
+/// the list is a char * through 8-byte slots. On arm64 an aggregate that goes in memory comes as a pointer.
+export function vaArg(b: Backend, f: Frame, list: Value, t: Type): Value {
+	if (arch == "x86_64") {
+		return if (t.size <= 8 && !(t instanceof Record)) vaSlot(b, f, list, t.kind == "float") else vaAggregate(b, f, list, t)
+	}
+	if (aapcs) {
+		return vaRegisters(b, f, list, t)
+	}
+	const indirect = inMemory(t)
+	const p = b.load(b.ptr(), list, false)
+	const step = b.constInt(b.int(64), if (indirect) 8 else alignUp(t.size, 8))
+	b.store(b.gep(b.int(8), p, [step]), list, false)
+	return if (indirect) b.load(b.ptr(), p, false) else p
+}
+
+/// An aggregate or __int128 from the x86-64 va_list at list: its eightbytes from the general and float
+/// registers saved at reg_save_area if enough of each are left, else all of it from the stack, aligned.
+function vaAggregate(b: Backend, f: Frame, list: Value, t: Type): Value {
+	const byte = b.int(8)
+	const int32 = b.int(32)
+	const int64 = b.int(64)
+	const at = (off: i32) => b.gep(byte, list, [b.constInt(int64, off)])
+	const sse = eightbytes(t)
+	const [gp, fp] = registers(t)
+	const tmp = f.alloca(t, 0)
+	const regs = f.label()
+	const stack = f.label()
+	const done = f.label()
+	// gp_offset and fp_offset, which end at 48 and 176.
+	const offsets = [b.load(int32, at(0), false), b.load(int32, at(4), false)]
+	const fits = b.binary("and", b.icmp("ule", offsets[0], b.constInt(int32, 48 - 8 * gp)),
+		b.icmp("ule", offsets[1], b.constInt(int32, 176 - 16 * fp)))
+	b.condBr(if (sse.length == 0) b.constInt(b.int(1), 0) else fits, regs, stack)
+	b.at(regs)
+	const save = b.load(b.ptr(), at(16), false)
+	for (const k of 0 ... sse.length - 1) {
+		const c = if (sse[k]) 1 else 0
+		const dst = b.gep(byte, tmp, [b.constInt(int64, 8 * k)])
+		b.copy(dst, b.gep(byte, save, [b.cast("zext", offsets[c], int64)]), min(8, t.size - 8 * k))
+		offsets[c] = b.binary("add", offsets[c], b.constInt(int32, 8 + 8 * c))
+	}
+	b.store(offsets[0], at(0), false)
+	b.store(offsets[1], at(4), false)
+	b.br(done)
+	b.at(stack)
+	const align = max(t.align, 8) as i64
+	const area = b.cast("ptrtoint", b.load(b.ptr(), at(8), false), int64)
+	const up = b.binary("add", area, b.constInt(int64, align - 1))
+	const p = b.cast("inttoptr", b.binary("and", up, b.constInt(int64, -align)), b.ptr())
+	b.copy(tmp, p, t.size)
+	b.store(b.gep(byte, p, [b.constInt(int64, alignUp(t.size, 8))]), at(8), false)
+	b.br(done)
+	b.at(done)
+	return tmp
+}
+
+/// The address of the next variadic eightbyte from the x86-64 va_list at list, a float's or another's:
+/// its offset into the saved registers is gp_offset or fp_offset, which end at 48 and 176.
+function vaSlot(b: Backend, f: Frame, list: Value, fp: bool): Value {
+	const i8 = b.int(8)
+	const i32 = b.int(32)
+	const at = (off: i64) => b.gep(i8, list, [b.constInt(b.int(64), off)])
+	const offset = at(if (fp) 4 else 0)
+	const area = at(8)
+	const n = b.load(i32, offset, false)
+	const slot = f.alloca(new Ptr(Void), 0)
+	const regs = f.label()
+	const stack = f.label()
+	const done = f.label()
+	b.condBr(b.icmp("ult", n, b.constInt(i32, if (fp) 176 else 48)), regs, stack)
+	b.at(regs)
+	b.store(b.gep(i8, b.load(b.ptr(), at(16), false), [b.cast("zext", n, b.int(64))]), slot, false)
+	b.store(b.binary("add", n, b.constInt(i32, if (fp) 16 else 8)), offset, false)
+	b.br(done)
+	b.at(stack)
+	const p = b.load(b.ptr(), area, false)
+	b.store(p, slot, false)
+	b.store(b.gep(i8, p, [b.constInt(b.int(64), 8)]), area, false)
+	b.br(done)
+	b.at(done)
+	return b.load(b.ptr(), slot, false)
+}
+
+/// The address of the next variadic t from the AAPCS64 va_list at list: from the registers saved below
+/// __gr_top or __vr_top, at __gr_offs or __vr_offs, which go up by 8 bytes a general one and 16 a float one,
+/// while the offset stays negative; else from __stack, in 8-byte slots. A float, or an aggregate of up to
+/// four of one float type, takes float registers, one each, whose floats are gathered here; another
+/// aggregate 16-aligned starts at an even general one.
+function vaRegisters(b: Backend, f: Frame, list: Value, t: Type): Value {
+	const byte = b.int(8)
+	const int32 = b.int(32)
+	const int64 = b.int(64)
+	const at = (off: i64) => b.gep(byte, list, [b.constInt(int64, off)])
+	const [size, n] = floats(t)
+	const fp = size > 0 && n <= 4
+	const indirect = inMemory(t)
+	const bytes = if (indirect) 8 else alignUp(t.size, 8)
+	const offset = at(if (fp) 28 else 24)
+	const slot = f.alloca(new Ptr(Void), 0)
+	const left = f.label()
+	const regs = f.label()
+	const stack = f.label()
+	const done = f.label()
+	let off = b.load(int32, offset, false)
+	b.condBr(b.icmp("slt", off, b.constInt(int32, 0)), left, stack)
+	b.at(left)
+	if (!fp && !indirect && t.align == 16) {
+		off = b.binary("and", b.binary("add", off, b.constInt(int32, 15)), b.constInt(int32, -16))
+	}
+	const next = b.binary("add", off, b.constInt(int32, if (fp) 16 * n else bytes))
+	b.store(next, offset, false)
+	b.condBr(b.icmp("sle", next, b.constInt(int32, 0)), regs, stack)
+	b.at(regs)
+	const p = b.gep(byte, b.load(b.ptr(), at(if (fp) 16 else 8), false), [b.cast("sext", off, int64)])
+	if (fp && n > 1) {
+		const tmp = f.alloca(t, 0)
+		for (const k of 0 ... n - 1) {
+			b.copy(b.gep(byte, tmp, [b.constInt(int64, size * k)]), b.gep(byte, p, [b.constInt(int64, 16 * k)]), size)
+		}
+		b.store(tmp, slot, false)
+	} else {
+		b.store(p, slot, false)
+	}
+	b.br(done)
+	b.at(stack)
+	const area = b.cast("ptrtoint", b.load(b.ptr(), at(0), false), int64)
+	const align = if (!indirect && t.align > 8) 16 else 8
+	const up = b.binary("add", area, b.constInt(int64, align - 1))
+	const q = b.cast("inttoptr", b.binary("and", up, b.constInt(int64, -align)), b.ptr())
+	b.store(q, slot, false)
+	b.store(b.gep(byte, q, [b.constInt(int64, bytes)]), at(0), false)
+	b.br(done)
+	b.at(done)
+	const arg = b.load(b.ptr(), slot, false)
+	return if (indirect) b.load(b.ptr(), arg, false) else arg
+}
+
+/// The default argument promotions (C11 6.5.2.2).
+export function promoteArg(t: Type): Type { return if (t.kind == "float") Double else promote(t) }
+
+/// The size of t's float members and their count, if all are floats of one size; else size 0.
+function floats(t: Type): [i32, i32] {
+	if (t.kind == "float") {
+		return [t.size, 1]
+	}
+	if (t instanceof Arr) {
+		const [size, n] = floats(t.base)
+		return [size, n * (t.len ?? 0)]
+	}
+	if (!(t instanceof Record) || t.kind == "union" || t.fields == null) {
+		return [0, 0]
+	}
+	let size = 0
+	let n = 0
+	for (const f of t.fields!) {
+		const [s, k] = floats(f.ty)
+		if (s == 0 || size != 0 && s != size || f.width >= 0) {
+			return [0, 0]
+		}
+		size = s
+		n += k
+	}
+	return [size, n]
+}

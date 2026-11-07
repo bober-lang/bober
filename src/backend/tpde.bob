@@ -1,0 +1,279 @@
+//! TPDE as the Backend (src/backend/backend.bob), through the C API of src/backend/tpde/tpde.h: a fast code
+//! generator without an IR of LLVM's, which compiles each instruction as it comes and so does not optimize. What it
+//! cannot do is thrown as a string, by verify and emit if not at once. A program using it links the C libraries of
+//! bober.pkg.
+
+import { CompileError } from "../error"
+import { Backend, Binary, Block, Cast, Cmp, FCmp, Operand, Type, Unary, Value, codes } from "./backend"
+import * as c from "../../std/c"
+import { withArray, withString } from "../../std/c"
+import {
+	TpdeABISizeOfType, TpdeAShr, TpdeAdd, TpdeAddAttributeAtIndex, TpdeAddExternal, TpdeAddFunction, TpdeAddGlobal, TpdeAnd,
+	TpdeAppendBasicBlock, TpdeArrayType, TpdeBSwap, TpdeBitCast, TpdeBuildAlloca, TpdeBuildAtomicLoad,
+	TpdeBuildAtomicStore, TpdeBuildBinOp, TpdeBuildBr, TpdeBuildCall, TpdeBuildCast, TpdeBuildCondBr,
+	TpdeBuildExtractValue, TpdeBuildFCmp, TpdeBuildFence, TpdeBuildGEP, TpdeBuildICmp, TpdeBuildInsertValue,
+	TpdeBuildInvoke, TpdeBuildLandingPad, TpdeBuildLoad, TpdeBuildRet, TpdeBuildRetVoid, TpdeBuildSelect,
+	TpdeBuildStore, TpdeBuildStructGEP, TpdeBuildSwitch, TpdeBuildTrap, TpdeBuildUnary, TpdeBuildUnreachable,
+	TpdeBuildVaStart, TpdeBuildFrameAddress, TpdeBuildStackAlloc,
+	TpdeConstArray, TpdeConstCast, TpdeConstGEP, TpdeConstInt, TpdeConstIntOfString, TpdeConstNull, TpdeConstReal,
+	TpdeConstRealOfString, TpdeConstString, TpdeConstStruct, TpdeCtlz, TpdeCtpop, TpdeCttz, TpdeDeleteFunction,
+	TpdeDoubleType, TpdeEmitToFile, TpdeFAbs, TpdeFAdd, TpdeFDiv, TpdeFMul, TpdeFNeg, TpdeFPExt, TpdeFPToSI, TpdeFPToUI,
+	TpdeFPTrunc, TpdeFRem, TpdeFSub, TpdeFloatType, TpdeHoldsRef, TpdeLayout, TpdeRefType, TpdeSetCollected,
+	TpdeSetConstant, TpdeSetHidden, TpdeSetSection, TpdeFunctionType, TpdeGetBasicBlockTerminator, TpdeGetInsertBlock,
+	TpdeGetNamedFunction, TpdeGetNamedGlobal, TpdeGetParam, TpdeGetReturnType, TpdeGlobalGetValueType, TpdeIntEQ,
+	TpdeIntNE, TpdeIntSGE, TpdeIntSGT, TpdeIntSLE, TpdeIntSLT, TpdeIntToPtr, TpdeIntType, TpdeIntUGE, TpdeIntUGT,
+	TpdeIntULE, TpdeIntULT, TpdeIsDeclaration, TpdeLShr, TpdeModuleCreate, TpdeMul, TpdeOr, TpdePointerType,
+	TpdePositionAtEnd, TpdePtrToInt, TpdeRealOEQ, TpdeRealOGE, TpdeRealOGT, TpdeRealOLE, TpdeRealOLT, TpdeRealONE,
+	TpdeRealORD, TpdeRealUEQ, TpdeRealUGE, TpdeRealUGT, TpdeRealULE, TpdeRealULT, TpdeRealUNE, TpdeRealUNO, TpdeReplace,
+	TpdeSDiv, TpdeSExt, TpdeSIToFP, TpdeSRem, TpdeSetInlineOnly, TpdeSetPersonalityFn, TpdeSetWeak, TpdeShl, TpdeSizeOf,
+	TpdeStructType, TpdeSub, TpdeTrunc, TpdeTypeOf, TpdeUDiv, TpdeUIToFP, TpdeURem, TpdeVerifyModule, TpdeVoidType,
+	TpdeXor, TpdeZExt,
+} from "tpde/tpde.h"
+import { free } from "stdlib.h"
+
+export class Tpde implements Backend {
+	private m = TpdeModuleCreate()
+
+	/// Like LLVM's, but TPDE has no use for the name, nor any optimizations to choose a level of.
+	constructor(name: string, level: u32 = 2) {}
+
+	void(): Type { return TpdeVoidType(this.m) }
+	int(bits: u32): Type { return TpdeIntType(this.m, bits) }
+	f32(): Type { return TpdeFloatType(this.m) }
+	f64(): Type { return TpdeDoubleType(this.m) }
+	ptr(): Type { return TpdePointerType(this.m) }
+	ref(): Type { return TpdeRefType(this.m) }
+	fn(result: Type, params: Type[]): Type {
+		return withArray(params, p => TpdeFunctionType(this.m, result, p, params.length as u32, 0))
+	}
+	variadic(result: Type, params: Type[]): Type {
+		return withArray(params, p => TpdeFunctionType(this.m, result, p, params.length as u32, 1))
+	}
+	struct(fields: Type[]): Type {
+		return withArray(fields, p => TpdeStructType(this.m, p, fields.length as u32, 0))
+	}
+	array(elem: Type, n: u64): Type { return TpdeArrayType(this.m, elem, n) }
+
+	constInt(t: Type, n: i64): Value { return TpdeConstInt(this.m, t, n as u64) }
+	constFloat(t: Type, x: f64): Value { return TpdeConstReal(this.m, t, x) }
+	constIntOf(t: Type, digits: string, radix: u8): Value {
+		return withString(digits, p => TpdeConstIntOfString(this.m, t, p, radix))
+	}
+	constFloatOf(t: Type, text: string): Value { return withString(text, p => TpdeConstRealOfString(this.m, t, p)) }
+	constZero(t: Type): Value { return TpdeConstNull(this.m, t) }
+	constBytes(s: string): Value {
+		const p = c.toCBytes(s)
+		const v = TpdeConstString(this.m, p, s.length as u64)
+		free(p)
+		return v
+	}
+	constStruct(fields: Value[]): Value {
+		return withArray(fields, p => TpdeConstStruct(this.m, p, fields.length as u32, 0))
+	}
+	constArray(elem: Type, elems: Value[]): Value {
+		return withArray(elems, p => TpdeConstArray(this.m, elem, p, elems.length as u64))
+	}
+	sizeOf(t: Type): Value { return TpdeSizeOf(this.m, t) }
+	bytes(t: Type): u64 { return TpdeABISizeOfType(this.m, t) }
+	constOffset(p: Value, bytes: i64): Value { return TpdeConstGEP(this.m, p, bytes) }
+	constCast(op: Cast, v: Value, to: Type): Value { return TpdeConstCast(this.m, casts.get(op)! as u32, v, to) }
+
+	function(name: string, t: Type, local: bool): Value {
+		const f = this.named(name)
+		return if (f != 0) f else withString(name, p => TpdeAddFunction(this.m, p, t, local as i32))
+	}
+	named(name: string): Value {
+		const f = withString(name, p => TpdeGetNamedFunction(this.m, p))
+		return if (f != 0) f else withString(name, p => TpdeGetNamedGlobal(this.m, p))
+	}
+	global(name: string, init: Value, local: bool, align: u32): Value {
+		return withString(name, p => TpdeAddGlobal(this.m, p, init, local as i32, align))
+	}
+	extern(name: string, t: Type): Value { return withString(name, p => TpdeAddExternal(this.m, p, t)) }
+	attr(fn: Value, index: i32, name: string, t: Type) {
+		withString(name, p => {
+			TpdeAddAttributeAtIndex(this.m, fn, index, p, t)
+			return 0
+		})
+	}
+	allocator(fn: Value) {}
+	constant(init: Value): Value { return withString("", p => TpdeAddGlobal(this.m, p, init, 1, 0)) }
+	literal(name: string, init: Value): Value {
+		const g = withString(name, p => TpdeAddGlobal(this.m, p, init, 0, 0))
+		TpdeSetConstant(this.m, g)
+		this.weak(g)
+		return g
+	}
+	declared(g: Value): bool { return TpdeIsDeclaration(this.m, g) != 0 }
+	isConstant(v: Value): bool { return false }
+	replace(old: Value, by: Value) { TpdeReplace(this.m, old, by) }
+	remove(fn: Value) { TpdeDeleteFunction(this.m, fn) }
+	personality(fn: Value, p: Value) { TpdeSetPersonalityFn(this.m, fn, p) }
+	weak(g: Value) { TpdeSetWeak(this.m, g) }
+	/// Weak, as TPDE does not inline: no caller of g sees its body.
+	overridable(g: Value) { this.weak(g) }
+	hidden(g: Value) { TpdeSetHidden(this.m, g) }
+	alias(g: Value, to: Value): Value { throw new CompileError("aliases are not supported by TPDE") }
+	/// Weak, as TPDE has no common symbols: of several definitions, any one is kept rather than the largest.
+	common(g: Value) { this.weak(g) }
+	param(fn: Value, i: u32): Value { return TpdeGetParam(this.m, fn, i) }
+	typeOf(v: Value): Type { return TpdeTypeOf(this.m, v) }
+	resultOf(t: Type): Type { return TpdeGetReturnType(this.m, t) }
+	valueType(f: Value): Type { return TpdeGlobalGetValueType(this.m, f) }
+
+	block(fn: Value): Block { return TpdeAppendBasicBlock(this.m, fn) }
+	at(b: Block) { TpdePositionAtEnd(this.m, b) }
+	here(): Block { return TpdeGetInsertBlock(this.m) }
+	ended(): bool { return TpdeGetBasicBlockTerminator(this.m, this.here()) != 0 }
+
+	ret(v: Value) { TpdeBuildRet(this.m, v) }
+	retVoid() { TpdeBuildRetVoid(this.m) }
+	br(to: Block) { TpdeBuildBr(this.m, to) }
+	condBr(cond: Value, yes: Block, no: Block) { TpdeBuildCondBr(this.m, cond, yes, no) }
+	unreachable() { TpdeBuildUnreachable(this.m) }
+
+	/// fpow as a call of C's pow or powf.
+	binary(op: Binary, a: Value, b: Value): Value {
+		if (op != "fpow") {
+			return TpdeBuildBinOp(this.m, binaries.get(op)! as u32, a, b)
+		}
+		const t = this.typeOf(a)
+		const f = this.fn(t, [t, t])
+		return this.call(f, this.function(if (this.bytes(t) == 4) "powf" else "pow", f, false), [a, b])
+	}
+	icmp(pred: Cmp, a: Value, b: Value): Value { return TpdeBuildICmp(this.m, cmps.get(pred)! as u32, a, b) }
+	fcmp(pred: FCmp, a: Value, b: Value): Value { return TpdeBuildFCmp(this.m, fcmps.get(pred)! as u32, a, b) }
+	cast(op: Cast, v: Value, to: Type): Value { return TpdeBuildCast(this.m, casts.get(op)! as u32, v, to) }
+	/// Compares and selects, as TPDE has no saturating conversion.
+	saturate(signed: bool, v: Value, to: Type): Value {
+		const ft = this.typeOf(v)
+		const bits = this.bytes(to) * 8
+		let top = 1.0
+		for (const i of 1 ... bits - (if (signed) 1 else 0)) {
+			top *= 2.0
+		}
+		// The least value, and the greatest as its complement: all ones for unsigned.
+		const least: i64 = if (signed) (-1 as i64) << ((bits - 1) as i64) else 0
+		const min = this.constInt(to, least)
+		const max = this.constInt(to, -1 - least)
+		const cut = this.cast(if (signed) "fptosi" else "fptoui", v, to)
+		const low = this.select(this.fcmp("olt", v, this.constFloat(ft, if (signed) -top else 0.0)), min, cut)
+		const high = this.select(this.fcmp("oge", v, this.constFloat(ft, top)), max, low)
+		return this.select(this.fcmp("uno", v, v), this.constZero(to), high)
+	}
+	select(cond: Value, yes: Value, no: Value): Value { return TpdeBuildSelect(this.m, cond, yes, no) }
+	alloca(t: Type, align: u32): Value { return TpdeBuildAlloca(this.m, t, align) }
+	stackAlloc(bytes: Value): Value { return TpdeBuildStackAlloc(this.m, bytes) }
+	load(t: Type, p: Value, volatile: bool): Value { return TpdeBuildLoad(this.m, t, p, volatile as i32) }
+	store(v: Value, p: Value, volatile: bool): Value { return TpdeBuildStore(this.m, v, p, volatile as i32) }
+	invariant(access: Value) {}
+	lifetime(p: Value, live: bool) {}
+	aliasing(access: Value, header: bool) {}
+	field(t: Type, p: Value, i: u32): Value { return TpdeBuildStructGEP(this.m, t, p, i) }
+	gep(t: Type, p: Value, indices: Value[]): Value {
+		return withArray(indices, a => TpdeBuildGEP(this.m, t, p, a, indices.length as u32))
+	}
+	extract(v: Value, i: u32): Value { return TpdeBuildExtractValue(this.m, v, i) }
+	insert(v: Value, e: Value, i: u32): Value { return TpdeBuildInsertValue(this.m, v, e, i) }
+	undef(t: Type): Value { return this.constZero(t) }
+	call(fnType: Type, fn: Value, args: Value[]): Value {
+		return withArray(args, a => TpdeBuildCall(this.m, fnType, fn, a, args.length as u32))
+	}
+	invoke(fnType: Type, fn: Value, args: Value[], then: Block, unwind: Block): Value {
+		return withArray(args, a => TpdeBuildInvoke(this.m, fnType, fn, a, args.length as u32, then, unwind))
+	}
+	landingPad(typeinfo: Value) { TpdeBuildLandingPad(this.m, typeinfo) }
+
+	constPacked(fields: Value[]): Value {
+		return withArray(fields, p => TpdeConstStruct(this.m, p, fields.length as u32, 1))
+	}
+	switch(v: Value, cases: i64[], targets: Block[], otherwise: Block) {
+		const ks: u64[] = []
+		for (const k of cases) {
+			ks.push(k as u64)
+		}
+		withArray(ks, k => withArray(targets, t => TpdeBuildSwitch(this.m, v, k, t, targets.length as u32, otherwise)))
+	}
+	unary(op: Unary, v: Value): Value { return TpdeBuildUnary(this.m, unaries.get(op)! as u32, v) }
+	copy(dst: Value, src: Value, bytes: i64) {
+		const t = this.fn(this.ptr(), [this.ptr(), this.ptr(), this.int(64)])
+		this.call(t, this.function("memcpy", t, false), [dst, src, this.constInt(this.int(64), bytes)])
+	}
+	zero(dst: Value, bytes: i64) {
+		const t = this.fn(this.ptr(), [this.ptr(), this.int(32), this.int(64)])
+		this.call(t, this.function("memset", t, false), [dst, this.constInt(this.int(32), 0),
+			this.constInt(this.int(64), bytes)])
+	}
+	atomicLoad(t: Type, p: Value): Value { return TpdeBuildAtomicLoad(this.m, t, p) }
+	atomicStore(v: Value, p: Value) { TpdeBuildAtomicStore(this.m, v, p) }
+	fence() { TpdeBuildFence(this.m) }
+	trap() { TpdeBuildTrap(this.m) }
+	readable(p: Value, n: Value, align: i64) {}
+	vaStart(ap: Value) { TpdeBuildVaStart(this.m, ap) }
+	frameAddress(): Value { return TpdeBuildFrameAddress(this.m) }
+	blockAddress(fn: Value, b: Block): Value { throw new CompileError("label addresses are not supported by TPDE") }
+	indirectBr(p: Value, targets: Block[]) { throw new CompileError("computed gotos are not supported by TPDE") }
+	asm(text: string, outs: Operand[], ins: Operand[], clobbers: string[]): Value[] { throw new CompileError("inline assembly is not supported by TPDE") }
+	hasAsm(): bool { return false }
+	moduleAsm(text: string) { throw new CompileError("inline assembly is not supported by TPDE") }
+	threadLocal(g: Value) { throw new CompileError("thread-local variables are not supported by TPDE") }
+	inlineOnly(fn: Value) { TpdeSetInlineOnly(this.m, fn) }
+
+	// TPDE keeps no debug information.
+	source(path: string, producer: string) {}
+	debugFunction(fn: Value, line: u32) {}
+	line(n: u32, col: u32) {}
+	debugLocal(name: string, p: Value, t: Type, line: u32) {}
+
+	collected() { TpdeSetCollected(this.m) }
+	holdsRef(t: Type): bool { return TpdeHoldsRef(this.m, t) != 0 }
+	layout(t: Type): Value { return if (this.holdsRef(t)) TpdeLayout(this.m, t) else this.constZero(this.ptr()) }
+	/// Each in section bober_roots, which src/gc.c reads, as the global and its layout.
+	root(g: Value) {
+		const t = this.valueType(g)
+		if (this.holdsRef(t)) {
+			this.collect(this.constStruct([g, this.layout(t)]), "bober_roots")
+		}
+	}
+	described(g: Value) { this.collect(this.constStruct([g]), "bober_types") }
+
+	/// A constant of init in the section, which the run time reads between the bounds the linker defines (src/rt.h).
+	private collect(init: Value, section: string) {
+		const e = this.constant(init)
+		withString(section, p => {
+			TpdeSetSection(this.m, e, p)
+			return 0
+		})
+	}
+	verify() { checked(TpdeVerifyModule(this.m)) }
+	/// Writes the object file; TPDE cannot write assembly.
+	emit(path: string, asm: bool) {
+		if (asm) {
+			throw new CompileError("assembly output is not supported by TPDE")
+		}
+		checked(withString(path, p => TpdeEmitToFile(this.m, p)))
+	}
+}
+
+/// TPDE's codes for the Backend's names.
+const binaries = codes([["add", TpdeAdd], ["sub", TpdeSub], ["mul", TpdeMul], ["udiv", TpdeUDiv], ["sdiv", TpdeSDiv],
+	["urem", TpdeURem], ["srem", TpdeSRem], ["shl", TpdeShl], ["lshr", TpdeLShr], ["ashr", TpdeAShr], ["and", TpdeAnd],
+	["or", TpdeOr], ["xor", TpdeXor], ["fadd", TpdeFAdd], ["fsub", TpdeFSub], ["fmul", TpdeFMul], ["fdiv", TpdeFDiv],
+	["frem", TpdeFRem]])
+const casts = codes([["trunc", TpdeTrunc], ["zext", TpdeZExt], ["sext", TpdeSExt], ["fptoui", TpdeFPToUI],
+	["fptosi", TpdeFPToSI], ["uitofp", TpdeUIToFP], ["sitofp", TpdeSIToFP], ["fptrunc", TpdeFPTrunc],
+	["fpext", TpdeFPExt], ["ptrtoint", TpdePtrToInt], ["inttoptr", TpdeIntToPtr], ["bitcast", TpdeBitCast]])
+const cmps = codes([["eq", TpdeIntEQ], ["ne", TpdeIntNE], ["ugt", TpdeIntUGT], ["uge", TpdeIntUGE], ["ult", TpdeIntULT],
+	["ule", TpdeIntULE], ["sgt", TpdeIntSGT], ["sge", TpdeIntSGE], ["slt", TpdeIntSLT], ["sle", TpdeIntSLE]])
+const fcmps = codes([["oeq", TpdeRealOEQ], ["ogt", TpdeRealOGT], ["oge", TpdeRealOGE], ["olt", TpdeRealOLT],
+	["ole", TpdeRealOLE], ["one", TpdeRealONE], ["ord", TpdeRealORD], ["ueq", TpdeRealUEQ], ["ugt", TpdeRealUGT],
+	["uge", TpdeRealUGE], ["ult", TpdeRealULT], ["ule", TpdeRealULE], ["une", TpdeRealUNE], ["uno", TpdeRealUNO]])
+const unaries = codes([["fneg", TpdeFNeg], ["fabs", TpdeFAbs], ["bswap", TpdeBSwap], ["ctlz", TpdeCtlz],
+	["cttz", TpdeCttz], ["ctpop", TpdeCtpop]])
+
+/// Throws the message at p, unless p is null.
+function checked(p: c.ptr) {
+	if (p != 0) {
+		throw new CompileError(c.fromCString(p))
+	}
+}
