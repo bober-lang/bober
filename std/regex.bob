@@ -1,0 +1,1081 @@
+//! Regular expressions in RE2's syntax, as Go's regexp takes them, matched leftmost-first in time linear in the text.
+//! They match the text's UTF-8 code points, an invalid byte as U+FFFD. Not supported: Unicode classes (\p), \C, and
+//! case folding beyond ASCII but of the Kelvin sign and long s, which fold to k and s.
+//!
+//! A pattern compiles to a program whose jumps are relative, so the parser builds it bottom up by concatenation, and a
+//! repetition copies its operand. As in RE2, a lazy DFA finds where a match ends, one of the reversed pattern where it
+//! starts, and a Pike VM its groups.
+
+import { position } from "./algo"
+import { HashMap } from "./collections/hashmap"
+
+import { a, A, B, b, backslash, caret, colon, comma, d, digit, dollar, dot, isAlphanumeric, isDigit, isHexDigit,
+	isUpper, k, K, lbrace, lbracket, less, lf, lparen, minus, P, pipe, plus, question, rbrace, rbracket, rparen, s, S,
+	star, toLower, underscore, w, x, z, zero } from "./ascii"
+
+import { max, min } from "./math"
+import { ParseError } from "./parse"
+import { sortBy } from "./sort"
+import { codePoint, indexOf, lastCodePoint, occurs, replace, utf8 } from "./string"
+
+const maxRune = 0x10ffff
+/// The code points beyond ASCII that fold to ASCII letters, the Kelvin sign and long s, with each case they fold to.
+const beyond: [i32, i32][] = [[k, 0x212a], [K, 0x212a], [s, 0x17f], [S, 0x17f]]
+/// The most a count of a repetition may be, as in Go.
+const maxRepeat: i32 = 1000
+/// The most instructions a program may have.
+const maxSize = 50000
+/// The most groups may nest, which bounds the depth of the parser's recursion to fit a fiber's stack.
+const maxDepth = 250
+/// The most i32s a DFA's states and their rows may take, 4 MiB, before it drops them all.
+const maxCache: i32 = 1 << 20
+/// The most bytes a match may start with for find to skip to them.
+const rare = 10
+
+export function compile(pattern: string): Regex throws ParseError {
+	const [prog, names] = parse(pattern, false)
+	return new Regex(prog, names, parse(pattern, true)[0])
+}
+
+/// The program of pattern, or of it reversed, and the names of its groups.
+function parse(pattern: string, reverse: bool): [Inst[], string[]] throws ParseError {
+	const p = new Parser(pattern, reverse)
+	const body = p.alt()
+	if (p.i < pattern.length) {
+		throw p.error(p.i)
+	}
+	if (body.length > maxSize) {
+		throw new ParseError("range", 0)
+	}
+	return [[new Inst("save", 0), ...body, new Inst("save", 1), new Inst("match")], p.names]
+}
+
+export class Regex {
+	/// Each capture group's name, "" if it has none; names[0] is the whole match's.
+	names: string[]
+	/// What every match starts with, and whether a match is just it, with no groups, which find finds with indexOf.
+	private prefix: string
+	private literal: bool
+	/// Where a match ends, and where it starts.
+	private forward: Dfa
+	private backward: Dfa
+	private vm: Machine
+
+	constructor(prog: Inst[], names: string[], reversed: Inst[]) {
+		this.names = names
+		const [p, whole] = prefix(prog)
+		this.prefix = p
+		this.literal = whole && names.length == 1
+		// Where a match starts, skipped to: its prefix, else a byte it starts with, where they are few.
+		const first = new bool[](256)
+		const empty = starters(prog, first)
+		const few = first.filter(x => x).length <= rare
+		this.forward = new Dfa(prog, false,
+			if (p != "") (s, i) => indexOf(s, p, i) else if (!empty && few) (s, i) => scan(s, i, first) else null)
+		this.backward = new Dfa(reversed, true, null)
+		this.vm = new Machine(prog, 2 * names.length)
+	}
+
+	test(s: string): bool { return this.find(s) != null }
+
+	/// The leftmost-first match in s at or after from: its start and end, then each group's, -1 for a group that took
+	/// no part.
+	find(s: string, from: i32 = 0): i32[] | null {
+		if (from < 0) {
+			return this.find(s, 0)
+		}
+		if (from > s.length) {
+			return null
+		}
+		if (this.literal) {
+			const i = indexOf(s, this.prefix, from)
+			return if (i < 0) null else [i, i + this.prefix.length]
+		}
+		const end = this.forward.walk(s, from, s.length)
+		if (end < 0) {
+			return null
+		}
+		const start = this.backward.walk(s, end, from)
+		return if (this.names.length == 1) [start, end] else this.vm.run(s, start)
+	}
+
+	/// The matches in s as find gives them, each from where the one before ended, but for an empty one right after
+	/// another.
+	findAll(s: string): i32[][] {
+		const all: i32[][] = []
+		let at = 0
+		let end = -1
+		while (at <= s.length) {
+			const found = this.find(s, at)
+			if (found == null) {
+				break
+			}
+			const empty = found[1] == at
+			if (!empty || found[0] != end) {
+				all.push(found)
+			}
+			at = if (!empty) found[1] else if (at < s.length) codePoint(s, at)[1] else at + 1
+			end = found[1]
+		}
+		return all
+	}
+
+	/// s with each of findAll's matches replaced by with, in which $0 to $9 stand for the text of a group, $<name> for
+	/// that of a named one, and $$ for $. A group that took no part or is not there stands for "".
+	replaceAll(s: string, with: string): string {
+		let out = ""
+		let last = 0
+		for (const found of this.findAll(s)) {
+			out += s.slice(last, found[0])
+			const group = (g: i32) => if (g >= 0 && 2 * g < found.length
+				&& found[2 * g] >= 0) s.slice(found[2 * g], found[2 * g + 1])
+				else ""
+			let i = 0
+			while (i < with.length) {
+				const end = if (occurs(with, i, "$<")) indexOf(with, ">", i) else -1
+				const name = if (end > 0) with.slice(i + 2, end) else ""
+				if (name != "" && word(name)) {
+					out += group(position(this.names, name))
+					i = end + 1
+				} else if (with[i] == dollar && isDigit(with.at(i + 1) ?? 0)) {
+					out += group(with[i + 1] - zero)
+					i += 2
+				} else {
+					out += chr(with[i])
+					i += if (occurs(with, i, "$$")) 2 else 1
+				}
+			}
+			last = found[1]
+		}
+		return out + s.slice(last, s.length)
+	}
+}
+
+type Op = "rune" | "split" | "save" | "assert" | "match"
+
+class Inst {
+	op: Op
+	/// split: where to go, relative to here, x first; save: the capture slot; assert: the escape it is, ^ or $.
+	x: i32
+	y: i32
+	/// rune: the sorted, disjoint inclusive ranges of the code points it takes, as lo, hi pairs.
+	ranges: i32[]
+
+	constructor(op: Op, x: i32 = 0, y: i32 = 0, ranges: i32[] = []) {
+		this.op = op
+		this.x = x
+		this.y = y
+		this.ranges = ranges
+	}
+}
+
+/// The code points of the runes that start prog, past its saves: the text all its matches start with, and whether
+/// they are all of prog. A rune that takes more than one code point ends it, and so do U+FFFD, which an invalid byte
+/// matches too, and a surrogate, whose UTF-8 is invalid.
+function prefix(prog: Inst[]): [string, bool] {
+	let out = ""
+	for (const op of prog) {
+		const r = op.ranges
+		if (op.op == "rune" && r.length == 2 && r[0] == r[1] && r[0] != 0xfffd && (r[0] < 0xd800 || r[0] > 0xdfff)) {
+			out += utf8(r[0])
+		} else if (op.op == "match") {
+			return [out, true]
+		} else if (op.op != "save") {
+			break
+		}
+	}
+	return [out, false]
+}
+
+/// Marks in first the bytes that a match of prog, or of a fragment of one, starts with, past splits, saves and
+/// assertions; whether it can be empty. A code point beyond ASCII marks every byte beyond.
+function starters(prog: Inst[], first: bool[]): bool {
+	const seen = new bool[](prog.length + 1)
+	const stack = [0]
+	let empty = false
+	while (stack.length > 0) {
+		const pc = stack.pop()
+		if (seen[pc]) {
+			continue
+		}
+		seen[pc] = true
+		if (pc == prog.length) {
+			empty = true // at the end of a fragment
+			continue
+		}
+		const op = prog[pc]
+		switch (op.op) {
+			case "split":
+				stack.push(pc + op.x)
+				stack.push(pc + op.y)
+			case "rune":
+				const r = op.ranges
+				for (const k of 0 ... r.length / 2 - 1) {
+					for (const c of r[2 * k] ... min(r[2 * k + 1], 0x7f)) {
+						first[c] = true
+					}
+					if (r[2 * k + 1] >= 0x80) {
+						for (const c of 0x80 ... 0xff) {
+							first[c] = true
+						}
+					}
+				}
+			case "match": empty = true
+			default: stack.push(pc + 1)
+		}
+	}
+	return empty
+}
+
+/// The first index at or after from of a byte in bytes in s, or -1.
+function scan(s: string, from: i32, bytes: bool[]): i32 {
+	let i = from
+	while (i < s.length && !bytes[s[i]]) {
+		i++
+	}
+	return if (i < s.length) i else -1
+}
+
+function rune(ranges: i32[]): Inst { return new Inst("rune", 0, 0, ranges) }
+
+function split(x: i32, y: i32, greedy: bool): Inst {
+	return if (greedy) new Inst("split", x, y) else new Inst("split", y, x)
+}
+
+function jump(x: i32): Inst { return new Inst("split", x, x) }
+
+/// x min to max times, or any number more if max is -1. As in Go, x* is (x+)? where x matches empty, so that it is
+/// not repeated empty, else a loop back to its split.
+function repeat(x: Inst[], min: i32, max: i32, greedy: bool): Inst[] {
+	const n = x.length
+	const out: Inst[] = []
+	for (const _ of 1 ... min) {
+		out.push(...x)
+	}
+	if (max < 0 && min > 0) {
+		return [...out, split(-n, 1, greedy)]
+	}
+	if (max < 0) {
+		const empty = starters(x, new bool[](256))
+		return [split(1, n + 2, greedy), ...x, if (empty) split(-n, 1, greedy) else jump(-n - 1)]
+	}
+	// Each optional x skips the rest: x{0,2} is (xx?)?.
+	for (const k of 1 ... max - min) {
+		out.push(split(1, (max - min - k + 1) * (n + 1), greedy))
+		out.push(...x)
+	}
+	return out
+}
+
+class Parser {
+	s: string
+	i = 0
+	names = [""]
+	/// How many groups it is in.
+	depth = 0
+	/// The flags in effect, of i, m, s and U.
+	flags = ""
+	/// Whether the program it builds matches the text backward: its concatenations and assertions are reversed.
+	reverse: bool
+
+	constructor(s: string, reverse: bool) {
+		this.s = s
+		this.reverse = reverse
+	}
+
+	error(at: i32): ParseError { return new ParseError("syntax", at) }
+
+	eat(c: u8): bool {
+		const ok = this.s.at(this.i) == c
+		if (ok) {
+			this.i++
+		}
+		return ok
+	}
+
+	has(flag: string): bool { return indexOf(this.flags, flag) >= 0 }
+
+	alt(): Inst[] throws ParseError {
+		const branches = [this.cat()]
+		let size = 0
+		while (this.eat(pipe)) {
+			branches.push(this.cat())
+			size += 2
+		}
+		for (const x of branches) {
+			size += x.length
+		}
+		// Each branch but the last is tried first and then jumps past the others.
+		const out: Inst[] = []
+		for (const x of branches) {
+			const last = out.length + x.length == size
+			if (!last) {
+				out.push(split(1, x.length + 2, true))
+			}
+			out.push(...x)
+			if (!last) {
+				out.push(jump(size - out.length))
+			}
+		}
+		return out
+	}
+
+	cat(): Inst[] throws ParseError {
+		const items: Inst[][] = []
+		// Whether the last item takes a repetition: none does after another, or after flags like (?i).
+		let operand = false
+		while (this.i < this.s.length && this.s[this.i] != pipe && this.s[this.i] != rparen) {
+			const at = this.i
+			const q = this.quantifier()
+			const before = items.length
+			if (q != null) {
+				if (!operand) {
+					throw this.error(at)
+				}
+				const [min, max, greedy] = q
+				const x = items.pop()!
+				if (x.length * (if (max < 0) min + 2 else max) > maxSize) {
+					throw new ParseError("range", at)
+				}
+				items.push(repeat(x, min, max, greedy))
+			} else if (occurs(this.s, at, "\\Q")) {
+				const end = indexOf(this.s, "\\E", at)
+				this.i += 2
+				while (this.i < (if (end < 0) this.s.length else end)) {
+					items.push([this.literal(this.char())])
+				}
+				this.i = if (end < 0) this.s.length else end + 2
+			} else {
+				const x = this.atom()
+				if (x != null) {
+					items.push(x)
+				}
+			}
+			operand = q == null && items.length > before
+		}
+		const out: Inst[] = []
+		for (const k of 0 ... items.length - 1) {
+			out.push(...items[if (this.reverse) items.length - 1 - k else k])
+		}
+		return out
+	}
+
+	/// The bounds and greediness of the repetition at i, max -1 for none; null where there is none, as at a { that
+	/// does not start a count, which is a literal.
+	quantifier(): [i32, i32, bool] | null throws ParseError {
+		const at = this.i
+		let min = 0
+		let max = -1
+		if (this.eat(plus)) {
+			min = 1
+		} else if (this.eat(question)) {
+			max = 1
+		} else if (this.eat(lbrace)) {
+			min = this.count()
+			max = if (!this.eat(comma)) min else if (this.s.at(this.i) == rbrace) -1 else this.count()
+			if (min < 0 || max < 0 && this.s[this.i - 1] != comma || !this.eat(rbrace)) {
+				this.i = at
+				return null
+			}
+			if (min > maxRepeat || max > maxRepeat || max >= 0 && max < min) {
+				throw new ParseError("range", at)
+			}
+		} else if (!this.eat(star)) {
+			return null
+		}
+		return [min, max, this.eat(question) == this.has("U")]
+	}
+
+	/// The decimal number at i, at most maxRepeat + 1, or -1 where there is none, as in 01.
+	count(): i32 {
+		const start = this.i
+		let n = 0
+		while (isDigit(this.s.at(this.i) ?? 0)) {
+			n = min(n * 10 + (this.s[this.i] - zero), maxRepeat + 1)
+			this.i++
+		}
+		return if (this.i == start || this.s[start] == zero && this.i > start + 1) -1 else n
+	}
+
+	/// The atom at i, or null for flags like (?i).
+	atom(): Inst[] | null throws ParseError {
+		const at = this.i
+		this.i++
+		switch (this.s[at]) {
+			case lparen: return this.group(at)
+			case lbracket: return [this.class(at)]
+			case dot: return [rune(if (this.has("s")) [0, maxRune] else [0, lf - 1, lf + 1, maxRune])]
+			case caret: return [this.assert(if (this.has("m")) caret else A)]
+			case dollar: return [this.assert(if (this.has("m")) dollar else z)]
+			case backslash:
+				const c = this.s.at(this.i) ?? 0
+				if (c == A || c == z || c == b || c == B) {
+					this.i++
+					return [this.assert(c)]
+				}
+				const perl = this.perl()
+				return [if (perl != null) rune(perl) else this.literal(this.escape(at))]
+			default:
+				this.i = at
+				return [this.literal(this.char())]
+		}
+	}
+
+	literal(c: i32): Inst { return rune(this.folded([c, c])) }
+
+	/// The assertion of the escape kind, whose start and end of text or line swap backward.
+	assert(kind: u8): Inst {
+		const swapped = switch (kind) {
+			case A: z
+			case z: A
+			case caret: dollar
+			case dollar: caret
+			default: kind
+		}
+		return new Inst("assert", if (this.reverse) swapped else kind)
+	}
+
+	/// After a (: a group, or null for the flags it sets for the rest of the enclosing one.
+	group(at: i32): Inst[] | null throws ParseError {
+		const outer = this.flags
+		let capture = true
+		if (this.eat(question)) {
+			if (this.eat(less) || occurs(this.s, this.i, "P<") && this.eat(P) && this.eat(less)) {
+				const end = indexOf(this.s, ">", this.i)
+				const name = if (end < 0) "" else this.s.slice(this.i, end)
+				if (name == "" || position(this.names, name) >= 0 || !word(name)) {
+					throw this.error(at)
+				}
+				this.names.push(name)
+				this.i = end + 1
+			} else {
+				capture = false
+				if (this.setFlags(at)) {
+					return null
+				}
+			}
+		} else {
+			this.names.push("")
+		}
+		const n = this.names.length - 1
+		if (this.depth == maxDepth) {
+			throw new ParseError("range", at)
+		}
+		this.depth++
+		const body = this.alt()
+		if (!this.eat(rparen)) {
+			throw this.error(at)
+		}
+		this.depth--
+		this.flags = outer
+		return if (capture) [new Inst("save", 2 * n), ...body, new Inst("save", 2 * n + 1)] else body
+	}
+
+	/// After (?: the flags up to : or ), and whether it was ).
+	setFlags(at: i32): bool throws ParseError {
+		let on = true
+		let set = false
+		while (true) {
+			const c = this.s.at(this.i) ?? 0
+			this.i++
+			const f = chr(c)
+			if (c != 0 && indexOf("imsU", f) >= 0) {
+				this.flags = replace(this.flags, f, "") + (if (on) f else "")
+				set = true
+			} else if (c == minus && on) {
+				on = false
+				set = false
+			} else if ((c == colon || c == rparen) && (on || set)) {
+				return c == rparen
+			} else {
+				throw this.error(at)
+			}
+		}
+	}
+
+	/// After [: a class, which may hold [:name:] for an ASCII class and [:^name:] for its negation.
+	class(at: i32): Inst throws ParseError {
+		const negated = this.eat(caret)
+		let r: i32[] = []
+		let first = true
+		while (first || !this.eat(rbracket)) {
+			first = false
+			if (this.i >= this.s.length) {
+				throw this.error(at)
+			}
+			const start = this.i
+			if (occurs(this.s, start, "[:")) {
+				const end = indexOf(this.s, ":]", start + 2)
+				if (end > 0) {
+					const negated = this.s[start + 2] == caret
+					const ranges = posix(this.s.slice(start + (if (negated) 3 else 2), end))
+					if (ranges == "") {
+						throw this.error(start)
+					}
+					r.push(...this.named(ranges, negated))
+					this.i = end + 2
+					continue
+				}
+			}
+			if (this.eat(backslash)) {
+				const perl = this.perl()
+				if (perl != null) {
+					r.push(...perl)
+					continue
+				}
+				this.i--
+			}
+			const lo = this.classChar(at)
+			let hi = lo
+			if (this.s.at(this.i) == minus && this.s.at(this.i + 1) != rbracket) {
+				this.i++
+				hi = this.classChar(at)
+				if (hi < lo) {
+					throw this.error(start)
+				}
+			}
+			r.push(...[lo, hi])
+		}
+		r = this.folded(r)
+		return rune(if (negated) negate(r) else r)
+	}
+
+	classChar(at: i32): i32 throws ParseError {
+		if (this.i >= this.s.length) {
+			throw this.error(at)
+		}
+		return if (this.eat(backslash)) this.escape(this.i - 1) else this.char()
+	}
+
+	char(): i32 {
+		const [c, next] = codePoint(this.s, this.i)
+		this.i = next
+		return c as i32
+	}
+
+	/// After a \: the ranges of \d, \s, \w or their negation, or null for another escape.
+	perl(): i32[] | null {
+		const c = this.s.at(this.i) ?? 0
+		const ranges = switch (toLower(c)) {
+			case d: posix("digit")
+			case s: "\t\n\x0c\r  "
+			case w: posix("word")
+			default: ""
+		}
+		if (ranges == "") {
+			return null
+		}
+		this.i++
+		return this.named(ranges, isUpper(c))
+	}
+
+	/// The ranges of a named class, given as pairs of bytes, or of its negation, which under the flag i is of the class
+	/// folded: (?i)[[:^upper:]] takes no ASCII letter.
+	named(ranges: string, negated: bool): i32[] {
+		const r = this.folded(pairs(ranges))
+		return if (negated) negate(r) else r
+	}
+
+	/// After a \: the code point it stands for.
+	escape(at: i32): i32 throws ParseError {
+		const c = this.s.at(this.i) ?? 0
+		this.i++
+		const octal = (ch: u8 | null) => ch != null && ch >= zero && ch <= zero + 7
+		if (octal(c) && (c == zero || octal(this.s.at(this.i)))) {
+			// \0, or a digit then more; a lone \1 to \7 would be a backreference.
+			let v: i32 = c - zero
+			for (const _ of 1 ... 2) {
+				if (octal(this.s.at(this.i))) {
+					v = v * 8 + (this.s[this.i] - zero)
+					this.i++
+				}
+			}
+			return v
+		}
+		if (c == x) {
+			const braced = this.eat(lbrace)
+			let v = 0
+			let n = 0
+			while (isHexDigit(this.s.at(this.i) ?? 0) && (braced || n < 2) && v <= maxRune) {
+				v = v * 16 + digit(this.s[this.i])!
+				this.i++
+				n++
+			}
+			if (n == 0 || !braced && n < 2 || braced && !this.eat(rbrace) || v > maxRune) {
+				throw this.error(at)
+			}
+			return v
+		}
+		const i = indexOf("aftnrv", chr(c))
+		if (c != 0 && i >= 0) {
+			return "\x07\x0c\t\n\r\x0b"[i]
+		}
+		if (c != 0 && c < 0x80 && !isAlphanumeric(c)) {
+			return c
+		}
+		throw this.error(at)
+	}
+
+	/// r normalized, with the other cases of its letters under the flag i: of ASCII letters and of those in beyond.
+	folded(r: i32[]): i32[] {
+		const n = normalize(r)
+		if (!this.has("i")) {
+			return n
+		}
+		const out = [...n]
+		for (const [c, other] of beyond) {
+			if (contains(n, c) || contains(n, other)) {
+				out.push(...[c, c, other, other])
+			}
+		}
+		for (const k of 0 ... n.length / 2 - 1) {
+			for (const [from, to] of [[a, A], [A, a]]) {
+				const lo = max(n[2 * k], from)
+				const hi = min(n[2 * k + 1], from + 25)
+				if (lo <= hi) {
+					out.push(...[lo - from + to, hi - from + to])
+				}
+			}
+		}
+		return normalize(out)
+	}
+}
+
+/// The ranges of a [:name:] class as pairs of bytes, or "".
+function posix(name: string): string {
+	return switch (name) {
+		case "alnum": "09AZaz"
+		case "alpha": "AZaz"
+		case "ascii": "\0\x7f"
+		case "blank": "\t\t  "
+		case "cntrl": "\0\x1f\x7f\x7f"
+		case "digit": "09"
+		case "graph": "!~"
+		case "lower": "az"
+		case "print": " ~"
+		case "punct": "!/:@[`{~"
+		case "space": "\t\r  "
+		case "upper": "AZ"
+		case "word": "09AZ__az"
+		case "xdigit": "09AFaf"
+		default: ""
+	}
+}
+
+function pairs(bytes: string): i32[] {
+	const r: i32[] = []
+	for (const c of bytes) {
+		r.push(c)
+	}
+	return r
+}
+
+function word(name: string): bool {
+	for (const c of name) {
+		if (!isAlphanumeric(c) && c != underscore) {
+			return false
+		}
+	}
+	return true
+}
+
+/// r's ranges sorted, with those that overlap or touch merged.
+function normalize(r: i32[]): i32[] {
+	const ranges: [i32, i32][] = []
+	for (const k of 0 ... r.length / 2 - 1) {
+		ranges.push([r[2 * k], r[2 * k + 1]])
+	}
+	sortBy(ranges, (p, q) => p[0] < q[0])
+	const out: i32[] = []
+	for (const [lo, hi] of ranges) {
+		if (out.length > 0 && lo <= out[out.length - 1] + 1) {
+			out[out.length - 1] = max(out[out.length - 1], hi)
+		} else {
+			out.push(...[lo, hi])
+		}
+	}
+	return out
+}
+
+/// The code points not in r, which is normalized.
+function negate(r: i32[]): i32[] {
+	const out: i32[] = []
+	let next = 0
+	for (const k of 0 ... r.length / 2 - 1) {
+		if (r[2 * k] > next) {
+			out.push(...[next, r[2 * k] - 1])
+		}
+		next = r[2 * k + 1] + 1
+	}
+	if (next <= maxRune) {
+		out.push(...[next, maxRune])
+	}
+	return out
+}
+
+function contains(r: i32[], c: i32): bool {
+	for (const k of 0 ... r.length / 2 - 1) {
+		if (c <= r[2 * k + 1]) {
+			return c >= r[2 * k]
+		}
+	}
+	return false
+}
+
+/// Whether the assertion of the escape op holds between code points of the kinds prev and next.
+function holds(op: i32, prev: i32, next: i32): bool {
+	return switch (op) {
+		case A: prev == edge
+		case z: next == edge
+		case caret: prev <= newline
+		case dollar: next <= newline
+		case b: (prev == wordChar) != (next == wordChar)
+		default: (prev == wordChar) == (next == wordChar)
+	}
+}
+
+/// The kinds of code point that assertions tell apart: none, at an end of the text; a line feed; a word character;
+/// and any other, which kind gives c, a code point or byte, or -1 for none.
+const edge = 0
+const newline = 1
+const wordChar = 2
+
+function kind(c: i64): i32 {
+	return if (c < 0) edge
+		else if (c == lf) newline
+		else if (c < 0x80 && (isAlphanumeric(c as u8) || c == underscore)) wordChar
+		else 3
+}
+
+/// The byte before i in s, and the one at i, -1 at an end.
+function before(s: string, i: i32): i64 { return if (i > 0) s[i - 1] else -1 }
+function after(s: string, i: i32): i64 { return if (i < s.length) s[i] else -1 }
+
+/// A lazy DFA over a program: each of its states is the threads of a step, made at the first step to it, with the
+/// steps over ASCII and over the end of the text cached. Forward, it starts a match anywhere and keeps the
+/// leftmost-first one, to find where that ends; backward, on the program of the reversed pattern, it keeps on for the
+/// longest, to find where it starts.
+///
+/// A state is where its row in table is, plus 1, plus its flags, for walk to step and test them without loading it.
+class Dfa {
+	prog: Inst[]
+	reverse: bool
+	/// Where walk skips to where it is idle, from i: the first place a match may start at, or -1 for none.
+	skip: ((s: string, i: i32) => i32) | null
+	/// Each state by id: the kind of the code point stepped over to it plus its flags matched and dead; then its threads
+	/// in priority order, the instructions to follow, of which prog.length starts a match.
+	states: i32[][] = []
+	ids = new HashMap[i32[], i32]()
+	/// The state each state steps to over each ASCII c, in its row of 129 at c + 1, -1 until made; c is -1 at the end.
+	table: i32[] = []
+	/// The state a walk starts in after a code point of each kind, -1 until made.
+	starts = [-1, -1, -1, -1]
+	/// The i32s its states and their rows in table take.
+	size = 0
+	stack: i32[] = []
+	/// The step each instruction was last followed in, and last added to the next state in.
+	now: i32[]
+	next: i32[]
+	step = 0
+
+	constructor(prog: Inst[], reverse: bool, skip: ((s: string, i: i32) => i32) | null) {
+		this.prog = prog
+		this.reverse = reverse
+		this.skip = skip
+		this.now = new i32[](prog.length + 1)
+		this.next = new i32[](prog.length + 1)
+	}
+
+	/// Where the last match found walking s from at to stop ends, or -1.
+	walk(s: string, at: i32, stop: i32): i32 {
+		const back = this.reverse
+		let st = this.start(kind(if (back) after(s, at) else before(s, at)))
+		let end = -1
+		let i = at
+		let table = this.table
+		while (true) {
+			if (st & idle != 0) {
+				i = this.skip!(s, i)
+				if (i < 0) {
+					return -1
+				}
+				st = this.start(kind(before(s, i)))
+			}
+			st &= row // its flags were heeded
+			// The steps cached to states without flags, in a loop without calls, which the optimizer keeps tight. It reads
+			// the byte stepped over in place, before i backward.
+			let j = 0
+			let c: i64 = 0
+			let t = 0
+			while (true) {
+				j = if (back) i - 1 else i
+				c = if (j >= 0 && j < s.length) s[j] else -1
+				t = if (c < 0x80) table[st + c] else -1
+				if (t < 0 || t >= matched || i == stop) {
+					break
+				}
+				st = t
+				i = if (back) j else j + 1
+			}
+			let next = if (back) j else j + 1
+			if (t < 0) {
+				if (c >= 0x80) {
+					[c, next] = if (back) lastCodePoint(s, i) else codePoint(s, i)
+					if (back && next < stop) {
+						// Begun before the start, from which each byte is U+FFFD forward; at it, only its kind counts.
+						[c, next] = [0xfffd, i - 1]
+					}
+				}
+				t = this.transition(st, c)
+				table = this.table
+			}
+			st = t
+			if (st & matched != 0) {
+				end = i
+			}
+			if (st & dead != 0 || i == stop) {
+				return end
+			}
+			i = next
+		}
+	}
+
+	/// The state a walk starts in, after a code point of kind k.
+	private start(k: i32): i32 {
+		if (this.starts[k] < 0) {
+			this.starts[k] = this.intern([k, if (this.reverse) 0 else this.prog.length])
+		}
+		return this.starts[k]
+	}
+
+	/// The state st steps to over c.
+	private transition(st: i32, c: i64): i32 {
+		const state = this.states[(st & row) / 129]
+		if (this.size >= maxCache) {
+			this.size = 0
+			this.states = []
+			this.ids = new HashMap[i32[], i32]()
+			this.table = []
+			this.starts = [-1, -1, -1, -1]
+			st = this.intern(state)
+		}
+		this.step++
+		const out = [kind(c)]
+		if (this.follow(state, state[0] & row, c, out)) {
+			out[0] |= matched
+		}
+		if (out.length == 1) {
+			out[0] |= dead
+		}
+		const t = this.intern(out)
+		if (c < 0x80) {
+			this.table[(st & row) + c] = t
+		}
+		return t
+	}
+
+	/// Follows the threads of state, where the code point before is of kind prev and the next is c, adding those past c
+	/// to out in priority order; whether one matches here.
+	private follow(state: i32[], prev: i32, c: i64, out: i32[]): bool {
+		const end = this.prog.length
+		// What is left to follow, the next last; end + 1 adds the thread at end, which starts a match.
+		const stack = this.stack
+		for (const k of 1 ... state.length - 1) {
+			stack.push(state[state.length - k])
+		}
+		let m = false
+		while (stack.length > 0) {
+			const pc = stack.pop()
+			if (pc > end) {
+				out.push(end) // a match starting at the next code point
+				continue
+			}
+			if (this.now[pc] == this.step) {
+				continue
+			}
+			this.now[pc] = this.step
+			if (pc == end) {
+				stack.push(end + 1)
+				stack.push(0)
+				continue
+			}
+			const op = this.prog[pc]
+			switch (op.op) {
+				case "split":
+					stack.push(pc + op.y)
+					stack.push(pc + op.x)
+				case "save": stack.push(pc + 1)
+				case "assert": if (holds(op.x, prev, kind(c))) {
+					stack.push(pc + 1)
+				}
+				case "match":
+					m = true
+					// Forward, the threads left would match later in priority.
+					while (!this.reverse && stack.length > 0) {
+						stack.pop()
+					}
+				default:
+					if (contains(op.ranges, c as i32) && this.next[pc + 1] != this.step) {
+						this.next[pc + 1] = this.step
+						out.push(pc + 1)
+					}
+			}
+		}
+		return m
+	}
+
+	private intern(state: i32[]): i32 {
+		const id = this.ids.get(state)
+		if (id != null) {
+			return id
+		}
+		// Idle with only the thread that starts a match, where there is a place to skip to.
+		const quiet = state.length == 2 && state[1] == this.prog.length && this.skip != null
+		const t = this.states.length * 129 + 1 | state[0] & (matched | dead) | (if (quiet) idle else 0)
+		this.states.push(state)
+		this.ids.set(state, t)
+		this.size += state.length + 129
+		for (const _ of 1 ... 129) {
+			this.table.push(-1)
+		}
+		return t
+	}
+}
+
+/// The flags of a Dfa state: that a match ended before the code point stepped over to it; that it has no threads; and
+/// that it is idle.
+const matched = 0x1000000
+const dead = 0x2000000
+const idle = 0x4000000
+/// The bits of a Dfa state below its flags.
+const row = 0xffffff
+
+/// A run of a program over a text: the threads at the current position and at the next, in priority order.
+class Machine {
+	prog: Inst[]
+	text = ""
+	now: Threads
+	next: Threads
+	/// The capture slots of the thread add follows.
+	slots: i32[]
+	/// The step each instruction was last added to next in, so that it is added once a step.
+	seen: i32[]
+	step = 1
+	stack: i32[] = []
+
+	constructor(prog: Inst[], slots: i32) {
+		this.prog = prog
+		this.now = new Threads(prog.length, slots)
+		this.next = new Threads(prog.length, slots)
+		this.slots = new i32[](slots)
+		this.seen = new i32[](prog.length)
+	}
+
+	/// Makes the threads at the next position the current ones.
+	swap() {
+		const t = this.now
+		this.now = this.next
+		this.next = t
+		this.next.n = 0
+		this.step++
+	}
+
+	/// The leftmost-first match in s at start, which there is, with its groups.
+	run(s: string, start: i32): i32[] {
+		this.text = s
+		this.swap() // dropping the threads a run before left
+		for (const k of 0 ... this.slots.length - 1) {
+			this.slots[k] = -1
+		}
+		this.add(0, start)
+		let found: i32[] = []
+		let at = start
+		while (true) {
+			this.swap()
+			if (this.now.n == 0) {
+				return found
+			}
+			// The code point at at, -1 past the end; decoded only beyond ASCII, as a tuple is allocated.
+			let r = after(s, at)
+			let next = at + 1
+			if (r >= 0x80) {
+				[r, next] = codePoint(s, at)
+			}
+			for (const k of 0 ... this.now.n - 1) {
+				const pc = this.now.pcs[k]
+				const op = this.prog[pc]
+				if (op.op == "match") {
+					// The threads after this one would match later in priority.
+					found = this.now.slots.slice(pc * this.slots.length, (pc + 1) * this.slots.length)
+					break
+				}
+				if (contains(op.ranges, r as i32)) {
+					this.load(pc)
+					this.add(pc + 1, next)
+				}
+			}
+			at = next
+		}
+	}
+
+	/// Sets slots to those of the current thread at pc.
+	load(pc: i32) {
+		for (const k of 0 ... this.slots.length - 1) {
+			this.slots[k] = this.now.slots[pc * this.slots.length + k]
+		}
+	}
+
+	/// Adds a thread at start with slots to next, at i in the text, following in priority order the instructions that
+	/// do not take a code point.
+	add(start: i32, i: i32) {
+		// What is left to follow, the next last; -1 - k puts back the value under it in slot k, once the thread a save
+		// set it for is followed.
+		const stack = this.stack
+		stack.push(start)
+		while (stack.length > 0) {
+			const pc = stack.pop()
+			if (pc < 0) {
+				this.slots[-1 - pc] = stack.pop()
+				continue
+			}
+			if (this.seen[pc] == this.step) {
+				continue
+			}
+			this.seen[pc] = this.step
+			const op = this.prog[pc]
+			switch (op.op) {
+				case "split":
+					stack.push(pc + op.y)
+					stack.push(pc + op.x)
+				case "save":
+					stack.push(this.slots[op.x])
+					stack.push(-1 - op.x)
+					this.slots[op.x] = i
+					stack.push(pc + 1)
+				case "assert": if (holds(op.x, kind(before(this.text, i)), kind(after(this.text, i)))) {
+					stack.push(pc + 1)
+				}
+				default:
+					const t = this.next
+					t.pcs[t.n] = pc
+					t.n++
+					for (const k of 0 ... this.slots.length - 1) {
+						t.slots[pc * this.slots.length + k] = this.slots[k]
+					}
+			}
+		}
+	}
+}
+
+/// The threads at a position, in priority order: n instructions in pcs. The capture slots of the thread at pc are at pc
+/// times their number in slots.
+class Threads {
+	pcs: i32[]
+	n = 0
+	slots: i32[]
+
+	constructor(size: i32, slots: i32) {
+		this.pcs = new i32[](size)
+		this.slots = new i32[](size * slots)
+	}
+}
