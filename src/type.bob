@@ -92,8 +92,8 @@ export class Type {
 	/// Whether f holds for each alternative of its underlying type.
 	each(f: (m: Type) => bool): bool { return this.underlying()?.alternatives().every(f) ?? false }
 
-	isNumber(): bool { return this.each(m => m.kind == "int" || m.kind == "float") }
-	isInt(): bool { return this.each(m => m.kind == "int") }
+	isNumber(): bool { return this.each(m => m.kind == "int" || m.kind == "float" || m.kind == "literal" && m.base!.kind == "int") }
+	isInt(): bool { return this.each(m => m.kind == "int" || m.kind == "literal" && m.base!.kind == "int") }
 	isString(): bool { return this.each(m => m.kind == "string" || m.kind == "literal" && m.base!.kind == "string") }
 	isOrdered(): bool { return this.each(m => m.isNumber() || m.isString()) }
 	/// Whether it is an untyped constant's (4.1).
@@ -217,7 +217,7 @@ export class Type {
 			case "function":
 				const r = s.base
 				if (t.kind != "function" || s.types.length < t.types.length || s.n > t.n
-					|| s.rest != t.rest || r != null && !r.fits(t.base!)) {
+					|| s.rest != t.rest || r != null && t.base != null && !r.fits(t.base!)) {
 					return false
 				}
 				for (const i of 0 ... t.types.length - 1) {
@@ -306,8 +306,9 @@ export class Type {
 	/// interface in it with each field's type in the set; an array by elements that fit an array's in it, a fixed array by
 	/// elements that fit those of them with a zero value (§5.1); a tuple by elements that fit a rest tuple's; or by being a
 	/// parameter constrained by a type set within it. On a value of such a parameter's type, an operation is allowed if it
-	/// is allowed, with the same result type, for each type in the set. Arguments to a generic function are inferred from
-	/// its value arguments where not given. Each distinct set of type arguments is a distinct instantiation with its own
+	/// is allowed, with the same result type, for each type in the set; `==`, `!=` and `instanceof` take it as the union
+	/// of the set (§6.5). Arguments to a generic function, or to a generic class in `new`, are inferred from the call's
+	/// value arguments where not given. Each distinct set of type arguments is a distinct instantiation with its own
 	/// layout, so a generic shall not instantiate itself, directly or through other generics, with a type argument that
 	/// strictly contains one of its own type parameters. Static branches and unrolled loops (§4.11) that depend on a type
 	/// parameter are checked for each instantiation. In its own constraint a parameter stands for its argument, and a
@@ -394,7 +395,7 @@ export class Type {
 					this.base!.unify(v.base, params, found)
 				}
 			}
-			default: if (v.kind == this.kind && v.generic == this.generic) {
+			default: if (v.kind == this.kind && (v.generic == this.generic || v.generic == this)) {
 				unifyAll(this.parts(), v.parts(), params, found)
 			}
 		}
@@ -433,13 +434,24 @@ export class Type {
 	static interface(t: Type): Type { return intern({ ...new Type("interface"), base: t }) }
 	/// ## Literal types
 	///
-	/// A string, `true`, `false` or `null` literal in a type denotes the type holding only that value. A literal type fits
-	/// its base type and is stored as it; a union of literals of one base is stored as the base.
+	/// A string, `true`, `false` or `null` literal in a type denotes the type holding only that value, and so does the
+	/// name of a `const` initialized by an integer or string constant (4.1): the value in the const's declared type,
+	/// which the const then has, else in `i32` for an untyped int. A literal type fits its base type and is stored as it;
+	/// a union of literals of one base is stored as the base, and arithmetic on it is the base's. Equal string literals
+	/// are one value, so a value of a string literal type is that value, and `==` and `switch` compare it by identity; a
+	/// string or an integer becomes one only by `as`, which traps if it is none of the type's literals (§6.6).
 	///
 	/// ```
 	/// type Mode = "fast" | "safe"     // stored as a string
 	/// const m: Mode = "fast"
 	/// const n: Mode = "slow"          // error
+	/// const o = flag as Mode          // traps unless flag is "fast" or "safe"
+	/// const End: u8 = 0
+	/// const Block: u8 = 2
+	/// type Op = End | Block           // stored as a u8
+	/// const p: Op = End
+	/// const q = p + 1                 // a u8
+	/// const r = byte as Op            // traps unless byte is 0 or 2
 	/// ```
 	///
 	/// A type used as a value is a literal too, of builtin/type.bob's Type, holding the type in params (4.11).
@@ -498,7 +510,7 @@ export class Type {
 	/// interface or object type under the same rule; nothing fits a class but the class itself.
 	///
 	/// An object type or interface is checked as itself; how its values are held and how member access finds the member
-	/// of the type a value came from is implementation-defined: as the union (§4.4) of the types converted to it in the
+	/// of the type a value came from are implementation-defined: as the union (§4.4) of the types converted to it in the
 	/// program, switching on the tag, or as each value with a table of its type's members. Converted from nothing, it has
 	/// no values. Reflection sees the type as written (§4.11). An object is an 8-byte reference to its fields in
 	/// declaration order.
@@ -597,6 +609,7 @@ export class Field {
 	type: Type
 	/// Whether its members are reachable on the type holding it (5.3).
 	embedded: bool
+	/// Whether it is the type's own, reached by its name, as `C.m`, rather than a value's.
 	static: bool
 
 	constructor(name: string, t: Type, embedded = false, static = false) {
@@ -673,7 +686,7 @@ export function memberOf(s: Type, t: Type): bool {
 
 /// Whether t is a member of ts, in order.
 function among(t: Type, ts: Type[]): bool {
-	const i = lowerBound(ts, t, (a, b) => a.id >= b.id) as i32
+	const i = partitionPoint(ts, s => s.id >= t.id) as i32
 	return i < ts.length && ts[i] == t
 }
 
@@ -748,7 +761,7 @@ function inInterface(s: Type, t: Type): bool {
 function zeros(t: Type): Type { return Type.interface(Type.union((t.underlying() ?? t).alternatives().filter(m => m.hasZero()))) }
 
 /// t with literals as their base types.
-function bases(t: Type): Type {
+export function bases(t: Type): Type {
 	return Type.union(t.alternatives().map(m => if (m.kind == "literal") m.base! else m))
 }
 
@@ -759,8 +772,8 @@ function unifyAll(ps: Type[], vs: Type[], params: Type[], found: (Type | null)[]
 	}
 }
 
-/// Each type made so far, structural ones by their StructuralHasher, and how many there are.
-const made = new HashMap[Type, Type, StructuralHasher]()
+/// Each type made so far, structural ones by their structure, and how many there are.
+const made = new HashMap[Type, Type, Structure]()
 
 let count = -1
 
@@ -777,12 +790,13 @@ function fresh(): i32 {
 	return count
 }
 
-/// The one type of t's StructuralHasher: t if it is the first made.
+/// The one type of t's structure: t if it is the first made.
 function intern(t: Type): Type {
 	const u = made.get(t)
 	if (u != null) {
 		return u
 	}
+	t.text = t.text.copy() // as it outlives the source
 	made.set(t, t)
 	return t
 }
@@ -793,13 +807,14 @@ function internField(f: Field): Field {
 	if (g != null) {
 		return g
 	}
+	f.name = f.name.copy() // as it outlives the source
 	madeFields.set(f, f)
 	return f
 }
 
 /// Hashes and compares types by their fields, each part by identity, as it is made once already; an instance by its
 /// generic and args, as its members are filled in after.
-class StructuralHasher {
+class Structure {
 	static hash(t: Type): u64 {
 		let h = combine(combine(fnv(t.text), t.n), t.generic?.id ?? -1)
 		for (const p of t.parts()) {

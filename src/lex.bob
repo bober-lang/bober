@@ -1,17 +1,40 @@
+//! The lexer: source text into tokens, a token at a time.
+//!
+//! # Lexical elements
+//!
+//! Source is UTF-8. Tokens are formed by longest match. Whitespace is space, tab, CR and LF.
+//!
+//! Grammar notation: `{x}` zero or more, `[x]` optional, `"x"` a token; the lexical rules of §2.3–§2.5 are regular
+//! expressions.
+
 import { lowerBound } from "../std/algo"
 import * from "../std/ascii"
 
+/// ## Identifiers and keywords
+///
+/// ```grammar
+/// Ident = [A-Za-z_$] [A-Za-z0-9_$]*
+/// ```
+///
+/// The keywords are reserved, except as a Key and right after `.` or `?.`, where they are names: `Reserved`'s. These
+/// are keywords only where the grammar expects them, and names everywhere else: `as` right after an expression on the
+/// same line, a modifier before a member's key, `test` starting a statement (so a local `test` cannot start one):
+/// `Contextual`'s.
 export type Keyword = Reserved | Contextual
 
 /// A keyword everywhere but as a key and after . or ?.
 type Reserved = "assert" | "async" | "await" | "break" | "case" | "catch" | "class" | "const" | "continue" | "default"
 	| "else" | "export" | "false" | "finally" | "for" | "function" | "if" | "import" | "instanceof" | "interface" | "let"
-	| "new" | "null" | "return" | "spawn" | "switch" | "test" | "this" | "throw" | "true" | "try" | "type" | "typeof"
+	| "new" | "null" | "return" | "spawn" | "switch" | "this" | "throw" | "true" | "try" | "type" | "typeof"
 	| "while"
 
 /// A keyword only where the parser asks for it; an ident elsewhere.
-export type Contextual = "as" | "extends" | "from" | "implements" | "of" | "private" | "readonly" | "static" | "throws"
+export type Contextual = "as" | "extends" | "from" | "implements" | "of" | "private" | "readonly" | "static" | "test"
+	| "throws"
 
+/// ## Operators and punctuators
+///
+/// They are `Operator`'s members.
 export type Operator = "(" | ")" | "[" | "]" | "{" | "}" | "," | "." | "..." | ";" | ":" | "?." | "??" | "=>" | "=" | "@"
 	| "+=" | "-=" | "*=" | "/=" | "%=" | "**=" | "&=" | "|=" | "^=" | "<<=" | ">>=" | "??=" | "==" | "!=" | "<" | ">"
 	| "<=" | ">=" | "+" | "-" | "*" | "/" | "%" | "**" | "++" | "--" | "<<" | ">>" | "&" | "|" | "^" | "~" | "!" | "&&"
@@ -68,20 +91,20 @@ export class SyntaxError {
 export class Lexer {
 	private src = ""
 	private pos: i32 = 0
-	private tok: Tok
+	/// The token ahead, scanned when first needed.
+	private tok: Tok | null = null
 	private lines: i32[] = []
 	/// The last token taken other than a comment.
 	private last: Kind = ";"
 
-	constructor(src: string) {
-		this.src = src
-		this.tok = this.scan()
-	}
+	constructor(src: string) { this.src = src }
 
 	/// The token ahead, retagged as keyword `want` if it spells that contextual keyword.
-	peek(want: Kind = "ident"): Tok {
-		this.is(this.tok, want)
-		return this.tok
+	peek(want: Kind = "ident"): Tok throws SyntaxError {
+		const t = this.tok ?? this.scan()
+		this.tok = t
+		this.is(t, want)
+		return t
 	}
 
 	/// Whether t is of kind `want`, retagging t first if it spells that contextual keyword.
@@ -92,21 +115,21 @@ export class Lexer {
 		return t.kind == want
 	}
 
-	next(): Tok {
-		const t = this.tok
+	next(): Tok throws SyntaxError {
+		const t = this.peek()
 		if (t.kind != "comment") {
 			this.last = t.kind
 		}
-		this.tok = this.scan()
+		this.tok = null
 		return t
 	}
 
 	/// Takes a } ahead as where a template's text resumes after ${.
-	resume(): Tok {
-		if (this.tok.kind == "}") {
-			const start = this.tok.loc.pos
-			this.pos = start
-			this.tok = new Tok(this.template("templateMid", "templateTail"), Loc.at(start, this.pos - start))
+	resume(): Tok throws SyntaxError {
+		const t = this.peek()
+		if (t.kind == "}") {
+			this.pos = t.loc.pos
+			this.tok = new Tok(this.template("templateMid", "templateTail"), Loc.at(t.loc.pos, this.pos - t.loc.pos))
 		}
 		return this.next()
 	}
@@ -139,6 +162,25 @@ export class Lexer {
 		}
 	}
 
+	/// ## Literals
+	///
+	/// ```grammar
+	/// Int    = "0" | [1-9] [0-9_]* | "0x" [0-9a-fA-F_]+ | "0o" [0-7_]+ | "0b" [01_]+
+	/// Float  = [0-9] [0-9_]* ("." [0-9] [0-9_]*) [Exp] | [0-9] [0-9_]* Exp
+	/// Exp    = [eE] [+-]? [0-9]+
+	/// String = '"' { char | Escape } '"' | "'" { char | Escape } "'"
+	/// Escape = \n \r \t \0 \\ \' \" \` \$ | \x HH | \u{ H..H }
+	/// ```
+	///
+	/// `_` appears only between digits. A decimal Int has no leading zero, and a `.` is surrounded by digits. A String
+	/// fits on one line. `\u{}` takes one to six hex digits up to 10FFFF.
+	///
+	/// ```
+	/// 1_000  0xF_F  0o17  0b1010  1e3  2.5E-1  1_0.2_5     // valid
+	/// 01  0x_1  1e  1.e3  .5  1..2  "\q"                   // invalid
+	/// 'a' == "a"
+	/// "\x41\u{42}" == "AB"
+	/// ```
 	private token(): Tok {
 		const start = this.pos
 		const cur = this.at(0)
@@ -207,6 +249,16 @@ export class Lexer {
 		return kind
 	}
 
+	/// ## Comments
+	///
+	/// ```grammar
+	/// //  comment, to the end of the line
+	/// /// doc comment: documents the next item, or, ending a line, the last item ending on it
+	/// //! module doc: documents the file, allowed only before the first token
+	/// ```
+	///
+	/// A doc comment shall document a File, Test, Function, Class, Interface, Var, TypeAlias, Param or Prop. Its lines
+	/// are Markdown; a heading starts a section of this spec (src/doc.bob).
 	private comment(): Kind {
 		while (this.at(0) != lf && this.at(0) != 0) {
 			this.pos++
@@ -243,6 +295,18 @@ export class Lexer {
 	}
 
 	/// Skips template text after ` or }, through ${ (returning more) or ` (returning done).
+	///
+	/// ## Templates
+	///
+	/// ```grammar
+	/// Template = "`" { char | Escape | "${" Expr "}" } "`"
+	/// ```
+	///
+	/// A template is a string whose `${}` parts are converted as in §6.9, also as a test name. Templates nest.
+	///
+	/// ```
+	/// `a${b}c`   `${`<${b}>`}`   `${"}"}` == "}"   `\${x}` == "${x}"
+	/// ```
 	private template(more: Kind, done: Kind): Kind {
 		this.pos++
 		while (true) {
