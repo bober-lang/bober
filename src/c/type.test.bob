@@ -1,0 +1,68 @@
+import { Arr, Char, Field, Int, Long, Ptr, Record, Type, UInt, ULong, UShort, LayoutError, common, layout, member, volatile } from "./type"
+
+function record(kind: "struct" | "union", members: [string, Type, i32][], pack = 0): Record {
+	const t = new Record(kind)
+	const fields: Field[] = []
+	for (const [name, ty, width] of members) {
+		const f = new Field(name, ty)
+		f.width = width
+		fields.push(f)
+	}
+	layout(t, fields, pack)
+	return t
+}
+
+test "members align as clang lays them out" {
+	const b = record("struct", [["x", Int, 3], ["y", UInt, 5], ["z", Char, -1], ["w", Int, 20]])
+	assert b.size == 8 && b.align == 4
+	assert member(b, "y")!.shift == 3 && member(b, "z")!.off == 1
+	assert member(b, "w")!.off == 4 && member(b, "w")!.shift == 0
+	const p = record("struct", [["a", Char, -1], ["b", Int, -1]], 1)
+	assert p.size == 5 && p.align == 1 && member(p, "b")!.off == 1
+	const q = record("struct", [["a", Char, -1], ["b", Int, 24]], 1)
+	assert q.size == 4 && member(q, "b")!.shift == 8
+	let msg = ""
+	try {
+		record("struct", [["a", Char, -1], ["b", Int, 30]], 1)
+	} catch (e: LayoutError) {
+		msg = e.msg
+	}
+	assert msg == "packed bitfield across its unit"
+	const u = record("union", [["c", new Arr(Char, 5), -1], ["i", Int, -1]])
+	assert u.size == 8 && u.align == 4
+}
+
+test "zero-width and unnamed bitfields" {
+	const z = record("struct", [["a", Char, -1], ["", Int, 0], ["b", Char, -1]])
+	assert z.size == 5 && member(z, "b")!.off == 4
+	const n = record("struct", [["a", Char, -1], ["", Long, 4], ["b", Char, -1]])
+	assert n.size == 3 && n.align == 1 && member(n, "b")!.off == 2
+}
+
+test "anonymous members are looked through" {
+	const inner = record("union", [["x", Int, -1], ["y", Char, -1]])
+	const outer = record("struct", [["a", Long, -1], ["", inner, -1]])
+	assert member(outer, "y")!.off == 8 && member(outer, "q") == null
+	let msg = ""
+	try {
+		record("struct", [["y", Int, -1], ["", inner, -1]])
+	} catch (e: LayoutError) {
+		msg = e.msg
+	}
+	assert msg == "duplicate member y"
+}
+
+test "usual arithmetic conversions" {
+	assert common(Char, UShort) == Int
+	assert common(Int, UInt) == UInt
+	assert common(UInt, Long) == Long
+	assert common(Long, ULong) == ULong
+}
+
+test "a volatile struct is completed with its tag" {
+	const t = new Record("struct")
+	const v = volatile(t)
+	layout(t, [new Field("x", Int)], 0, 8)
+	assert v instanceof Record && v.volatile && volatile(t) == v
+	assert v.size == 8 && v.align == 8 && member(v, "x") != null
+}

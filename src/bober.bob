@@ -1,5 +1,6 @@
-//! bober, the compiler's driver. Paths are relative to the directory it runs in, the repo's. It runs as build/bober, built
-//! by itself or bootstrapped by build/boot (boot/README.md).
+//! bober, the compiler's driver. Paths are relative to the directory it runs in; its own files are in its root
+//! (src/root.bob). It runs as build/bober, built by itself or bootstrapped by build/boot (boot/README.md), or as the
+//! bin/bober of the package dist.sh makes.
 //!
 //! # Introduction
 //!
@@ -17,26 +18,28 @@ import { fromCString } from "../std/c"
 import { Keys, Rest, Unknown, decode as decodeJson, encode, quoted } from "../std/encoding/json"
 import { decode } from "../std/encoding/optarg"
 import { exists, glob, mkdirAll, open, readFile, remove, removeAll, rename, stat } from "../std/fs"
-import { dir as parent, join, rel } from "../std/fs/path"
+import { dir as parent, isAbs, join, rel } from "../std/fs/path"
 import { fnv } from "../std/hash"
 import { IoError } from "../std/io"
-import { arch } from "../std/os"
+import { os } from "../std/os"
 import { ParseError } from "../std/parse"
 import { write } from "./bc/file"
 import { Program } from "./bc/program"
 import { show } from "./bc/show"
-import { glue, includesOf } from "./c/bind"
+import { glue, includesOf, sysroot } from "./c/bind"
+import { link, object } from "./c/bobcc"
 import { doc } from "./doc"
 import { Facts, emit, learn } from "./emit"
 import { Flags, check, normal } from "./check"
 import { CompileError } from "./error"
 import { formatFile } from "./format"
 import { Backend } from "./backend/backend"
-import { LLVM } from "./backend/llvm"
+import { LLVM, triple } from "./backend/llvm"
 import { Tpde } from "./backend/tpde"
 import { lower } from "./lower"
 import { serve } from "./lsp"
 import { mono } from "./mono"
+import { root } from "./root"
 import { CLib, Package, load, nearest, out } from "./pkg"
 import * as process from "../std/process"
 import { getcwd } from "unistd.h"
@@ -57,34 +60,23 @@ as lowered: a generic's code takes its type args' descriptors.`
 
 const dir = "build"
 
-const triple = `${if (arch == "arm64") "aarch64" else arch}-linux-musl`
+/// Links the objects and linker options args into the executable out by bobcc's link, with libc++ for C++ libraries:
+/// folding identical code, with a build ID on ELF (compilerId); throws a CompileError if it fails.
+export function ld(args: string[], out: string) {
+	const flags = if (os == "macos") ["-lc++"] else ["--build-id", "-lc++", "-lc++abi"]
+	if (link(sysroot, ["--icf=all", ...args, ...flags], out) != 0) {
+		throw new CompileError(`cannot link ${out}`)
+	}
+}
 
-/// The flags of the system's clang for the target, with the musl sysroot of src/backend/llvm/Makefile.
-const target = [`--target=${triple}`, "--sysroot=build/musl"]
-
-export const cc = ["clang", ...target]
-
-/// How cc compiles C++ with the sysroot at root: with its libc++'s headers, not those of clang's own, which it finds
-/// first.
-const cxx = (root: string) => `-stdlib++-isystem${root}/usr/include/c++/v1`
-
-/// How cc links a static executable: with compiler-rt's builtins, libunwind and libc++.
-const static = ["-static", "-fuse-ld=lld", "-rtlib=compiler-rt", "-unwindlib=libunwind", "-stdlib=libc++"]
-
-/// cc as the linker of a static executable, as clang++ to link the C++ runtime when C++ code needs it, dropping unused
-/// sections and folding identical ones, but for the collector's (src/rt.ld), with a build ID (compilerId).
-export const ld = ["clang++", ...target, ...static, "-Wl,--gc-sections,--icf=all,--build-id,-T,src/rt.ld"]
-
-/// The CMake toolchain file of the target, for cc and ld with the sysroot at root.
-const toolchain = (root: string) => `set(CMAKE_C_COMPILER clang)
-set(CMAKE_CXX_COMPILER clang++)
-set(CMAKE_C_COMPILER_TARGET ${triple})
+/// The CMake toolchain file of C library c, built in cwd: bober's defaults for the target, its triple, the sysroot and on
+/// ELF static executables, with the compilers CMake finds, then c's toolchain file, which may override them.
+const toolchain = (c: CLib, cwd: string) => `set(CMAKE_C_COMPILER_TARGET ${triple})
 set(CMAKE_CXX_COMPILER_TARGET ${triple})
 set(CMAKE_ASM_COMPILER_TARGET ${triple})
-set(CMAKE_SYSROOT "${root}")
-set(CMAKE_CXX_FLAGS_INIT "${cxx(root)}")
-set(CMAKE_EXE_LINKER_FLAGS_INIT "${static.join(" ")}")
-`
+${if (os == "macos") `set(CMAKE_OSX_SYSROOT "${sysroot}")` else `set(CMAKE_SYSROOT "${if (isAbs(sysroot)) "" else cwd + "/"}${sysroot}")
+set(CMAKE_EXE_LINKER_FLAGS_INIT "-static")`}
+${if (c.toolchain == "") "" else `include("${cwd}/${c.toolchain}")\n`}`
 
 function main(): i32 {
 	const argv = args()
@@ -161,7 +153,7 @@ function command(cmd: string, f: Flags): i32 {
 	return 2
 }
 
-/// The hash of the compiler's build ID, a hash of its content that ld has the linker put in its first page.
+/// The hash of the compiler's build ID, a hash of its content that ld puts in its first page.
 function compilerId(): u64 throws IoError {
 	const f = open("/proc/self/exe")
 	const page = f.read(4096) ?? ""
@@ -170,10 +162,10 @@ function compilerId(): u64 throws IoError {
 	return fnv(page.slice(i + 8, i + 8 + page[i - 4]))
 }
 
-/// Compiles the program of main into the executable exe, linked with the link args: each module once by TPDE, fast to
-/// compile, or if release all as one, monomorphized, by LLVM at -O2; throws the errors, or what failed, as a CompileError
-/// or IoError.
-export function build(main: string, exe: string, tests: bool, link: string[] = [], includes: string[] = [],
+/// Compiles the program of main into the executable exe, linked with the linker options args: each module once by
+/// TPDE, fast to compile, or if release all as one, monomorphized, by LLVM at -O2; throws the errors, or what failed,
+/// as a CompileError or IoError.
+export function build(main: string, exe: string, tests: bool, args: string[] = [], includes: string[] = [],
 	release = false) {
 	const home = nearest(main)
 	if (home != null) {
@@ -245,37 +237,37 @@ export function build(main: string, exe: string, tests: bool, link: string[] = [
 			}
 		}
 	}
-	run([...ld, ...objects, ...runtime(dir), ...libs, ...link, "-o", exe])
+	ld([...objects, ...runtime(dir), ...libs, ...args], exe)
 }
 
-/// The run time's objects, src/rt.c's, src/gc.c's, src/fiber.c's, src/io.c's and src/type.c's, compiled at -O2 into out
-/// where older than their source or src/rt.h.
+/// The run time's objects, src/rt.c's, src/gc.c's, src/fiber.c's, src/io.c's and src/type.c's of bober's root, compiled
+/// by bobcc into out where older than their source or src/rt.h.
 export function runtime(out: string): string[] {
 	const objects: string[] = []
 	for (const c of ["rt", "gc", "fiber", "io", "type"]) {
 		const o = `${out}/${c}.c.o` // not a program's, out/<name>.o
-		if (!newer(o, [`src/${c}.c`, "src/rt.h"])) {
-			run([...cc, "-c", "-fexceptions", "-O2", `src/${c}.c`, "-o", o])
+		const src = join(root, `src/${c}.c`)
+		if (!newer(o, [src, join(root, "src/rt.h")])) {
+			object(sysroot, src, o, [])
 		}
 		objects.push(o)
 	}
 	return objects
 }
 
-/// The archive out.a of c's sources, each compiled at -O2 into out, with c's private headers and those of includes,
-/// where older than it, or all where pkg, its bober.pkg, or a header of c's is newer than the archive. C++ is C++20.
+/// The archive out.a of c's sources, each compiled into out, with c's private headers and those of includes, where
+/// older than it, or all where pkg, its bober.pkg, or a header of c's is newer than the archive, by bobcc.
 function archive(c: CLib, out: string, pkg: string, includes: string[]): string {
 	const a = `${out}.a`
 	const skip = globs(c.exclude)
 	const all = !newer(a, [pkg, ...globs([...c.include, ...c.private].map(d => `${d}/**/*.h`))])
-	const flags = [...[...c.private, ...includes].map(d => `-I${d}`), ...c.defines.map(e => `-D${e[0]}=${e[1]}`)]
+	const dirs = [...c.private, ...includes]
 	const objects: string[] = []
 	for (const s of globs(c.sources).filter(s => !skip.includes(s))) {
 		const o = `${out}/${rel(c.src as string, s)!}.o`
 		if (all || !newer(o, [s])) {
 			mkdirAll(parent(o))
-			const std: string[] = if (endsWith(s, ".cpp")) ["-std=c++20", cxx("build/musl")] else []
-			run([...cc, "-c", "-O2", ...std, ...flags, s, "-o", o])
+			object(sysroot, s, o, dirs, c.defines)
 		}
 		objects.push(o)
 	}
@@ -289,16 +281,26 @@ function archive(c: CLib, out: string, pkg: string, includes: string[]): string 
 }
 
 /// Builds and installs each CMake project of p into its out, listing the static libraries it installs in out/libs,
-/// unless its entry in p, its patches and the toolchain are what they were last: its src, copied or fetched with its
-/// hash checked to out/src, patched, and configured afresh with its preset "bober" and the target's toolchain file,
-/// finding those of p before it, in out/build, which is kept, as the archive fetched.
+/// unless its entry in p, its patches and toolchain files are what they were last, and it was built after those of p
+/// before it and the files of its src if a directory: its src, copied or fetched with its hash checked to out/src,
+/// patched, and configured afresh with its preset "bober" and toolchain file, finding those of p before it, in
+/// out/build, which is kept, as the archive fetched.
 function cmake(p: Package) {
 	const cwd = fromCString(getcwd(0, 0))
-	const tools = toolchain(`${cwd}/build/musl`)
+	const before: string[] = []
 	for (const [name, c] of p.c) {
+		if (c.cmake.version == 0) {
+			continue
+		}
 		const o = out(p.name, name)
-		const entry = encode(c.src) + encode(c.cmake) + c.patches.map(x => readFile(x)).join("") + tools
-		if (c.cmake.version == 0 || exists(`${o}/stamp`) && readFile(`${o}/stamp`) == entry) {
+		const tools = toolchain(c, cwd)
+		const entry = encode(c.src) + encode(c.cmake) + c.patches.map(x => readFile(x)).join("")
+			+ (if (c.toolchain == "") "" else readFile(c.toolchain)) + tools
+		const src = c.src
+		const inputs = [...before.map(b => `${b}/stamp`), ...(if (src instanceof string) glob(`${src}/**/*`) else [])]
+		const prefixes = before.map(b => `${cwd}/${b}`).join(";")
+		before.push(o)
+		if (newer(`${o}/stamp`, inputs) && readFile(`${o}/stamp`) == entry) {
 			continue
 		}
 		let root = `${o}/src`
@@ -306,7 +308,6 @@ function cmake(p: Package) {
 			removeAll(root)
 		}
 		mkdirAll(o)
-		const src = c.src
 		if (src instanceof string) {
 			run(["cmake", "-E", "copy_directory", src, root])
 		} else {
@@ -326,11 +327,11 @@ file(ARCHIVE_EXTRACT INPUT "${o}/src.tar" DESTINATION "${o}/fetch")`)
 		const preset = [...c.cmake.fields.map(e => `${quoted(e[0])}:${e[1]}`), `"name":"bober"`, `"generator":"Ninja"`]
 		save(`${root}/CMakeUserPresets.json`,
 			`{"version":${c.cmake.version},"configurePresets":[{${preset.join(",")}}]}`)
-		save(`${dir}/${triple}.cmake`, tools)
+		save(`${o}/toolchain.cmake`, tools)
 		mkdirAll(`${o}/build/.cmake/api/v1/query`)
 		save(`${o}/build/.cmake/api/v1/query/codemodel-v2`, "")
 		run(["cmake", "-S", root, "-B", `${o}/build`, "--fresh", "--preset", "bober", "--toolchain",
-			`${cwd}/${dir}/${triple}.cmake`, `-DCMAKE_PREFIX_PATH=${cwd}/${out(p.name, "")}`])
+			`${cwd}/${o}/toolchain.cmake`, `-DCMAKE_PREFIX_PATH=${prefixes}`])
 		run(["cmake", "--build", `${o}/build`])
 		run(["cmake", "--install", `${o}/build`, "--prefix", o])
 		save(`${o}/libs`, installed(`${o}/build`).join("\n"))
@@ -404,7 +405,7 @@ function glued(p: Program, m: i32, includes: string[]): string | null {
 	}
 	const f = file(path)
 	save(`${f}.c`, c)
-	run([...cc, "-c", "-iquote", ".", ...includes.map(d => `-I${d}`), `${f}.c`, "-o", `${f}.c.o`])
+	object(sysroot, `${f}.c`, `${f}.c.o`, [".", ...includes])
 	return `${f}.c.o`
 }
 
@@ -423,13 +424,13 @@ function name(main: string): string {
 	return n.slice(i, n.length)
 }
 
-/// Where the files of the module at path go, without extension: its path in the build directory, each / a _. A C
-/// header's module is named by its path and the names imported from it, which would be too long a file name, so they
-/// are hashed instead.
+/// Where the files of the module at path go, without extension: its path in the build directory, each / a _, relative to
+/// bober's root if in it. A C header's module is named by its path and the names imported from it, which would be too
+/// long a file name, so they are hashed instead.
 function file(path: string): string {
 	const space = indexOf(path, " ")
 	let s = ""
-	for (const c of if (space < 0) path else path.slice(0, space)) {
+	for (const c of rel(root, if (space < 0) path else path.slice(0, space)) ?? path) {
 		s += if (c == 0x2f) "_" else chr(c)
 	}
 	if (space >= 0) {

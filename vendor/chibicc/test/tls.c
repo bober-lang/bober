@@ -1,5 +1,4 @@
 #include "test.h"
-#include <stdio.h>
 #include <pthread.h>
 
 _Thread_local int v1;

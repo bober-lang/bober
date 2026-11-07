@@ -17,6 +17,16 @@ function compile(src: string): string {
 	return m.text()
 }
 
+/// The error compiling src stops at, "" for none.
+function error(src: string): string {
+	try {
+		compile(src)
+	} catch (e: CError) {
+		return e.where()
+	}
+	return ""
+}
+
 /// Whether a line of the module, its indentation aside, starts with prefix.
 function has(ir: string, prefix: string): bool { return split(ir, "\n").some(l => startsWith(trim(l), prefix)) }
 
@@ -99,6 +109,32 @@ test "asm statements become inline asm; a + operand is also an input, tied to it
 		+ "(i64 %6, i32 %7)")
 }
 
+test "asm operands may be named, as %[name] or with a modifier as %w[name]" {
+	const ir = compile("int f(int x, long y) { __asm__(\"add %w[x], %w[x], %w[y] // %%[x]\" : [x] \"+r\"(x) : [y] \"r\"(y)); return x; }")
+	assert has(ir, "%8 = call i32 asm sideeffect \"add ${0:w}, ${0:w}, ${1:w} // %[x]\", \"=r,r,0\"(i64 %6, i32 %7)")
+}
+
+test "file-scope asm goes to the module as is" {
+	const ir = compile("__asm__(\".globl f\\nf: ret %x0\"); int g(void);")
+	assert has(ir, "module asm") && has(ir, "\".globl f\"") && has(ir, "\"f: ret %x0\"")
+}
+
+test "a weak definition is one another module may override, also if a declaration said so" {
+	const ir = compile("int __attribute__((weak)) f(void) { return 0; } int g(void) __attribute__((weak)); int g(void) { return 1; } __attribute__((weak)) int x;")
+	assert has(ir, "define weak i32 @f()")
+	assert has(ir, "define weak i32 @g()")
+	assert has(ir, "@x = weak global")
+}
+
+test "an alias is another name of a function, global or alias defined in the unit, static if it is" {
+	const ir = compile("static int f(void) { return 1; } extern __typeof__(f) g __attribute__((weak, alias(\"f\"))); static int h(void) __attribute__((alias(\"f\"))); int x; extern int y __attribute__((alias(\"x\"))); extern int z __attribute__((alias(\"y\")));")
+	assert has(ir, "@g = weak alias i32 (), ptr @f")
+	assert has(ir, "@h = internal alias i32 (), ptr @f")
+	assert has(ir, "@y = alias [4 x i8], ptr @x")
+	assert has(ir, "@z = alias [4 x i8], ptr @y")
+	assert error("int f(void); int g(void) __attribute__((alias(\"f\")));") == "t.c:1:47: \"f\" is not defined here"
+}
+
 test "the asm constraint g, any operand, is a register" {
 	const ir = compile("void f(int x) { __asm__(\"\" : \"+g\"(x) : \"g\"(x)); }")
 	assert has(ir, "%6 = call i32 asm sideeffect \"\", \"=r,r,0\"(i32 %4, i32 %5)")
@@ -106,8 +142,9 @@ test "the asm constraint g, any operand, is a register" {
 
 test "a K&R definition types its parameters by the declarations before its body, a float as a double" {
 	const ir = compile("int f(a, b, c) char b; float c; { return a + b; } int g(void) { return f(1, 2, 3); }")
-	assert has(ir, "define i32 @f(i32 %0, i8 signext %1, double %2)")
-	assert has(ir, "%2 = call i32 @f(i32 1, i8 signext 2, double 3.000000e+00)")
+	const ext = if (aapcs) "" else "signext "
+	assert has(ir, `define i32 @f(i32 %0, i8 ${ext}%1, double %2)`)
+	assert has(ir, `%2 = call i32 @f(i32 1, i8 ${ext}2, double 3.000000e+00)`)
 }
 
 test "C23 attributes are read as GNU's, before a declaration or a statement" {
@@ -221,8 +258,39 @@ test "a parameter is in scope for the rest of its list, where an array length ma
 	assert msg == "t.c:1:23: expected an integer constant"
 }
 
+test "a label is defined once in its function; in code that is not run, labels and gotos are of no consequence" {
+	assert error("int f(void) { goto l; }") == "t.c:1:20: undefined label l"
+	assert error("int f(void) { l: l: return 0; }") == "t.c:1:18: duplicate label l"
+	assert error("int f(void *p) { int n = sizeof(({ l: goto *p; goto m; 1; })); goto l; l: return n; }") == ""
+}
+
+// Configure scripts probe types with code that must fail to compile, as Tcl's does with case (sizeof(long long) == 8).
+test "a switch's cases differ, and a local's type is complete" {
+	assert error("void f(int x) { switch (x) { case 1: case 2 - 1: ; } }") == "t.c:1:38: duplicate case value"
+	assert error("void f(int x) { switch (x) { default: default: ; } }") == "t.c:1:39: multiple default labels in one switch"
+	assert error("struct s; void f(void) { struct s v; }") == "t.c:1:36: v has an incomplete type"
+	assert error("struct s; void f(void) { extern struct s v; struct s *p; }") == ""
+	assert error("struct s; void f(void) { struct s v[2]; }") == "t.c:1:39: v has an incomplete type"
+}
+
+test "a declaration agrees with the others of its name, and a call with its prototype" {
+	assert error("extern int a[]; int a[3]; int f(); int f(int x) { return x; } int x; int x = 1; int g(void) { return f(1); }") == ""
+	assert error("int f(void); long *f(void);") == "t.c:1:27: conflicting types for f"
+	assert error("int x = 1; int x = 2;") == "t.c:1:20: redefinition of x"
+	assert error("char a[1 - 2 * (sizeof(int) == 4)];") == "t.c:1:8: array size is negative"
+	assert error("int g(int, int); int f(void) { return g(1); }") == "t.c:1:40: too few arguments to the function"
+	assert error("int g(int); int f(void) { return g(1, 2); }") == "t.c:1:35: too many arguments to the function"
+}
+
 test "an ignored attribute warns once, where it is first seen" {
-	const p = new Parser(new Lexer(new File("t.c", "__attribute__((cold)) void f(void);\n[[gnu::__cold__]] void g(void);")), new Nothing())
+	const p = new Parser(new Lexer(new File("t.c", "__attribute__((constructor)) void f(void);\n[[gnu::__constructor__]] void g(void);")), new Nothing())
 	p.unit()
-	assert p.warnings.length == 1 && p.warnings[0].where() == "t.c:1:16: ignored attribute cold"
+	assert p.warnings.length == 1 && p.warnings[0].where() == "t.c:1:16: ignored attribute constructor"
+}
+
+test "a function has the attributes of all its declarations; a hidden one is not exported" {
+	const ir = compile("_Noreturn void f(void); void f(void) __attribute__((cold)); [[noreturn]] void f(void) { for (;;); }\n__attribute__((const, format(printf, 1, 2))) int g(const char *, ...); __attribute__((visibility(\"hidden\"))) int x;")
+	assert has(ir, "define void @f() #0 {") && has(ir, "attributes #0 = { cold noreturn \"frame-pointer\"=\"all\" }")
+	assert has(ir, "declare i32 @g(ptr, ...) #1") && has(ir, "attributes #1 = { \"frame-pointer\"=\"all\" }")
+	assert has(ir, "@x = hidden global")
 }

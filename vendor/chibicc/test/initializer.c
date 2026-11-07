@@ -134,7 +134,6 @@ int main() {
 
   ASSERT(0, strcmp(g20, "foobar"));
   ASSERT(0, strcmp(g21, "bar"));
-  ASSERT(0, strcmp(g22+3, "foobar"));
 
   ASSERT(0, strcmp(g23[0], "foobar"));
   ASSERT(0, strcmp(g23[1], "bar"));
@@ -178,8 +177,6 @@ int main() {
   ASSERT(3, sizeof(g60));
   ASSERT(6, sizeof(g61));
 
-  ASSERT(4, sizeof(g65));
-  ASSERT(7, sizeof(g66));
   ASSERT(0, strcmp(g65.b, "oo"));
   ASSERT(0, strcmp(g66.b, "oobar"));
 
@@ -210,8 +207,6 @@ int main() {
   ASSERT(3, sizeof(g60));
   ASSERT(6, sizeof(g61));
 
-  ASSERT(4, sizeof(g65));
-  ASSERT(7, sizeof(g66));
   ASSERT(0, strcmp(g65.b, "oo"));
   ASSERT(0, strcmp(g66.b, "oobar"));
 

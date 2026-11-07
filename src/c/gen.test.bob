@@ -1,0 +1,40 @@
+import { Nothing } from "../backend/backend"
+import { Gen, Val, float, global, int } from "./gen"
+import { Bool, Char, Double, Float, Int, Long, Ptr, UChar, UInt, UInt128, ULong, wrap } from "./type"
+
+const g = new Gen(new Nothing())
+
+function fold(op: string, a: Val, b: Val): i64 { return g.binary(op, a, b).n }
+
+test "constants wrap to their type" {
+	assert wrap(300, UChar) == 44 && wrap(200, Char) == -56
+	assert wrap(-1, UInt) == 4294967295 && wrap(5, Bool) == 1
+	assert wrap(-1, UInt128) == -1
+}
+
+test "arithmetic folds by the usual conversions" {
+	assert fold("+", int(2147483647, Int), int(1, Int)) == -2147483648
+	assert fold("/", int(-7, Int), int(2, Int)) == -3
+	assert fold("/", int(-8, UInt), int(2, Int)) == 2147483644
+	assert fold(">>", int(-8, Int), int(1, Int)) == -4
+	assert fold("<", int(-1, Int), int(0, UInt)) == 0
+	assert fold("<", int(-1, Int), int(0, Long)) == 1
+	assert g.binary("*", float(1.5, Double), int(2, Int)).x == 3.0
+	assert `${g.binary("+", float(0.1, Float), float(0.2, Float)).x}`.slice(0, 10) == "0.30000001"
+}
+
+test "casts fold" {
+	assert g.cast(int(-1, Int), ULong).n == -1
+	assert g.cast(float(-2.7, Double), Int).n == -2
+	assert g.cast(int(3, Int), Double).x == 3.0
+	assert g.cast(int(0, Int), new Ptr(Int)).n == 0
+	assert g.cast(float(0.5, Double), Bool).n == 1
+}
+
+test "address constants keep their offsets" {
+	const a = global(Int, 7, "a")
+	const p = g.binary("+", g.addressOf(a), int(3, Int))
+	assert p.known == "addr" && p.off == 12 && p.sym == "a"
+	assert g.binary("-", p, g.addressOf(a)).n == 3
+	assert g.binary("==", p, g.addressOf(global(Int, 8, "b"))).known == ""
+}

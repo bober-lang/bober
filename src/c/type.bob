@@ -1,4 +1,5 @@
 import { HashMap } from "../../std/collections/hashmap"
+import { Value } from "../backend/backend"
 import { alignUp, max } from "../../std/math"
 
 /// A C type, at the widths bober fixes for it, told apart by its class and kind.
@@ -47,12 +48,15 @@ export class Arr {
 	base: Type
 	/// null while unknown.
 	len: i32 | null
+	/// The size in bytes of a variable length array, or of an array of them, as an i64 the code computes; else 0.
+	bytes: Value
 
-	constructor(base: Type, len: i32 | null) {
+	constructor(base: Type, len: i32 | null, bytes: Value = 0) {
 		this.size = base.size * (len ?? 0)
 		this.align = base.align
 		this.base = base
 		this.len = len
+		this.bytes = bytes
 	}
 }
 
@@ -126,7 +130,13 @@ export function isInt(t: Type): bool { return t.kind == "int" || t.kind == "bool
 export function isArith(t: Type): bool { return isInt(t) || t.kind == "float" }
 /// Whether t is _Bool or an unsigned int.
 export function isUnsigned(t: Type): bool { return t.kind == "bool" || t instanceof Scalar && t.unsigned == true }
+/// Whether t is a variable length array, or an array of them.
+export function isVla(t: Type): bool { return t instanceof Arr && t.bytes != 0 }
 export function isVolatile(t: Type): bool { return !(t instanceof Arr || t instanceof Fn) && t.volatile }
+/// Whether t has a size: not void, nor a struct or union declared but not yet defined, nor an array of them.
+export function isComplete(t: Type): bool {
+	return if (t instanceof Arr) isComplete(t.base) else t.kind != "void" && !(t instanceof Record && t.fields == null)
+}
 
 /// The type a pointer of type t points to.
 export function pointee(t: Type): Type { return (t as Ptr).base }
@@ -140,7 +150,7 @@ export function callee(t: Type): Fn | null {
 /// t volatile-qualified, an array's elements in its stead. A function stays unqualified.
 export function volatile(t: Type): Type {
 	if (t instanceof Arr) {
-		return new Arr(volatile(t.base), t.len)
+		return new Arr(volatile(t.base), t.len, t.bytes)
 	}
 	if (t instanceof Fn || t.volatile) {
 		return t

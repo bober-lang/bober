@@ -1,9 +1,8 @@
 //! The run time that code from src/emit.bob links against, but for its collector, src/gc.c; what std imports of it is
-//! declared in rt.h. A thrown value is its tag, bits and ref after an _Unwind_Exception header, raised
-//! with _Unwind_RaiseException and caught by the landing pad bober_personality finds; compile this with -fexceptions,
-//! without which LTO takes bober_throw not to unwind. A trap prints where it happened and exits, or in a test fails
-//! just that test. A function that can trap takes the module's source path and the byte offset in it last, and
-//! reports them as path:line:col.
+//! declared in rt.h. A thrown value is its tag, bits and ref after an _Unwind_Exception header, raised with
+//! _Unwind_RaiseException and caught by the landing pad bober_personality finds; bobcc, which takes any C function to
+//! unwind, compiles it. A trap prints where it happened and exits, or in a test fails just that test. A function that
+//! can trap takes the module's source path and the byte offset in it last, and reports them as path:line:col.
 
 #include "rt.h"
 #include <setjmp.h>

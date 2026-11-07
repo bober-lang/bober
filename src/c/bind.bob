@@ -1,0 +1,365 @@
+//! What names imported from a C header are in bober (§3.1): its functions, objects, constants, structs and types,
+//! written as a module of declarations, a function's or object's without a body; and the C that gives a static function
+//! a symbol. TODO: the C widths are LP64 for now; convert at calls on targets where they differ.
+//!
+//! ## C headers
+//!
+//! An import of a String ending in `.h` or `.c` takes names from a C file, found as `#include` String in the importing
+//! file would find it, with implementation-defined include directories. It shall list its names, each the file's: a
+//! function, with a prototype and not variadic, is a function called with the C ABI; an object is a `const` naming it
+//! in place; an enumeration constant, or an object-like macro expanding to string literals or to a constant expression
+//! of integer, floating or pointer type, is a `const`; an object-like macro expanding to a function's name is that
+//! function; a struct, by its tag or a typedef, is a class, and another typedef a type alias. A static function, inline
+//! in a header, is one too: the implementation gives it a symbol.
+//!
+//! C types are bober types of fixed width: `_Bool` is `bool`, `char` and `signed char` `i8`, `short` `i16`, `int` and an
+//! enumeration `i32`, `long` and `long long` `i64`, their unsigned types the `u` ones, `float` `f32`, `double` and
+//! `long double` `f64`, and every pointer `u64`. Where a target's C type has another width, a value converts to it on
+//! the way into C and back on the way out (§6.6). A struct is a class of its members in order, a nested struct
+//! embedded; an array is `T[n]`. One returned from C is a new instance whose initializers and constructor do not run. A
+//! parameter that is a pointer to such a struct is its class: C is given the instance, and what C changes in it is
+//! changed in the instance; one that is the struct is `...T`, and C is given a copy. A parameter that is a pointer to a
+//! scalar `T` is `T[] | u64`, and one to a byte or `void` is `string | u8[] | u64`: C is given an array's elements, and
+//! what C changes in them is changed in the array, or a copy of a string's bytes and a NUL. C is given each value as
+//! the bytes of its C type, for the call only, which an implementation may copy in and back out: what C reads around
+//! them or keeps past the call is no bober value's. The builtin `fromBytes(xs: u8[])` is the string of xs. A union,
+//! bitfield, flexible array, array of unknown length, or a struct that packing or alignment lays out other than bober
+//! would, has no bober type, and a name whose declaration needs one shall not be imported. How a program finds a C
+//! function or object is implementation-defined. Bober's guarantees hold only while C keeps them: an imported object
+//! that C changes, or a function that breaks them, is at the program's own risk. The module std/c names C's types and
+//! converts strings to and from C.
+//!
+//! ```
+//! import * as c from "std/c"
+//! import { div, div_t, free, RAND_MAX, strtod } from "stdlib.h"
+//! import { sqlite3_open } from "../vendor/sqlite/sqlite3.h"
+//! import { printf } from "stdio.h"          // error: printf is variadic
+//! import * as libc from "string.h"         // error: names are listed
+//! const p = c.toCString("2.5"); strtod(p, 0) == 2.5; free(p)
+//! const d: div_t = div(7, 2); d.quot == 3
+//! strtod("2.5", 0) == 2.5                   // a string is given as a C string
+//! ```
+
+import { Nothing } from "../backend/backend"
+import { contains } from "../../std/algo"
+import { isAlphanumeric, underscore } from "../../std/ascii"
+import { alignUp, max } from "../../std/math"
+import { indexOf, startsWith } from "../../std/string"
+import { dir, join } from "../../std/fs/path"
+import { os } from "../../std/os"
+import { CompileError } from "../error"
+import { load, nearest } from "../pkg"
+import { root } from "../root"
+import { Val } from "./gen"
+import { CError, Tok } from "./lex"
+import { strings } from "./literal"
+import { Parser } from "./parse"
+import { Preprocessor } from "./pp"
+import { Arr, Fn, Ptr, Record, Type, isUnsigned } from "./type"
+
+/// The sysroot bober compiles and links C with: on macOS the SDK of the command line tools, else the musl of
+/// src/backend/llvm/Makefile, in bober's root.
+export let sysroot = if (os == "macos") "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+	else join(root, "build/musl")
+
+/// The system's headers, of the sysroot.
+export let system = sysroot + "/usr/include"
+
+/// The declarations of names, as importer sees them with #include "header" and the include directories of
+/// includesOf, then system. A static function is declared as bober_inline_<name>, which glue defines. Throws a message for a name
+/// the header lacks or bober cannot declare.
+export function bind(importer: string, header: string, names: string[], includes: string[],
+	read: (path: string) => string | null = p => readFile(p)): string {
+	const pp = new Preprocessor(importer, [], [...includesOf(importer, includes, read), system],
+		path => if (path == importer) `#include "${header}"\n` else read(path))
+	const p = new Parser(pp, new Nothing())
+	try {
+		p.unit()
+	} catch (e: CError) {
+		throw new CompileError(e.where())
+	}
+	const b = new Binder(p, pp)
+	for (const n of names) {
+		b.name(n)
+	}
+	for (const n of names) {
+		try {
+			b.bind(n)
+		} catch (e: CError | Unbindable) {
+			throw new CompileError(`${header}: ${n}: ${if (e instanceof CError) e.where() else e.msg}`)
+		}
+	}
+	return b.out
+}
+
+/// Why bober cannot declare a name.
+class Unbindable {
+	msg: string
+
+	constructor(msg: string) { this.msg = msg }
+}
+
+/// The file importer's #include "header" finds: in importer's directory, then in those of includesOf, then system; as
+/// if in importer's directory if in none.
+export function located(importer: string, header: string, includes: string[],
+	read: (path: string) => string | null = p => readFile(p)): string {
+	for (const d of [dir(importer), ...includesOf(importer, includes, read), system]) {
+		if (read(join(d, header)) != null) {
+			return join(d, header)
+		}
+	}
+	return join(dir(importer), header)
+}
+
+/// includes, then the include directories of the C libraries of the package nearest above importer.
+export function includesOf(importer: string, includes: string[],
+	read: (path: string) => string | null = p => readFile(p)): string[] {
+	const d = nearest(importer, read)
+	const dirs = includes.slice(0, includes.length)
+	if (d != null) {
+		for (const [_, c] of load(d, read).c) {
+			dirs.push(...c.include)
+		}
+	}
+	return dirs
+}
+
+/// The C defining syms, of the declarations bind gives the header at path, that are static functions'; "" if none.
+/// The program compiles it with the headers of its packages' C libraries. Weak, as each set of names imported is a
+/// module of its own.
+export function glue(path: string, syms: string[]): string {
+	let c = ""
+	for (const s of syms) {
+		if (startsWith(s, "bober_inline_")) {
+			const f = s.slice(13, s.length)
+			c += `extern __typeof__(${f}) ${s} __attribute__((weak, alias("${f}")));\n`
+		}
+	}
+	return if (c == "") "" else `#include "${path}"\n${c}`
+}
+
+class Binder {
+	out = ""
+	private p: Parser
+	private pp: Preprocessor
+	/// The structs with a class, its name, and whether it is in out.
+	private records: Record[] = []
+	private names: string[] = []
+	private done: bool[] = []
+	private funcs: string[] = []
+
+	constructor(p: Parser, pp: Preprocessor) {
+		this.p = p
+		this.pp = pp
+	}
+
+	/// Names the struct n declares after n.
+	name(n: string) {
+		const t = this.lookup(n)
+		if (t instanceof Record && t.kind == "struct" && t.fields != null && this.find(t) < 0) {
+			this.records.push(t)
+			this.names.push(n)
+			this.done.push(false)
+		}
+	}
+
+	bind(n: string) {
+		const toks = this.pp.expansion(n)
+		if (toks != null) {
+			this.macro(n, toks)
+			return
+		}
+		const d = this.lookup(n)
+		if (d instanceof Type) {
+			const t = this.type(d)
+			if (t != n) {
+				this.out += `export type ${n} = ${t}\n`
+			}
+		} else if (d instanceof Val && d.ty.kind == "func") {
+			this.func(n, d)
+		} else if (d instanceof Val && d.known == "int") {
+			this.constant(n, d)
+		} else if (d instanceof Val && d.known == "addr") {
+			const t = this.type(d.ty)
+			this.out += `export const ${n}: ${t}\n`
+		} else {
+			throw new Unbindable("not declared")
+		}
+	}
+
+	private lookup(n: string): Val | Type | null {
+		return this.p.declared(n) ?? this.p.declared(`struct ${n}`) ?? this.p.declared(`union ${n}`)
+	}
+
+	private macro(n: string, toks: Tok[]) {
+		const texts: string[] = []
+		for (const t of toks) {
+			if (t.kind == "string") {
+				texts.push(t.text)
+			}
+		}
+		if (texts.length > 0 && texts.length == toks.length) {
+			const [ty, bytes] = strings(texts)
+			if (ty.size != 1) {
+				throw new Unbindable("a wide string")
+			}
+			this.out += `export const ${n} = ${quoted(bytes.slice(0, bytes.length - 1))}\n`
+			return
+		}
+		const v = this.p.value(toks)
+		if (v.ty.kind == "func" && v.known == "addr" && v.off == 0) {
+			this.func(n, v)
+		} else if (v.known == "int" || v.known == "float") {
+			this.constant(n, v)
+		} else {
+			throw new Unbindable("not a constant")
+		}
+	}
+
+	/// The function v, under its symbol's name, which n names too if it differs. A class parameter is a pointer to
+	/// the struct, ...T the struct by value.
+	private func(n: string, v: Val) {
+		const sym = if (this.p.local(v.sym)) `bober_inline_${v.sym}` else v.sym
+		for (const c of sym) {
+			if (!isAlphanumeric(c) && c != underscore) {
+				throw new Unbindable(`renamed to ${sym}`)
+			}
+		}
+		const ft = v.ty as Fn
+		if (ft.variadic) {
+			throw new Unbindable("variadic")
+		}
+		if (!ft.prototyped) {
+			throw new Unbindable("without a prototype")
+		}
+		if (!contains(this.funcs, sym)) {
+			this.funcs.push(sym)
+			let params = ""
+			for (const i of 0 ... ft.params.length - 1) {
+				params += `${if (i > 0) ", " else ""}a${i}: ${this.param(ft.params[i][0])}`
+			}
+			const result = if (ft.result.kind == "void") "" else `: ${this.type(ft.result)}`
+			this.out += `export function ${sym}(${params})${result}\n`
+		}
+		if (sym != n) {
+			this.out += `export const ${n} = ${sym}\n`
+		}
+	}
+
+	/// A parameter's type: a struct by value is embedded; a pointer to one that is a class, the class; one to a byte
+	/// or void takes a string or a u8[], one to another scalar T a T[], and either a u64 too.
+	private param(t: Type): string {
+		if (t instanceof Record) {
+			return `...${this.type(t)}`
+		}
+		const base = if (t instanceof Ptr) t.base else null
+		if (base instanceof Record) {
+			try {
+				return this.type(base)
+			} catch (e: Unbindable) {} // one bober cannot declare, as an incomplete struct, stays u64
+		} else if (base != null && (base.kind == "void" || base.kind == "int" && base.size == 1)) {
+			return "string | u8[] | u64"
+		} else if (base != null
+			&& (base.kind == "bool" || base.kind == "ptr" || base.kind == "int" && base.size <= 8
+			|| base.kind == "float" && base.size <= 8)) {
+			return `${this.type(base)}[] | u64`
+		}
+		return this.type(t)
+	}
+
+	private constant(n: string, v: Val) {
+		const t = this.type(v.ty)
+		if (v.known == "int") {
+			this.out += `export const ${n}: ${t} = ${if (isUnsigned(v.ty) || t == "u64") `${v.n as u64}` else `${v.n}`}\n`
+			return
+		}
+		const x = `${v.x}`
+		if (x == "inf" || x == "-inf" || x == "nan") {
+			throw new Unbindable("not finite")
+		}
+		const float = indexOf(x, ".") >= 0 || indexOf(x, "e") >= 0
+		this.out += `export const ${n}: ${t} = ${x}${if (float) "" else ".0"}\n`
+	}
+
+	private type(t: Type): string {
+		if (t.kind == "bool") {
+			return "bool"
+		}
+		if (t.kind == "int" && t.size <= 8) {
+			return `${if (isUnsigned(t)) "u" else "i"}${t.size * 8}`
+		}
+		if (t.kind == "float" && t.size >= 4) {
+			return `f${t.size * 8}`
+		}
+		if (t.kind == "ptr") {
+			return "u64"
+		}
+		if (t instanceof Arr && (t.len ?? 0) > 0) {
+			return `${this.type(t.base)}[${t.len}]`
+		}
+		if (t instanceof Record && t.kind == "struct" && t.fields != null) {
+			let i = this.find(t)
+			if (i < 0) {
+				this.records.push(t)
+				this.names.push(`C${this.records.length}`)
+				this.done.push(false)
+				i = this.records.length - 1
+			}
+			if (!this.done[i]) {
+				const text = this.record(t, this.names[i])
+				this.out += text
+				this.done[i] = true
+			}
+			return this.names[i]
+		}
+		throw new Unbindable(if (t.kind == "array") "an array of unknown length"
+			else if (t.kind == "struct") "an incomplete struct"
+			else if (t.size > 8) `a ${t.size}-byte ${t.kind}`
+			else `a ${t.kind}`)
+	}
+
+	private find(t: Record): i32 {
+		for (const i of 0 ... this.records.length - 1) {
+			if (this.records[i].fields == t.fields) {
+				return i
+			}
+		}
+		return -1
+	}
+
+	/// A class laid out as the struct t is, which C's packing and alignment attributes may not allow.
+	private record(t: Record, name: string): string {
+		let fields = ""
+		let off = 0
+		let align = 1
+		for (const f of t.fields ?? []) {
+			if (f.name == "" || f.width >= 0) {
+				throw new Unbindable(`${name} has a bitfield or an anonymous member`)
+			}
+			off = alignUp(off, f.ty.align)
+			if (f.off != off) {
+				throw new Unbindable(`${name} is packed`)
+			}
+			off += f.ty.size
+			align = max(align, f.ty.align)
+			fields += `${if (fields == "") "" else "; "}${f.name}: ${if (f.ty.kind == "struct") "..." else ""}${this.type(f.ty)}`
+		}
+		if (t.size != alignUp(off, align)) {
+			throw new Unbindable(`${name} is aligned`)
+		}
+		return `export class ${name} { ${fields} }\n`
+	}
+}
+
+/// s as a bober string literal.
+function quoted(s: string): string {
+	let out = "\""
+	for (const ch of s) {
+		out += if (ch == ("\"" as u8) || ch == ("\\" as u8) || ch == ("$" as u8)) "\\" + chr(ch)
+			else if (ch >= 32 && ch < 127) chr(ch)
+			else `\\x${hex(ch >> 4)}${hex(ch & 15)}`
+	}
+	return out + "\""
+}
+
+function hex(d: u8): string { return "0123456789ABCDEF".slice(d, d + 1) }
