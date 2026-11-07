@@ -1,0 +1,281 @@
+import { SyntaxError, Tok } from "./lex"
+import { Parser, Tree } from "./parse"
+
+/// Writes each construct as (kind:token parts), leaving out :token where it is the kind itself or a bracket.
+function sexpr(src: string, p: Tree | Tok): string {
+	if (p instanceof Tok) {
+		return " " + src.slice(p.loc.pos, p.loc.end())
+	}
+	const text = src.slice(p.t.loc.pos, p.t.loc.end())
+	let s = ` (${p.kind}` + (if (text == p.kind || text == "(" || text == "[" || text == "{") "" else ":" + text)
+	for (const q of p.parts) {
+		s += sexpr(src, q)
+	}
+	return s + ")"
+}
+
+function e(src: string): string { return inside(`const x = ${src}`, "(var:const x = ", 1) }
+function s(src: string): string { return inside(`test "t" {\n${src}\n}`, "(test \"t\" (block ", 2) }
+
+/// The dump of src, after head and before the last n characters, which hold its wrapping.
+function inside(src: string, head: string, n: i32): string {
+	const d = f(src)
+	assert d.slice(0, head.length) == head
+	return d.slice(head.length, d.length - n)
+}
+
+function f(src: string): string {
+	const p = new Parser(src)
+	let s = ""
+	let t = p.parse()
+	while (t != null) {
+		s += sexpr(src, t)
+		t = p.parse()
+	}
+	return s.slice(1, s.length)
+}
+
+function error(src: string): string {
+	try {
+		f(src)
+	} catch (err: SyntaxError) {
+		return `${err.loc.pos}: ${err.msg}`
+	}
+	return "none"
+}
+
+test "binary operators bind by level" {
+	assert e("1 + 2 * 3") == "(binary:+ 1 (binary:* 2 3))"
+	assert e("2 ** 3 ** 2") == "(binary:** 2 (binary:** 3 2))"
+	assert e("1 << 2 + 1") == "(binary:<< 1 (binary:+ 2 1))"
+	assert e("1 | 2 ^ 3 & 1") == "(binary:| 1 (binary:^ 2 (binary:& 3 1)))"
+	assert e("a ?? b ?? c") == "(binary:?? (binary:?? a b) c)"
+	assert e("a || b && !c == d") == "(binary:|| a (binary:&& b (binary:== (unary:! c) d)))"
+	assert e("a - -1") == "(binary:- a (unary:- 1))"
+	assert e("x instanceof T | null") == "(binary:instanceof x (binary:| T null))"
+}
+
+test "chains and mixes" {
+	assert e("1 < x <= 10") == "(chain:<= (binary:< 1 x) 10)"
+	assert e("x >= 3 > 2") == "(chain:> (binary:>= x 3) 2)"
+	assert e("x == 7 == 7") == "(chain:== (binary:== x 7) 7)"
+	assert e("(a != b) == c") == "(binary:== (paren (binary:!= a b)) c)"
+	assert e("(a ?? b) || c") == "(binary:|| (paren (binary:?? a b)) c)"
+	assert e("(-2) ** 2") == "(binary:** (paren (unary:- 2)) 2)"
+	assert e("2 ** -2") == "(binary:** 2 (unary:- 2))"
+}
+
+test "as" {
+	assert e("x as u8 as i32") == "(binary:as (binary:as x u8) i32)"
+	assert e("-x as i32") == "(binary:as (unary:- x) i32)"
+	assert e("x as T[]") == "(binary:as x (index T))"
+}
+
+test "unary" {
+	assert e("typeof x") == "(unary:typeof x)"
+	assert e("await ...jobs") == "(unary:await (unary:... jobs))"
+	assert e("async a.b(c)?.()") == "(unary:async (call:?. (call (member:. a b) c)))"
+	assert e("~!-x.y") == "(unary:~ (unary:! (unary:- (member:. x y))))"
+}
+
+test "suffixes" {
+	assert e("a?.b?.[0]?.(1)!.c") == "(member:. (postfix:! (call:?. (index:?. (member:?. a b) 0) 1)) c)"
+	assert e("f(...xs, 1,)") == "(call f (unary:... xs) 1)"
+	assert e("m[string, i32]") == "(index m string i32)"
+	assert e("a.if.class") == "(member:. (member:. a if) class)"
+}
+
+test "new" {
+	assert e("new ns.Point(1).x") == "(member:. (new (member:. ns Point) 1) x)"
+	assert e("new Point[i32]()") == "(new (index Point i32))"
+	assert e("new Make()()") == "(call (new Make))"
+	assert e("new (Square | null)[](4)") == "(new (index (paren (binary:| Square null))) 4)"
+	assert error("function f() { new A }") == "21: expected (, got }"
+}
+
+test "literals" {
+	assert e("[1, [2, []], ...xs, a = 1]") == "(array 1 (array 2 (array)) (unary:... xs) (binary:= a 1))"
+	assert e("{ a, b: 1, \"c-d\": 2, 0: 3, if: 4, ...o }")
+		== "(object (prop:a) (prop:b : 1) (prop:\"c-d\" : 2) (prop:0 : 3) (prop:if : 4) (unary:... o))"
+	assert e("{ m() {}, n[T](v: T): T { return v } }")
+		== "(object (method:m (params) (block)) (method:n (typeParams (typeParam:T)) (params (param:v v : T)) : T (block (jump:return v))))"
+	assert e("`a${b}c${`d${e}`}`") == "(template:`a${ b }c${ (template:`d${ e }`) }`)"
+	assert e("`${{ v: 2 }.v}${\"}\"}${a\n}`") == "(template:`${ (member:. (object (prop:v : 2)) v) }${ \"}\" }${ a }`)"
+	assert e("'x'") == "'x'"
+	assert error("const a = 1..2") == "12: expected ident, got ."
+	assert error("const a = { b: 1 c: 2 }") == "17: expected ,, got ident"
+}
+
+test "conditional expressions" {
+	assert e("if (a) b else if (c) d else e") == "(ifExpr:if a b (ifExpr:if c d e))"
+	assert e("switch (k) { case 1, 2 ... 4: 2; case -1: 3\ndefault: 4 }")
+		== "(switchExpr:switch k (case 1 (binary:... 2 4) 2) (case (unary:- 1) 3) (case:default 4))"
+	assert error("const a = 1 + if (b) 2 else 3") == "14: expected an expression, got if"
+	assert error("const a = if (b) 1") == "18: expected else, got eof"
+	assert error("const a = if (b) { c: 1 } else 2") == "17: expected an expression, got {"
+}
+
+test "arrows and function types" {
+	assert e("x => y => x + y") == "(arrow:=> (params:x (param:x x)) (arrow:=> (params:y (param:y y)) (binary:+ x y)))"
+	assert e("(a, b) => a") == "(arrow:=> (params (param:a a) (param:b b)) a)"
+	assert e("(v) => v") == "(arrow:=> (params (param:v v)) v)"
+	assert e("(a = 1, ...r: i32[]) => { return r }")
+		== "(arrow:=> (params (param:a a = 1) (param:... (unary:... r) : (index i32))) (block (jump:return r)))"
+	assert e("() => ({})") == "(arrow:=> (params) (paren (object)))"
+	assert e("(s: string) => i32 throws E | F") == "(arrow:=> (params (param:s s : string)) i32 throws (binary:| E F))"
+	assert error("const a = (1, 2) => 3") == "12: expected ), got ,"
+	assert error("const a = (x, { v }) => v") == "14: expected ident, got {"
+	assert e("(x: i32): i32 => x") == "(arrow:=> (params (param:x x : i32)) : i32 x)"
+	assert e("(): A | null => null") == "(arrow:=> (params) : (binary:| A null) null)"
+	assert error("const a = (1) => 2") == "14: expected ;, got =>"
+	assert error("const a = (b, c)") == "16: expected =>, got eof"
+	assert error("const a = ()") == "12: expected =>, got eof"
+	assert error("type T = () => { id: u64 }") == "19: expected a call, await or new before it, got :"
+}
+
+test "statements" {
+	assert s("x = 1") == "(assign:= x 1)"
+	assert s("a.b[c] **= 2") == "(assign:**= (index (member:. a b) c) 2)"
+	assert s("[x, y] = [y, x]") == "(assign:= (array x y) (array y x))"
+	assert s("xs[0]++") == "(assign:++ (index xs 0))"
+	assert s("f()") == "(call f)"
+	assert s("o.m?.()") == "(call:?. (member:. o m))"
+	assert s("await g()") == "(unary:await (call g))"
+	assert s("return") == "(jump:return)"
+	assert s("{ return\nx() }") == "(block (jump:return) (call x))"
+	assert s("if (a) {} else if (b) {} else {}") == "(if a (block) else (if b (block) else (block)))"
+	assert s("for (const [k, v] of pairs) {}") == "(for const (array k v) pairs (block))"
+	assert s("for (let i of 0 ... n - 1) { continue }")
+		== "(for let i (binary:... 0 (binary:- n 1)) (block (jump:continue)))"
+	assert s("while (i < 10) { break }") == "(while (binary:< i 10) (block (jump:break)))"
+	assert s("switch (c) {\n case 'a' ... 'z', (A | B):\n  g()\n  h()\n default: {}\n}")
+		== "(switch c (case (binary:... 'a' 'z') (paren (binary:| A B)) (block:: (call g) (call h))) (case:default (block:: (block))))"
+	assert s("try {} catch ({ message }: Error) {} finally {}")
+		== "(try (block) (catch (object (prop:message)) : Error (block)) finally (block))"
+	assert s("try { throw 1 } catch { assert false }")
+		== "(try (block (jump:throw 1)) (catch (block (jump:assert false))))"
+	assert s("assert f() throws new E(1)") == "(jump:assert (call f) throws (new E 1))"
+	assert s("test `sub ${a}` {}") == "(test (template:`sub ${ a }`) (block))"
+	assert s("switch (c) { case 'R' as u8: g() }") == "(switch c (case (binary:as 'R' u8) (block:: (call g))))"
+}
+
+test "a newline ends a statement unless the next token continues it" {
+	assert s("{ f()\n(g)()\n[a] = b }") == "(block (call f) (call (paren g)) (assign:= (array a) b))"
+	assert s("{ x = a\n-1\ny = b\n.c\n?.d }")
+		== "(block (assign:= x (binary:- a 1)) (assign:= y (member:?. (member:. b c) d)))"
+	assert s("{ x = y!\nf() }") == "(block (assign:= x (postfix:! y)) (call f))"
+	assert s("try {}\ncatch(e) {}\nfinally {}") == "(try (block) (catch e (block)) finally (block))"
+	assert s("if (a) {}\nelse {}") == "(if a (block) else (block))"
+	assert s("{ assert a\nthrows(b) }") == "(block (jump:assert a) (call throws b))"
+	assert e("{ a: T\nas: U\ninstanceof(): V {} }")
+		== "(object (prop:a : T) (prop:as : U) (method:instanceof (params) : V (block)))"
+	assert e("{ f: () => 1\nthrows: 2 }") == "(object (prop:f : (arrow:=> (params) 1)) (prop:throws : 2))"
+	assert error("function f() { d\n++ }") == "17: expected a call, await or new before it, got ++"
+	assert error("function f() { x = y\nas T }") == "24: expected a call, await or new before it, got ident"
+	assert error("function f() { return\n1 }") == "24: expected a call, await or new before it, got }"
+	assert error("function f() { let a = g\n(1) }") == "29: expected a call, await or new before it, got }"
+	assert error("const a = [\n1\n2\n]") == "14: expected ,, got int"
+	assert error("function f(\na: i32\nb: i32\n) {}") == "19: expected ,, got ident"
+}
+
+test "rejected statements" {
+	assert error("function f() { a == 1 }") == "22: expected a call, await or new before it, got }"
+	assert error("function f() { a! = 1 }") == "18: expected an assignable expression before it, got ="
+	assert error("function f() { o?.a = 1 }") == "20: expected an assignable expression before it, got ="
+	assert error("function f() { o?.a.b[0] = 1 }") == "25: expected an assignable expression before it, got ="
+	assert error("function f() { let b = a++ }") == "24: expected ;, got ++"
+	assert error("function f() { switch (a) { case 1: } }") == "36: expected a statement, got }"
+	assert error("function f() { switch (a) { case 1 | 2: g() } }") == "35: expected ,, got |"
+	assert error("function f() { try {} }") == "22: expected catch or finally, got }"
+	assert error("function f() { throw }") == "21: expected an expression, got }"
+	assert error("function f() { async g() }") == "25: expected a call, await or new before it, got }"
+}
+
+test "what TypeScript has and bober leaves out is rejected" {
+	assert error("const a = 1 /* c */") == "13: expected an expression, got *"
+	assert error("const a = b !== c") == "14: expected an expression, got ="
+	assert error("const a = .5") == "10: expected an expression, got ."
+	assert error("const a = [1, , 2]") == "14: expected an expression, got ,"
+	assert error("const a = [T](x: T) => x") == "15: expected ,, got :"
+	assert error("type U =\n| A") == "9: expected an expression, got |"
+	assert error("class A extends B {}") == "8: expected {, got ident"
+	assert error("function f() { a = b = 1 }") == "21: expected ;, got ="
+	assert error("function f() { { a, b } = c }") == "18: expected a call, await or new before it, got ,"
+	assert error("function f() { --a }") == "15: expected an expression, got --"
+	assert error("function f() { if (a) g() }") == "22: expected {, got ident"
+	assert error("function f() { if (a) {} else g() }") == "30: expected {, got ident"
+	assert error("function f() { for (let i = 0; i < 3; i++) {} }") == "26: expected of, got ="
+	assert error("function f() { for (i of xs) {} }") == "20: expected let or const, got ident"
+}
+
+test "declarations" {
+	assert f("import { a, b as c, } from \"m\"\nimport * as ns from \"m\"\nimport * from \"m\"\nimport \"../m\"")
+		== "(import (object a (binary:as b c)) \"m\") (import (binary:as * ns) \"m\") (import * \"m\") (import \"../m\")"
+	assert f("export const x: i32 = 1; let y") == "(var:const export x : i32 = 1) (var:let y)"
+	assert f("function id[T](x: T): T throws E { return x }")
+		== "(function id (typeParams (typeParam:T)) (params (param:x x : T)) : T throws E (block (jump:return x)))"
+	assert f("type Pair[A, B = A] = [A, B]") == "(type Pair (typeParams (typeParam:A) (typeParam:B = A)) (array A B))"
+	assert f("class P[T extends Id] implements N[T] & Eq {\n  ...Base\n  x: i32 = 0\n  a: ...A; static private readonly m = 1\n  len(): i32 { return 1 }\n}")
+		== "(class P (typeParams (typeParam:T extends Id)) implements (binary:& (index N T) Eq) (members (unary:... Base) (prop:x : i32 = 0) (prop:a : (unary:... A)) (prop:m static private readonly = 1) (method:len (params) : i32 (block (jump:return 1)))))"
+	assert f("class B implements I @S[\"x\"] @T {\n  a: i32 @S[\"a\"] @T = 1\n  m(): i32 @T { return 1 }\n}")
+		== "(class B implements I @ (index S \"x\") @ T (members (prop:a : i32 @ (index S \"a\") @ T = 1) (method:m (params) : i32 @ T (block (jump:return 1)))))"
+	assert f("interface I extends J { static static: i32; f(): void }")
+		== "(class:interface I extends J (members (prop:static static : i32) (method:f (params) : void)))"
+	assert f("test \"t\" { assert true }") == "(test \"t\" (block (jump:assert true)))"
+}
+
+test "contextual keywords are idents elsewhere" {
+	assert f("import { of } from \"m\"\nclass A implements of { from = 1 }")
+		== "(import (object of) \"m\") (class A implements of (members (prop:from = 1)))"
+	assert f("function f[T extends from](of: T): T throws from {}")
+		== "(function f (typeParams (typeParam:T extends from)) (params (param:of of : T)) : T throws from (block))"
+	assert s("for (const from of of) {}") == "(for const from of (block))"
+	assert s("as = readonly as static") == "(assign:= as (binary:as readonly static))"
+	assert s("const test = f(test)") == "(var:const test = (call f test))"
+	assert f("class A { static\n f() {} }") == "(class A (members (prop:static) (method:f (params) (block))))"
+	assert f("class A { static readonly x = 1; private static(): i32 {} }")
+		== "(class A (members (prop:x static readonly = 1) (method:static private (params) : i32 (block))))"
+}
+
+test "rejected declarations" {
+	assert error("g()") == "0: expected a declaration, got ident"
+	assert error("assert true") == "0: expected a declaration, got assert"
+	assert error("const a = 1\nimport { b } from \"m\"") == "12: expected a declaration, got import"
+	assert error("import a from \"m\"") == "7: expected *, got ident"
+	assert error("import { a; b } from \"m\"") == "10: expected ,, got ;"
+	assert error("export test \"t\" {}") == "7: expected a declaration, got ident"
+	assert error("test `t` {}") == "5: expected a test name, got template"
+	assert error("test {}") == "5: expected a test name, got {"
+	assert error("function f[]() {}") == "11: expected a type parameter, got ]"
+	assert error("const { type } = node") == "8: expected an identifier, got type"
+	assert error("let a, b") == "5: expected ;, got ,"
+}
+
+test "syntax the corpus leaves out parses" {
+	assert error("import {} from \"m\"\nlet z: u8[4]\nconst [p, ...q] = [1, 2]\nconst { r, s: t = 1, ...u } = obj\nconst { type: kind, from: source } = node") == "none"
+	assert error("function all[T extends Base = Default,\n\tU](a: T, [b, c]: [i32, i32], { d, e: f = 1 }: Row, g = 2, ...rest: U[]): T {}")
+		== "none"
+	assert error("type Fn = (x: i32, ...rest: i32[]) => i32\ntype Table = Map[string, User[]]\ntype Kind = \"a\" | 'c'\ntype Row = { id: u64, name: string }")
+		== "none"
+	assert error("interface Named[T extends Id = u64] extends Base & Other[T] {\n\t/// documents id\n\treadonly id: T\n\tload[U](id: U): U\n}")
+		== "none"
+	assert error("interface Keyed {\n\ttype: string\n\tprivate readonly readonly: i32\n\tcatch(f: Fn): void\n\tdefault = 1\n}") == "none"
+	assert error("class P[T] {\n\tstatic make[U](...args: U[]): P[U] { return new P[U]() }\n\tprivate reset() {}\n}") == "none"
+	assert error("function f() {\n\tfunction g[T](v: T): T { return v }\n\tclass L {}\n\tinterface S {}\n\ttype A = i32\n}") == "none"
+}
+
+test "the language tests and the compiler's own source parse" {
+	const files = ["tests/check.bob", "tests/lexing.bob", "tests/arrays.bob",
+		"tests/classes.bob", "tests/control.bob", "tests/exceptions.bob", "tests/functions.bob", "tests/init.bob",
+		"tests/modules.bob", "tests/numbers.bob", "tests/objects.bob", "tests/strings.bob", "tests/unions.bob",
+		"tests/run/calc.bob", "src/lex.bob", "src/parse.bob", "src/lex.test.bob", "src/parse.test.bob"]
+	let failed = ""
+	for (const path of files) {
+		const src = readFile(path) ?? ""
+		const err = if (src == "") "missing" else error(src)
+		if (err != "none") {
+			failed += `${path}:${err} `
+		}
+	}
+	assert failed == ""
+}

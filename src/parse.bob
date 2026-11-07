@@ -1,6 +1,9 @@
 //! Recursive descent with Pratt expressions, into a tree of constructs.
 
-import { Kind, Lexer, SyntaxError, Tok, assigns, keyword, prec } from "./lex"
+import { isBlank, lf, space } from "../std/ascii"
+import { partitionPoint } from "../std/algo"
+import { startsWith } from "../std/string"
+import { Kind, Lexer, Loc, SyntaxError, Tok, assigns, keyword, prec } from "./lex"
 
 /// A construct, entered at its keyword, operator or opening bracket, at the name of a typeParam, prop
 /// or method, or at the first token of a param. A block is the statements after { or a case's :, and
@@ -36,8 +39,11 @@ export class Tree {
 export class Parser {
 	private l: Lexer
 	private shape: Shape = ""
+	/// Whether an arrow's result type is being parsed, where `T =>` is no arrow.
+	private result = false
 	/// The comments, in order. They are not in the tree.
 	comments: Tok[] = []
+	private src: string
 	private header: bool
 	/// Whether only imports have come so far.
 	private imports = true
@@ -46,11 +52,32 @@ export class Parser {
 		header = false 	/// Whether functions may lack a body, as those of a C header do (3.1).
 	) {
 		this.l = new Lexer(src)
+		this.src = src
 		this.header = header
 	}
 
+	/// The doc comment of the construct at pos, once parsed: the `///` comments on the lines right before it, each alone
+	/// on its line, without `///` and a space after.
+	doc(pos: i32): string {
+		let i = partitionPoint(this.comments, c => c.loc.pos >= pos) as i32
+		let line = this.lineCol(pos)[0]
+		let doc = ""
+		while (i > 0) {
+			const c = this.comments[i - 1]
+			const text = this.l.text(c)
+			if (!startsWith(text, "///") || this.lineCol(c.loc.pos)[0] != line - 1 || !leads(this.src, c.loc.pos)) {
+				break
+			}
+			const body = text.slice(if (text.length > 3 && text[3] == space) 4 else 3, text.length)
+			doc = if (doc == "") body else body + "\n" + doc
+			line--
+			i--
+		}
+		return doc.copy() // as it outlives the source
+	}
+
 	/// The next of the file's imports and then declarations, or null at its end.
-	parse(): Tree | null {
+	parse(): Tree | null throws SyntaxError {
 		const k = this.peek().kind
 		if (k == "eof") {
 			return null
@@ -99,7 +126,7 @@ export class Parser {
 	}
 
 	private top(): Tree {
-		if (this.peek().kind == "test") {
+		if (this.peek("test").kind == "test") {
 			return this.testBlock(true)
 		}
 		const t = this.peek()
@@ -112,13 +139,16 @@ export class Parser {
 			case "let", "const":
 				const n = new Tree("var", t, mods)
 				n.parts.push(this.pattern())
-				this.typed(n)
+				this.optExpr(n, ":")
+				this.tags(n)
+				this.optExpr(n, "=")
 				return n
 			case "function": return this.fn("function", t, mods)
 			case "type":
 				const n = new Tree("type", t, mods)
 				n.parts.push(this.expect("ident"))
 				this.typeParams(n)
+				this.tags(n)
 				this.expect("=")
 				n.parts.push(this.expr())
 				return n
@@ -128,9 +158,6 @@ export class Parser {
 				this.typeParams(n)
 				if (this.opt(n, if (t.kind == "class") "implements" else "extends")) {
 					n.parts.push(this.expr())
-					while (this.eat(",")) {
-						n.parts.push(this.expr())
-					}
 				}
 				this.tags(n)
 				n.parts.push(this.object("members"))
@@ -160,9 +187,7 @@ export class Parser {
 		n.parts.push(this.listOf("params", this.expect("("), ")", () => this.param(false)))
 		this.optExpr(n, ":")
 		this.errors(n)
-		if (kind == "method") {
-			this.tags(n)
-		}
+		this.tags(n)
 		if (kind == "function" && !this.header || this.peek().kind == "{") {
 			n.parts.push(this.block())
 		}
@@ -212,6 +237,7 @@ export class Parser {
 		this.optExpr(n, "=")
 	}
 
+	/// A `throws` clause on the same line: the token and what follows.
 	private errors(n: Tree) {
 		const t = this.peek()
 		if (!t.nl && this.eat("throws")) {
@@ -227,7 +253,7 @@ export class Parser {
 		return n
 	}
 
-	/// Tags (5.3), each a type after an @.
+	/// Tags (§5.3), each a type after an @.
 	private tags(n: Tree) {
 		while (this.optExpr(n, "@")) {}
 	}
@@ -291,8 +317,24 @@ export class Parser {
 		n.end = this.peek().loc.pos
 	}
 
+	/// # Statements
+	///
+	/// ```grammar
+	/// Block    = "{" {Stmt Term} "}"
+	/// Stmt     = Block | Var | Function | Class | Interface | TypeAlias
+	///          | If | For | While | Switch | Try | Jump | Test | Assert | Simple
+	/// Simple   = Postfix [AssignOp Expr | "++" | "--"] | Await
+	/// AssignOp = "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "**=" | "&=" | "|=" | "^=" | "<<=" | ">>=" | "??="
+	/// If       = "if" "(" Expr ")" Block ["else" (If | Block)]
+	/// For      = "for" "(" ("let" | "const") Pattern "of" Range ")" Block
+	/// While    = "while" "(" Expr ")" Block
+	/// Switch   = "switch" "(" Expr ")" "{" {CaseHead Stmt Term {Stmt Term}} "}"
+	/// Try      = "try" Block (Catch ["finally" Block] | "finally" Block)
+	/// Catch    = "catch" ["(" Pattern [":" Type] ")"] Block
+	/// Jump     = "return" [Expr] | "throw" Expr | "break" | "continue"
+	/// ```
 	private stmt(): Part {
-		const t = this.peek()
+		const t = this.peek("test")
 		switch (t.kind) {
 			case "{": return this.block()
 			case "let", "const", "function", "class", "interface", "type": return this.decl([])
@@ -313,11 +355,24 @@ export class Parser {
 					&& (t.kind != "return" || k.kind != ";" && !ends(k.kind) && !k.nl)) {
 					n.parts.push(this.expr())
 				}
+				if (t.kind == "assert") {
+					this.errors(n)
+				}
 				return n
 		}
 		return this.simple()
 	}
 
+	/// ## Simple statements
+	///
+	/// An expression statement is a call, an `await` or a `new`. Assignment is a statement, not an expression; its
+	/// target is a name, a member, a subscript, or an array pattern. A compound assignment `a op= b` evaluates `a`'s
+	/// parts once. `x++` and `x--` are statements.
+	///
+	/// ```
+	/// [x, y] = [y, x]      xs[0]++      x ??= 5      a.b[c] = 1
+	/// a = b = 1    a == 1    let b = a++    --a    { a, b } = c    // errors
+	/// ```
 	private simple(): Part {
 		const x = this.expr()
 		const shape = this.shape
@@ -369,7 +424,7 @@ export class Parser {
 		return if (this.eat("...")) new Tree("binary", t, [x, this.expr(min)]) else x
 	}
 
-	private label(): Part { return this.range(Suffix) }
+	private label(): Part { return this.range(As) }
 
 	private tryStmt(): Tree {
 		const n = new Tree("try", this.next())
@@ -431,6 +486,23 @@ export class Parser {
 	}
 
 	/// Parses an expression of operators binding at least min.
+	///
+	/// # Expressions
+	///
+	/// ```grammar
+	/// Expr    = IfExpr | Unary ({"as" Postfix} | {BinaryOp Unary})
+	/// Unary   = ("!" | "-" | "~" | "typeof" | "async" | "spawn") Unary | Await | Postfix
+	/// Await   = "await" ("..." Postfix | Unary)
+	/// Postfix = Primary {Suffix}
+	/// Suffix  = "." Ident | "?." Ident | ["?."] "[" [Expr {"," Expr} [","]] "]" | ["?."] Args | "!"
+	/// Args    = "(" [["..."] Expr {"," ["..."] Expr} [","]] ")"
+	/// Primary = Ident | Int | Float | String | Template | "true" | "false" | "null" | "this"
+	///         | Array | Object | Paren | SwitchExpr | New | Ident "=>" ArrowBody
+	/// Array   = "[" [Elem {"," Elem} [","]] "]"
+	/// Elem    = "..." Expr | Expr ["=" Expr]
+	/// Paren   = FnType | ArrowParams [":" Type] "=>" ArrowBody | "(" Expr ")"
+	/// New     = "new" Primary {"." Ident | "[" [Expr {"," Expr} [","]] "]"} Args
+	/// ```
 	private expr(min = 1): Part {
 		const t = this.peek()
 		if (min == 1 && this.eat("if")) {
@@ -517,7 +589,7 @@ export class Parser {
 		switch (t.kind) {
 			case "ident":
 				const x = this.next()
-				if (this.peek().kind == "=>") {
+				if (!this.result && this.peek().kind == "=>") {
 					return this.arrow(new Tree("params", t, [this.paramAt(t, x)]))
 				}
 				this.shape = "ident"
@@ -586,7 +658,16 @@ export class Parser {
 	}
 
 	private arrow(params: Tree): Tree {
-		const n = new Tree("arrow", this.expect("=>"), [params])
+		const colon = this.peek()
+		const parts: Part[] = [params]
+		if (this.eat(":")) {
+			const outer = this.result
+			this.result = true
+			parts.push(colon)
+			parts.push(this.expr())
+			this.result = outer
+		}
+		const n = new Tree("arrow", this.expect("=>"), parts)
 		n.parts.push(if (this.peek().kind == "{") this.block() else this.expr())
 		this.errors(n)
 		this.shape = ""
@@ -630,6 +711,31 @@ export class Parser {
 		return n
 	}
 
+	/// ## Terminators
+	///
+	/// A statement, a case of a switch expression, or a property of a class or object ends at `;`, before `}` or the
+	/// end of the file, or at a newline it cannot continue across. It continues across a newline wherever the next
+	/// token can continue it (`continues`), except that a token starting a line is never:
+	///
+	/// 1. `(` `[` calling or indexing what is before it, or `++` `--` incrementing it;
+	/// 2. `as` or `instanceof`;
+	/// 3. the value of a `return`, or a `throws` clause.
+	///
+	/// ```
+	/// let b: i32 = 5
+	/// -1             // one statement: `-` continues, b == 4
+	/// let c = a
+	///   .b           // one statement
+	/// f()
+	/// (g)()          // two statements
+	/// let d = 0
+	/// d
+	/// ++             // error
+	/// return
+	/// x              // two statements
+	/// try {}
+	/// catch(e) {}    // one statement
+	/// ```
 	private term() {
 		const t = this.peek()
 		if (!t.nl && t.kind != "}" && t.kind != "eof") {
@@ -698,3 +804,12 @@ function continues(t: Tok): bool {
 }
 
 function fail(t: Tok, want: string): SyntaxError { return new SyntaxError(t.loc, `expected ${want}, got ${t.kind}`) }
+
+/// Whether only blanks come before pos on its line.
+export function leads(src: string, pos: i32): bool {
+	let i = pos
+	while (i > 0 && isBlank(src[i - 1])) {
+		i--
+	}
+	return i == 0 || src[i - 1] == lf
+}

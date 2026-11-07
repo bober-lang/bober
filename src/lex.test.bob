@@ -1,0 +1,116 @@
+import { Lexer, Loc, SyntaxError } from "./lex"
+
+function kinds(src: string): string {
+	const l = new Lexer(src)
+	let s: string = l.next().kind
+	while (l.peek().kind != "eof") {
+		s += " " + l.next().kind
+	}
+	return s
+}
+
+/// The texts of src's tokens, with | before each that a newline comes before.
+function lines(src: string): string {
+	const l = new Lexer(src)
+	let s = l.text(l.next())
+	while (l.peek().kind != "eof") {
+		const t = l.next()
+		s += (if (t.nl) " | " else " ") + l.text(t)
+	}
+	return s
+}
+
+function texts(src: string): string {
+	const l = new Lexer(src)
+	let s = l.text(l.next())
+	while (l.peek().kind != "eof") {
+		s += " " + l.text(l.next())
+	}
+	return s
+}
+
+function error(src: string): string {
+	try {
+		kinds(src)
+	} catch (e: SyntaxError) {
+		return `${e.loc.pos}: ${e.msg}`
+	}
+	return "none"
+}
+
+test "operators take the longest match" {
+	assert texts("a**=b>>=c??=d...e?.f=>g") == "a **= b >>= c ??= d ... e ?. f => g"
+	assert texts("1...3 a?.b a??b x!=y") == "1 ... 3 a ?. b a ?? b x != y"
+	assert texts("a<-1 a---b") == "a < - 1 a -- - b"
+}
+
+test "keywords, and keywords as names after . and ?." {
+	assert kinds("if iff $ _a a$1 typeName") == "if ident ident ident ident ident"
+	assert kinds("a.if b?.class") == "ident . ident ident ?. ident"
+}
+
+test "numbers" {
+	assert kinds("0 1_000 0xAb_C 0o17 0b1010 1.5 0.5 1e3 2.5E-1 1_0.2_5 0e0")
+		== "int int int int int float float float float float float"
+	assert error("01") == "2: malformed number"
+	assert error("0x_1") == "2: malformed number"
+	assert error("0b2") == "2: malformed number"
+	assert error("0f123") == "0: malformed number"
+	assert error("0X1") == "0: malformed number"
+	assert error("1e") == "2: malformed number"
+	assert error("1.e3") == "1: malformed number"
+	assert error("1_") == "1: malformed number"
+	assert error("1__0") == "1: malformed number"
+	assert error("1e3_0") == "3: malformed number"
+	assert error("0x1.5") == "3: malformed number"
+}
+
+test "strings" {
+	assert kinds("\"a\\tb\\x41\\u{10FFFF}\\$\\`\" 'é' '\\'' ''") == "string string string string"
+	assert error("\"\\q\"") == "1: invalid escape"
+	assert error("\"\\x4\"") == "1: invalid escape"
+	assert error("\"\\u{}\"") == "1: invalid escape"
+	assert error("\"\\u{110000}\"") == "1: invalid escape"
+	assert error("\"abc") == "4: unterminated string"
+	assert error("\"a\nb\"") == "2: unterminated string"
+	assert error("'ab") == "3: unterminated string"
+}
+
+test "templates" {
+	assert kinds("`a`") == "template"
+	assert kinds("`a${b}") == "templateHead ident }"
+	assert kinds("`\\${x}`") == "template"
+	assert error("`${b`") == "5: unterminated template"
+}
+
+test "comments and whitespace" {
+	assert kinds("a // c\n//! d\n/// e\n\tb\r\n") == "ident comment comment comment ident"
+	assert kinds("a // c\n.b") == "ident comment . ident"
+	assert kinds("a.// c\nif") == "ident . comment ident"
+	assert kinds("a // c") == "ident comment"
+	assert error("#") == "0: unexpected character"
+	assert error("é") == "0: unexpected character"
+	assert error("a ? b : c") == "2: unexpected character"
+}
+
+test "tokens know whether a newline comes before them" {
+	assert lines("a b\r\n\n\tc // d\ne") == "a b | c // d | e"
+	assert lines("`x\ny` z") == "`x\ny` z"
+}
+
+test "locations join, and map to lines and columns" {
+	const j = Loc.at(4, 2).join(Loc.at(1, 2))
+	assert j.pos == 1 && j.len == 5
+	const l = new Lexer("ab\n\ncd `x\ny` e")
+	while (l.next().kind != "eof") {}
+	assert at(l, 0) == "1:1"
+	assert at(l, 2) == "1:3"
+	assert at(l, 4) == "3:1"
+	assert at(l, 6) == "3:3"
+	assert at(l, 13) == "4:4"
+}
+
+function at(l: Lexer, pos: i32): string {
+	const [line, col] = l.lineCol(pos)
+	return `${line}:${col}`
+}
