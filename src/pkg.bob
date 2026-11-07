@@ -1,0 +1,89 @@
+//! A package's bober.pkg, as std/encoding/json decodes it: the package of the files in its directory and below, to the
+//! next bober.pkg.
+
+import { Mapping, Rest, Unknown, decode } from "../std/encoding/json"
+import { dir, join } from "../std/fs/path"
+import { ParseError } from "../std/parse"
+import { CompileError } from "./error"
+
+/// A package's name, "@namespace/name".
+export type Identity = string
+/// The hash of an archive's content.
+export type Hash = string
+/// A directory of the package, or of a C library's src.
+export type Dir = string
+export type Glob = string
+
+export class Package {
+	name: Identity = ""
+	/// The C libraries it links, by name.
+	c: [string, CLib][] @Mapping = []
+}
+
+/// A C library, compiled from its sources or, if cmake has a version, the static libraries a CMake project installs.
+export class CLib {
+	/// Its directory, or for a CMake project [url, sha256] of an archive of it; url#dir if the project is dir in it.
+	src: Dir | [string, Hash] = ""
+	/// The files compiled, less those exclude matches.
+	sources: Glob[] = []
+	exclude: Glob[] = []
+	/// The headers an importer includes; private's only compiling it does.
+	include: Dir[] = []
+	private: Dir[] = []
+	/// The macros it is compiled with, by name.
+	defines: [string, string][] @Mapping = []
+	cmake: Preset = new Preset()
+	/// The patches applied to a copy of src before it is built, as patch -p1 takes them.
+	patches: string[] = []
+}
+
+/// The configure preset that builds a CMake project, in the version of CMakePresets.json it is written in, but for its
+/// name and generator, which bober gives; written to CMakeUserPresets.json without being read.
+export class Preset {
+	version: i32 = 0
+	fields: Unknown[] @Rest = []
+}
+
+/// Where a C library of the package is built, and a CMake project installed.
+export function out(pkg: Identity, lib: string): Dir { return join("build", pkg, lib) }
+
+/// The directory of the bober.pkg nearest above path, or null if there is none.
+export function nearest(path: string, read: (path: string) => string | null = p => readFile(p)): Dir | null {
+	let d = dir(path)
+	while (read(join(d, "bober.pkg")) == null) {
+		if (dir(d) == d) {
+			return null
+		}
+		d = dir(d)
+	}
+	return d
+}
+
+/// The package of the bober.pkg in d, with its C libraries' src and patches joined onto d, their other paths onto their
+/// src or a CMake project's install tree.
+export function load(d: Dir, read: (path: string) => string | null = p => readFile(p)): Package throws CompileError {
+	const path = join(d, "bober.pkg")
+	let p = new Package()
+	try {
+		p = decode[Package](read(path) ?? "")
+	} catch (e: ParseError) {
+		throw new CompileError(`${path}: ${e.kind} error at byte ${e.at}`)
+	}
+	for (const [name, c] of p.c) {
+		const cmake = c.cmake.version > 0
+		const src = c.src
+		if (src instanceof string) {
+			c.src = join(d, src)
+		} else if (!cmake) {
+			throw new CompileError(`${path}: ${name}: only a CMake project is fetched`)
+		}
+		const root = if (cmake) out(p.name, name) else c.src as string
+		const at = (xs: string[]) => xs.map(x => join(root, x))
+		c.patches = c.patches.map(x => join(d, x))
+		c.sources = at(c.sources)
+		c.exclude = at(c.exclude)
+		c.include = at(c.include)
+		c.private = at(c.private)
+	}
+	return p
+}

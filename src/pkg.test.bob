@@ -1,0 +1,43 @@
+import { Package, load, nearest } from "./pkg"
+import { decode, encode } from "../std/encoding/json"
+
+test "decode a bober.pkg" {
+	const p = decode[Package](`{
+		"name": "@janez/app",
+		"c": {
+			"mbedtls": {
+				"src": "vendor/mbedtls",
+				"sources": ["library/*.c"],
+				"exclude": ["library/net_sockets.c"],
+				"include": ["include"],
+				"private": ["library"],
+				"defines": { "MBEDTLS_CONFIG_FILE": "bober_config.h" }
+			},
+			"llvm": {
+				"src": ["https://example.com/llvm.tar.xz", "q9"],
+				"cmake": { "version": 6, "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" } }
+			}
+		}
+	}`)
+	assert p.name == "@janez/app"
+	const [name, mbed] = p.c[0]
+	assert name == "mbedtls" && mbed.src == "vendor/mbedtls" && mbed.exclude == ["library/net_sockets.c"]
+	assert mbed.private == ["library"] && mbed.defines == [["MBEDTLS_CONFIG_FILE", "bober_config.h"]]
+	assert mbed.cmake.version == 0
+	const llvm = p.c[1][1]
+	assert llvm.src == ["https://example.com/llvm.tar.xz", "q9"]
+	assert llvm.cmake.version == 6 && llvm.cmake.fields == [["cacheVariables", `{ "CMAKE_BUILD_TYPE": "Release" }`]]
+}
+
+test "load joins a C library's paths onto its directory" {
+	const p = load("std")
+	const mbed = p.c.find(e => e[0] == "mbedtls")![1]
+	assert mbed.src == "vendor/mbedtls" && mbed.include[0] == "vendor/mbedtls/include"
+	assert mbed.private[0] == "vendor/mbedtls/library" && mbed.exclude == ["vendor/mbedtls/library/net_sockets.c"]
+	const bober = load(".")
+	const tpde = bober.c.find(e => e[0] == "tpde")![1]
+	assert tpde.src == "vendor/tpde" && tpde.patches == ["src/backend/tpde/tpde.patch"]
+	assert tpde.include == ["build/@bober/bober/tpde/include"]
+	assert bober.c[0][1].src instanceof [string, string]
+	assert nearest("std/tls/tls.h") == "std" && nearest("std") == "." && nearest("a/b.bob", p => null) == null
+}
