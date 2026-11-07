@@ -1,0 +1,761 @@
+//! Floats as decimal text and back, exactly rounded: the fewest digits that read back as the same float, or a given
+//! precision. Ported from Go's strconv (BSD-3-Clause, Copyright 2009 The Go Authors): Dragonbox for the shortest
+//! digits, Ryū's fixed digits up to 18, Eisel-Lemire for reading, and its big decimal where those give up.
+
+import { addr, load } from "../builtin/mem"
+import { E, e, dot, isDigit, minus, plus, zero } from "./ascii"
+import { pow10Tab } from "./float/powers"
+import { isFinite, isNaN, max, min } from "./math"
+import { ParseError } from "./parse"
+import { Float } from "./types"
+
+/// A binary float format: the bits of the significand after its leading one, of the exponent, and the exponent's
+/// offset.
+type Layout = { mantbits: i32, expbits: i32, bias: i32 }
+
+const single: Layout = { mantbits: 23, expbits: 8, bias: -127 }
+const double: Layout = { mantbits: 52, expbits: 11, bias: -1023 }
+
+type Format = "e" | "f" | "g"
+
+/// Powers of ten, exact as integers and as floats.
+const tens: u64[] = [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000, 10000000000,
+	100000000000, 1000000000000, 10000000000000, 100000000000000, 1000000000000000, 10000000000000000,
+	100000000000000000, 1000000000000000000]
+const tensf: f64[] = [1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+	1e17, 1e18, 1e19, 1e20, 1e21, 1e22]
+
+/// x in decimal. "e" is d.ddde±d, "f" is ddd.ddd, "g" is whichever is shorter, as in C's printf; prec is the
+/// digits after the point for "e" and "f" and the significant digits for "g", or, negative, the fewest that read
+/// back as x, "f" from 1e-6 up to 1e21. Exponents and infinities are written as JavaScript writes them.
+export function formatFloat[T extends Float](x: T, fmt: Format = "g", prec: i32 = -1): string {
+	const y = x as f64
+	if (isNaN(y)) {
+		return "NaN"
+	}
+	if (!isFinite(y)) {
+		return if (y < 0.0) "-Infinity" else "Infinity"
+	}
+	const neg = y < 0.0 || y == 0.0 && 1.0 / y < 0.0
+	const l = if (T == f32) single else double
+	const [mant, exp] = decompose(if (neg) -y else y, l)
+	let p = if (prec >= 0 && fmt == "g") max(prec, 1) else prec
+	const d = if (p < 0) shortest(mant, exp, l) else fixed(mant, exp, l, fmt, p)
+	if (p < 0) {
+		p = switch (fmt) {
+			case "e": d.nd - 1
+			case "f": max(d.nd - d.dp, 0)
+			default: d.nd
+		}
+	}
+	if (fmt == "g") {
+		// %e where the exponent is below -4 or at least the precision; the shortest digits are laid out as in JavaScript.
+		const eprec = if (prec < 0) 21 else if (p > d.nd && d.nd >= d.dp) d.nd else p
+		if (d.dp - 1 < (if (prec < 0) -6 else -4) || d.dp - 1 >= eprec) {
+			return fmtE(d, neg, min(p, d.nd) - 1)
+		}
+		return fmtF(d, neg, max((if (p > d.dp) d.nd else p) - d.dp, 0))
+	}
+	return if (fmt == "e") fmtE(d, neg, p) else fmtF(d, neg, p)
+}
+
+/// The fewest digits that read back as mant × 2^exp, by Dragonbox: the float's rounding interval is scaled by the
+/// power of ten that leaves one or two integers in it, found from 128 bits of the power, as the paper's algorithms
+/// 5.2, 5.4 and 5.6 do. An f32 takes the same path with the 128-bit powers, where Go has a 64-bit variant.
+function shortest(mant: u64, exp: i32, l: Layout): Decimal {
+	const d = new Decimal(24)
+	if (mant == 0) {
+		return d
+	}
+	const s = (63 - l.mantbits) as u64
+	if (mant == (1 as u64) << (l.mantbits as u64)) {
+		// The least of a binade: the interval below it is half as wide.
+		const k = -((exp * 631305 - 261663) >> 21) // -⌊exp log10 2 - log10 (4/3)⌋
+		const [hi, _, e1] = pow10(k)
+		const b = (exp + e1 - 1) as u64
+		let xi = (hi - (hi >> ((l.mantbits + 2) as u64))) >> (s - b)
+		const zi = (hi + (hi >> ((l.mantbits + 1) as u64))) >> (s - b)
+		if (exp != 2 && exp != 3) {
+			xi++
+		}
+		const q = zi / 10
+		if (xi <= q * 10) {
+			d.assign(q, 1 - k)
+			return d
+		}
+		let y = ((hi >> (s - 1 - b)) + 1) / 2
+		if (exp == -77 && y % 2 != 0) {
+			y--
+		} else if (y < xi) {
+			y++
+		}
+		d.assign(y, -k)
+		return d
+	}
+	// Scaled to leave at most one multiple of 100 in the interval, whose integer end is at z.
+	const k = 2 - log10pow2(exp)
+	let [hi, lo, e1] = pow10(k)
+	if (k < 0 || k > 55) {
+		lo++ // the ceiling of an inexact power
+	}
+	const b = (exp + e1 - 1) as u64
+	const [zi, zf, _] = mul192((mant * 2 + 1) << b, hi, lo)
+	let q = zi / 1000
+	let r = zi % 1000
+	const delta = hi >> (63 - b)
+	if (r < delta) {
+		if (r != 0 || zf != 0 || mant % 2 == 0) {
+			d.assign(q, 3 - k)
+			return d
+		}
+		q--
+		r = 1000
+	} else if (r == delta) {
+		const [odd, exact] = parity(mant * 2 - 1, hi, lo, b)
+		if (odd || exact && mant % 2 == 0) {
+			d.assign(q, 3 - k)
+			return d
+		}
+	}
+	// No multiple of 100: the multiple of 10 nearest the float, which is halfway from z.
+	const dist = r + 50 - delta / 2
+	let y = 10 * q + dist / 100
+	if (dist % 100 == 0) {
+		const [odd, exact] = parity(mant * 2, hi, lo, b)
+		if (odd != ((dist - 50) % 2 != 0) || exact && y % 2 != 0) {
+			y--
+		}
+	}
+	d.assign(y, 2 - k)
+	return d
+}
+
+/// Of mant2 × 10^k scaled by 2^b as the product with its 128-bit power is: whether the integer part is odd, and
+/// whether there is no fraction.
+function parity(mant2: u64, hi: u64, lo: u64, b: u64): [bool, bool] {
+	const [_, mid, low] = mul192(mant2, hi, lo)
+	return [(mid >> (64 - b)) & 1 != 0, (mid << b | low >> (64 - b)) == 0]
+}
+
+/// mant × 2^exp rounded to what fmt shows at prec: by Ryū for up to 18 digits, else by the big decimal.
+function fixed(mant: u64, exp: i32, l: Layout, fmt: Format, prec: i32): Decimal {
+	const e2 = exp + l.mantbits
+	const digits = switch (fmt) {
+		case "e": prec + 1
+		case "f": if (e2 >= 0) 1 + log10pow2(e2 + 1) + prec else 1 + prec - log10pow2(-e2)
+		default: prec
+	}
+	if (digits > 18) {
+		const d = new Decimal()
+		d.assign(mant)
+		d.shift(exp)
+		switch (fmt) {
+			case "e": d.round(prec + 1)
+			case "f": d.round(d.dp + prec)
+			default: d.round(prec)
+		}
+		return d
+	}
+	const d = new Decimal(24)
+	if (mant != 0 && digits > 0) {
+		fixedDigits(d, mant, exp, digits, prec, fmt)
+	}
+	return d
+}
+
+/// Ryū's fixed digits of mant × 2^exp, 1 to 18 of them: it is scaled by the power of ten that makes an integer of
+/// that many digits and a rounding bit, 128 bits of the power being enough for any f64. For "f", digits is an upper
+/// estimate, and the digits past prec after the point are cut.
+function fixedDigits(d: Decimal, mant: u64, exp: i32, digits: i32, prec: i32, fmt: Format) {
+	const z = clz(mant)
+	const m = mant << (z as u64)
+	const e = exp - z
+	const p = digits - 1 - log10pow2(63 + e)
+	let [hi, lo, e2] = pow10(p)
+	if (-22 <= p < 0) {
+		lo++ // the ceiling, so that multiples of 5^-p divide exactly
+	}
+	const [v0, mid, low] = mul192(m, hi, lo)
+	// Whether bits were dropped: of an inexact power, or of the product's lower words, unless an exact division.
+	let trunc = if (0 <= p <= 55) (mid | low) != 0 else !(-22 <= p < 0 && divisible5(m, -p))
+	const shift = (-(e + e2) - 1) as u64
+	trunc = trunc || v0 & (((1 as u64) << shift) - 1) != 0
+	let v = v0 >> shift
+	let n = digits
+	let dp = digits - p
+	if (v >= tens[n] << 1) {
+		trunc = trunc || v % 10 != 0
+		v /= 10
+		dp++
+	}
+	if (fmt == "f" && n != dp + prec) {
+		while (n > dp + prec) {
+			trunc = trunc || v % 10 != 0
+			v /= 10
+			n--
+		}
+		if (n <= 0) {
+			n = 1 // 0.09 to one digit is 0.1
+			dp++
+		}
+	}
+	// Up on more than a half, or on a half when odd; then the rounding bit goes.
+	v += v & (if (trunc) 1 else v >> 1) & 1
+	v >>= 1
+	if (v == tens[n]) {
+		v = tens[n - 1] // 999… became 1000…
+		dp++
+	}
+	d.assign(v, dp - n)
+}
+
+/// Whether 5^p divides x.
+function divisible5(x: u64, p: i32): bool {
+	let v = x
+	for (const _ of 1 ... p) {
+		if (v % 5 != 0) {
+			return false
+		}
+		v /= 5
+	}
+	return true
+}
+
+/// s whole as a float: digits, a fraction after ., an exponent after e or E, a leading -; no +, spaces or _.
+export function parseFloat[T extends Float = f64](s: string): T throws ParseError {
+	const [v, end] = scanFloat[T](s, 0)
+	if (end != s.length) {
+		throw new ParseError("syntax", end)
+	}
+	return v
+}
+
+/// The float at s[start] and the index after it; "range" means too large for T, as there is no written infinity.
+/// Rounds to nearest, even on ties, however many digits.
+export function scanFloat[T extends Float = f64](s: string, start: i32 = 0): [T, i32] throws ParseError {
+	let i = start
+	const neg = s.at(i) == minus
+	if (neg) {
+		i++
+	}
+	if (!isDigit(s.at(i) ?? 0)) {
+		throw new ParseError("syntax", i)
+	}
+	// The first 19 significant digits in mant, all of them in long once there are more, and the point dp digits in.
+	let mant: u64 = 0
+	let nd = 0
+	let dp = 0
+	let point = false
+	let long: Decimal | null = null
+	while (true) {
+		const ch = s.at(i) ?? 0
+		if (ch == dot && !point) {
+			point = true
+			dp = nd
+			if (!isDigit(s.at(i + 1) ?? 0)) {
+				throw new ParseError("syntax", i + 1)
+			}
+		} else if (!isDigit(ch)) {
+			break
+		} else if (ch == zero && nd == 0) {
+			dp--
+		} else if (nd < 19) {
+			mant = mant * 10 + (ch - zero)
+			nd++
+		} else {
+			if (long == null) {
+				long = new Decimal()
+				long.assign(mant)
+				long.nd = 19 // with the trailing zeros
+			}
+			long.append(ch - zero)
+			nd++
+		}
+		i++
+	}
+	if (!point) {
+		dp = nd
+	}
+	if (s.at(i) == e || s.at(i) == E) {
+		i++
+		const esign = if (s.at(i) == minus) -1 else 1
+		if (s.at(i) == minus || s.at(i) == plus) {
+			i++
+		}
+		if (!isDigit(s.at(i) ?? 0)) {
+			throw new ParseError("syntax", i)
+		}
+		let exp = 0
+		while (isDigit(s.at(i) ?? 0)) {
+			exp = min(exp * 10 + (s[i] - zero), 10000)
+			i++
+		}
+		dp += exp * esign
+	}
+	const l = if (T == f32) single else double
+	const exp10 = dp - min(nd, 19)
+	let v = if (long == null) exact[T](mant, exp10) else null
+	if (v == null) {
+		v = eiselLemire(mant, exp10, l)
+		if (long != null && v != eiselLemire(mant + 1, exp10, l)) {
+			v = null // the dropped digits may matter
+		}
+	}
+	if (v == null) {
+		const d = long ?? new Decimal()
+		if (long == null) {
+			d.assign(mant, exp10)
+		} else {
+			d.dp = dp
+		}
+		const [m, e2] = toBinary(d, l, start)
+		v = compose(m, e2)
+	}
+	return [(if (neg) -v else v) as T, i]
+}
+
+/// mant × 10^exp10 as a T when one operation rounds: mant is exact in T, and so is 10^|exp10|, up to 10^22 in an
+/// f64 and 10^10 in an f32; more of the exponent may go into mant while it stays an exact integer. Else null.
+function exact[T extends Float](mant: u64, exp10: i32): f64 | null {
+	const [intdigits, powdigits] = if (T == f32) [7, 10] else [15, 22]
+	if (mant >> ((if (T == f32) 23 else 52) as u64) != 0 || exp10 < -powdigits || exp10 > intdigits + powdigits) {
+		return null
+	}
+	let f = mant as T
+	let e = exp10
+	if (e > powdigits) {
+		f *= tensf[e - powdigits] as T
+		e = powdigits
+		if (f > (tensf[intdigits] as T)) {
+			return null
+		}
+	}
+	return (if (e < 0) f / (tensf[-e] as T) else f * (tensf[e] as T)) as f64
+}
+
+/// mant × 10^exp10, mant nonzero, as the nearest float of the layout, when 128 bits of the power of ten decide the
+/// rounding: Eisel-Lemire. Null where they do not, or where the power is out of the table.
+function eiselLemire(mant: u64, exp10: i32, l: Layout): f64 | null {
+	if (mant == 0) {
+		return 0.0
+	}
+	if (exp10 < -348 || exp10 > 347) {
+		return null
+	}
+	const [hi, lo, e2] = pow10(exp10)
+	const z = clz(mant)
+	const m = mant << (z as u64)
+	let exp = e2 + 63 - l.bias - z
+	let [xhi, xlo] = mul128(m, hi)
+	// The bits below the result's rounding bit: all ones leave the rounding undecided, so the low word of the power
+	// is multiplied in too.
+	const mask = ((1 as u64) << ((61 - l.mantbits) as u64)) - 1
+	if (xhi & mask == mask && xlo + m < m) {
+		const [yhi, ylo] = mul128(m, lo)
+		const mlo = xlo + yhi
+		const mhi = xhi + (if (mlo < xlo) 1 else 0)
+		if (mhi & mask == mask && mlo + 1 == 0 && ylo + m < m) {
+			return null
+		}
+		xhi = mhi
+		xlo = mlo
+	}
+	const msb = xhi >> 63
+	let r = xhi >> (msb + ((61 - l.mantbits) as u64))
+	exp -= (1 ^ msb) as i32
+	if (xlo == 0 && xhi & mask == 0 && r & 3 == 1) {
+		return null // exactly halfway, as far as is known
+	}
+	r += r & 1
+	r >>= 1
+	if (r >> ((l.mantbits + 1) as u64) > 0) {
+		r >>= 1
+		exp++
+	}
+	if (exp <= 0 || exp >= (1 << l.expbits) - 1) {
+		return null // subnormal or infinite
+	}
+	return compose(r, exp + l.bias - l.mantbits)
+}
+
+/// 10^k as the words hi and lo of a 128-bit significand with its top bit set, and e, where 10^k = hi.lo × 2^(e - 128).
+function pow10(k: i32): [u64, u64, i32] {
+	return [pow10Tab[2 * (k + 348)], pow10Tab[2 * (k + 348) + 1], 1 + ((k * 108853) >> 15)]
+}
+
+/// ⌊x log10 2⌋, for |x| up to 1600.
+function log10pow2(x: i32): i32 { return (x * 78913) >> 18 }
+
+/// The leading zero bits of x.
+function clz(x: u64): i32 {
+	let n = 64
+	let v = x
+	while (v != 0) {
+		v >>= 1
+		n--
+	}
+	return n
+}
+
+/// The high and low words of x × y, from the products of their 32-bit halves.
+function mul128(x: u64, y: u64): [u64, u64] {
+	const ll = (x & 0xffffffff) * (y & 0xffffffff)
+	const lh = (x & 0xffffffff) * (y >> 32)
+	const hl = (x >> 32) * (y & 0xffffffff)
+	const mid = (ll >> 32) + (lh & 0xffffffff) + (hl & 0xffffffff)
+	return [(x >> 32) * (y >> 32) + (lh >> 32) + (hl >> 32) + (mid >> 32), mid << 32 | ll & 0xffffffff]
+}
+
+/// The three words of x × y, y the two words hi and lo.
+function mul192(x: u64, hi: u64, lo: u64): [u64, u64, u64] {
+	const [m1, l] = mul128(x, lo)
+	const [h, m2] = mul128(x, hi)
+	const m = m1 + m2
+	return [h + (if (m < m1) 1 else 0), m, l]
+}
+
+/// x, positive and finite, as mant × 2^exp with mant below 2^(mantbits + 1), and at least 2^mantbits unless exp is
+/// the least a subnormal has; zero is 0 × 2^0.
+function decompose(x: f64, l: Layout): [u64, i32] {
+	if (x == 0.0) {
+		return [0, 0]
+	}
+	let m = x
+	let exp = 0
+	while (m >= two64) {
+		m /= two64
+		exp += 64
+	}
+	while (m < 1.0) {
+		m *= two64
+		exp -= 64
+	}
+	// m is in [1, 2^64): its integer part's bit length tells how far its top bit is from bit mantbits.
+	const shift = l.mantbits - 63 + clz(m as u64)
+	m = if (shift >= 0) m * pow2(shift) else m / pow2(-shift)
+	exp -= shift
+	let mant = m as u64
+	const minexp = l.bias + 1 - l.mantbits
+	if (exp < minexp) {
+		mant >>= (minexp - exp) as u64
+		exp = minexp
+	}
+	return [mant, exp]
+}
+
+/// 2^k, k from 0 to 63.
+function pow2(k: i32): f64 { return ((1 as u64) << (k as u64)) as f64 }
+const two64 = 18446744073709551616.0
+
+/// mant × 2^exp: exact when that is a float, else mant rounds to 53 bits first. Scaling by 2^(exp mod 64) and then
+/// by 2^64 at a time is exact, as every value on the way is a float.
+export function compose(mant: u64, exp: i32): f64 {
+	let v = (mant as f64) * pow2(exp & 63)
+	let k = exp >> 6
+	while (k > 0) {
+		v *= two64
+		k--
+	}
+	while (k < 0) {
+		v /= two64
+		k++
+	}
+	return v
+}
+
+/// x's IEEE 754 bits, a NaN's payload too.
+export function bits(x: f64): u64 { return load[u64](addr(x)) }
+/// The f64 whose IEEE 754 bits are b.
+export function fromBits(b: u64): f64 { return load[f64](addr(b)) }
+
+const powtab = [1, 3, 6, 9, 13, 16, 19, 23, 26]
+
+/// d, the number at s[at], as the nearest mant × 2^exp of the layout; a "range" error above its largest.
+function toBinary(d: Decimal, l: Layout, at: i32): [u64, i32] throws ParseError {
+	if (d.nd == 0 || d.dp < -330) {
+		return [0, 0]
+	}
+	if (d.dp > 310) {
+		throw new ParseError("range", at)
+	}
+	// Scale by powers of two until d is in [0.5, 1).
+	let exp = 0
+	while (d.dp > 0) {
+		const n = if (d.dp >= powtab.length) 27 else powtab[d.dp]
+		d.shift(-n)
+		exp += n
+	}
+	while (d.dp < 0 || d.dp == 0 && d.d[0] < 5) {
+		const n = if (-d.dp >= powtab.length) 27 else powtab[-d.dp]
+		d.shift(n)
+		exp -= n
+	}
+	exp--
+	// A subnormal: fewer significant bits.
+	if (exp < l.bias + 1) {
+		d.shift(exp - l.bias - 1)
+		exp = l.bias + 1
+	}
+	if (exp - l.bias >= (1 << l.expbits) - 1) {
+		throw new ParseError("range", at)
+	}
+	d.shift(1 + l.mantbits)
+	let mant = d.roundedInteger()
+	// Rounding carried into a new bit.
+	if (mant == (2 as u64) << (l.mantbits as u64)) {
+		mant >>= 1
+		exp++
+		if (exp - l.bias >= (1 << l.expbits) - 1) {
+			throw new ParseError("range", at)
+		}
+	}
+	return [mant, exp - l.mantbits]
+}
+
+/// d as d.ddde±d with prec digits after the point.
+function fmtE(d: Decimal, neg: bool, prec: i32): string {
+	const out = new u8[]((if (neg) 1 else 0) + 1 + (if (prec > 0) prec + 1 else 0))
+	let i = 0
+	if (neg) {
+		out[0] = minus
+		i = 1
+	}
+	i = digitsOf(d, 0, 1, out, i)
+	if (prec > 0) {
+		out[i] = dot
+		digitsOf(d, 1, prec, out, i + 1)
+	}
+	const exp = if (d.nd == 0) 0 else d.dp - 1
+	return fromBytes(out) + (if (exp < 0) "e-" else "e+") + `${if (exp < 0) -exp else exp}`
+}
+
+/// d as ddd.ddd with prec digits after the point.
+function fmtF(d: Decimal, neg: bool, prec: i32): string {
+	const out = new u8[]((if (neg) 1 else 0) + max(d.dp, 1) + (if (prec > 0) prec + 1 else 0))
+	let i = 0
+	if (neg) {
+		out[0] = minus
+		i = 1
+	}
+	if (d.dp > 0) {
+		i = digitsOf(d, 0, d.dp, out, i)
+	} else {
+		out[i] = zero
+		i++
+	}
+	if (prec > 0) {
+		out[i] = dot
+		digitsOf(d, d.dp, prec, out, i + 1)
+	}
+	return fromBytes(out)
+}
+
+/// The n digits of d from index from, zero beyond its ends, into out at i; the index after them.
+function digitsOf(d: Decimal, from: i32, n: i32, out: u8[], i: i32): i32 {
+	for (const j of 0 ... n - 1) {
+		const k = from + j
+		out[i + j] = zero + (if (k >= 0 && k < d.nd) d.d[k] else 0)
+	}
+	return i + n
+}
+
+/// A decimal of up to cap significant digits, 800 being enough to write any f64 exactly: digits d[0 … nd), none
+/// leading or trailing zero, with the point dp digits in, and whether nonzero digits past them were dropped.
+class Decimal {
+	d: u8[]
+	nd = 0
+	dp = 0
+	trunc = false
+
+	constructor(cap: i32 = 800) { this.d = new u8[](cap) }
+
+	/// The digits of v × 10^exp, v below 10^19.
+	assign(v: u64, exp: i32 = 0) {
+		let n = 1
+		while (n < tens.length && v >= tens[n]) {
+			n++
+		}
+		let w = v
+		for (const i of 1 ... n) {
+			this.d[n - i] = (w % 10) as u8
+			w /= 10
+		}
+		this.nd = n
+		this.dp = n + exp
+		this.trim()
+	}
+
+	/// One more digit after the others.
+	append(digit: u8) {
+		if (this.nd < this.d.length) {
+			this.d[this.nd] = digit
+			this.nd++
+		} else if (digit != 0) {
+			this.trunc = true
+		}
+	}
+
+	private trim() {
+		while (this.nd > 0 && this.d[this.nd - 1] == 0) {
+			this.nd--
+		}
+		if (this.nd == 0) {
+			this.dp = 0
+		}
+	}
+
+	/// Multiplies by 2^k.
+	shift(k: i32) {
+		if (this.nd == 0) {
+			return
+		}
+		let n = k
+		while (n > 60) {
+			this.shiftLeft(60)
+			n -= 60
+		}
+		while (n < -60) {
+			this.shiftRight(60)
+			n += 60
+		}
+		if (n > 0) {
+			this.shiftLeft(n)
+		} else if (n < 0) {
+			this.shiftRight(-n)
+		}
+	}
+
+	/// Divides by 2^k, k at most 60: long division, each digit carrying its remainder into the next.
+	private shiftRight(k: i32) {
+		const s = k as u64
+		let r = 0
+		let w = 0
+		let n: u64 = 0
+		// Pick up enough leading digits for the first quotient digit.
+		while (n >> s == 0) {
+			if (r >= this.nd) {
+				if (n == 0) {
+					this.nd = 0
+					return
+				}
+				while (n >> s == 0) {
+					n *= 10
+					r++
+				}
+				break
+			}
+			n = n * 10 + this.d[r]
+			r++
+		}
+		this.dp -= r - 1
+		const mask = ((1 as u64) << s) - 1
+		while (r < this.nd) {
+			const c = this.d[r]
+			this.d[w] = (n >> s) as u8
+			w++
+			n = (n & mask) * 10 + c
+			r++
+		}
+		while (n > 0) {
+			const dig = (n >> s) as u8
+			if (w < this.d.length) {
+				this.d[w] = dig
+				w++
+			} else if (dig > 0) {
+				this.trunc = true
+			}
+			n = (n & mask) * 10
+		}
+		this.nd = w
+		this.trim()
+	}
+
+	/// Multiplies by 2^k, k at most 60: long multiplication from the last digit, after making room for the new
+	/// leading digits.
+	private shiftLeft(k: i32) {
+		// 2^k = 10^k / 5^k adds k - digits(5^k) + 1 digits, or one fewer, leaving the first slot unwritten.
+		const more = k - k * 69897 / 100000
+		let r = this.nd
+		let w = this.nd + more
+		let n: u64 = 0
+		while (r > 0 || n > 0) {
+			if (r > 0) {
+				r--
+				n += (this.d[r] as u64) << (k as u64)
+			}
+			w--
+			if (w < this.d.length) {
+				this.d[w] = (n % 10) as u8
+			} else if (n % 10 != 0) {
+				this.trunc = true
+			}
+			n /= 10
+		}
+		this.nd = min(this.nd + more, this.d.length) - w
+		this.dp += more - w
+		for (const i of 0 ... this.nd - 1) {
+			this.d[i] = this.d[i + w]
+		}
+		this.trim()
+	}
+
+	/// Whether d[nd …) rounds up: above a half, or a half with more dropped past it or an odd digit before it.
+	private roundsUp(nd: i32): bool {
+		if (nd < 0 || nd >= this.nd) {
+			return false
+		}
+		if (this.d[nd] == 5 && nd + 1 == this.nd) {
+			return this.trunc || nd > 0 && this.d[nd - 1] % 2 == 1
+		}
+		return this.d[nd] >= 5
+	}
+
+	/// Rounds to nd digits.
+	round(nd: i32) {
+		if (nd >= 0 && nd < this.nd) {
+			if (this.roundsUp(nd)) {
+				this.roundUp(nd)
+			} else {
+				this.roundDown(nd)
+			}
+		}
+	}
+
+	private roundDown(nd: i32) {
+		if (nd >= 0 && nd < this.nd) {
+			this.nd = nd
+			this.trim()
+		}
+	}
+
+	private roundUp(nd: i32) {
+		if (nd < 0 || nd >= this.nd) {
+			return
+		}
+		let i = nd - 1
+		while (i >= 0) {
+			if (this.d[i] < 9) {
+				this.d[i]++
+				this.nd = i + 1
+				return
+			}
+			i--
+		}
+		// All nines: one more digit.
+		this.d[0] = 1
+		this.nd = 1
+		this.dp++
+	}
+
+	/// The integer part, rounded; all ones past 10^20.
+	roundedInteger(): u64 {
+		if (this.dp > 20) {
+			return 0xffffffffffffffff
+		}
+		let n: u64 = 0
+		for (const i of 0 ... this.dp - 1) {
+			n = n * 10 + (if (i < this.nd) this.d[i] else 0)
+		}
+		return if (this.roundsUp(this.dp)) n + 1 else n
+	}
+}
