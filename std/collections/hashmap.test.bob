@@ -1,0 +1,103 @@
+import { fnv, combine } from "../hash"
+import { lower } from "../string"
+import { HashMap } from "./hashmap"
+
+/// A key by value: two points are equal when their coordinates are.
+class Point {
+	x: i32
+	y: i32
+
+	constructor(x: i32, y: i32) {
+		this.x = x
+		this.y = y
+	}
+}
+
+/// Strings compared without case.
+class Caseless {
+	static hash(k: string): u64 { return fnv(lower(k)) }
+	static eq(a: string, b: string): bool { return lower(a) == lower(b) }
+}
+
+test "set, get, overwrite" {
+	const m = new HashMap[string, i32]()
+	m.set("a", 1)
+	m.set("b", 2)
+	m.set("a", 3)
+	assert m.get("a") == 3
+	assert m.get("b") == 2
+	assert m.get("c") == null
+	assert m.size == 2
+}
+
+test "int keys grow and keep every key" {
+	const m = new HashMap[i32, string]()
+	for (const i of 0 ... 999) {
+		m.set(i * 8, `v${i}`)
+	}
+	assert m.size == 1000
+	for (const i of 0 ... 999) {
+		assert m.get(i * 8) == `v${i}`
+	}
+	assert !m.has(4)
+}
+
+test "a class key hashes and compares by its fields" {
+	const m = new HashMap[Point, string]()
+	m.set(new Point(1, 2), "a")
+	m.set(new Point(1, 2), "b")
+	assert m.size == 1
+	assert m.get(new Point(1, 2)) == "b"
+	assert m.get(new Point(2, 1)) == null
+}
+
+test "an array key by its elements, the references among them by identity" {
+	const p = new Point(1, 2)
+	const m = new HashMap[Point[], string]()
+	m.set([p, p], "a")
+	assert m.get([p, p]) == "a"
+	assert m.get([p, new Point(1, 2)]) == null
+	assert m.get([p]) == null
+}
+
+interface Named { name: string }
+class Cat { name = "cat" }
+class Dog { name = "dog" }
+
+test "an interface held as a union of its classes is by identity too" {
+	const c = new Cat()
+	const m = new HashMap[Named[], i32]()
+	m.set([c, new Dog()], 1)
+	m.set([c], 2)
+	assert m.get([c]) == 2
+	assert m.get([new Cat()]) == null
+}
+
+test "a hasher given" {
+	const m = new HashMap[string, i32, Caseless]()
+	m.set("Key", 1)
+	assert m.get("KEY") == 1
+	assert m.get("key") == 1
+	assert m.get("keys") == null
+}
+
+test "string keys grow, and delete keeps probe chains intact" {
+	const m = new HashMap[string, i32]()
+	for (const i of 0 ... 199) {
+		m.set(`k${i}`, i)
+	}
+	for (const i of 0 ... 99) {
+		m.delete(`k${i * 2}`)
+	}
+	assert m.size == 100
+	for (const i of 0 ... 99) {
+		assert !m.has(`k${i * 2}`)
+		assert m.get(`k${i * 2 + 1}`) == i * 2 + 1
+	}
+}
+
+test "fnv-1a" {
+	assert fnv("") == 14695981039346656037
+	assert fnv("a") == 0xaf63dc4c8601ec8c
+	assert combine(fnv(""), 0x61) == fnv("a")
+}
