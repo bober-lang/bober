@@ -10,6 +10,7 @@
 #include <mbedtls/x509_crt.h>
 #include <psa/crypto.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -20,9 +21,13 @@ typedef struct {
   mbedtls_pk_context key;
   // sending while a send is parked in the BIO; broken, the errno of a send that failed, as Mbed TLS would resend the
   // record it left before anything else, so every send after fails the same, as Go's; notified once close_notify is
-  // sent, ended once the peer's is read or bober_tls_close has cut the reads
-  int fd, err, nalpn, sending, broken, notified, ended;
-  long timeout;
+  // sent, ended once the peer's is read or bober_tls_close has cut the reads, eof once the socket has ended, as
+  // mbedtls_ssl_read's 0 is that or empty records (RFC 8446 §5.1)
+  int fd, err, nalpn, sending, broken, notified, ended, eof;
+  // when the read in flight, the record of the write in flight, which may be at once, or the handshake must be done
+  // by, so that a byte at a time does not hold one past its timeout; 0 for never. What a read sends, as the alert
+  // refusing a renegotiation, has the read's deadline
+  long until[2];
   size_t nip;
   unsigned char ip[16];  // a client's host if an IP, its nip bytes, checked by bober_tls_ip
   const char *alpn[9];  // null-ended
@@ -32,8 +37,15 @@ typedef struct {
 static long bober_tls_io(bober_tls *t, int write, void *buf, size_t n) {
   for (long r;;) {
     if ((r = write ? bober_io_write(t->fd, buf, n) : bober_io_read(t->fd, buf, n)) != BOBER_IO_AGAIN) return r;
-    if ((r = bober_io_ready(t->fd, write, t->timeout))) return r;
+    long wait = t->until[write] - bober_mono();
+    if ((r = bober_io_ready(t->fd, write, !t->until[write] ? 0 : wait < 1 ? 1 : wait))) return r;
   }
+}
+
+/// When a call of timeout ns must be done by.
+static long bober_tls_until(long timeout) {
+  long now = bober_mono();
+  return !timeout ? 0 : timeout > LONG_MAX - now ? LONG_MAX : now + timeout;
 }
 
 static int bober_tls_send(void *ctx, const unsigned char *buf, size_t n) {
@@ -50,6 +62,8 @@ static int bober_tls_send(void *ctx, const unsigned char *buf, size_t n) {
 static int bober_tls_recv(void *ctx, unsigned char *buf, size_t n) {
   bober_tls *t = ctx;
   long r = bober_tls_io(t, 0, buf, n);
+  if (!r) t->eof = 1;
+  if (!t->sending) t->until[1] = t->until[0];
   return r < 0 ? (t->err = -r, MBEDTLS_ERR_NET_RECV_FAILED) : r;
 }
 
@@ -109,10 +123,11 @@ static int bober_tls_ip(void *ctx, mbedtls_x509_crt *crt, int depth, uint32_t *f
   return *flags |= MBEDTLS_X509_BADCERT_CN_MISMATCH, 0;
 }
 
-/// Shakes hands, a client's with host, checked against the chain and sent as SNI unless an IP; a server's with null.
+/// Shakes hands within timeout, a client's with host, checked against the chain and sent as SNI unless an IP; a
+/// server's with null.
 static int bober_tls_handshake(void *ctx, const char *host, long timeout) {
   bober_tls *t = ctx;
-  t->timeout = timeout;
+  t->until[0] = t->until[1] = bober_tls_until(timeout);
   int r = mbedtls_ssl_setup(&t->ssl, &t->conf);
   if (!r && host) {
     // SNI must not carry an IP, so bober_tls_ip checks one, and the null hostname skips Mbed TLS's check of names.
@@ -128,10 +143,10 @@ static int bober_tls_handshake(void *ctx, const char *host, long timeout) {
 /// have been cut off.
 static int bober_tls_read(void *ctx, void *buf, size_t n, long timeout) {
   bober_tls *t = ctx;
-  t->timeout = timeout;
+  t->until[0] = bober_tls_until(timeout);
   while (!t->ended) {
     int r = mbedtls_ssl_read(&t->ssl, buf, n);
-    if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+    if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE || (!r && !t->eof)) continue;
     if (r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) t->ended = 1;
     else if (r || t->ended) return r;
     else return t->err = ECONNRESET, MBEDTLS_ERR_NET_RECV_FAILED;
@@ -139,15 +154,22 @@ static int bober_tls_read(void *ctx, void *buf, size_t n, long timeout) {
   return 0;
 }
 
+/// Lowers the read in flight's deadline to by, a bober_mono time, from its next wait; nothing for 0.
+static void bober_tls_hasten(void *ctx, long by) {
+  bober_tls *t = ctx;
+  if (by && (!t->until[0] || by < t->until[0])) t->until[0] = by;
+}
+
 /// Sends all n bytes at buf: n, or a code.
 static int bober_tls_write(void *ctx, const void *buf, size_t n, long timeout) {
   bober_tls *t = ctx;
-  t->timeout = timeout;
   // buf may be in the collector's heap, which moves while the BIO parks, so a copy, as src/io.c makes for a write.
   unsigned char *copy = malloc(n + 1);
+  if (!copy) return MBEDTLS_ERR_SSL_ALLOC_FAILED;
   memcpy(copy, buf, n);
   int r = 0;
   for (size_t at = 0; at < n;) {
+    t->until[1] = bober_tls_until(timeout);  // a record's, so a long write goes on while it moves, as net's
     r = mbedtls_ssl_write(&t->ssl, copy + at, n - at);
     if (r >= 0) at += r;
     else if (r != MBEDTLS_ERR_SSL_WANT_READ && r != MBEDTLS_ERR_SSL_WANT_WRITE) break;
@@ -160,17 +182,18 @@ static int bober_tls_write(void *ctx, const void *buf, size_t n, long timeout) {
 static int bober_tls_shutdown(void *ctx, long timeout) {
   bober_tls *t = ctx;
   if (t->notified) return 0;
-  t->notified = 1, t->timeout = timeout;
+  t->notified = 1, t->until[1] = bober_tls_until(timeout);
   int r;
   while ((r = mbedtls_ssl_close_notify(&t->ssl)) == MBEDTLS_ERR_SSL_WANT_WRITE) {}
   return r;
 }
 
-/// Tells the peer if it can, so that it reads an end rather than a cut, then ends the reads and writes in flight.
+/// Tells the peer if it can, within a second at most, as a peer that reads nothing could hold it, so that it reads an
+/// end rather than a cut; then ends the reads and writes in flight.
 static void bober_tls_close(void *ctx, long timeout) {
   bober_tls *t = ctx;
   t->ended = 1;
-  bober_tls_shutdown(t, timeout);
+  bober_tls_shutdown(t, !timeout || timeout > 1000000000 ? 1000000000 : timeout);
   bober_io_shutdown(t->fd, 1);
 }
 

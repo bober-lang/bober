@@ -305,6 +305,19 @@ test "a response's body goes as it comes, not held back till more of it is read"
 	await job
 }
 
+test "a response's body goes as it comes, not held back till more of it is read" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const t = raw(l)
+	t.timeout = 300_000_000
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/pong"], [":authority", "localhost"]]
+	t.write(frame(1, 4, 1, new Encoder().encode(post)) + frame(0, 0, 1, "a"))
+	assert until(t, 0, 0, 1) && found == "a"
+	t.close()
+	shutdown(l.fd, SHUT_RDWR)
+	await job
+}
+
 test "requests at once share the connection, and a fault resets one stream alone" {
 	const l = net.listen("127.0.0.1:0")
 	const job = async serve(l, 100)
@@ -398,6 +411,30 @@ test "a frame on the wrong stream, or a SETTINGS or PING of the wrong size, is a
 	assert until(t, 6)
 	t.close()
 	l.handle.shutdown(true)
+	await job
+}
+
+test "a frame on the wrong stream, or a SETTINGS or PING of the wrong size, is a connection error of its code; one on a closed stream is not" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const code = fromBytes([0, 0, 0, 8])
+	const inc = fromBytes([0, 0, 0, 1])
+	const cases: [string, i64][] = [[frame(3, 0, 0, code), 1], [frame(3, 0, 1, code), 1], [frame(0, 0, 1, "x"), 1],
+		[frame(8, 0, 1, inc), 1], [frame(2, 0, 0, "12345"), 1], [frame(7, 0, 1, code + code), 1],
+		[frame(4, 1, 0, fromBytes([0, 3, 0, 0, 0, 1])), 6], [frame(4, 0, 0, "12345"), 6], [frame(6, 0, 0, "1234"), 6]]
+	for (const [bad, want] of cases) {
+		const t = raw(l)
+		t.write(bad)
+		assert until(t, 7) && num(found, 4, 4) == want
+		t.close()
+	}
+	const t = raw(l)
+	t.write(frame(1, 5, 1, new Encoder().encode(get("/hello"))))
+	assert until(t, 0, 0, 1)
+	t.write(frame(0, 0, 1, "x") + frame(8, 0, 1, inc) + frame(3, 0, 1, code) + frame(6, 0, 0, "12345678"))
+	assert until(t, 6)
+	t.close()
+	shutdown(l.fd, SHUT_RDWR)
 	await job
 }
 

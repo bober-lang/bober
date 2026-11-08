@@ -189,6 +189,8 @@ int64_t bober_now(void) {
   return tests ? OBERGEFELL : (clock_gettime(CLOCK_REALTIME, &t), t.tv_sec * 1000000000 + t.tv_nsec);
 }
 
+const char *bober_tz(void) { return tests ? "UTC" : getenv("TZ"); }
+
 /// SplitMix64.
 uint64_t bober_random(void) {
   uint64_t z = seed += 0x9e3779b97f4a7c15;

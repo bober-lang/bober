@@ -2,7 +2,10 @@ import { readFile } from "./fs"
 import { IoError } from "./io"
 import * as net from "./net"
 import { Config, client, server } from "./tls"
+import { monotonic, second } from "./time"
 import { Signal } from "../builtin/fiber"
+import { MSG_DONTWAIT, send } from "sys/socket.h"
+import { usleep } from "unistd.h"
 
 const own = owning()
 
@@ -244,5 +247,142 @@ test "close ends a read in flight" {
 	const read = async c.read(1024)
 	c.close()
 	assert await read == null && await job == null
+	l.close()
+}
+
+test "close tells a peer that reads nothing for a second at most, then ends a read in flight" {
+	const l = net.listen("127.0.0.1:0")
+	const done = new Signal()
+	const job = async (() => {
+		const c = l.accept()
+		server(c, own).read(1)
+		done.wait()
+		c.close()
+	})()
+	const raw = net.dial(`${l.addr}`)
+	const c = client(raw, "localhost", trusting())
+	c.write("x")
+	// Bytes past the TLS, never read, until the socket's buffers and the peer's stay full.
+	const junk = flood().slice(0, 4096)
+	let idle = 0
+	while (idle < 20) {
+		if (send(raw.fd, junk, 4096, MSG_DONTWAIT) > 0) {
+			idle = 0
+		} else {
+			idle++
+			usleep(10_000)
+		}
+	}
+	const read = async c.read(1024)
+	const start = monotonic()
+	c.close()
+	assert monotonic() - start < 2 * second && await read == null
+	done.wake()
+	await job
+	l.close()
+}
+
+test "a read and a write in flight at once each keep their timeout" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async (() => {
+		const c = l.accept()
+		const s = server(c, own)
+		try {
+			s.read(1024)
+			c.write("\x17\x03\x03\x00\x20")  // a record's head: the read waits again, after the write, for the rest
+			c.timeout = 200_000_000
+			try {
+				c.read(1)  // a pause past the write's timeout
+			} catch (e: IoError) {}
+			c.write("0123456789abcdef0123456789abcdef")
+		} finally {
+			s.close()
+		}
+	})()
+	const c = client(net.dial(`${l.addr}`), "localhost", trusting())
+	const read = async c.read(1024)
+	c.timeout = 50_000_000
+	c.write("x")
+	let kind = ""
+	try {
+		await read
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	assert kind == "Tls"
+	c.close()
+	await job
+	l.close()
+}
+
+/// Shakes hands on the connection l accepts, then sends a record of nonsense past the TLS a byte every 50 ms.
+function trickling(l: net.Listener) throws IoError {
+	const c = l.accept()
+	const s = server(c, own)
+	c.timeout = 50_000_000
+	const record = "\x17\x03\x03\x00\x20" + flood().slice(0, 32)
+	try {
+		for (const i of 0 ... record.length - 1) {
+			c.write(record.slice(i, i + 1))
+			try {
+				c.read(1) // A pause.
+			} catch (e: IoError) {}
+		}
+	} catch (e: IoError) {}
+	s.close()
+}
+
+test "a read's timeout is for the whole read, though its record comes a byte at a time" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async trickling(l)
+	const c = client(net.dial(`${l.addr}`), "localhost", trusting())
+	c.timeout = 200_000_000
+	let kind = ""
+	try {
+		c.read(1024)
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	c.close()
+	await job
+	assert kind == "TimedOut"
+	l.close()
+}
+
+/// Reads all the connection l accepts sends, pausing 10 ms each 256 KiB: the byte count.
+function sipping(l: net.Listener): i32 throws IoError {
+	const s = server(l.accept(), own)
+	const idle = net.listen("127.0.0.1:0")
+	const pause = net.dial(`${idle.addr}`)  // a read of a connection never accepted times out
+	pause.timeout = 10_000_000
+	try {
+		let n = 0
+		let got = s.read(1 << 16)
+		while (got != null) {
+			if ((n >> 18) != ((n + got.length) >> 18)) {
+				try {
+					pause.read(1)
+				} catch (e: IoError) {}
+			}
+			n += got.length
+			got = s.read(1 << 16)
+		}
+		return n
+	} finally {
+		s.close()
+		pause.close()
+		idle.close()
+	}
+}
+
+test "a write's timeout is for each record, so a long write goes on while the peer reads" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async sipping(l)
+	const c = client(net.dial(`${l.addr}`), "localhost", trusting())
+	c.timeout = 100_000_000
+	const big = flood()
+	c.write(big)
+	c.close()
+	assert await job == big.length
 	l.close()
 }

@@ -52,9 +52,14 @@ export function waited(fd: i32, write: bool, timeout: i64, op: string, what: str
 	}
 }
 
-/// Up to n > 0 bytes that read, a read of the run time's into the buffer it is given, gives; null at the end.
+/// The buffer received reads up to chunk bytes into. Fibers can share it, as a read writes it only in the call of the
+/// run time's, which never parks, and received copies what came before it returns.
+let scratch = new u8[](chunk)
+
+/// Up to n > 0 bytes that read, a read of the run time's of at most n bytes into the buffer it is given, gives; null
+/// at the end.
 export function received(n: i32, read: (buf: u8[]) => i64 throws IoError): string | null throws IoError {
-	const buf = new u8[](n)
+	const buf = if (n <= chunk) scratch else new u8[](n)
 	const got = read(buf) as i32
 	return if (got == 0) null else fromBytes(buf.slice(0, got))
 }

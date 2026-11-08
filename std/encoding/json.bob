@@ -1,8 +1,9 @@
 //! Values as JSON: a class, object or interface as an object of its fields in declaration order, an array, fixed
 //! array or tuple as an array, and a union's value untagged, which decoding reads as a member that fits, an integer
-//! if one does. Decoding is strict: no unknown keys, a class it makes takes no arguments, and fields left out keep
-//! their initial values. Tags on a field (spec 5.3) change its key, leave it out, take the unknown keys, or
-//! hold an object as its entries; ../encoding's count too.
+//! if one does, with a range error once the members that failed have read 16 times the input for each member.
+//! Decoding is strict: no unknown keys, a class it makes takes no arguments, and fields left out keep their initial
+//! values. Tags on a field (spec 5.3) change its key, leave it out, take the unknown keys, or hold an object as its
+//! entries; ../encoding's count too.
 
 import { backslash, colon, comma, cr, digit, dot, isControl, isDigit, lbrace, lbracket, lf, minus, nul, plus, quote,
 	rbrace, rbracket, slash, space, tab, zero } from "../ascii"
@@ -22,7 +23,8 @@ export class Skip {}
 export class OmitEmpty {}
 /// Tags an Unknown[] field to take the keys no other field takes, and to encode them back.
 export class Rest {}
-/// Tags a [K, V][] field to hold an object as its entries, in order; a key twice fails decoding.
+/// Tags a [K, V][] field to hold an object as its entries, in order; a key twice fails decoding. A key not a string is
+/// its JSON, quoted, so a string key spelling another member's JSON, as "1" in i32 | string, reads back as that member.
 export class Mapping {}
 
 /// A key and its value's text, as a Rest field holds them.
@@ -81,6 +83,12 @@ export function encode[T](v: T): string throws EncodeError {
 	}
 }
 
+/// k's JSON as an object's key: quoted, unless a string's already is.
+function keyOf[K](k: K): string throws EncodeError {
+	const s = encode(k)
+	return if (s[0] == quote) s else quoted(s)
+}
+
 /// A Mapping field's entries as an object.
 function entries[T](xs: T): string throws EncodeError {
 	const items: string[] = []
@@ -88,7 +96,7 @@ function entries[T](xs: T): string throws EncodeError {
 		case "array": for (const e of xs) {
 			const kv: string[] = []
 			for (const f of T.elem.fields) {
-				kv.push(encode(e[f.name]))
+				kv.push(if (kv.length == 0) keyOf(e[f.name]) else encode(e[f.name]))
 			}
 			items.push(kv.join(":"))
 		}
@@ -123,6 +131,9 @@ function starts[T](c: u8): bool {
 const hex = "0123456789abcdef"
 /// The most arrays and objects decoding nests, as each takes a few KiB of a fiber's 1 MiB stack in a debug build.
 const maxDepth = 128
+/// How many times the input, for each of a union's members, the members that fail may read in all, so decoding
+/// reads it at most that many times more, however deep they nest.
+const retries: i64 = 16 // i64, as the bound it makes passes 2^31
 
 /// s as a JSON string.
 export function quoted(s: string): string {
@@ -149,6 +160,7 @@ class Decoder {
 	s: string
 	i = 0
 	depth = 0 // arrays and objects open
+	failed: i64 = 0 // bytes read by union members that failed
 
 	constructor(s: string) { this.s = s }
 
@@ -180,6 +192,10 @@ class Decoder {
 							try {
 								return this.value[M]()
 							} catch (e: ParseError) {
+								this.failed += this.i - at
+								if (this.failed > retries * T.members.length * this.s.length) {
+									throw new ParseError("range", at)
+								}
 								last = e
 								this.i = at
 								this.depth = depth
@@ -239,7 +255,7 @@ class Decoder {
 							const at = this.i
 							this.skip()
 							const rest: Unknown[] = r[f.name]
-							rest.push([name, this.s.slice(at, this.i)])
+							rest.push([name, this.s.slice(at, this.i).copy()]) // not keeping all of s alive
 							known = true
 						}
 					}
@@ -258,18 +274,21 @@ class Decoder {
 		switch (T.kind) {
 			case "array":
 				const xs: T = []
-				const keys: string[] = []
+				const keys: [string, i32][] = [] // each key and where it starts
 				this.space()
 				this.open(lbrace)
 				while (this.more(rbrace, xs.length)) {
 					const at = this.i
-					const key = this.string()
-					if (keys.includes(key)) {
-						throw new ParseError("syntax", at)
-					}
-					keys.push(key)
+					keys.push([this.string(), at])
 					this.i = at
 					xs.push(this.entry[T.elem]())
+				}
+				// Sorted, stably, a key twice is next to itself, the later after.
+				sortBy(keys, (a, b) => a[0] < b[0])
+				for (const i of 1 ... keys.length - 1) {
+					if (keys[i][0] == keys[i - 1][0]) {
+						throw new ParseError("syntax", keys[i][1])
+					}
 				}
 				return xs
 			default: throw this.error()
@@ -286,12 +305,30 @@ class Decoder {
 					if (i == 1) {
 						this.close(colon)
 					}
-					e[f.name] = this.value[f.type]()
+					e[f.name] = if (i == 0) this.key[f.type]() else this.value[f.type]()
 					i++
 				}
 				return e
 			default: throw this.error()
 		}
+	}
+
+	/// A key as keyOf writes it: a non-string's JSON, quoted and canonical so a key twice is the same text; else a
+	/// string.
+	key[T extends Decodable](): T throws ParseError {
+		const at = this.i
+		const s = this.string()
+		if (T.kind == "string") {
+			return s
+		}
+		try {
+			const k = decode[T](s)
+			if (keyOf(k) == quoted(s)) {
+				return k
+			}
+		} catch (e: ParseError | EncodeError) {}
+		this.i = at
+		return this.value[T]()
 	}
 
 	/// Moves past a value of any type.
@@ -304,7 +341,16 @@ class Decoder {
 					this.skip()
 					n++
 				}
-			case lbrace: this.value[Keys]()
+			case lbrace:
+				this.open(lbrace)
+				let n = 0
+				while (this.more(rbrace, n)) {
+					this.string()
+					this.close(colon)
+					this.space()
+					this.skip()
+					n++
+				}
 			case quote: this.string()
 			case ascii.t, ascii.f: this.bool()
 			case ascii.n: this.word("null")
