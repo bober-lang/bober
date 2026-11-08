@@ -144,8 +144,12 @@ void bober_wake(uint64_t f);
 
 /// The time in ns since the epoch, in tests a fixed one that does not advance.
 int64_t bober_now(void);
+/// The local time zone as POSIX's TZ gives it, 0 if TZ is unset; in tests "UTC".
+const char *bober_tz(void);
 /// 64 random bits, not for keys; in tests the same ones in each test.
 uint64_t bober_random(void);
+/// The time in ns since a fixed point, which nothing sets back or forward: for deadlines, which must pass in tests too.
+int64_t bober_mono(void);
 
 // I/O, through which std makes every system call, so that it needs no header of the system's: src/io.c translates
 // each for where it runs, through its libc. A call gives a result >= 0 or a failure < 0, which only bober_io_kind
@@ -179,6 +183,8 @@ long bober_io_mkdir(const char *path);
 /// Removes a file or an empty directory.
 long bober_io_remove(const char *path);
 long bober_io_rename(const char *from, const char *to);
+/// What the symlink at path points to, n bytes of it at most, in buf; its length.
+long bober_io_readlink(const char *path, void *buf, unsigned long n);
 /// What stat finds: err is 0 or a failure; times are in ns since the epoch, born 0 if unknown; kind is "file",
 /// "directory", "symlink" or "other"; perm the permission bits.
 typedef struct {

@@ -21,6 +21,7 @@ function routes(): Router {
 	r.get("/files/*path", (req, p) => text(`file ${p.get("path")!}`))
 	r.get("/in", (req, p) => text(req.headers.all("x-in").join("")))
 	r.get("/slash/", (req, p) => text("slash"))
+	r.get("/", (req, p) => text("root"))
 	const api = new Router()
 	api.use((req, next) => {
 		const res = next(req)
@@ -29,6 +30,7 @@ function routes(): Router {
 	})
 	api.get("/:name", (req, p) => text(`api ${p.get("name")!}`))
 	r.mount("/api", api)
+	r.mount("/v2/", api)
 	return r
 }
 
@@ -38,18 +40,25 @@ function on(method: string, path: string): Response { return app.handle(new Requ
 
 test "params, wildcards and literals" {
 	assert on("GET", "/users/1").body.text() == "user 1"
+	assert on("GET", "/users/").status == 404
 	assert on("GET", "/users/me").body.text() == "me"
 	assert on("GET", "/files/a/b.txt").body.text() == "file a/b.txt"
-	assert on("GET", "/files/").body.text() == "file "
+	assert on("GET", "/files/").body.text() == "file " && on("GET", "").body.text() == "root"
 	assert on("POST", "/users").status == 201
+	// Matched as it is, as middleware sees it, and taken decoded, a + kept, and an escape not well formed as it is.
+	assert on("GET", "/users/m%65").body.text() == "user me"
+		&& on("GET", "/users/a%20b%2Fc+d").body.text() == "user a b/c+d"
+		&& on("GET", "/users/100%").body.text() == "user 100%"
+		&& on("GET", "/files/a%20b/c").body.text() == "file a b/c"
 }
 
 test "what is not found" {
 	assert on("GET", "/nothing").status == 404
 	assert on("GET", "/slash").status == 404
 	assert on("GET", "/slash/").status == 200
+	assert on("GET", "/files").status == 404
 	const res = on("DELETE", "/users/1")
-	assert res.status == 405 && res.headers.get("allow") == "GET"
+	assert res.status == 405 && res.headers.get("allow") == "GET, HEAD"
 	const users = on("GET", "/users")
 	assert users.status == 405 && users.headers.get("allow") == "POST"
 	assert on("HEAD", "/users/1").status == 200
@@ -75,5 +84,5 @@ test "middleware wraps outermost first" {
 test "a mounted router keeps its middleware" {
 	const res = on("GET", "/api/thing")
 	assert res.body.text() == "api thing" && res.headers.get("x-api") == "1"
-	assert on("GET", "/api/a/b").status == 404
+	assert on("GET", "/api/a/b").status == 404 && on("GET", "/v2/thing").body.text() == "api thing"
 }

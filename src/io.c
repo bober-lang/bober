@@ -9,6 +9,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -27,15 +28,14 @@ uint64_t __attribute__((weak)) bober_self(void) { return 0; }
 void __attribute__((weak)) bober_wake(uint64_t f) {}
 void __attribute__((weak)) bober_park(void) { bober_io_wait(); }
 
+int64_t bober_mono(void) {
+  struct timespec t;
+  return clock_gettime(CLOCK_MONOTONIC, &t), t.tv_sec * 1000000000 + t.tv_nsec;
+}
+
 /// A fiber parked until fd is ready, on its stack: done once it is, -1 if its deadline passed first.
 typedef struct Wait { uint64_t fiber; int fd, write, done; long deadline; struct Wait *next; } Wait;
 static Wait *waits;
-
-static long now(void) {
-  struct timespec t;
-  clock_gettime(CLOCK_MONOTONIC, &t);
-  return t.tv_sec * 1000000000 + t.tv_nsec;
-}
 
 /// What a call that gave r gives: r, or the failure errno is, BOBER_IO_AGAIN for one that would block.
 static long result(long r) {
@@ -43,7 +43,8 @@ static long result(long r) {
 }
 
 long bober_io_ready(int fd, int write, long timeout) {
-  Wait w = {bober_self(), fd, write, 0, timeout ? now() + timeout : 0, waits};
+  long t = bober_mono();  // a deadline past the largest long saturates to it, which never comes
+  Wait w = {bober_self(), fd, write, 0, !timeout ? 0 : timeout > LONG_MAX - t ? LONG_MAX : t + timeout, waits};
   waits = &w;
   while (!w.done) bober_park();
   return w.done < 0 ? -ETIMEDOUT : 0;
@@ -53,16 +54,17 @@ int bober_io_wait(void) {
   static struct pollfd *fds;
   static int cap;
   int n = 0;
-  long soonest = 0, t = now();
+  long soonest = 0, t = bober_mono();
   for (Wait *w = waits; w; w = w->next, n++) {
     if (n == cap && !(fds = realloc(fds, (cap = cap ? 2 * cap : 64) * sizeof *fds))) fputs("out of memory\n", stderr), exit(1);
     fds[n] = (struct pollfd){w->fd, w->write ? POLLOUT : POLLIN, 0};
     if (w->deadline && (!soonest || w->deadline < soonest)) soonest = w->deadline;
   }
   if (!n) return 0;
-  if (poll(fds, n, !soonest ? -1 : soonest <= t ? 0 : (soonest - t + 999999) / 1000000) < 0 && errno != EINTR)
-    perror("poll"), exit(1);
-  t = now();
+  // In ms rounded up, at most poll's int; a later deadline is polled for again.
+  long ms = !soonest ? -1 : soonest <= t ? 0 : (soonest - t - 1) / 1000000 + 1;
+  if (poll(fds, n, ms > INT_MAX ? INT_MAX : ms) < 0 && errno != EINTR) perror("poll"), exit(1);
+  t = bober_mono();
   // bober_wake only queues, so the list keeps the order fds has.
   Wait **p = &waits;
   for (int i = 0; *p; i++) {
@@ -120,6 +122,8 @@ long bober_io_write(int fd, const void *buf, unsigned long n) { return result(wr
 long bober_io_sync(int fd) { return result(fsync(fd)); }
 long bober_io_mkdir(const char *path) { return result(mkdir(path, 0777)); }
 long bober_io_rename(const char *from, const char *to) { return result(rename(from, to)); }
+
+long bober_io_readlink(const char *path, void *buf, unsigned long n) { return result(readlink(path, buf, n)); }
 
 long bober_io_remove(const char *path) {
   struct stat s;

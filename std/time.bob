@@ -1,0 +1,1008 @@
+//! Time: instants, durations, the calendar and time zones, after the design of TC39's Temporal and Rust's jiff. The
+//! calendar's arithmetic is Neri and Schneider's ("Euclidean affine functions and their application to calendar
+//! algorithms", 2022), the TZif reader and POSIX TZ rules RFC 8536's, as Go's time package reads them.
+//!
+//! An instant is an i64 of ns since 1970-01-01T00:00Z, as now() gives it and fs.stat stamps files: it spans 1677-09-21
+//! to 2262-04-11: a Zone takes a wall clock's reading past either end to it, as a float cast does, and a parser throws
+//! a range error at the year of a timestamp past it. A duration is an i64 of ns, exact: a day or a month is none, as
+//! its length depends on the calendar and the zone, so those are steps of a Date. A Date or DateTime is what a calendar
+//! and a wall clock read, which names an instant only together with a Zone, and whose == compares identity, as any
+//! class's does: compare() compares values. Deadlines and elapsed times take monotonic(), which jumps neither with the
+//! wall clock nor with NTP. Leap seconds do not exist here, as in Unix time; nor do calendars but the proleptic
+//! Gregorian, locales or strftime's patterns, whose text depends on them, or zone abbreviations, which are ambiguous.
+
+import { J, M, T, Z, colon, comma, dot, greater, isAlphabetic, isAlphanumeric, isDigit, less, lf, minus, plus, slash,
+	space, t as lowerT, z as lowerZ, zero } from "./ascii"
+import { addr, store } from "../builtin/mem"
+import { copy } from "../builtin/string"
+import { fromCString } from "./c"
+import { open, readLink } from "./fs"
+import { IoError } from "./io"
+import { maxOf, minOf } from "./limits"
+import { abs, clamp, min } from "./math"
+import { ParseError } from "./parse"
+import { indexOf, occurs, startsWith } from "./string"
+import { bober_env, bober_mono, bober_tz } from "../src/rt.h"
+
+export const nanosecond: i64 = 1
+export const microsecond: i64 = 1_000
+export const millisecond: i64 = 1_000_000
+export const second: i64 = 1_000_000_000
+export const minute: i64 = 60 * second
+export const hour: i64 = 60 * minute
+
+/// d as Go writes a duration: 1h2m3.5s, 1.5ms or 0s, in the largest unit under a second, else in hours, minutes and
+/// seconds, with as many digits after the point as are not trailing zeros.
+export function formatDuration(d: i64): string {
+	const u = if (d < 0) 0 - (d as u64) else d as u64
+	const sign = if (d < 0) "-" else ""
+	if (u < 1_000_000_000) {
+		const [unit, size]: [string, u64] = if (u < 1_000) ["ns", 1] else if (u < 1_000_000) ["µs", 1_000]
+			else ["ms", 1_000_000]
+		return if (u == 0) "0s" else `${sign}${decimal(u, size)}${unit}`
+	}
+	const [h, m] = [u / 3_600_000_000_000, u / 60_000_000_000 % 60]
+	const hm = if (h > 0) `${h}h${m}m` else if (m > 0) `${m}m` else ""
+	return `${sign}${hm}${decimal(u % 60_000_000_000, 1_000_000_000)}s`
+}
+
+/// n / size, size a power of 10, with the digits after the point that are not trailing zeros.
+function decimal(n: u64, size: u64): string {
+	let [f, k] = [n % size, size]
+	let s = ""
+	while (f > 0) {
+		k /= 10
+		s += `${f / k}`
+		f %= k
+	}
+	return if (s == "") `${n / size}` else `${n / size}.${s}`
+}
+
+/// ns since a fixed point in the past, which nothing sets back or forward: for deadlines and elapsed times, not dates.
+export function monotonic(): i64 { return bober_mono() }
+
+/// The monotonic() at which timeout ns from start are up: 0 for a timeout of 0, which is none; one too far for an i64
+/// saturates to its largest, which never comes.
+export function deadline(timeout: i64, start = monotonic()): i64 {
+	return if (timeout == 0) 0 else if (timeout > maxOf[i64]() - start) maxOf[i64]() else start + timeout
+}
+
+/// Whether y has a February 29: one divisible by 4, but by 16 if by 25, which for multiples of 4 is by 400 if by 100.
+export function isLeap(y: i32): bool { return (y & (if (y % 25 == 0) 15 else 3)) == 0 }
+
+/// 28 to 31: 31 for the months whose number and its bit 3 differ in bit 0, but February.
+export function daysInMonth(y: i32, m: i32): i32 {
+	return if (m == 2) 28 + (isLeap(y) as i32) else 30 | (m ^ m >> 3) & 1
+}
+
+/// Whether y-m-d is a day of the calendar, in the years -9999 to 9999 a Date spans.
+export function isValid(y: i32, m: i32, d: i32): bool {
+	return y >= -9999 && y <= 9999 && m >= 1 && m <= 12 && d >= 1 && d <= daysInMonth(y, m)
+}
+
+/// A day of the proleptic Gregorian calendar, from -9999-01-01 to 9999-12-31.
+export class Date {
+	readonly year: i32
+	/// 1 for January to 12.
+	readonly month: i32
+	readonly day: i32
+
+	/// Traps unless isValid(year, month, day).
+	constructor(year: i32, month: i32, day: i32) {
+		assert isValid(year, month, day)
+		this.year = year
+		this.month = month
+		this.day = day
+	}
+
+	/// Days since 1970-01-01, negative before.
+	days(): i64 { return daysOf(this.year, this.month, this.day) }
+
+	/// 1 for Monday to 7 for Sunday, as ISO 8601 numbers them.
+	weekday(): i32 { return weekdayOf(this.days()) }
+
+	/// The date n days later, or earlier for n < 0; traps past the years a Date spans.
+	addDays(n: i64): Date { return dateOf(this.days() + n) }
+
+	/// The date n months later, or earlier for n < 0, on the same day or the month's last if it is shorter, so that
+	/// January 31 and a month is February 28 or 29; 12 months are a year. Traps past the years a Date spans.
+	addMonths(n: i64): Date {
+		const k = (this.year as i64) * 12 + ((this.month - 1) as i64) + n
+		const y = floorDiv(k, 12)
+		assert y >= -9999 && y <= 9999
+		const m = (k - y * 12 + 1) as i32
+		return new Date(y as i32, m, min(this.day, daysInMonth(y as i32, m)))
+	}
+
+	/// Negative, zero or positive as this precedes, equals or follows other.
+	compare(other: Date): i32 { return sign(this.days() - other.days()) }
+
+	/// As ISO 8601 writes it, 2006-01-02, and Temporal a year past 0 to 9999, -000044-03-15.
+	toString(): string {
+		let w: u8[13]
+		const b = addr(w)
+		return copy(b, putDate(b, 0, this) as i64)
+	}
+}
+
+/// A wall clock's reading on a day, in no particular zone.
+export class DateTime {
+	readonly date: Date
+	readonly hour: i32
+	readonly minute: i32
+	readonly second: i32
+	readonly nanosecond: i32
+
+	/// Traps unless hour is 0 to 23, minute and second 0 to 59 and nanosecond 0 to 999 999 999.
+	constructor(date: Date, hour: i32 = 0, minute: i32 = 0, second: i32 = 0, nanosecond: i32 = 0) {
+		assert hour >= 0 && hour < 24 && minute >= 0 && minute < 60 && second >= 0 && second < 60
+		assert nanosecond >= 0 && nanosecond < 1_000_000_000
+		this.date = date
+		this.hour = hour
+		this.minute = minute
+		this.second = second
+		this.nanosecond = nanosecond
+	}
+
+	/// Negative, zero or positive as this precedes, equals or follows other.
+	compare(other: DateTime): i32 {
+		const c = sign(localSeconds(this) - localSeconds(other))
+		return if (c != 0) c else sign((this.nanosecond - other.nanosecond) as i64)
+	}
+
+	/// As RFC 3339 writes a local time, 2006-01-02T15:04:05, with the digits of a fraction of a second there are, up to
+	/// the last that is not 0: 2006-01-02T15:04:05.5.
+	toString(): string {
+		let w: u8[32]
+		const b = addr(w)
+		return copy(b, text(this, b) as i64)
+	}
+}
+
+/// Writes dt as toString does to b, and up to 8 bytes more past it; the index after.
+function text(dt: DateTime, b: u64): i32 {
+	const at = putDate(b, 0, dt.date)
+	set(b, at, T)
+	const i = putHms(b, at + 1, secondOfDay(dt), true)
+	const f = dt.nanosecond
+	if (f == 0) {
+		return i
+	}
+	set(b, i, dot)
+	set(b, i + 1, zero + ((f / 100_000_000) as u8))
+	const d = digits8(f % 100_000_000)
+	set8(b, i + 2, d + 0x3030303030303030)
+	return i + 10 - clz(d) / 8 // less the trailing 0s, which are d's top bytes that are 0
+}
+
+/// dt's seconds since 1970-01-01T00:00 on a wall clock.
+function localSeconds(dt: DateTime): i64 {
+	return dt.date.days() * 86400 + (secondOfDay(dt) as i64)
+}
+
+function secondOfDay(dt: DateTime): i32 { return (dt.hour * 60 + dt.minute) * 60 + dt.second }
+
+/// How Zone.instant picks among the instants at which a wall clock reads a time: in a fold, where it is set back and
+/// reads it twice, the earlier or the later; in a gap, where it is set forward past it, the instant of the reading as
+/// though it had not been, one past the gap with "later" and one before it with "earlier". "compatible" is "earlier"
+/// in a fold and "later" in a gap, as Temporal's and C's mktime's.
+export type Disambiguation = "compatible" | "earlier" | "later"
+
+/// The offsets from UTC of a place's wall clocks over time, as the tz database records them: a table of transitions,
+/// and after the last a POSIX TZ rule.
+export class Zone {
+	/// The name it was loaded by: "UTC", a tz database name, a TZ rule, or an offset as RFC 3339 writes it.
+	readonly name: string
+	/// The instants at which the offset changes, in s since the epoch, ascending, and the offset from each on.
+	private times: i64[]
+	private offsets: i32[]
+	/// The offset before the first transition, or with none and no rule.
+	private initial: i32
+	/// The offsets from the last transition on.
+	private rule: Rule | null
+
+	constructor(name: string, times: i64[], offsets: i32[], initial: i32, rule: Rule | null) {
+		this.name = name
+		this.times = times
+		this.offsets = offsets
+		this.initial = initial
+		this.rule = if (rule != null && rule.std == rule.dst) null else rule
+	}
+
+	/// Seconds east of UTC at instant t.
+	offset(t: i64): i32 { return this.offsetAt(secondsOf(t)) }
+
+	/// What a wall clock here reads at instant t.
+	civil(t: i64): DateTime { return civilAt(t, this.offset(t)) }
+
+	/// The instants at which a wall clock here reads dt, ascending: one, none in a gap, or two in a fold, but one past
+	/// instants' span, to whose end both are taken.
+	instants(dt: DateTime): i64[] {
+		const r: i64[] = []
+		for (const s of this.readings(localSeconds(dt))[0]) {
+			const t = instantOf(s, dt.nanosecond as i64)
+			if (r.length == 0 || r[r.length - 1] != t) {
+				r.push(t)
+			}
+		}
+		return r
+	}
+
+	/// The instant at which a wall clock here reads dt, picked as pick says where it reads it twice or never.
+	instant(dt: DateTime, pick: Disambiguation = "compatible"): i64 {
+		const local = localSeconds(dt)
+		// With no change of offset in the days around, as nearly always, it reads dt once.
+		if (this.next(local - 2 * 86400) > local + 2 * 86400) {
+			return instantOf(local - (this.offsetAt(local) as i64), dt.nanosecond as i64)
+		}
+		const [r, early, late] = this.readings(local)
+		const t = if (r.length == 0) (if (pick == "earlier") early else late)
+			else if (pick == "later") r[r.length - 1] else r[0]
+		return instantOf(t, dt.nanosecond as i64)
+	}
+
+	/// The s since the epoch at which a wall clock here reads local s since 1970-01-01T00:00, ascending; for none, those
+	/// at which it would by the offsets after and before the gap that skips it: one before the gap, one past it.
+	private readings(local: i64): [i64[], i64, i64] {
+		const r: i64[] = []
+		let [early, late] = [local, local]
+		// The periods of one offset each from 2 days before on to 2 days after, as no offset is 2 days or more.
+		let from = local - 2 * 86400
+		let o = this.offsetAt(from)
+		while (from <= local + 2 * 86400) {
+			const end = this.next(from)
+			const after = this.offsetAt(end)
+			const t = local - (o as i64)
+			if (t >= from && t < end) {
+				r.push(t)
+			} else if (t >= end && local - (after as i64) < end) {
+				early = local - (after as i64)
+				late = t
+			}
+			from = end
+			o = after
+		}
+		return [r, early, late]
+	}
+
+	/// The offset at s seconds since the epoch.
+	private offsetAt(s: i64): i32 {
+		const i = this.index(s)
+		return if (i == this.times.length - 1 && this.rule != null) this.rule!.offset(s) else if (i < 0) this.initial
+			else this.offsets[i]
+	}
+
+	/// The first transition after s seconds since the epoch, or the largest i64 if none is.
+	private next(s: i64): i64 {
+		const i = this.index(s)
+		return if (i < this.times.length - 1) this.times[i + 1] else if (this.rule != null) this.rule!.next(s) else never
+	}
+
+	/// The index of the last transition by s seconds since the epoch, -1 before the first, by binary search without
+	/// branches.
+	private index(s: i64): i32 {
+		const n = this.times.length
+		if (n == 0 || s < this.times[0]) {
+			return -1
+		}
+		let lo = 0
+		let len = n
+		while (len > 1) {
+			const half = len / 2
+			lo += ((this.times[lo + half] <= s) as i32) * half
+			len -= half
+		}
+		return lo
+	}
+}
+
+export const utc = new Zone("UTC", [], [], 0, null)
+
+/// The zone always offset seconds east of UTC, less than a day either way, named as RFC 3339 writes it: +01:00, or
+/// +00:01:15 with seconds.
+export function fixed(offset: i32): Zone {
+	assert offset > -86400 && offset < 86400
+	return new Zone(offsetName(offset), [], [], offset, null)
+}
+
+/// offset as RFC 3339 writes it, +01:00, with seconds if it has them: +00:01:15.
+function offsetName(offset: i32): string {
+	const a = abs(offset)
+	let w: u8[9]
+	const b = addr(w)
+	set(b, 0, if (offset < 0) minus else plus)
+	return copy(b, putHms(b, 1, a, a % 60 != 0) as i64)
+}
+
+/// The zone of the tz database named name, as "Europe/Vienna", from TZDIR, else /usr/share/zoneinfo; "UTC" without it.
+export function load(name: string): Zone throws IoError | ParseError {
+	if (name == "UTC") {
+		return utc
+	}
+	// Not a path out of the database.
+	const up = indexOf(name, "..")
+	if (startsWith(name, "/") || up >= 0) {
+		throw new ParseError("syntax", if (up >= 0) up else 0)
+	}
+	const p = bober_env("TZDIR")
+	const dir = if (p == 0) "" else fromCString(p)
+	return tzif(name, head(`${if (dir == "") "/usr/share/zoneinfo" else dir}/${name}`))
+}
+
+let localZone: Zone | null = null
+
+/// The zone of the system's wall clock: TZ's, a path to a TZif file after a :, a tz database name or a POSIX rule,
+/// else /etc/localtime's, named by the database's name for it where its path tells; UTC if neither loads, and in tests.
+export function local(): Zone {
+	if (localZone == null) {
+		const p = bober_tz()
+		const tz = if (p == 0) ":/etc/localtime" else fromCString(p)
+		const path = if (startsWith(tz, ":")) tz.slice(1, tz.length) else tz
+		try {
+			localZone = if (startsWith(path, "/")) tzif(zoneName(path), head(path)) else if (tz == "") utc else load(path)
+		} catch {
+			try {
+				localZone = posix(tz)
+			} catch {
+				localZone = utc
+			}
+		}
+	}
+	return localZone!
+}
+
+/// The first MB of the file at path, more than a TZif file has, so that a device or a huge file exhausts no memory.
+function head(path: string): string throws IoError {
+	const f = open(path)
+	try {
+		let s = ""
+		while (s.length < 1 << 20) {
+			const c = f.read(1 << 16)
+			if (c == null) {
+				break
+			}
+			s += c
+		}
+		return s
+	} finally {
+		f.close()
+	}
+}
+
+/// The tz database name of the TZif file at path, Europe/Vienna if it is or links to
+/// /usr/share/zoneinfo/Europe/Vienna; else path.
+function zoneName(path: string): string {
+	let target = path
+	try {
+		target = readLink(path)
+	} catch {}
+	const i = indexOf(target, "zoneinfo/")
+	return if (i < 0) path else target.slice(i + 9, target.length)
+}
+
+/// The zone a TZif file of RFC 8536 holds, of any version; its leap seconds are left out, as everywhere here.
+export function tzif(name: string, b: string): Zone throws ParseError {
+	if (!startsWith(b, "TZif") || b.length < 44) {
+		throw new ParseError("syntax", 0)
+	}
+	// Version 1 has 4-byte times only; later ones repeat its data with 8-byte times and add a rule after.
+	const wide = b[4] != 0
+	const v1 = 44 + dataLength(b, 0, 4)
+	if (wide && (v1 + 44 > (b.length as i64) || !occurs(b, v1 as i32, "TZif"))) {
+		throw new ParseError("syntax", min(v1, b.length as i64) as i32)
+	}
+	const at = if (wide) v1 as i32 else 0
+	const size = if (wide) 8 else 4
+	const length = (at as i64) + 44 + dataLength(b, at, size)
+	if (length > (b.length as i64)) {
+		throw new ParseError("syntax", b.length)
+	}
+	const end = length as i32
+	const [n, types] = [big(b, at + 32, 4) as i32, big(b, at + 36, 4) as i32]
+	if (types == 0) {
+		throw new ParseError("syntax", at + 36)
+	}
+	const t = at + 44
+	const kinds = t + n * size
+	const typeOffsets = kinds + n
+	const offsets: i32[] = []
+	for (const i of 0 ... types - 1) {
+		const o = big(b, typeOffsets + 6 * i, 4)
+		if (o < -89999 || o > 93599) {
+			throw new ParseError("range", typeOffsets + 6 * i)
+		}
+		offsets.push(o as i32)
+	}
+	const times: i64[] = []
+	const after: i32[] = []
+	for (const i of 0 ... n - 1) {
+		const time = big(b, t + i * size, size)
+		const k = b[kinds + i] as i32
+		if (k >= types || i > 0 && time <= times[i - 1]) {
+			throw new ParseError("syntax", if (k >= types) kinds + i else t + i * size)
+		}
+		times.push(time)
+		after.push(offsets[k])
+	}
+	let rule: Rule | null = null
+	if (wide) {
+		// The rule ends the file, between two newlines.
+		const close = indexOf(b, "\n", end + 1)
+		if (b.at(end) != lf || close != b.length - 1) {
+			throw new ParseError("syntax", if (close < 0) end else close + 1)
+		}
+		if (close > end + 1) {
+			rule = rules(b.slice(end + 1, close), end + 1)
+		}
+	}
+	// Zone drops a rule without DST, so its offset goes in the last transition's, or the initial one without any.
+	if (rule != null && rule.std == rule.dst && n > 0) {
+		after[n - 1] = rule.std
+	}
+	return new Zone(name, times, after, if (n == 0 && rule != null) rule.std else offsets[0], rule)
+}
+
+/// The zone a POSIX TZ rule describes, as TZ and a TZif file's footer give it: "CET-1CEST,M3.5.0,M10.5.0/3", or
+/// "EST5EDT" with the US's rules of 2007 on.
+export function posix(rule: string): Zone throws ParseError {
+	const r = rules(rule, 0)
+	return new Zone(rule, [], [], r.std, r)
+}
+
+/// t as RFC 3339 writes it at zone's offset: 2006-01-02T15:04:05.5+01:00, Z for UTC. As RFC 3339 has offsets of whole
+/// minutes under a day, one that has seconds, as the zones of the tz database have before about 1900, is rounded to
+/// minutes, one of a day or more cut to 23:59, and the reading taken at that.
+export function rfc3339(t: i64, zone: Zone = utc): string {
+	const o = clamp((zone.offset(t) + 30 + 86400) / 60 * 60 - 86400, -86340, 86340)
+	let w: u8[41]
+	const b = addr(w)
+	const at = text(civilAt(t, o), b)
+	set(b, at, if (o == 0) Z else if (o < 0) minus else plus)
+	return copy(b, (if (o == 0) at + 1 else putHms(b, at + 1, abs(o), false)) as i64)
+}
+
+/// The instant an RFC 3339 timestamp names: 2006-01-02T15:04:05Z, with a fraction of up to 9 digits after the seconds,
+/// a t or z for T or Z and an offset such as +01:00 for Z. A leap second, 60, is taken for 59, as Temporal does.
+export function parseRfc3339(s: string): i64 throws ParseError {
+	const date = expect(s, 0, "0000-00-00")
+	const sep = s.at(10)
+	if (sep != T && sep != lowerT) {
+		throw new ParseError("syntax", 10)
+	}
+	const hms = expect(s, 11, "00:00:00")
+	let i = 19
+	let ns = 0
+	if (s.at(i) == dot) {
+		const from = i + 1
+		i = from
+		while (i < from + 9 && isDigit(s.at(i) ?? 0)) {
+			i++
+		}
+		if (i == from) {
+			throw new ParseError("syntax", i)
+		}
+		ns = number(s, from, i)
+		for (const _ of i ... from + 8) {
+			ns *= 10
+		}
+	}
+	let offset = 0
+	const z = s.at(i)
+	if (z == Z || z == lowerZ) {
+		i++
+	} else if (z == plus || z == minus) {
+		const hm = expect(s, i + 1, "00:00")
+		const minutes = ranged(hm / 100, i + 1, 0, 23) * 60 + ranged(hm % 100, i + 4, 0, 59)
+		offset = (if (z == minus) -60 else 60) * minutes
+		i += 6
+	} else {
+		throw new ParseError("syntax", i)
+	}
+	if (i != s.length) {
+		throw new ParseError("syntax", i)
+	}
+	const y = date / 10000
+	const mo = ranged(date / 100 % 100, 5, 1, 12)
+	const d = ranged(date % 100, 8, 1, daysInMonth(y, mo))
+	return within(daysOf(y, mo, d) * 86400 + seconds(hms, 11) - (offset as i64), ns as i64, 0)
+}
+
+/// t as HTTP writes a date, an IMF-fixdate of RFC 9110: Sun, 06 Nov 1994 08:49:37 GMT.
+export function httpDate(t: i64): string {
+	const dt = utc.civil(t)
+	const d = dt.date
+	let w: u8[29]
+	const b = addr(w)
+	copyTo(b, 0, weekdays, 3 * d.weekday() - 3, 3)
+	copyTo(b, 3, ", ", 0, 2)
+	put(b, 5, d.day, 2)
+	set(b, 7, space)
+	copyTo(b, 8, months, 3 * d.month - 3, 3)
+	set(b, 11, space)
+	put(b, 12, d.year, 4)
+	set(b, 16, space)
+	putHms(b, 17, secondOfDay(dt), true)
+	copyTo(b, 25, " GMT", 0, 4)
+	return copy(b, 29)
+}
+
+/// The instant an HTTP-date names, in any of the forms RFC 9110 has a recipient take: an IMF-fixdate, as httpDate
+/// writes it, RFC 850's, Sunday, 06-Nov-94 08:49:37 GMT, whose year is the last ending in its digits up to 50 years
+/// from now, or C's asctime's, Sun Nov  6 08:49:37 1994. Its weekday is checked to be one, not to be the date's.
+export function parseHttpDate(s: string): i64 throws ParseError { return httpDateAt(s, now()) }
+
+/// parseHttpDate's instant of s as of the instant at.
+function httpDateAt(s: string, at: i64): i64 throws ParseError {
+	const c = indexOf(s, ",")
+	if (c > 3) {
+		if (!longWeekdays.includes(s.slice(0, c))) {
+			throw new ParseError("syntax", 0)
+		}
+		expect(s, c, ", 00-")
+		const m = named(s, c + 5, months) + 1
+		expect(s, c + 8, "-00 00:00:00 GMT")
+		const n = utc.civil(at)
+		const near = n.date.year + 50
+		let y = near - (near - number(s, c + 9, c + 11)) % 100
+		// Past 50 years from now, or on a day that year has not, as 29-Feb-00 is in 2100, it is of the century before.
+		if (y == near && !isValid(y, m, number(s, c + 2, c + 4))) {
+			y -= 100
+		}
+		const t = httpInstant(s, c + 24, y, m, c + 2, c + 12, c + 9)
+		const limit = utc.instant(new DateTime(n.date.addMonths(600), n.hour, n.minute, n.second, n.nanosecond))
+		return if (t <= limit) t else httpInstant(s, c + 24, y - 100, m, c + 2, c + 12, c + 9)
+	}
+	named(s, 0, weekdays)
+	if (c == 3) {
+		expect(s, 3, ", 00 ")
+		const m = named(s, 8, months) + 1
+		expect(s, 11, " 0000 00:00:00 GMT")
+		return httpInstant(s, 29, number(s, 12, 16), m, 5, 17, 12)
+	}
+	// A day of one digit is padded with a space, taken for a 0.
+	const t = if (s.at(8) == space) `${s.slice(0, 8)}0${s.slice(9, s.length)}` else s
+	expect(t, 3, " ")
+	const m = named(t, 4, months) + 1
+	expect(t, 7, " 00 00:00:00 0000")
+	return httpInstant(t, 24, number(t, 20, 24), m, 8, 11, 20)
+}
+
+const weekdays = "MonTueWedThuFriSatSun"
+const longWeekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+const months = "JanFebMarAprMayJunJulAugSepOctNovDec"
+
+/// Which of the names of 3 letters in names s has at at, from 0; a syntax error at at for none.
+function named(s: string, at: i32, names: string): i32 throws ParseError {
+	const i = if (s.length < at + 3) -1 else indexOf(names, s.slice(at, at + 3))
+	if (i < 0 || i % 3 != 0) {
+		throw new ParseError("syntax", at)
+	}
+	return i / 3
+}
+
+/// The instant of an HTTP-date s of length n, of year y and month m, its day and time at the indices given; a range
+/// error at the year's past instants' span.
+function httpInstant(s: string, n: i32, y: i32, m: i32, day: i32, time: i32, year: i32): i64 throws ParseError {
+	if (s.length != n) {
+		throw new ParseError("syntax", n)
+	}
+	const d = ranged(number(s, day, day + 2), day, 1, daysInMonth(y, m))
+	return within(daysOf(y, m, d) * 86400 + seconds(expect(s, time, "00:00:00"), time), 0, year)
+}
+
+/// The instant s seconds and ns ns past the epoch; a range error at at past instants' span.
+function within(s: i64, ns: i64, at: i32): i64 throws ParseError {
+	const t = instantOf(s, ns)
+	if (secondsOf(t) != s || t - s * second != ns) {
+		throw new ParseError("range", at)
+	}
+	return t
+}
+
+/// The seconds of the day hhmmss names, from hh:mm:ss at at, a leap second as the one before it.
+function seconds(hms: i32, at: i32): i64 throws ParseError {
+	return (ranged(hms / 10000, at, 0, 23) * 3600 + ranged(hms / 100 % 100, at + 3, 0, 59) * 60
+		+ min(ranged(hms % 100, at + 6, 0, 60), 59)) as i64
+}
+
+/// v, a range error at at unless lo to hi.
+function ranged(v: i32, at: i32, lo: i32, hi: i32): i32 throws ParseError {
+	if (v < lo || v > hi) {
+		throw new ParseError("range", at)
+	}
+	return v
+}
+
+/// The digits of s from at on that pattern matches, a 0 in it matching any digit, as one number if there are up to 9;
+/// a syntax error at the first byte that it does not match.
+function expect(s: string, at: i32, pattern: string): i32 throws ParseError {
+	let v = 0
+	for (const i of 0 ... pattern.length - 1) {
+		const c = s.at(at + i) ?? 0
+		if (if (pattern[i] == zero) !isDigit(c) else c != pattern[i]) {
+			throw new ParseError("syntax", at + i)
+		}
+		if (pattern[i] == zero) {
+			v = v * 10 + ((c - zero) as i32)
+		}
+	}
+	return v
+}
+
+/// The decimal number of the digits of s from from up to to.
+function number(s: string, from: i32, to: i32): i32 {
+	let v = 0
+	for (const i of from ... to - 1) {
+		v = v * 10 + ((s[i] - zero) as i32)
+	}
+	return v
+}
+
+// The calendar in days since 1970-01-01, after Neri and Schneider: days are counted in u32 from 82 400-year eras
+// before it, in years that start in March so that February's length matters last, and each step is a multiplication
+// and shift without branches. It is exact over the years -32 799 to 2 906 944, past those a Date spans.
+
+const eras: u32 = 82
+const yearShift: u32 = 400 * eras
+const dayShift: u32 = 719468 + 146097 * eras
+const minDays = daysOf(-9999, 1, 1)
+const maxDays = daysOf(9999, 12, 31)
+
+/// Days since 1970-01-01 of y-m-d, for y in the years exact.
+function daysOf(y: i64, m: i64, d: i64): i64 {
+	const j = (m <= 2) as u32
+	const year = (y as u32) + yearShift - j
+	const c = year / 100
+	const month = (m as u32) + 12 * j
+	return ((1461 * year / 4 - c + c / 4 + (979 * month - 2919) / 32 + (d as u32) - 1 - dayShift) as i32) as i64
+}
+
+/// The date days after 1970-01-01, trapping past the years a Date spans.
+function dateOf(days: i64): Date {
+	assert days >= minDays && days <= maxDays
+	const n = 4 * ((days as u32) + dayShift) + 3
+	const c = n / 146097
+	// The day of the century, and from it the year and the day of the year at once.
+	const p = 2939745 * ((n % 146097 | 3) as u64)
+	const doy = (p as u32) / 2939745 / 4
+	const md = 2141 * doy + 197913
+	const j = (doy >= 306) as u32
+	return new Date((100 * c + ((p >> 32) as u32) - yearShift + j) as i32, ((md >> 16) - 12 * j) as i32,
+		((md & 0xffff) / 2141 + 1) as i32)
+}
+
+/// The weekday days after 1970-01-01, 1 for Monday to 7 for Sunday.
+function weekdayOf(days: i64): i32 { return ((days + (dayShift as i64) + 2) % 7 + 1) as i32 }
+
+/// The latest instant, and the s of no transition.
+const never = maxOf[i64]()
+
+// Instants' span in s, and the ns of the instant ending each.
+const maxSeconds: i64 = 9_223_372_036
+const minSeconds: i64 = -9_223_372_037
+
+/// t's whole seconds since the epoch, rounded down.
+function secondsOf(t: i64): i64 { return floorDiv(t, second) }
+
+function floorDiv(a: i64, b: i64): i64 { return a / b - ((a % b < 0) as i64) }
+
+/// The instant s seconds and ns ns past the epoch, saturated at the ends of instants' span.
+function instantOf(s: i64, ns: i64): i64 {
+	if (s > maxSeconds || s == maxSeconds && ns > 854_775_807) {
+		return never
+	}
+	if (s < minSeconds || s == minSeconds && ns < 145_224_192) {
+		return minOf[i64]()
+	}
+	// The ns of the first second past the start of instants' span first, which is in it while its own are not.
+	const low = (s < 0) as i64
+	return (s + low) * second + ns - low * second
+}
+
+/// What a wall clock offset seconds east of UTC reads at instant t.
+function civilAt(t: i64, offset: i32): DateTime {
+	const s = secondsOf(t) + (offset as i64)
+	const days = floorDiv(s, 86400)
+	const sod = (s - days * 86400) as i32
+	return new DateTime(dateOf(days), sod / 3600, sod / 60 % 60, sod % 60, (t - secondsOf(t) * second) as i32)
+}
+
+function sign(n: i64): i32 { return ((n > 0) as i32) - ((n < 0) as i32) }
+
+// The text of dates and times, written to a buffer on the stack of the most it takes, and copied to a string once.
+// Digits are put a word at a time, its low byte first, as on the little-endian targets there are.
+
+/// Writes c to b at i.
+function set(b: u64, i: i32, c: u8) { store[u8](b + (i as u64), c) }
+
+/// Writes w's 8 bytes to b from i on, low byte first.
+function set8(b: u64, i: i32, w: u64) { store[u64](b + (i as u64), w) }
+
+/// Writes v's last n digits to b from at on; the index after them.
+function put(b: u64, at: i32, v: i32, n: i32): i32 {
+	let x = v
+	for (const i of 1 ... n) {
+		set(b, at + n - i, zero + ((x % 10) as u8))
+		x /= 10
+	}
+	return at + n
+}
+
+/// Writes d to b from at on; the index after.
+function putDate(b: u64, at: i32, d: Date): i32 {
+	const y = abs(d.year)
+	let i = at
+	if (d.year < 0 || d.year > 9999) {
+		set(b, i, if (d.year < 0) minus else plus)
+		i = put(b, i + 1, y / 100, 4)
+	} else {
+		i = put(b, i, y / 100, 2)
+	}
+	return put3(b, i, y % 100, d.month, d.day, minus)
+}
+
+/// Writes a, c and e, each under 100, as 2 digits with sep between, aa-cc-ee, to b from at on in one store; the index
+/// after. They are split into tens and ones at once, as bytes of a word.
+function put3(b: u64, at: i32, a: i32, c: i32, e: i32, sep: u8): i32 {
+	const x = (a as u64) | ((c as u64) << 24) | ((e as u64) << 48)
+	const t = (x * 103 >> 10) & 0x000f00000f00000f
+	const s = sep as u64
+	set8(b, at, t | ((x - t * 10) << 8) | 0x3030003030003030 | (s << 16) | (s << 40))
+	return at + 8
+}
+
+/// v's 8 digits, v < 10⁸, a byte each in the order they are written, split into halves, pairs and digits a word at once.
+function digits8(v: i32): u64 {
+	const x = ((v / 10000) as u64) | (((v % 10000) as u64) << 32)
+	const h = (x * 10486 >> 20) & 0x0000007f0000007f
+	const y = h | ((x - h * 100) << 16)
+	const t = (y * 103 >> 10) & 0x000f000f000f000f
+	return t | ((y - t * 10) << 8)
+}
+
+/// The leading zero bits of x.
+function clz(x: u64): i32 {
+	let n = 64
+	let v = x
+	while (v != 0) {
+		v >>= 1
+		n--
+	}
+	return n
+}
+
+/// Writes s seconds as hh:mm, and :ss after if seconds, to b from at on, and 3 bytes more past them if not; the index
+/// after.
+function putHms(b: u64, at: i32, s: i32, seconds: bool): i32 {
+	put3(b, at, s / 3600, s / 60 % 60, s % 60, colon)
+	return if (seconds) at + 8 else at + 5
+}
+
+/// Writes the n bytes of s from from on to b from at on.
+function copyTo(b: u64, at: i32, s: string, from: i32, n: i32) {
+	for (const i of 0 ... n - 1) {
+		set(b, at + i, s[from + i])
+	}
+}
+
+// RFC 8536's TZif files and POSIX's TZ rules.
+
+/// A TZ rule's offsets, east of UTC, and when DST starts and ends, in standard time and DST.
+class Rule {
+	std: i32
+	dst: i32
+	start: When
+	end: When
+
+	constructor(std: i32, dst: i32, start: When, end: When) {
+		this.std = std
+		this.dst = dst
+		this.start = start
+		this.end = end
+	}
+
+	/// The offset at s seconds since the epoch: that after the last transition by then, the later of two at once.
+	offset(s: i64): i32 {
+		let latest = -never
+		let o = this.std
+		const y = yearNear(s)
+		for (const year of y - 2 ... y + 2) {
+			for (const k of 0 ... 1) {
+				const t = this.transition(year, k)
+				if (t <= s && t >= latest) {
+					latest = t
+					o = if (k == 0) this.dst else this.std
+				}
+			}
+		}
+		return o
+	}
+
+	/// The first transition after s seconds since the epoch.
+	next(s: i64): i64 {
+		let first = never
+		const y = yearNear(s)
+		for (const year of y - 2 ... y + 2) {
+			for (const k of 0 ... 1) {
+				const t = this.transition(year, k)
+				first = if (t > s && t < first) t else first
+			}
+		}
+		return first
+	}
+
+	/// When DST starts in year, for k 0, or ends, for 1, in s since the epoch.
+	private transition(year: i64, k: i32): i64 {
+		return if (k == 0) this.start.at(year) - (this.std as i64) else this.end.at(year) - (this.dst as i64)
+	}
+}
+
+/// A year within one of that s seconds since the epoch are in, by the mean length of a year; the years 2 either side
+/// of it hold the transitions around s, as a rule's time may move one up to a week into the next or previous year.
+function yearNear(s: i64): i64 { return floorDiv(s, 31_556_952) + 1970 }
+
+/// A day of the year and a time on it, local, at which DST starts or ends: J for day n of 1 to 365 counting no
+/// February 29, n for day n of 0 to 365, M for the d-th weekday, 0 for Sunday, of week w of month m, 5 for its last.
+class When {
+	kind: "J" | "n" | "M"
+	n = 0
+	m = 0
+	w = 0
+	d = 0
+	/// s from the day's start, -167 h to 167 h.
+	time = 7200
+
+	constructor(kind: "J" | "n" | "M") { this.kind = kind }
+
+	/// The local wall clock's time of it in year, as s since 1970-01-01T00:00.
+	at(year: i64): i64 {
+		if (this.kind != "M") {
+			const leap = this.kind == "J" && this.n > 59 && isLeap(year as i32)
+			const n = this.n - ((this.kind == "J") as i32) + (leap as i32)
+			return (daysOf(year, 1, 1) + (n as i64)) * 86400 + (this.time as i64)
+		}
+		const first = daysOf(year, this.m as i64, 1)
+		const d = first + (((this.d - weekdayOf(first) % 7 + 7) % 7 + 7 * (this.w - 1)) as i64)
+		const past = d >= first + (daysInMonth(year as i32, this.m) as i64)
+		return (d - 7 * (past as i64)) * 86400 + (this.time as i64)
+	}
+}
+
+/// The rule s states, from at in the text it is of: std offset [dst [offset] [,start[/time],end[/time]]], an offset
+/// being hh[:mm[:ss]] west of UTC, and a name letters or <+01>.
+function rules(s: string, at: i32): Rule throws ParseError {
+	const p = new TzScan(s, at)
+	p.name()
+	const std = -p.hms(24)
+	if (p.i == s.length) {
+		return new Rule(std, std, new When("n"), new When("n"))
+	}
+	p.name()
+	const dst = if (p.i < s.length && s[p.i] != comma) -p.hms(24) else std + 3600
+	const r = if (p.i == s.length) new Rule(std, dst, us(3, 2), us(11, 1)) else new Rule(std, dst, p.when(), p.when())
+	if (p.i != s.length) {
+		throw p.error()
+	}
+	return r
+}
+
+/// The US's rule since 2007: DST from the w-th Sunday of month m.
+function us(m: i32, w: i32): When {
+	const r = new When("M")
+	r.m = m
+	r.w = w
+	return r
+}
+
+/// Reads a TZ rule.
+class TzScan {
+	s: string
+	/// Where s is in the text it is of, for errors.
+	base: i32
+	i = 0
+
+	constructor(s: string, base: i32) {
+		this.s = s
+		this.base = base
+	}
+
+	error(): ParseError { return new ParseError("syntax", this.base + this.i) }
+
+	/// A zone's name: 3 or more letters, or 3 or more of letters, digits, + and - between < and >.
+	name() throws ParseError {
+		const quoted = this.s.at(this.i) == less
+		const from = this.i + (quoted as i32)
+		this.i = from
+		while (this.i < this.s.length && (if (quoted) isAlphanumeric(this.s[this.i]) || this.s[this.i] == plus
+			|| this.s[this.i] == minus else isAlphabetic(this.s[this.i]))) {
+			this.i++
+		}
+		if (this.i - from < 3 || quoted && this.s.at(this.i) != greater) {
+			throw new ParseError("syntax", this.base + from - (quoted as i32))
+		}
+		this.i += quoted as i32
+	}
+
+	/// [+-]h[h][:mm[:ss]] in s, hours up to max.
+	hms(max: i32): i32 throws ParseError {
+		const neg = this.s.at(this.i) == minus
+		this.i += (neg || this.s.at(this.i) == plus) as i32
+		let v = this.num(0, max) * 3600
+		if (this.s.at(this.i) == colon) {
+			this.i++
+			v += this.num(0, 59) * 60
+			if (this.s.at(this.i) == colon) {
+				this.i++
+				v += this.num(0, 59)
+			}
+		}
+		return if (neg) -v else v
+	}
+
+	/// ,date[/time] as When has it.
+	when(): When throws ParseError {
+		if (this.s.at(this.i) != comma) {
+			throw this.error()
+		}
+		this.i++
+		const c = this.s.at(this.i)
+		const r = new When(if (c == J) "J" else if (c == M) "M" else "n")
+		if (r.kind == "J") {
+			this.i++
+			r.n = this.num(1, 365)
+		} else if (r.kind == "n") {
+			r.n = this.num(0, 365)
+		} else {
+			this.i++
+			r.m = this.num(1, 12)
+			this.dot()
+			r.w = this.num(1, 5)
+			this.dot()
+			r.d = this.num(0, 6)
+		}
+		if (this.s.at(this.i) == slash) {
+			this.i++
+			r.time = this.hms(167)
+		}
+		return r
+	}
+
+	dot() throws ParseError {
+		if (this.s.at(this.i) != dot) {
+			throw this.error()
+		}
+		this.i++
+	}
+
+	/// A number of 1 to 3 digits from lo to hi.
+	num(lo: i32, hi: i32): i32 throws ParseError {
+		const from = this.i
+		while (this.i < from + 3 && isDigit(this.s.at(this.i) ?? 0)) {
+			this.i++
+		}
+		if (this.i == from) {
+			throw this.error()
+		}
+		const v = number(this.s, from, this.i)
+		if (v < lo || v > hi) {
+			throw new ParseError("range", this.base + from)
+		}
+		return v
+	}
+}
+
+/// The sizes of the data after a TZif header at at, with times of size bytes: transitions, their types, the types,
+/// their names, leap seconds and two flags per type.
+function dataLength(b: string, at: i32, size: i32): i64 {
+	const [isut, isstd, leap, n, types, chars] = [0, 1, 2, 3, 4, 5].map(k => big(b, at + 20 + 4 * k, 4) & 0xffffffff)
+	return n * ((size + 1) as i64) + types * 6 + chars + leap * ((size + 4) as i64) + isstd + isut
+}
+
+/// The big-endian, two's complement integer of the n bytes of b from at on.
+function big(b: string, at: i32, n: i32): i64 {
+	let v: i64 = 0
+	for (const i of 0 ... n - 1) {
+		v = v << 8 | (b[at + i] as i64)
+	}
+	return if (n == 4) (v as i32) as i64 else v
+}

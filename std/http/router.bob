@@ -1,19 +1,22 @@
-//! Routes requests by method and path, after Hono: a pattern's segments match a path's, `:name` taking one of them
-//! and `*name` the rest; middleware wraps every route, outermost first. A literal segment wins over `:`, which wins
-//! over `*`; a path known with the wrong method is 405 with Allow; HEAD falls back to GET; `/a` and `/a/` differ.
+//! Routes requests by method and path, after Hono: a pattern's segments match a path's, `:name` taking one of them,
+//! not empty, and `*name` the rest; middleware wraps every route, outermost first. A literal segment wins over `:`,
+//! which wins over `*`; a path known with the wrong method is 405 with Allow; HEAD falls back to GET; `/a` and `/a/`
+//! differ, and `/a/*r` matches `/a/` but not `/a`. A path is matched as it is, as middleware sees it, an empty one as
+//! `/`; its params are percent-decoded, so a guard on what one holds checks the param, not the path.
 
 import { HashMap } from "../collections/hashmap"
 import { Handler, Middleware, Request, Response, wrap } from "../http"
 import { IoError } from "../io"
 import { ParseError } from "../parse"
-import { split, startsWith } from "../string"
+import { endsWith, split, startsWith } from "../string"
+import { unescape } from "../url"
 
 export type Params = HashMap[string, string]
 export type Route = (req: Request, params: Params) => Response throws IoError | ParseError
 
-/// A pattern's segments: those of "/a/:b" are ["a", ":b"], of "/" [""].
+/// A pattern's segments: those of "/a/:b" are ["a", ":b"], of "/" or "" [""].
 function segments(path: string): string[] {
-	const parts = split(path, "/")
+	const parts = split(if (path == "") "/" else path, "/")
 	return parts.slice(1, parts.length)
 }
 
@@ -40,16 +43,16 @@ class Entry {
 	match(path: string[]): Params | null {
 		const p = new HashMap[string, string]()
 		for (const i of 0 ... this.segments.length - 1) {
-			const s = this.segments[i]
-			if (startsWith(s, "*")) {
-				p.set(s.slice(1, s.length), path.slice(i, path.length).join("/"))
-				return p
-			}
 			if (i >= path.length) {
 				return null
 			}
-			if (startsWith(s, ":")) {
-				p.set(s.slice(1, s.length), path[i])
+			const s = this.segments[i]
+			if (startsWith(s, "*")) {
+				p.set(s.slice(1, s.length), unescape(path.slice(i, path.length).join("/"), true))
+				return p
+			}
+			if (startsWith(s, ":") && path[i] != "") {
+				p.set(s.slice(1, s.length), unescape(path[i], true))
 			} else if (s != path[i]) {
 				return null
 			}
@@ -62,6 +65,8 @@ export class Router {
 	/// By rank, then in the order added.
 	private routes: Entry[] = []
 	private mws: Middleware[] = []
+	/// The routes inside mws, built as each is added rather than per request.
+	private chain: Handler = req => this.route(req)
 
 	get(pattern: string, route: Route) { this.add("GET", pattern, route) }
 	post(pattern: string, route: Route) { this.add("POST", pattern, route) }
@@ -72,12 +77,17 @@ export class Router {
 	options(pattern: string, route: Route) { this.add("OPTIONS", pattern, route) }
 	any(pattern: string, route: Route) { this.add("", pattern, route) }
 	/// Wraps every route, and the 404s and 405s, inside those added before it.
-	use(mw: Middleware) { this.mws.push(mw) }
+	use(mw: Middleware) {
+		this.mws.push(mw)
+		this.chain = wrap(this.mws, req => this.route(req))
+	}
 
-	/// Adds r's routes under prefix, each wrapped in r's middleware.
+	/// Adds r's routes under prefix, a / it ends in left out, each wrapped in r's middleware; under /api, r's / is
+	/// /api/.
 	mount(prefix: string, r: Router) {
+		const under = if (endsWith(prefix, "/")) prefix.slice(0, prefix.length - 1) else prefix
 		for (const e of r.routes) {
-			this.add(e.method, prefix + e.pattern, (req, p) => wrap(r.mws, q => e.route(q, p))(req))
+			this.add(e.method, under + e.pattern, (req, p) => wrap(r.mws, q => e.route(q, p))(req))
 		}
 	}
 
@@ -91,7 +101,7 @@ export class Router {
 	}
 
 	/// The router as a handler.
-	handle(req: Request): Response throws IoError | ParseError { return wrap(this.mws, q => this.route(q))(req) }
+	handle(req: Request): Response throws IoError | ParseError { return this.chain(req) }
 
 	private route(req: Request): Response throws IoError | ParseError {
 		const path = segments(req.url.path)
@@ -114,8 +124,10 @@ export class Router {
 				get = e
 				getParams = p
 			}
-			if (!allow.includes(e.method)) {
-				allow.push(e.method)
+			for (const m of if (e.method == "GET") ["GET", "HEAD"] else [e.method]) {
+				if (!allow.includes(m)) {
+					allow.push(m)
+				}
 			}
 		}
 		if (get != null) {

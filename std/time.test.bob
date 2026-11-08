@@ -1,0 +1,278 @@
+import { Date, DateTime, dateOf, daysInMonth, daysOf, deadline, fixed, formatDuration, head, hour, httpDate, httpDateAt,
+	isLeap, isValid, local, maxDays, millisecond, minDays, minute, monotonic, parseHttpDate, parseRfc3339, posix,
+	rfc3339, second, tzif, utc } from "./time"
+import { maxOf, minOf } from "./limits"
+import { ParseError } from "./parse"
+
+/// The ParseError f throws, or null.
+function failure(f: () => i64): ParseError | null {
+	try {
+		f()
+		return null
+	} catch (e: ParseError) {
+		return e
+	}
+}
+
+test "the calendar against counting days one by one, over all a Date spans" {
+	let [y, m, d] = [-9999, 1, 1]
+	let wd = (daysOf(-9999, 1, 1) % 7 + 7 + 3) % 7 + 1
+	for (const n of minDays ... maxDays) {
+		const date = dateOf(n)
+		assert date.year == y && date.month == m && date.day == d
+		assert daysOf(y, m, d) == n && date.weekday() == wd
+		d++
+		if (d > daysInMonth(y, m)) {
+			d = 1
+			m++
+			if (m > 12) {
+				m = 1
+				y++
+			}
+		}
+		wd = wd % 7 + 1
+	}
+	assert y == 10000
+}
+
+test "leap years" {
+	assert isLeap(2000) && isLeap(2024) && isLeap(0) && isLeap(-4) && isLeap(-400)
+	assert !isLeap(1900) && !isLeap(2023) && !isLeap(-100) && !isLeap(-1)
+	assert daysInMonth(2024, 2) == 29 && daysInMonth(2023, 2) == 28
+	assert [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map(m => daysInMonth(2023, m)) == [31, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+}
+
+test "dates" {
+	const d = new Date(1970, 1, 1)
+	assert d.days() == 0 && d.weekday() == 4 && `${d}` == "1970-01-01"
+	assert `${new Date(-44, 3, 15)}` == "-000044-03-15" && `${new Date(9999, 12, 31)}` == "9999-12-31"
+	assert new Date(2024, 1, 31).addMonths(1) == new Date(2024, 2, 29)
+	assert new Date(2023, 1, 31).addMonths(1) == new Date(2023, 2, 28)
+	assert new Date(2024, 3, 31).addMonths(-13) == new Date(2023, 2, 28)
+	assert new Date(2024, 2, 29).addMonths(12) == new Date(2025, 2, 28)
+	assert new Date(2024, 12, 31).addDays(1) == new Date(2025, 1, 1)
+	assert new Date(2024, 1, 1).compare(new Date(2023, 12, 31)) > 0 && d.compare(new Date(1970, 1, 1)) == 0
+	assert isValid(2024, 2, 29) && !isValid(2023, 2, 29) && !isValid(2023, 13, 1) && !isValid(2023, 0, 1) && !isValid(10000, 1, 1)
+	assert isValid(1582, 10, 10) // proleptic Gregorian, with no Julian switch as Java's GregorianCalendar has
+}
+
+test "instants on a wall clock, to the ends of their span" {
+	assert `${utc.civil(0)}` == "1970-01-01T00:00:00" && `${utc.civil(-1)}` == "1969-12-31T23:59:59.999999999"
+	assert `${utc.civil(1_500_000_000)}` == "1970-01-01T00:00:01.5"
+	assert `${utc.civil(max)}` == "2262-04-11T23:47:16.854775807"
+	assert `${utc.civil(min)}` == "1677-09-21T00:12:43.145224192"
+	assert utc.instant(utc.civil(max)) == max && utc.instant(utc.civil(min)) == min
+	assert utc.instant(new DateTime(new Date(9999, 1, 1))) == max && utc.instant(new DateTime(new Date(1, 1, 1))) == min
+	assert utc.instant(new DateTime(new Date(2262, 4, 11), 23, 47, 16, 854_775_808)) == max
+}
+
+test "RFC 3339" {
+	assert rfc3339(0) == "1970-01-01T00:00:00Z" && rfc3339(-1) == "1969-12-31T23:59:59.999999999Z"
+	assert rfc3339(1_000_000, fixed(-90 * 60)) == "1969-12-31T22:30:00.001-01:30"
+	assert parseRfc3339("1985-04-12T23:20:50.52Z") == 482196050_520_000_000
+	assert parseRfc3339("1996-12-19T16:39:57-08:00") == 851042397 * second
+	assert parseRfc3339("1990-12-31t15:59:59.123456789z") == 662659199_123_456_789
+	assert parseRfc3339("2262-04-11T23:47:16.854775807Z") == max && parseRfc3339("1677-09-21T00:12:43.145224192Z") == min
+	assert failure(() => parseRfc3339("2262-04-11T23:47:16.854775808Z"))!.at == 0
+	assert failure(() => parseRfc3339("1677-09-21T00:12:43.145224191Z"))!.at == 0
+	assert failure(() => parseRfc3339("9999-12-31T23:59:59Z"))!.kind == "range"
+	assert parseRfc3339("1990-12-31T23:59:60Z") == parseRfc3339("1990-12-31T23:59:59Z")
+	assert failure(() => parseRfc3339("1990-12-31T23:59:61Z"))!.at == 17
+	assert failure(() => parseRfc3339("2023-02-29T00:00:00Z"))!.kind == "range"
+	assert failure(() => parseRfc3339("2023-02-28 00:00:00Z"))!.at == 10
+	assert failure(() => parseRfc3339("2023-02-28T00:00:00.Z"))!.at == 20
+	assert failure(() => parseRfc3339("2023-02-28T00:00:00.1234567890Z"))!.at == 29
+	assert failure(() => parseRfc3339("2023-02-28T00:00:00+24:00"))!.at == 20
+	assert failure(() => parseRfc3339("2023-02-28T00:00:00"))!.at == 19
+	assert failure(() => parseRfc3339("2023-2-28T00:00:00Z"))!.at == 6
+	assert failure(() => parseRfc3339(" 2023-02-28T00:00:00Z"))!.at == 0
+	assert failure(() => parseRfc3339("2023-02-28T00:00:00Zx"))!.at == 20
+	for (const t of [1_700_000_000_123_456_789, 1, -1, -999_999_999, max, min]) {
+		assert parseRfc3339(rfc3339(t)) == t && parseRfc3339(rfc3339(t, vienna)) == t
+	}
+}
+
+test "a monotonic clock" {
+	const t = monotonic()
+	assert monotonic() >= t && t >= 0
+	assert deadline(0) == 0 && deadline(max) == max && deadline(second) > t + second / 2
+}
+
+test "durations as Go writes them" {
+	assert formatDuration(0) == "0s" && formatDuration(1) == "1ns" && formatDuration(1_500) == "1.5µs"
+	assert formatDuration(-1_250_000) == "-1.25ms" && formatDuration(999_999_999) == "999.999999ms"
+	assert formatDuration(second) == "1s" && formatDuration(90 * second + 1) == "1m30.000000001s"
+	assert formatDuration(hour) == "1h0m0s" && formatDuration(26 * hour + 3 * minute + 500 * millisecond) == "26h3m0.5s"
+	assert formatDuration(min) == "-2562047h47m16.854775808s" && formatDuration(max) == "2562047h47m16.854775807s"
+}
+
+test "HTTP dates" {
+	assert httpDate(784111777_000_000_000) == "Sun, 06 Nov 1994 08:49:37 GMT"
+	assert httpDate(0) == "Thu, 01 Jan 1970 00:00:00 GMT" && httpDate(-1) == "Wed, 31 Dec 1969 23:59:59 GMT"
+	assert parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT") == 784111777 * second
+	assert failure(() => parseHttpDate("Fri, 31 Dec 9999 23:59:59 GMT"))!.at == 12
+	// RFC 850's and asctime's, a year of RFC 850's up to 50 years past now(), 2015 in tests.
+	assert parseHttpDate("Sunday, 06-Nov-94 08:49:37 GMT") == 784111777 * second
+	assert parseHttpDate("Sun Nov  6 08:49:37 1994") == 784111777 * second
+	assert parseHttpDate("Sun Nov 16 08:49:37 1994") == 784111777 * second + 10 * 86400 * second
+	assert parseHttpDate("Thursday, 01-Jan-65 00:00:00 GMT") == parseRfc3339("2065-01-01T00:00:00Z")
+	assert parseHttpDate("Friday, 01-Jan-66 00:00:00 GMT") == parseRfc3339("1966-01-01T00:00:00Z")
+	// now() is 2015-06-26T14:00:00Z: 50 years on is the last of 2065, the instant after of 1965.
+	assert parseHttpDate("Friday, 26-Jun-65 14:00:00 GMT") == parseRfc3339("2065-06-26T14:00:00Z")
+	assert parseHttpDate("Friday, 26-Jun-65 14:00:01 GMT") == parseRfc3339("1965-06-26T14:00:01Z")
+	assert parseHttpDate("Thursday, 31-Dec-65 23:59:59 GMT") == parseRfc3339("1965-12-31T23:59:59Z")
+	// In 2050, 29-Feb-00 is not in 2100, which has no February 29, but in 2000.
+	const in2050 = parseRfc3339("2050-01-01T00:00:00Z")
+	assert httpDateAt("Tuesday, 29-Feb-00 12:00:00 GMT", in2050) == parseRfc3339("2000-02-29T12:00:00Z")
+	assert httpDateAt("Friday, 01-Jan-00 00:00:00 GMT", in2050) == parseRfc3339("2100-01-01T00:00:00Z")
+	assert failure(() => httpDateAt("Wednesday, 30-Feb-00 12:00:00 GMT", in2050))!.at == 11
+	assert failure(() => parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT "))!.at == 29
+	assert failure(() => parseHttpDate("Sundae, 06-Nov-94 08:49:37 GMT"))!.at == 0
+	assert failure(() => parseHttpDate("Sunday, 06-Nov-94 08:49:37 UTC"))!.at == 27
+	assert failure(() => parseHttpDate("Sunday, 31-Nov-94 08:49:37 GMT"))!.at == 8
+	assert failure(() => parseHttpDate("Sun Nov  6 08:49:37 94"))!.at == 22
+	assert failure(() => parseHttpDate("Sun Nov  6 25:49:37 1994"))!.at == 11
+	assert failure(() => parseHttpDate("Sun Nox  6 08:49:37 1994"))!.at == 4
+	assert failure(() => parseHttpDate("Sux Nov  6 08:49:37 1994"))!.at == 0
+	assert failure(() => parseHttpDate(""))!.at == 0
+	assert failure(() => parseHttpDate("Sun, 06 Nov 1994 08:49:37 UTC"))!.at == 26
+	assert failure(() => parseHttpDate("Sun, 06 Now 1994 08:49:37 GMT"))!.at == 8
+	assert failure(() => parseHttpDate("Sun, 31 Nov 1994 08:49:37 GMT"))!.at == 5
+}
+
+const max = maxOf[i64]()
+const min = minOf[i64]()
+
+const vienna = posix("CET-1CEST,M3.5.0,M10.5.0/3")
+
+test "a POSIX rule, its gap and its fold" {
+	const spring = parseRfc3339("2024-03-31T01:00:00Z")
+	assert vienna.offset(spring - 1) == 3600 && vienna.offset(spring) == 7200
+	assert rfc3339(spring - second, vienna) == "2024-03-31T01:59:59+01:00" && rfc3339(spring, vienna) == "2024-03-31T03:00:00+02:00"
+	const gap = new DateTime(new Date(2024, 3, 31), 2, 30)
+	assert vienna.instants(gap) == []
+	assert vienna.instant(gap) == spring + 30 * minute && vienna.instant(gap, "later") == spring + 30 * minute
+	assert vienna.instant(gap, "earlier") == spring - 30 * minute
+	const autumn = parseRfc3339("2024-10-27T01:00:00Z")
+	const fold = new DateTime(new Date(2024, 10, 27), 2, 30)
+	assert vienna.instants(fold) == [autumn - 30 * minute, autumn + 30 * minute]
+	assert vienna.instant(fold) == autumn - 30 * minute && vienna.instant(fold, "earlier") == autumn - 30 * minute
+	assert vienna.instant(fold, "later") == autumn + 30 * minute
+	assert vienna.instants(new DateTime(new Date(2262, 10, 26), 2, 30)) == [max]
+	assert vienna.instants(new DateTime(new Date(1676, 10, 25), 2, 30)) == [min]
+	const plain = new DateTime(new Date(2024, 7, 1), 12)
+	assert vienna.instants(plain) == [parseRfc3339("2024-07-01T10:00:00Z")]
+	assert vienna.civil(vienna.instant(plain)) == plain
+}
+
+test "POSIX rules of the southern hemisphere, the US by default, and every kind of day" {
+	const sydney = posix("AEST-10AEDT,M10.1.0,M4.1.0/3")
+	assert sydney.offset(parseRfc3339("2024-01-01T00:00:00Z")) == 11 * 3600
+	assert sydney.offset(parseRfc3339("2024-07-01T00:00:00Z")) == 10 * 3600
+	const us = posix("EST5EDT")
+	assert us.offset(parseRfc3339("2024-03-10T06:59:59Z")) == -5 * 3600
+	assert us.offset(parseRfc3339("2024-03-10T07:00:00Z")) == -4 * 3600
+	assert us.offset(parseRfc3339("2024-11-03T05:59:59Z")) == -4 * 3600
+	assert us.offset(parseRfc3339("2024-11-03T06:00:00Z")) == -5 * 3600
+	// DST all year, as RFC 8536 §3.3.1 writes it.
+	const always = posix("EST5EDT,0/0,J365/25")
+	for (const s of ["2023-12-31T23:00:00Z", "2024-01-01T04:59:59Z", "2024-01-01T05:00:00Z", "2024-06-01T00:00:00Z"]) {
+		assert always.offset(parseRfc3339(s)) == -4 * 3600
+	}
+	// Greenland's times before midnight; J and zero-based days, in a leap year.
+	const nuuk = posix("<-02>2<-01>,M3.5.0/-1,M10.5.0/0")
+	assert nuuk.offset(parseRfc3339("2024-03-31T00:59:59Z")) == -7200 && nuuk.offset(parseRfc3339("2024-03-31T01:00:00Z")) == -3600
+	const j = posix("XXX0YYY,J60/0,J61/0")
+	const n = posix("XXX0YYY,59/0,60/0")
+	const days: [string, i32, i32][] = [["2023-02-28", 0, 0], ["2023-03-01", 3600, 3600], ["2023-03-02", 0, 0],
+		["2024-02-29", 0, 3600], ["2024-03-01", 3600, 0]]
+	for (const [day, jo, no] of days) {
+		const t = parseRfc3339(`${day}T12:00:00Z`)
+		assert j.offset(t) == jo && n.offset(t) == no
+	}
+	// DST of a day, or of an hour, which no zone of the tz database has: wall clocks in it read once, or twice.
+	const noon = new DateTime(new Date(2023, 3, 1), 12)
+	assert j.instants(noon) == [parseRfc3339("2023-03-01T11:00:00Z")] && j.instant(noon) == j.instants(noon)[0]
+	const hour = posix("XXX0YYY,J60/0,J60/2")
+	const twice = new DateTime(new Date(2023, 3, 1), 1, 30)
+	assert hour.instants(twice) == [parseRfc3339("2023-03-01T00:30:00Z"), parseRfc3339("2023-03-01T01:30:00Z")]
+	const skipped = new DateTime(new Date(2023, 3, 1), 0, 30)
+	assert hour.instants(skipped) == [] && hour.instant(skipped) == parseRfc3339("2023-03-01T00:30:00Z")
+	assert hour.instant(skipped, "earlier") == parseRfc3339("2023-02-28T23:30:00Z")
+	assert posix("UTC0").offset(0) == 0 && posix("<+0530>-5:30").offset(0) == 19800
+}
+
+test "malformed POSIX rules" {
+	const cases: [string, i32][] = [["", 0], ["CE-1", 0], ["CET", 3], ["CET-1CEST,M3.5.0", 16], ["CET-1CEST,M13.5.0,M10.5.0", 11],
+		["CET-1CEST,M3.5.0,M10.5.0/168", 25], ["<+01-1", 0], ["<A,B>-1", 0], ["CET-1CEST,M3.5,M10.5.0", 14], ["CET-1x", 5]]
+	for (const [rule, at] of cases) {
+		try {
+			posix(rule)
+			assert false
+		} catch (e: ParseError) {
+			assert e.at == at
+		}
+	}
+}
+
+test "fixed zones and the local one" {
+	assert fixed(3600).name == "+01:00" && fixed(-75).name == "-00:01:15" && fixed(0).offset(12345) == 0
+	assert rfc3339(0, fixed(75)) == "1970-01-01T00:01:00+00:01" && rfc3339(0, fixed(-29)) == "1970-01-01T00:00:00Z"
+	assert rfc3339(0, fixed(86399)) == "1970-01-01T23:59:00+23:59"
+	assert local() == utc
+}
+
+/// A TZif file of version v with the transitions at to offsets, an initial one first, and rule after.
+function file(v: string, times: i64[], offsets: i32[], rule: string): string {
+	const be = (x: i64, n: i32) => {
+		let s = ""
+		for (const i of 1 ... n) {
+			s += chr((x >> 8 * (n - i)) as u8)
+		}
+		return s
+	}
+	const data = (size: i32) => {
+		let s = `TZif${v}\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0${be(0, 4)}${be(0, 4)}${be(0, 4)}${be(times.length as i64, 4)}`
+		s += `${be(offsets.length as i64, 4)}${be(4, 4)}`
+		for (const t of times) {
+			s += be(t, size)
+		}
+		for (const i of 1 ... times.length) {
+			s += chr(i as u8)
+		}
+		for (const o of offsets) {
+			s += `${be(o as i64, 4)}\0\0`
+		}
+		return s + "LMT\0"
+	}
+	return if (v == "\0") data(4) else `${data(4)}${data(8)}\n${rule}\n`
+}
+
+test "TZif files of every version" {
+	const times: i64[] = [-2_000_000_000, 100, 200]
+	for (const v of ["\0", "2", "3", "4"]) {
+		const z = tzif("Test", file(v, times, [3700, 3600, 7200, 3600], "CET-1CEST,M3.5.0,M10.5.0/3"))
+		assert z.offset(-2_000_000_001 * second) == 3700 && z.offset(-2_000_000_000 * second) == 3600
+		assert z.offset(150 * second) == 7200 && z.offset(199 * second) == 7200 && z.offset(200 * second) == 3600
+		const summer = parseRfc3339("2024-07-01T00:00:00Z")
+		assert z.offset(summer) == (if (v == "\0") 3600 else 7200)
+	}
+	const fixedOnly = tzif("Fixed", file("2", [], [-3600], ""))
+	assert fixedOnly.offset(0) == -3600 && fixedOnly.offset(parseRfc3339("2100-01-01T00:00:00Z")) == -3600
+	// A rule without DST holds from the last transition on, over what the data says.
+	assert tzif("Footer", file("2", [], [3600], "UTC0")).offset(0) == 0
+	const footer = tzif("Footer", file("2", [100], [3600, 7200], "UTC0"))
+	assert footer.offset(100 * second - 1) == 3600 && footer.offset(100 * second) == 0
+	assert head("/dev/zero").length == 1 << 20
+	const extra = file("2", [], [0], "UTC0") + "x"
+	assert failure(() => tzif("Extra", extra).offset(0))!.at == extra.length - 1
+	assert failure(() => tzif("Bad", "TZif2").offset(0)) != null
+	assert failure(() => tzif("Bad", file("2", [200, 100], [0, 0, 0], "")).offset(0)) != null
+	assert failure(() => tzif("Bad", file("2", [100], [0, 100000], "")).offset(0))!.kind == "range"
+	const good = file("2", times, [0, 0, 0, 0], "UTC0")
+	for (const n of 0 ... good.length - 1) {
+		if (n != good.length - 1) {
+			assert failure(() => tzif("Short", good.slice(0, n)).offset(0)) != null
+		}
+	}
+}
