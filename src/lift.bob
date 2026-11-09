@@ -1,0 +1,106 @@
+//! bober lift: the Program being made and what the checker and lower know of it, keyed by the checker's symbols and
+//! types; and the modules of the bundle, linked into it from their files (src/bc/file.bob) rather than checked and
+//! lowered.
+
+import { contains } from "../std/algo"
+import { HashMap } from "../std/collections/hashmap"
+import { Reader, Writer } from "../std/encoding/binary"
+import { open } from "../std/fs"
+import { fnv } from "../std/hash"
+import { IoError } from "../std/io"
+import { ParseError } from "../std/parse"
+import { indexOf } from "../std/string"
+import * as decl from "./bc/decl"
+import { deps, pathOf, read, write } from "./bc/file"
+import { Program } from "./bc/program"
+import { CompileError } from "./error"
+import { root } from "./root"
+import { Type } from "./type"
+
+export class Lift {
+	prog = new Program()
+	/// Each top-level decl by its checker symbol.
+	entries = new HashMap[string, i32]()
+	/// Per decl, the checker's type of what it declares.
+	types = new HashMap[i32, Type]()
+	/// By checker type id: the decl of each class and interface, and the Param of each type param.
+	nominals = new HashMap[i32, i32]()
+	params = new HashMap[i32, i32]()
+	/// The bundle: the file of each module by the path it holds, of source hash 0 and made by this compiler.
+	bundle = new HashMap[string, string]()
+
+	/// The module at path of the bundle, linked with the modules it imports not yet linked, each top-level decl an
+	/// entry; -1 if the bundle lacks it. Throws a CompileError if a file is missing, stale or malformed.
+	module(path: string): i32 {
+		const file = this.bundle.get(path)
+		if (file == null) {
+			return -1
+		}
+		const p = this.prog
+		const linked = p.module(path)
+		if (linked >= 0) {
+			return linked
+		}
+		const paths = [path]
+		const files = [file!]
+		try {
+			let i = 0
+			while (i < files.length) {
+				for (const d of deps(files[i], root)) {
+					const f = if (p.module(d) < 0 && !contains(paths, d)) this.bundle.get(d) else null
+					if (f != null) {
+						paths.push(d)
+						files.push(f!)
+					}
+				}
+				i++
+			}
+			const ms = read(p, files, compilerId(), files.map(_ => 0 as u64), root)
+			if (ms != null) {
+				for (const m of ms!) {
+					for (const d of p.modules[m].decls) {
+						this.entries.set(`${p.modules[m].path}:${p.strings[p.decls[d].name]}`, d)
+					}
+				}
+				return ms![0]
+			}
+		} catch (e: ParseError | IoError) {}
+		throw new CompileError(`the bundle's ${path}, or a module it imports, is missing, stale or malformed`)
+	}
+}
+
+/// The bundle of the modules of p, made by the compiler whose hash is compiler, which drops their tests and source
+/// hashes first: each one's file, as its length, unsigned LEB128, and its bytes.
+export function bundle(p: Program, compiler: u64): string {
+	for (const x of p.modules) {
+		x.source = 0
+		x.decls = x.decls.filter(d => p.decls[d].kind != decl.Test)
+	}
+	const w = new Writer()
+	for (const m of 0 ... p.modules.length - 1) {
+		const f = write(p, m, compiler)
+		w.uleb(f.length as u64)
+		w.raw(f)
+	}
+	return w.bytes
+}
+
+/// The files of bundle s by the path each holds.
+export function unbundle(s: string): HashMap[string, string] throws ParseError {
+	const files = new HashMap[string, string]()
+	const r = new Reader(s)
+	while (r.pos < s.length) {
+		const f = r.raw(r.uleb() as i32)
+		files.set(pathOf(f, root), f)
+	}
+	return files
+}
+
+/// The hash of the compiler's build ID, a hash of its content that ld puts in its first page.
+export function compilerId(): u64 throws IoError {
+	const f = open("/proc/self/exe")
+	const page = f.read(4096) ?? ""
+	f.close()
+	const i = indexOf(page, "\x03\x00\x00\x00GNU\x00") // the note's type, NT_GNU_BUILD_ID, and owner
+	return fnv(page.slice(i + 8, i + 8 + page[i - 4]))
+}

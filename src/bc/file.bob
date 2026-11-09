@@ -34,8 +34,9 @@
 //!
 //! A file is fresh while its compiler and source hashes are the current ones and the ABI hash it has of each dep is
 //! that dep's; reading a stale one is a miss. A changed compiler makes each stale, so the format has no version. The
-//! source hash is 0 in a package. Files are read as a set, as modules of builtin/ and std/ import each other, and are
-//! first linked into a scratch Program, so that a malformed one leaves the Program as it was.
+//! source hash is 0 in a package, whose paths are relative to bober's root (src/root.bob), as the repo's are. Files are
+//! read as a set, as modules of builtin/ and std/ import each other, and are first linked into a scratch Program, so
+//! that a malformed one leaves the Program as it was.
 //!
 //! ## ABI
 //!
@@ -48,6 +49,7 @@
 import { contains } from "../../std/algo"
 import { HashMap } from "../../std/collections/hashmap"
 import { Reader, Writer } from "../../std/encoding/binary"
+import { isAbs, join } from "../../std/fs/path"
 import { combine, fnv } from "../../std/hash"
 import { min } from "../../std/math"
 import { ParseError } from "../../std/parse"
@@ -86,12 +88,14 @@ function parts(k: kind.Kind, a: i32): Part[] {
 export function write(p: Program, m: i32, compiler: u64): string { return new Out(p, m).file(compiler) }
 
 /// The modules of files, linked into p, each of whose deps p holds or is among them; null if one is stale, or made by
-/// another compiler or of another source than its hash in sources (sourceHash).
-export function read(p: Program, files: string[], compiler: u64, sources: u64[]): i32[] | null throws ParseError {
+/// another compiler or of another source than its hash in sources (sourceHash). A relative path a file holds is
+/// relative to root.
+export function read(p: Program, files: string[], compiler: u64, sources: u64[],
+	root = "."): i32[] | null throws ParseError {
 	const abis = new HashMap[string, u64]()
 	const heads: In[] = []
 	for (const i of 0 ... files.length - 1) {
-		heads.push(new In(p, files[i]))
+		heads.push(new In(p, files[i], root))
 		if (heads[i].compiler != compiler || heads[i].source != sources[i]) {
 			return null
 		}
@@ -113,8 +117,18 @@ export function read(p: Program, files: string[], compiler: u64, sources: u64[])
 			}
 		}
 	}
-	link(scratch, files) // which throws for a malformed file before p changes
-	return link(p, files)
+	link(scratch, files, root) // which throws for a malformed file before p changes
+	return link(p, files, root)
+}
+
+/// The path of the module of file, a relative one relative to root.
+export function pathOf(file: string, root = "."): string throws ParseError {
+	return new In(new Program(), file, root).path
+}
+
+/// The paths of the modules whose decls the module of file uses, its deps, a relative one relative to root.
+export function deps(file: string, root = "."): string[] throws ParseError {
+	return new In(new Program(), file, root).paths
 }
 
 /// Declares in module m of q, in owner, decl d of p and the decls it owns, without their parts.
@@ -127,10 +141,10 @@ function declare(q: Program, m: i32, owner: i32, p: Program, d: i32): void {
 }
 
 /// The modules of files, linked into p.
-function link(p: Program, files: string[]): i32[] throws ParseError {
+function link(p: Program, files: string[], root: string): i32[] throws ParseError {
 	const ins: In[] = []
 	for (const f of files) {
-		const x = new In(p, f)
+		const x = new In(p, f, root)
 		x.m = p.addModule(x.path)
 		p.modules[x.m].abi = x.abi
 		p.modules[x.m].source = x.source
@@ -387,7 +401,8 @@ class In {
 	/// Where the section being read ends.
 	private end = 0
 
-	constructor(p: Program, bytes: string) throws ParseError {
+	constructor(p: Program, bytes: string, root: string) throws ParseError {
+		const at = (path: string) => if (isAbs(path)) path else join(root, path)
 		this.p = p
 		this.r = new Reader(bytes)
 		for (const t of 0 ... (kind.Float as i32)) {
@@ -399,11 +414,11 @@ class In {
 		this.compiler = this.r.fixed(8)
 		this.source = this.r.fixed(8)
 		this.abi = this.r.fixed(8)
-		this.path = this.text()
+		this.path = at(this.text())
 		this.end = this.r.pos
 		this.next()
 		for (const _ of 1 ... this.n()) {
-			this.paths.push(this.text())
+			this.paths.push(at(this.text()))
 			this.hashes.push(this.r.fixed(8))
 		}
 	}
