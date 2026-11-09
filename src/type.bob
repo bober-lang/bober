@@ -337,11 +337,11 @@ export class Type {
 	/// function h[T extends i8 | i16](x: T) {}   // error: a union constraint; name a type set
 	/// ```
 	instantiate(args: Type[]): Type {
+		if (this.kind == "function") { // rebuilt even for its own params, so the instance has none left to infer
+			return Type.function(this.types.map(p => p.in(this, args)), this.base?.in(this, args), this.n, this.rest)
+		}
 		if (args.equals(this.params)) {
 			return this
-		}
-		if (this.kind == "function") {
-			return Type.function(this.types.map(p => p.in(this, args)), this.base?.in(this, args), this.n, this.rest)
 		}
 		// Made once, its members taken from its generic's when first asked (members), as they may refer to it.
 		return intern({ ...new Type(this.kind), generic: this, params: args })
@@ -380,8 +380,9 @@ export class Type {
 				}
 			}
 			case "union":
-				const open = this.types.filter(m => m.kind == "param")
-				const closed = Type.union(this.types.filter(m => m.kind != "param"))
+				const bare = this.types.filter(m => m.kind == "param")
+				const open = if (bare.length > 0) bare else this.types.filter(m => m.mentions(params))
+				const closed = Type.union(this.types.filter(m => !contains(open, m)))
 				const rest = v.alternatives().filter(m => !m.fits(closed))
 				if (open.length == 1 && rest.length > 0) {
 					open[0].unify(Type.union(rest), params, found)
