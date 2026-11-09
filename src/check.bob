@@ -47,6 +47,7 @@ export function check(paths: string[], includes: string[] = [], read: (path: str
 		}
 	})
 	deferred = []
+	visited = 0
 	tagTypes = new HashMap[string, Type]()
 	const ms = new Modules(includes, read, next)
 	for (const path of [...paths, ...lowered]) {
@@ -81,8 +82,6 @@ let info = new HashMap[string, Member]()
 let fills = new HashMap[i32, () => void]()
 let filling = 0
 let deferred: (() => void)[] = []
-/// How many searches of uses ran, each marking the declarations it visits (Decl.seen).
-let searches = 0
 /// The classes of builtin/tag.bob, by name.
 let tagTypes = new HashMap[string, Type]()
 /// builtin/type.bob's Type, of any type as a value (4.11).
@@ -124,35 +123,49 @@ class Errors {
 	types: Type[]
 	/// Whether types are listed, not inferred: as it lists them, or is exported or main and lists none.
 	listed = false
-	/// The throws and calls in its body.
+	/// The throws and calls in its body, and the sites calling it.
 	sites: Site[] = []
+	callers: Site[] = []
 
 	constructor(types: Type[] = []) {
 		this.types = types
 	}
 }
 
-/// A throw or call, which may throw the types of from, but those a catch around it takes, null for any.
+/// A throw or call in the function of errors in, which may throw the types of from, but those a catch around it takes,
+/// null for any.
 class Site {
 	at: Loc
 	from: Errors
+	in: Errors
 	caught: (Type | null)[] = []
 
-	constructor(at: Loc, from: Errors) {
+	constructor(at: Loc, from: Errors, in: Errors) {
 		this.at = at
 		this.from = from
+		this.in = in
 	}
 
-	/// The types it lets escape; a type param's are unchecked, as what it stands for is not known here.
-	escaping(): Type[] {
-		return this.from.types.filter(t => t.kind != "param" && !this.caught.some(c => c == null || t.fits(c)))
-	}
+	/// The types it lets escape.
+	escaping(): Type[] { return this.from.types.filter(t => this.passes(t)) }
+
+	/// Whether it lets t escape; a type param's are unchecked, as what it stands for is not known here.
+	passes(t: Type): bool { return t.kind != "param" && !this.caught.some(c => c == null || t.fits(c)) }
 }
 
-/// Adds t to ts unless it fits one of them; returns whether it did.
+/// Adds t to ts unless it fits one of them, dropping those that fit it; returns whether it did.
 function add(ts: Type[], t: Type): bool {
 	if (ts.some(u => t.fits(u))) {
 		return false
+	}
+	let i = 0
+	while (i < ts.length) {
+		if (ts[i].fits(t)) {
+			ts[i] = ts[ts.length - 1]
+			ts.pop()
+		} else {
+			i++
+		}
 	}
 	ts.push(t)
 	return true
@@ -277,13 +290,15 @@ const bound = new HashMap[string, string]()
 /// it names, with their bodies and initializers, and theirs in turn; for `new C(…)`, or a class embedding `C`, `C`'s
 /// field initializers and constructor; for `new T()`, those of each class in `T`'s constraint; for `x.m` or `C.m`, the
 /// method or static member `m` of the class of `x` or of `C`, and for `${x}`, `x`'s `toString`. Types, annotations
-/// included, run nothing. A function literal may be called where it is, so its body counts, but where it is all of a
-/// variable's initializer: a function's value does not depend on its body, so that variable has no dependencies,
-/// though naming it counts its body. A variable, or static field (§5.3), shall not be among its own dependencies, and a
-/// `const` shall not depend on a `let`. Variables are initialized before `main`, each after its dependencies; the order
-/// is otherwise implementation-defined. A variable read before it is initialized, through a member of an interface,
-/// union or object, or a function or object one initializer stores and another runs, holds its zero value, or null
-/// where its type has none.
+/// included, run nothing. A function literal may be called where it is, so its body counts, but where the initializer
+/// gives it unrun: as its value, in parentheses, cast with `as`, as a branch of an `if` or `switch` expression, or as
+/// an element or member of an array or object literal. A function's value does not depend on its body, so its body is
+/// none of that variable's dependencies, though naming the variable counts it, and may use the variable where it has a
+/// type. A variable, or static field (§5.3), shall not be among its own dependencies, and a `const` shall not depend
+/// on a `let`. Variables are initialized before `main`, each after its dependencies; the order is otherwise
+/// implementation-defined. A variable read before it is initialized, through a member of an interface, union or
+/// object, or a function or object one initializer stores and another runs, holds its zero value, or null where its
+/// type has none.
 ///
 /// ```
 /// const total = double(base) + 1    // base is initialized first
@@ -303,6 +318,8 @@ const bound = new HashMap[string, string]()
 /// const e: () => i32 = () => g()
 /// const g: () => i32 = () => e()     // ok: neither is run
 /// const once: i32 = (() => once)()   // error: the function is run
+/// const ops: { f: (n: i32) => i32 } = { f: n => if (n == 0) 0 else ops.f(n - 1) }   // ok
+/// const pick: () => i32 = if (base > 0) (() => pick()) else (() => 0)                // ok: base is a dependency
 /// class P { ps: P[] = none }
 /// const none: P[] = []               // ok: types run nothing
 /// const q = new Q()
@@ -421,15 +438,24 @@ class Decl {
 	/// Whether a check in it failed, so that it is not handed on.
 	failed = false
 	state: "new" | "busy" | "done" = "new"
-	/// The top-level declarations it references.
+	/// The top-level declarations it references, and the last that recorded it as one.
 	deps: Decl[] = []
+	depOf: Decl | null = null
 	/// What running it may run (3): the functions, variables and class members it names and the classes it constructs;
-	/// a class's are those of its constructor and instance field initializers.
+	/// a class's are those of its constructor and instance field initializers. And the last that recorded it as one.
 	uses: Decl[] = []
-	/// The last search of uses that visited it.
-	seen = 0
+	userOf: Decl | null = null
+	/// Its order in the search of uses (strong): 0 before it, negated once its strongly connected uses are all found;
+	/// and the least order it reaches back to meanwhile. Then whether those loop, and whether it uses a let, transitively.
+	index = 0
+	low = 0
+	loops = false
+	lets = false
 	warning: Warning | null = null
 	errors = new Errors()
+	/// For a variable or field whose initializer gives function literals unrun: what computing its value, without
+	/// their bodies, may run (3).
+	value: Decl | null = null
 
 	constructor(node: Node, at: Tok) {
 		this.node = node
@@ -438,6 +464,10 @@ class Decl {
 		this.mutable = node.t.kind == "let"
 	}
 }
+
+/// An initializer being checked that gives function literals unrun (3), of the variable b if one name, and the
+/// declaration their bodies are uses of.
+type Init = { fns: Node[], b: Binding | null, user: Decl | null }
 
 /// What a name stands for: a value, or a type where isType. A top-level one is typed when first needed.
 class Binding {
@@ -461,7 +491,7 @@ class Binding {
 	params: Type[] = []
 	/// For a const initialized by an integer or string constant, the literal type its name denotes in a type (4.2).
 	literal: Type | null = null
-	/// While its initializer is checked, whether that is a function literal, which does not run it, or a value (3).
+	/// While its initializer is checked, whether that is in the body of a function literal it gives unrun (3).
 	initializing: "" | "function" | "value" = ""
 
 	constructor(t: Type | null, mutable: bool, isType: bool) {
@@ -596,6 +626,8 @@ class Checker {
 	private annotating = false
 	/// The class member being checked whose uses are its own, else null for the owner's.
 	private user: Decl | null = null
+	/// The initializer being checked that gives function literals unrun (3).
+	private init: Init | null = null
 	private self: Type | null = null
 	/// The class whose body is being checked, which sees its private members, as tests do.
 	private host: Type | null = null
@@ -685,14 +717,10 @@ class Checker {
 	/// Infers the errors of the functions that do not list theirs, then warns of each type another lets escape but does
 	/// not list, once, where it first escapes; it is not added to its errors, so no caller is warned of it again (7.5).
 	private escapes() {
-		let changed = true
-		while (changed) {
-			changed = false
-			for (const e of this.throwing.filter(e => !e.listed)) {
-				for (const s of e.sites) {
-					for (const t of s.escaping()) {
-						changed = add(e.types, t) || changed
-					}
+		for (const e of this.throwing.filter(e => !e.listed)) {
+			for (const s of e.sites) {
+				for (const t of s.escaping()) {
+					this.escape(e, t)
 				}
 			}
 		}
@@ -702,6 +730,21 @@ class Checker {
 				for (const t of s.escaping()) {
 					if (add(known, t)) {
 						this.report(s.at, `${show(t)} is neither caught nor listed`, true)
+					}
+				}
+			}
+		}
+	}
+
+	/// Adds t to the errors e of a function that does not list them, and to those of its callers it escapes to.
+	private escape(e: Errors, t: Type) {
+		const todo = [e]
+		while (todo.length > 0) {
+			const x = todo.pop()!
+			if (!x.listed && add(x.types, t)) {
+				for (const s of x.callers) {
+					if (s.passes(t)) {
+						todo.push(s.in)
 					}
 				}
 			}
@@ -1025,11 +1068,16 @@ class Checker {
 
 	/// Reports a variable among its own dependencies, or a const depending on a let, unless checking it failed (3).
 	private cycles(d: Decl) {
-		searches++
-		const e = if (d.failed) null else reached(d, e => e == d || !d.mutable && e.mutable, searches)
-		if (e == d) {
+		const v = d.value ?? d
+		if (v.index == 0) {
+			strong(v)
+		}
+		if (d.failed) {
+			return
+		}
+		if (v.loops) {
 			this.report(d.at.loc, `${this.text(d.at)} depends on itself`)
-		} else if (e != null) {
+		} else if (!d.mutable && v.lets) {
 			this.report(d.at.loc, `${this.text(d.at)} is a const that depends on a let`)
 		}
 	}
@@ -1186,15 +1234,12 @@ class Checker {
 		if (b != null) {
 			b.type = declared
 			b.mutable = n.t.kind == "let"
-			b.initializing = if (init?.kind == "arrow") "function" else "value"
-		}
-		if (this.locals.level == 0 && b?.initializing != "function") {
-			this.vars.push(this.owner!)
+			b.initializing = "value"
 		}
 		let t = declared
 		let literal: Type | null = null
 		if (init != null) {
-			const v = this.expr(init, declared)
+			const v = this.initial(init, declared, b, if (this.locals.level == 0) this.owner else null)
 			literal = if (n.t.kind == "const" && b != null) this.literal(init, v, declared) else null
 			if (declared != null) {
 				this.fit(v, declared, init)
@@ -1223,6 +1268,29 @@ class Checker {
 		}
 		if (init != null && n.t.kind == "const") {
 			this.generic(pattern, init)
+		}
+	}
+
+	/// The type of initializer p of variable b, if one name, or of top-level variable or field d, which is
+	/// initialized after its dependencies (3).
+	private initial(p: Node, want: Type | null, b: Binding | null, d: Decl | null): Type {
+		const fns = unrun(p)
+		if (d != null) {
+			this.vars.push(d)
+			if (fns.length > 0) {
+				d.value = new Decl(d.node!, d.at)
+				d.uses.push(d.value!)
+			}
+		}
+		const init = this.init
+		const user = this.user
+		this.init = if (fns.length > 0) ({ fns: fns, b: b, user: user }) else null
+		this.user = d?.value ?? user
+		try {
+			return this.expr(p, want)
+		} finally {
+			this.init = init
+			this.user = user
 		}
 	}
 
@@ -1725,15 +1793,12 @@ class Checker {
 	private initializer(m: Node, f: Field, t: Type): bool {
 		const init = after(m, "=")!
 		const a = about(t, f.name, f.static)
-		if (a.decl != null && init.kind != "arrow") {
-			this.vars.push(a.decl!)
-		}
 		const user = this.user
 		this.user = a.decl ?? user
 		const ok = this.apart(() => {
 			const want = if (f.embedded) embedding(f.type) else if (after(m, ":") == null) null else f.type
 			this.self = if (has(m, "static")) null else selfOf(t)
-			const v = this.expr(init, want)
+			const v = this.initial(init, want, null, a.decl)
 			if (want == null) {
 				f.type = v.widen(true)
 				m.type = f.type
@@ -2643,7 +2708,8 @@ class Checker {
 			throw this.error(t.loc, `a local class cannot capture ${name}`)
 		}
 		const owner = this.owner
-		if (d != null && owner != null && !contains(owner.deps, d)) {
+		if (d != null && owner != null && d.depOf != owner) {
+			d.depOf = owner
 			owner.deps.push(d)
 		}
 		if (uses && !b.isType) {
@@ -2659,7 +2725,8 @@ class Checker {
 	/// Records d as a use of the class member being checked, else of the declaration.
 	private use(d: Decl | null) {
 		const u = this.user ?? this.owner
-		if (u != null && d != null && !contains(u.uses, d)) {
+		if (u != null && d != null && d.userOf != u) {
+			d.userOf = u
 			u.uses.push(d)
 		}
 	}
@@ -2688,7 +2755,7 @@ class Checker {
 			// A typed top-level one is left to cycles, as are its other dependencies (3).
 			throw this.error((d?.at ?? at).loc, `${this.text(at)} depends on itself`)
 		} else if (b.type == null && b.initializing == "function") {
-			// Read in the function literal that is all of its own initializer, which does not run it (3).
+			// Read in a function literal its own initializer gives unrun (3).
 			throw this.error(at.loc, `${this.text(at)} needs a type to be used in its own initializer`)
 		} else if (b.type == null && (d == null || d.kind == "function")) {
 			throw this.error(at.loc, `${this.text(at)} calls itself, so it needs a result type`)
@@ -3333,7 +3400,9 @@ class Checker {
 	private thrown(at: Loc, from: Errors | null) {
 		const e = this.fn?.errors
 		if (e != null && from != null) {
-			e.sites.push(new Site(at, from))
+			const s = new Site(at, from, e)
+			e.sites.push(s)
+			from.callers.push(s)
 		}
 	}
 
@@ -3531,7 +3600,26 @@ class Checker {
 		const declared = if (isTok(n.parts[1], ":")) this.annotation(n.parts[2]) else null
 		const f = new Fn(declared ?? w?.base)
 		const body = arrowBody(n)
-		const t = returning(sig, if (body.kind == "block") this.body(body, f) else this.returned(body, f.result))
+		const init = this.init
+		const user = this.user
+		const unrun = init != null && contains(init.fns, n)
+		if (unrun) {
+			this.init = null
+			this.user = init!.user
+			if (init!.b != null) {
+				init!.b!.initializing = "function"
+			}
+		}
+		let t = Null
+		try {
+			t = returning(sig, if (body.kind == "block") this.body(body, f) else this.returned(body, f.result))
+		} finally {
+			this.init = init
+			this.user = user
+			if (unrun && init!.b != null) {
+				init!.b!.initializing = "value"
+			}
+		}
 		this.close(paths)
 		if (contains(t.types, Empty)) {
 			throw new Failed()
@@ -4164,6 +4252,21 @@ function isConstant(p: Node): bool {
 		&& isConstant(p.parts[0])
 }
 
+/// The function literals p gives as its value or an element or member of it, unrun (3).
+function unrun(p: Node): Node[] {
+	switch (p.kind) {
+		case "arrow": return [p]
+		case "binary": return if (p.t.kind == "as") unrun(p.parts[0]) else []
+		case "paren", "ifExpr", "switchExpr", "case", "array", "object", "prop":
+			let fns: Node[] = []
+			for (const q of p.parts) {
+				fns = [...fns, ...unrun(q)]
+			}
+			return fns
+	}
+	return []
+}
+
 /// The names pattern p binds.
 export function patternNames(p: Node): Node[] {
 	switch (p.kind) {
@@ -4260,22 +4363,43 @@ function aim(want: Type | null, kinds: TypeKind[]): Type | null {
 	return if (found.length == 1) found[0] else null
 }
 
-/// The first use of origin, or of theirs, transitively, that to holds of, through the declarations not yet seen by
-/// search; else null.
-function reached(origin: Decl, to: (d: Decl) => bool, search: i32): Decl | null {
-	for (const d of origin.uses) {
-		if (to(d)) {
-			return d
+/// How many declarations the searches of uses visited, and those visited whose strongly connected uses are not all
+/// found yet.
+let visited = 0
+const pending: Decl[] = []
+
+/// Finds the strongly connected uses of d and of all it uses (Tarjan's), each marked as it is found with whether they
+/// loop and whether they reach a let, which those of what uses them then rest on.
+function strong(d: Decl): void {
+	visited++
+	d.index = visited
+	d.low = visited
+	pending.push(d)
+	for (const e of d.uses) {
+		if (e.index == 0) {
+			strong(e)
 		}
-		if (d.seen != search) {
-			d.seen = search
-			const e = reached(d, to, search)
-			if (e != null) {
-				return e
-			}
+		if (e.index > 0 && e.low < d.low) {
+			d.low = e.low
 		}
 	}
-	return null
+	if (d.low == d.index) {
+		let i = pending.length - 1
+		while (pending[i] != d) {
+			i--
+		}
+		let lets = false
+		for (const j of i ... pending.length - 1) {
+			lets = lets || pending[j].uses.some(e => e.mutable || e.lets)
+		}
+		const loops = pending.length - i > 1 || contains(d.uses, d)
+		while (pending.length > i) {
+			const e = pending.pop()!
+			e.index = -e.index
+			e.loops = loops
+			e.lets = lets
+		}
+	}
 }
 
 /// The value of an integer literal, or infinity past u64.
