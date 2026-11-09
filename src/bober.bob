@@ -17,7 +17,7 @@ import { endsWith, indexOf, split, startsWith } from "../std/string"
 import { fromCString } from "../std/c"
 import { Keys, Rest, Unknown, decode as decodeJson, encode, quoted } from "../std/encoding/json"
 import { decode } from "../std/encoding/optarg"
-import { exists, glob, mkdirAll, open, readFile, remove, removeAll, rename, stat } from "../std/fs"
+import { exists, glob, mkdirAll, readFile, remove, removeAll, rename, stat } from "../std/fs"
 import { dir as parent, isAbs, join, rel } from "../std/fs/path"
 import { fnv } from "../std/hash"
 import { IoError } from "../std/io"
@@ -36,6 +36,7 @@ import { formatFile } from "./format"
 import { Backend } from "./backend/backend"
 import { LLVM, triple } from "./backend/llvm"
 import { Tpde } from "./backend/tpde"
+import { compilerId } from "./lift"
 import { lower } from "./lower"
 import { serve } from "./lsp"
 import { mono } from "./mono"
@@ -151,15 +152,6 @@ function command(cmd: string, f: Flags): i32 {
 	}
 	print(usage)
 	return 2
-}
-
-/// The hash of the compiler's build ID, a hash of its content that ld puts in its first page.
-function compilerId(): u64 throws IoError {
-	const f = open("/proc/self/exe")
-	const page = f.read(4096) ?? ""
-	f.close()
-	const i = indexOf(page, "\x03\x00\x00\x00GNU\x00") // the note's type, NT_GNU_BUILD_ID, and owner
-	return fnv(page.slice(i + 8, i + 8 + page[i - 4]))
 }
 
 /// Compiles the program of main into the executable exe, linked with the linker options args: each module once by

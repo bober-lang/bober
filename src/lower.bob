@@ -36,6 +36,7 @@ import {
 } from "./check"
 import { CompileError } from "./error"
 import { Tok } from "./lex"
+import { Lift } from "./lift"
 import { builtinPath } from "./root"
 import { Bool, Field, Null, String, Type, basics, members } from "./type"
 import { free, strtod } from "stdlib.h"
@@ -53,20 +54,11 @@ export function lower(paths: string[], dirs: string[] = [], read: (path: string)
 
 /// The stage after the checker: lowers each module's declarations as they are handed on.
 export class Lower implements Checked {
-	prog = new Program()
+	lift = new Lift()
 	/// What lowering a module threw first, which finish throws, after the checker's errors.
 	private failed: CompileError | null = null
 	private units = new HashMap[string, Unit]()
-	/// Each top-level decl by its checker symbol.
-	entries = new HashMap[string, i32]()
-	/// Per decl, the checker's type of what it declares, and the decls of its module it refers to or owns, which a
-	/// variable is initialized after.
-	types: Type[] = []
-	refs: i32[][] = []
-	/// By checker type id: the decl of each class and interface, the Param of each type param, and each type lowered
-	/// that no local or param changes, by its id twice, plus 1 if exact.
-	nominals = new HashMap[i32, i32]()
-	params = new HashMap[i32, i32]()
+	/// By checker type id twice, plus 1 if exact, each type lowered that no local or param changes.
 	lowered = new HashMap[i32, i32]()
 
 	decl(n: Node, path: string, src: string) {
@@ -99,7 +91,7 @@ export class Lower implements Checked {
 		if (this.failed != null) {
 			throw this.failed!
 		}
-		return this.prog
+		return this.lift.prog
 	}
 
 	/// The unit of the module at path, made on first use.
@@ -115,20 +107,20 @@ export class Lower implements Checked {
 
 	/// A new decl of module m, in owner, -1 for none, of the checker's type t.
 	newDecl(m: i32, owner: i32, name: string, k: decl.Kind, mods: i32, t: Type, doc: string = ""): i32 {
-		const d = this.prog.decl(m, owner, name, k)
-		this.prog.decls[d].mods = mods
-		this.prog.decls[d].doc = this.prog.intern(doc)
-		this.types.push(t)
-		this.refs.push([])
+		const p = this.lift.prog
+		const d = p.decl(m, owner, name, k)
+		p.decls[d].mods = mods
+		p.decls[d].doc = p.intern(doc)
+		this.lift.types.set(d, t)
 		return d
 	}
 
 	/// The top-level decl of the checker's symbol, if lowered or declared ahead.
-	top(symbol: string): i32 | null { return this.entries.get(symbol) }
+	top(symbol: string): i32 | null { return this.lift.entries.get(symbol) }
 
 	/// The decl of class or interface t, or of the generic it is an instance of.
 	nominal(t: Type): i32 {
-		const d = this.nominals.get((t.generic ?? t).id)
+		const d = this.lift.nominals.get((t.generic ?? t).id)
 		if (d == null) {
 			throw new CompileError(`unsupported: ${showType(t)} is not declared where its uses can reach it`)
 		}
@@ -137,12 +129,14 @@ export class Lower implements Checked {
 
 	/// The decl of member name of class or interface c.
 	member(c: Type, name: string): i32 | null {
-		const d = this.nominals.get((c.generic ?? c).id)
-		const m = if (d == null) -1 else this.prog.find(this.prog.decls[d!].module, d!, name)
+		const p = this.lift.prog
+		const d = this.lift.nominals.get((c.generic ?? c).id)
+		const m = if (d == null) -1 else p.find(p.decls[d!].module, d!, name)
 		return if (m < 0) null else m
 	}
 
-	/// The decl of builtin/'s export name, which lowering calls: declared ahead if its module is not yet lowered.
+	/// The decl of builtin/'s export name, which lowering calls: the bundle's, else declared ahead if its module is not
+	/// yet lowered.
 	builtin(name: string): i32 {
 		const file = switch (name) {
 			case "zero": "mem"
@@ -154,15 +148,10 @@ export class Lower implements Checked {
 		}
 		const path = builtinPath(file)
 		const symbol = `${path}:${name}`
-		const u = this.unit(path)
-		return this.top(symbol) ?? u.entry(symbol, -1, name, if (name == "Future") decl.Class else decl.Function, decl.Export, Null, "", null)
-	}
-
-	/// Records that d's code refers to on, of its module.
-	depend(d: i32, on: i32) {
-		if (!contains(this.refs[d], on)) {
-			this.refs[d].push(on)
+		if (this.top(symbol) == null) {
+			this.lift.module(path)
 		}
+		return this.top(symbol) ?? this.unit(path).entry(symbol, -1, name, if (name == "Future") decl.Class else decl.Function, decl.Export, Null, "", null)
 	}
 }
 
@@ -178,11 +167,13 @@ class Unit {
 	vars: i32[] = []
 	/// What is left to lower of the declaration being declared.
 	private jobs: (() => void)[] = []
+	/// Per decl, the decls of the module its code refers to or it owns, which a variable is initialized after.
+	private refs = new HashMap[i32, i32[]]()
 
 	constructor(l: Lower, path: string) {
 		this.l = l
-		this.prog = l.prog
-		this.m = l.prog.addModule(path)
+		this.prog = l.lift.prog
+		this.m = l.lift.prog.addModule(path)
 	}
 
 	/// Lowers top-level declaration n, reusing the decls it was declared ahead with.
@@ -240,8 +231,8 @@ class Unit {
 		const t = n.type!
 		const k: decl.Kind = if (n.t.kind == "class") decl.Class else decl.Interface
 		const d = this.entry(symbol, owner, name, k, mods, t, n.doc, null)
-		if (this.l.nominals.get(t.id) == null) { // not declared ahead
-			this.l.nominals.set(t.id, d)
+		if (this.l.lift.nominals.get(t.id) == null) { // not declared ahead
+			this.l.lift.nominals.set(t.id, d)
 			this.generic(t.params, d)
 		}
 		for (const p of child(n, "members")!.parts) {
@@ -269,7 +260,7 @@ class Unit {
 		const self = if (has(p, "static")) null else selfOf(t)
 		const pt = p.type!
 		const md = this.entry("", d, key, k, pm, pt, p.doc, if (k == decl.Var && self == null) this.vars else null)
-		this.l.depend(d, md)
+		this.depend(d, md)
 		this.later(() => { this.prog.decls[md].tags = this.tags(p) })
 		if (k == decl.Function) {
 			this.generic(pt.params, md)
@@ -319,7 +310,7 @@ class Unit {
 			return
 		}
 		seen.set(d, true)
-		for (const r of this.l.refs[d]) {
+		for (const r of this.refs.get(d) ?? []) {
 			this.visit(r, seen, order)
 		}
 		const x = this.prog.decls[d]
@@ -328,12 +319,22 @@ class Unit {
 		}
 	}
 
+	/// Records that d's code refers to on, of the module.
+	depend(d: i32, on: i32) {
+		const rs = this.refs.get(d)
+		if (rs == null) {
+			this.refs.set(d, [on])
+		} else if (!contains(rs, on)) {
+			rs.push(on)
+		}
+	}
+
 	/// Records that the code of decl from refers to decl d: of this module, as a dependency of from, else of the module.
 	refer(from: i32, d: i32) {
 		const m = this.prog.decls[d].module
 		const deps = this.prog.modules[this.m].deps
 		if (m == this.m) {
-			this.l.depend(from, d)
+			this.depend(from, d)
 		} else if (!contains(deps, m)) {
 			deps.push(m)
 		}
@@ -392,7 +393,7 @@ class Unit {
 	/// The type type param t stands for: in code g, the Type a local of it holds; a param a static branch narrows (4.11)
 	/// is that param, and one's elem its Member.
 	private param(t: Type, g: Gen | null): i32 {
-		const known = g?.held(t) ?? this.l.params.get(t.id)
+		const known = g?.held(t) ?? this.l.lift.params.get(t.id)
 		if (known != null) {
 			return known!
 		}
@@ -435,23 +436,23 @@ class Unit {
 	/// Has ps, the type params of decl d, stand for its Params.
 	private generic(ps: Type[], d: i32) {
 		for (const i of 0 ... ps.length - 1) {
-			this.l.params.set(ps[i].id, this.prog.type(kind.Param, d, i))
+			this.l.lift.params.set(ps[i].id, this.prog.type(kind.Param, d, i))
 		}
 	}
 
 	/// The decl of name in owner, -1 for none, of the checker's symbol if top-level, of type t: declared ahead, or else
 	/// now, added to tops if top-level and to list.
 	entry(symbol: string, owner: i32, name: string, k: decl.Kind, mods: i32, t: Type, doc: string, list: i32[] | null): i32 {
-		const ahead = if (owner < 0) this.l.entries.get(symbol) ?? -1 else this.prog.find(this.m, owner, name)
+		const ahead = if (owner < 0) this.l.lift.entries.get(symbol) ?? -1 else this.prog.find(this.m, owner, name)
 		if (ahead >= 0) {
 			this.prog.decls[ahead].mods = mods
 			this.prog.decls[ahead].doc = this.prog.intern(doc)
-			this.l.types[ahead] = t
+			this.l.lift.types.set(ahead, t)
 			return ahead
 		}
 		const d = this.l.newDecl(this.m, owner, name, k, mods, t, doc)
 		if (owner < 0) {
-			this.l.entries.set(symbol, d)
+			this.l.lift.entries.set(symbol, d)
 			this.tops.push(d)
 		}
 		list?.push(d)
@@ -1307,7 +1308,7 @@ class Gen {
 		const d = this.global(p)
 		if (d != null) {
 			const at = new Place(op.Global, op.SetGlobal, this.ref(d!))
-			at.type = this.ty(this.u.l.types[d!])
+			at.type = this.ty(this.u.l.lift.types.get(d!)!)
 			return at
 		}
 		const r = p.parts[0]
@@ -1539,7 +1540,7 @@ class Gen {
 	private global(p: Node): i32 | null {
 		const l = this.u.l
 		if (p.kind == "token") {
-			return if (p.symbol == "") null else l.entries.get(p.symbol)
+			return if (p.symbol == "") null else l.lift.entries.get(p.symbol)
 		}
 		if (p.kind != "member") {
 			return null
@@ -1547,7 +1548,7 @@ class Gen {
 		const a = p.parts[0]
 		const name = this.text(p.parts[1])
 		if (isTok(a, "ident") && endsWith(a.symbol, ":")) {
-			return l.entries.get(a.symbol + name)
+			return l.lift.entries.get(a.symbol + name)
 		}
 		const c = standsFor(a.type!)
 		const d = if (c != null && c.kind == "class") l.member(c!, name) else null
@@ -1565,7 +1566,7 @@ class Gen {
 			return kind.Type
 		}
 		this.op(op.Global, this.ref(d!), this.typeArgs(d!, t, p))
-		return if (this.prog.decls[d!].kind == decl.Var) this.ty(this.u.l.types[d!]) else this.ty(t)
+		return if (this.prog.decls[d!].kind == decl.Var) this.ty(this.u.l.lift.types.get(d!)!) else this.ty(t)
 	}
 
 	/// Pushes the value of link p of an access chain, which branches out of the block at level chain where it is null
@@ -1776,7 +1777,7 @@ class Gen {
 	/// The type args of the generic function d that its instantiation inst at p has, given or inferred, defaults filling
 	/// in.
 	private inferred(d: i32, inst: Type, p: Node): Type[] {
-		const g = this.u.l.types[d]
+		const g = this.u.l.lift.types.get(d)!
 		const ps = g.params
 		if (ps.length == 0 || g.kind != "function") {
 			return []
@@ -1827,7 +1828,7 @@ class Gen {
 	/// Pushes the closure of a nested function or arrow of type t, a decl in this one's.
 	private closure(name: string, t: Type, params: Node, body: Node) {
 		const d = this.u.l.newDecl(this.u.m, this.owner, name, decl.Function, 0, t)
-		this.u.l.depend(this.owner, d)
+		this.u.depend(this.owner, d)
 		const g = new Gen(this.u, d, t.base!, this, this.typeParams)
 		g.code.at = body.t.loc.pos
 		g.params(params, t)
