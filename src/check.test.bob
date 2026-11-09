@@ -421,12 +421,19 @@ test "values once unknown have types" {
 	assert errors("type K = \"a\" | \"b\"\nfunction f(): K | null {\n\tfor (const k of K.members) {\n\t\treturn k.value\n\t}\n\treturn null\n}") == ""
 }
 
-test "a variable is read in its own initializer only in the function literal that is all of it, and only if it declares its type" {
+test "a variable is read in its own initializer only in a function literal that gives unrun, and only if it declares its type" {
 	assert errors("const fact: (n: i64) => i64 = n => if (n == 0) 1 else n * fact(n - 1)\nconst n: i32 = n + 1\nconst loop = () => loop()")
 		== "76: n depends on itself; 110: loop needs a type to be used in its own initializer"
 	assert errors("function f() {\n\tconst g: () => i32 = () => g()\n\tconst n: i32 = n + 1\n\tconst h = () => h()\n\tconst x: i32 = (() => x)()\n}")
 		== "63: n depends on itself; 86: h needs a type to be used in its own initializer; 113: x depends on itself"
 	assert errors("let x = 1\nfunction f() { const x = x + 1 }") == "35: x depends on itself"
+	const F = "(n: i32) => i32"
+	assert errors(`function f(c: bool) {\n\tconst a: ${F} = (n => a(n))\n\tconst b: ${F} = (n => b(n)) as ${F}\n`
+		+ `\tconst d: ${F} = if (c) (n => d(n)) else n => n\n\tconst e: (${F})[] = [n => e[0](n)]\n`
+		+ `\tconst g: { h: ${F} } = { h: n => g.h(n) }\n\tconst k: ${F} = switch (c) { case true: (n => k(n)); default: (n => n) }\n}`) == ""
+	assert errors(`function f(c: bool) {\n\tconst a: ${F} = if (a(1) > 0) (n => n) else n => n\n\tconst b = (n: i32) => b(n)\n\tconst d: ${F} = id(n => d(n))\n}\n`
+		+ `function id(f: ${F}): ${F} { return f }`)
+		== "54: a depends on itself; 108: b needs a type to be used in its own initializer; 149: d depends on itself"
 }
 
 test "top-level variables do not depend on themselves" {
@@ -443,6 +450,8 @@ test "top-level variables do not depend on themselves" {
 	assert errors("const i = 1\nlet j = f()\n\nfunction f(): i32 { return if (i == 2) j else 0 }") == "16: j depends on itself"
 	assert errors("let n = 0\nconst m = f()\n\nfunction f(): i32 { return n }") == "16: m is a const that depends on a let"
 	assert errors("let n = 0\nconst f: () => i32 = () => n") == ""
+	assert errors("const n = 1\nconst e: () => i32 = if (n > 0) (() => g()) else () => 0\nconst g: () => i32 = (() => e())\nclass C { static f: () => i32 = (() => C.f()) }") == ""
+	assert errors("const e: () => i32 = if (g() > 0) (() => 1) else () => 0\nconst g: () => i32 = (() => e())") == "6: e depends on itself"
 	assert errors("class P { ps: P[] = none }\nconst none: P[] = []") == ""
 	assert errors("const k: i32 = new C().m()\nclass C { m(): i32 { return k } }") == "6: k depends on itself"
 	assert errors("const u = new U()\nclass U {\n\tf(): U { return U.make() }\n\tstatic make(): U { return u }\n}") == ""
