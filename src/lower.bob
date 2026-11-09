@@ -37,7 +37,7 @@ import {
 import { CompileError } from "./error"
 import { Tok } from "./lex"
 import { builtinPath } from "./root"
-import { Bool, Field, Null, String, Type, basics } from "./type"
+import { Bool, Field, Null, String, Type, basics, members } from "./type"
 import { free, strtod } from "stdlib.h"
 
 /// The modules at paths and those they import, checked and lowered into one Program. Throws the type errors, or what
@@ -2077,10 +2077,11 @@ function methods(o: Type): Type | null { return (if (o.kind == "union" && o.isSt
 /// Whether a value of type t is a Type or an array of them, which exists only when compiling (4.11).
 /// The embedded field of class or object t member name is promoted through (5.3), null if t has it as its own.
 function through(t: Type, name: string): Field | null {
-	if (t.kind != "class" && t.kind != "object" || t.fields.some(f => f.name == name)) {
+	const fs = if (t.kind == "class" || t.kind == "object") members(t) else []
+	if (fs.length == 0 || fs.some(f => f.name == name)) {
 		return null
 	}
-	return t.fields.find(f => f.embedded && !f.static && f.type.member(name) != null) ?? null
+	return fs.find(f => f.embedded && !f.static && f.type.member(name) != null) ?? null
 }
 
 /// Whether a for over t is an Each: of an array, or of a param only ever an array or fixed array, which a fixed array
