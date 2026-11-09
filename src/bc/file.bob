@@ -25,8 +25,8 @@
 //! decls    per decl of its own, in the order made: Str name, kind byte, owner
 //! imports  per decl of another module it uses: dep, owner, Str name, nth of that name in its owner
 //! types    per type, after its parts: kind byte, a and b as its kind says
-//! defs     per decl: mods, type params (Str name, constraint, default), type, supers, tags, Str doc, 0 or 1 and its
-//!          code; then the module's decls, inits and deps, and where its lines end, each after the one before
+//! defs     per decl: mods, type params (Str name, constraint, default), type, supers, tags, throws, Str doc, 0 or 1
+//!          and its code; then the module's decls, inits and deps, and where its lines end, each after the one before
 //! ```
 //!
 //! A code is its locals (Str name, type, mods), captures and code lists, then its op count and per op its source
@@ -230,6 +230,7 @@ class Out {
 			uleb(defs, this.type(x.type))
 			this.part(defs, op.TypeList, x.supers)
 			this.part(defs, op.TypeList, x.tags)
+			this.part(defs, op.TypeList, x.throws)
 			uleb(defs, this.str(x.doc))
 			defs.u8(if (x.code == null) 0 else 1)
 			if (x.code != null) {
@@ -423,7 +424,7 @@ class In {
 		this.table(this.decls, () => {
 			const name = p.strings[this.str()]
 			const k = this.r.u8()
-			if (k > decl.Test) {
+			if (k > decl.Alias) {
 				throw this.bad()
 			}
 			return p.decl(this.m, this.owner(), name, k as decl.Kind)
@@ -463,6 +464,7 @@ class In {
 			x.type = this.type()
 			x.supers = this.part(op.TypeList)
 			x.tags = this.part(op.TypeList)
+			x.throws = this.part(op.TypeList)
 			x.doc = this.str()
 			if (this.r.u8() == 1) {
 				x.code = this.code()
@@ -656,6 +658,7 @@ class Abi {
 		this.type(x.type)
 		this.list(x.supers)
 		this.list(x.tags)
+		this.list(x.throws)
 		if (x.kind == decl.Var && (x.mods & decl.Readonly) != 0 && x.code != null) {
 			this.code(x.code!)
 		}
