@@ -1,0 +1,161 @@
+//! yaml.bob against the YAML test suite in vendor/yaml-tests: each case must give the events of its test.event, or
+//! fail where it has an error file; where it has an in.json, its documents must load to the values in it; and emit
+//! must write its documents as text of the same events, but for what emit does not keep (see normal).
+
+import { ampersand, backslash, comma, less, lbrace, lbracket, minus, nine, quote, rbrace, rbracket, space,
+	zero } from "../ascii"
+import { exists, glob, readFile } from "../fs"
+import { formatFloat, parseFloat } from "../float"
+import { ParseError } from "../parse"
+import { sort } from "../sort"
+import { indexOf, replace, split, startsWith } from "../string"
+import { Alias, boolOf, documents, emit, EncodeError, events, floatOf, kindOf, Node, Scalar, Seq } from "./yaml"
+import { decode, quoted } from "./json"
+
+const root = "vendor/yaml-tests/yaml-test-suite"
+
+test "yaml-test-suite" {
+	for (const f of glob(`${root}/**/in.yaml`)) {
+		const dir = f.slice(0, f.length - "/in.yaml".length)
+		test `${dir.slice(root.length + 1, dir.length)}` {
+			const src = readFile(f)
+			if (exists(`${dir}/error`)) {
+				assert loaded(src) == "error"
+			} else {
+				assert evented(src) == readFile(`${dir}/test.event`)
+				assert normal(evented(emitted(src))) == normal(evented(src))
+				if (exists(`${dir}/in.json`)) {
+					assert loaded(src) == canonical(readFile(`${dir}/in.json`))
+				}
+			}
+		}
+	}
+}
+
+function evented(src: string): string {
+	try {
+		return events(src)
+	} catch (e: ParseError) {
+		return "error"
+	}
+}
+
+/// src's documents as emit writes them, or src where documents rejects a key twice.
+function emitted(src: string): string {
+	try {
+		return emit(documents(src))
+	} catch (e: ParseError | EncodeError) {
+		return src
+	}
+}
+
+/// Events without what emit does not keep: scalar styles, each now :, explicit document markers and flow collections.
+function normal(ev: string): string {
+	const out: string[] = []
+	for (const line of split(ev, "\n")) {
+		if (startsWith(line, "=VAL")) {
+			let i = 4 // the space before the style, after any anchor and tag
+			while (line[i + 1] == ampersand || line[i + 1] == less) {
+				i = indexOf(line, " ", i + 1)
+			}
+			out.push(`${line.slice(0, i + 1)}:${line.slice(i + 2, line.length)}`)
+		} else {
+			out.push(replace(replace(replace(replace(line, "+DOC ---", "+DOC"), "-DOC ...", "-DOC"), " []", ""), " {}", ""))
+		}
+	}
+	return out.join("\n")
+}
+
+/// The documents of src as JSON values, one to a line, or "error".
+function loaded(src: string): string {
+	try {
+		return documents(src).map(d => json(d.root)).join("\n")
+	} catch (e: ParseError) {
+		return "error"
+	}
+}
+
+/// n as compact JSON, with its numbers as formatFloat writes them.
+function json(n: Node): string throws ParseError {
+	if (n instanceof Alias) {
+		return json(n.target)
+	}
+	if (n instanceof Scalar) {
+		return switch (kindOf(n)) {
+			case "null": "null"
+			case "bool": `${boolOf(n)}`
+			case "int", "float": formatFloat(floatOf(n))
+			case "str": quoted(n.value)
+		}
+	}
+	if (n instanceof Seq) {
+		return `[${n.items.map(json).join(",")}]`
+	}
+	const kvs: string[] = []
+	for (const i of 0 ... n.keys.length - 1) {
+		const k = json(n.keys[i])
+		kvs.push(`${if (k[0] == quote) k else quoted(if (k == "null") "" else k)}:${json(n.values[i])}`)
+	}
+	sort(kvs)
+	return `{${kvs.join(",")}}`
+}
+
+/// The JSON values of j, one to a line, as json writes them.
+function canonical(j: string): string throws ParseError {
+	const out: string[] = []
+	let i = skip(j, 0)
+	while (i < j.length) {
+		const [v, e] = value(j, i)
+		out.push(v)
+		i = skip(j, e)
+	}
+	return out.join("\n")
+}
+
+/// The JSON value at j[i] compact, its objects' members sorted and its strings and numbers as json writes them, and
+/// the index after it.
+function value(j: string, i: i32): [string, i32] throws ParseError {
+	const c = j[i]
+	let e = i + 1
+	if (c == lbracket || c == lbrace) {
+		const close = if (c == lbrace) rbrace else rbracket
+		const items: string[] = []
+		e = skip(j, e)
+		while (j[e] != close) {
+			let [v, f] = value(j, e)
+			if (c == lbrace) {
+				const [w, g] = value(j, skip(j, skip(j, f) + 1))
+				v = `${v}:${w}`
+				f = g
+			}
+			items.push(v)
+			e = skip(j, f)
+			if (j[e] == comma) {
+				e = skip(j, e + 1)
+			}
+		}
+		if (c == lbrace) {
+			sort(items)
+		}
+		return [`${chr(c)}${items.join(",")}${chr(close)}`, e + 1]
+	}
+	if (c == quote) {
+		while (j[e] != quote) {
+			e += if (j[e] == backslash) 2 else 1
+		}
+		return [quoted(decode[string](j.slice(i, e + 1))), e + 1]
+	}
+	while (e < j.length && j[e] > space && j[e] != comma && j[e] != rbracket && j[e] != rbrace) {
+		e++
+	}
+	const v = j.slice(i, e)
+	return [if (c == minus || c >= zero && c <= nine) formatFloat(parseFloat(v)) else v, e]
+}
+
+function skip(j: string, i: i32): i32 {
+	let e = i
+	while (e < j.length && j[e] <= space) {
+		e++
+	}
+	return e
+}

@@ -1,0 +1,2184 @@
+//! YAML 1.2 as a tree of nodes, composed as eemeli/yaml (ISC, github.com/eemeli/yaml) composes it, from the tokens
+//! of ./yaml/cst: scalars keep their text, and kindOf reads a scalar by the core schema. Strict: whatever eemeli/yaml
+//! reports as an error throws a ParseError at its offset, as do a %YAML directive twice, directives without a
+//! document, an alias to no anchor before it, and, in documents, a key twice in a mapping or a node its core tag does
+//! not fit, as !!int x or !!map [a]. Comments are dropped. An anchor is an alias's target once its node is complete,
+//! so the tree has no cycles; to bound the work of expanding them, aliases in a document may stand for at most
+//! maxExpansion (2^20) nodes in all, and collections nest maxDepth (128) deep.
+//!
+//! decode and encode map values as ./json does, with field tags of the same names; fields take ../encoding's tags
+//! too. A document is read by the core schema, strictly, so a string is only a scalar of kind "str" and a class takes
+//! only string keys, and a ParseError is at the node's offset. A Rest field takes each unknown value as YAML text
+//! that reads back as it, with no line feed at its end: its aliases expanded and its anchors dropped, under a bound
+//! on its size that alias bombs hit as a "range" error. encode writes block YAML through emit: plain scalars where
+//! they read back as they are, else quoted, and text with line breaks as a literal block scalar.
+
+import * as ascii from "../ascii"
+import { ampersand, apostrophe, backslash, backtick, colon, comma, cr, digit, dot, exclamation, greater, hash, isDigit,
+	isHexDigit, lbrace, lbracket, less, lf, minus, nine, percent, pipe, plus, question, quote, rbrace, rbracket, seven,
+	slash, space, star, tab, tilde, underscore, zero } from "../ascii"
+import { HashMap } from "../collections/hashmap"
+import { formatFloat, parseFloat } from "../float"
+import { inf, isFinite, isNaN, max, nan } from "../math"
+import { ParseError, parseInt } from "../parse"
+import { codePoint, endsWith, indexOf, replace, split, startsWith, utf8 } from "../string"
+import * as encoding from "../encoding"
+import { Decodable, Float, has, Integral } from "../types"
+import { quoted, Unknown } from "./json"
+import * as kind from "./yaml/kind"
+import { byte, Cst, isTagChar, Kind, none, parse, Tok } from "./yaml/cst"
+
+/// How a scalar is written.
+export type Style = "plain" | "single" | "double" | "literal" | "folded"
+
+export class Scalar {
+	value: string
+	style: Style
+	/// The full tag, "!" for the non-specific one, or null.
+	tag: string | null
+	anchor: string | null = null
+	/// Where it starts in the source.
+	at: i32
+
+	constructor(value: string, style: Style, tag: string | null, at: i32) {
+		this.value = value
+		this.style = style
+		this.tag = tag
+		this.at = at
+	}
+}
+
+export class Seq {
+	items: Node[] = []
+	/// Whether written in [].
+	flow: bool
+	tag: string | null
+	anchor: string | null = null
+	at: i32
+
+	constructor(flow: bool, tag: string | null, at: i32) {
+		this.flow = flow
+		this.tag = tag
+		this.at = at
+	}
+}
+
+/// A mapping's entries in order: keys[i] maps to values[i]. A key without a value maps to an empty plain scalar.
+export class Map {
+	keys: Node[] = []
+	values: Node[] = []
+	/// Whether written in {}, or as a single pair in a flow sequence.
+	flow: bool
+	tag: string | null
+	anchor: string | null = null
+	at: i32
+
+	constructor(flow: bool, tag: string | null, at: i32) {
+		this.flow = flow
+		this.tag = tag
+		this.at = at
+	}
+}
+
+export class Alias {
+	name: string
+	/// The node of the last anchor of its name before it.
+	target: Scalar | Seq | Map
+	at: i32
+
+	constructor(name: string, target: Scalar | Seq | Map, at: i32) {
+		this.name = name
+		this.target = target
+		this.at = at
+	}
+}
+
+export type Node = Scalar | Seq | Map | Alias
+
+export class Document {
+	root: Node
+	/// Whether it starts with --- and ends with ....
+	start: bool
+	end = false
+
+	constructor(root: Node, start: bool) {
+		this.root = root
+		this.start = start
+	}
+}
+
+/// ../encoding's Name, for YAML alone.
+export class Name[K extends string] {}
+/// ../encoding's Skip, for YAML alone.
+export class Skip {}
+/// ../encoding's OmitEmpty, for YAML alone.
+export class OmitEmpty {}
+/// Tags an Unknown[] field to take the keys no other field takes, and to encode them back.
+export class Rest {}
+/// Tags a [K, V][] field to hold a mapping as its entries, in order.
+export class Mapping {}
+
+/// The most nodes a document's aliases may stand for, all expanded.
+const maxExpansion: i64 = 1 << 20
+/// The most collections a document may nest, and decode may read through its aliases, as each takes a few KiB of a
+/// fiber's 1 MiB stack in a debug build.
+const maxDepth = 128
+/// The most bytes from an implicit key's start to its :.
+const maxKey = 1024
+
+/// The documents of s, loaded: no two keys of a mapping the same node, as 1 and 0x1 are, and each node of a core tag
+/// one it fits.
+export function documents(s: string): Document[] throws ParseError { return new Composer(s, true).run() }
+
+/// The parse events of s as the YAML test suite writes them, in its test.event files, for the suite and the fuzzing
+/// against other parsers: what documents loads, without its checks.
+export function events(s: string): string throws ParseError {
+	let out = "+STR\n"
+	for (const doc of new Composer(s, false).run()) {
+		out += if (doc.start) "+DOC ---\n" else "+DOC\n"
+		out = event(out, doc.root)
+		out += if (doc.end) "-DOC ...\n" else "-DOC\n"
+	}
+	return out + "-STR\n"
+}
+
+/// The one document of s as a T.
+export function decode[T extends Decodable](s: string): T throws ParseError {
+	const docs = documents(s)
+	if (docs.length != 1) {
+		throw new ParseError("syntax", if (docs.length == 0) s.length else docs[1].root.at)
+	}
+	return new Decoder(s).value[T](docs[0].root)
+}
+
+/// Each document of s as a T.
+export function decodeAll[T extends Decodable](s: string): T[] throws ParseError {
+	const d = new Decoder(s)
+	const out: T[] = []
+	for (const doc of documents(s)) {
+		out.push(d.value[T](doc.root))
+	}
+	return out
+}
+
+/// A string not UTF-8, which YAML cannot hold, a Rest value's text that is not one YAML document, or a tag that is
+/// no URI, which a verbatim tag must be.
+export class EncodeError {
+	value: string
+
+	constructor(value: string) { this.value = value }
+}
+
+/// v as a YAML document, through emit: a string scalar in quotes where plain it would read as another type.
+export function encode[T](v: T): string throws EncodeError { return emit([new Document(toNode(v), false)]) }
+
+/// docs as YAML text, each after --- but the first, unless it needs one: block collections but empty ones, which are
+/// [] and {}, a key not a scalar on one line after ?, and each scalar plain where it reads back as the same value of
+/// the same kind, a literal block where it has lines, else in quotes, single unless it was double or must be.
+export function emit(docs: Document[]): string throws EncodeError {
+	const e = new Emitter()
+	for (const i of 0 ... docs.length - 1) {
+		const r = docs[i].root
+		if (i > 0 || marked(r)) {
+			e.out += "---"
+		}
+		e.node(r, 0, false)
+		e.out += "\n"
+	}
+	return e.out
+}
+
+function event(out: string, n: Node): string {
+	let o = out
+	if (n instanceof Alias) {
+		return `${o}=ALI *${n.name}\n`
+	}
+	const props = (if (n.anchor != null) ` &${n.anchor}` else "") + (if (n.tag != null) ` <${n.tag}>` else "")
+	if (n instanceof Scalar) {
+		const style = switch (n.style) {
+			case "plain": ":"
+			case "single": "'"
+			case "double": "\""
+			case "literal": "|"
+			case "folded": ">"
+		}
+		o += `=VAL${props} ${style}`
+		let run = 0
+		const v = n.value
+		for (const i of 0 ... v.length - 1) {
+			const e = escape(v[i])
+			if (e != "") {
+				o += v.slice(run, i) + e
+				run = i + 1
+			}
+		}
+		return o + v.slice(run, v.length) + "\n"
+	}
+	if (n instanceof Seq) {
+		o += (if (n.flow) "+SEQ []" else "+SEQ") + props + "\n"
+		for (const it of n.items) {
+			o = event(o, it)
+		}
+		return o + "-SEQ\n"
+	}
+	o += (if (n.flow) "+MAP {}" else "+MAP") + props + "\n"
+	for (const i of 0 ... n.keys.length - 1) {
+		o = event(event(o, n.keys[i]), n.values[i])
+	}
+	return o + "-MAP\n"
+}
+
+export type ScalarKind = "null" | "bool" | "int" | "float" | "str"
+
+/// What a scalar's text is under the core schema: null, true or false, an integer, a float, or a string. A scalar
+/// tagged !!null, !!bool, !!int or !!float is that, as documents checks it reads, though !!float takes integers too;
+/// any other tag or quotes make it a string.
+export function kindOf(n: Scalar): ScalarKind {
+	const tag = n.tag
+	if (tag == null) {
+		return if (n.style == "plain") plainKind(n.value) else "str"
+	}
+	return switch (tag) {
+		case "tag:yaml.org,2002:null": "null"
+		case "tag:yaml.org,2002:bool": "bool"
+		case "tag:yaml.org,2002:int": "int"
+		case "tag:yaml.org,2002:float": "float"
+		default: "str"
+	}
+}
+
+function plainKind(v: string): ScalarKind {
+	// Only these start what is not a string, or nothing does.
+	const c = byte(v, 0)
+	if (c != -1 && !isDigit(c as u8) && c != minus && c != plus && c != dot && c != tilde && (c | 0x20) != ascii.n
+			&& (c | 0x20) != ascii.t && (c | 0x20) != ascii.f) {
+		return "str"
+	}
+	switch (v) {
+		case "", "~", "null", "Null", "NULL": return "null"
+		case "true", "True", "TRUE", "false", "False", "FALSE": return "bool"
+		case ".nan", ".NaN", ".NAN", ".inf", ".Inf", ".INF", "+.inf", "+.Inf", "+.INF", "-.inf", "-.Inf", "-.INF":
+			return "float"
+	}
+	if (v.length > 2 && v[0] == zero && (v[1] == ascii.o || v[1] == ascii.x)) {
+		const hex = v[1] == ascii.x
+		for (const c of v.slice(2, v.length)) {
+			if (!(if (hex) isHexDigit(c) else c >= zero && c <= seven)) {
+				return "str"
+			}
+		}
+		return "int"
+	}
+	// [-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?, an integer without . or the exponent
+	let i = if (v[0] == minus || v[0] == plus) 1 else 0
+	const digits = i
+	i = skipDigits(v, i)
+	const whole = i > digits
+	let point = false
+	if (byte(v, i) == dot) {
+		point = true
+		const f = i + 1
+		i = skipDigits(v, f)
+		if (!whole && i == f) {
+			return "str"
+		}
+	} else if (!whole) {
+		return "str"
+	}
+	let exp = false
+	if (byte(v, i) == ascii.e || byte(v, i) == ascii.E) {
+		exp = true
+		i++
+		if (byte(v, i) == minus || byte(v, i) == plus) {
+			i++
+		}
+		const e = i
+		i = skipDigits(v, i)
+		if (i == e) {
+			return "str"
+		}
+	}
+	return if (i != v.length) "str" else if (point || exp) "float" else "int"
+}
+
+function skipDigits(v: string, from: i32): i32 {
+	let i = from
+	while (i < v.length && isDigit(v[i])) {
+		i++
+	}
+	return i
+}
+
+/// A bool scalar's value.
+export function boolOf(n: Scalar): bool throws ParseError {
+	if (kindOf(n) != "bool") {
+		throw new ParseError("syntax", n.at)
+	}
+	return (n.value[0] | 0x20) == ascii.t
+}
+
+/// An int scalar's value; "range" if it does not fit.
+export function intOf(n: Scalar): i64 throws ParseError { return integer[i64](n) }
+
+function integer[T extends Integral](n: Scalar): T throws ParseError {
+	const v = n.value
+	if (kindOf(n) != "int") {
+		throw new ParseError("syntax", n.at)
+	}
+	try {
+		const r = radix(v)
+		return parseInt[T](if (r != 10) v.slice(2, v.length) else if (v[0] == plus) v.slice(1, v.length) else v, r)
+	} catch (e: ParseError) {
+		throw new ParseError(e.kind, n.at)
+	}
+}
+
+/// The radix of a number's text: 16 after 0x, 8 after 0o, else 10.
+function radix(v: string): i32 {
+	return if (v.length < 3 || v[0] != zero) 10 else if (v[1] == ascii.x) 16 else if (v[1] == ascii.o) 8 else 10
+}
+
+/// A float or int scalar's value.
+export function floatOf(n: Scalar): f64 throws ParseError { return real[f64](n) }
+
+function real[T extends Float](n: Scalar): T throws ParseError {
+	const k = kindOf(n)
+	const v = n.value
+	if (k != "int" && k != "float") {
+		throw new ParseError("syntax", n.at)
+	}
+	try {
+		const r = radix(v)
+		if (r != 10) {
+			return parseInt[u64](v.slice(2, v.length), r) as T
+		}
+		const neg = v[0] == minus
+		let x = v.slice(if (neg || v[0] == plus) 1 else 0, v.length)
+		if (x[0] == dot && x[1] > nine) {
+			return (if (x[1] == ascii.n || x[1] == ascii.N) nan else if (neg) -inf else inf) as T
+		}
+		// parseFloat wants a digit on each side of the point.
+		const p = indexOf(x, ".")
+		if (p == 0) {
+			x = "0" + x
+		} else if (p > 0 && (byte(x, p + 1) < zero || byte(x, p + 1) > nine)) {
+			x = x.slice(0, p + 1) + "0" + x.slice(p + 1, x.length)
+		}
+		const f = parseFloat[T](x)
+		return if (neg) -f else f
+	} catch (e: ParseError) {
+		throw new ParseError(e.kind, n.at)
+	}
+}
+
+/// The props of a node, read from the tokens before it as resolveProps reads them; its tokens are -1 if none.
+class Props {
+	/// Its indicator: ? or : of a mapping, - of a sequence, or --- of a document.
+	found = -1
+	comma = false
+	anchor = -1
+	tag = -1
+	/// The last newline after its anchor or tag.
+	newline = -1
+	hasNewline = false
+	comment = false
+	/// Where the first anchor or tag starts, else end.
+	start = -1
+	/// Where its tokens end.
+	end = 0
+
+	/// Starts it afresh, its tokens ending at end so far.
+	reset(end: i32) {
+		this.found = -1
+		this.comma = false
+		this.anchor = -1
+		this.tag = -1
+		this.newline = -1
+		this.hasNewline = false
+		this.comment = false
+		this.start = -1
+		this.end = end
+	}
+}
+
+class Anchor {
+	node: Scalar | Seq | Map
+	/// How many nodes it stands for, its aliases expanded.
+	size: i64
+
+	constructor(node: Scalar | Seq | Map, size: i64) {
+		this.node = node
+		this.size = size
+	}
+}
+
+const core = "tag:yaml.org,2002:"
+
+class Composer {
+	s: string
+	/// Whether it loads: mapping keys unique, and core tags fitting their nodes.
+	loads: bool
+	docs: Document[] = []
+	/// The %TAG handles' prefixes for the next document.
+	tags = new HashMap[string, string]()
+	/// Those of the current document.
+	docTags = new HashMap[string, string]()
+	/// Whether the next document is YAML 1.1, which keeps the directives before it for the documents after it.
+	v11 = false
+	/// Whether the directives before the next document start afresh.
+	fresh = false
+	/// Whether directives are waiting for their document, and whether one of them is %YAML.
+	atDirectives = false
+	version = false
+	anchors: HashMap[string, Anchor] = new HashMap[string, Anchor]()
+	/// The nodes of the document so far, its aliases expanded, and the most of those its aliases may stand for.
+	size: i64 = 0
+	aliased: i64 = 0
+	depth = 0
+	/// Whether no collection has been composed in this document yet.
+	atRoot = true
+	/// Where the node last composed ends, with the comments after it on its line.
+	end = 0
+	/// The tree of s.
+	c: Cst
+	/// Keys as text, to tell those the same.
+	keys: Json
+
+	constructor(s: string, loads: bool) throws ParseError {
+		this.s = lineFeeds(s)
+		this.loads = loads
+		this.c = parse(this.s)
+		this.keys = new Json(retries * s.length + (1 << 16))
+	}
+
+	fail(at: i32): ParseError { return new ParseError("syntax", at) }
+
+	run(): Document[] throws ParseError {
+		let last: Document | null = null
+		for (const t of this.c.top) {
+			switch (t.kind) {
+				case kind.directive: this.directive(t)
+				case kind.document:
+					const doc = this.document(t)
+					if (this.atDirectives && !doc.start) {
+						throw this.fail(t.at)
+					}
+					this.atDirectives = false
+					this.version = false
+					// A document of nothing, unmarked, is left out.
+					const r = doc.root
+					if (doc.start || this.end != r.at || r instanceof Scalar && (r.anchor != null || r.tag != null)) {
+						this.docs.push(doc)
+					}
+					last = doc
+				case kind.docEnd:
+					if (last == null) {
+						throw this.fail(t.at)
+					}
+					last.end = true
+					this.endTokens(t.tail, true)
+				default: throw this.fail(t.at)
+			}
+		}
+		if (this.atDirectives) {
+			throw this.fail(this.s.length)
+		}
+		return this.docs
+	}
+
+	directive(t: Tok) throws ParseError {
+		if (this.fresh) {
+			this.tags = new HashMap[string, string]()
+			this.fresh = false
+		}
+		this.atDirectives = true
+		const parts: string[] = []
+		let i = t.at
+		while (i < t.end) {
+			while (i < t.end && (this.s[i] == space || this.s[i] == tab)) {
+				i++
+			}
+			const from = i
+			while (i < t.end && this.s[i] != space && this.s[i] != tab) {
+				i++
+			}
+			if (i > from) {
+				parts.push(this.s.slice(from, i))
+			}
+		}
+		switch (parts[0]) {
+			case "%TAG":
+				if (parts.length != 3 || !isTagDirective(parts[1], parts[2]) || this.tags.has(parts[1])) {
+					throw this.fail(t.at)
+				}
+				this.tags.set(parts[1], parts[2])
+			case "%YAML":
+				if (parts.length != 2 || this.version
+					|| parts[1] != "1.1" && parts[1] != "1.2" && !isVersion(parts[1])) {
+					throw this.fail(t.at)
+				}
+				this.version = true
+				this.v11 = parts[1] == "1.1"
+			case "%": throw this.fail(t.at) // a directive needs a name
+			default: {} // unknown directives are ignored
+		}
+	}
+
+	document(t: Tok): Document throws ParseError {
+		this.docTags = this.tags
+		if (this.v11) {
+			this.fresh = true
+		} else if (this.tags.size > 0) {
+			// An empty one may stay, as no directive comes before the next document starts.
+			this.tags = new HashMap[string, string]()
+		}
+		this.anchors = new HashMap[string, Anchor]()
+		this.size = 0
+		this.aliased = 0
+		this.atRoot = true
+		const start = t.start
+		const value = t.value
+		const props = this.props(new Props(), start, kind.docStart, value, t.at, 0, true, false)
+		if (props.found != -1 && value != null && (value.kind == kind.blockMap || value.kind == kind.blockSeq)
+				&& !props.hasNewline) {
+			throw this.fail(props.end)
+		}
+		const root = if (value != null) this.node(value, props) else this.empty(props.end, start, props)
+		const end = this.end
+		this.endTokens(t.tail, false)
+		this.end = end
+		return new Document(root, props.found != -1)
+	}
+
+	/// The tags and anchor of a node and the indicator and other tokens before it, as resolveProps checks them, in p.
+	props(p: Props, ts: i32, indicator: Kind, next: Tok | null, offset: i32, parentIndent: i32, startOnNewline: bool,
+			flow: bool): Props throws ParseError {
+		const c = this.c
+		p.reset(offset)
+		let atNewline = startOnNewline
+		let hasSpace = startOnNewline
+		let reqSpace = false
+		let tab = -1
+		// Whether the tab is right after the - or ?, where it separates props, as in `-\t!a b`, but not indentation.
+		let separates = false
+		let last: Kind = kind.space
+		for (const t of c.from(ts) ... c.to(ts) - 1) {
+			const k = c.kind[t]
+			const at = c.at[t]
+			if (reqSpace) {
+				if (k != kind.space && k != kind.newline && k != kind.comma) {
+					throw this.fail(at)
+				}
+				reqSpace = false
+			}
+			if (tab != -1) {
+				if (atNewline && !separates && k != kind.comment && k != kind.newline) {
+					throw this.fail(c.at[tab])
+				}
+				tab = -1
+			}
+			const before = last
+			last = k
+			p.end = c.end[t]
+			if (k == indicator) {
+				if (p.anchor != -1 || p.tag != -1 || p.found != -1) {
+					throw this.fail(at)
+				}
+				p.found = t
+				atNewline = indicator == kind.seqItemInd || indicator == kind.explicitKeyInd
+				hasSpace = false
+				continue
+			}
+			switch (k) {
+				case kind.space:
+					// At the document level, tabs at the start of a line may be white space before a flow node.
+					if (!flow && (indicator != kind.docStart || next == null || next.kind == kind.blockMap
+							|| next.kind == kind.blockSeq) && hasTab(this.s, at, c.end[t])) {
+						tab = t
+						separates = before == indicator
+					}
+					hasSpace = true
+				case kind.comment:
+					// A comment line after a flow collection's line, whose line break went to that collection, is apart too.
+					if (!hasSpace && byte(this.s, at - 1) != lf) {
+						throw this.fail(at)
+					}
+					p.comment = true
+					atNewline = false
+				case kind.newline:
+					atNewline = true
+					p.hasNewline = true
+					if (p.anchor != -1 || p.tag != -1) {
+						p.newline = t
+					}
+					hasSpace = true
+				case kind.anchor, kind.tag:
+					if (k == kind.anchor) {
+						if (p.anchor != -1) {
+							throw this.fail(at)
+						}
+						p.anchor = t
+					} else {
+						if (p.tag != -1) {
+							throw this.fail(at)
+						}
+						p.tag = t
+					}
+					if (p.start == -1) {
+						p.start = at
+					}
+					atNewline = false
+					hasSpace = false
+					reqSpace = true
+				case kind.comma:
+					if (!flow || p.comma) {
+						throw this.fail(at)
+					}
+					p.comma = true
+					atNewline = false
+					hasSpace = false
+				default: throw this.fail(at)
+			}
+		}
+		if (reqSpace && next != null && next.kind != kind.space && next.kind != kind.newline && next.kind != kind.comma
+				&& !(next.kind == kind.scalar && next.at == next.end)) {
+			throw this.fail(next.at)
+		}
+		if (tab != -1 && (atNewline && c.indent[tab] <= parentIndent || next != null
+				&& (next.kind == kind.blockMap || next.kind == kind.blockSeq))) {
+			throw this.fail(c.at[tab])
+		}
+		if (p.start == -1) {
+			p.start = p.end
+		}
+		return p
+	}
+
+	/// The tokens of ts past its first skip, after a node to the end of its line, which must be white space and
+	/// comments; this.end moves past.
+	endTokens(ts: i32, reqSpace: bool, skip = 0) throws ParseError {
+		const c = this.c
+		let hasSpace = false
+		for (const t of c.from(ts) + skip ... c.to(ts) - 1) {
+			switch (c.kind[t]) {
+				case kind.space, kind.newline: hasSpace = true
+				case kind.comment:
+					if (reqSpace && !hasSpace) {
+						throw this.fail(c.at[t])
+					}
+				default: throw this.fail(c.at[t])
+			}
+			this.end += c.end[t] - c.at[t]
+		}
+	}
+
+	/// The node of t with props.
+	node(t: Tok, props: Props): Node throws ParseError {
+		if (t.kind == kind.alias) {
+			if (props.anchor != -1 || props.tag != -1) {
+				throw this.fail(t.at)
+			}
+			return this.alias(t)
+		}
+		const size = this.size
+		const n: Scalar | Seq | Map = switch (t.kind) {
+			case kind.blockMap, kind.blockSeq, kind.flowCollection: this.collection(t, props)
+			default: this.scalar(t, props.tag)
+		}
+		this.size++
+		this.tagged(n)
+		this.anchor(n, props.anchor, size)
+		return n
+	}
+
+	/// Throws at n if it loads and its core tag does not fit it: !!seq a sequence, !!map a mapping, !!str a scalar, and
+	/// !!null, !!bool, !!int and !!float a scalar that reads as that, !!float an integer too.
+	tagged(n: Scalar | Seq | Map) throws ParseError {
+		const t = n.tag
+		if (!this.loads || t == null || !startsWith(t, core)) {
+			return
+		}
+		const name = t.slice(core.length, t.length)
+		const scalar = name == "str" || name == "null" || name == "bool" || name == "int" || name == "float"
+		if (n instanceof Scalar) {
+			const k = plainKind(n.value)
+			if (name == "seq" || name == "map" || scalar && name != "str" && k != name && !(name == "float" && k == "int")) {
+				throw this.fail(n.at)
+			}
+		} else if (scalar || name == "seq" && n instanceof Map || name == "map" && n instanceof Seq) {
+			throw this.fail(n.at)
+		}
+	}
+
+	/// An empty plain scalar with props, as after offset and the tokens before it.
+	empty(offset: i32, before: i32, props: Props): Scalar throws ParseError {
+		const c = this.c
+		let at = offset
+		// After the last token that is not white space or a comment, and the spaces after that.
+		let i = c.to(before) - 1
+		while (i >= c.from(before) && (c.kind[i] == kind.space || c.kind[i] == kind.comment || c.kind[i] == kind.newline)) {
+			at -= c.end[i] - c.at[i]
+			i--
+		}
+		if (i >= c.from(before)) {
+			i++
+			while (i < c.to(before) && c.kind[i] == kind.space) {
+				at += c.end[i] - c.at[i]
+				i++
+			}
+		}
+		const n = new Scalar("", "plain", this.tagName(props.tag), at)
+		this.end = if (props.comment) props.end else at
+		this.size++
+		this.tagged(n)
+		this.anchor(n, props.anchor, this.size - 1)
+		return n
+	}
+
+	/// Names n by anchor a, if any, as a node that stands for those composed since size.
+	anchor(n: Scalar | Seq | Map, a: i32, size: i64) throws ParseError {
+		if (a == -1) {
+			return
+		}
+		const at = this.c.at[a]
+		const end = this.c.end[a]
+		if (end - at == 1) {
+			throw this.fail(at)
+		}
+		const name = this.s.slice(at + 1, end)
+		n.anchor = name
+		this.anchors.set(name, new Anchor(n, this.size - size))
+	}
+
+	alias(t: Tok): Alias throws ParseError {
+		const a = this.anchors.get(this.s.slice(t.at + 1, t.end))
+		if (a == null) {
+			throw this.fail(t.at)
+		}
+		this.size += a.size
+		this.aliased += a.size
+		if (this.aliased > maxExpansion) {
+			throw new ParseError("range", t.at)
+		}
+		this.end = t.end
+		this.endTokens(t.tail, true)
+		return new Alias(this.s.slice(t.at + 1, t.end), a.node, t.at)
+	}
+
+	/// The full name of a tag, as %TAG directives resolve it.
+	tagName(t: i32): string | null throws ParseError {
+		if (t == -1) {
+			return null
+		}
+		const at = this.c.at[t]
+		const src = this.s.slice(at, this.c.end[t])
+		if (src == "!") {
+			return src
+		}
+		if (src[1] == less) {
+			if (src.length < 4 || src[src.length - 1] != greater) {
+				throw this.fail(at)
+			}
+			const v = src.slice(2, src.length - 1)
+			if (v == "!" || v == "!!" || !isUri(v, false)) {
+				throw this.fail(at)
+			}
+			return v
+		}
+		let h = src.length - 1
+		while (src[h] != exclamation) {
+			h--
+		}
+		h++
+		if (h == src.length) {
+			throw this.fail(at)
+		}
+		const handle = src.slice(0, h)
+		const prefix = this.docTags.get(handle) ?? (if (handle == "!!") core else null)
+		if (prefix == null || prefix == "") {
+			if (handle == "!") {
+				return "!" + unescape(src, 1)
+			}
+			throw this.fail(at)
+		}
+		return prefix + unescape(src, h)
+	}
+
+	scalar(t: Tok, tag: i32): Scalar throws ParseError {
+		const s = this.s
+		if (t.kind == kind.blockScalar) {
+			return this.blockScalar(t, tag)
+		}
+		let value = ""
+		let style: Style = "plain"
+		switch (t.kind) {
+			case kind.scalar:
+				switch (if (t.end > t.at) s[t.at] else 0) {
+					case tab, comma, percent, pipe, greater, ascii.at, backtick: throw this.fail(t.at)
+				}
+				value = fold(s, t.at, t.end)
+			case kind.singleQuotedScalar:
+				style = "single"
+				if (t.end - t.at == 1 || s[t.end - 1] != apostrophe) {
+					throw this.fail(t.end)
+				}
+				value = fold(s, t.at + 1, t.end - 1)
+				if (indexOf(value, "''") >= 0) {
+					value = replace(value, "''", "'")
+				}
+			default:
+				style = "double"
+				value = this.doubleQuoted(t.at, t.end)
+		}
+		this.end = t.end
+		this.endTokens(t.tail, true)
+		return new Scalar(value, style, this.tagName(tag), t.at)
+	}
+
+	doubleQuoted(at: i32, end: i32): string throws ParseError {
+		const s = this.s
+		// Checked first, as the closing quote bounds the reads ahead.
+		if (end - at == 1 || s[end - 1] != quote) {
+			throw this.fail(end)
+		}
+		let res = ""
+		let run = at + 1
+		let i = at + 1
+		while (i < end - 1) {
+			const c = s[i]
+			if (c != cr && c != lf && c != backslash && c != space && c != tab) {
+				i++
+				continue
+			}
+			res += s.slice(run, i)
+			if (c == cr) {
+				if (s[i + 1] != lf) {
+					res += "\r"
+				}
+			} else if (c == lf) {
+				// A line break folds into a space, or into the empty lines after it.
+				let n = 0
+				while (true) {
+					const d = s[i + 1]
+					if (d != space && d != tab && d != lf && (d != cr || s[i + 2] != lf)) {
+						break
+					}
+					if (d == lf) {
+						n++
+						res += "\n"
+					}
+					i++
+				}
+				if (n == 0) {
+					res += " "
+				}
+			} else if (c == backslash) {
+				i++
+				if (i == end - 1) {
+					throw this.fail(end) // its closing quote is escaped
+				}
+				const d = s[i]
+				const e = switch (d) {
+					case zero: "\0"
+					case ascii.a: "\x07"
+					case ascii.b: "\x08"
+					case ascii.e: "\x1b"
+					case ascii.f: "\x0c"
+					case ascii.n: "\n"
+					case ascii.r: "\r"
+					case ascii.t, tab: "\t"
+					case ascii.v: "\x0b"
+					case ascii.N: "\u{85}"
+					case underscore: "\u{a0}"
+					case ascii.L: "\u{2028}"
+					case ascii.P: "\u{2029}"
+					case space, quote, slash, backslash: s.slice(i, i + 1)
+					default: ""
+				}
+				if (e != "") {
+					res += e
+				} else if (d == lf || d == cr && s[i + 1] == lf) {
+					// An escaped line break is dropped with the blanks after it, though not the empty lines.
+					if (d == cr) {
+						i++
+					}
+					while (s[i + 1] == space || s[i + 1] == tab || s[i + 1] == cr || s[i + 1] == lf) {
+						if (s[i + 1] == lf) {
+							res += "\n"
+						}
+						i++
+					}
+				} else if (d == ascii.x || d == ascii.u || d == ascii.U) {
+					const esc = i - 1
+					const n = if (d == ascii.x) 2 else if (d == ascii.u) 4 else 8
+					let cp = hexAt(s, i + 1, n, end - 1)
+					i += n
+					// A high surrogate joins the low one escaped after it; any other is no character.
+					if (cp >= 0xd800 && cp < 0xe000) {
+						const lo = if (cp < 0xdc00 && s[i + 1] == backslash && s[i + 2] == ascii.u) hexAt(s, i + 3, 4, end - 1)
+							else -1
+						if (lo < 0xdc00 || lo >= 0xe000) {
+							throw this.fail(esc)
+						}
+						cp = 0x10000 + (cp - 0xd800 << 10) + lo - 0xdc00
+						i += 6
+					}
+					if (cp < 0 || cp > 0x10ffff) {
+						throw this.fail(esc)
+					}
+					res += utf8(cp)
+				} else {
+					throw this.fail(i - 1)
+				}
+			} else {
+				// Blanks before a line break are dropped.
+				const ws = i
+				while (s[i + 1] == space || s[i + 1] == tab) {
+					i++
+				}
+				if (s[i + 1] != lf && !(s[i + 1] == cr && byte(s, i + 2) == lf)) {
+					res += s.slice(ws, i + 1)
+				}
+			}
+			i++
+			run = i
+		}
+		return if (run == at + 1) s.slice(run, end - 1) else res + s.slice(run, end - 1)
+	}
+
+	blockScalar(t: Tok, tagTok: i32): Scalar throws ParseError {
+		const s = this.s
+		const c = this.c
+		const h = c.from(t.start)
+		const style: Style = if (s[c.at[h]] == greater) "folded" else "literal"
+		let explicit = 0
+		let chomp: u8 = 0
+		for (const i of c.at[h] + 1 ... c.end[h] - 1) {
+			const c = s[i]
+			if (chomp == 0 && (c == minus || c == plus)) {
+				chomp = c
+			} else if (explicit == 0 && c > zero && c <= nine) {
+				explicit = c - zero
+			} else {
+				throw this.fail(i)
+			}
+		}
+		let hasSpace = false
+		for (const i of h + 1 ... c.to(t.start) - 1) {
+			switch (c.kind[i]) {
+				case kind.space: hasSpace = true
+				case kind.newline: {}
+				case kind.comment:
+					if (!hasSpace) {
+						throw this.fail(c.at[i])
+					}
+				default: throw this.fail(c.at[i])
+			}
+		}
+		const tag = this.tagName(tagTok)
+		this.end = t.end
+		// Its lines: where each starts, how indented, and whether nothing but a carriage return follows.
+		const starts: i32[] = []
+		if (t.end > t.from) {
+			starts.push(t.from)
+			for (const i of t.from ... t.end - 1) {
+				if (s[i] == lf) {
+					starts.push(i + 1)
+				}
+			}
+		}
+		const n = starts.length
+		const lineEnd = (i: i32): i32 => if (i + 1 < n) starts[i + 1] - 1 else t.end
+		const indent = (i: i32): i32 => {
+			let j = starts[i]
+			while (j < lineEnd(i) && s[j] == space) {
+				j++
+			}
+			return j - starts[i]
+		}
+		// With an explicit indentation, the spaces of a line more indented than it are content.
+		const blank = (i: i32): bool => {
+			const j = starts[i] + indent(i)
+			return (j == lineEnd(i) || j + 1 == lineEnd(i) && s[j] == cr) && (explicit == 0 || indent(i) <= t.indent + explicit)
+		}
+		let chompStart = n
+		while (chompStart > 0 && blank(chompStart - 1)) {
+			chompStart--
+		}
+		if (chompStart == 0) {
+			let v = ""
+			if (chomp == plus && n > 0) {
+				for (const _ of 1 ... max(1, n - 1)) {
+					v += "\n"
+				}
+			}
+			return new Scalar(v, style, tag, t.at)
+		}
+		let trim = t.indent + explicit
+		let contentStart = 0
+		for (const i of 0 ... chompStart - 1) {
+			if (blank(i)) {
+				if (explicit == 0 && indent(i) > trim) {
+					trim = indent(i)
+				}
+			} else {
+				if (indent(i) < trim) {
+					throw this.fail(starts[i] + indent(i))
+				}
+				if (explicit == 0) {
+					trim = indent(i)
+				}
+				contentStart = i
+				if (trim == 0 && !this.atRoot) {
+					throw this.fail(starts[i])
+				}
+				break
+			}
+		}
+		// More indented trailing empty lines are content.
+		let i = n - 1
+		while (i >= chompStart) {
+			if (indent(i) > trim) {
+				chompStart = i + 1
+			}
+			i--
+		}
+		let v = ""
+		for (const i of 0 ... contentStart - 1) {
+			v += spaces(indent(i) - trim) + "\n"
+		}
+		let sep = ""
+		let moreIndented = false
+		for (const i of contentStart ... chompStart - 1) {
+			const ind = indent(i)
+			const from = starts[i] + ind
+			let to = lineEnd(i)
+			if (to > from && s[to - 1] == cr) {
+				to--
+			}
+			if (to > from && ind < trim) {
+				throw this.fail(from)
+			}
+			const line = s.slice(from, to)
+			if (style == "literal") {
+				v += sep + spaces(ind - trim) + line
+				sep = "\n"
+			} else if (ind > trim || byte(s, from) == tab && from < to) {
+				if (sep == " ") {
+					sep = "\n"
+				} else if (!moreIndented && sep == "\n") {
+					sep = "\n\n"
+				}
+				v += sep + spaces(ind - trim) + line
+				sep = "\n"
+				moreIndented = true
+			} else if (from == to) {
+				if (sep == "\n") {
+					v += "\n"
+				} else {
+					sep = "\n"
+				}
+			} else {
+				v += sep + line
+				sep = " "
+				moreIndented = false
+			}
+		}
+		if (chomp == plus) {
+			for (const i of chompStart ... n - 1) {
+				v += "\n" + spaces(indent(i) - trim)
+			}
+			if (v.length == 0 || v[v.length - 1] != lf) {
+				v += "\n"
+			}
+		} else if (chomp == 0) {
+			v += "\n"
+		}
+		return new Scalar(v, style, tag, t.at)
+	}
+
+	collection(t: Tok, props: Props): Seq | Map throws ParseError {
+		const tag = this.tagName(props.tag)
+		if (t.kind == kind.blockSeq || t.kind == kind.blockMap) {
+			// Its props end their line, as a block mapping's first key takes those on its own.
+			const last = max(props.anchor, props.tag)
+			if (last != -1 && props.newline < last) {
+				throw this.fail(this.c.at[last])
+			}
+		}
+		this.atRoot = false
+		this.depth++
+		if (this.depth > maxDepth) {
+			throw new ParseError("range", t.at)
+		}
+		const n: Seq | Map = switch (t.kind) {
+			case kind.blockMap: this.blockMap(t, tag)
+			case kind.blockSeq: this.blockSeq(t, tag)
+			default: this.flowCollection(t, tag)
+		}
+		this.depth--
+		return n
+	}
+
+	blockMap(t: Tok, tag: string | null): Map throws ParseError {
+		const c = this.c
+		const m = new Map(false, tag, t.at)
+		let offset = t.at
+		let commentEnd = -1
+		// Each item's props, read afresh for each.
+		const keyProps = new Props()
+		const valueProps = new Props()
+		for (const it of t.items!) {
+			const key = it.key
+			const sep = it.sep
+			const kp = this.props(keyProps, it.start, kind.explicitKeyInd, key ?? this.first(sep), offset, t.indent, true,
+				false)
+			const implicit = kp.found == -1
+			if (implicit) {
+				if (key != null && (key.kind == kind.blockSeq || key.indent != t.indent)) {
+					throw this.fail(offset)
+				}
+				if (kp.anchor == -1 && kp.tag == -1 && sep == none) {
+					commentEnd = kp.end
+					continue
+				}
+				if (kp.newline != -1 || hasNewline(c, this.s, key)) {
+					throw this.fail(if (key != null) key.at else c.at[c.to(it.start) - 1])
+				}
+			} else if (c.indent[kp.found] != t.indent) {
+				throw this.fail(offset)
+			}
+			const k = if (key != null) this.node(key, kp) else this.empty(kp.end, it.start, kp)
+			const vp = this.props(valueProps, sep, kind.mapValueInd, it.value, this.end, t.indent,
+				key == null || key.kind == kind.blockScalar, false)
+			if (vp.found != -1 && c.indent[vp.found] != t.indent) {
+				throw this.fail(c.at[vp.found]) // a : not at its mapping's indentation, as after a value on its line
+			}
+			offset = vp.end
+			if (vp.found != -1) {
+				if (implicit) {
+					if (it.value != null && it.value!.kind == kind.blockMap && !vp.hasNewline
+							|| kp.start < c.at[vp.found] - maxKey) {
+						throw this.fail(offset)
+					}
+				}
+				const v = if (it.value != null) this.node(it.value!, vp) else this.empty(offset, sep, vp)
+				offset = this.end
+				m.keys.push(k)
+				m.values.push(v)
+			} else {
+				if (implicit || it.value != null || vp.anchor != -1 || vp.tag != -1) {
+					// a value, or its props, needs its :
+					throw this.fail(if (implicit) k.at else if (it.value != null) it.value!.at else vp.start)
+				}
+				m.keys.push(k)
+				m.values.push(new Scalar("", "plain", null, this.end))
+			}
+		}
+		if (commentEnd > 0 && commentEnd < offset) {
+			throw this.fail(commentEnd)
+		}
+		this.end = if (commentEnd != -1) commentEnd else offset
+		if (this.loads) {
+			this.unique(m)
+		}
+		return m
+	}
+
+	blockSeq(t: Tok, tag: string | null): Seq throws ParseError {
+		const q = new Seq(false, tag, t.at)
+		let offset = t.at
+		let commentEnd = -1
+		const props = new Props()
+		for (const it of t.items!) {
+			const p = this.props(props, it.start, kind.seqItemInd, it.value, offset, t.indent, true, false)
+			if (p.found == -1) {
+				if (p.anchor != -1 || p.tag != -1 || it.value != null) {
+					throw this.fail(if (it.value != null && it.value!.kind == kind.blockSeq) p.end else offset)
+				}
+				commentEnd = p.end
+				continue
+			}
+			q.items.push(if (it.value != null) this.node(it.value!, p) else this.empty(p.end, it.start, p))
+			offset = this.end
+		}
+		this.end = if (commentEnd != -1) commentEnd else offset
+		return q
+	}
+
+	flowCollection(t: Tok, tag: string | null): Seq | Map throws ParseError {
+		const c = this.c
+		const isMap = t.braces
+		const m = new Map(true, tag, t.at)
+		const q = new Seq(true, tag, t.at)
+		const items = t.items!
+		let offset = t.at + 1
+		const keyProps = new Props()
+		const valueProps = new Props()
+		for (const i of 0 ... items.length - 1) {
+			const it = items[i]
+			const key = it.key
+			const sep = it.sep
+			const value = it.value
+			const p = this.props(keyProps, it.start, kind.explicitKeyInd, key ?? this.first(sep) ?? value, offset,
+				t.indent, false, true)
+			if (p.found == -1) {
+				if (p.anchor == -1 && p.tag == -1 && sep == none && value == null) {
+					if (i == 0 && p.comma || i < items.length - 1) {
+						throw this.fail(p.start)
+					}
+					offset = p.end
+					continue
+				}
+				if (!isMap && hasNewline(c, this.s, key)) {
+					throw this.fail(key!.at)
+				}
+			}
+			if (i == 0 && p.comma || i > 0 && !p.comma) {
+				throw this.fail(p.start)
+			}
+			if (!isMap && sep == none && p.found == -1) {
+				q.items.push(this.flowItem(value, p, none))
+				offset = this.end
+				continue
+			}
+			const k = this.flowItem(key, p, it.start)
+			const vp = this.props(valueProps, sep, kind.mapValueInd, value, this.end, t.indent, false, true)
+			if (vp.found != -1) {
+				if (!isMap && p.found == -1) {
+					// An implicit key in a flow sequence is on one line, with its props.
+					if (p.newline != -1) {
+						throw this.fail(c.at[p.newline])
+					}
+					for (const i of c.from(sep) ... vp.found - 1) {
+						if (c.kind[i] == kind.newline) {
+							throw this.fail(c.at[i])
+						}
+					}
+					if (p.start < c.at[vp.found] - maxKey) {
+						throw this.fail(c.at[vp.found])
+					}
+				}
+			} else if (value != null) {
+				throw this.fail(if (this.s[value.at] == colon) value.at else vp.start)
+			}
+			const v = if (value != null || vp.found != -1) this.flowItem(value, vp, sep) else null
+			if (v == null) {
+				this.end = vp.end
+			}
+			const val = v ?? new Scalar("", "plain", null, vp.end)
+			if (isMap) {
+				m.keys.push(k)
+				m.values.push(val)
+			} else {
+				const pair = new Map(true, null, k.at)
+				pair.keys.push(k)
+				pair.values.push(val)
+				q.items.push(pair)
+			}
+			offset = this.end
+		}
+		const close = c.from(t.tail)
+		if (c.size(t.tail) == 0 || c.kind[close] != (if (isMap) kind.flowMapEnd else kind.flowSeqEnd)) {
+			throw this.fail(offset)
+		}
+		this.end = c.end[close]
+		this.endTokens(t.tail, true, 1)
+		if (isMap && this.loads) {
+			this.unique(m)
+		}
+		return if (isMap) m else q
+	}
+
+	/// The node of a flow collection's key or value t, which is empty if null and may not be a block collection.
+	flowItem(t: Tok | null, p: Props, before: i32): Node throws ParseError {
+		if (t == null) {
+			return this.empty(p.end, before, p)
+		}
+		if (t.kind == kind.blockMap || t.kind == kind.blockSeq) {
+			throw this.fail(t.at)
+		}
+		return this.node(t, p)
+	}
+
+	/// The first token of list l as a node, or null.
+	first(l: i32): Tok | null {
+		const c = this.c
+		const i = c.from(l)
+		return if (c.size(l) == 0) null else new Tok(c.kind[i], c.at[i], c.end[i], c.indent[i])
+	}
+
+	/// Throws at the second of two keys of m that are the same node.
+	unique(m: Map) throws ParseError {
+		const keys = m.keys
+		if (keys.length <= 16) {
+			for (const i of 1 ... keys.length - 1) {
+				for (const j of 0 ... i - 1) {
+					if (this.same(keys[i], keys[j])) {
+						throw new ParseError("syntax", keys[i].at)
+					}
+				}
+			}
+			return
+		}
+		const seen = new HashMap[string, bool]()
+		for (const k of keys) {
+			const key = this.key(k)
+			if (seen.has(key)) {
+				throw new ParseError("syntax", k.at)
+			}
+			seen.set(key, true)
+		}
+	}
+
+	/// Whether keys a and b are the same node: scalars of one kind and text, or of one value.
+	same(a: Node, b: Node): bool throws ParseError {
+		const x = target(a)
+		const y = target(b)
+		if (x instanceof Scalar && y instanceof Scalar) {
+			const k = kindOf(x)
+			return k == kindOf(y) && (x.value == y.value || k != "str" && this.keys.scalar(x) == this.keys.scalar(y))
+		}
+		return !(x instanceof Scalar) && !(y instanceof Scalar) && this.key(x) == this.key(y)
+	}
+
+	/// Key n as text the same for the same node.
+	key(n: Node): string throws ParseError {
+		const t = target(n)
+		return if (t instanceof Scalar) this.keys.scalar(t) else this.keys.text(t)
+	}
+}
+
+/// Whether a %TAG directive's handle is !, !! or !name!, and its prefix a URI, or a local one after a !.
+function isTagDirective(handle: string, prefix: string): bool {
+	const n = handle.length
+	if (handle[0] != exclamation || n > 1 && handle[n - 1] != exclamation) {
+		return false
+	}
+	for (const i of 1 ... n - 2) {
+		if (!ascii.isAlphanumeric(handle[i]) && handle[i] != minus) {
+			return false
+		}
+	}
+	return isUri(prefix, true)
+}
+
+/// Whether s is a tag's URI: letters, digits, %-escapes and the marks a URI takes; a %TAG prefix's first not a flow
+/// indicator.
+function isUri(s: string, prefix: bool): bool {
+	let i = 0
+	while (i < s.length) {
+		const c = s[i]
+		if (c == percent && i + 2 < s.length && isHexDigit(s[i + 1]) && isHexDigit(s[i + 2])) {
+			i += 3
+		} else if (ascii.isAlphanumeric(c) || isTagChar(c)
+				|| (i > 0 || !prefix) && (c == comma || c == ascii.lbracket || c == ascii.rbracket)) {
+			i++
+		} else {
+			return false
+		}
+	}
+	return true
+}
+
+/// s with each carriage return not before a line feed, which is a line break of its own, a line feed.
+function lineFeeds(s: string): string {
+	let res = ""
+	let run = 0
+	for (const i of 0 ... s.length - 1) {
+		if (s[i] == cr && byte(s, i + 1) != lf) {
+			res += s.slice(run, i) + "\n"
+			run = i + 1
+		}
+	}
+	return if (run == 0) s else res + s.slice(run, s.length)
+}
+
+/// Whether a %YAML version is digits.digits, which is a version this does not know, but takes.
+function isVersion(v: string): bool {
+	const dot = indexOf(v, ".")
+	return dot > 0 && skipDigits(v, 0) == dot && dot + 1 < v.length && skipDigits(v, dot + 1) == v.length
+}
+
+/// Whether white space t has a tab and more follows it on its line, so it may be indentation.
+function hasTab(s: string, at: i32, end: i32): bool {
+	const next = byte(s, end)
+	if (next == -1 || next == lf || next == cr) {
+		return false
+	}
+	for (const i of at ... end - 1) {
+		if (s[i] == tab) {
+			return true
+		}
+	}
+	return false
+}
+
+/// Whether a key spans lines, as a block value or a flow one with a line break in it.
+function hasNewline(c: Cst, s: string, t: Tok | null): bool {
+	if (t == null) {
+		return false
+	}
+	switch (t.kind) {
+		case kind.alias, kind.scalar, kind.singleQuotedScalar, kind.doubleQuotedScalar:
+			for (const i of t.at ... t.end - 1) {
+				if (s[i] == lf) {
+					return true
+				}
+			}
+			return c.includes(t.tail, kind.newline)
+		case kind.flowCollection:
+			for (const it of t.items!) {
+				if (c.includes(it.start, kind.newline) || c.includes(it.sep, kind.newline) || hasNewline(c, s, it.key)
+						|| hasNewline(c, s, it.value)) {
+					return true
+				}
+			}
+			return false
+		default: return true
+	}
+}
+
+/// s[from:to] with its lines folded: blanks around a line break dropped, and a single break a space.
+function fold(s: string, from: i32, to: i32): string {
+	let nl = from
+	while (nl < to && s[nl] != lf) {
+		nl++
+	}
+	if (nl == to) {
+		return s.slice(from, to)
+	}
+	let res = s.slice(from, trimEnd(s, from, nl))
+	let sep = " "
+	let pos = nl + 1
+	while (true) {
+		nl = pos
+		while (nl < to && s[nl] != lf) {
+			nl++
+		}
+		let start = pos
+		while (start < nl && (s[start] == space || s[start] == tab)) {
+			start++
+		}
+		if (nl == to) {
+			return res + sep + s.slice(start, to)
+		}
+		const end = trimEnd(s, start, nl)
+		if (start == end) {
+			if (sep == "\n") {
+				res += sep
+			} else {
+				sep = "\n"
+			}
+		} else {
+			res += sep + s.slice(start, end)
+			sep = " "
+		}
+		pos = nl + 1
+	}
+}
+
+/// Where the line from from to the line feed at nl ends, less a carriage return and blanks.
+function trimEnd(s: string, from: i32, nl: i32): i32 {
+	let end = nl
+	if (end > from && s[end - 1] == cr) {
+		end--
+	}
+	while (end > from && (s[end - 1] == space || s[end - 1] == tab)) {
+		end--
+	}
+	return end
+}
+
+/// The value of the n hex digits of s at from, all before end, or -1.
+function hexAt(s: string, from: i32, n: i32, end: i32): i64 {
+	let v: i64 = 0
+	for (const j of from ... from + n - 1) {
+		const h = if (j < end) digit(s[j]) else null
+		if (h == null || h > 15) {
+			return -1
+		}
+		v = v * 16 + h
+	}
+	return v
+}
+
+/// A tag's suffix from i on with its %-escapes, which the lexer checked, decoded.
+function unescape(src: string, i: i32): string throws ParseError {
+	let res = ""
+	let run = i
+	let j = i
+	while (j < src.length) {
+		if (src[j] == percent) {
+			res += src.slice(run, j) + chr(parseInt[u8](src.slice(j + 1, j + 3), 16))
+			j += 3
+			run = j
+		} else {
+			j++
+		}
+	}
+	return if (run == i) src.slice(i, src.length) else res + src.slice(run, src.length)
+}
+
+function spaces(n: i32): string {
+	let s = ""
+	for (const _ of 1 ... n) {
+		s += " "
+	}
+	return s
+}
+
+/// How many times the source and the nodes its aliases may stand for, for each of a union's members, the members that
+/// fail may read in all, as json bounds them.
+const retries: i64 = 16
+
+class Decoder {
+	/// Nodes read in all, those read by union members that failed, and the most those may be per member.
+	read: i64 = 0
+	failed: i64 = 0
+	bound: i64
+	depth = 0
+	/// How many bytes of scalars Rest values may still copy, aliases expanded.
+	left: i64
+
+	constructor(s: string) {
+		this.bound = retries * (s.length + maxExpansion)
+		this.left = retries * s.length + (1 << 16)
+	}
+
+	value[T extends Decodable](node: Node): T throws ParseError {
+		this.read++
+		switch (T.kind) {
+			case "null":
+				this.scalar(node, "null")
+				return null
+			case "bool": return boolOf(this.scalar(node, "bool"))
+			case "int": return integer[T](this.scalar(node, "int"))
+			case "float":
+				const n = target(node)
+				if (!(n instanceof Scalar)) {
+					throw new ParseError("syntax", node.at)
+				}
+				return real[T](n)
+			case "string": return this.scalar(node, "str").value
+			case "literal":
+				if (this.value[string | bool | null](node) != T.value) {
+					throw new ParseError("syntax", node.at)
+				}
+				return T.value
+			case "union":
+				// The members of node's shape, integers first, as 1 fits a float too and the members are in canonical
+				// order (§4.4), not as written.
+				const read = this.read
+				const depth = this.depth
+				let last: ParseError | null = null
+				const t = target(node)
+				const k = if (t instanceof Scalar) kindOf(t) else "str"
+				for (const ints of [true, false]) {
+					for (const M of T.members) {
+						if ((M.kind == "int") == ints && fits[M](t, k)) {
+							try {
+								return this.value[M](node)
+							} catch (e: ParseError) {
+								this.failed += this.read - read
+								if (this.failed > this.bound * T.members.length) {
+									throw new ParseError("range", node.at)
+								}
+								last = e
+								this.read = read
+								this.depth = depth
+							}
+						}
+					}
+				}
+				throw last ?? new ParseError("syntax", node.at)
+			case "array":
+				const xs: T = []
+				for (const x of this.items(node, -1)) {
+					xs.push(this.value[T.elem](x))
+				}
+				this.depth--
+				return xs
+			case "fixed":
+				let fixed: T
+				const items = this.items(node, T.length)
+				for (const i of 0 ... T.length - 1) {
+					fixed[i] = this.value[T.elem](items[i])
+				}
+				this.depth--
+				return fixed
+			case "tuple":
+				const tuple = new T()
+				const fields = this.items(node, T.fields.length)
+				let i = 0
+				for (const f of T.fields) {
+					tuple[f.name] = this.value[f.type](fields[i])
+					i++
+				}
+				this.depth--
+				return tuple
+			case "class":
+				const r = new T()
+				const m = this.mapping(node)
+				for (const i of 0 ... m.keys.length - 1) {
+					const name = this.value[string](m.keys[i])
+					const v = m.values[i]
+					let known = false
+					for (const f of T.fields) {
+						if (!encoding.skips(f.tags, Skip) && !has(f.tags, Rest)
+								&& name == encoding.key(f.tags, Name, f.name)) {
+							r[f.name] = if (has(f.tags, Mapping)) this.entries[f.type](v) else this.value[f.type](v)
+							known = true
+						}
+					}
+					for (const f of T.fields) {
+						if (!known && has(f.tags, Rest) && f.type == Unknown[]) {
+							const rest: Unknown[] = r[f.name]
+							rest.push([name, this.text(v)])
+							known = true
+						}
+					}
+					if (!known) {
+						throw new ParseError("syntax", m.keys[i].at)
+					}
+				}
+				this.depth--
+				return r
+			default: throw new ParseError("syntax", node.at)
+		}
+	}
+
+	/// A mapping as a Mapping field's [K, V][].
+	entries[T extends Decodable](node: Node): T throws ParseError {
+		switch (T.kind) {
+			case "array":
+				const xs: T = []
+				const m = this.mapping(node)
+				for (const i of 0 ... m.keys.length - 1) {
+					xs.push(this.entry[T.elem](m.keys[i], m.values[i]))
+				}
+				this.depth--
+				return xs
+			default: throw new ParseError("syntax", node.at)
+		}
+	}
+
+	entry[T extends Decodable](k: Node, v: Node): T throws ParseError {
+		switch (T.kind) {
+			case "tuple":
+				const e = new T()
+				let i = 0
+				for (const f of T.fields) {
+					e[f.name] = this.value[f.type](if (i == 0) k else v)
+					i++
+				}
+				return e
+			default: throw new ParseError("syntax", k.at)
+		}
+	}
+
+	/// node's scalar, which must read as k.
+	scalar(node: Node, k: ScalarKind): Scalar throws ParseError {
+		const n = target(node)
+		if (!(n instanceof Scalar) || kindOf(n) != k) {
+			throw new ParseError("syntax", node.at)
+		}
+		return n
+	}
+
+	/// node's sequence, of length n unless n is -1, one deeper.
+	items(node: Node, n: i32): Node[] throws ParseError {
+		const s = target(node)
+		if (!(s instanceof Seq) || n != -1 && s.items.length != n) {
+			throw new ParseError("syntax", node.at)
+		}
+		this.deeper(node)
+		return s.items
+	}
+
+	/// node's mapping, one deeper.
+	mapping(node: Node): Map throws ParseError {
+		const m = target(node)
+		if (!(m instanceof Map)) {
+			throw new ParseError("syntax", node.at)
+		}
+		this.deeper(node)
+		return m
+	}
+
+	/// n as a Rest value's text: as emit writes it alone, without the line feed at its end, so with no keep block
+	/// scalar, and with no --- unless it needs one; "null" for nothing.
+	text(n: Node): string throws ParseError {
+		const c = this.copy(n)
+		const e = new Emitter()
+		e.keep = false
+		try {
+			e.out = if (c instanceof Scalar || !marked(c)) "" else "---"
+			e.node(c, 0, false)
+		} catch (x: EncodeError) {
+			throw new ParseError("syntax", n.at)
+		}
+		return if (e.out == "") "null" else e.out
+	}
+
+	/// n with its aliases expanded and its anchors dropped, its scalars' bytes charged to left.
+	copy(n: Node): Scalar | Seq | Map throws ParseError {
+		const t = target(n)
+		this.left -= 8
+		if (t instanceof Scalar) {
+			this.left -= t.value.length
+			if (this.left < 0) {
+				throw new ParseError("range", n.at)
+			}
+			return if (t.anchor == null) t else new Scalar(t.value, t.style, t.tag, t.at)
+		}
+		this.deeper(n)
+		if (t instanceof Seq) {
+			const q = new Seq(t.flow, t.tag, t.at)
+			for (const x of t.items) {
+				q.items.push(this.copy(x))
+			}
+			this.depth--
+			return q
+		}
+		const m = new Map(t.flow, t.tag, t.at)
+		for (const i of 0 ... t.keys.length - 1) {
+			m.keys.push(this.copy(t.keys[i]))
+			m.values.push(this.copy(t.values[i]))
+		}
+		this.depth--
+		return m
+	}
+
+	/// One collection deeper, which aliases make deeper than the tree, unless maxDepth already.
+	deeper(node: Node) throws ParseError {
+		if (this.depth == maxDepth) {
+			throw new ParseError("range", node.at)
+		}
+		this.depth++
+	}
+}
+
+/// Whether a T may be read from n, a scalar of kind k.
+function fits[T](n: Node, k: ScalarKind): bool {
+	switch (T.kind) {
+		case "array", "fixed", "tuple": return n instanceof Seq
+		case "class": return n instanceof Map
+		case "null", "bool", "int": return n instanceof Scalar && k == T.kind
+		case "float": return n instanceof Scalar && (k == "float" || k == "int")
+		case "string": return n instanceof Scalar && k == "str"
+		default: return n instanceof Scalar
+	}
+}
+
+function target(n: Node): Scalar | Seq | Map { return if (n instanceof Alias) n.target else n }
+
+/// Writes keys as JSON text, the same for the same node: aliases expanded, tags dropped, floats with a point or
+/// exponent, and .inf, -.inf, .nan or #text for those JSON has not, under a bound on the bytes it writes and how deep
+/// it nests.
+class Json {
+	/// How many bytes it may still write.
+	left: i64
+	depth = 0
+	out = ""
+
+	constructor(left: i64) { this.left = left }
+
+	/// n's text.
+	text(n: Node): string throws ParseError {
+		this.out = ""
+		this.node(n)
+		return this.out
+	}
+
+	node(n: Node) throws ParseError {
+		const t = target(n)
+		if (t instanceof Scalar) {
+			this.add(n, this.scalar(t))
+			return
+		}
+		if (this.depth == maxDepth) {
+			throw new ParseError("range", n.at)
+		}
+		this.depth++
+		if (t instanceof Seq) {
+			this.add(n, "[")
+			for (const i of 0 ... t.items.length - 1) {
+				this.add(n, if (i == 0) "" else ",")
+				this.node(t.items[i])
+			}
+			this.add(n, "]")
+		} else {
+			this.add(n, "{")
+			for (const i of 0 ... t.keys.length - 1) {
+				this.add(n, if (i == 0) "" else ",")
+				this.node(t.keys[i])
+				this.add(n, ":")
+				this.node(t.values[i])
+			}
+			this.add(n, "}")
+		}
+		this.depth--
+	}
+
+	scalar(n: Scalar): string throws ParseError {
+		switch (kindOf(n)) {
+			case "null": return "null"
+			case "bool": return `${boolOf(n)}`
+			case "str": return quoted(n.value)
+			case "int":
+				try {
+					return `${intOf(n)}`
+				} catch (e: ParseError) {}
+				try {
+					return `${integer[u64](n)}`
+				} catch (e: ParseError) {}
+				return "#" + n.value
+			default:
+				const x = floatOf(n)
+				if (isFinite(x)) {
+					const f = formatFloat(x)
+					return if (indexOf(f, ".") < 0 && indexOf(f, "e") < 0) f + ".0" else f
+				}
+				return if (isNaN(x)) ".nan" else if (x > 0.0) ".inf" else "-.inf"
+		}
+	}
+
+	add(n: Node, s: string) throws ParseError {
+		this.left -= s.length
+		if (this.left < 0) {
+			throw new ParseError("range", n.at)
+		}
+		this.out += s
+	}
+}
+
+/// v as a node, as json encodes it.
+function toNode[T](v: T): Node throws EncodeError {
+	const t = typeof v
+	switch (t.kind) {
+		case "null": return word("null")
+		case "bool", "int": return word(`${v}`)
+		case "float": return word(if (isNaN(v)) ".nan" else if (!isFinite(v)) (if (v > 0.0) ".inf" else "-.inf") else `${v}`)
+		case "string": return new Scalar(v, "single", null, 0)
+		case "literal": return toNode[string | bool | null](t.value)
+		case "union":
+			for (const M of t.members) {
+				if (v instanceof M) {
+					return toNode(v)
+				}
+			}
+			return word("null")
+		case "array", "fixed":
+			const seq = new Seq(false, null, 0)
+			for (const x of v) {
+				seq.items.push(toNode(x))
+			}
+			return seq
+		case "tuple":
+			const tuple = new Seq(false, null, 0)
+			for (const f of t.fields) {
+				tuple.items.push(toNode(v[f.name]))
+			}
+			return tuple
+		case "class", "object", "interface":
+			const m = new Map(false, null, 0)
+			for (const f of t.fields) {
+				const x = v[f.name]
+				if (has(f.tags, Rest) && f.type == Unknown[]) {
+					for (const [k, text] of x) {
+						m.keys.push(new Scalar(k, "single", null, 0))
+						m.values.push(parsed(text))
+					}
+				} else if (!encoding.omits(f.tags, Skip, OmitEmpty, x)) {
+					m.keys.push(new Scalar(encoding.key(f.tags, Name, f.name), "single", null, 0))
+					m.values.push(if (has(f.tags, Mapping)) toEntries(x) else toNode(x))
+				}
+			}
+			return m
+		default: return new Scalar(t.name, "single", null, 0)
+	}
+}
+
+function word(v: string): Scalar { return new Scalar(v, "plain", null, 0) }
+
+/// A Mapping field's [K, V][] as a mapping.
+function toEntries[T](xs: T): Map throws EncodeError {
+	const m = new Map(false, null, 0)
+	switch (T.kind) {
+		case "array": for (const e of xs) {
+			let i = 0
+			for (const f of T.elem.fields) {
+				(if (i == 0) m.keys else m.values).push(toNode(e[f.name]))
+				i++
+			}
+		}
+	}
+	return m
+}
+
+/// A Rest value's text as a node.
+function parsed(text: string): Node throws EncodeError {
+	try {
+		const docs = documents(text)
+		if (docs.length == 1) {
+			return docs[0].root
+		}
+	} catch (e: ParseError) {}
+	throw new EncodeError(text)
+}
+
+class Emitter {
+	out = ""
+	/// Whether a scalar may be a keep block scalar, |+, whose last line break is the text's last.
+	keep = true
+
+	/// n after the indicator out ends with, -, ?, : or ---, or at the start of a line; a collection's entries at ind,
+	/// the first on the indicator's line if compact, as after - and ?, and it has no props.
+	node(n: Node, ind: i32, compact: bool) throws EncodeError {
+		const o = this.out
+		const sep = if (o.length == 0 || o[o.length - 1] == lf) "" else " "
+		if (n instanceof Alias) {
+			this.out += `${sep}*${n.name}`
+			return
+		}
+		const p = props(n)
+		if (n instanceof Scalar) {
+			const text = scalar(n, ind, !this.keep && endsWith(n.value, "\n\n"))
+			const both = if (p == "" || text == "") p + text else `${p} ${text}`
+			if (both != "") {
+				this.out += sep + both
+			}
+			return
+		}
+		const size = if (n instanceof Seq) n.items.length else n.keys.length
+		if (size == 0) {
+			this.out += sep + (if (p == "") "" else p + " ") + (if (n instanceof Seq) "[]" else "{}")
+			return
+		}
+		this.out += if (p != "") sep + p else if (compact) " " else ""
+		const pad = "\n" + spaces(ind)
+		const inline = p == "" && (compact || sep == "")
+		for (const i of 0 ... size - 1) {
+			if (i > 0 || !inline) {
+				this.out += pad
+			}
+			if (n instanceof Seq) {
+				this.out += "-"
+				this.node(n.items[i], ind + 2, true)
+			} else {
+				const key = implicit(n.keys[i])
+				if (key != null) {
+					this.out += key + ":"
+					this.node(n.values[i], ind + 2, false)
+				} else {
+					this.out += "?"
+					this.node(n.keys[i], ind + 2, true)
+					this.out += pad + ":"
+					this.node(n.values[i], ind + 2, true)
+				}
+			}
+		}
+	}
+}
+
+/// Whether a first document's root needs its ---: an empty scalar would be no document, a block scalar is not one
+/// alone on its line, and props alone on theirs are not a block collection's.
+function marked(r: Node): bool throws EncodeError {
+	if (r instanceof Scalar) {
+		return r.value == "" && r.style == "plain" && props(r) == "" || indexOf(r.value, "\n") >= 0
+	}
+	return !(r instanceof Alias) && props(r) != "" && (if (r instanceof Seq) r.items.length else r.keys.length) > 0
+}
+
+/// k as an implicit key, or null where it must be explicit: a collection, an empty scalar or one of lines.
+function implicit(k: Node): string | null throws EncodeError {
+	if (k instanceof Alias) {
+		return `*${k.name} `
+	}
+	if (!(k instanceof Scalar)) {
+		return null
+	}
+	const text = scalar(k, 0, true)
+	const p = props(k)
+	const key = if (p == "") text else `${p} ${text}`
+	return if (text == "" || key.length > maxKey - 1) null else key
+}
+
+/// n's anchor and tag as written before it.
+function props(n: Node): string throws EncodeError {
+	if (n instanceof Alias) {
+		return ""
+	}
+	const a = if (n.anchor != null) `&${n.anchor}` else ""
+	const t = n.tag
+	return if (t == null) a else if (a == "") tagged(t) else `${a} ${tagged(t)}`
+}
+
+/// A tag as written: !! for the core schema's, ! for a local one, %-escaping what a name cannot hold, else verbatim,
+/// which reads back as it is only if a URI.
+function tagged(t: string): string throws EncodeError {
+	if (t == "!") {
+		return t
+	}
+	if (startsWith(t, core) && t.length > core.length) {
+		return "!!" + escaped(t.slice(core.length, t.length))
+	}
+	if (t != "" && t[0] == exclamation) {
+		return "!" + escaped(t.slice(1, t.length))
+	}
+	if (t == "" || !isUri(t, false)) {
+		throw new EncodeError(t)
+	}
+	return `!<${t}>`
+}
+
+function escaped(s: string): string {
+	let out = ""
+	for (const c of s) {
+		out += if (ascii.isAlphanumeric(c) || isTagChar(c) && c != exclamation) chr(c) else `%${hex(c, 2)}`
+	}
+	return out
+}
+
+/// n's text in a style that keeps its value and kind, "" if empty and that reads back the same; on one line if line,
+/// as a key is.
+function scalar(n: Scalar, ind: i32, line: bool): string throws EncodeError {
+	const v = n.value
+	if (v == "") {
+		return if (n.style == "plain" || n.tag != null) "" else "''"
+	}
+	// Whether each character but tabs and line feeds is one to write as it is, and whether any are tabs or lines.
+	let raw = true
+	let tabs = false
+	let lines = false
+	let i = 0
+	while (i < v.length) {
+		const [cp, next] = codePoint(v, i)
+		if (cp == 0xfffd && next == i + 1) {
+			throw new EncodeError(v)
+		}
+		if (cp == tab) {
+			tabs = true
+		} else if (cp == lf) {
+			lines = true
+		} else if (!printable(cp)) {
+			raw = false
+		}
+		i = next
+	}
+	if (raw && !tabs && !lines && isPlain(v) && (n.style == "plain" || n.tag != null || plainKind(v) == "str")) {
+		return v
+	}
+	if (raw && lines && !line && isLiteral(v)) {
+		return literal(v, ind)
+	}
+	if (raw && !lines && n.style != "double") {
+		return `'${replace(v, "'", "''")}'`
+	}
+	return double(v)
+}
+
+/// Whether cp may be written as it is: printable, not a line break of YAML 1.1, a BOM or a C1 control.
+function printable(cp: i64): bool {
+	return 0x20 <= cp && cp < 0x7f || 0xa0 <= cp && cp <= 0xd7ff && cp != 0x2028 && cp != 0x2029
+		|| 0xe000 <= cp && cp <= 0xfffd && cp != 0xfeff || cp >= 0x10000
+}
+
+/// Whether v, of printable characters on one line, reads back as itself plain, as a key too: nothing a plain scalar
+/// cannot start or end with, no ": " or " #", and not a document marker.
+function isPlain(v: string): bool {
+	const last = v[v.length - 1]
+	if (last == space || last == colon || startsWith(v, "---") || startsWith(v, "...")) {
+		return false
+	}
+	switch (v[0]) {
+		case minus: if (v.length == 1 || v[1] == space) {
+			return false
+		}
+		case space, question, colon, comma, lbracket, rbracket, lbrace, rbrace, hash, ampersand, star, exclamation, pipe,
+			greater, apostrophe, quote, percent, ascii.at, backtick:
+			return false
+	}
+	return indexOf(v, ": ") < 0 && indexOf(v, " #") < 0
+}
+
+/// Whether v, of printable characters and lines, is a literal block's text: a line not empty, the first not starting
+/// with a space or tab, which would need an indentation indicator, and none ending with one, which editors strip.
+function isLiteral(v: string): bool {
+	let content = false
+	for (const line of split(v, "\n")) {
+		if (line != "") {
+			const end = line[line.length - 1]
+			if (!content && (line[0] == space || line[0] == tab) || end == space || end == tab) {
+				return false
+			}
+			content = true
+		}
+	}
+	return content
+}
+
+/// v as a literal block, its lines at ind, at least 2 for a document's, with the chomping its final line feeds need.
+function literal(v: string, ind: i32): string {
+	let feeds = 0
+	while (feeds < v.length && v[v.length - 1 - feeds] == lf) {
+		feeds++
+	}
+	let out = if (feeds == 0) "|-" else if (feeds == 1) "|" else "|+"
+	const pad = spaces(max(ind, 2))
+	for (const line of split(v.slice(0, v.length - (if (feeds == 0) 0 else 1)), "\n")) {
+		out += if (line == "") "\n" else `\n${pad}${line}`
+	}
+	return out
+}
+
+/// v double-quoted, escaping what is not printable.
+function double(v: string): string {
+	let out = "\""
+	let run = 0
+	let i = 0
+	while (i < v.length) {
+		const [cp, next] = codePoint(v, i)
+		let e = if (cp == quote) "\\\"" else escape(cp)
+		if (e == "" && !printable(cp)) {
+			e = switch (cp) {
+				case 0x85: "\\N"
+				case 0x2028: "\\L"
+				case 0x2029: "\\P"
+				default: if (cp < 0x100) `\\x${hex(cp, 2)}` else if (cp < 0x10000) `\\u${hex(cp, 4)}` else `\\U${hex(cp, 8)}`
+			}
+		}
+		if (e != "") {
+			out += v.slice(run, i) + e
+			run = next
+		}
+		i = next
+	}
+	return out + v.slice(run, v.length) + "\""
+}
+
+/// The escape of a backslash or of a C0 control that has a short one, else "".
+function escape(c: i64): string {
+	return switch (c) {
+		case backslash: "\\\\"
+		case 0: "\\0"
+		case 7: "\\a"
+		case 8: "\\b"
+		case tab: "\\t"
+		case lf: "\\n"
+		case 11: "\\v"
+		case 12: "\\f"
+		case cr: "\\r"
+		case 27: "\\e"
+		default: ""
+	}
+}
+
+function hex(v: i64, digits: i32): string {
+	let out = ""
+	for (const i of 1 ... digits) {
+		out += chr("0123456789ABCDEF"[(v >> (4 * (digits - i)) & 15) as i32])
+	}
+	return out
+}

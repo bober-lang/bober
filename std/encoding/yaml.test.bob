@@ -1,0 +1,516 @@
+import { inf, isNaN, nan } from "../math"
+import { ParseError } from "../parse"
+import { indexOf, utf8 } from "../string"
+import * as encoding from "../encoding"
+import { Alias, boolOf, decode, decodeAll, documents, emit, encode, EncodeError, events, floatOf, intOf, kindOf, Map,
+	Mapping, maxDepth, maxExpansion, Name, Node, OmitEmpty, Rest, Scalar, Seq, Skip } from "./yaml"
+import { Unknown } from "./json"
+
+function root(s: string): Node throws ParseError { return documents(s)[0].root }
+
+function scalar(s: string): Scalar throws ParseError {
+	const n = root(s)
+	assert n instanceof Scalar
+	return n
+}
+
+test "the tree keeps styles, tags, anchors and offsets" {
+	const m = root("a: [1, 'x']\n? b\n: !t &c |\n  z\nd: *c\n")
+	assert m instanceof Map
+	assert m.keys.length == 3 && !m.flow && m.at == 0
+	const seq = m.values[0]
+	assert seq instanceof Seq && seq.flow && seq.at == 3 && seq.items.length == 2
+	const x = seq.items[1]
+	assert x instanceof Scalar && x.value == "x" && x.style == "single" && x.at == 7
+	const z = m.values[1]
+	assert z instanceof Scalar && z.value == "z\n" && z.style == "literal" && z.tag == "!t" && z.anchor == "c"
+	const d = m.values[2]
+	assert d instanceof Alias && d.name == "c" && d.target == z && d.at == 33
+}
+
+test "documents" {
+	const docs = documents("a\n--- b\n...\n%YAML 1.2\n---\n")
+	assert docs.length == 3
+	assert !docs[0].start && !docs[0].end && docs[1].start && docs[1].end && docs[2].start
+	assert documents("").length == 0 && documents("# only\n").length == 0
+}
+
+test "tags resolve through %TAG" {
+	assert scalar("%TAG !e! tag:example.com,2000:\n--- !e!a%21 x").tag == "tag:example.com,2000:a!"
+	assert scalar("!!str x").tag == "tag:yaml.org,2002:str"
+	assert scalar("!<tag:x> y").tag == "tag:x"
+	assert scalar("! x").tag == "!"
+	assert root("! [x]") instanceof Seq
+	assert documents("!e!a x") throws new ParseError("syntax", 0)
+}
+
+test "kindOf reads the core schema" {
+	const kinds = [["", "null"], ["~", "null"], ["NULL", "null"], ["nULL", "str"], ["True", "bool"], ["yes", "str"],
+		["0", "int"], ["-12", "int"], ["+12", "int"], ["0o17", "int"], ["0x1F", "int"], ["0b1", "str"], ["1_000", "str"],
+		["1.5", "float"], [".5", "float"], ["1.", "float"], ["1e3", "float"], ["-1.5E-3", "float"], [".inf", "float"],
+		["-.Inf", "float"], [".NaN", "float"], ["e3", "str"], ["1.2.3", "str"], ["0x", "str"], ["-x", "str"]]
+	for (const [text, kind] of kinds) {
+		assert kindOf(scalar(`--- ${text}`)) == kind
+	}
+	assert kindOf(scalar("'1'")) == "str" && kindOf(scalar("!!int '1'")) == "int" && kindOf(scalar("!!str 1")) == "str"
+	assert kindOf(scalar("!!float 1")) == "float" && kindOf(scalar("!x 1")) == "str"
+	assert !boolOf(scalar("FALSE")) && boolOf(scalar("!!bool true")) && boolOf(scalar("x")) throws new ParseError("syntax", 0)
+}
+
+test "core tags fit their nodes in documents" {
+	assert documents("!!int x") throws new ParseError("syntax", 6)
+	assert documents("!!map x") throws new ParseError("syntax", 6)
+	assert documents("!!str [a]") throws new ParseError("syntax", 6)
+	assert documents("!!seq {a: 1}") throws new ParseError("syntax", 6)
+	assert documents("{!!int x: 1}") throws new ParseError("syntax", 7)
+	assert documents("!!null").length == 1 && documents("!!float 1").length == 1 && documents("!!int '0x1'").length == 1
+	assert documents("!!binary x").length == 1 && events("!!int x") != ""
+}
+
+test "intOf and floatOf" {
+	assert intOf(scalar("0x1F")) == 31 && intOf(scalar("0o17")) == 15 && intOf(scalar("+12")) == 12
+	assert intOf(scalar("-9223372036854775808")) == -9223372036854775808
+	assert intOf(scalar("9223372036854775808")) throws new ParseError("range", 0)
+	assert intOf(scalar("1.5")) throws new ParseError("syntax", 0)
+	assert floatOf(scalar("1.")) == 1.0 && floatOf(scalar("-.5")) == -0.5 && floatOf(scalar("+1.e2")) == 100.0
+	assert floatOf(scalar("0x10")) == 16.0 && floatOf(scalar("-.inf")) < -1e308 && isNaN(floatOf(scalar(".nan")))
+	assert floatOf(scalar("!!float 0x10")) == 16.0 && floatOf(scalar("!!float 0o17")) == 15.0
+	assert floatOf(scalar("0xFFFFFFFFFFFFFFFF")) == 18446744073709551615.0 && floatOf(scalar("0e5")) == 0.0
+	assert 1.0 / floatOf(scalar("-0.0")) == -inf && 1.0 / floatOf(scalar("-0")) == -inf
+}
+
+test "keys are unique in documents" {
+	assert documents("a: 1\na: 2\n") throws new ParseError("syntax", 5)
+	assert documents("{1: a, 0x1: b}") throws new ParseError("syntax", 7)
+	assert documents("&k a: 1\n*k : 2\n") throws new ParseError("syntax", 8)
+	assert documents("? \n: 1\n? ~\n: 2\n") throws new ParseError("syntax", 9)
+	assert documents("1: a\n'1': b\n1.0: c\n9223372036854775808: d\n9223372036854775809: e\n").length == 1
+	assert documents("{[1]: a, [1]: b}") throws new ParseError("syntax", 9)
+	assert documents("{{1: a}: x, {'1': a}: y, [1.0]: z, [1e0]: w}") throws new ParseError("syntax", 35)
+	assert events("a: 1\na: 2\n") != ""
+}
+
+test "aliases need an anchor before them" {
+	assert documents("*a") throws new ParseError("syntax", 0)
+	assert documents("&a [*a]") throws new ParseError("syntax", 4)
+	assert documents("- *a\n- &a x\n") throws new ParseError("syntax", 2)
+	assert documents("- &a x\n---\n- *a\n") throws new ParseError("syntax", 13)
+}
+
+test "aliases expand to at most maxExpansion nodes" {
+	// Each level is 16 aliases of the one before, so level 3 stands for about 16^4 nodes and level 4 for 16^5.
+	let s = "a: &a [x, x, x, x, x, x, x, x, x, x, x, x, x, x, x, x]\n"
+	let prev = "a"
+	for (const level of ["1", "2", "3", "4"]) {
+		s += `${level}: &${level} [*${prev}`
+		for (const _ of 2 ... 16) {
+			s += `, *${prev}`
+		}
+		s += "]\n"
+		prev = level
+	}
+	assert documents(s.slice(0, indexOf(s, "4:"))).length == 1
+	assert documents(s) throws new ParseError("range", 327)
+}
+
+test "collections nest at most maxDepth deep" {
+	let flow = ""
+	for (const _ of 1 ... 128) {
+		flow = `[${flow}]`
+	}
+	assert documents(flow).length == 1
+	assert documents(`[${flow}]`) throws new ParseError("range", 128)
+	let block = "x"
+	for (const i of 1 ... 200) {
+		block = `- ${block}`
+	}
+	assert documents(block) throws new ParseError("range", 256)
+}
+
+test "errors are at their offset" {
+	assert documents("\"abc") throws new ParseError("syntax", 4)
+	assert documents("a: b: c") throws new ParseError("syntax", 3)
+	assert documents("a:\n\t- b") throws new ParseError("syntax", 3)
+	assert documents("[a, b") throws new ParseError("syntax", 5)
+	assert documents("\"\\q\"") throws new ParseError("syntax", 1)
+	assert documents("%YAML 1.2\n%YAML 1.2\n---\n") throws new ParseError("syntax", 10)
+	assert documents("%YAML 1.2\n") throws new ParseError("syntax", 10)
+	assert documents("a:\n  - b\n - c") throws new ParseError("syntax", 9)
+	assert documents("a: 1\n b: 2") throws new ParseError("syntax", 3)
+	assert documents("&a &b x") throws new ParseError("syntax", 3)
+	assert documents("\"a\\uD800\"") throws new ParseError("syntax", 2)
+	assert documents("\"\\uDC00\\uD800\"") throws new ParseError("syntax", 1)
+}
+
+test "events" {
+	assert events("") == "+STR\n-STR\n"
+	assert events("--- &a !!str \"x\\ty\"\n...\n")
+		== "+STR\n+DOC ---\n=VAL &a <tag:yaml.org,2002:str> \"x\\ty\n-DOC ...\n-STR\n"
+	assert events("{a: *b}") throws new ParseError("syntax", 4)
+}
+
+test "escapes of a surrogate pair are one character" {
+	assert scalar("\"\\uD83D\\uDE00\\u00e9\"").value == utf8(0x1F600) + utf8(0xe9)
+}
+
+test "a comment holds any byte" {
+	assert events("x: 1 # a\x00b\n# \x00") == events("x: 1")
+}
+
+test "line breaks may be CRLF" {
+	assert events("a: |\r\n  x\r\n  y\r\nb: \"p\r\n  q\"\r\n") == events("a: |\n  x\n  y\nb: \"p\n  q\"\n")
+}
+
+/// Cases the differential fuzz against libfyaml found.
+test "fuzz regressions" {
+	// A byte order mark is no indentation: the - after it starts the line.
+	assert events("\u{feff}- a") == "+STR\n+DOC\n+SEQ\n=VAL :a\n-SEQ\n-DOC\n-STR\n"
+	// A line of only a tab is blank, not indentation.
+	assert events("a:\n\t\nb:") == events("a:\n\nb:")
+	// An explicit key's value is not the key of a next : at the mapping's indentation.
+	assert events("?\n:\n:") == "+STR\n+DOC\n+MAP\n=VAL :\n=VAL :\n=VAL :\n=VAL :\n-MAP\n-DOC\n-STR\n"
+	// Props after an explicit key belong to a value, which needs its :.
+	assert events("? \"\"!") throws new ParseError("syntax", 4)
+	// A comment line does not lower the indentation a plain scalar needs to go on.
+	assert events("k:\n#c\n x\na") throws new ParseError("syntax", 9)
+	// A ? or - in flow needs white space after it, and cannot start a plain scalar before , ] or }.
+	assert events("{a, ?}") throws new ParseError("syntax", 4)
+	assert events("[-]") throws new ParseError("syntax", 1)
+	assert events("[? a, ?\tb]") != "" && events("?,") != ""
+	// A comma on the line after a ? or props ends their item, as after a space.
+	assert events("{?\n,}") == events("{? ,}") && events("[!t\n,]") == events("[!t ,]")
+	// A block scalar ends its key's line, so a flow collection on the next may be a key.
+	assert events("k: |\n[a]: b") == "+STR\n+DOC\n+MAP\n=VAL :k\n=VAL |\n+SEQ []\n=VAL :a\n-SEQ\n=VAL :b\n-MAP\n-DOC\n-STR\n"
+	// Document markers are three of one kind; a mix is a plain scalar.
+	assert events("-.-") == "+STR\n+DOC\n=VAL :-.-\n-DOC\n-STR\n"
+	// Only a comment may follow a block scalar header on its line.
+	assert events("| ---") throws new ParseError("syntax", 2)
+	// A comment line may follow a flow collection inside another.
+	assert events("{a: []\n# c\n}") == events("{a: []}")
+	// A flow sequence's implicit key is on one line with its props.
+	assert events("[!\n[a]: b]") throws new ParseError("syntax", 2)
+	// Props on the line of an empty key's : are that key's.
+	assert events("k:\n &a : b") == "+STR\n+DOC\n+MAP\n=VAL :k\n+MAP\n=VAL &a :\n=VAL :b\n-MAP\n-MAP\n-DOC\n-STR\n"
+	// In ''' the last two quotes are one escaped quote, so the closing one is missing.
+	assert events("'''") throws new ParseError("syntax", 3)
+	// A line less indented than a quoted scalar needs is an error, even where the line before ends in a quote.
+	assert events(": '''\n: ' '") throws new ParseError("syntax", 5)
+	// A directive needs a name.
+	assert events("%\n---") throws new ParseError("syntax", 0)
+	// A document marker starts its line, so after a tab it is a plain scalar.
+	assert events("[\n\t---\n]") == "+STR\n+DOC\n+SEQ []\n=VAL :---\n-SEQ\n-DOC\n-STR\n"
+	// Past an explicit indentation, the spaces of a blank line are content.
+	assert events("- |+1\n\n   \n") == "+STR\n+DOC\n+SEQ\n=VAL |\\n  \\n\n-SEQ\n-DOC\n-STR\n"
+	// A verbatim tag cut short by a space is too short to hold its <>.
+	assert events("!< x>") throws new ParseError("syntax", 0)
+	// Props on an explicit value's line, before a :, are an empty key's, as after a -.
+	assert events("? k\n: &a !t : v") == "+STR\n+DOC\n+MAP\n=VAL :k\n+MAP\n=VAL &a <!t> :\n=VAL :v\n-MAP\n-MAP\n-DOC\n-STR\n"
+}
+
+class Point {
+	x: i32 = 0
+	y: f64 = 0.5
+}
+
+class Server {
+	host = "localhost"
+	port: u16 = 8080
+	tags: string[] = []
+}
+
+class Config {
+	title = "demo"
+	mode: "fast" | "safe" = "fast"
+	origin = new Point()
+	server: Server | null = null
+	points: Point[] = []
+	matrix: i32[][] = [[1, 2], [3]]
+}
+
+class Text {
+	v = ""
+}
+
+class Real {
+	v = 0.0
+}
+
+class Any {
+	v: i32 | f64 | string | bool | null = null
+}
+
+class Shapes {
+	pair: [string, i32] = ["", 0]
+	three: i32[3] = [0, 0, 0]
+}
+
+class Tagged {
+	id: i32 @Name["ID"] = 7
+	nick: string | null @OmitEmpty = null
+	cache: string @Skip = "c"
+	counts: [string, i32][] @Mapping = []
+	ids: [i32, string][] @Mapping = []
+	rest: Unknown[] @Rest = []
+}
+
+class Tree {
+	kids: Tree[] = []
+}
+
+class Trees {
+	a = new Tree()
+	b = new Tree()
+}
+
+test "decode a document into a type" {
+	const c = decode[Config](`title: x
+mode: safe
+origin: {x: 1, y: 2}
+server:
+  host: h
+  port: 0x50
+  tags: [a, "b"]
+points:
+- x: -1
+- &p {y: .5e1}
+- *p
+matrix: [[], [7]]
+`)
+	assert c.title == "x" && c.mode == "safe" && c.origin.x == 1 && c.origin.y == 2.0
+	const s = c.server!
+	assert s.host == "h" && s.port == 80 && s.tags.join(",") == "a,b"
+	assert c.points.length == 3 && c.points[0].x == -1 && c.points[0].y == 0.5 && c.points[1].y == 5.0
+	assert c.points[2].x == 0 && c.points[2].y == 5.0
+	assert c.matrix.length == 2 && c.matrix[0].length == 0 && c.matrix[1][0] == 7
+	assert decode[Config]("server: ~").server == null
+	assert decode[Config]("{}").title == "demo"
+	const any = ["1", "1.5", "x", "'1'", "true", "~"].map(v => `${decode[Any](`v: ${v}`).v}`)
+	assert any.join(" ") == "1 1.5 x 1 true null"
+	assert decode[Any]("v: 1").v instanceof i32 && decode[Any]("v: '1'").v instanceof string
+	const sh = decode[Shapes]("pair: [a, 2]\nthree: [1, 2, 3]")
+	assert sh.pair[0] == "a" && sh.pair[1] == 2 && sh.three[2] == 3
+	assert decode[Real]("v: -.INF").v == -inf && isNaN(decode[Real]("v: .nan").v) && decode[Real]("v: 0o17").v == 15.0
+	assert decode[u64]("0xFFFFFFFFFFFFFFFF") == 0xFFFFFFFFFFFFFFFF && decode[i8]("-128") == -128
+}
+
+test "decode is strict" {
+	assert decode[Config]("title: 1") throws new ParseError("syntax", 7)
+	assert decode[Config]("title:") throws new ParseError("syntax", 6)
+	assert decode[Config]("titel: x") throws new ParseError("syntax", 0)
+	assert decode[Config]("mode: slow") throws new ParseError("syntax", 6)
+	assert decode[Config]("1: x") throws new ParseError("syntax", 0)
+	assert decode[Config]("server: {port: 70000}") throws new ParseError("range", 15)
+	assert decode[Config]("server: {port: -1}") throws new ParseError("syntax", 15)
+	assert decode[Config]("server: [x]") throws new ParseError("syntax", 8)
+	assert decode[Config]("points: [1]") throws new ParseError("syntax", 9)
+	assert decode[Shapes]("three: [1, 2]") throws new ParseError("syntax", 7)
+	assert decode[Shapes]("pair: [a, 1, 2]") throws new ParseError("syntax", 6)
+	assert decode[Text]("v: x\n---\nv: y\n") throws new ParseError("syntax", 9)
+	assert decode[Text]("# none\n") throws new ParseError("syntax", 7)
+	const skipped = decode[Tagged]("cache: x")
+	assert skipped.cache == "c" && skipped.rest[0][0] == "cache"
+	assert decode[i8 | u8]("300") throws new ParseError("range", 0)
+	// a's tree is maxDepth deep, and b's, an alias to it in two more, deeper.
+	let a = "a: &a "
+	let close = "{}"
+	for (const _ of 1 ... ((maxDepth as i32) - 2) / 2) {
+		a += "{kids: ["
+		close += "]}"
+	}
+	a += close
+	// Each level a class and an array, on a fiber's stack.
+	const job = async decode[Trees](a)
+	assert (await job).a.kids.length == 1
+	let kind = ""
+	try {
+		decode[Trees](a + "\nb: {kids: [*a]}\n")
+	} catch (e: ParseError) {
+		kind = e.kind
+	}
+	assert kind == "range"
+}
+
+test "decodeAll reads each document" {
+	const ps = decodeAll[Point]("x: 1\n---\nx: 2\n...\n--- {y: 3}\n")
+	assert ps.length == 3 && ps[0].x == 1 && ps[1].x == 2 && ps[2].y == 3.0
+	assert decodeAll[Point]("").length == 0
+}
+
+test "field tags" {
+	const t = decode[Tagged](`ID: 3
+nick: n
+counts: {a: 1, b: 2}
+ids: {1: one, 0x2: two}
+x: [1, {y: 2.0}, &q 'q']
+z: *q
+`)
+	assert t.id == 3 && t.nick == "n" && t.cache == "c"
+	assert t.counts.map(e => `${e[0]}=${e[1]}`).join(" ") == "a=1 b=2"
+	assert t.ids.map(e => `${e[0]}=${e[1]}`).join(" ") == "1=one 2=two"
+	assert t.rest.map(e => `${e[0]}=${e[1]}`).join(" ") == "x=- 1\n- y: 2.0\n- q z=q"
+	assert encode(t) == `ID: 3
+nick: n
+counts:
+  a: 1
+  b: 2
+ids:
+  1: one
+  2: two
+x:
+  - 1
+  - y: 2.0
+  - q
+z: q
+`
+	const back = decode[Tagged](encode(t))
+	assert back.rest.length == 2 && back.rest[0][1] == t.rest[0][1]
+	assert encode(new Tagged()) == "ID: 7\ncounts: {}\nids: {}\n"
+	const bad = new Tagged()
+	bad.rest = [["k", "[unclosed"]]
+	assert encode(bad) throws new EncodeError("[unclosed")
+}
+
+class Loose {
+	rest: Unknown[] @Rest = []
+}
+
+/// Aliases n levels deep, each a collection of four of the one before, which is a collection open as deep as open.
+function aliases(n: i32, open: string, close: string): string {
+	let s = `a: &a ${open}x${close}\n`
+	for (const i of 1 ... n) {
+		const p = if (i == 1) "a" else `${i - 1}`
+		s += `b${i}: &${i} ${open}*${p}, *${p}, *${p}, *${p}${close}\n`
+	}
+	return s
+}
+
+function restKind(s: string): string {
+	try {
+		decode[Loose](s)
+	} catch (e: ParseError) {
+		return e.kind
+	}
+	return ""
+}
+
+test "a Rest value is YAML" {
+	const text = (s: string) => decode[Loose](s).rest[0][1]
+	assert text("v: {a: &x [1], b: *x, ~: .inf}") == "a:\n  - 1\nb:\n  - 1\n~: .inf"
+	assert text("v: !!float 2") == "!!float 2" && text("v: 18446744073709551616") == "18446744073709551616"
+	assert text("v: \"x\\ty\"") == "\"x\\ty\"" && text("v:") == "null" && text("v: !!str") == "!!str"
+	// What reads back as it without the line feed at its end: a keep block scalar is quoted, props and a block
+	// collection after ---.
+	assert text("v: |\n  a\n") == "|\n  a" && text("v: |+\n  a\n\n") == "\"a\\n\\n\""
+	assert text("v:\n- |+\n  a\n\n") == "- \"a\\n\\n\""
+	assert text("v: !!map {a: 1}") == "--- !!map\na: 1" && decode[Loose](text("v: !!map {a: 1}")).rest[0][1] == "1"
+	assert decode[f64](text("v: !!float 2")) == 2.0 && decode[string](text("v: |\n  a\n")) == "a\n"
+	// Text far longer than s, or nesting deeper than it.
+	assert restKind(aliases(9, "[", "]")) == "range" && restKind(aliases(3, "[[[[[[[[[[", "]]]]]]]]]]")) == ""
+	assert restKind(aliases(13, "[[[[[[[[[[", "]]]]]]]]]]")) == "range"
+}
+
+class Tags {
+	a: i32 @Name["A"] @encoding.Name["x"] = 1
+	b: i32 @encoding.Name["B"] = 2
+	c: i32 @encoding.Skip = 3
+	d: string @encoding.OmitEmpty = ""
+	e: string @OmitEmpty = ""
+}
+
+test "yaml's own tags over ../encoding's" {
+	assert encode(new Tags()) == "A: 1\nB: 2\n"
+	const t = decode[Tags]("A: 4\nB: 5\nd: x")
+	assert t.a == 4 && t.b == 5 && t.d == "x"
+	assert decode[Tags]("x: 4") throws new ParseError("syntax", 0)
+	assert decode[Tags]("c: 4") throws new ParseError("syntax", 0)
+}
+
+test "encode writes block YAML" {
+	const c = new Config()
+	const s = new Server()
+	s.tags = ["a"]
+	c.server = s
+	c.points = [new Point(), new Point()]
+	assert encode(c) == `title: demo
+mode: fast
+origin:
+  x: 0
+  y: 0.5
+server:
+  host: localhost
+  port: 8080
+  tags:
+    - a
+points:
+  - x: 0
+    y: 0.5
+  - x: 0
+    y: 0.5
+matrix:
+  - - 1
+    - 2
+  - - 3
+`
+	assert decode[Config](encode(c)).points.length == 2
+	assert encode[i32[][]]([[1, 2], []]) == "- - 1\n  - 2\n- []\n"
+	assert encode(null) == "null\n" && encode(1.5) == "1.5\n" && encode("") == "''\n"
+	assert encode([nan, inf, -inf]) == "- .nan\n- .inf\n- -.inf\n"
+	const r = new Real()
+	r.v = -inf
+	assert decode[Real](encode(r)).v == -inf
+}
+
+test "encode quotes what would read back otherwise" {
+	const cases: [string, string][] = [
+		["plain", "plain"], ["é ü", "é ü"], ["it's", "it's"], ["a#b", "a#b"], ["-1x", "-1x"], ["[a]x", "'[a]x'"],
+		["null", "'null'"], ["~", "'~'"], ["true", "'true'"], ["False", "'False'"], ["1", "'1'"], ["-1e3", "'-1e3'"],
+		[".inf", "'.inf'"], ["0x1F", "'0x1F'"], ["", "''"], ["- a", "'- a'"], ["-", "'-'"], ["a: b", "'a: b'"],
+		["a #b", "'a #b'"], [" a", "' a'"], ["a ", "'a '"], ["a:", "'a:'"], ["#x", "'#x'"], ["'x", "'''x'"],
+		["&a", "'&a'"], ["*a", "'*a'"], ["!t", "'!t'"], ["%x", "'%x'"], ["@x", "'@x'"], ["`x", "'`x'"],
+		["? x", "'? x'"], [": x", "': x'"], ["---", "'---'"], ["...", "'...'"], ["x\ty", "'x\ty'"],
+		["\x01", "\"\\x01\""], ["a" + utf8(0x2028) + "b", "\"a\\Lb\""], [utf8(0x85), "\"\\N\""],
+		[utf8(0xfeff), "\"\\uFEFF\""], ["\x7f", "\"\\x7F\""], ["a\\b\"c", "a\\b\"c"], ["'\"", "'''\"'"],
+		["a\nb", "|-\n  a\n  b"], ["a\n", "|\n  a"], ["a\n\n", "|+\n  a\n"], ["\na", "|-\n\n  a"],
+		[" a\nb", "\" a\\nb\""], ["a \nb", "\"a \\nb\""], ["\n\n", "\"\\n\\n\""], ["a\r\nb", "\"a\\r\\nb\""],
+	]
+	for (const [v, want] of cases) {
+		const t = new Text()
+		t.v = v
+		const text = encode(t)
+		assert text == `v: ${want}\n`
+		assert decode[Text](text).v == v
+		assert decode[string](encode(v)) == v
+	}
+	assert encode("\xff") throws new EncodeError("\xff")
+}
+
+test "emit writes any tree" {
+	const src = `a: &x !t [1]
+b: *x
+? [k]
+: |
+  lit
+*x : !!str
+c: !<tag:example.com,2000:a> v
+? ''
+: !e x
+---
+--- &r
+- !!binary x
+`
+	assert emit(documents(src)) == `a: &x !t
+  - 1
+b: *x
+? - k
+: |
+  lit
+*x : !!str
+c: !<tag:example.com,2000:a> v
+'': !e x
+---
+--- &r
+- !!binary x
+`
+	// A tag that is no URI has no verbatim form.
+	assert emit(documents("%TAG !e! tag:x:\n--- !e!a%3E x\n")) throws new EncodeError("tag:x:a>")
+}
