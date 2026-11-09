@@ -1,0 +1,56 @@
+import { acos, acosf, asin, asinf, atan, atan2, atan2f, atanf } from "./atrig"
+import { asF64, asU64 } from "./bits"
+import { scalbn } from "./ieee"
+import { agree1, agree2, c } from "./musl/oracle"
+
+/// Where the functions change course, by high word, with neighbors, and negated.
+function hard(): f64[] {
+	const xs: f64[] = []
+	const highs: u64[] = [0x00100000, 0x3c600000, 0x3e400000, 0x3e500000, 0x3fdc0000, 0x3fe00000, 0x3fe60000,
+		0x3fef3333, 0x3ff00000, 0x3ff30000, 0x40038000, 0x44100000]
+	const lows: u64[] = [0, 1, 0x7fffffff, 0x80000000, 0xffffffff]
+	for (const hi of highs) {
+		for (const lo of lows) {
+			for (const d of -2 ... 2) {
+				const y = asF64((hi << 32 | lo) + (d as u64))
+				xs.push(y)
+				xs.push(-y)
+			}
+		}
+	}
+	return xs
+}
+
+/// y/x about the thresholds 2^±64 and 2^±26, as [y, x] and [x, y], each of either sign.
+function thresholds(): [f64, f64][] {
+	const out: [f64, f64][] = []
+	for (const x of [1.0, -1.0, 3.0, -0.75, 1e-300, -1e300]) {
+		for (const e of [-66, -65, -64, -63, -27, -26, -25, 25, 26, 27, 63, 64, 65, 66]) {
+			for (const d of -2 ... 2) {
+				const y = asF64(asU64(x * scalbn(1.0, e)) + (d as u64))
+				out.push([y, x])
+				out.push([-y, x])
+				out.push([x, y])
+				out.push([x, -y])
+			}
+		}
+	}
+	return out
+}
+
+test "asin, acos and atan" {
+	const xs = hard()
+	const xsf = xs.map(x => x as f32)
+	agree1("asin", asin, c.asin, 100000, xs)
+	agree1("asinf", asinf, c.asinf, 100000, xsf)
+	agree1("acos", acos, c.acos, 100000, xs)
+	agree1("acosf", acosf, c.acosf, 100000, xsf)
+	agree1("atan", atan, c.atan, 100000, xs)
+	agree1("atanf", atanf, c.atanf, 100000, xsf)
+}
+
+test "atan2" {
+	const xs = thresholds()
+	agree2("atan2", atan2, c.atan2, 100000, xs)
+	agree2("atan2f", atan2f, c.atan2f, 100000, xs.map((p: [f64, f64]): [f32, f32] => [p[0] as f32, p[1] as f32]))
+}

@@ -1,0 +1,44 @@
+//! The bits of floats, as std/math's implementations read and build them, musl's asuint64, asdouble, asuint and
+//! asfloat; and the constants they share.
+
+import { addr, load } from "../../builtin/mem"
+
+/// x's IEEE 754 bits.
+export function asU64(x: f64): u64 { return load[u64](addr(x)) }
+/// The f64 of the bits b.
+export function asF64(b: u64): f64 { return load[f64](addr(b)) }
+/// x's IEEE 754 bits.
+export function asU32(x: f32): u32 { return load[u32](addr(x)) }
+/// The f32 of the bits b.
+export function asF32(b: u32): f32 { return load[f32](addr(b)) }
+
+export const inf: f64 = 1.0 / 0.0
+export const nan: f64 = 0.0 / 0.0
+export const inff: f32 = 1.0 / 0.0
+export const nanf: f32 = 0.0 / 0.0
+export const pi = 3.141592653589793
+export const ln2 = 0.6931471805599453
+/// ln2 in two parts, the first with 32 trailing zero bits; and to f32, the first with 9.
+export const ln2hi = 6.93147180369123816490e-01
+export const ln2lo = 1.90821492927058770002e-10
+export const ln2hif: f32 = 0.69313812255859375
+export const ln2lof: f32 = 9.0580006144591607e-06
+/// 1.5 2^52: adding then subtracting it rounds an f64 below 2^51 to an integer, whose bits are then its low bits.
+export const toint = 6755399441055744.0
+/// 2^52 and 2^23: an f64 or f32 at least it is an integer; adding then subtracting it rounds one below it to one.
+export const two52 = 4503599627370496.0
+export const two23: f32 = 8388608.0
+
+/// The leading zero bits of x, not 0, as musl's portable a_clz_64.
+export function clz64(x: u64): i32 {
+	let y = (if (x >> 32 != 0) x >> 32 else x) as u32
+	let r = if (x >> 32 != 0) 0 else 32
+	for (const k of [16, 8, 4, 2]) {
+		if (y >> (k as u32) != 0) {
+			y >>= k as u32
+		} else {
+			r |= k
+		}
+	}
+	return r | (if (y >> 1 != 0) 0 else 1)
+}

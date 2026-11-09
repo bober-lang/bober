@@ -1,0 +1,59 @@
+import { asF64, asU64 } from "./bits"
+import { Rng, agree1, c } from "./musl/oracle"
+import { cos, cosf, sin, sincos, sincosf, sinf, tan, tanf } from "./trig"
+
+/// Where the reduction changes course, by high word; multiples of pi/2, small and up to 2^1000 times, and odd ones of
+/// pi/4, where x / (pi/2) may round the wrong way; the f64 closest to one (Kahan and McDonald); and random ones up to
+/// 1e308: each with neighbors, and negated.
+function hard(): f64[] {
+	const xs: f64[] = []
+	const add = (x: f64) => {
+		for (const d of -3 ... 3) {
+			const y = asF64(asU64(x) + (d as u64))
+			xs.push(y)
+			xs.push(-y)
+		}
+	}
+	const highs: u64[] = [0x3e400000, 0x3e46a09e, 0x3e500000, 0x3fe59428, 0x3fe921fb, 0x4002d97c, 0x400921fb,
+		0x400f6a7a, 0x4012d97c, 0x4015fdbc, 0x401921fb, 0x401c463b, 0x413921fb, 0x7fefffff]
+	const lows: u64[] = [0, 1, 0x54442d18, 0x7fffffff, 0x80000000, 0xffffffff]
+	for (const hi of highs) {
+		for (const lo of lows) {
+			add(asF64(hi << 32 | lo))
+		}
+	}
+	for (const k of 1 ... 500) {
+		add((k as f64) * 1.5707963267948966)
+	}
+	for (const k of 0 ... 3000) {
+		add(((k as f64) + 0.5) * 1.5707963267948966)
+	}
+	let p = 1.5707963267948966
+	for (const _ of 1 ... 1000) {
+		add(p)
+		add(p * 3.0)
+		p *= 2.0
+	}
+	add(6381956970095103.0 * asF64(0x71c0000000000000)) // × 2^797
+	const r = new Rng()
+	for (const _ of 1 ... 2000) {
+		add(asF64(r.next() % 0x7fe0000000000000))
+	}
+	return xs
+}
+
+test "sin, cos and tan" {
+	const xs = hard()
+	agree1("sin", sin, c.sin, 100000, xs)
+	agree1("cos", cos, c.cos, 100000, xs)
+	agree1("tan", tan, c.tan, 100000, xs)
+	agree1("sincos", sincos, c.sincos, 100000, xs)
+}
+
+test "sinf, cosf and tanf" {
+	const xs = hard().map(x => x as f32)
+	agree1("sinf", sinf, c.sinf, 100000, xs)
+	agree1("cosf", cosf, c.cosf, 100000, xs)
+	agree1("tanf", tanf, c.tanf, 100000, xs)
+	agree1("sincosf", sincosf, c.sincosf, 100000, xs)
+}

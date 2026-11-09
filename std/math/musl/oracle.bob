@@ -1,0 +1,311 @@
+//! The oracle std/math's tests compare with bit for bit: musl's libm, compiled by bobcc from vendor/musl (./bober.pkg).
+//! The libc.a bober links was compiled by clang, which contracts a*b+c into one fma where the target has it, and so
+//! rounds differently from a port that, as bober, never does. Only tests import this package.
+//!
+//! A test compares a function of std/math with musl's on edge values and on random inputs from a seeded generator:
+//! as many as the test binary's first argument says, else its default, and from the seed its second argument says.
+//!
+//! bober.pkg compiles src/math/*[!l].c, leaving out the long double functions, whose files end in l.c, and with them
+//! ceil.c, which it adds back.
+
+import { acos, acosf, acosh, acoshf, asin, asinf, asinh, asinhf, atan, atan2, atan2f, atanf, atanh, atanhf, cbrt, cbrtf,
+	ceil, ceilf, copysign, copysignf, cos, cosf, cosh, coshf, erf, erfc, erfcf, erff, exp, exp10, exp10f, exp2, exp2f,
+	expf, expm1, expm1f, fabs, fabsf, fdim, fdimf, floor, floorf, fma, fmaf, fmax, fmaxf, fmin, fminf, fmod, fmodf,
+	frexp, frexpf, hypot, hypotf, ilogb, ilogbf, j0, j0f, j1, j1f, jn, jnf, lgamma_r, lgammaf_r, log, log10, log10f,
+	log1p, log1pf, log2, log2f, logb, logbf, logf, modf, modff, nearbyint, nearbyintf, nextafter, nextafterf, pow, powf,
+	remainder, remainderf, remquo, remquof, rint, rintf, round, roundf, scalbn, scalbnf, sin, sincos, sincosf, sinf,
+	sinh, sinhf, sqrt, sqrtf, tan, tanf, tanh, tanhf, tgamma, tgammaf, trunc, truncf, y0, y0f, y1, y1f, yn,
+	ynf } from "./musl.h"
+
+import { asF32, asF64, asU32, asU64 } from "../bits"
+import { args } from "../../../builtin/io"
+import { trap } from "../../../builtin/mem"
+import { ParseError, parseInt } from "../../parse"
+import { Float } from "../../types"
+
+/// musl's functions by their C names, their out-parameters returned after their result.
+export const c = { acos: (x: f64) => acos(x), acosf: (x: f32) => acosf(x), acosh: (x: f64) => acosh(x),
+	acoshf: (x: f32) => acoshf(x), asin: (x: f64) => asin(x), asinf: (x: f32) => asinf(x), asinh: (x: f64) => asinh(x),
+	asinhf: (x: f32) => asinhf(x), atan: (x: f64) => atan(x), atanf: (x: f32) => atanf(x),
+	atan2: (y: f64, x: f64) => atan2(y, x), atan2f: (y: f32, x: f32) => atan2f(y, x), atanh: (x: f64) => atanh(x),
+	atanhf: (x: f32) => atanhf(x), cbrt: (x: f64) => cbrt(x), cbrtf: (x: f32) => cbrtf(x), ceil: (x: f64) => ceil(x),
+	ceilf: (x: f32) => ceilf(x), copysign: (x: f64, y: f64) => copysign(x, y),
+	copysignf: (x: f32, y: f32) => copysignf(x, y), cos: (x: f64) => cos(x), cosf: (x: f32) => cosf(x),
+	cosh: (x: f64) => cosh(x), coshf: (x: f32) => coshf(x), erf: (x: f64) => erf(x), erff: (x: f32) => erff(x),
+	erfc: (x: f64) => erfc(x), erfcf: (x: f32) => erfcf(x), exp: (x: f64) => exp(x), expf: (x: f32) => expf(x),
+	exp10: (x: f64) => exp10(x), exp10f: (x: f32) => exp10f(x), exp2: (x: f64) => exp2(x), exp2f: (x: f32) => exp2f(x),
+	expm1: (x: f64) => expm1(x), expm1f: (x: f32) => expm1f(x), fabs: (x: f64) => fabs(x), fabsf: (x: f32) => fabsf(x),
+	fdim: (x: f64, y: f64) => fdim(x, y), fdimf: (x: f32, y: f32) => fdimf(x, y), floor: (x: f64) => floor(x),
+	floorf: (x: f32) => floorf(x), fma: (x: f64, y: f64, z: f64) => fma(x, y, z),
+	fmaf: (x: f32, y: f32, z: f32) => fmaf(x, y, z), fmax: (x: f64, y: f64) => fmax(x, y),
+	fmaxf: (x: f32, y: f32) => fmaxf(x, y), fmin: (x: f64, y: f64) => fmin(x, y),
+	fminf: (x: f32, y: f32) => fminf(x, y), fmod: (x: f64, y: f64) => fmod(x, y),
+	fmodf: (x: f32, y: f32) => fmodf(x, y), frexp: (x: f64): [f64, i32] => {
+	const e = new i32[](1)
+	return [frexp(x, e), e[0]]
+}, frexpf: (x: f32): [f32, i32] => {
+	const e = new i32[](1)
+	return [frexpf(x, e), e[0]]
+}, hypot: (x: f64, y: f64) => hypot(x, y), hypotf: (x: f32, y: f32) => hypotf(x, y), ilogb: (x: f64) => ilogb(x),
+	ilogbf: (x: f32) => ilogbf(x), j0: (x: f64) => j0(x), j0f: (x: f32) => j0f(x), j1: (x: f64) => j1(x),
+	j1f: (x: f32) => j1f(x), jn: (n: i32, x: f64) => jn(n, x), jnf: (n: i32, x: f32) => jnf(n, x),
+	lgamma: (x: f64): [f64, i32] => {
+	const s = new i32[](1)
+	return [lgamma_r(x, s), s[0]]
+}, lgammaf: (x: f32): [f32, i32] => {
+	const s = new i32[](1)
+	return [lgammaf_r(x, s), s[0]]
+}, log: (x: f64) => log(x), logf: (x: f32) => logf(x), log10: (x: f64) => log10(x), log10f: (x: f32) => log10f(x),
+	log1p: (x: f64) => log1p(x), log1pf: (x: f32) => log1pf(x), log2: (x: f64) => log2(x), log2f: (x: f32) => log2f(x),
+	logb: (x: f64) => logb(x), logbf: (x: f32) => logbf(x), modf: (x: f64): [f64, f64] => {
+	const i = new f64[](1)
+	return [modf(x, i), i[0]]
+}, modff: (x: f32): [f32, f32] => {
+	const i = new f32[](1)
+	return [modff(x, i), i[0]]
+}, nearbyint: (x: f64) => nearbyint(x), nearbyintf: (x: f32) => nearbyintf(x),
+	nextafter: (x: f64, y: f64) => nextafter(x, y), nextafterf: (x: f32, y: f32) => nextafterf(x, y),
+	pow: (x: f64, y: f64) => pow(x, y), powf: (x: f32, y: f32) => powf(x, y),
+	remainder: (x: f64, y: f64) => remainder(x, y), remainderf: (x: f32, y: f32) => remainderf(x, y),
+	remquo: (x: f64, y: f64): [f64, i32] => {
+	const q = new i32[](1)
+	return [remquo(x, y, q), q[0]]
+}, remquof: (x: f32, y: f32): [f32, i32] => {
+	const q = new i32[](1)
+	return [remquof(x, y, q), q[0]]
+}, rint: (x: f64) => rint(x), rintf: (x: f32) => rintf(x), round: (x: f64) => round(x), roundf: (x: f32) => roundf(x),
+	scalbn: (x: f64, n: i32) => scalbn(x, n), scalbnf: (x: f32, n: i32) => scalbnf(x, n), sin: (x: f64) => sin(x),
+	sinf: (x: f32) => sinf(x), sincos: (x: f64): [f64, f64] => {
+	const s = new f64[](1)
+	const k = new f64[](1)
+	sincos(x, s, k)
+	return [s[0], k[0]]
+}, sincosf: (x: f32): [f32, f32] => {
+	const s = new f32[](1)
+	const k = new f32[](1)
+	sincosf(x, s, k)
+	return [s[0], k[0]]
+}, sinh: (x: f64) => sinh(x), sinhf: (x: f32) => sinhf(x), sqrt: (x: f64) => sqrt(x), sqrtf: (x: f32) => sqrtf(x),
+	tan: (x: f64) => tan(x), tanf: (x: f32) => tanf(x), tanh: (x: f64) => tanh(x), tanhf: (x: f32) => tanhf(x),
+	tgamma: (x: f64) => tgamma(x), tgammaf: (x: f32) => tgammaf(x), trunc: (x: f64) => trunc(x),
+	truncf: (x: f32) => truncf(x), y0: (x: f64) => y0(x), y0f: (x: f32) => y0f(x), y1: (x: f64) => y1(x),
+	y1f: (x: f32) => y1f(x), yn: (n: i32, x: f64) => yn(n, x), ynf: (n: i32, x: f32) => ynf(n, x) }
+
+/// The random inputs a test takes per function: the first argument, else n.
+export function count(n: i64): i64 { return arg(0, n) }
+
+/// The integer of the test binary's argument i, else otherwise.
+function arg(i: i32, otherwise: i64): i64 {
+	const a = args()
+	if (a.length <= i) {
+		return otherwise
+	}
+	try {
+		return parseInt[i64](a[i])
+	} catch (e: ParseError) {
+		trap(`argument ${a[i]} is not an integer`)
+	}
+	return otherwise // unreached, but the checker asks for it
+}
+
+/// The bits of x, widened.
+export function bitsOf[T extends Float](x: T): u64 {
+	if (T == f32) {
+		return asU32(x as f32) as u64
+	}
+	return asU64(x as f64)
+}
+
+/// The T of the low bits of b.
+export function ofBits[T extends Float](b: u64): T {
+	if (T == f32) {
+		return asF32(b as u32) as T
+	}
+	return asF64(b) as T
+}
+
+/// An input of bits b: if a NaN, a quiet one, for musl leaves signaling NaNs unsupported, and LLVM, knowing fmax by its
+/// name, quiets them where musl's C would not.
+function input[T extends Float](b: u64): T {
+	const x = ofBits[T](b)
+	return if (x == x) x else ofBits[T](b | (if (T == f32) 0x400000 else 0x8000000000000))
+}
+
+/// Whether a and b are one value: floats by their bits, or both NaN, so that -0 is not +0; anything else, as tuples of
+/// floats, by the shortest digits that read back as each float.
+export function same[R](a: R, b: R): bool {
+	if (R == f32 || R == f64) {
+		return a != a && b != b || bitsOf(a) == bitsOf(b)
+	}
+	return `${a}` == `${b}`
+}
+
+/// x, a float also by its bits in hex.
+export function show[R](x: R): string {
+	if (R == f32 || R == f64) {
+		const b = bitsOf(x)
+		let s = ""
+		for (const i of 1 ... (if (R == f32) 8 else 16)) {
+			const d = (b >> ((i * 4 - 4) as u64) & 15) as i32
+			s = "0123456789abcdef".slice(d, d + 1) + s
+		}
+		return `${x} (0x${s})`
+	}
+	return `${x}`
+}
+
+/// SplitMix64, seeded by the second argument, else 1.
+export class Rng {
+	s = arg(1, 1) as u64
+
+	next(): u64 {
+		this.s += 0x9e3779b97f4a7c15
+		let z = this.s
+		z = (z ^ z >> 30) * 0xbf58476d1ce4e5b9
+		z = (z ^ z >> 27) * 0x94d049bb133111eb
+		return z ^ z >> 31
+	}
+
+	/// An f64 in [0, 1), of 53 random bits.
+	unit(): f64 { return ((this.next() >> 11) as f64) / 9007199254740992.0 }
+
+	/// A T: of random bits; of an exponent near 1's; a few ulps from a multiple of 1/2 below 4096; or of an
+	/// exponent near the subnormals' or where every T is an integer; each a quarter of the time.
+	float[T extends Float](): T {
+		const b = this.next()
+		const [mant, bias] = if (T == f32) [23, 127] else [52, 1023]
+		const m = (b >> 12) & ((1 as u64) << (mant as u64)) - 1
+		const sign = (b >> 11 & 1) << ((mant as u64) + (if (T == f32) 8 else 11))
+		const exp = (e: i64) => sign | (e as u64) << (mant as u64) | m
+		switch (b & 3) {
+			case 0: return input[T](b >> (if (T == f32) 32 else 0))
+			case 1: return ofBits[T](exp(bias - 40 + (((b >> 2) % 110) as i64)))
+			case 2:
+				const k = (((b >> 2) % 16384) as i64) - 8192
+				return input[T](bitsOf((k as T) * 0.5) + (b >> 16) % 7 - 3)
+			default:
+				const e = if ((b >> 2 & 1) == 0) ((b >> 3) % 40) as i64 else bias + mant - 4 + (((b >> 3) % 8) as i64)
+				return ofBits[T](exp(e))
+		}
+	}
+
+	/// A T a few ulps from x.
+	near[T extends Float](x: T): T { return input[T](bitsOf(x) + this.next() % 9 - 4) }
+}
+
+/// Values where functions change course: zeros, subnormals, the least and greatest normals, infinities, NaN, the
+/// integers and halves about 1 and about where every T is an integer, and a few constants and limits of exp; each
+/// with its neighbors up to ulps away, and negated.
+export function edges[T extends Float](ulps: i64 = 2): T[] {
+	const bits: u64[] = if (T == f32) [0, 1, 0x7fffff, 0x800000, 0x7f7fffff, 0x7f800000, 0x7fc00000, 0x4b000000,
+		0x4b800000, 0x5f000000, 0x5f800000, 0x00400000, 0x0b800000, 0x3e800000]
+		else [0, 1, 0xfffffffffffff, 0x10000000000000, 0x7fefffffffffffff, 0x7ff0000000000000, 0x7ff8000000000000,
+		0x4330000000000000, 0x4340000000000000, 0x43e0000000000000, 0x43f0000000000000, 0x0008000000000000,
+		0x1e60000000000000, 0x3cb0000000000000]
+	const values: f64[] = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 7.0, 10.0, 100.0, 0.1, 0.75, 3.141592653589793,
+		2.718281828459045, 0.6931471805599453, 1.5707963267948966, 88.72283935546875, 709.782712893384,
+		745.1332191019411, 103.97208404541016, 1e-5, 1e10, 1e20, 1e300, 1e-300, 1e-310, 4294967296.0, 1.0e6]
+	const out: T[] = []
+	const add = (x: T) => {
+		for (const d of -ulps ... ulps) {
+			const y = input[T](bitsOf(x) + (d as u64))
+			out.push(y)
+			out.push(-y)
+		}
+	}
+	for (const b of bits) {
+		add(ofBits[T](b))
+	}
+	for (const v of values) {
+		add(v as T)
+	}
+	return out
+}
+
+/// Checks f against musl's g on each of xs, then on n inputs of gen: reports the first ten it differs on, and asserts
+/// that it differs on none.
+export function agree[A, R](name: string, f: (a: A) => R, g: (a: A) => R, xs: A[], n: i64, gen: (r: Rng) => A) {
+	let bad = 0
+	const check = (a: A) => {
+		const got = f(a)
+		const want = g(a)
+		if (!same(got, want)) {
+			bad++
+			if (bad <= 10) {
+				print(`${name}(${show(a)}) = ${show(got)}, musl ${show(want)}`)
+			}
+		}
+	}
+	for (const a of xs) {
+		check(a)
+	}
+	const r = new Rng()
+	for (const _ of 1 ... n) {
+		check(gen(r))
+	}
+	assert bad == 0
+}
+
+/// agree on edges and xs, and on count(n) random inputs.
+export function agree1[T extends Float, R](name: string, f: (x: T) => R, g: (x: T) => R, n: i64 = 100000,
+	xs: T[] = []) {
+	const all = edges[T]()
+	all.append(xs)
+	agree(name, f, g, all, count(n), r => r.float[T]())
+}
+
+/// Each pair of xs, then each of more, as f64s.
+function pairs[T extends Float](xs: T[], more: [T, T][]): [f64, f64][] {
+	const out: [f64, f64][] = []
+	for (const x of xs) {
+		for (const y of xs) {
+			out.push([x as f64, y as f64])
+		}
+	}
+	for (const p of more) {
+		out.push([p[0] as f64, p[1] as f64])
+	}
+	return out
+}
+
+/// Each triple of every fifth of all, as f64s.
+function triples[T extends Float](all: T[]): [f64, f64, f64][] {
+	const xs: f64[] = []
+	for (const i of 0 ... all.length / 5 - 1) {
+		xs.push(all[i * 5] as f64)
+	}
+	const out: [f64, f64, f64][] = []
+	for (const x of xs) {
+		for (const y of xs) {
+			for (const z of xs) {
+				out.push([x, y, z])
+			}
+		}
+	}
+	return out
+}
+
+// agree2 and agree3 widen their inputs to f64, exactly, for in debug builds a generic function passing [T, T] on as a
+// type argument passes the wrong type.
+
+/// agree on each pair of edges an ulp from theirs and on xs, and on count(n) random pairs, a quarter of them a few
+/// ulps apart.
+export function agree2[T extends Float, R](name: string, f: (x: T, y: T) => R, g: (x: T, y: T) => R, n: i64 = 100000,
+	xs: [T, T][] = []) {
+	agree(name, (p: [f64, f64]) => f(p[0] as T, p[1] as T), (p: [f64, f64]) => g(p[0] as T, p[1] as T),
+		pairs(edges[T](1), xs), count(n), r => {
+			const x = r.float[T]()
+			return [x as f64, (if ((r.next() & 3) == 0) r.near(x) else r.float[T]()) as f64]
+		})
+}
+
+/// agree on triples of every fifth edge, and on count(n) random triples, a quarter of them with z a few ulps from -x*y.
+export function agree3[T extends Float](name: string, f: (x: T, y: T, z: T) => T, g: (x: T, y: T, z: T) => T,
+	n: i64 = 100000) {
+	agree(name, (t: [f64, f64, f64]) => f(t[0] as T, t[1] as T, t[2] as T),
+		(t: [f64, f64, f64]) => g(t[0] as T, t[1] as T, t[2] as T), triples(edges[T]()), count(n), r => {
+			const x = r.float[T]()
+			const y = r.float[T]()
+			return [x as f64, y as f64, (if ((r.next() & 3) == 0) r.near(-x * y) else r.float[T]()) as f64]
+		})
+}

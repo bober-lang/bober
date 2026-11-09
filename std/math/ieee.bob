@@ -1,0 +1,704 @@
+//! The operations on a float's representation: its sign, rounding to an integer, remainders, scaling by powers of two,
+//! its exponent, its neighbors, and comparisons that order NaN and signed zeros; each for f64 and, suffixed f, f32.
+//!
+//! Ported from musl 1.2.5, MIT, Copyright © 2005-2020 Rich Felker, et al. (vendor/musl/COPYRIGHT). Results are
+//! musl's bit for bit in round-to-nearest, which bober always rounds in, and raise no floating-point exceptions.
+
+import { asF32, asF64, asU32, asU64, two23, two52 } from "./bits"
+
+
+export function fabs(x: f64): f64 { return asF64(asU64(x) & 0x7fffffffffffffff) }
+export function fabsf(x: f32): f32 { return asF32(asU32(x) & 0x7fffffff) }
+
+/// x's magnitude with y's sign.
+export function copysign(x: f64, y: f64): f64 {
+	return asF64(asU64(x) & 0x7fffffffffffffff | asU64(y) & 0x8000000000000000)
+}
+export function copysignf(x: f32, y: f32): f32 { return asF32(asU32(x) & 0x7fffffff | asU32(y) & 0x80000000) }
+
+/// Whether x's sign bit is set, as for -0 and a negative NaN.
+export function signbit(x: f64): bool { return asU64(x) >> 63 != 0 }
+export function signbitf(x: f32): bool { return asU32(x) >> 31 != 0 }
+
+export function floor(x: f64): f64 {
+	const i = asU64(x)
+	const e = (i >> 52 & 0x7ff) as i32
+	if (e >= 0x3ff + 52 || x == 0.0) {
+		return x
+	}
+	if (e <= 0x3ff - 1) {
+		return if (i >> 63 != 0) -1.0 else 0.0
+	}
+	// y = int(x) - x, where int(x) is an integer neighbor of x
+	const y = if (i >> 63 != 0) x - two52 + two52 - x else x + two52 - two52 - x
+	return if (y > 0.0) x + y - 1.0 else x + y
+}
+
+export function floorf(x: f32): f32 {
+	let u = asU32(x)
+	const e = ((u >> 23 & 0xff) as i32) - 0x7f
+	if (e >= 23) {
+		return x
+	}
+	if (e >= 0) {
+		const m: u32 = 0x007fffff >> (e as u32)
+		if ((u & m) == 0) {
+			return x
+		}
+		if (u >> 31 != 0) {
+			u += m
+		}
+		u &= ~m
+	} else if (u >> 31 == 0) {
+		u = 0
+	} else if (u << 1 != 0) {
+		return -1.0
+	}
+	return asF32(u)
+}
+
+export function ceil(x: f64): f64 {
+	const i = asU64(x)
+	const e = (i >> 52 & 0x7ff) as i32
+	if (e >= 0x3ff + 52 || x == 0.0) {
+		return x
+	}
+	if (e <= 0x3ff - 1) {
+		return if (i >> 63 != 0) -0.0 else 1.0
+	}
+	const y = if (i >> 63 != 0) x - two52 + two52 - x else x + two52 - two52 - x
+	return if (y < 0.0) x + y + 1.0 else x + y
+}
+
+export function ceilf(x: f32): f32 {
+	let u = asU32(x)
+	const e = ((u >> 23 & 0xff) as i32) - 0x7f
+	if (e >= 23) {
+		return x
+	}
+	if (e >= 0) {
+		const m: u32 = 0x007fffff >> (e as u32)
+		if ((u & m) == 0) {
+			return x
+		}
+		if (u >> 31 == 0) {
+			u += m
+		}
+		u &= ~m
+	} else if (u >> 31 != 0) {
+		return -0.0
+	} else if (u << 1 != 0) {
+		return 1.0
+	}
+	return asF32(u)
+}
+
+/// x rounded toward zero.
+export function trunc(x: f64): f64 {
+	const i = asU64(x)
+	let e = ((i >> 52 & 0x7ff) as i32) - 0x3ff + 12
+	if (e >= 52 + 12) {
+		return x
+	}
+	if (e < 12) {
+		e = 1
+	}
+	const m = ~(0 as u64) >> (e as u64)
+	return asF64(i & ~m)
+}
+
+export function truncf(x: f32): f32 {
+	const i = asU32(x)
+	let e = ((i >> 23 & 0xff) as i32) - 0x7f + 9
+	if (e >= 23 + 9) {
+		return x
+	}
+	if (e < 9) {
+		e = 1
+	}
+	const m = ~(0 as u32) >> (e as u32)
+	return asF32(i & ~m)
+}
+
+/// x rounded to the nearest integer, halves away from zero.
+export function round(x: f64): f64 {
+	const i = asU64(x)
+	const e = (i >> 52 & 0x7ff) as i32
+	if (e >= 0x3ff + 52) {
+		return x
+	}
+	const a = if (i >> 63 != 0) -x else x
+	if (e < 0x3ff - 1) {
+		return 0.0 * x
+	}
+	let y = a + two52 - two52 - a
+	if (y > 0.5) {
+		y = y + a - 1.0
+	} else if (y <= -0.5) {
+		y = y + a + 1.0
+	} else {
+		y = y + a
+	}
+	return if (i >> 63 != 0) -y else y
+}
+
+export function roundf(x: f32): f32 {
+	const i = asU32(x)
+	const e = (i >> 23 & 0xff) as i32
+	if (e >= 0x7f + 23) {
+		return x
+	}
+	const a = if (i >> 31 != 0) -x else x
+	if (e < 0x7f - 1) {
+		return 0.0 * x
+	}
+	let y = a + two23 - two23 - a
+	if (y > 0.5) {
+		y = y + a - 1.0
+	} else if (y <= -0.5) {
+		y = y + a + 1.0
+	} else {
+		y = y + a
+	}
+	return if (i >> 31 != 0) -y else y
+}
+
+/// x rounded to the nearest integer, halves to even, as is nearbyint without a rounding mode to follow.
+export function rint(x: f64): f64 {
+	const i = asU64(x)
+	if ((i >> 52 & 0x7ff) >= 0x3ff + 52) {
+		return x
+	}
+	const s = i >> 63 != 0
+	const y = if (s) x - two52 + two52 else x + two52 - two52
+	return if (y != 0.0) y else if (s) -0.0 else 0.0
+}
+
+export function rintf(x: f32): f32 {
+	const i = asU32(x)
+	if ((i >> 23 & 0xff) >= 0x7f + 23) {
+		return x
+	}
+	const s = i >> 31 != 0
+	const y = if (s) x - two23 + two23 else x + two23 - two23
+	return if (y != 0.0) y else if (s) -0.0 else 0.0
+}
+
+/// x - n*y, n the integer x/y truncates to: of x's sign and less than y in magnitude, and exact.
+export function fmod(x: f64, y: f64): f64 {
+	let ux = asU64(x)
+	let uy = asU64(y)
+	let ex = (ux >> 52 & 0x7ff) as i32
+	let ey = (uy >> 52 & 0x7ff) as i32
+	const sx = ux >> 63
+	if (uy << 1 == 0 || y != y || ex == 0x7ff) {
+		return x * y / (x * y)
+	}
+	if (ux << 1 <= uy << 1) {
+		return if (ux << 1 == uy << 1) 0.0 * x else x
+	}
+	// normalize x and y
+	[ux, ex] = normalize(ux, ex)
+	[uy, ey] = normalize(uy, ey)
+	// x mod y
+	while (ex > ey) {
+		const i = ux - uy
+		if (i >> 63 == 0) {
+			if (i == 0) {
+				return 0.0 * x
+			}
+			ux = i
+		}
+		ux <<= 1
+		ex--
+	}
+	const i = ux - uy
+	if (i >> 63 == 0) {
+		if (i == 0) {
+			return 0.0 * x
+		}
+		ux = i
+	}
+	while (ux >> 52 == 0) {
+		ux <<= 1
+		ex--
+	}
+	return asF64(scaled(ux, ex) | sx << 63)
+}
+
+export function fmodf(x: f32, y: f32): f32 {
+	let ux = asU32(x)
+	let uy = asU32(y)
+	let ex = (ux >> 23 & 0xff) as i32
+	let ey = (uy >> 23 & 0xff) as i32
+	const sx = ux & 0x80000000
+	if (uy << 1 == 0 || y != y || ex == 0xff) {
+		return x * y / (x * y)
+	}
+	if (ux << 1 <= uy << 1) {
+		return if (ux << 1 == uy << 1) 0.0 * x else x
+	}
+	[ux, ex] = normalizef(ux, ex)
+	[uy, ey] = normalizef(uy, ey)
+	while (ex > ey) {
+		const i = ux - uy
+		if (i >> 31 == 0) {
+			if (i == 0) {
+				return 0.0 * x
+			}
+			ux = i
+		}
+		ux <<= 1
+		ex--
+	}
+	const i = ux - uy
+	if (i >> 31 == 0) {
+		if (i == 0) {
+			return 0.0 * x
+		}
+		ux = i
+	}
+	while (ux >> 23 == 0) {
+		ux <<= 1
+		ex--
+	}
+	return asF32(scaledf(ux, ex) | sx)
+}
+
+/// The significand of the bits u of a finite nonzero f64 of biased exponent e, with its leading 1 at bit 52, and the
+/// exponent, below 1 for a subnormal.
+function normalize(u: u64, e: i32): [u64, i32] {
+	if (e != 0) {
+		return [u & ~(0 as u64) >> 12 | (1 as u64) << 52, e]
+	}
+	let ex = 0
+	let i = u << 12
+	while (i >> 63 == 0) {
+		ex--
+		i <<= 1
+	}
+	return [u << ((1 - ex) as u64), ex]
+}
+
+function normalizef(u: u32, e: i32): [u32, i32] {
+	if (e != 0) {
+		return [u & ~(0 as u32) >> 9 | (1 as u32) << 23, e]
+	}
+	let ex = 0
+	let i = u << 9
+	while (i >> 31 == 0) {
+		ex--
+		i <<= 1
+	}
+	return [u << ((1 - ex) as u32), ex]
+}
+
+/// The bits of the f64 of significand m and exponent e as normalize gives them; a subnormal's when e is below 1.
+function scaled(m: u64, e: i32): u64 {
+	return if (e > 0) m - ((1 as u64) << 52) | (e as u64) << 52 else m >> ((1 - e) as u64)
+}
+
+function scaledf(m: u32, e: i32): u32 {
+	return if (e > 0) m - ((1 as u32) << 23) | (e as u32) << 23 else m >> ((1 - e) as u32)
+}
+
+/// The remainder of x/y, x - n*y with n the integer nearest x/y, halves to even; and the low 31 bits of |n|, with
+/// x/y's sign.
+export function remquo(x: f64, y: f64): [f64, i32] {
+	let ux = asU64(x)
+	let uy = asU64(y)
+	let ex = (ux >> 52 & 0x7ff) as i32
+	let ey = (uy >> 52 & 0x7ff) as i32
+	const sx = ux >> 63 != 0
+	const sy = uy >> 63 != 0
+	if (uy << 1 == 0 || y != y || ex == 0x7ff) {
+		return [x * y / (x * y), 0]
+	}
+	if (ux << 1 == 0) {
+		return [x, 0]
+	}
+	[ux, ex] = normalize(ux, ex)
+	[uy, ey] = normalize(uy, ey)
+	let q: u32 = 0
+	if (ex < ey) {
+		if (ex + 1 != ey) {
+			return [x, 0]
+		}
+	} else {
+		// x mod y
+		while (ex > ey) {
+			const i = ux - uy
+			if (i >> 63 == 0) {
+				ux = i
+				q++
+			}
+			ux <<= 1
+			q <<= 1
+			ex--
+		}
+		const i = ux - uy
+		if (i >> 63 == 0) {
+			ux = i
+			q++
+		}
+		if (ux == 0) {
+			ex = -60
+		} else {
+			while (ux >> 52 == 0) {
+				ux <<= 1
+				ex--
+			}
+		}
+	}
+	// scale the result and decide between |x| and |x|-|y|
+	let r = asF64(scaled(ux, ex))
+	const ay = if (sy) -y else y
+	if (ex == ey || ex + 1 == ey && (2.0 * r > ay || 2.0 * r == ay && q % 2 != 0)) {
+		r -= ay
+		q++
+	}
+	const n = (q & 0x7fffffff) as i32
+	return [if (sx) -r else r, if (sx != sy) -n else n]
+}
+
+export function remquof(x: f32, y: f32): [f32, i32] {
+	let ux = asU32(x)
+	let uy = asU32(y)
+	let ex = (ux >> 23 & 0xff) as i32
+	let ey = (uy >> 23 & 0xff) as i32
+	const sx = ux >> 31 != 0
+	const sy = uy >> 31 != 0
+	if (uy << 1 == 0 || y != y || ex == 0xff) {
+		return [x * y / (x * y), 0]
+	}
+	if (ux << 1 == 0) {
+		return [x, 0]
+	}
+	[ux, ex] = normalizef(ux, ex)
+	[uy, ey] = normalizef(uy, ey)
+	let q: u32 = 0
+	if (ex < ey) {
+		if (ex + 1 != ey) {
+			return [x, 0]
+		}
+	} else {
+		while (ex > ey) {
+			const i = ux - uy
+			if (i >> 31 == 0) {
+				ux = i
+				q++
+			}
+			ux <<= 1
+			q <<= 1
+			ex--
+		}
+		const i = ux - uy
+		if (i >> 31 == 0) {
+			ux = i
+			q++
+		}
+		if (ux == 0) {
+			ex = -30
+		} else {
+			while (ux >> 23 == 0) {
+				ux <<= 1
+				ex--
+			}
+		}
+	}
+	let r = asF32(scaledf(ux, ex))
+	const ay = if (sy) -y else y
+	if (ex == ey || ex + 1 == ey && (2.0 * r > ay || 2.0 * r == ay && q % 2 != 0)) {
+		r -= ay
+		q++
+	}
+	const n = (q & 0x7fffffff) as i32
+	return [if (sx) -r else r, if (sx != sy) -n else n]
+}
+
+/// x - n*y, n the integer nearest x/y, halves to even.
+export function remainder(x: f64, y: f64): f64 { return remquo(x, y)[0] }
+export function remainderf(x: f32, y: f32): f32 { return remquof(x, y)[0] }
+
+/// x's fractional and integral parts, both of x's sign.
+export function modf(x: f64): [f64, f64] {
+	const u = asU64(x)
+	const e = ((u >> 52 & 0x7ff) as i32) - 0x3ff
+	const sign = asF64(u & 0x8000000000000000)
+	// no fractional part
+	if (e >= 52) {
+		return [if (e == 0x400 && u << 12 != 0) x else sign, x]
+	}
+	// no integral part
+	if (e < 0) {
+		return [x, sign]
+	}
+	const mask = ~(0 as u64) >> 12 >> (e as u64)
+	if ((u & mask) == 0) {
+		return [sign, x]
+	}
+	const i = asF64(u & ~mask)
+	return [x - i, i]
+}
+
+export function modff(x: f32): [f32, f32] {
+	const u = asU32(x)
+	const e = ((u >> 23 & 0xff) as i32) - 0x7f
+	const sign = asF32(u & 0x80000000)
+	if (e >= 23) {
+		return [if (e == 0x80 && u << 9 != 0) x else sign, x]
+	}
+	if (e < 0) {
+		return [x, sign]
+	}
+	const mask: u32 = 0x007fffff >> (e as u32)
+	if ((u & mask) == 0) {
+		return [sign, x]
+	}
+	const i = asF32(u & ~mask)
+	return [x - i, i]
+}
+
+/// x as f × 2^e with |f| in [1/2, 1), or f x and e 0 if x is 0, infinite or NaN.
+export function frexp(x: f64): [f64, i32] {
+	const u = asU64(x)
+	const e = (u >> 52 & 0x7ff) as i32
+	if (e == 0) {
+		if (x == 0.0) {
+			return [x, 0]
+		}
+		const [f, k] = frexp(x * 18446744073709551616.0)
+		return [f, k - 64]
+	}
+	if (e == 0x7ff) {
+		return [x, 0]
+	}
+	return [asF64(u & 0x800fffffffffffff | 0x3fe0000000000000), e - 0x3fe]
+}
+
+export function frexpf(x: f32): [f32, i32] {
+	const u = asU32(x)
+	const e = (u >> 23 & 0xff) as i32
+	if (e == 0) {
+		if (x == 0.0) {
+			return [x, 0]
+		}
+		const [f, k] = frexpf(x * 18446744073709551616.0)
+		return [f, k - 64]
+	}
+	if (e == 0xff) {
+		return [x, 0]
+	}
+	return [asF32(u & 0x807fffff | 0x3f000000), e - 0x7e]
+}
+
+/// x × 2^n, rounded once.
+export function scalbn(x: f64, n: i32): f64 {
+	let y = x
+	let k = n
+	if (k > 1023) {
+		y *= 8.98846567431158e307 // 2^1023
+		k -= 1023
+		if (k > 1023) {
+			y *= 8.98846567431158e307
+			k -= 1023
+			if (k > 1023) {
+				k = 1023
+			}
+		}
+	} else if (k < -1022) {
+		// make sure the final k < -53 to avoid double rounding in the subnormal range
+		y *= asF64(0x0360000000000000) // 2^-1022 × 2^53
+		k += 1022 - 53
+		if (k < -1022) {
+			y *= asF64(0x0360000000000000)
+			k += 1022 - 53
+			if (k < -1022) {
+				k = -1022
+			}
+		}
+	}
+	return y * asF64(((0x3ff + k) as u64) << 52)
+}
+
+export function scalbnf(x: f32, n: i32): f32 {
+	let y = x
+	let k = n
+	if (k > 127) {
+		y *= 1.7014118346046923e38 // 2^127
+		k -= 127
+		if (k > 127) {
+			y *= 1.7014118346046923e38
+			k -= 127
+			if (k > 127) {
+				k = 127
+			}
+		}
+	} else if (k < -126) {
+		y *= asF32(0x0c800000) // 2^-126 × 2^24
+		k += 126 - 24
+		if (k < -126) {
+			y *= asF32(0x0c800000)
+			k += 126 - 24
+			if (k < -126) {
+				k = -126
+			}
+		}
+	}
+	return y * asF32(((0x7f + k) as u32) << 23)
+}
+
+/// The least i32, the result of ilogb for 0 and NaN.
+const ilogb0 = -2147483648
+
+/// The exponent of x: e where |x| is in [2^e, 2^(e+1)); ilogb0 for 0 and NaN, the greatest i32 for infinities.
+export function ilogb(x: f64): i32 {
+	let i = asU64(x)
+	let e = (i >> 52 & 0x7ff) as i32
+	if (e == 0) {
+		i <<= 12
+		if (i == 0) {
+			return ilogb0
+		}
+		// subnormal x
+		e = -0x3ff
+		while (i >> 63 == 0) {
+			e--
+			i <<= 1
+		}
+		return e
+	}
+	if (e == 0x7ff) {
+		return if (i << 12 != 0) ilogb0 else 2147483647
+	}
+	return e - 0x3ff
+}
+
+export function ilogbf(x: f32): i32 {
+	let i = asU32(x)
+	let e = (i >> 23 & 0xff) as i32
+	if (e == 0) {
+		i <<= 9
+		if (i == 0) {
+			return ilogb0
+		}
+		e = -0x7f
+		while (i >> 31 == 0) {
+			e--
+			i <<= 1
+		}
+		return e
+	}
+	if (e == 0xff) {
+		return if (i << 9 != 0) ilogb0 else 2147483647
+	}
+	return e - 0x7f
+}
+
+/// ilogb(x) as a float: -infinity for 0, infinity for infinities, NaN for NaN.
+export function logb(x: f64): f64 {
+	if (x - x != x - x) {
+		return x * x
+	}
+	return if (x == 0.0) -1.0 / (x * x) else ilogb(x) as f64
+}
+
+export function logbf(x: f32): f32 {
+	if (x - x != x - x) {
+		return x * x
+	}
+	return if (x == 0.0) -1.0 / (x * x) else ilogbf(x) as f32
+}
+
+/// The float after x toward y, or y if they are equal.
+export function nextafter(x: f64, y: f64): f64 {
+	if (x != x || y != y) {
+		return x + y
+	}
+	const ux = asU64(x)
+	const uy = asU64(y)
+	if (ux == uy) {
+		return y
+	}
+	const ax = ux & 0x7fffffffffffffff
+	const ay = uy & 0x7fffffffffffffff
+	if (ax == 0) {
+		return if (ay == 0) y else asF64(uy & 0x8000000000000000 | 1)
+	}
+	return asF64(if (ax > ay || (ux ^ uy) >> 63 != 0) ux - 1 else ux + 1)
+}
+
+export function nextafterf(x: f32, y: f32): f32 {
+	if (x != x || y != y) {
+		return x + y
+	}
+	const ux = asU32(x)
+	const uy = asU32(y)
+	if (ux == uy) {
+		return y
+	}
+	const ax = ux & 0x7fffffff
+	const ay = uy & 0x7fffffff
+	if (ax == 0) {
+		return if (ay == 0) y else asF32(uy & 0x80000000 | 1)
+	}
+	return asF32(if (ax > ay || (ux ^ uy) >> 31 != 0) ux - 1 else ux + 1)
+}
+
+/// x - y if x is greater, else 0; NaN if either is.
+export function fdim(x: f64, y: f64): f64 { return if (x != x) x else if (y != y) y else if (x > y) x - y else 0.0 }
+export function fdimf(x: f32, y: f32): f32 { return if (x != x) x else if (y != y) y else if (x > y) x - y else 0.0 }
+
+/// The greater of x and y, +0 of the zeros; the other if one is NaN.
+export function fmax(x: f64, y: f64): f64 {
+	if (x != x) {
+		return y
+	}
+	if (y != y) {
+		return x
+	}
+	if (signbit(x) != signbit(y)) {
+		return if (signbit(x)) y else x
+	}
+	return if (x < y) y else x
+}
+
+export function fmaxf(x: f32, y: f32): f32 {
+	if (x != x) {
+		return y
+	}
+	if (y != y) {
+		return x
+	}
+	if (signbitf(x) != signbitf(y)) {
+		return if (signbitf(x)) y else x
+	}
+	return if (x < y) y else x
+}
+
+/// The lesser of x and y, -0 of the zeros; the other if one is NaN.
+export function fmin(x: f64, y: f64): f64 {
+	if (x != x) {
+		return y
+	}
+	if (y != y) {
+		return x
+	}
+	if (signbit(x) != signbit(y)) {
+		return if (signbit(x)) x else y
+	}
+	return if (x < y) x else y
+}
+
+export function fminf(x: f32, y: f32): f32 {
+	if (x != x) {
+		return y
+	}
+	if (y != y) {
+		return x
+	}
+	if (signbitf(x) != signbitf(y)) {
+		return if (signbitf(x)) x else y
+	}
+	return if (x < y) x else y
+}
