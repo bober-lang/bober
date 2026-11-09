@@ -18,7 +18,7 @@ import { fromCString } from "../std/c"
 import { Keys, Rest, Unknown, decode as decodeJson, encode, quoted } from "../std/encoding/json"
 import { decode } from "../std/encoding/optarg"
 import { exists, glob, mkdirAll, readFile, remove, removeAll, rename, stat } from "../std/fs"
-import { dir as parent, isAbs, join, rel } from "../std/fs/path"
+import { base, dir as parent, isAbs, join, rel } from "../std/fs/path"
 import { fnv } from "../std/hash"
 import { IoError } from "../std/io"
 import { os } from "../std/os"
@@ -36,7 +36,7 @@ import { formatFile } from "./format"
 import { Backend } from "./backend/backend"
 import { LLVM, triple } from "./backend/llvm"
 import { Tpde } from "./backend/tpde"
-import { compilerId } from "./lift"
+import { bundle, compilerId } from "./lift"
 import { lower } from "./lower"
 import { serve } from "./lsp"
 import { mono } from "./mono"
@@ -143,6 +143,9 @@ function command(cmd: string, f: Flags): i32 {
 		case "lsp":
 			serve(dirs)
 			return 0
+		case "bundle":
+			pack(argv[0])
+			return 0
 		case "lower":
 			const p = lower(argv, dirs)
 			for (const path of argv) {
@@ -164,22 +167,6 @@ export function build(main: string, exe: string, tests: bool, args: string[] = [
 		cmake(load(home))
 	}
 	const p = lower([main], includes)
-	// The packages of its modules but headers, whose C libraries' headers compile its headers' glue.
-	const packages: [string, string[]][] = []
-	const headers: string[] = []
-	const cIncludes = includes.slice(0, includes.length)
-	for (const m of p.modules) {
-		const path = split(m.path, ": ")[0]
-		if (path != m.path) {
-			headers.push(path)
-			continue
-		}
-		const d = nearest(path)
-		if (d != null && !packages.some(e => e[0] == d)) {
-			packages.push([d, includesOf(path, [])])
-			cIncludes.push(...packages[packages.length - 1][1])
-		}
-	}
 	mkdirAll(dir)
 	const compiler = compilerId()
 	for (const m of 0 ... p.modules.length - 1) {
@@ -204,18 +191,42 @@ export function build(main: string, exe: string, tests: bool, args: string[] = [
 			b.emit(`${file(path)}.o`, false)
 			objects.push(`${file(path)}.o`)
 		}
-		const c = glued(p, m, cIncludes)
-		if (c != null) {
-			objects.push(c)
-		}
 	}
 	if (whole != null) {
 		whole.emit(`${exe}.o`, false)
 		objects.push(`${exe}.o`)
 	}
-	// All C libraries of each package one of whose headers it imports, which lld takes in any order, and of which it
-	// links what it uses.
+	// The run time, and in the package the C of the bundle's modules too, compiled in lib/ (pack).
+	const rt = if (exists(join(root, "lib/std.bobc"))) glob(join(root, "lib/*.[ao]")) else runtime(dir)
+	ld([...objects, ...cObjects(p, includes), ...rt, ...args], exe)
+}
+
+/// The objects of the glue of p's modules of C headers but the bundle's, of source hash 0, compiled with includes and
+/// those of the packages of its other modules, and all C libraries of each package one of whose headers it imports,
+/// which lld takes in any order, and of which it links what it uses.
+function cObjects(p: Program, includes: string[]): string[] {
+	const packages: [string, string[]][] = []
+	const headers: string[] = []
+	const cIncludes = includes.slice(0, includes.length)
+	for (const m of p.modules.filter(m => m.source != 0)) {
+		const path = split(m.path, ": ")[0]
+		if (path != m.path) {
+			headers.push(path)
+			continue
+		}
+		const d = nearest(path)
+		if (d != null && !packages.some(e => e[0] == d)) {
+			packages.push([d, includesOf(path, [])])
+			cIncludes.push(...packages[packages.length - 1][1])
+		}
+	}
 	const libs: string[] = []
+	for (const m of 0 ... p.modules.length - 1) {
+		const c = if (p.modules[m].source == 0) null else glued(p, m, cIncludes)
+		if (c != null) {
+			libs.push(c)
+		}
+	}
 	for (const [d, dirs] of packages) {
 		if (!headers.some(h => dirs.some(i => startsWith(h, `${i}/`)))) {
 			continue
@@ -229,7 +240,22 @@ export function build(main: string, exe: string, tests: bool, args: string[] = [
 			}
 		}
 	}
-	ld([...objects, ...runtime(dir), ...libs, ...args], exe)
+	return libs
+}
+
+/// The bundle command, which dist.sh runs in the repo: writes the bundle of builtin/'s and std/'s modules, lowered
+/// from source, to lib/std.bobc (src/lift.bob), and compiles the C they link into lib: the run time's objects, the
+/// archive std.a of their glue, and their C libraries' archives.
+function pack(lib: string) {
+	const p = lower([...glob("std/**/*.bob"), ...glob("builtin/*.bob")].filter(f => !endsWith(f, ".test.bob")))
+	mkdirAll(lib)
+	runtime(lib)
+	const cs = cObjects(p, [])
+	run(["ar", "rcs", join(lib, "std.a"), ...cs.filter(c => endsWith(c, ".o"))])
+	for (const a of cs.filter(c => endsWith(c, ".a"))) {
+		save(join(lib, base(a)), readFile(a))
+	}
+	save(join(lib, "std.bobc"), bundle(p, compilerId()))
 }
 
 /// The run time's objects, src/rt.c's, src/gc.c's, src/fiber.c's, src/io.c's and src/type.c's of bober's root, compiled

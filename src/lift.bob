@@ -6,6 +6,7 @@ import { contains } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
 import { Reader, Writer } from "../std/encoding/binary"
 import { open } from "../std/fs"
+import { join } from "../std/fs/path"
 import { fnv } from "../std/hash"
 import { IoError } from "../std/io"
 import { ParseError } from "../std/parse"
@@ -17,6 +18,11 @@ import { CompileError } from "./error"
 import { root } from "./root"
 import { Type } from "./type"
 
+/// lib/std.bobc, the package's bundle (src/root.bob), once read; empty in a repo, which has none, or if malformed. std
+/// imports its C headers relative to itself or from the sysroot, so that the package finds a header's module by the
+/// path the repo gave it.
+let std: HashMap[string, string] | null = null
+
 export class Lift {
 	prog = new Program()
 	/// Each top-level decl by its checker symbol.
@@ -26,8 +32,9 @@ export class Lift {
 	/// By checker type id: the decl of each class and interface, and the Param of each type param.
 	nominals = new HashMap[i32, i32]()
 	params = new HashMap[i32, i32]()
-	/// The bundle: the file of each module by the path it holds, of source hash 0 and made by this compiler.
-	bundle = new HashMap[string, string]()
+	/// The bundle: the file of each module by the path it holds, of source hash 0 and made by this compiler; the
+	/// package's, stdBundle, unless set.
+	bundle = stdBundle()
 
 	/// The module at path of the bundle, linked with the modules it imports not yet linked, each top-level decl an
 	/// entry; -1 if the bundle lacks it. Throws a CompileError if a file is missing, stale or malformed.
@@ -67,6 +74,18 @@ export class Lift {
 		} catch (e: ParseError | IoError) {}
 		throw new CompileError(`the bundle's ${path}, or a module it imports, is missing, stale or malformed`)
 	}
+}
+
+function stdBundle(): HashMap[string, string] {
+	if (std == null) {
+		try {
+			std = unbundle(readFile(join(root, "lib/std.bobc")) ?? "")
+		} catch (e: ParseError) {
+			print("bober: lib/std.bobc is malformed")
+			std = new HashMap[string, string]()
+		}
+	}
+	return std!
 }
 
 /// The bundle of the modules of p, made by the compiler whose hash is compiler, which drops their tests and source

@@ -1,14 +1,14 @@
 #!/bin/sh
-# dist.sh: makes build/dist/bober.tar.gz, bober to unpack anywhere: bin/bober, built -release, and the files of its root
-# (src/root.bob) as the repo lays them out. Runs in the repo.
+# dist.sh: makes build/dist/bober.tar.gz, bober to unpack anywhere: bin/bober, built -release; lib/, the bundle of builtin/
+# and std/ it writes, with the C they link compiled (src/root.bob); and the C sysroot, build/musl, but C++'s headers. Runs
+# in the repo.
 set -e
 build/bober build -release src/bober.bob
 rm -rf build/dist
 mkdir -p build/dist/bober/bin
 cp build/bober build/dist/bober/bin/
+build/bober bundle build/dist/bober/lib
 {
-	git ls-files builtin std vendor/mbedtls vendor/monocypher src/rt.h src/rt.c src/gc.c src/fiber.c src/io.c src/type.c |
-		grep -E '\.(bob|pkg|c|h)$' | grep -v '\.test\.bob$'
 	find build/musl/usr/include -path '*/c++' -prune -o -type f -print
 	find build/musl/usr/lib -name '*.[ao]'
 } | tar -cf - -T - | tar -xf - -C build/dist/bober
