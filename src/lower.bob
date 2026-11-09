@@ -57,7 +57,7 @@ export class Lower implements Checked {
 	/// What lowering a module threw first, which finish throws, after the checker's errors.
 	private failed: CompileError | null = null
 	private units = new HashMap[string, Unit]()
-	/// Each top-level decl by its checker symbol, -1 for a type alias, which lower expands.
+	/// Each top-level decl by its checker symbol.
 	entries = new HashMap[string, i32]()
 	/// Per decl, the checker's type of what it declares, and the decls of its module it refers to or owns, which a
 	/// variable is initialized after.
@@ -124,10 +124,7 @@ export class Lower implements Checked {
 	}
 
 	/// The top-level decl of the checker's symbol, if lowered or declared ahead.
-	top(symbol: string): i32 | null {
-		const d = this.entries.get(symbol)
-		return if (d == null || d! < 0) null else d
-	}
+	top(symbol: string): i32 | null { return this.entries.get(symbol) }
 
 	/// The decl of class or interface t, or of the generic it is an instance of.
 	nominal(t: Type): i32 {
@@ -206,6 +203,7 @@ class Unit {
 		}
 		const mods = (if (isTok(n.parts[0], "export")) decl.Export else 0) | (if (n.t.kind == "const") decl.Readonly else 0)
 		const t = n.type ?? Type.function([], Null)
+		const ps = child(n, "typeParams")?.parts.map(p => p.type!) ?? [] // a function's or alias's
 		switch (n.kind) {
 			case "test":
 				const d = this.l.newDecl(this.m, -1, unquoted(text), decl.Test, 0, t, n.doc)
@@ -215,17 +213,23 @@ class Unit {
 				const body = bodyOf(n)
 				const extern = body == null && indexOf(this.path(), ": ") >= 0 // a C header's, not an intrinsic's
 				const d = this.entry(name.symbol, -1, text, decl.Function, mods | (if (extern) decl.Extern else 0), t, n.doc, null)
-				const ps = child(n, "typeParams")?.parts.map(p => p.type!) ?? []
 				this.generic(ps, d)
 				this.later(() => {
 					this.prog.decls[d].params = this.typeParams(ps)
+					this.prog.decls[d].throws = this.throws(n)
 					this.define(d, this.fn(t, child(n, "params")), this.body(d, t, null, child(n, "params"), body, t.params))
 				})
 			case "var":
 				const d = this.entry(name.symbol, -1, text, decl.Var, mods, t, n.doc, this.vars)
 				this.later(() => this.define(d, this.ty(t, true), this.initializer(d, after(n, "="), t, null, [])))
 			case "class": this.klass(n, name.symbol, text, mods, -1)
-			default: this.l.entries.set(name.symbol, -1)
+			case "type":
+				const d = this.entry(name.symbol, -1, text, decl.Alias, mods, t, n.doc, null)
+				this.generic(ps, d)
+				this.later(() => {
+					this.prog.decls[d].params = this.typeParams(ps)
+					this.define(d, this.ty(t, true), null)
+				})
 		}
 		return this.jobs
 	}
@@ -271,6 +275,7 @@ class Unit {
 			this.generic(pt.params, md)
 			this.later(() => {
 				this.prog.decls[md].params = this.typeParams(pt.params)
+				this.prog.decls[md].throws = this.throws(p)
 				this.define(md, this.fn(pt), this.body(md, pt, self, child(p, "params"), bodyOf(p), [...t.params, ...pt.params]))
 			})
 		} else {
@@ -280,6 +285,9 @@ class Unit {
 
 	/// The list of the tags of n.
 	private tags(n: Node): i32 { return this.prog.list((n.tags ?? []).map(t => this.ty(t))) }
+
+	/// The list of the types n lists after throws.
+	private throws(n: Node): i32 { return this.prog.list(after(n, "throws")?.type?.alternatives().map(t => this.ty(t)) ?? []) }
 
 	/// Drops the source, keeping its hash and where its lines end, then lists the module's top-level decls, and its
 	/// variables in the order they are initialized: consts, then lets, each after those it depends on (spec 3).
@@ -1056,8 +1064,11 @@ class Gen {
 		return false
 	}
 
-	/// Whether top-level or static decl d, -1 for a type alias, names a type.
-	private names(d: i32): bool { return d < 0 || this.prog.decls[d].kind == decl.Class || this.prog.decls[d].kind == decl.Interface }
+	/// Whether top-level or static decl d names a type.
+	private names(d: i32): bool {
+		const k = this.prog.decls[d].kind
+		return k == decl.Class || k == decl.Interface || k == decl.Alias
+	}
 
 	private tryStmt(p: Node) {
 		this.open(op.Try)
@@ -1524,7 +1535,7 @@ class Gen {
 		return if (at == null) null else this.capture(at!)
 	}
 
-	/// The decl of the top-level declaration or static member p names, -1 for a type alias, if it names one.
+	/// The decl of the top-level declaration or static member p names, if it names one.
 	private global(p: Node): i32 | null {
 		const l = this.u.l
 		if (p.kind == "token") {
