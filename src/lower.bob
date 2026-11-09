@@ -45,7 +45,8 @@ import { free, strtod } from "stdlib.h"
 /// is not lowered, as a CompileError.
 export function lower(paths: string[], dirs: string[] = [], read: (path: string) => string | null = p => readFile(p)): Program {
 	const l = new Lower()
-	const errors = check(paths, dirs, read, l).filter(e => !e.warning).map(e => `${e.path}:${e.line}:${e.col}: ${e.msg}`)
+	const errors = check(paths, dirs, read, l, l.lift).filter(e => !e.warning)
+		.map(e => `${e.path}:${e.line}:${e.col}: ${e.msg}`)
 	if (errors.length > 0) {
 		throw new CompileError(errors.join("\n"))
 	}
@@ -341,7 +342,8 @@ class Unit {
 	}
 
 	/// The bytecode type of t, in code g if it is in one. A literal type is its base type unless exact: in a union,
-	/// whose members it tells apart, as a type argument, or as the declared type of a var or member.
+	/// whose members it tells apart, as a type argument or a type param's constraint or default, or as the declared
+	/// type of a var or member.
 	ty(t: Type, exact: bool = false, g: Gen | null = null): i32 {
 		if (t.kind == "param") {
 			return this.param(t, g)
@@ -429,8 +431,9 @@ class Unit {
 	}
 
 	private typeParams(ps: Type[]): TypeParam[] {
-		return ps.map(p => ({ name: this.prog.intern(showType(p)), constraint: if (p.base == null) 0 else this.ty(p.base!),
-			fallback: if (p.fallback == null) 0 else this.ty(p.fallback!) }))
+		return ps.map(p => ({ name: this.prog.intern(showType(p)),
+			constraint: if (p.base == null) 0 else this.ty(p.base!, true),
+			fallback: if (p.fallback == null) 0 else this.ty(p.fallback!, true) }))
 	}
 
 	/// Has ps, the type params of decl d, stand for its Params.

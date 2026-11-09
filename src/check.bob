@@ -10,10 +10,15 @@ import { Set } from "../std/collections/set"
 import { Cc, Rest } from "../std/encoding/optarg"
 import { join } from "../std/fs/path"
 import { sortBy } from "../std/sort"
-import { endsWith, indexOf, startsWith } from "../std/string"
+import { endsWith, indexOf, quoted, startsWith } from "../std/string"
+import * as decl from "./bc/decl"
+import * as kind from "./bc/kind"
+import * as op from "./bc/op"
+import { Program } from "./bc/program"
 import { bind, located } from "./c/bind"
 import { CompileError } from "./error"
 import { Kind, Loc, SyntaxError, Tok, prec } from "./lex"
+import { Lift } from "./lift"
 import { Parser, Syntax, Tree } from "./parse"
 import { builtin, builtinPath, root } from "./root"
 import {
@@ -33,9 +38,10 @@ const documented: Syntax[] = ["test", "var", "function", "class", "type", "metho
 /// What the compiler lowers the builtin types and the prelude to, which every program holds.
 let lowered = [...first, ...["equal", "show", "math", "fiber"].map(builtinPath)]
 
-/// The errors of the modules at paths and of those they import, each checked once and handed on to next.
+/// The errors of the modules at paths and of those they import, each checked once and handed on to next; one lift's
+/// bundle holds is made from its decls instead.
 export function check(paths: string[], includes: string[] = [], read: (path: string) => string | null = p => readFile(p),
-	next: Checked = new Ignore()): TypeError[] {
+	next: Checked = new Ignore(), lift = new Lift()): TypeError[] {
 	info = new HashMap[string, Member]()
 	fills = new HashMap[i32, () => void]()
 	fillWith(t => {
@@ -49,7 +55,7 @@ export function check(paths: string[], includes: string[] = [], read: (path: str
 	deferred = []
 	visited = 0
 	tagTypes = new HashMap[string, Type]()
-	const ms = new Modules(includes, read, next)
+	const ms = new Modules(includes, read, next, new Linked(lift))
 	for (const path of [...paths, ...lowered]) {
 		const m = ms.load(normal(path))
 		if (m instanceof string) {
@@ -88,6 +94,41 @@ let tagTypes = new HashMap[string, Type]()
 let Meta = Empty
 /// builtin/'s classes and interfaces, by path and name, made once for every program.
 const builtins = new HashMap[string, Type]()
+
+/// Class or interface name of the module at path, new, of the type params ps makes; builtin/'s made once for every
+/// program, and then filled anew each check, as fill also records the members' info.
+function nominalOf(path: string, name: string, k: TypeKind, ps: () => Type[]): Type {
+	const key = `${path}:${name}`
+	const made = builtins.get(key)
+	if (made != null) {
+		made.fields = []
+		return made
+	}
+	const t = new Type(k)
+	names.set(t, name.copy())
+	t.params = ps()
+	if (builtin(path)) {
+		builtins.set(key, t)
+	}
+	return t
+}
+
+/// Has class or interface t, named name in the module at path, stand for what the checker knows of one of builtin/'s:
+/// the class of strings' or arrays' methods, a tag, or Type.
+function special(path: string, name: string, t: Type) {
+	if (path == builtinPath("string")) {
+		String.base = t
+		String16.base = t
+		String32.base = t
+	} else if (path == builtinPath("array")) {
+		Arrays.params = t.params
+		Arrays.base = t
+	} else if (path == builtinPath("tag")) {
+		tagTypes.set(name, t)
+	} else if (path == builtinPath("type")) {
+		Meta = t
+	}
+}
 
 /// The members of t a value has: those not static.
 function fields(t: Type): Field[] { return members(t).filter(f => !f.static) }
@@ -354,11 +395,13 @@ class Modules {
 	private includes: string[]
 	private read: (path: string) => string | null
 	private loaded = new HashMap[string, Module]()
+	private linked: Linked
 
-	constructor(includes: string[], read: (path: string) => string | null, next: Checked) {
+	constructor(includes: string[], read: (path: string) => string | null, next: Checked, linked: Linked) {
 		this.includes = includes
 		this.read = p => read(p) ?? readFile(p) // the files read gives none of, as builtin/, from disk
 		this.next = next
+		this.linked = linked
 	}
 
 	/// The module at path, or why there is none.
@@ -367,6 +410,10 @@ class Modules {
 		if (m != null) {
 			return if (m.done) m else `import cycle through ${path}`
 		}
+		const b = this.bundled(path)
+		if (b != null) {
+			return b
+		}
 		const src = this.read(path)
 		return if (src == null) `cannot read ${path}` else this.checked(path, src, false)
 	}
@@ -374,7 +421,7 @@ class Modules {
 	/// The module of names from C header spec, as importer includes it, or why there is none (3.1).
 	header(importer: string, spec: string, names: string[]): Module | string {
 		const key = `${located(importer, spec, this.includes, this.read)}: ${names.join(" ")}`
-		const m = this.loaded.get(key)
+		const m = this.loaded.get(key) ?? this.bundled(key)
 		if (m != null) {
 			return m
 		}
@@ -383,6 +430,19 @@ class Modules {
 			const src = bound.get(k) ?? bind(importer, spec, names, this.includes, this.read)
 			bound.set(k, src)
 			return this.checked(key, src, true)
+		} catch (e: CompileError) {
+			return e.msg
+		}
+	}
+
+	/// The module at path made from the bundle's decls, or why it cannot be; null if the bundle lacks it.
+	private bundled(path: string): Module | string | null {
+		try {
+			const m = this.linked.module(path)
+			if (m != null) {
+				this.loaded.set(path, m)
+			}
+			return m
 		} catch (e: CompileError) {
 			return e.msg
 		}
@@ -418,6 +478,241 @@ class Module {
 	done = false
 
 	constructor(path: string) { this.path = path }
+}
+
+/// The modules the bundle holds (src/lift.bob), made from the decls linked into its Program rather than checked, each
+/// decl known to lift by its checker type, as one checked and lowered is. What the checker keeps of a declaration but
+/// a decl does not tell is lost: a literal type where lowering takes its base, or spelled otherwise than quoted spells
+/// it, a type a const holds, the value of an untyped int const but a literal, negated or not, whether a const depends
+/// on a let, the errors a function infers rather than lists, and what its tags warn of.
+class Linked {
+	private lift: Lift
+	private p: Program
+	/// The checker's type of each Program type made, of each Param once its decl's type params are made.
+	private types = new HashMap[i32, Type]()
+
+	constructor(lift: Lift) {
+		this.lift = lift
+		this.p = lift.prog
+	}
+
+	/// The module at path, of its top-level decls, done; null if the bundle lacks it.
+	module(path: string): Module | null throws CompileError {
+		const m = this.lift.module(path)
+		if (m < 0) {
+			return null
+		}
+		const x = new Module(path)
+		for (const d of this.p.modules[m].decls) {
+			const name = this.p.strings[this.p.decls[d].name]
+			const b = this.binding(d)
+			b.symbol = `${path}:${name}`
+			x.tops.set(name, b)
+			if ((this.p.decls[d].mods & decl.Export) != 0) {
+				x.names.push(name)
+				x.exports.set(name, b)
+			}
+		}
+		x.done = true
+		return x
+	}
+
+	private binding(d: i32): Binding {
+		const x = this.p.decls[d]
+		const t = this.declared(d)
+		const isType = x.kind == decl.Class || x.kind == decl.Interface || x.kind == decl.Alias
+		const readonly = (x.mods & decl.Readonly) != 0
+		const b = new Binding(t, x.kind == decl.Var && !readonly, isType)
+		b.decl = this.decl(d)
+		b.decl!.errors = this.errors(d)
+		b.params = if (x.kind == decl.Alias) this.params(d) else if (isType) t.params else []
+		if (x.kind == decl.Var && readonly) {
+			const v = if (t == UntypedInt) this.value(d) else null
+			b.literal = if (v != null) Type.literal(decimal(v!), I32)
+				else if (t.kind == "literal" && (t.base!.kind == "int" || t.base!.kind == "string")) t else null
+		} else if (x.kind == decl.Class) {
+			about(t, "constructor").decl = b.decl
+		}
+		return b
+	}
+
+	/// The value of untyped int const d: its code an Int, then each Neg; null for other code.
+	private value(d: i32): f64 | null {
+		const c = this.p.decls[d].code
+		let v: f64 | null = null
+		for (const i of 0 ... (c?.ops.length ?? 0) - 1) {
+			switch (c!.ops[i]) {
+				case op.Int: v = this.p.ints[c!.b(i)] as f64
+				case op.Neg: v = if (v == null) null else -v!
+				case op.End: return v
+				default: return null
+			}
+		}
+		return null
+	}
+
+	/// The checker's declaration of decl d, done and declared ahead, as it is to lowering.
+	private decl(d: i32): Decl {
+		const x = this.p.decls[d]
+		const e = new Decl(null, new Tok(), ["class", "class", "var", "function", "test", "type"][x.kind] as Syntax)
+		e.mutable = x.kind == decl.Var && (x.mods & decl.Readonly) == 0
+		e.state = "done"
+		e.ahead = true
+		return e
+	}
+
+	/// The errors of function d, those it lists.
+	private errors(d: i32): Errors {
+		const e = new Errors(this.p.lists[this.p.decls[d].throws].map(t => this.type(t)))
+		e.listed = true
+		return e
+	}
+
+	/// The checker's type of what decl d declares, made once.
+	private declared(d: i32): Type {
+		const known = this.lift.types.get(d)
+		if (known != null) {
+			return known
+		}
+		const x = this.p.decls[d]
+		if (x.kind == decl.Class || x.kind == decl.Interface) {
+			return this.nominal(d)
+		}
+		const ps = this.params(d)
+		const t = if (x.kind == decl.Function) this.fn(x.type, ps) else this.type(x.type)
+		this.lift.types.set(d, t)
+		return t
+	}
+
+	/// Class or interface d, whose members are filled in when first needed.
+	private nominal(d: i32): Type {
+		const x = this.p.decls[d]
+		const path = this.p.modules[x.module].path
+		const name = this.p.strings[x.name]
+		const t = nominalOf(path, name, if (x.kind == decl.Class) "class" else "interface", () => [])
+		this.lift.types.set(d, t)
+		this.lift.nominals.set(t.id, d)
+		t.params = this.params(d, t.params)
+		fills.set(t.id, () => this.fill(t, d))
+		special(path, name, t)
+		return t
+	}
+
+	/// Fills in class or interface t of decl d: an interface's members of those it extends and its type set, then the
+	/// members of its own, with what the checker knows of each beyond its type.
+	private fill(t: Type, d: i32) {
+		const x = this.p.decls[d]
+		for (const s of if (t.kind == "interface") this.p.lists[x.supers] else []) {
+			const st = this.type(s)
+			if (st.kind == "object" || st.kind == "class" || st.kind == "interface" && !isSet(st)) {
+				t.fields.push(...members(st))
+			}
+		}
+		if (x.type != 0) {
+			t.base = this.type(x.type)
+		}
+		for (const m of x.members) {
+			const y = this.p.decls[m]
+			const static = (y.mods & decl.Static) != 0
+			const f = new Field(this.p.strings[y.name], this.declared(m), (y.mods & decl.Embed) != 0, static)
+			const a = about(t, f.name, f.static)
+			a.hidden = (y.mods & decl.Private) != 0
+			a.readonly = (y.mods & decl.Readonly) != 0
+			a.errors = this.errors(m)
+			if (t.kind == "class" && (f.static || y.kind == decl.Function) && f.name != "constructor") {
+				a.decl = this.decl(m)
+			}
+			t.fields.push(f)
+		}
+	}
+
+	/// The type params of decl d, made once, from those made if given, as a builtin's are.
+	private params(d: i32, made: Type[] = []): Type[] {
+		const x = this.p.decls[d]
+		const ids: i32[] = []
+		for (const i of 0 ... x.params.length - 1) {
+			ids.push(this.p.type(kind.Param, d, i))
+		}
+		if (ids.length > 0 && !this.types.has(ids[0])) {
+			for (const i of 0 ... ids.length - 1) {
+				const t = if (i < made.length) made[i] else new Type("param")
+				names.set(t, this.p.strings[x.params[i].name])
+				this.types.set(ids[i], t)
+				this.lift.params.set(t.id, ids[i])
+			}
+			for (const i of 0 ... ids.length - 1) {
+				const tp = x.params[i]
+				const t = this.types.get(ids[i])!
+				t.base = if (tp.constraint == 0) null else this.type(tp.constraint)
+				t.fallback = if (tp.fallback == 0) null else this.type(tp.fallback)
+			}
+		}
+		return ids.map(id => this.types.get(id)!)
+	}
+
+	/// The checker's type of Func t, of type params ps.
+	private fn(t: i32, ps: Type[]): Type {
+		const p = this.p
+		const items = p.items(t)
+		const last = if (items.length > 0) p.kind(items[items.length - 1]) else kind.None
+		const plain = (u: i32) => p.kind(u) != kind.Optional && p.kind(u) != kind.Rest && p.kind(u) != kind.Embed
+		const types = items.map(u => this.type(if (plain(u)) u else p.a(u)))
+		const required = items.filter(u => p.kind(u) != kind.Optional && p.kind(u) != kind.Rest).length
+		return Type.function(types, this.type(p.b(t)), required, last == kind.Rest, ps)
+	}
+
+	/// The checker's type of Program type t: a literal's as the checker writes it.
+	private type(t: i32): Type {
+		const known = this.types.get(t)
+		if (known != null) {
+			return known
+		}
+		const r = this.make(t)
+		this.types.set(t, r)
+		return r
+	}
+
+	private make(t: i32): Type {
+		const p = this.p
+		const k = p.kind(t)
+		const a = p.a(t)
+		const b = p.b(t)
+		const ts = () => p.items(t).map(u => this.type(u))
+		switch (k) {
+			case kind.Type: return Meta
+			case kind.Int: return UntypedInt
+			case kind.Float: return UntypedFloat
+			case kind.Array: return Type.array(this.type(a))
+			case kind.FixedArray: return Type.fixed(this.type(a), b)
+			case kind.Union: return Type.union(ts())
+			case kind.Func: return this.fn(t, [])
+			case kind.Tuple:
+				const es = p.items(t)
+				const rest = es.length > 0 && p.kind(es[es.length - 1]) == kind.Rest
+				return Type.tuple(es.map(u => this.type(if (p.kind(u) == kind.Rest) p.a(u) else u)), rest)
+			case kind.Object:
+				const fs: Field[] = []
+				const ns = p.names[b]
+				const its = p.items(t)
+				for (const i of 0 ... its.length - 1) {
+					fs.push(new Field(p.strings[ns[2 * i]], this.type(its[i]), (ns[2 * i + 1] & decl.Embed) != 0))
+				}
+				return Type.object(fs)
+			case kind.Named:
+				const args = p.lists[b].map(u => this.type(u))
+				return if (a == this.lift.entries.get(`${builtinPath("fiber")}:Future`)) Type.async(args[0])
+					else this.declared(a).instantiate(args)
+			case kind.Literal:
+				const text = switch (a) {
+					case kind.String: quoted(p.strings[b])
+					case kind.Bool: if (b == 1) "true" else "false"
+					case kind.U64: `${p.ints[b] as u64}`
+					default: `${p.ints[b]}`
+				}
+				return Type.literal(text, this.type(a))
+		}
+		return [Null, ...basics][k - kind.Null] // a primitive's: a signature holds no Of or Member, and its Params are made
+	}
 }
 
 /// What ends checking a statement, or a declaration outside one, at its first error. A variable that it leaves without
@@ -457,11 +752,11 @@ class Decl {
 	/// their bodies, may run (3).
 	value: Decl | null = null
 
-	constructor(node: Node, at: Tok) {
+	constructor(node: Node | null, at: Tok, kind = node!.kind) {
 		this.node = node
-		this.kind = node.kind
+		this.kind = kind
 		this.at = at
-		this.mutable = node.t.kind == "let"
+		this.mutable = node?.t.kind == "let"
 	}
 }
 
@@ -894,19 +1189,8 @@ class Checker {
 	/// strings and arrays.
 	private nominal(n: Node, owner: Decl): Type {
 		const name = this.text(operands(n)[0].t)
-		const key = `${this.m.path}:${name}`
-		const made = builtins.get(key)
-		const t = made ?? new Type(if (n.t.kind == "class") "class" else "interface")
-		if (made != null) {
-			// Filled anew each check, as fill also records the members' info.
-			t.fields = []
-		} else {
-			names.set(t, name.copy())
-			t.params = this.paramsOf(n)
-			if (builtin(this.m.path)) {
-				builtins.set(key, t)
-			}
-		}
+		const k: TypeKind = if (n.t.kind == "class") "class" else "interface"
+		const t = nominalOf(this.m.path, name, k, () => this.paramsOf(n))
 		// A local class sees the block's types (5.1).
 		const locals = this.locals
 		const wall = if (locals.level > 0) this.depth else -1
@@ -919,18 +1203,7 @@ class Checker {
 			}
 			this.apart(() => this.fill(t, n))
 		}))
-		if (this.m.path == builtinPath("string")) {
-			String.base = t
-			String16.base = t
-			String32.base = t
-		} else if (this.m.path == builtinPath("array")) {
-			Arrays.params = t.params
-			Arrays.base = t
-		} else if (this.m.path == builtinPath("tag")) {
-			tagTypes.set(name, t)
-		} else if (this.m.path == builtinPath("type")) {
-			Meta = t
-		}
+		special(this.m.path, name, t)
 		return t
 	}
 

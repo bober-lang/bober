@@ -1,14 +1,20 @@
 import { contains } from "../std/algo"
-import { Checked, Node, check, show } from "./check"
+import { HashMap } from "../std/collections/hashmap"
+import { startsWith } from "../std/string"
+import { show as shown } from "./bc/show"
+import { Checked, Node, TypeError, check, show } from "./check"
+import { CompileError } from "./error"
+import { Lift, bundle, compilerId, unbundle } from "./lift"
+import { Lower, lower } from "./lower"
 
 /// The errors of main.bob of source src, as pos: msg separated by "; ", where it imports the modules of files, each
 /// a path and its source.
 function errors(src: string, files: string[] = []): string {
-	const ms: string[] = []
-	for (const e of check(["main.bob"], [], p => source(p, src, files))) {
-		ms.push(`${if (e.path == "main.bob") "" else e.path + ":"}${e.loc.pos}: ${if (e.warning) "warning: " else ""}${e.msg}`)
-	}
-	return ms.join("; ")
+	return check(["main.bob"], [], p => source(p, src, files)).map(message).join("; ")
+}
+
+function message(e: TypeError): string {
+	return `${if (e.path == "main.bob") "" else e.path + ":"}${e.loc.pos}: ${if (e.warning) "warning: " else ""}${e.msg}`
 }
 
 function source(path: string, src: string, files: string[]): string | null {
@@ -557,4 +563,81 @@ test "the compiler's own source checks" {
 		}
 	}
 	assert failed == ""
+}
+
+/// The errors of main.bob of source src, as errors gives them, then its bytecode shown, where it imports the modules of
+/// files, or of bundle, which are made from their decls rather than checked.
+function lowered(src: string, files: string[], bundle: HashMap[string, string]): string {
+	const l = new Lower()
+	l.lift.bundle = bundle
+	const ms = check(["main.bob"], [], p => source(p, src, files), l, l.lift).map(message)
+	try {
+		const p = l.finish()
+		ms.push(shown(p, p.module("main.bob")))
+	} catch (e: CompileError) {
+		ms.push(e.msg)
+	}
+	return ms.join("; ")
+}
+
+/// The bundle of the modules at paths and of those they import, made by the compiler whose hash is compiler.
+function bundled(paths: string[], files: string[], compiler = compilerId()): HashMap[string, string] {
+	return unbundle(bundle(lower(paths, [], path => source(path, "", files)), compiler))
+}
+
+test "a module of the bundle, linked once if this compiler made it, checks and lowers what imports it as from source" {
+	const lib = `export function g(): i32 throws i32 { throw 1 }
+export const End: u8 = 0
+export const Block: u8 = 2
+export type Op = End | Block
+export const N = 3
+export const M = -3
+export const S = "s\\t"
+export type Pair[T] = [T, T]
+export type Maybe[T = i32] = T | null
+export class G[V = "v"] {}
+export function id[T](x: T): T { return x }
+export function f(a: i32, b = 2, ...c: i32[]): i32 { return a + b + c.length }
+export interface Shape { area(): f64 }
+export class Box[T] {
+	private secret = 1
+	readonly item: T
+	static count = 0
+
+	constructor(item: T) { this.item = item }
+	map[U](f: (x: T) => U): Box[U] { return new Box(f(this.item)) }
+	static of[V](v: V): Box[V] { return new Box(v) }
+}`
+	const files = ["lib.bob", lib]
+	const b = bundled(["lib.bob", "std/algo.bob", "std/io.bob", "std/math.bob"], files)
+	const same = (src: string): string => {
+		const out = lowered(src, files, new HashMap[string, string]())
+		assert lowered(src, [], b) == out
+		return out
+	}
+	const imports = "import { g, End, Block, Op, N, M, S, Pair, Maybe, G, id, f, Shape, Box } from \"lib\"\n"
+	assert startsWith(same(`${imports}export function h(): i32 { return g() }`),
+		"119: warning: i32 is neither caught nor listed")
+	same(`${imports}const a: Op = End\nconst n: N = 3 as N\nconst m = -3 as M\nconst s: S = "s\\t"
+const xs: i32[N] = [1, 2, 3]\nfunction k(o: Op): i32 { return switch (o) { case End: 1; case Block: 2 } }`)
+	same(`${imports}const a: Pair[string] = id(["a", "b"])\nconst m: Maybe = null\nconst n: Maybe[string] = id("x")
+const b = Box.of(1).map(x => \`\${x}\`).item\nconst c = new G()\nconst d = f(1) + f(1, 2) + f(1, 2, 3, 4)
+class Sq implements Shape { area(): f64 { return 1.0 } }\nconst e: Shape = new Sq()`)
+	same(`${imports}const a: Op = 1\nconst b: i32 = Box.of("a").item\nconst c = f()\nconst d = f(1, "2")
+const x = new Box(1)\nconst e = x.secret\nconst h = Box.count\nfunction k() { x.item = 2 }\nconst s: Shape = 1`)
+	same(`import * as lib from "lib"\nimport { contains, unique } from "std/algo"\nimport { max } from "std/math"
+const a: lib.Op = lib.End\nconst b = lib.id(lib.N) + max(1, 2)\nconst xs: i32[] = [1]
+const c = unique([1, 2]).length + "abc".slice(1, 2).length
+const d = contains(["a"], lib.S) && xs.map(x => x + 1).length > 0`)
+	same(`import { Writer } from "std/io"\nclass W implements Writer { write(s: string) {} }
+const w: Writer = new W()`)
+	const l = new Lower()
+	l.lift.bundle = b
+	const zero = l.builtin("zero")
+	assert l.lift.prog.decls[zero].type != 0 && l.lift.module("lib.bob") >= 0 && l.builtin("zero") == zero
+	assert l.lift.prog.modules.filter(x => x.path == "builtin/mem.bob").length == 1
+	const stale = new Lift()
+	stale.bundle = bundled(["lib.bob"], files, 1)
+	assert stale.module("lib.bob") throws new CompileError(
+		"the bundle's lib.bob, or a module it imports, is missing, stale or malformed")
 }
