@@ -477,7 +477,7 @@ class Binding {
 	mutable: bool
 	isType: bool
 	decl: Decl | null = null
-	/// How many functions deep it is declared, as narrowing does not apply to captured variables.
+	/// How many functions deep it is declared, which tells a function that captures it from the one declaring it.
 	depth = 0
 	/// Whether it is a const or unrolled for's binding whose static value depends on a type param (4.11).
 	generic = false
@@ -512,7 +512,8 @@ class Binding {
 /// or on `x.kind` with literal labels, narrows in each case. An assignment to `x` narrows it to the assigned value's
 /// type, and where branches meet, `x` has the union of their types. A loop or `try` loses the narrowing of the
 /// variables it assigns. Narrowing applies to a local, and to a member path from a local or `this`, as `a.b.c`, until a
-/// part of the path is assigned; never to a captured variable.
+/// part of the path is assigned; a nested function narrows a captured variable afresh, until an `await`, and not at
+/// all once it or another assigns it.
 ///
 /// ```
 /// function label(s: Shape | null): string {
@@ -1383,7 +1384,7 @@ class Checker {
 	/// function g(...xs: i32) {}            // error: a rest param is an array
 	/// ```
 	private function(n: Node, b: Binding | null, bodies: bool, errors: Errors | null = null, builds: Type | null = null): Type {
-		const paths = this.open()
+		const [paths, mark] = this.open()
 		const ps = this.paramsOf(n)
 		this.typeParams(n, ps, true)
 		const listed = after(n, "throws")
@@ -1406,7 +1407,7 @@ class Checker {
 			this.throwing.push(errors)
 		}
 		const t = returning(sig, if (bodies && body != null) this.body(body, f) else result, ps)
-		this.close(paths)
+		this.close(paths, mark)
 		if (contains(t.types, Empty)) {
 			throw new Failed()
 		}
@@ -2805,6 +2806,7 @@ class Checker {
 					}
 					return Type.tuple([I32, Type.union(ts)], false)
 				}
+				this.suspend(true)
 				return this.awaited(this.expr(x, null), x)
 			case "async", "spawn":
 				if (x.kind != "call") {
@@ -3143,12 +3145,12 @@ class Checker {
 		return false
 	}
 
-	/// The binding narrowed for p: a local of this function it does not share with a nested one, or a member path,
-	/// made with its declared type if it has none yet; null where p is neither, or made elsewhere, or only given a type.
+	/// The binding narrowed for p: a local no nested function assigns, or a member path, made with its declared type if
+	/// it has none yet; null where p is neither, or made elsewhere, or only given a type.
 	private place(p: Node, declared: Type | null = null): Binding | null {
 		if (p.kind == "token") {
 			const b = if (p.t.kind == "ident") this.locals.get(this.text(p.t)) else null
-			return if (b == null || b.depth != this.depth || b.shared) null else b
+			return if (b == null || b.shared) null else b
 		}
 		const s = this.path(p)
 		if (s == null) {
@@ -3181,19 +3183,35 @@ class Checker {
 		return if (p.kind == "token" && this.place(p) != null) this.text(p.t) else null
 	}
 
-	/// Opens a function's scope, with no member paths narrowed yet, and returns the paths of the one left for close.
-	private open(): Binding[] {
+	/// Opens a function's scope, with no member paths narrowed and mutable variables unnarrowed, as they may change
+	/// before it runs; returns what close restores.
+	private open(): [Binding[], i32] {
 		const paths = this.paths
+		const mark = this.suspend(false)
 		this.paths = []
 		this.depth++
 		this.locals.enter()
-		return paths
+		return [paths, mark]
 	}
 
-	private close(paths: Binding[]) {
+	private close(paths: Binding[], mark: i32) {
 		this.locals.leave()
 		this.depth--
 		this.paths = paths
+		this.restore(mark)
+	}
+
+	/// Unnarrows the mutable variables narrowed now, or only those captured, as the function declaring one may assign it
+	/// while this one waits; returns the mark from before.
+	private suspend(captured: bool): i32 {
+		const mark = this.undo.length
+		for (const i of 0 ... mark - 1) {
+			const b = this.undo[i].b
+			if (b.mutable && b.narrowed != null && (!captured || b.depth != this.depth)) {
+				this.narrow([new Narrowing(b, null)])
+			}
+		}
+		return mark
 	}
 
 	private narrow(ns: Narrowing[]) {
@@ -3626,11 +3644,12 @@ class Checker {
 	/// ```
 	private arrow(n: Node, want: Type | null): Type {
 		const w = aim(want, ["function"])
-		const paths = this.open()
+		const [paths, mark] = this.open()
 		const sig = this.params(n.parts[0], w)
 		const declared = if (isTok(n.parts[1], ":")) this.annotation(n.parts[2]) else null
 		const f = new Fn(declared ?? w?.base)
 		const body = arrowBody(n)
+		const outer = this.fn
 		const init = this.init
 		const user = this.user
 		const unrun = init != null && contains(init.fns, n)
@@ -3641,17 +3660,19 @@ class Checker {
 				init!.b!.initializing = "function"
 			}
 		}
+		this.fn = f
 		let t = Null
 		try {
 			t = returning(sig, if (body.kind == "block") this.body(body, f) else this.returned(body, f.result))
 		} finally {
+			this.fn = outer
 			this.init = init
 			this.user = user
 			if (unrun && init!.b != null) {
 				init!.b!.initializing = "value"
 			}
 		}
-		this.close(paths)
+		this.close(paths, mark)
 		if (contains(t.types, Empty)) {
 			throw new Failed()
 		}
