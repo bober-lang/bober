@@ -18,7 +18,7 @@ import { Parser, Syntax, Tree } from "./parse"
 import { builtin, builtinPath, root } from "./root"
 import {
 	Array as Arrays, Bool, Empty, Field, I32, Kind as TypeKind, Null, String, String16, String32, Type, U8, UntypedFloat,
-	UntypedInt, bases, basics, memberOf,
+	UntypedInt, bases, basics, fillWith, memberOf, members, setOf,
 } from "./type"
 
 /// The modules of builtin/ every module outside builtin/ and C's loads first: those declaring the classes of a string's
@@ -38,8 +38,15 @@ export function check(paths: string[], includes: string[] = [], read: (path: str
 	next: Checked = new Ignore()): TypeError[] {
 	info = new HashMap[string, Member]()
 	fills = new HashMap[i32, () => void]()
-	filling = []
-	early = []
+	fillWith(t => {
+		const f = fills.get(t.id)
+		if (f != null) {
+			fills.delete(t.id)
+			filling++
+			try { f() } finally { filling-- }
+		}
+	})
+	deferred = []
 	tagTypes = new HashMap[string, Type]()
 	const ms = new Modules(includes, read, next)
 	for (const path of [...paths, ...lowered]) {
@@ -69,13 +76,13 @@ function nameOf(t: Type): string | null {
 const names = new HashMap[Type, string, ById]()
 /// What is known of each member of a class, interface or namespace beyond its type, by about's key.
 let info = new HashMap[string, Member]()
-/// How to fill in each class and interface declared that is not yet, by its id; those being filled; and the instances
-/// made of those while they were, to be filled in again after.
+/// How to fill in each class and interface declared that is not yet, by its id, how many are being filled in, and the
+/// checks put off until the declaration being checked is done, as they ask for members not declared yet (satisfying).
 let fills = new HashMap[i32, () => void]()
-let filling: Type[] = []
+let filling = 0
+let deferred: (() => void)[] = []
 /// How many searches of uses ran, each marking the declarations it visits (Decl.seen).
 let searches = 0
-let early: Type[] = []
 /// The classes of builtin/tag.bob, by name.
 let tagTypes = new HashMap[string, Type]()
 /// builtin/type.bob's Type, of any type as a value (4.11).
@@ -83,49 +90,13 @@ let Meta = Empty
 /// builtin/'s classes and interfaces, by path and name, made once for every program.
 const builtins = new HashMap[string, Type]()
 
-/// The members of t, its class or interface filled in first if it is not yet.
-function members(t: Type): Field[] {
-	const g = t.generic ?? t
-	const f = fills.get(g.id)
-	if (f != null) {
-		fills.delete(g.id)
-		filling.push(g)
-		f()
-		filling.pop()
-		for (const i of early) {
-			if (i.generic == g) {
-				i.refill()
-			}
-		}
-	}
-	return t.fields
-}
-
 /// The members of t a value has: those not static.
 function fields(t: Type): Field[] { return members(t).filter(f => !f.static) }
 
-/// Whether t has members, all static, filled in first.
-function staticOnly(t: Type): bool {
-	members(t)
-	return t.staticOnly()
-}
-
-/// Generic g's instance for args, g filled in first, or once it is if it is being.
-function instance(g: Type, args: Type[]): Type {
-	members(g)
-	const t = g.instantiate(args)
-	if (contains(filling, g)) {
-		early.push(t)
+function runDeferred() {
+	while (deferred.length > 0) {
+		deferred.pop()!()
 	}
-	return t
-}
-
-/// An array of t, its class filled in first.
-function arrayOf(t: Type): Type {
-	if (Arrays.base != null) {
-		instance(Arrays.base!, [t])
-	}
-	return Type.array(t)
 }
 
 /// Hashes a type by its identity.
@@ -697,7 +668,12 @@ class Checker {
 			this.imports(n)
 		}
 		for (const d of ds) {
+			this.signature(d)
+			runDeferred()
+		}
+		for (const d of ds) {
 			this.settle(d)
+			runDeferred()
 			this.handOn()
 		}
 		this.escapes()
@@ -914,6 +890,29 @@ class Checker {
 		return t
 	}
 
+	/// Types what d declares as far as its annotations tell, so that what refers to it is checked without checking it: a
+	/// class's or interface's members, an alias, or the signature of a function with a result type or no body, which is
+	/// busy meanwhile, so that it is not called in its own signature. The rest, a body's or an initializer's, is checked
+	/// when d is settled, or when first needed.
+	private signature(d: Decl) {
+		if (d.state != "new") {
+			return
+		}
+		const n = d.node!
+		if (n.kind == "class") {
+			members(d.nominal!)
+		} else if (n.kind == "type") {
+			this.settle(d)
+		} else if (n.kind == "function" && declaresType(n)) {
+			d.state = "busy"
+			try {
+				this.within(d, () => this.apart(() => { this.function(n, this.top.get(this.text(operands(n)[0].t)), false, d.errors) }))
+			} finally {
+				d.state = "new"
+			}
+		}
+	}
+
 	/// Checks d, to hand on unless it failed.
 	private settle(d: Decl) {
 		if (d.state != "new") {
@@ -945,7 +944,7 @@ class Checker {
 	private handOn() {
 		let i = 0
 		while (i < this.settled.length) {
-			this.complete(this.settled[i], [])
+			this.complete(this.settled[i])
 			this.ahead(this.settled[i])
 			i++
 		}
@@ -960,25 +959,25 @@ class Checker {
 
 	/// Fills in the members of the classes and interfaces d depends on that are not handed on yet, and declares them to
 	/// the next stage ahead, so that it sees them whole; they are this module's, as those imported are handed on.
-	private complete(d: Decl, seen: Decl[]) {
+	private complete(d: Decl) {
 		for (const e of d.deps) {
-			const t = e.nominal
-			if (e.state != "done" && !contains(seen, e)) {
-				seen.push(e)
-				if (t != null) {
-					members(t)
+			if (e.state != "done" && !e.ahead) {
+				if (e.nominal != null) {
+					members(e.nominal!)
 				}
 				this.ahead(e)
-				this.complete(e, seen)
+				this.complete(e)
 			}
 		}
 	}
 
 	/// Declares d to the next stage ahead of handing it on, once; not a test, which nothing refers to.
 	private ahead(d: Decl) {
-		if (!d.ahead && d.kind != "test" && !this.modules.failed) {
+		if (!d.ahead && d.kind != "test") {
 			d.ahead = true
-			this.modules.next.declare(d.node!, this.m.path, this.src)
+			if (!this.modules.failed) {
+				this.modules.next.declare(d.node!, this.m.path, this.src)
+			}
 		}
 	}
 
@@ -1325,7 +1324,7 @@ class Checker {
 			errors.listed = true
 		}
 		const params = child(n, "params")!
-		const sig = this.params(params, null)
+		const sig = this.params(params, null, bodies)
 		const ann = after(n, ":")
 		const body = bodyOf(n)
 		const result = if (ann != null) this.annotation(ann) else if (n.kind == "method" || body == null) Null else null
@@ -1349,8 +1348,9 @@ class Checker {
 	}
 
 	/// Binds params n, typed by their annotations, else by want's params, else by their defaults, and returns
-	/// the function type they make, without its result. A param that fails is Empty, and fails where used.
-	private params(n: Node, want: Type | null): Type {
+	/// the function type they make, without its result. A param that fails is Empty, and fails where used. An
+	/// annotated one's default is checked only where defaults is, with the body, as it may name what is not declared yet.
+	private params(n: Node, want: Type | null, defaults = true): Type {
 		const types: Type[] = []
 		let required = 0
 		let rest = false
@@ -1362,7 +1362,7 @@ class Checker {
 				required = i + 1
 			}
 			let pt = Empty
-			const typed = this.apart(() => { pt = this.param(p, i, want) })
+			const typed = this.apart(() => { pt = this.param(p, i, want, defaults) })
 			p.type = pt
 			types.push(pt)
 			if (typed) {
@@ -1376,13 +1376,13 @@ class Checker {
 		return t
 	}
 
-	private param(p: Node, i: i32, want: Type | null): Type {
+	private param(p: Node, i: i32, want: Type | null, defaults: bool): Type {
 		const ann = after(p, ":")
 		const init = after(p, "=")
 		const rest = p.parts[0].kind == "unary"
 		let pt = if (ann != null) this.annotation(ann) else if (want == null) null
 			else if (rest && want.rest) want.types[want.types.length - 1] else element(want, i)
-		if (init != null) {
+		if (init != null && (pt == null || defaults)) {
 			const v = this.expr(init, pt)
 			if (pt == null) {
 				pt = v.widen(true)
@@ -1619,22 +1619,14 @@ class Checker {
 			}
 			t.fields.push(f)
 			m.type = f.type
-			if (after(m, "=") != null && state != "failed") {
+			if (state == "pending") {
 				fields.push(f)
 				inits.push(m)
 			}
 		}
-		const user = this.user
 		for (const i of 0 ... inits.length - 1) {
-			const a = about(t, fields[i].name, fields[i].static)
-			if (a.decl != null && after(inits[i], "=")!.kind != "arrow") {
-				this.vars.push(a.decl!)
-			}
-			this.user = a.decl ?? user
-			const ok = this.apart(() => this.initializer(inits[i], fields[i], t))
-			a.state = if (ok) "typed" else "failed"
+			about(t, fields[i].name, fields[i].static).state = if (this.initializer(inits[i], fields[i], t)) "typed" else "failed"
 		}
-		this.user = user
 		this.locals.leave()
 	}
 
@@ -1728,24 +1720,36 @@ class Checker {
 		return "typed"
 	}
 
-	/// Checks the initializer of member m, typing field f by it where m has no type.
-	private initializer(m: Node, f: Field, t: Type) {
+	/// Checks the initializer of member m of class t, typing field f by it where m has no type, as a use of the member's
+	/// declaration if it has one (3), and returns whether it did not fail.
+	private initializer(m: Node, f: Field, t: Type): bool {
 		const init = after(m, "=")!
-		const want = if (f.embedded) embedding(f.type) else if (after(m, ":") == null) null else f.type
-		this.self = if (has(m, "static")) null else selfOf(t)
-		const v = this.expr(init, want)
-		if (want == null) {
-			f.type = v.widen(true)
-			m.type = f.type
-			this.convert(init, f.type)
-		} else {
-			this.fit(v, want, init)
+		const a = about(t, f.name, f.static)
+		if (a.decl != null && init.kind != "arrow") {
+			this.vars.push(a.decl!)
 		}
+		const user = this.user
+		this.user = a.decl ?? user
+		const ok = this.apart(() => {
+			const want = if (f.embedded) embedding(f.type) else if (after(m, ":") == null) null else f.type
+			this.self = if (has(m, "static")) null else selfOf(t)
+			const v = this.expr(init, want)
+			if (want == null) {
+				f.type = v.widen(true)
+				m.type = f.type
+				this.convert(init, f.type)
+			} else {
+				this.fit(v, want, init)
+			}
+		})
+		this.user = user
+		return ok
 	}
 
-	/// Checks what a class's type leaves out: that it implements its interfaces, and its methods' bodies.
+	/// Checks what a class's type leaves out: that it implements its interfaces, its methods' bodies, and its annotated
+	/// members' initializers.
 	private classBody(n: Node, t: Type) {
-		members(t)
+		const fs = members(t) // one per member, or none if its type params failed
 		if (t.kind == "class") {
 			for (const s of supers(n)) {
 				this.apart(() => {
@@ -1764,14 +1768,18 @@ class Checker {
 		const user = this.user
 		this.locals.enter()
 		this.typeParams(n, t.params, false)
-		for (const m of child(n, "members")!.parts) {
+		const ms = child(n, "members")!.parts
+		for (const i of 0 ... ms.length - 1) {
+			const m = ms[i]
+			const static = has(m, "static")
+			const a = about(t, this.key(m.t), static)
 			if (m.kind == "method") {
-				const static = has(m, "static")
-				const a = about(t, this.key(m.t), static)
 				this.self = if (static) null else selfOf(t)
 				this.user = a.decl ?? user
 				const builds = if (!static && this.key(m.t) == "constructor") t else null
 				this.apart(() => { this.function(m, null, true, a.errors, builds) })
+			} else if (fs.length == ms.length && after(m, ":") != null && after(m, "=") != null && a.state == "typed") {
+				this.initializer(m, fs[i], t)
 			}
 		}
 		this.user = user
@@ -2669,14 +2677,8 @@ class Checker {
 	private typeOf(b: Binding, at: Tok): Type {
 		const d = b.decl
 		if (b.type == null && d != null && d.state == "new") {
-			const n = d.node!
-			if (n.kind == "function" && after(n, ":") != null) {
-				d.state = "busy"
-				try {
-					this.within(d, () => { b.type = this.function(n, null, false) })
-				} finally {
-					d.state = "new"
-				}
+			if (d.kind == "function" && declaresType(d.node!)) {
+				this.signature(d)
 			} else {
 				this.settle(d)
 			}
@@ -2697,10 +2699,6 @@ class Checker {
 		const t = b.type
 		if (t == null || b.failed) {
 			throw new Failed()
-		}
-		// An alias's type is not yet known while its own is read, which a class it names may hold.
-		if (b.isType && this.owner?.kind != "type") {
-			members(t)
 		}
 		return t
 	}
@@ -3387,7 +3385,7 @@ class Checker {
 		const t = this.inferred(n, args, known, want) ?? this.typeExpr(n.parts[0])
 		switch (t.kind) {
 			case "class":
-				if (staticOnly(t)) {
+				if (t.staticOnly()) {
 					throw this.error(start(n.parts[0]), `${show(t)} has only statics; it is not instantiated`)
 				}
 				const c = t.member("constructor")
@@ -3419,10 +3417,9 @@ class Checker {
 		if (g.kind != "class" || ps.length == 0 || g.params != ps) {
 			return null
 		}
-		members(g)
 		const c = g.member("constructor")
 		const f = this.infer(returning(if (c?.kind == "function") c! else Type.function([], Null), g, ps), args, n.t, known, want)
-		p.type = instance(g, f.base!.params)
+		p.type = g.instantiate(f.base!.params)
 		return p.type
 	}
 
@@ -3448,7 +3445,7 @@ class Checker {
 			throw this.error(n.t.loc, "an empty array needs a type")
 		}
 		// Not yet a variable's, a literal's elements are not their literal types, so ["a"] fits a string[].
-		return w ?? arrayOf(if (elem!.kind == "literal" && elem!.params.length == 0) elem!.base! else elem!)
+		return w ?? Type.array(if (elem!.kind == "literal" && elem!.params.length == 0) elem!.base! else elem!)
 	}
 
 	/// An object literal's type: the class a spread of one gives it, whose other parts shall be its fields (4.8),
@@ -3595,7 +3592,7 @@ class Checker {
 				const [base, ps] = if (isTok(a, "ident")) this.named(a) else [this.typeExpr(a), []]
 				a.type = base
 				if (p.parts.length == 1) {
-					return arrayOf(this.applied(base, ps, [], a))
+					return Type.array(this.applied(base, ps, [], a))
 				}
 				const len = this.constant(p.parts[1])
 				if (len != null && p.parts.length == 2) {
@@ -3621,7 +3618,7 @@ class Checker {
 					if (m.kind != "method" && ann == null) {
 						throw this.error(m.t.loc, "a member needs a type")
 					}
-					const mt = if (m.kind == "method") this.function(m, null, false) else this.typeExpr(ann!)
+					const mt = if (m.kind == "method") this.function(m, null, true) else this.typeExpr(ann!)
 					m.type = mt
 					fs.push(new Field(this.key(m.t), mt))
 				}
@@ -3677,6 +3674,9 @@ class Checker {
 		if (ps.length == 0) {
 			return g
 		}
+		if (g.params == ps && this.owner?.kind != "type") {
+			members(g) // its params' constraints and defaults are typed with its members
+		}
 		const targs: Type[] = []
 		for (const i of 0 ... ps.length - 1) {
 			const a = if (i < args.length) args[i] else this.byDefault(ps, i, targs, start(at))
@@ -3685,7 +3685,7 @@ class Checker {
 			}
 			targs.push(this.satisfying(a, ps, targs, start(at)))
 		}
-		return if (g.params != ps) substitute(g, ps, targs) else if (g.kind == "function") g.instantiate(targs) else instance(g, targs)
+		return if (g.params != ps) substitute(g, ps, targs) else g.instantiate(targs)
 	}
 
 	/// Generic function f instantiated with the type args that args give, else their defaults (4.9). Each arg is checked
@@ -3726,7 +3726,7 @@ class Checker {
 			if (a == null) {
 				throw this.error(at.loc, `cannot infer ${show(ps[i])}`)
 			}
-			targs.push(this.satisfying(a, ps, targs, at.loc))
+			targs.push(this.satisfying(a, ps, targs, at.loc, true))
 		}
 		return f.instantiate(targs)
 	}
@@ -3757,13 +3757,25 @@ class Checker {
 	}
 
 	/// a, reported where it does not fit the constraint of the param of ps after those with the args before it, the
-	/// param itself standing for a in it, as T in `T extends Eq[T]`.
-	private satisfying(a: Type, ps: Type[], args: Type[], at: Loc): Type {
+	/// param itself standing for a in it, as T in `T extends Eq[T]`. While a class or interface is filled in, the check
+	/// of a type arg written waits for the members a and c may name, theirs included; one inferred is checked at once,
+	/// as the call goes on with it.
+	private satisfying(a: Type, ps: Type[], args: Type[], at: Loc, inferred = false): Type {
 		const p = ps[args.length]
 		const k = p.base
 		const c = if (k == null) null else substitute(k, ps.slice(0, args.length + 1), [...args, a])
-		if (c != null && !this.defaulting && !a.fits(c)) {
-			throw this.error(at, `${show(a)} does not fit ${show(p)}'s constraint ${show(c)}`)
+		if (c == null || this.defaulting) {
+			return a
+		}
+		const msg = `${show(a)} does not fit ${show(p)}'s constraint ${show(c)}`
+		if (filling > 0 && !inferred) {
+			deferred.push(() => {
+				if (!a.fits(c!)) {
+					this.report(at, msg)
+				}
+			})
+		} else if (!a.fits(c)) {
+			throw this.error(at, msg)
 		}
 		return a
 	}
@@ -3780,7 +3792,7 @@ class Checker {
 	/// Reports v not fitting want, or an integer constant not representable in it.
 	private fit(v: Type, wanted: Type, at: Node) {
 		const want = this.refine(wanted)
-		if (want.kind == "interface" && staticOnly(want)) {
+		if (want.kind == "interface" && want.staticOnly()) {
 			throw this.error(start(at), `a value never fits ${show(want)}, which has only statics`)
 		}
 		if (!v.fits(want)) {
@@ -3833,7 +3845,7 @@ class Checker {
 			case "ifExpr":
 				this.convert(p.parts[1], c)
 				this.convert(p.parts[2], c)
-			case "index": this.convert(p.parts[0], arrayOf(c))
+			case "index": this.convert(p.parts[0], Type.array(c))
 			case "prop", "paren", "unary", "binary":
 				for (const q of p.parts) {
 					this.convert(q, c)
@@ -3932,11 +3944,8 @@ function fieldOf(t: Type, name: string): Field | null {
 /// What this is in the methods of class t: t, but a string or T[] in builtin/'s.
 export function selfOf(t: Type): Type { return if (t == String.base) String else if (t == Arrays.base) Type.array(t.params[0]) else t }
 
-/// The type of t used as a value (4.11), Meta filled in first, as a Type's members are read by o.member.
-function meta(t: Type): Type {
-	members(Meta)
-	return Type.literal("", Meta, [t])
-}
+/// The type of t used as a value (4.11).
+function meta(t: Type): Type { return Type.literal("", Meta, [t]) }
 
 /// The type a Type value of type t stands for, null where t is not that or the type is not known.
 export function standsFor(t: Type): Type | null { return if (t.kind == "literal" && t.base == Meta) t.params[0] else null }
@@ -3957,7 +3966,7 @@ function reflected(t: Type, name: string): Type | null {
 }
 
 /// Whether t is a type set (4.9).
-function isSet(t: Type): bool { return t.kind == "interface" && t.base != null }
+function isSet(t: Type): bool { return setOf(t) != null }
 
 /// The type set that holds ts.
 function typeSet(ts: Type[]): Type { return Type.interface(Type.union(ts)) }
@@ -4117,6 +4126,9 @@ export function tags(n: Node): Node[] {
 /// The body of arrow n, after its params and result type.
 export function arrowBody(n: Node): Node { return n.parts[if (isTok(n.parts[1], ":")) 3 else 1] }
 
+/// Whether function n declares its type without its body: it has a result type or no body.
+function declaresType(n: Node): bool { return after(n, ":") != null || bodyOf(n) == null }
+
 export function bodyOf(n: Node): Node | null {
 	const b = n.parts[n.parts.length - 1]
 	return if (b.kind == "block") b else null
@@ -4179,7 +4191,7 @@ function ofKind(p: Type, k: string): Type | null {
 		case "bool": Bool
 		case "null": Null
 		case "type": Meta
-		case "array": arrayOf(Type.derived(p, "elem", partOf(p, "elem")))
+		case "array": Type.array(Type.derived(p, "elem", partOf(p, "elem")))
 		case "fixed": Type.derived(p, "", typeSet([Type.fixed(Type.derived(p, "elem", zeros(partOf(p, "elem"))), -1)]))
 		case "": null
 		default: Type.derived(p, "", if (ts.length > 0) typeSet(ts) else ofKnown(p, k))

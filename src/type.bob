@@ -84,7 +84,7 @@ export class Type {
 	underlying(): Type | null {
 		return switch (this.kind) {
 			case "param": this.base?.underlying()
-			case "interface": this.base ?? this
+			case "interface": setOf(this) ?? this
 			default: this
 		}
 	}
@@ -122,7 +122,8 @@ export class Type {
 		return switch (this.kind) {
 			case "class": this
 			case "literal": this.base!.methods()
-			case "string", "array": this.base
+			case "string": this.base
+			case "array": filled(this).base
 			default: null
 		}
 	}
@@ -150,14 +151,15 @@ export class Type {
 				}
 				return Type.union(ts)
 			case "object", "class", "interface":
-				const f = this.fields.find(e => e.name == name && e.static == static)
+				const fs = members(this)
+				const f = fs.find(e => e.name == name && e.static == static)
 				if (f != null) {
 					return f.type
 				}
 				if (name == "constructor" && !static && this.kind == "class" && !this.staticOnly()) {
 					return Type.function([], Null)
 				}
-				for (const e of this.fields) {
+				for (const e of fs) {
 					const m = if (e.embedded) e.type.member(name, static) else null
 					if (m != null) {
 						return m
@@ -168,7 +170,10 @@ export class Type {
 	}
 
 	/// Whether it has members, all static: a class never instantiated, or an interface no value fits.
-	staticOnly(): bool { return this.fields.length > 0 && this.fields.every(f => f.static) }
+	staticOnly(): bool {
+		const fs = members(this)
+		return fs.length > 0 && fs.every(f => f.static)
+	}
 
 	/// Whether a value of this fits t.
 	///
@@ -194,7 +199,7 @@ export class Type {
 		if (s.kind == "union") {
 			return s.types.every(m => m.fits(t))
 		}
-		if (t.kind == "interface" && t.base != null && s.kind != "param") {
+		if (setOf(t) != null && s.kind != "param") {
 			return fitsRecursive(s, t)
 		}
 		if (t.kind == "union") {
@@ -336,20 +341,8 @@ export class Type {
 		if (this.kind == "function") {
 			return Type.function(this.types.map(p => p.in(this, args)), this.base?.in(this, args), this.n, this.rest)
 		}
-		// Made once, its members after, as they may refer to it.
-		const t: Type = { ...new Type(this.kind), generic: this, params: args }
-		const u = intern(t)
-		if (u == t) {
-			t.refill()
-		}
-		return u
-	}
-
-	/// Takes an instance's members and base anew from its generic's, as filled in since it was made.
-	refill() {
-		const g = this.generic!
-		this.fields = g.fields.map(f => new Field(f.name, f.type.in(g, this.params), f.embedded, f.static))
-		this.base = g.base?.in(g, this.params)
+		// Made once, its members taken from its generic's when first asked (members), as they may refer to it.
+		return intern({ ...new Type(this.kind), generic: this, params: args })
 	}
 
 	/// This as it is in generic g's instance for args: with g's params as args, those past args left.
@@ -690,6 +683,43 @@ function among(t: Type, ts: Type[]): bool {
 	return i < ts.length && ts[i] == t
 }
 
+/// Fills in the members of a class or interface declared but not yet filled in: the checker's, which declares them.
+let fill = (t: Type) => {}
+
+export function fillWith(f: (t: Type) => void) { fill = f }
+
+/// The members of t, its class or interface filled in first if it is not yet, and an instance's taken from its
+/// generic's where those have grown or been typed since they were last taken.
+export function members(t: Type): Field[] { return filled(t).fields }
+
+/// The type set (4.9) interface t holds, null if it holds members, or if t is not an interface.
+export function setOf(t: Type): Type | null { return if (t.kind == "interface") filled(t).base else null }
+
+/// t with its members filled in. The fits found while filling may rest on members not declared yet, so they are dropped.
+function filled(t: Type): Type {
+	const g = t.generic ?? t
+	const n = tried.length
+	fill(g)
+	while (tried.length > n) {
+		fitted.delete(tried.pop())
+	}
+	if (g != t && (t.fields.length != g.fields.length || t.base == null && g.base != null || behind(t.fields, g.fields))) {
+		t.fields = g.fields.map(f => new Field(f.name, f.type.in(g, t.params), f.embedded, f.static))
+		t.base = g.base?.in(g, t.params)
+	}
+	return t
+}
+
+/// Whether a field of an instance's fs is not typed yet where its generic's in gs is since.
+function behind(fs: Field[], gs: Field[]): bool {
+	for (const i of 0 ... fs.length - 1) {
+		if (fs[i].type == Empty && gs[i].type != Empty) {
+			return true
+		}
+	}
+	return false
+}
+
 /// Whether s fits t, an object type, interface or type set, which may refer to itself: s is assumed to fit while it is
 /// worked out, and if it does not, what was found since may rest on that, so it is dropped. Each is worked out once.
 function fitsRecursive(s: Type, t: Type): bool {
@@ -707,13 +737,14 @@ function fitsRecursive(s: Type, t: Type): bool {
 			fitted.delete(tried.pop())
 		}
 		fitted.set(k, false)
+		tried.push(k)
 	}
 	return f
 }
 
 /// Whether s fits what t embeds, and has each other member of t, static or not, with a fitting type.
 function hasMembers(s: Type, t: Type): bool {
-	for (const f of t.fields) {
+	for (const f of members(t)) {
 		if (f.embedded) {
 			if (!s.fits(f.type)) {
 				return false
@@ -742,7 +773,7 @@ function inInterface(s: Type, t: Type): bool {
 			else null
 		switch (m.kind) {
 			case "object",
-				"interface": if (s.fits(m) && s.fields.every(f => f.static || f.type.kind == "function" || f.type.fits(t))) {
+				"interface": if (s.fits(m) && members(s).every(f => f.static || f.type.kind == "function" || f.type.fits(t))) {
 				return true
 			}
 			case "array": if (s.kind == "array" && s.params[0].fits(e!)
@@ -779,10 +810,10 @@ let count = -1
 
 /// Each field of an object type made so far.
 const madeFields = new HashMap[Field, Field]()
-/// Each fits asked so far, by the value's type and the target's. A class, interface or param is filled in
-/// after it is made, so its members shall be known before the first fits that reaches them.
+/// Each fits asked so far, by the value's type and the target's.
 const fitted = new HashMap[[Type, Type], bool]()
-/// The fits assumed or found since the outermost one still checked began, to drop if one fails.
+/// The fits memoized, in order, so that those since a point are dropped: those resting on an assumption that fails
+/// (fitsRecursive), and those found while a class or interface is filled in (filled).
 const tried: [Type, Type][] = []
 
 function fresh(): i32 {

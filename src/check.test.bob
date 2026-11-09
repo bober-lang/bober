@@ -78,6 +78,10 @@ test "each declaration is handed on typed once checked" {
 		== "(var:i32[] a:i32[] (array:i32[] 1:i32 2:i32)) (var:{ k: i32 } o:{ k: i32 } (object:{ k: i32 } (prop:i32 (unary:i32 1:i32))))"
 }
 
+test "a function with a result type is called in a class's initializer before its body is checked" {
+	assert errors("class C {\n\tx = f()\n\ty = 2\n}\nfunction f(): i32 {\n\tconst c = new C()\n\tconst s: string = c.y\n\treturn 1\n}") == "86: expected string, got i32"
+}
+
 test "values fit their declared types" {
 	assert errors("const a: i32 = 1\nconst b: i32 | null = null\nconst c: string = \"s\"") == ""
 	assert errors("const a: i32 = \"s\"") == "15: expected i32, got \"s\""
@@ -199,6 +203,7 @@ test "calls" {
 	assert errors("function apply(f: (x: i32) => i32, x: i32): i32 { return f(x) }\nconst y = apply(x => x * 3, 2)") == ""
 	assert errors("const f = (x: i32) => x\nconst b = f(\"s\")") == "36: expected i32, got \"s\""
 	assert errors("function f(n: i32) { return f(n) }") == "28: f calls itself, so it needs a result type"
+	assert errors("function f(x: i32 = g()): i32 { return x }\nfunction g() { return f(1) }") == ""
 	assert errors("function f(): string { return 1 }") == "30: expected string, got untyped int"
 	assert errors("function f(a: i32, b: i32): i32 { return a }\nconst g: (a: i32, b: i32 = 0) => i32 = f")
 		== "84: expected (i32, i32) => i32, got (i32, i32) => i32"
@@ -228,6 +233,9 @@ test "classes and interfaces" {
 	assert errors("class A {\n\tx: i32 = \"s\"\n}") == "20: expected i32, got \"s\""
 	assert errors("class A {\n\tf(): string { return this.x }\n\tx: i32 = 0\n}") == "32: expected string, got i32"
 	assert errors("class A {\n\tx: i32 = 1\n\ty = this.x\n}\nconst b: string = new A().y") == "54: expected string, got i32"
+	// An interface's members name one that extends it.
+	assert errors("interface A {\n\tf(x: B): i32\n\tg(): i32\n}\ninterface B extends A {}\nfunction h(b: B): i32 { return b.g() }") == ""
+	assert errors("type O = {\n\tf(x: i32 = \"s\"): i32\n}") == "23: expected i32, got \"s\""
 	assert errors("interface I {\n\ta: i32\n}\nconst a: I = { a: \"s\" }") == "42: expected i32, got \"s\""
 	assert errors("class A {\n\tx = 1\n}\n\nconst a: A = { x: 1 }") == "33: expected A, got { x: untyped int }"
 	assert errors("class P {\n\tx = 1\n}\n\nclass Q {\n\tp: ...P = { x: 2 }\n\n\tf() { this.p = { ...new P() } }\n}") == ""
@@ -310,6 +318,10 @@ export class Box @Experimental {
 test "generics" {
 	const id = "function id[T](x: T): T { return x }\n"
 	assert errors(id + "const a: i32 = id(5)\nconst b: string = id(5)\nconst c = id[i64](5)") == "76: expected string, got i32"
+	// An instance made while its generic's members are typed takes their types once they are.
+	assert errors("class B[T] {\n\ta = 1\n\tb = new B[i32]().a\n\n\tget(): T | null { return null }\n}\nconst x: string = new B[i32]().b")
+		== "94: expected string, got i32"
+	assert errors("class B[T extends Nope] {\n\tx: i32 = 1\n}") == "18: Nope is not declared"
 	assert errors("type Opt[T] = T | null\ntype Pair[A, B = A] = [A, B]\nconst o: Opt[i32] = null\nconst p: Pair[i32] = [1, 2]\nconst q: Pair = [1, 2]")
 		== "114: Pair needs a type argument for A"
 	assert errors("interface Signed extends i8 | i16 | i32 | i64 {}\nfunction neg[T extends Signed](x: T): T { return -x }\nconst a = neg(1 as u8)\nlet s: Signed")
@@ -346,11 +358,21 @@ test "F-bounded constraint" {
 	const classes = "class P {\n\tx = 0\n\n\tequals(o: P): bool { return this.x == o.x }\n}\nclass Q {\n\tx = 0\n}\n"
 	assert errors(key + f + classes + "const a = f(new P(), new P())\nconst b = f(1, 2)\nconst c = f(new Q(), new Q())\nconst d = f(\"a\", \"b\")")
 		== "328: Q does not fit K's constraint Key[Q]; 358: string does not fit K's constraint Key[string]"
+	// A class's or interface's own members are declared before it is checked against a constraint in them.
+	assert errors("interface Eq[T] {\n\tequals(o: T): bool\n}\nclass Set[T extends Eq[T]] {}\nclass P {\n\ts: Set[P] | null = null\n\n\tequals(o: P): bool { return true }\n}\nclass Q {\n\ts: Set[Q] | null = null\n}") == "158: Q does not fit T's constraint Eq[Q]"
+	assert errors(key + "class Box[T extends Eq[T]] {\n\tv = 0\n}\nclass P {\n\tb: ...Box[P]\n\n\tequals(o: P): bool { return true }\n}\ninterface Q extends Key[Q] {\n\tequals(o: Q): bool\n}") == ""
+	// So is a method's default, checked with its body.
+	assert errors(key + "function g(x: Eq[P]): i32 { return 1 }\nclass P {\n\tm(k: i32 = g(new P())): i32 { return 1 }\n\n\tequals(o: P): bool { return true }\n}") == ""
+	// A generic's constraints are typed before it is applied, wherever that is; the check is put off, not lost.
+	assert errors(key + "class C {\n\tx: Box[Q] | null = null\n}\nclass Box[T extends Eq[T]] {\n\tv = 0\n}\nclass Q {\n\tx = 0\n}") == "94: Q does not fit T's constraint Eq[Q]"
+	assert errors("class Box[T extends I] {\n\tv = 0\n}\ninterface I {\n\tm(): i32\n}\nfunction f(x: Box[P]): i32 {\n\treturn 1\n}\nclass P {\n\ty: Box[P] | null = null\n}")
+		== "74: P does not fit T's constraint I; 115: P does not fit T's constraint I"
 }
 
 test "a default's constraint is checked where the default is used" {
 	const decls = "interface Small extends i8 | i16 {}\nclass Auto[K extends Small] {}\nclass Box[K, H = Auto[K]] {}\n"
 	assert errors(decls + "const a = new Box[i8]()\nconst b = new Box[f64, i32]()\nconst c = new Box[f64]()") == "164: f64 does not fit K's constraint Small"
+	assert errors("class C {\n\tx: Box | null = null\n}\nclass Box[T = i32] {\n\tv = 0\n}") == ""
 }
 
 test "an interface of statics constrains a type param, through which its statics are called" {
