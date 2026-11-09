@@ -1,0 +1,274 @@
+//! The error function erf(x) = 2/sqrt(pi) ∫₀ˣ e^(-t²) dt and its complement erfc(x) = 1 - erf(x); each for f64 and,
+//! suffixed f, f32. Below |x| = 0.84375, x + x R(x²); to 1.25, a rational function about 1; beyond, erfc(x) ~
+//! e^(-x² - 0.5625 + R(1/x²)) / x, with e^(-x²) split so as not to lose x²'s low bits.
+//!
+//! Ported from musl 1.2.5, MIT, Copyright © 2005-2020 Rich Felker, et al. (vendor/musl/COPYRIGHT), from FreeBSD:
+//! Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved. Developed at SunPro, a Sun Microsystems, Inc.
+//! business. Permission to use, copy, modify, and distribute this software is freely granted, provided that this
+//! notice is preserved. erff and erfcf converted to float by Ian Lance Taylor, Cygnus Support.
+
+import { asF32, asF64, asU32, asU64 } from "./bits"
+import { exp, expf } from "./exp"
+import { fabs, fabsf } from "./ieee"
+
+/// erf(1) to 24 bits.
+const erx = 0.8450629115104675
+const efx8 = 1.0270333367641007
+// erf(x) ~ x + x pp(x²)/qq(x²) on [0, 0.84375]
+const pp0 = 0.12837916709551256
+const pp1 = -0.3250421072470015
+const pp2 = -0.02848174957559851
+const pp3 = -0.005770270296489442
+const pp4 = -2.3763016656650163e-05
+const qq1 = 0.39791722395915535
+const qq2 = 0.0650222499887673
+const qq3 = 0.005081306281875766
+const qq4 = 0.00013249473800432164
+const qq5 = -3.960228278775368e-06
+// erf(1 + s) - erx ~ pa(s)/qa(s) on [0.84375, 1.25]
+const pa0 = -0.0023621185607526594
+const pa1 = 0.41485611868374833
+const pa2 = -0.3722078760357013
+const pa3 = 0.31834661990116175
+const pa4 = -0.11089469428239668
+const pa5 = 0.035478304325618236
+const pa6 = -0.002166375594868791
+const qa1 = 0.10642088040084423
+const qa2 = 0.540397917702171
+const qa3 = 0.07182865441419627
+const qa4 = 0.12617121980876164
+const qa5 = 0.01363708391202905
+const qa6 = 0.011984499846799107
+// log(x erfc(x)) + x² + 0.5625 ~ ra(z)/sa(z), z = 1/x², on [1.25, 1/0.35]
+const ra0 = -0.009864944034847148
+const ra1 = -0.6938585727071818
+const ra2 = -10.558626225323291
+const ra3 = -62.375332450326006
+const ra4 = -162.39666946257347
+const ra5 = -184.60509290671104
+const ra6 = -81.2874355063066
+const ra7 = -9.814329344169145
+const sa1 = 19.651271667439257
+const sa2 = 137.65775414351904
+const sa3 = 434.56587747522923
+const sa4 = 645.3872717332679
+const sa5 = 429.00814002756783
+const sa6 = 108.63500554177944
+const sa7 = 6.570249770319282
+const sa8 = -0.0604244152148581
+// ... and ~ rb(z)/sb(z) on [1/0.35, 28]
+const rb0 = -0.0098649429247001
+const rb1 = -0.799283237680523
+const rb2 = -17.757954917754752
+const rb3 = -160.63638485582192
+const rb4 = -637.5664433683896
+const rb5 = -1025.0951316110772
+const rb6 = -483.5191916086514
+const sb1 = 30.33806074348246
+const sb2 = 325.7925129965739
+const sb3 = 1536.729586084437
+const sb4 = 3199.8582195085955
+const sb5 = 2553.0504064331644
+const sb6 = 474.52854120695537
+const sb7 = -22.44095244658582
+
+/// pp(z)/qq(z).
+function pq(z: f64): f64 {
+	return (pp0 + z * (pp1 + z * (pp2 + z * (pp3 + z * pp4)))) / (1.0 + z * (qq1 + z * (qq2 + z * (qq3 + z * (qq4
+		+ z * qq5)))))
+}
+
+/// erfc(x), |x| in [0.84375, 1.25).
+function erfc1(x: f64): f64 {
+	const s = fabs(x) - 1.0
+	const p = pa0 + s * (pa1 + s * (pa2 + s * (pa3 + s * (pa4 + s * (pa5 + s * pa6)))))
+	const q = 1.0 + s * (qa1 + s * (qa2 + s * (qa3 + s * (qa4 + s * (qa5 + s * qa6)))))
+	return 1.0 - erx - p / q
+}
+
+/// erfc(|x|), |x| in [0.84375, 28), ix its high word less the sign.
+function erfc2(ix: u32, x0: f64): f64 {
+	if (ix < 0x3ff40000) {
+		return erfc1(x0)
+	}
+	const x = fabs(x0)
+	const s = 1.0 / (x * x)
+	let r = 0.0
+	let q = 0.0
+	if (ix < 0x4006db6d) {
+		// |x| < 1/0.35
+		r = ra0 + s * (ra1 + s * (ra2 + s * (ra3 + s * (ra4 + s * (ra5 + s * (ra6 + s * ra7))))))
+		q = 1.0 + s * (sa1 + s * (sa2 + s * (sa3 + s * (sa4 + s * (sa5 + s * (sa6 + s * (sa7 + s * sa8)))))))
+	} else {
+		r = rb0 + s * (rb1 + s * (rb2 + s * (rb3 + s * (rb4 + s * (rb5 + s * rb6)))))
+		q = 1.0 + s * (sb1 + s * (sb2 + s * (sb3 + s * (sb4 + s * (sb5 + s * (sb6 + s * sb7))))))
+	}
+	const z = asF64(asU64(x) & 0xffffffff00000000) // so that z² is exact, and -x² = -z² + (z - x)(z + x)
+	return exp(-z * z - 0.5625) * exp((z - x) * (z + x) + r / q) / x
+}
+
+export function erf(x: f64): f64 {
+	const sign = (asU64(x) >> 63) as i32
+	const ix = ((asU64(x) >> 32) as u32) & 0x7fffffff
+	if (ix >= 0x7ff00000) {
+		return ((1 - 2 * sign) as f64) + 1.0 / x // ±1, or NaN
+	}
+	if (ix < 0x3feb0000) {
+		// |x| < 0.84375
+		if (ix < 0x3e300000) {
+			return 0.125 * (8.0 * x + efx8 * x) // |x| < 2^-28
+		}
+		return x + x * pq(x * x)
+	}
+	const y = if (ix < 0x40180000) 1.0 - erfc2(ix, x) else 1.0 // |x| < 6
+	return if (sign != 0) -y else y
+}
+
+export function erfc(x: f64): f64 {
+	const sign = (asU64(x) >> 63) as i32
+	const ix = ((asU64(x) >> 32) as u32) & 0x7fffffff
+	if (ix >= 0x7ff00000) {
+		return ((2 * sign) as f64) + 1.0 / x // 0 or 2, or NaN
+	}
+	if (ix < 0x3feb0000) {
+		// |x| < 0.84375
+		if (ix < 0x3c700000) {
+			return 1.0 - x // |x| < 2^-56
+		}
+		const y = pq(x * x)
+		if (sign != 0 || ix < 0x3fd00000) {
+			return 1.0 - (x + x * y) // x < 1/4
+		}
+		return 0.5 - (x - 0.5 + x * y)
+	}
+	if (ix < 0x403c0000) {
+		// |x| < 28
+		return if (sign != 0) 2.0 - erfc2(ix, x) else erfc2(ix, x)
+	}
+	return if (sign != 0) 2.0 else 0.0
+}
+
+const erxf: f32 = 0.8450629115104675
+const efx8f: f32 = 1.0270333290100098
+const pp0f: f32 = 0.12837916612625122
+const pp1f: f32 = -0.32504209876060486
+const pp2f: f32 = -0.028481749817728996
+const pp3f: f32 = -0.005770270247012377
+const pp4f: f32 = -2.3763017452438362e-05
+const qq1f: f32 = 0.3979172110557556
+const qq2f: f32 = 0.06502225250005722
+const qq3f: f32 = 0.0050813062116503716
+const qq4f: f32 = 0.0001324947370449081
+const qq5f: f32 = -3.9602282413397916e-06
+const pa0f: f32 = -0.0023621185682713985
+const pa1f: f32 = 0.41485610604286194
+const pa2f: f32 = -0.3722078800201416
+const pa3f: f32 = 0.31834661960601807
+const pa4f: f32 = -0.11089469492435455
+const pa5f: f32 = 0.03547830507159233
+const pa6f: f32 = -0.002166375517845154
+const qa1f: f32 = 0.10642088204622269
+const qa2f: f32 = 0.5403979420661926
+const qa3f: f32 = 0.07182865589857101
+const qa4f: f32 = 0.12617121636867523
+const qa5f: f32 = 0.01363708358258009
+const qa6f: f32 = 0.011984500102698803
+const ra0f: f32 = -0.009864944033324718
+const ra1f: f32 = -0.6938585638999939
+const ra2f: f32 = -10.558626174926758
+const ra3f: f32 = -62.37533187866211
+const ra4f: f32 = -162.39666748046875
+const ra5f: f32 = -184.60508728027344
+const ra6f: f32 = -81.28743743896484
+const ra7f: f32 = -9.814329147338867
+const sa1f: f32 = 19.65127182006836
+const sa2f: f32 = 137.6577606201172
+const sa3f: f32 = 434.5658874511719
+const sa4f: f32 = 645.3872680664062
+const sa5f: f32 = 429.0081481933594
+const sa6f: f32 = 108.63500213623047
+const sa7f: f32 = 6.570249557495117
+const sa8f: f32 = -0.06042441353201866
+const rb0f: f32 = -0.009864943102002144
+const rb1f: f32 = -0.7992832660675049
+const rb2f: f32 = -17.75795555114746
+const rb3f: f32 = -160.63638305664062
+const rb4f: f32 = -637.5664672851562
+const rb5f: f32 = -1025.0950927734375
+const rb6f: f32 = -483.5191955566406
+const sb1f: f32 = 30.33806037902832
+const sb2f: f32 = 325.7925109863281
+const sb3f: f32 = 1536.7296142578125
+const sb4f: f32 = 3199.858154296875
+const sb5f: f32 = 2553.05029296875
+const sb6f: f32 = 474.5285339355469
+const sb7f: f32 = -22.44095230102539
+
+function pqf(z: f32): f32 {
+	return (pp0f + z * (pp1f + z * (pp2f + z * (pp3f + z * pp4f)))) / (1.0 + z * (qq1f + z * (qq2f + z * (qq3f
+		+ z * (qq4f + z * qq5f)))))
+}
+
+function erfc1f(x: f32): f32 {
+	const s = fabsf(x) - 1.0
+	const p = pa0f + s * (pa1f + s * (pa2f + s * (pa3f + s * (pa4f + s * (pa5f + s * pa6f)))))
+	const q = 1.0 + s * (qa1f + s * (qa2f + s * (qa3f + s * (qa4f + s * (qa5f + s * qa6f)))))
+	return 1.0 - erxf - p / q
+}
+
+function erfc2f(ix: u32, x0: f32): f32 {
+	if (ix < 0x3fa00000) {
+		return erfc1f(x0)
+	}
+	const x = fabsf(x0)
+	const s = 1.0 / (x * x)
+	let r: f32 = 0.0
+	let q: f32 = 0.0
+	if (ix < 0x4036db6d) {
+		r = ra0f + s * (ra1f + s * (ra2f + s * (ra3f + s * (ra4f + s * (ra5f + s * (ra6f + s * ra7f))))))
+		q = 1.0 + s * (sa1f + s * (sa2f + s * (sa3f + s * (sa4f + s * (sa5f + s * (sa6f + s * (sa7f + s * sa8f)))))))
+	} else {
+		r = rb0f + s * (rb1f + s * (rb2f + s * (rb3f + s * (rb4f + s * (rb5f + s * rb6f)))))
+		q = 1.0 + s * (sb1f + s * (sb2f + s * (sb3f + s * (sb4f + s * (sb5f + s * (sb6f + s * sb7f))))))
+	}
+	const z = asF32(asU32(x) & 0xffffe000)
+	return expf(-z * z - 0.5625) * expf((z - x) * (z + x) + r / q) / x
+}
+
+export function erff(x: f32): f32 {
+	const sign = (asU32(x) >> 31) as i32
+	const ix = asU32(x) & 0x7fffffff
+	if (ix >= 0x7f800000) {
+		return ((1 - 2 * sign) as f32) + 1.0 / x
+	}
+	if (ix < 0x3f580000) {
+		if (ix < 0x31800000) {
+			return 0.125 * (8.0 * x + efx8f * x)
+		}
+		return x + x * pqf(x * x)
+	}
+	const y = if (ix < 0x40c00000) 1.0 - erfc2f(ix, x) else 1.0
+	return if (sign != 0) -y else y
+}
+
+export function erfcf(x: f32): f32 {
+	const sign = (asU32(x) >> 31) as i32
+	const ix = asU32(x) & 0x7fffffff
+	if (ix >= 0x7f800000) {
+		return ((2 * sign) as f32) + 1.0 / x
+	}
+	if (ix < 0x3f580000) {
+		if (ix < 0x23800000) {
+			return 1.0 - x
+		}
+		const y = pqf(x * x)
+		if (sign != 0 || ix < 0x3e800000) {
+			return 1.0 - (x + x * y)
+		}
+		return 0.5 - (x - 0.5 + x * y)
+	}
+	if (ix < 0x41e00000) {
+		return if (sign != 0) 2.0 - erfc2f(ix, x) else erfc2f(ix, x)
+	}
+	return if (sign != 0) 2.0 else 0.0
+}

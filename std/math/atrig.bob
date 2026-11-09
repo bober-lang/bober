@@ -1,0 +1,398 @@
+//! The inverse trigonometric functions, arcsine, arccosine and arctangent, and the arctangent of y/x in all four
+//! quadrants; each for f64 and, suffixed f, f32.
+//!
+//! Ported from musl 1.2.5, MIT, Copyright © 2005-2020 Rich Felker, et al. (vendor/musl/COPYRIGHT), from FreeBSD:
+//! Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved. Developed at SunSoft, a Sun Microsystems, Inc.
+//! business. Permission to use, copy, modify, and distribute this software is freely granted, provided that this
+//! notice is preserved. f32 versions by Ian Lance Taylor, Cygnus Support.
+
+import { asF32, asF64, asU32, asU64, pi } from "./bits"
+import { fabs, fabsf } from "./ieee"
+import { sqrt, sqrtf } from "./root"
+
+const pio2Hi = 1.57079632679489655800e+00
+const pio2Lo = 6.12323399573676603587e-17
+// asin(x) ~ x + x^3 R(x^2) on [-0.5, 0.5], R a rational function
+const pS0 = 1.66666666666666657415e-01
+const pS1 = -3.25565818622400915405e-01
+const pS2 = 2.01212532134862925881e-01
+const pS3 = -4.00555345006794114027e-02
+const pS4 = 7.91534994289814532176e-04
+const pS5 = 3.47933107596021167570e-05
+const qS1 = -2.40339491173441421878e+00
+const qS2 = 2.02094576023350569471e+00
+const qS3 = -6.88283971605453293030e-01
+const qS4 = 7.70381505559019352791e-02
+
+function rational(z: f64): f64 {
+	const p = z * (pS0 + z * (pS1 + z * (pS2 + z * (pS3 + z * (pS4 + z * pS5)))))
+	const q = 1.0 + z * (qS1 + z * (qS2 + z * (qS3 + z * qS4)))
+	return p / q
+}
+
+/// x's upper 32 bits, its low ones 0.
+function upper(x: f64): f64 { return asF64(asU64(x) & 0xffffffff00000000) }
+
+export function asin(x: f64): f64 {
+	const u = asU64(x)
+	const hx = (u >> 32) as u32
+	const ix = hx & 0x7fffffff
+	if (ix >= 0x3ff00000) {
+		// |x| >= 1, or NaN
+		if ((ix - 0x3ff00000 | (u as u32)) == 0) {
+			return x * pio2Hi
+		}
+		return 0.0 / (x - x)
+	}
+	if (ix < 0x3fe00000) {
+		// |x| < 0.5
+		if (ix < 0x3e500000 && ix >= 0x00100000) {
+			return x
+		}
+		return x + x * rational(x * x)
+	}
+	// asin(x) = pi/2 - 2 asin(sqrt((1 - |x|)/2))
+	const z = (1.0 - fabs(x)) * 0.5
+	const s = sqrt(z)
+	const r = rational(z)
+	let y = 0.0
+	if (ix >= 0x3fef3333) {
+		// |x| > 0.975
+		y = pio2Hi - (2.0 * (s + s * r) - pio2Lo)
+	} else {
+		// f + c = sqrt(z)
+		const f = upper(s)
+		const c = (z - f * f) / (s + f)
+		y = 0.5 * pio2Hi - (2.0 * s * r - (pio2Lo - 2.0 * c) - (0.5 * pio2Hi - 2.0 * f))
+	}
+	return if (hx >> 31 != 0) -y else y
+}
+
+export function acos(x: f64): f64 {
+	const u = asU64(x)
+	const hx = (u >> 32) as u32
+	const ix = hx & 0x7fffffff
+	if (ix >= 0x3ff00000) {
+		if ((ix - 0x3ff00000 | (u as u32)) == 0) {
+			return if (hx >> 31 != 0) 2.0 * pio2Hi else 0.0
+		}
+		return 0.0 / (x - x)
+	}
+	if (ix < 0x3fe00000) {
+		if (ix <= 0x3c600000) {
+			// |x| < 2^-57
+			return pio2Hi
+		}
+		return pio2Hi - (x - (pio2Lo - x * rational(x * x)))
+	}
+	if (hx >> 31 != 0) {
+		// x < -0.5: acos(x) = pi - 2 asin(sqrt((1 + x)/2))
+		const z = (1.0 + x) * 0.5
+		const s = sqrt(z)
+		const w = rational(z) * s - pio2Lo
+		return 2.0 * (pio2Hi - (s + w))
+	}
+	// x > 0.5: acos(x) = 2 asin(sqrt((1 - x)/2))
+	const z = (1.0 - x) * 0.5
+	const s = sqrt(z)
+	const df = upper(s)
+	const c = (z - df * df) / (s + df)
+	const w = rational(z) * s + c
+	return 2.0 * (df + w)
+}
+
+/// atan of 0.5, 1, 1.5 and inf, each as a sum.
+const atanHi: f64[] = [4.63647609000806093515e-01, 7.85398163397448278999e-01, 9.82793723247329054082e-01,
+	1.57079632679489655800e+00]
+
+const atanLo: f64[] = [2.26987774529616870924e-17, 3.06161699786838301793e-17, 1.39033110312309984516e-17,
+	6.12323399573676603587e-17]
+
+// atan(x) ~ x - x^3 (aT0 + aT1 x^2 + ... + aT10 x^20) on [-7/16, 7/16]
+const aT0 = 3.33333333333329318027e-01
+const aT1 = -1.99999999998764832476e-01
+const aT2 = 1.42857142725034663711e-01
+const aT3 = -1.11111104054623557880e-01
+const aT4 = 9.09088713343650656196e-02
+const aT5 = -7.69187620504482999495e-02
+const aT6 = 6.66107313738753120669e-02
+const aT7 = -5.83357013379057348645e-02
+const aT8 = 4.97687799461593236017e-02
+const aT9 = -3.65315727442169155270e-02
+const aT10 = 1.62858201153657823623e-02
+
+export function atan(x0: f64): f64 {
+	const hx = (asU64(x0) >> 32) as u32
+	const neg = hx >> 31 != 0
+	const ix = hx & 0x7fffffff
+	if (ix >= 0x44100000) {
+		// |x| >= 2^66
+		if (x0 != x0) {
+			return x0
+		}
+		return if (neg) -atanHi[3] else atanHi[3]
+	}
+	// x reduced to within 7/16 of 0 by atan(x) = atan(c) + atan((x - c)/(1 + xc)), c the id-th of 0.5, 1, 1.5 and inf
+	let x = x0
+	let id = -1
+	if (ix < 0x3fdc0000) {
+		// |x| < 0.4375
+		if (ix < 0x3e400000) {
+			return x
+		}
+	} else {
+		x = fabs(x)
+		if (ix < 0x3fe60000) {
+			id = 0
+			x = (2.0 * x - 1.0) / (2.0 + x)
+		} else if (ix < 0x3ff30000) {
+			id = 1
+			x = (x - 1.0) / (x + 1.0)
+		} else if (ix < 0x40038000) {
+			id = 2
+			x = (x - 1.5) / (1.0 + 1.5 * x)
+		} else {
+			id = 3
+			x = -1.0 / x
+		}
+	}
+	const z = x * x
+	const w = z * z
+	// odd and even terms apart
+	const s1 = z * (aT0 + w * (aT2 + w * (aT4 + w * (aT6 + w * (aT8 + w * aT10)))))
+	const s2 = w * (aT1 + w * (aT3 + w * (aT5 + w * (aT7 + w * aT9))))
+	if (id < 0) {
+		return x - x * (s1 + s2)
+	}
+	const r = atanHi[id] - (x * (s1 + s2) - atanLo[id] - x)
+	return if (neg) -r else r
+}
+
+const piLo = 1.2246467991473531772E-16
+
+/// The angle of the point (x, y) from the x axis, in [-pi, pi].
+export function atan2(y: f64, x: f64): f64 {
+	if (x != x || y != y) {
+		return x + y
+	}
+	const ux = asU64(x)
+	const uy = asU64(y)
+	const lx = ux as u32
+	const ly = uy as u32
+	if ((((ux >> 32) as u32) - 0x3ff00000 | lx) == 0) {
+		// x = 1
+		return atan(y)
+	}
+	const m = (uy >> 63 | ux >> 62 & 2) as i32 // 2 sign(x) + sign(y)
+	const ix = (ux >> 32 & 0x7fffffff) as u32
+	const iy = (uy >> 32 & 0x7fffffff) as u32
+	if ((iy | ly) == 0) {
+		return switch (m) {
+			case 0, 1: y
+			case 2: pi
+			default: -pi
+		}
+	}
+	if ((ix | lx) == 0) {
+		return if ((m & 1) != 0) -pi / 2.0 else pi / 2.0
+	}
+	if (ix == 0x7ff00000) {
+		if (iy == 0x7ff00000) {
+			return switch (m) {
+				case 0: pi / 4.0
+				case 1: -pi / 4.0
+				case 2: 3.0 * pi / 4.0
+				default: -3.0 * pi / 4.0
+			}
+		}
+		return switch (m) {
+			case 0: 0.0
+			case 1: -0.0
+			case 2: pi
+			default: -pi
+		}
+	}
+	if (ix + (64 << 20) < iy || iy == 0x7ff00000) {
+		// |y/x| > 2^64
+		return if ((m & 1) != 0) -pi / 2.0 else pi / 2.0
+	}
+	// atan(|y/x|), without underflow where it is below 2^-64 and x < 0
+	const z = if ((m & 2) != 0 && iy + (64 << 20) < ix) 0.0 else atan(fabs(y / x))
+	return switch (m) {
+		case 0: z
+		case 1: -z
+		case 2: pi - (z - piLo)
+		default: (z - piLo) - pi
+	}
+}
+
+// as R, for f32's precision
+const pS0f: f32 = 1.6666586697e-01
+const pS1f: f32 = -4.2743422091e-02
+const pS2f: f32 = -8.6563630030e-03
+const qS1f: f32 = -7.0662963390e-01
+
+function rationalf(z: f32): f32 {
+	const p = z * (pS0f + z * (pS1f + z * pS2f))
+	const q = 1.0 + z * qS1f
+	return p / q
+}
+
+export function asinf(x: f32): f32 {
+	const hx = asU32(x)
+	const ix = hx & 0x7fffffff
+	if (ix >= 0x3f800000) {
+		if (ix == 0x3f800000) {
+			return ((x as f64) * pio2Hi) as f32
+		}
+		return 0.0 / (x - x)
+	}
+	if (ix < 0x3f000000) {
+		if (ix < 0x39800000 && ix >= 0x00800000) {
+			return x
+		}
+		return x + x * rationalf(x * x)
+	}
+	const z: f32 = (1.0 - fabsf(x)) * 0.5
+	const s = sqrt(z as f64)
+	const y = (pio2Hi - 2.0 * (s + s * (rationalf(z) as f64))) as f32
+	return if (hx >> 31 != 0) -y else y
+}
+
+const pio2Hif: f32 = 1.5707962513e+00
+const pio2Lof: f32 = 7.5497894159e-08
+
+export function acosf(x: f32): f32 {
+	const hx = asU32(x)
+	const ix = hx & 0x7fffffff
+	if (ix >= 0x3f800000) {
+		if (ix == 0x3f800000) {
+			return if (hx >> 31 != 0) 2.0 * pio2Hif else 0.0
+		}
+		return 0.0 / (x - x)
+	}
+	if (ix < 0x3f000000) {
+		if (ix <= 0x32800000) {
+			return pio2Hif
+		}
+		return pio2Hif - (x - (pio2Lof - x * rationalf(x * x)))
+	}
+	if (hx >> 31 != 0) {
+		const z: f32 = (1.0 + x) * 0.5
+		const s = sqrtf(z)
+		const w = rationalf(z) * s - pio2Lof
+		return 2.0 * (pio2Hif - (s + w))
+	}
+	const z: f32 = (1.0 - x) * 0.5
+	const s = sqrtf(z)
+	const df = asF32(asU32(s) & 0xfffff000)
+	const c = (z - df * df) / (s + df)
+	const w = rationalf(z) * s + c
+	return 2.0 * (df + w)
+}
+
+const atanHif: f32[] = [4.6364760399e-01, 7.8539812565e-01, 9.8279368877e-01, 1.5707962513e+00]
+const atanLof: f32[] = [5.0121582440e-09, 3.7748947079e-08, 3.4473217170e-08, 7.5497894159e-08]
+const aT0f: f32 = 3.3333328366e-01
+const aT1f: f32 = -1.9999158382e-01
+const aT2f: f32 = 1.4253635705e-01
+const aT3f: f32 = -1.0648017377e-01
+const aT4f: f32 = 6.1687607318e-02
+
+export function atanf(x0: f32): f32 {
+	const hx = asU32(x0)
+	const neg = hx >> 31 != 0
+	const ix = hx & 0x7fffffff
+	if (ix >= 0x4c800000) {
+		// |x| >= 2^26
+		if (x0 != x0) {
+			return x0
+		}
+		return if (neg) -atanHif[3] else atanHif[3]
+	}
+	let x = x0
+	let id = -1
+	if (ix < 0x3ee00000) {
+		if (ix < 0x39800000) {
+			return x
+		}
+	} else {
+		x = fabsf(x)
+		if (ix < 0x3f300000) {
+			id = 0
+			x = (2.0 * x - 1.0) / (2.0 + x)
+		} else if (ix < 0x3f980000) {
+			id = 1
+			x = (x - 1.0) / (x + 1.0)
+		} else if (ix < 0x401c0000) {
+			id = 2
+			x = (x - 1.5) / (1.0 + 1.5 * x)
+		} else {
+			id = 3
+			x = -1.0 / x
+		}
+	}
+	const z = x * x
+	const w = z * z
+	const s1 = z * (aT0f + w * (aT2f + w * aT4f))
+	const s2 = w * (aT1f + w * aT3f)
+	if (id < 0) {
+		return x - x * (s1 + s2)
+	}
+	const r = atanHif[id] - ((x * (s1 + s2) - atanLof[id]) - x)
+	return if (neg) -r else r
+}
+
+const pif: f32 = 3.1415927410e+00
+const piLof: f32 = -8.7422776573e-08
+
+/// The angle of the point (x, y) from the x axis, in [-pi, pi].
+export function atan2f(y: f32, x: f32): f32 {
+	if (x != x || y != y) {
+		return x + y
+	}
+	const ux = asU32(x)
+	const uy = asU32(y)
+	if (ux == 0x3f800000) {
+		return atanf(y)
+	}
+	const m = (uy >> 31 | ux >> 30 & 2) as i32
+	const ix = ux & 0x7fffffff
+	const iy = uy & 0x7fffffff
+	if (iy == 0) {
+		return switch (m) {
+			case 0, 1: y
+			case 2: pif
+			default: -pif
+		}
+	}
+	if (ix == 0) {
+		return if ((m & 1) != 0) -pif / 2.0 else pif / 2.0
+	}
+	if (ix == 0x7f800000) {
+		if (iy == 0x7f800000) {
+			return switch (m) {
+				case 0: pif / 4.0
+				case 1: -pif / 4.0
+				case 2: 3.0 * pif / 4.0
+				default: -3.0 * pif / 4.0
+			}
+		}
+		return switch (m) {
+			case 0: 0.0
+			case 1: -0.0
+			case 2: pif
+			default: -pif
+		}
+	}
+	if (ix + (26 << 23) < iy || iy == 0x7f800000) {
+		return if ((m & 1) != 0) -pif / 2.0 else pif / 2.0
+	}
+	const z: f32 = if ((m & 2) != 0 && iy + (26 << 23) < ix) 0.0 else atanf(fabsf(y / x))
+	return switch (m) {
+		case 0: z
+		case 1: -z
+		case 2: pif - (z - piLof)
+		default: (z - piLof) - pif
+	}
+}

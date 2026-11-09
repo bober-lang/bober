@@ -1,0 +1,29 @@
+import { trunc, truncf } from "./ieee"
+import { log2, log2f } from "./log"
+import { agree, agree1, agree2, c, count } from "./musl/oracle"
+import { exp10, exp10f, pow, powf } from "./pow"
+
+test "pow" {
+	agree2("pow", pow, c.pow)
+	agree2("powf", powf, c.powf)
+}
+
+/// pow on random x and y of x^y spread evenly in exponent over the finite results, about their limits too; and half
+/// the time on -x and y an integer, whose result is negative if it is odd.
+test "pow of finite results" {
+	agree("pow", (p: [f64, f64]) => pow(p[0], p[1]), (p: [f64, f64]) => c.pow(p[0], p[1]), [], count(100000), r => {
+		const x = r.float[f64]()
+		const y = (r.unit() * 2160.0 - 1100.0) / log2(x)
+		return if ((r.next() & 1) == 0) [x, y] else [-x, trunc(y)]
+	})
+	agree("powf", (p: [f32, f32]) => powf(p[0], p[1]), (p: [f32, f32]) => c.powf(p[0], p[1]), [], count(100000), r => {
+		const x = r.float[f32]()
+		const y = ((r.unit() * 300.0 - 160.0) as f32) / log2f(x)
+		return if ((r.next() & 1) == 0) [x, y] else [-x, truncf(y)]
+	})
+}
+
+test "exp10" {
+	agree1("exp10", exp10, c.exp10)
+	agree1("exp10f", exp10f, c.exp10f)
+}

@@ -1,0 +1,81 @@
+import { ceil, ceilf, copysign, copysignf, fabs, fabsf, fdim, fdimf, floor, floorf, fmax, fmaxf, fmin, fminf, fmod,
+	fmodf, frexp, frexpf, ilogb, ilogbf, logb, logbf, modf, modff, nextafter, nextafterf, remainder, remainderf, remquo,
+	remquof, rint, rintf, round, roundf, scalbn, scalbnf, trunc, truncf } from "./ieee"
+import { Rng, agree, agree1, agree2, c, count, edges } from "./musl/oracle"
+import { Float } from "../types"
+
+test "rounding" {
+	agree1("floor", floor, c.floor)
+	agree1("floorf", floorf, c.floorf)
+	agree1("ceil", ceil, c.ceil)
+	agree1("ceilf", ceilf, c.ceilf)
+	agree1("trunc", trunc, c.trunc)
+	agree1("truncf", truncf, c.truncf)
+	agree1("round", round, c.round)
+	agree1("roundf", roundf, c.roundf)
+	agree1("rint", rint, c.rint)
+	agree1("rintf", rintf, c.rintf)
+	agree1("nearbyint", rint, c.nearbyint)
+	agree1("nearbyintf", rintf, c.nearbyintf)
+}
+
+test "sign and magnitude" {
+	agree1("fabs", fabs, c.fabs)
+	agree1("fabsf", fabsf, c.fabsf)
+	agree2("copysign", copysign, c.copysign)
+	agree2("copysignf", copysignf, c.copysignf)
+	agree2("fdim", fdim, c.fdim)
+	agree2("fdimf", fdimf, c.fdimf)
+	agree2("fmax", fmax, c.fmax)
+	agree2("fmaxf", fmaxf, c.fmaxf)
+	agree2("fmin", fmin, c.fmin)
+	agree2("fminf", fminf, c.fminf)
+	agree2("nextafter", nextafter, c.nextafter)
+	agree2("nextafterf", nextafterf, c.nextafterf)
+}
+
+test "remainders" {
+	agree2("fmod", fmod, c.fmod)
+	agree2("fmodf", fmodf, c.fmodf)
+	agree2("remainder", remainder, c.remainder)
+	agree2("remainderf", remainderf, c.remainderf)
+	agree2("remquo", remquo, c.remquo)
+	agree2("remquof", remquof, c.remquof)
+	agree1("modf", modf, c.modf)
+	agree1("modff", modff, c.modff)
+}
+
+test "exponents" {
+	agree1("frexp", frexp, c.frexp)
+	agree1("frexpf", frexpf, c.frexpf)
+	agree1("ilogb", ilogb, c.ilogb)
+	agree1("ilogbf", ilogbf, c.ilogbf)
+	agree1("logb", logb, c.logb)
+	agree1("logbf", logbf, c.logbf)
+}
+
+/// The exponents scalbn changes course at.
+const ns: i32[] = [-2147483648, -100000, -2200, -2150, -2098, -2097, -2096, -1200, -1100, -1080, -1076, -1075, -1074,
+	-1073, -1060, -1023, -1022, -1021, -1000, -200, -152, -151, -150, -149, -148, -127, -126, -125, -64, -1, 0, 1, 64,
+	126, 127, 128, 254, 255, 1000, 1023, 1024, 2046, 2047, 2048, 3000, 100000, 2147483647]
+
+/// Each edge with each of ns.
+function scaled[T extends Float](): [T, i32][] {
+	const out: [T, i32][] = []
+	for (const x of edges[T]()) {
+		for (const n of ns) {
+			out.push([x, n])
+		}
+	}
+	return out
+}
+
+/// A random T and exponent in [-2200, 2200).
+function scale[T extends Float](r: Rng): [T, i32] { return [r.float[T](), ((r.next() % 4400) as i32) - 2200] }
+
+test "scalbn" {
+	agree("scalbn", (p: [f64, i32]) => scalbn(p[0], p[1]), (p: [f64, i32]) => c.scalbn(p[0], p[1]), scaled[f64](),
+		count(100000), scale[f64])
+	agree("scalbnf", (p: [f32, i32]) => scalbnf(p[0], p[1]), (p: [f32, i32]) => c.scalbnf(p[0], p[1]), scaled[f32](),
+		count(100000), scale[f32])
+}

@@ -1,0 +1,226 @@
+//! Square and cube roots, and the hypotenuse; each for f64 and, suffixed f, f32. sqrt is correctly rounded in integer
+//! arithmetic, not by the hardware's instruction, so that it is musl's anywhere. Being correctly rounded, the
+//! instruction gives the same bits, and is the fast path once bober's backend has it as an intrinsic.
+//!
+//! Ported from musl 1.2.5, MIT, Copyright © 2005-2020 Rich Felker, et al. (vendor/musl/COPYRIGHT). cbrt and cbrtf are
+//! from FreeBSD: Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved. Developed at SunPro, a Sun
+//! Microsystems, Inc. business. Permission to use, copy, modify, and distribute this software is freely granted,
+//! provided that this notice is preserved. Optimized by Bruce D. Evans; cbrtf converted to float by Ian Lance Taylor,
+//! Cygnus Support.
+
+import { asF32, asF64, asU32, asU64 } from "./bits"
+
+/// 1/sqrt(x) to 8 bits, as 2^-16 times the entry of x's last exponent bit and first 6 significand bits, x in [1, 4).
+const rsqrtTab: u16[] = [0xb451, 0xb2f0, 0xb196, 0xb044, 0xaef9, 0xadb6, 0xac79, 0xab43, 0xaa14, 0xa8eb, 0xa7c8, 0xa6aa,
+	0xa592, 0xa480, 0xa373, 0xa26b, 0xa168, 0xa06a, 0x9f70, 0x9e7b, 0x9d8a, 0x9c9d, 0x9bb5, 0x9ad1, 0x99f0, 0x9913,
+	0x983a, 0x9765, 0x9693, 0x95c4, 0x94f8, 0x9430, 0x936b, 0x92a9, 0x91ea, 0x912e, 0x9075, 0x8fbe, 0x8f0a, 0x8e59,
+	0x8daa, 0x8cfe, 0x8c54, 0x8bac, 0x8b07, 0x8a64, 0x89c4, 0x8925, 0x8889, 0x87ee, 0x8756, 0x86c0, 0x862b, 0x8599,
+	0x8508, 0x8479, 0x83ec, 0x8361, 0x82d8, 0x8250, 0x81c9, 0x8145, 0x80c2, 0x8040, 0xff02, 0xfd0e, 0xfb25, 0xf947,
+	0xf773, 0xf5aa, 0xf3ea, 0xf234, 0xf087, 0xeee3, 0xed47, 0xebb3, 0xea27, 0xe8a3, 0xe727, 0xe5b2, 0xe443, 0xe2dc,
+	0xe17a, 0xe020, 0xdecb, 0xdd7d, 0xdc34, 0xdaf1, 0xd9b3, 0xd87b, 0xd748, 0xd61a, 0xd4f1, 0xd3cd, 0xd2ad, 0xd192,
+	0xd07b, 0xcf69, 0xce5b, 0xcd51, 0xcc4a, 0xcb48, 0xca4a, 0xc94f, 0xc858, 0xc764, 0xc674, 0xc587, 0xc49d, 0xc3b7,
+	0xc2d4, 0xc1f4, 0xc116, 0xc03c, 0xbf65, 0xbe90, 0xbdbe, 0xbcef, 0xbc23, 0xbb59, 0xba91, 0xb9cc, 0xb90a, 0xb84a,
+	0xb78c, 0xb6d0, 0xb617, 0xb560]
+
+/// a*b*2^-32 of the low 32 bits of each, rounded down.
+function mul32(a: u64, b: u64): u64 { return (a & 0xffffffff) * (b & 0xffffffff) >> 32 }
+
+/// a*b*2^-64, less at most 3.
+function mul64(a: u64, b: u64): u64 {
+	return (a >> 32) * (b >> 32) + ((a >> 32) * (b & 0xffffffff) >> 32) + ((a & 0xffffffff) * (b >> 32) >> 32)
+}
+
+export function sqrt(x: f64): f64 {
+	let ix = asU64(x)
+	let top = ix >> 52
+	if (top - 1 >= 0x7ff - 1) {
+		// ±0, a negative, a subnormal, inf or NaN
+		if (ix * 2 == 0 || ix == 0x7ff0000000000000) {
+			return x
+		}
+		if (ix > 0x7ff0000000000000) {
+			return (x - x) / (x - x)
+		}
+		ix = asU64(x * 4503599627370496.0)
+		top = (ix >> 52) - 52
+	}
+	// x = 4^e m, m in [1, 4) as fixed point 2.62, and 2^e the result's exponent
+	const m = (ix << 11 | 0x8000000000000000) >> (top & 1)
+	top = (top + 0x3ff) >> 1
+	// r ~ 1/sqrt(m) and s ~ sqrt(m): from the table, by two Goldschmidt iterations in 32 bits and one in 64
+	const three: u64 = 0xc0000000
+	let r = (rsqrtTab[(ix >> 46) % 128] as u64) << 16
+	let s = mul32(m >> 32, r)
+	let u = three - mul32(s, r)
+	r = mul32(r, u) << 1
+	s = mul32(s, u) << 1
+	u = three - mul32(s, r)
+	r = mul32(r, u) << 33
+	s = mul64(m, r)
+	u = (three << 32) - mul64(s, r)
+	s = (mul64(s, u) - 2) >> 9
+	// s < sqrt(m) < s + 2^-52: round to s or s + 2^-52 by comparing (2^52 s + 1/2)^2 with 2^104 m
+	const d = s - ((m << 42) - s * s)
+	return asF64((s + (d >> 63)) & 0xfffffffffffff | top << 52)
+}
+
+export function sqrtf(x: f32): f32 {
+	let ix = asU32(x)
+	if (ix - 0x00800000 >= 0x7f800000 - 0x00800000) {
+		if (ix * 2 == 0 || ix == 0x7f800000) {
+			return x
+		}
+		if (ix > 0x7f800000) {
+			return (x - x) / (x - x)
+		}
+		ix = asU32(x * 8388608.0) - (23 << 23)
+	}
+	// as sqrt, in 32 bits, m as fixed point 2.30
+	const m = if ((ix & 0x00800000) != 0) ix << 7 & 0x7fffffff else ix << 8 | 0x80000000
+	const three: u32 = 0xc0000000
+	let r = (rsqrtTab[(ix >> 17) % 128] as u32) << 16
+	let s = mul32(m, r) as u32
+	let u = three - (mul32(s, r) as u32)
+	r = (mul32(r, u) as u32) << 1
+	s = (mul32(s, u) as u32) << 1
+	u = three - (mul32(s, r) as u32)
+	s = ((mul32(s, u) as u32) - 1) >> 6
+	const d = s - ((m << 16) - s * s)
+	return asF32((s + (d >> 31)) & 0x7fffff | ((ix >> 1) + (0x3f800000 >> 1)) & 0x7f800000)
+}
+
+/// cbrt's polynomial, 1/cbrt(r) to 2^-23.5 for |r - 1| < 1/10.
+const p0 = 1.87595182427177009643
+const p1 = -1.88497979543377169875
+const p2 = 1.621429720105354466140
+const p3 = -0.758397934778766047437
+const p4 = 0.145996192886612446982
+
+export function cbrt(x: f64): f64 {
+	let u = asU64(x)
+	let hx = ((u >> 32) as u32) & 0x7fffffff
+	if (hx >= 0x7ff00000) {
+		return x + x
+	}
+	// cbrt(2^e (1 + m)) ~ 2^(e/3) (1 + (e%3 + m)/3): dividing x's top bits by 3 nearly does, to 5 bits, and adding a
+	// bias of (1023 - 1023/3 - 0.03306235651) 2^20 restores the exponent's and halves the error
+	if (hx < 0x00100000) {
+		u = asU64(x * 18014398509481984.0)
+		hx = ((u >> 32) as u32) & 0x7fffffff
+		if (hx == 0) {
+			return x
+		}
+		hx = hx / 3 + 696219795
+	} else {
+		hx = hx / 3 + 715094163
+	}
+	let t = asF64(u & 0x8000000000000000 | (hx as u64) << 32)
+	// to 23 bits by the polynomial in t^3/x
+	let r = t * t * (t / x)
+	t = t * (p0 + r * (p1 + r * p2) + r * r * r * (p3 + r * p4))
+	// rounded away from zero to 23 bits, so that it is above cbrt(x), by at most 2 of their ulps
+	t = asF64((asU64(t) + 0x80000000) & 0xffffffffc0000000)
+	// to 53 bits by a Newton step, with an error below 0.667 ulps
+	r = x / (t * t)
+	r = (r - t) / (t + t + r)
+	return t + t * r
+}
+
+export function cbrtf(x: f32): f32 {
+	let u = asU32(x)
+	let hx = u & 0x7fffffff
+	if (hx >= 0x7f800000) {
+		return x + x
+	}
+	// as cbrt, to 5 bits
+	if (hx < 0x00800000) {
+		if (hx == 0) {
+			return x
+		}
+		u = asU32(x * 16777216.0)
+		hx = (u & 0x7fffffff) / 3 + 642849266
+	} else {
+		hx = hx / 3 + 709958130
+	}
+	// to 16 bits by a Newton step, and to 47 by another, in f64 so that no term overflows
+	let t = asF32(u & 0x80000000 | hx) as f64
+	const xd = x as f64
+	for (const _ of 1 ... 2) {
+		const r = t * t * t
+		t = t * (xd + xd + r) / (xd + r + r)
+	}
+	return t as f32
+}
+
+/// x*x as hi + lo, x split into halves that multiply exactly.
+function sq(x: f64): [f64, f64] {
+	const xc = x * 134217729.0
+	const xh = x - xc + xc
+	const xl = x - xh
+	const hi = x * x
+	return [hi, xh * xh - hi + 2.0 * xh * xl + xl * xl]
+}
+
+/// sqrt(x*x + y*y), without undue overflow or underflow; inf if either is, though the other be NaN.
+export function hypot(x: f64, y: f64): f64 {
+	let ux = asU64(x) & 0x7fffffffffffffff
+	let uy = asU64(y) & 0x7fffffffffffffff
+	if (ux < uy) {
+		[ux, uy] = [uy, ux]
+	}
+	const ex = (ux >> 52) as i32
+	const ey = (uy >> 52) as i32
+	let a = asF64(ux)
+	let b = asF64(uy)
+	if (ey == 0x7ff) {
+		return b
+	}
+	if (ex == 0x7ff || uy == 0) {
+		return a
+	}
+	if (ex - ey > 64) {
+		return a + b
+	}
+	// scaled by 2^±700 so that neither hi*hi overflows nor lo*lo underflows
+	let z = 1.0
+	if (ex > 0x3ff + 510) {
+		z = asF64(0x6bb0000000000000)
+		a *= asF64(0x1430000000000000)
+		b *= asF64(0x1430000000000000)
+	} else if (ey < 0x3ff - 450) {
+		z = asF64(0x1430000000000000)
+		a *= asF64(0x6bb0000000000000)
+		b *= asF64(0x6bb0000000000000)
+	}
+	const [ha, la] = sq(a)
+	const [hb, lb] = sq(b)
+	return z * sqrt(lb + la + hb + ha)
+}
+
+export function hypotf(x: f32, y: f32): f32 {
+	let ux = asU32(x) & 0x7fffffff
+	let uy = asU32(y) & 0x7fffffff
+	if (ux < uy) {
+		[ux, uy] = [uy, ux]
+	}
+	let a = asF32(ux)
+	let b = asF32(uy)
+	if (uy == 0xff << 23) {
+		return b
+	}
+	if (ux >= 0xff << 23 || uy == 0 || ux - uy >= 25 << 23) {
+		return a + b
+	}
+	// scaled by 2^±90, the sum in f64
+	let z: f32 = 1.0
+	if (ux >= (0x7f + 60) << 23) {
+		z = asF32(0x6c800000)
+		a *= asF32(0x12800000)
+		b *= asF32(0x12800000)
+	} else if (uy < (0x7f - 60) << 23) {
+		z = asF32(0x12800000)
+		a *= asF32(0x6c800000)
+		b *= asF32(0x6c800000)
+	}
+	return z * sqrtf(((a as f64) * (a as f64) + (b as f64) * (b as f64)) as f32)
+}

@@ -1,0 +1,27 @@
+import { lgamma, lgammaf, tgamma, tgammaf } from "./gamma"
+import { agree, agree1, c, count, Rng } from "./musl/oracle"
+import { Float } from "../types"
+
+test "tgamma" {
+	agree1("tgamma", tgamma, c.tgamma)
+	agree1("tgammaf", tgammaf, c.tgammaf)
+}
+
+test "lgamma" {
+	agree1("lgamma", lgamma, c.lgamma)
+	agree1("lgammaf", lgammaf, c.lgammaf)
+}
+
+/// x even in [-200, 200), where gamma reflects, overflows and underflows, or a few ulps from the integers and halves
+/// there, its poles and the zeros of lgamma among them; each half the time.
+function range[T extends Float](r: Rng): T {
+	const b = r.next()
+	return if ((b & 1) == 0) (r.unit() * 400.0 - 200.0) as T else r.near((((b >> 1) % 800) as T) * 0.5 - 200.0)
+}
+
+test "gamma over its range" {
+	agree("tgamma", tgamma, c.tgamma, [], count(100000), range[f64])
+	agree("lgamma", lgamma, c.lgamma, [], count(100000), range[f64])
+	agree("tgammaf", tgammaf, c.tgammaf, [], count(100000), range[f32])
+	agree("lgammaf", lgammaf, c.lgammaf, [], count(100000), range[f32])
+}

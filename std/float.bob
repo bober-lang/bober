@@ -5,7 +5,6 @@
 import { addr, load } from "../builtin/mem"
 import { E, e, dot, isDigit, minus, plus, zero } from "./ascii"
 import { pow10Tab } from "./float/powers"
-import { isFinite, isNaN, max, min } from "./math"
 import { ParseError } from "./parse"
 import { Float } from "./types"
 
@@ -17,6 +16,11 @@ const single: Layout = { mantbits: 23, expbits: 8, bias: -127 }
 const double: Layout = { mantbits: 52, expbits: 11, bias: -1023 }
 
 type Format = "e" | "f" | "g"
+
+// Not std/math's: every module imports builtin/show, which imports this one, so that would take libm into each
+// program, and into an init cycle through builtin that leaves its globals unset in debug builds.
+function max(a: i32, b: i32): i32 { return if (a > b) a else b }
+function min(a: i32, b: i32): i32 { return if (a < b) a else b }
 
 /// Powers of ten, exact as integers and as floats.
 const tens: u64[] = [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000, 10000000000,
@@ -30,10 +34,10 @@ const tensf: f64[] = [1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e
 /// back as x, "f" from 1e-6 up to 1e21. Exponents and infinities are written as JavaScript writes them.
 export function formatFloat[T extends Float](x: T, fmt: Format = "g", prec: i32 = -1): string {
 	const y = x as f64
-	if (isNaN(y)) {
+	if (y != y) {
 		return "NaN"
 	}
-	if (!isFinite(y)) {
+	if (y - y != 0.0) {
 		return if (y < 0.0) "-Infinity" else "Infinity"
 	}
 	const neg = y < 0.0 || y == 0.0 && 1.0 / y < 0.0
