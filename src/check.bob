@@ -3,7 +3,7 @@
 //! to the next stage with the type of each construct and token in it.
 
 import { contains } from "../std/algo"
-import { digit, isAlphabetic, o, x } from "../std/ascii"
+import { digit, isAlphabetic, minus, o, x } from "../std/ascii"
 import { HashMap } from "../std/collections/hashmap"
 import { ScopedMap } from "../std/collections/scopedmap"
 import { Set } from "../std/collections/set"
@@ -1247,7 +1247,7 @@ class Checker {
 			} else {
 				const w = if (n.t.kind == "const" && v.isUntyped() && isConstant(init)) v else v.widen(n.t.kind == "let")
 				this.convert(init, w)
-				t = w
+				t = if (v.isUntyped()) w else literal ?? w
 			}
 		} else if (n.t.kind == "const") {
 			throw this.error(n.t.loc, "a const needs an initializer")
@@ -1295,11 +1295,11 @@ class Checker {
 	}
 
 	/// The literal type a const initialized by p, of type v, and declared t denotes in a type, where p is an integer or
-	/// string constant (4.2): of its value in t, else in v's base or `i32`; else null.
+	/// string constant (4.2): of its value in t, else in v or its base, or `i32` for an untyped one; else null.
 	private literal(p: Node, v: Type, t: Type | null): Type | null {
-		const n = if (v == UntypedInt) this.constant(p) else null
+		const n = if (v.kind == "int") this.constant(p) else null
 		const text = if (n != null) decimal(n!) else if (v.kind == "literal") v.text else null
-		const base = t ?? (if (n != null) I32 else v.base)
+		const base = t ?? (if (v.isUntyped()) I32 else if (n != null) v else v.base)
 		return if (text != null && (base?.kind == "int" || base?.kind == "string")) Type.literal(text!, base!) else null
 	}
 
@@ -2271,6 +2271,7 @@ class Checker {
 			if (v.join(subject) == null) {
 				throw this.error(start(p), `expected ${show(subject)}, got ${show(v)}`)
 			}
+			this.representable(p, bases(subject))
 			if ((v.kind == "literal" || v == Null) && contains(subject.alternatives(), v)) {
 				types.push(v)
 			}
@@ -2412,7 +2413,7 @@ class Checker {
 		const v = if (value == null) now else this.expr(value, if (op == "??=") t.nonNull() else t)
 		const r = switch (op) {
 			case "=": v
-			case "++", "--": bases(now)
+			case "++", "--": this.single(now, n.t)
 			case "??=": if (now.hasNull()) t.nonNull() else this.never(now, n.t)
 			default: this.operate(op.slice(0, op.length - 1), now, v, t, n.t)
 		}
@@ -2792,7 +2793,7 @@ class Checker {
 				if (!(if (op == "-") t.isNumber() else t.isInt())) {
 					throw this.error(n.t.loc, `${op} needs ${if (op == "-") "a number" else "an integer"}, got ${show(t)}`)
 				}
-				return bases(t)
+				return this.single(t, n.t)
 			case "typeof": return meta(this.expr(x, null))
 			case "await":
 				if (x.kind == "unary" && x.t.kind == "...") {
@@ -2815,7 +2816,7 @@ class Checker {
 				this.deferred = deferred
 				return Type.async(r)
 			case "...":
-				const t = this.expr(x, null)
+				const t = this.expr(x, want)
 				if (t.kind != "array") {
 					throw this.error(start(x), `cannot spread ${show(t)}`)
 				}
@@ -2888,11 +2889,12 @@ class Checker {
 	///   zero traps
 	/// - `**`: numbers; right associative; a negative integer exponent traps
 	///
-	/// Number operands are of one type or widen to one (§4.1), which the result takes. Integer results wrap. Floats
-	/// follow IEEE 754 with round-to-nearest. `==` and `!=` take operands that join (§4.10), a type set's parameter as
-	/// the union of its set, and compare values, string code units, reference identity (in an assert, by value: §5.5),
-	/// or a union's tag and then its value; two `Type`s are equal when they are one type, and equal types are one
-	/// reference; functions and `T[n]` are not comparable. `< > <= >=` take numbers or strings.
+	/// Number operands are of one type or widen to one (§4.1), which the result takes; a union of number types is none.
+	/// Integer results wrap. Floats follow IEEE 754 with round-to-nearest. `==` and `!=` take operands that join
+	/// (§4.10), a type set's parameter as the union of its set, and compare values, string code units, reference
+	/// identity (in an assert, by value: §5.5), or a union's tag and then its value; two `Type`s are equal when they are
+	/// one type, and equal types are one reference; functions and `T[n]` are not comparable. `< > <= >=` take numbers
+	/// or strings.
 	///
 	/// A chain `a < b <= c` means `a < b && b <= c` with `b` evaluated once; chains are of `==` only, of `< <=` only,
 	/// or of `> >=` only. `??` shall not mix with other binary operators without parentheses, the left operand of `**`
@@ -2915,6 +2917,7 @@ class Checker {
 	/// x / 2 * 2 + x % 2 == 7           // integer division
 	/// let e = -1; 2 ** e               // traps
 	/// f == g                           // error: functions do not compare
+	/// let u: i32 | i64 = 7; u + 1      // error: not of one type
 	/// ```
 	private binary(n: Node, want: Type | null): Type {
 		const a = n.parts[0]
@@ -2930,7 +2933,10 @@ class Checker {
 			case "??":
 				const l = this.expr(a, if (want == null) null else want.nullable())
 				const r = this.expr(b, want ?? l.nonNull())
-				return this.joined(if (l.hasNull()) l.nonNull() else this.never(l, n.t), r, want, n.t.loc)
+				const t = this.joined(if (l.hasNull()) l.nonNull() else this.never(l, n.t), r, want, n.t.loc)
+				this.convert(a, t.nullable())
+				this.convert(b, t)
+				return t
 			case "|":
 				if (this.isType(a)) {
 					return meta(this.typeExpr(n))
@@ -2960,11 +2966,22 @@ class Checker {
 		if (!l.isNumber() || !r.isNumber() || ints && (!l.isInt() || !r.isInt())) {
 			throw this.error(at.loc, `${op} needs ${if (ints) "integers" else "numbers"}, got ${show(l)} and ${show(r)}`)
 		}
+		this.single(l, at)
+		this.single(r, at)
 		if (op == "<<" || op == ">>") {
 			// The count does not type the shifted value; an untyped one stays untyped (4.1).
 			return if (l.isUntyped()) this.common(l, l, want, at) else bases(l)
 		}
 		return this.common(bases(l), bases(r), want, at)
+	}
+
+	/// The number type of operand t of operator at, a literal's being its base's; a union of number types is none.
+	private single(t: Type, at: Tok): Type {
+		const b = bases(t)
+		if (b.kind == "union") {
+			throw this.error(at.loc, `${at.kind} needs numbers of one type, got ${show(b)}`)
+		}
+		return b
 	}
 
 	/// The number type l and r widen to: an untyped one takes the other's type, and two untyped ones stay untyped,
@@ -3004,6 +3021,10 @@ class Checker {
 			return r
 		}
 		if (l.isNumber() && r.isNumber()) {
+			if (op != "==" && op != "!=") {
+				this.single(l, n.t)
+				this.single(r, n.t)
+			}
 			const t = if (l.isUntyped() && r.isUntyped() && l.kind == r.kind) l.widen(false) else this.common(bases(l), bases(r), null, n.t)
 			this.convert(if (n.kind == "chain") a.parts[1] else a, t)
 			this.convert(b, t)
@@ -3216,9 +3237,6 @@ class Checker {
 		if (!scalars && !v.fits(t) && !t.fits(v) && !(isTok(x, "string") && t.kind == "int")) {
 			throw this.error(n.t.loc, `cannot cast ${show(v)} to ${show(t)}`)
 		}
-		if (v.fits(t)) {
-			this.representable(x, t)
-		}
 		this.convert(x, if (v.fits(t)) t else v.widen(false))
 		return t
 	}
@@ -3236,17 +3254,20 @@ class Checker {
 	/// `a!` is `a` cast from `T | null` to `T`.
 	///
 	/// `a?.b`, `a?.[i]` and `a?.(args)` give `null` without evaluating the rest of the chain when `a` is `null`; the
-	/// chain's type is the result's type `| null`.
+	/// chain's type is the result's type `| null`. `a` shall not be of type `null`, which has no members.
 	///
 	/// ```
 	/// o?.k ?? 0        xs?.[0]        f?.()        a?.b?.[0]?.(1)
 	/// const c: i32 | null = n?.b.c    // the whole chain after `?.` is skipped on null
 	/// const d = a.b                   // error if a: {…} | null
+	/// const e = null; e?.b            // error: e is always null
 	/// ```
 	private link(n: Node, assigned: bool, want: Type | null = null): Type {
 		const a = n.parts[0]
 		let o = if (isLink(a)) this.link(a, false) else this.expr(a, null)
-		if (n.t.kind == "?.") {
+		if (n.t.kind == "?." && o == Null) {
+			throw this.error(n.t.loc, `${if (a.kind == "token") this.text(a.t) else "the value before ?."} is always null`)
+		} else if (n.t.kind == "?.") {
 			o = o.nonNull()
 		} else if (n.kind != "postfix" && o.hasNull()) {
 			throw this.error(start(a), `${if (a.kind == "token") this.text(a.t) else show(o)} may be null`)
@@ -3353,6 +3374,7 @@ class Checker {
 				if (e == null) {
 					throw this.error(start(i), `expected a static subscript within ${show(o)}`)
 				}
+				i.type = Type.literal(decimal(v!), I32) // the index, which lowering reads the element by
 				return e
 		}
 		throw this.error(n.t.loc, `cannot subscript ${show(o)}`)
@@ -3418,7 +3440,7 @@ class Checker {
 					throw this.error(a.t.loc, "a spread goes only into a rest param")
 				}
 				spread = true
-				this.expr(a, null)
+				this.fit(this.expr(a, Type.array(p!)).params[0], p!, a) // each element is copied, so each need only fit p
 			} else if (p == null && k == null) {
 				this.value(a)
 			} else if (p != null) {
@@ -3498,23 +3520,32 @@ class Checker {
 		if (n0 >= 0 && n.parts.length != n0) {
 			throw this.error(n.t.loc, `expected ${n0} elements, got ${n.parts.length}`)
 		}
+		// A sibling literal's or a ?? operand's untyped constants shape the elements, but are no type to take.
+		const shaped = w != null && !w.isLoose()
 		let elem: Type | null = null
 		for (const i of 0 ... n.parts.length - 1) {
 			const e = n.parts[i]
 			const ew = if (w == null) null else element(w, i)
 			const spread = e.kind == "unary" && e.t.kind == "..."
 			const t = if (spread) element(this.expr(e, null), 0)! else this.expr(e, ew)
-			if (ew != null) {
+			if (ew != null && shaped) {
 				this.fit(t, ew, e)
 			} else {
 				elem = if (elem == null || t == elem || t.fits(elem)) elem ?? t else this.joined(elem, t, null, start(e))
 			}
 		}
-		if (w == null && elem == null) {
+		if (shaped || elem == null && w != null) {
+			return w!
+		}
+		if (elem == null) {
 			throw this.error(n.t.loc, "an empty array needs a type")
 		}
 		// Not yet a variable's, a literal's elements are not their literal types, so ["a"] fits a string[].
-		return w ?? Type.array(if (elem!.kind == "literal" && elem!.params.length == 0) elem!.base! else elem!)
+		const t = if (elem.kind == "literal" && elem.params.length == 0) elem.base! else elem
+		for (const e of n.parts) {
+			this.convert(e, t) // untyped constants take the type the other elements give
+		}
+		return Type.array(t)
 	}
 
 	/// An object literal's type: the class a spread of one gives it, whose other parts shall be its fields (4.8),
@@ -3777,7 +3808,8 @@ class Checker {
 	}
 
 	/// Generic function f instantiated with the type args that args give, else their defaults (4.9). Each arg is checked
-	/// once, its type kept in known; one its context shapes last, with what the others and then want give.
+	/// once, its type kept in known: plain ones first, then those their context shapes, with what want and the others
+	/// give, then arrows, whose params the others type, then empty literals, which give nothing.
 	private infer(f: Type, args: Node[], at: Tok, known: (Type | null)[], want: Type | null): Type {
 		const ps = f.params
 		const found: (Type | null)[] = []
@@ -3787,30 +3819,35 @@ class Checker {
 		for (const a of args) {
 			known.push(null)
 		}
-		for (const shaped of [false, true]) {
-			if (shaped && want != null) {
-				// What the result is wanted as gives only the type args the others leave open.
-				const wanted = found.slice(0, found.length)
+		let wanted: (Type | null)[] = []
+		for (const phase of [0, 1, 2, 3]) {
+			if (phase == 1 && want != null) {
+				// What the result is wanted as gives the type args the others leave open or with untyped constants in them.
+				wanted = found.slice(0, found.length)
 				f.base!.unify(want.nonNull(), ps, wanted)
 				for (const i of 0 ... ps.length - 1) {
-					found[i] = found[i] ?? wanted[i]
+					const a = found[i]
+					found[i] = if (a == null) wanted[i] else if (a.isLoose()) taken(a, wanted[i]!) else a
 				}
 			}
 			for (const i of 0 ... args.length - 1) {
 				const a = args[i]
 				const p = element(f, i)
-				if (p == null || (a.kind == "arrow" || contextual(a)) != shaped || a.t.kind == "...") {
+				if (p == null || phaseOf(a) != phase || a.t.kind == "...") {
 					continue
 				}
-				const w = if (shaped) this.partly(p, ps, found) else null
+				const w = if (phase == 0) null else this.partly(p, ps, found, phase == 1 && (a.kind == "array" || a.kind == "object"))
 				known[i] = this.expr(a, if (w != null && (a.kind == "arrow" || !w.mentions(ps))) w else null)
 				p.unify(known[i]!, ps, found)
 			}
 		}
 		const targs: Type[] = []
 		for (const i of 0 ... ps.length - 1) {
+			// A literal type arg widens to its base, unless the wanted one takes the literal but not the base.
 			const t = found[i]
-			const a = if (t != null) t.widen(true) else this.byDefault(ps, i, targs, at.loc)
+			const w = if (i < wanted.length) wanted[i] else null
+			const a = if (t == null) this.byDefault(ps, i, targs, at.loc)
+				else if (w != null && !t.isLoose() && t.fits(w) && !t.widen(true).fits(w)) w else t.widen(true)
 			if (a == null) {
 				throw this.error(at.loc, `cannot infer ${show(ps[i])}`)
 			}
@@ -3819,15 +3856,21 @@ class Checker {
 		return f.instantiate(targs)
 	}
 
-	/// p with the type args found so far, a function's result left to the arg while it has others.
-	private partly(p: Type, ps: Type[], found: (Type | null)[]): Type {
+	/// p with the type args found so far, but where open, not those found with untyped constants, so the arg may widen
+	/// them; a function's result is left to the arg where it mentions a type arg not yet found or found so, which the
+	/// result may widen.
+	private partly(p: Type, ps: Type[], found: (Type | null)[], open: bool): Type {
 		const partial: Type[] = []
+		const loose: Type[] = []
 		for (const i of 0 ... ps.length - 1) {
 			const f = found[i]
-			partial.push(if (f == null) ps[i] else f.widen(true))
+			if (f == null || f.isLoose()) {
+				loose.push(ps[i])
+			}
+			partial.push(if (f == null || open && f.isLoose()) ps[i] else f.widen(true))
 		}
 		const want = substitute(p, ps, partial)
-		return if (want.kind == "function" && want.base!.mentions(ps)) returning(want, null, want.params) else want
+		return if (p.kind == "function" && p.base!.mentions(loose)) returning(want, null, want.params) else want
 	}
 
 	/// The default of param i of ps, given the args before it, reported at at where those do not fit it.
@@ -3889,34 +3932,32 @@ class Checker {
 			}
 			throw this.error(start(at), `expected ${show(want)}, got ${show(v)}`)
 		} else if (v.isLoose()) {
-			this.representable(at, want)
 			this.convert(at, want)
 		}
 	}
 
-	/// Gives p, whose value converts to t, and the untyped constants in it the types they take (4.1): a number the
-	/// member of a union t it takes by default, else the first it fits.
-	private convert(p: Node, t: Type) {
+	/// Gives p, whose value converts to t, and the untyped constants in it the types they take (4.1); an integer literal
+	/// shall be representable in the type it takes, a negated one whole with its sign, so p itself is not checked where
+	/// checked is false, as an operand of a constant checked whole.
+	private convert(p: Node, t: Type, checked = true) {
 		const u = p.type
 		if (u == null || !u.isLoose() || t.isLoose()) {
 			return
 		}
-		const ms = if (u.kind == "union") [t] else t.alternatives() // a union, as `if (c) 1 else null`, takes all of t
-		let c = ms[0]
-		for (const m of ms) {
-			if (m == u.widen(false) || !u.fits(c) && u.fits(m)) {
-				c = m
-			}
+		if (p.kind == "unary" && p.t.kind == "...") {
+			return this.convert(p.parts[0], Type.array(t)) // an array spread's elements convert to t
 		}
+		const c = taken(u, t)
 		p.type = c
+		if (checked) {
+			this.representable(p, c)
+		}
 		switch (p.kind) {
 			case "array":
 				for (const i of 0 ... p.parts.length - 1) {
-					const q = p.parts[i]
-					const spread = q.kind == "unary" && q.t.kind == "..."
 					const e = element(c, i)
 					if (e != null) {
-						this.convert(if (spread) q.parts[0] else q, if (spread) c else e)
+						this.convert(p.parts[i], e)
 					}
 				}
 			case "object":
@@ -3936,7 +3977,8 @@ class Checker {
 			case "index": this.convert(p.parts[0], Type.array(c))
 			case "prop", "paren", "unary", "binary":
 				for (const q of p.parts) {
-					this.convert(q, c)
+					const nullable = q == p.parts[0] && p.t.kind == "??" // ?? reads its left operand as nullable
+					this.convert(q, if (nullable) c.nullable() else c, !isConstant(p)) // a constant's value is checked whole, with its sign
 				}
 		}
 	}
@@ -3948,13 +3990,20 @@ class Checker {
 		}
 	}
 
-	/// The value of p where it is an integer literal, possibly negated.
+	/// The value of p where it is an integer constant, possibly negated, or cast to an integer type that holds it: a
+	/// literal, or a const one initialized.
 	private constant(p: Node): f64 | null {
 		if (p.kind == "token") {
-			return if (p.t.kind == "int") integer(this.text(p.t)) else null
+			const l = if (p.t.kind == "ident") this.find(this.text(p.t))?.literal else null
+			const s = if (p.t.kind == "int") this.text(p.t) else if (l?.base?.kind == "int") l!.text else null
+			return if (s == null) null else integer(s!)
 		}
 		if (p.kind == "paren") {
 			return this.constant(p.parts[0])
+		}
+		if (p.kind == "binary" && p.t.kind == "as") {
+			const v = this.constant(p.parts[0])
+			return if (v != null && p.type?.kind == "int" && holds(p.type!, v!)) v else null
 		}
 		const v = if (p.kind == "unary" && p.t.kind == "-") this.constant(p.parts[0]) else null
 		return if (v == null) null else -v
@@ -4237,10 +4286,29 @@ function stop(p: Node): i32 {
 	return end
 }
 
-/// Whether the type of p depends on what it converts to.
-function contextual(p: Node): bool {
-	return p.kind == "array" || p.kind == "object" || p.kind == "ifExpr" || p.kind == "switchExpr"
-		|| p.kind == "binary" && p.t.kind == "??" || p.kind == "paren" && contextual(p.parts[0])
+/// The type a value of u with untyped constants in it takes converting to t (4.1): a number the member of a union t it
+/// takes by default, else the first it fits.
+function taken(u: Type, t: Type): Type {
+	const ms = if (u.kind == "union") [t] else t.alternatives() // a union, as `if (c) 1 else null`, takes all of t
+	let c = ms[0]
+	for (const m of ms) {
+		if (m == u.widen(false) || !u.fits(c) && u.fits(m)) {
+			c = m
+		}
+	}
+	return c
+}
+
+/// The phase infer checks arg p in.
+function phaseOf(p: Node): i32 {
+	return switch (p.kind) {
+		case "array", "object": if (p.parts.length == 0) 3 else 1
+		case "ifExpr", "switchExpr": 1
+		case "arrow": 2 // after the literals, whose types its params may take
+		case "binary": if (p.t.kind == "??" || prec(p.t.kind) > 4) 1 else 0 // arithmetic and bitwise, untyped if their operands are
+		case "paren", "unary": phaseOf(p.parts[0])
+		default: 0
+	}
 }
 
 /// Integer constant v in decimal.
@@ -4402,8 +4470,11 @@ function strong(d: Decl): void {
 	}
 }
 
-/// The value of an integer literal, or infinity past u64.
+/// The value of an integer literal, possibly negated, or infinity past u64.
 function integer(s: string): f64 {
+	if (s[0] == minus) {
+		return -integer(s.slice(1, s.length))
+	}
 	let radix: u64 = 10
 	let i = 0
 	if (s.length > 2 && isAlphabetic(s[1])) {

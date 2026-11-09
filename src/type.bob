@@ -186,8 +186,9 @@ export class Type {
 	/// into a union sets the tag, one into an object type or interface is implementation-defined (§4.7), widening extends
 	/// the number, and any other fit changes no bits.
 	///
-	/// Two values join to one type if one fits the other, or if they differ only by `null` or by literal types of one base,
-	/// which they then join as (`join`). `[1, "s"]` and `if (c) 1 else "s"` have no type.
+	/// Two values join to one type if one fits the other, or if they differ by literal types at the top, whose bases then
+	/// join, or by `null`, which the type they join to without it takes (`join`). `[1, "s"]` and `if (c) 1 else "s"` have
+	/// no type.
 	///
 	/// Elements are invariant, so `Square[]` does not fit `Shape[]`, but a literal's untyped constants fit as they would
 	/// alone: `[1, 2]` fits `i64[]`.
@@ -246,7 +247,8 @@ export class Type {
 		}
 		const x = bases(this)
 		const y = bases(b)
-		return if (x.nonNull().fits(y) || y.nonNull().fits(x)) Type.union([x, y]) else null
+		return if (x.fits(y)) y else if (y.fits(x)) x
+			else if (x.hasNull() != y.hasNull()) x.nonNull().join(y.nonNull())?.nullable() else null
 	}
 
 	/// This with untyped constants in it as i32 and f64, and if literals, or in an array or object, literals as their
@@ -359,15 +361,17 @@ export class Type {
 	/// Whether it has one of params in it.
 	mentions(params: Type[]): bool { return contains(params, this) || this.parts().some(p => p.mentions(params)) }
 
-	/// Sets in found the args of params that a value of v fitting this gives them, where found has none yet, an untyped
-	/// one, or one that widens to it (4.9).
+	/// Sets in found the args of params that a value of v fitting this gives them: v where none is found yet or the one
+	/// found has untyped constants and fits v widened but not the reverse, else what the two join to (`join`), or the
+	/// one found stays, for the arg to fail against (4.9).
 	unify(v: Type, params: Type[], found: (Type | null)[]) {
 		switch (this.kind) {
 			case "param":
 				const i = position(params, this)
 				const f = if (i < 0) null else found[i]
-				if (i >= 0 && (f == null || f.isUntyped() || f.fits(v) && !v.fits(f))) {
-					found[i] = v
+				if (i >= 0) {
+					found[i] = if (f == null || f.isLoose() && f.fits(v.widen(true)) && !v.fits(f)) v
+						else f!.join(v) ?? f
 				}
 			case "object": for (const f of this.fields) {
 				const m = v.member(f.name)
@@ -428,11 +432,13 @@ export class Type {
 	/// ## Literal types
 	///
 	/// A string, `true`, `false` or `null` literal in a type denotes the type holding only that value, and so does the
-	/// name of a `const` initialized by an integer or string constant (4.1): the value in the const's declared type,
-	/// which the const then has, else in `i32` for an untyped int. A literal type fits its base type and is stored as it;
-	/// a union of literals of one base is stored as the base, and arithmetic on it is the base's. Equal string literals
-	/// are one value, so a value of a string literal type is that value, and `==` and `switch` compare it by identity; a
-	/// string or an integer becomes one only by `as`, which traps if it is none of the type's literals (§6.6).
+	/// name of a `const` initialized by an integer or string constant (4.1), or one cast to an integer type that holds
+	/// it: the value in the const's declared type, else in the constant's, `i32` for an untyped int; a const not
+	/// untyped then has that type. A type argument inferred from a literal type is its base, unless the type argument the call's wanted
+	/// result gives takes only the literal (4.9). A literal type fits its base type and is stored as it; a union of literals of one base is stored as the
+	/// base, and arithmetic on it is the base's. Equal string literals are one value, so a value of a string literal
+	/// type is that value, and `==` and `switch` compare it by identity; a string or an integer becomes one only by
+	/// `as`, which traps if it is none of the type's literals (§6.6).
 	///
 	/// ```
 	/// type Mode = "fast" | "safe"     // stored as a string
@@ -445,6 +451,8 @@ export class Type {
 	/// const p: Op = End
 	/// const q = p + 1                 // a u8
 	/// const r = byte as Op            // traps unless byte is 0 or 2
+	/// const Next = 3 as u8            // a 3 in u8, as in a type
+	/// const s: Op = id(End)           // id[Op], with id[T](v: T): T
 	/// ```
 	///
 	/// A type used as a value is a literal too, of builtin/type.bob's Type, holding the type in params (4.11).

@@ -72,7 +72,7 @@ test "each declaration is handed on typed once checked" {
 	assert typed("const c: i64 = [1, 2][0]\nfunction f(c: bool): i64 | string { return if (c) 1 else \"s\" }")
 		== "(var:i64 c:i64 i64:i64 (index:i64 (array:i64[] 1:i64 2:i64) 0:i32)) (function:(bool) => i64 | string f:(bool) => i64 | string (params:(bool) => i64 | string (param:bool c:bool bool:bool)) (binary:i64 | string i64:i64 string:string) (block (jump (ifExpr:i64 | string c:bool 1:i64 \"s\":\"s\"))))"
 	assert typed("const a = 2.75 as i32\nconst b = 3 as u8")
-		== "(var:i32 a:i32 (binary:i32 2.75:f64 i32:i32)) (var:u8 b:u8 (binary:u8 3:u8 u8:u8))"
+		== "(var:i32 a:i32 (binary:i32 2.75:f64 i32:i32)) (var:3 b:3 (binary:u8 3:u8 u8:u8))"
 	assert typed("test \"t\" {\n\tprint(1.5)\n}") == "(test \"t\":\"t\" (block (call:null print:(f64) => null 1.5:f64)))"
 	assert typed("const a = [1, 2]\nconst o = { k: -1 }")
 		== "(var:i32[] a:i32[] (array:i32[] 1:i32 2:i32)) (var:{ k: i32 } o:{ k: i32 } (object:{ k: i32 } (prop:i32 (unary:i32 1:i32))))"
@@ -104,19 +104,34 @@ test "a const of an integer or string constant names its literal type, a union o
 		== "92: a switch expression needs a default or a case for each value"
 	assert errors("const N = -5\nconst S = \"s\"\nconst T: string = \"t\"\nconst a: N = 3 as N\nconst b: S | T = T") == ""
 	assert errors("let n = 0\nconst a: n = 0\nfunction f(p: \"a\") { const b: p = p }") == "19: n is not a type; 55: p is not a type"
+	const levels = "const Lo: u8 = (19)\nconst Hi = 20 as u8\ntype L = Lo | Hi\nfunction id[T](v: T): T { return v }\n"
+	assert errors(levels + "const a: L = id(Hi)\nconst b: u8 = id(Lo) + 1\nconst c = [id(Lo), 300]") == "158: 300 is not representable as u8"
+	assert errors("const A = 1000 as i64 as u8\nconst B: i64 = 1000\nconst C = B as u8\ntype K = A\ntype J = C") == "75: A is not a type; 86: C is not a type"
 }
 
 test "numbers widen, and constants take their context" {
+	assert errors("function h(x: u8): i32 {\n\tswitch (x) {\n\t\tcase 300: return 1\n\t\tdefault: return 0\n\t}\n}") == "46: 300 is not representable as u8"
+	assert errors("const Max: u8 = 10\nconst xs = [Max, 1]\nconst ys: u8[] = xs\nconst x: i64 = 1\nconst z: i64 = if (xs.length > 0) x else 3000000000") == ""
+	assert errors("const Max: u8 = 10\nconst xs = [Max, 300]") == "36: 300 is not representable as u8"
+	assert errors("const Max: u8 = 10\nfunction f(c: bool, x: u8 | null): i32 {\n\tconst a = if (c) Max else 300\n\tconst b = x ?? 300\n\tconst d: i8 = -128\n\treturn a + b + d\n}\nfunction g(x: u8): u8 { return x + 300 }") == "87: 300 is not representable as u8; 107: 300 is not representable as u8; 186: 300 is not representable as u8"
+	assert errors("const A: u8 = 0\nconst B: u8 = 1\ntype Op = A | B\nfunction f(x: Op): i32 {\n\tswitch (x) {\n\t\tcase 1: return 1\n\t\tdefault: return 0\n\t}\n}") == ""
 	assert errors("const d: i32 = 1\nconst e: i64 = d + 1\nconst big: i64 = 1 << 40") == ""
 	assert errors("const A = 1\nconst x: u32 = A | 2 | 4\nconst p: u16 = 1\nconst q = (p & 1 << 9) != 0") == ""
 	assert errors("const n: u8 = 9\nconst a: i64 = 1 << n\nconst b = 1 << n")
 		== "50: << of untyped constants needs a type from its context"
+	assert errors("function f(x: u8): bool { x += 300\n\treturn x == 300 }") == "31: 300 is not representable as u8; 48: 300 is not representable as u8"
 	assert errors("let a: u8 = 300") == "12: 300 is not representable as u8"
 	assert errors("const a: i8 = -129") == "14: -129 is not representable as i8"
 	assert errors("const a: i64 = 9223372036854775807\nconst b: u64 = 0xffff_ffff_ffff_ffff") == ""
 	assert errors("const a = 300 as u8") == "10: 300 is not representable as u8"
+	assert errors("const A = 300\nconst B = -1\nconst a: u8 = A\nconst b: u8 = B\nconst d: u8 = A + 1")
+		== "41: 300 is not representable as u8; 57: -1 is not representable as u8; 73: 300 is not representable as u8"
+	assert errors("function f(c: bool, x: i64) {\n\tconst a = if (c) [x] else [2]\n\tconst b: bool = a\n}") == "78: expected bool, got i64[]"
+	assert errors("function f(c: bool) {\n\tconst a = if (c) [] else [1]\n\tconst b = if (c) [[1], []] else [[2]]\n\tconst d = (if (c) [1] else null) ?? []\n}") == ""
 	assert errors("let x: f64 = 1") == "13: expected f64, got untyped int"
 	assert errors("const d: i32 = 1\nconst g: u32 = 1\nconst h = d + g") == "46: i32 and u32 do not widen to one type"
+	assert errors("function f(k: i32 | i64): bool { return k + 1 > 0 || k < 2 }") == "42: + needs numbers of one type, got i32 | i64; 55: < needs numbers of one type, got i32 | i64"
+	assert errors("function f(k: i32 | i64) {\n\tlet x = -k\n\tk++\n}") == "36: - needs numbers of one type, got i32 | i64; 41: ++ needs numbers of one type, got i32 | i64"
 	assert errors("const a = true * 2") == "15: * needs numbers, got bool and untyped int"
 	assert errors("const a = 1.5 & 1") == "14: & needs integers, got untyped float and untyped int"
 	assert errors("const a = 1 + \"s\"") == "12: + needs numbers, got untyped int and \"s\""
@@ -142,6 +157,7 @@ test "null is checked and narrowed" {
 		== "42: + needs numbers, got i32 | null and untyped int"
 	assert errors("function f(a: { b: i32 } | null): i32 { return a.b }") == "47: a may be null"
 	assert errors("function f(a: { b: i32 } | null): i32 | null { return a?.b }") == ""
+	assert errors("function f() {\n\tconst n = null\n\tconst a = n?.b.c\n}") == "43: n is always null"
 	assert errors("function f(n: i32 | null): i32 { return n ?? 0 }") == ""
 	assert errors("function f(n: i32): i32 { return n ?? 0 }") == "35: i32 is never null"
 	assert errors("function f(n: i32 | null): i32 { return n ?? \"s\" }") == "42: i32 and \"s\" have no common type"
@@ -196,6 +212,9 @@ test "a discriminating field narrows unions" {
 }
 
 test "calls" {
+	assert errors("function sum(...xs: i32[]): i32 { return 0 }\nconst ys: i64[] = [1]\nconst a = sum(...[\"a\"])\nconst b = sum(...ys)\nconst c = sum(...[1, 2])")
+		== "85: expected i32, got \"a\"; 105: expected i32, got i64"
+	assert errors("function kinds(...xs: (i32 | string)[]): i32 { return 0 }\nconst ints: i32[] = [1]\nconst k = kinds(1, ...ints)") == ""
 	assert errors("function f(x: i32): i32 { return f(1, 2) }") == "34: expected 1 arguments, got 2"
 	assert errors("function f(a: i32, b = 5, ...c: string[]): i32 { return f() + f(1, 2, \"x\", 3) }")
 		== "57: expected 1 to any arguments, got 0"
@@ -340,6 +359,19 @@ test "generics" {
 	assert errors("function g[T, U extends T](u: U): T { return u }\nfunction ok[T](x: T): bool { return true }\nfunction h[T](x: T) {\n\tif (ok(x)) {\n\t\tconst s: string = 1\n\t}\n}")
 		== "148: expected string, got untyped int"
 	assert errors("function size[T](v: T): i32 {\n\tswitch (T.kind) {\n\t\tcase \"string\": return v.length\n\t\tdefault: return 0\n\t}\n}") == ""
+	// An untyped type arg is kept open for a later arg whose type may widen it; arrows and then empty literals are checked last.
+	assert errors("function m[T, U](f: (x: T) => U, xs: T[]): U[] { return xs.map(f) }\nconst a = m(x => x * 2, [1, 2])\nconst b: bool = a") == "116: expected bool, got i32[]"
+	assert errors("function g[T](f: () => T, xs: T[]): T { return xs[0] }\nfunction h(k: i64) {\n\tconst a = g(() => k, [1, 2])\n\tconst b: bool = a\n}") == "123: expected bool, got i64"
+	assert errors("function g[T](a: T, b: T): T { return b }\nfunction one(): i64 { return 1 }\nconst h = g(one, () => 2)\nconst b: bool = h") == "117: expected bool, got () => i64"
+	assert errors("function f[T](xs: T[], ys: T[]): T[] { return xs }\nfunction g[T](a: T, b: T): T { return a }\nconst x: i64 = 1\nconst a = f([], [1])\nconst b = f([1], [x])\nconst c = g(if (true) 1 else 2, x)\nconst d: i64[] = f([1], [])\nconst e = g(1 + 2, x)\nconst h = g({ a: 1 }, { a: x })")
+		== ""
+	assert errors("function g[T](a: T, b: T): T { return a }\nconst K: u8 = 1\nconst a: bool = g(K, 3)\nconst b = g(K, 300)")
+		== "74: expected bool, got u8; 97: 300 is not representable as u8"
+	assert errors("function g[T](a: T, b: T): T { return a }\nfunction f(c: bool): i32 {\n\tconst a = g(1, if (c) 2 else null)\n\tconst b = g(if (c) 2 else null, 1)\n\tconst d: i64 | null = g(1, if (c) 2 else null)\n\tconst e: i64 | null = g(if (c) 1 else null, 2)\n\tconst h = g(if (c) 1 else null, 2 as i64)\n\tconst k: bool = g(1, null)\n\tconst l: bool = g(null, 1)\n\treturn 0\n}") == "297: expected bool, got i32 | null; 325: expected bool, got i32 | null"
+	assert errors("interface Int extends i32 | i64 {}\nfunction m[T extends Int](a: T, b: T): T { return a }\nfunction apply[T](x: T, f: (v: T) => T): T { return f(x) }\nconst a: i64 | null = m(1, 2)\nconst b: i64 | string = m(1, 2)\nconst d: i64 | null = apply(1, v => v * 2)") == ""
+	assert errors("interface Int extends i32 | i64 {}\nfunction g[T extends Int](a: T): T { return a }\nconst a: i32 = g(if (true) 1 else 2)") == ""
+	assert errors("function pair[A, B](a: A, b: B): [A, B] { return [a, b] }\nconst q: [u8, string] = pair(1, \"s\")\nconst r: [u8, string] = pair(300, \"s\")")
+		== "124: 300 is not representable as u8"
 }
 
 test "a type set holds the classes that fit its interfaces, if their fields are in it, and arrays of it" {
