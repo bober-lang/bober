@@ -861,7 +861,7 @@ class Checker {
 			for (const name of m.names) {
 				const b = m.exports.get(name)!
 				const t = b.type
-				fs.push(new Field(name, if (t == null) Empty else if (b.isType) meta(t) else t))
+				fs.push(new Field(name, if (t == null) Empty else if (b.isType) meta(t, b.params) else t))
 			}
 			const o = Type.object(fs)
 			for (const name of m.names) {
@@ -3729,7 +3729,7 @@ class Checker {
 					return Type.union([this.typeExpr(a), this.typeExpr(p.parts[1])])
 				}
 			case "index":
-				const [base, ps] = if (isTok(a, "ident")) this.named(a) else [this.typeExpr(a), []]
+				const [base, ps] = if (isTok(a, "ident") || a.kind == "member") this.named(a) else [this.typeExpr(a), []]
 				a.type = base
 				if (p.parts.length == 1) {
 					return Type.array(this.applied(base, ps, [], a))
@@ -3780,17 +3780,23 @@ class Checker {
 					case "...": return this.typeExpr(a)
 				}
 			case "member":
-				const m = this.expr(p, null)
-				const b = standsFor(m)
-				if (b != null) {
-					return b
-				}
+				const [t, ps] = this.named(p)
+				return this.applied(t, ps, [], p)
 		}
 		throw this.error(start(p), "expected a type")
 	}
 
-	/// The type that name p stands for, and its type params, if it is a generic or an alias that has some.
+	/// The type that name p, or ns.name of a namespace import, stands for, and its type params, if it is a generic or an
+	/// alias that has some.
 	private named(p: Node): [Type, Type[]] {
+		if (p.kind == "member") {
+			const m = this.expr(p, null)
+			const t = standsFor(m)
+			if (t == null) {
+				throw this.error(start(p), "expected a type")
+			}
+			return [t, m.params.slice(1, m.params.length)]
+		}
 		const b = this.lookup(p.t, !this.annotating)
 		p.symbol = b.symbol
 		if (b.isType) {
@@ -4102,8 +4108,8 @@ function fieldOf(t: Type, name: string): Field | null {
 /// What this is in the methods of class t: t, but a string or T[] in builtin/'s.
 export function selfOf(t: Type): Type { return if (t == String.base) String else if (t == Arrays.base) Type.array(t.params[0]) else t }
 
-/// The type of t used as a value (4.11).
-function meta(t: Type): Type { return Type.literal("", Meta, [t]) }
+/// The type of t used as a value (4.11), and of a namespace import's generic, its params.
+function meta(t: Type, ps: Type[] = []): Type { return Type.literal("", Meta, [t, ...ps]) }
 
 /// The type a Type value of type t stands for, null where t is not that or the type is not known.
 export function standsFor(t: Type): Type | null { return if (t.kind == "literal" && t.base == Meta) t.params[0] else null }

@@ -346,6 +346,11 @@ test "generics" {
 	assert errors("class B[T extends Nope] {\n\tx: i32 = 1\n}") == "18: Nope is not declared"
 	assert errors("type Opt[T] = T | null\ntype Pair[A, B = A] = [A, B]\nconst o: Opt[i32] = null\nconst p: Pair[i32] = [1, 2]\nconst q: Pair = [1, 2]")
 		== "114: Pair needs a type argument for A"
+	const lib = "export class Box[T] {\n\tv: T | null = null\n}\nexport class IntBox {}\nexport type Pair[A, B = A] = [A, B]"
+	assert errors("import * as m from \"lib\"\nconst b: m.Box[i32] = new m.Box[i32]()\nconst p: m.Pair[i32] = [1, 2]\nconst i: m.IntBox[] = []\n"
+		+ "const c: m.Box = b\nconst d: m.IntBox[i64] = new m.IntBox()\nconst e: m.Pair = p", ["lib.bob", lib])
+		== "128: m.Box needs a type argument for T; 147: m.IntBox takes 0 type arguments, got 1; 187: m.Pair needs a type argument for A"
+	assert errors("function f[T]() {\n\tfor (const g of T.fields) {\n\t\tconst xs: g.type[] = []\n\t}\n}") == ""
 	assert errors("interface Signed extends i8 | i16 | i32 | i64 {}\nfunction neg[T extends Signed](x: T): T { return -x }\nconst a = neg(1 as u8)\nlet s: Signed")
 		== "116: u8 does not fit T's constraint Signed; 133: Signed has no zero value"
 	assert errors("function h[T extends i8 | i16](x: T) {}") == "21: a constraint is not a union; name a type set"
@@ -375,6 +380,9 @@ test "generics" {
 	assert errors("interface Int extends i32 | i64 {}\nfunction g[T extends Int](a: T): T { return a }\nconst a: i32 = g(if (true) 1 else 2)") == ""
 	assert errors("function pair[A, B](a: A, b: B): [A, B] { return [a, b] }\nconst q: [u8, string] = pair(1, \"s\")\nconst r: [u8, string] = pair(300, \"s\")")
 		== "124: 300 is not representable as u8"
+	// A type arg is found through a union's one member mentioning it, or its bare param if it has one.
+	assert errors("class Box[T] {\n\tv: T | null = null\n}\nfunction e[T](x: T | Box[T]): T | null { return null }\nfunction s[K](n: Box[K] | null): K | null { return null }\nconst a: bool = e(1)\nconst b: bool = s(new Box[i64]())")
+		== "166: expected bool, got i32 | null; 187: expected bool, got i64 | null"
 }
 
 test "a type set holds the classes that fit its interfaces, if their fields are in it, and arrays of it" {
