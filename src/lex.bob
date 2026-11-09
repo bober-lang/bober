@@ -8,6 +8,7 @@
 //! expressions.
 
 import { lowerBound } from "../std/algo"
+import { values } from "../std/types"
 import * from "../std/ascii"
 
 /// ## Identifiers and keywords
@@ -374,18 +375,23 @@ export class Lexer {
 	private error(msg: string): SyntaxError { return new SyntaxError(Loc.at(this.pos, 1), msg) }
 }
 
+// Read once: reflecting them per token costs more than the lexing.
+const keywords = values[Keyword]()
+const contextuals = values[Contextual]()
+const operators = values[Operator]()
+
 export function keyword(s: string): Keyword | null {
-	for (const k of Keyword.members) {
-		if (s == k.value) {
-			return k.value
+	for (const k of keywords) {
+		if (s == k) {
+			return k
 		}
 	}
 	return null
 }
 
 function contextual(s: string): bool {
-	for (const k of Contextual.members) {
-		if (s == k.value) {
+	for (const k of contextuals) {
+		if (s == k) {
 			return true
 		}
 	}
@@ -395,8 +401,7 @@ function contextual(s: string): bool {
 /// The longest operator that ahead starts with.
 function operator(ahead: u8[3]): Operator | null {
 	let op: Operator | null = null
-	for (const o of Operator.members) {
-		const s = o.value
+	for (const s of operators) {
 		let i = 0
 		while (i < s.length && s[i] == ahead[i]) {
 			i++
