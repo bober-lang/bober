@@ -1,0 +1,1380 @@
+//! YAML's concrete syntax as eemeli/yaml (ISC, github.com/eemeli/yaml) reads it: a lexer splits the source into
+//! tokens, and a parser folds them into a tree of documents, collections and scalars that keeps every token, for
+//! ../yaml to compose into nodes. A token is a span of the source; the parser throws at a token it cannot place.
+
+import * as ascii from "../../ascii"
+import { ampersand, apostrophe, backslash, colon, comma, cr, dollar, dot, equal, exclamation, greater, hash,
+	isAlphanumeric, isHexDigit, lbrace, lbracket, less, lf, lparen, minus, nine, one, percent, pipe, plus, question,
+	quote, rbrace, rbracket, rparen, semicolon, slash, space, star, tab, tilde, underscore } from "../../ascii"
+import { max, min } from "../../math"
+import { ParseError } from "../../parse"
+import * as kind from "./kind"
+
+/// A kind of token or node, one of ./kind's.
+export type Kind = u8
+
+/// A node of the tree: a document, collection, scalar, directive or document end, with lists of the tokens around it.
+export class Tok {
+	kind: Kind
+	/// Where its source starts and ends; a block scalar's source is its body, from `from`.
+	at: i32
+	end: i32
+	/// The indentation of its line, as the parser counts it.
+	indent: i32
+	/// A document's props and other leading tokens; a block scalar's header and the tokens after it on its line.
+	start = none
+	/// The tokens after a flow scalar, flow collection or document to the end of its line; a flow collection's begin
+	/// with its closing bracket, and a document end's follow it.
+	tail = none
+	/// A document's value.
+	value: Tok | null = null
+	/// A collection's items.
+	items: Item[] | null = null
+	/// Whether a flow collection is a mapping.
+	braces = false
+	/// Where a block scalar's body starts.
+	from = 0
+
+	constructor(k: Kind, at: i32, end: i32, indent: i32) {
+		this.kind = k
+		this.at = at
+		this.end = end
+		this.indent = indent
+	}
+}
+
+/// An item of a collection: its leading tokens, its key, the tokens between key and value, and its value. A key-less
+/// item of a mapping has a sep and a null key; an item of a sequence has neither.
+export class Item {
+	start: i32
+	key: Tok | null
+	sep: i32
+	value: Tok | null = null
+	/// Whether it starts with ?.
+	explicitKey = false
+
+	constructor(start = none, key: Tok | null = null, sep = none) {
+		this.start = start
+		this.key = key
+		this.sep = sep
+	}
+}
+
+/// No list, which reads as an empty one.
+export const none = -1
+
+/// The tree's tokens, and the lists of them its nodes hold, by index. The parser adds a token as it puts it at the
+/// end of a list, which is empty or the one it added to last, so a list is a run of tokens.
+export class Cst {
+	/// Each token's kind, where its source starts and ends, and the indentation of its line, as the parser counts it.
+	kind: Kind[] = []
+	at: i32[] = []
+	end: i32[] = []
+	indent: i32[] = []
+	/// The directives, documents and document ends.
+	top: Tok[] = []
+	/// Each list's run of tokens.
+	private first: i32[] = []
+	private after: i32[] = []
+
+	/// Where the tokens of list l start, and where they end.
+	from(l: i32): i32 { return if (l == none) 0 else this.first[l] }
+	to(l: i32): i32 { return if (l == none) 0 else this.after[l] }
+	size(l: i32): i32 { return this.to(l) - this.from(l) }
+
+	/// A new list, empty.
+	list(): i32 {
+		this.first.push(0)
+		this.after.push(0)
+		return this.first.length - 1
+	}
+
+	/// Adds a token to the end of list l, or of a new list if none; the list.
+	add(l: i32, k: Kind, at: i32, end: i32, indent: i32): i32 {
+		const r = if (l == none) this.list() else l
+		const i = this.kind.length
+		this.kind.push(k)
+		this.at.push(at)
+		this.end.push(end)
+		this.indent.push(indent)
+		if (this.first[r] == this.after[r]) {
+			this.first[r] = i
+		}
+		this.after[r] = i + 1
+		return r
+	}
+
+	/// The tokens of l from token i on, cut from it as a list of their own, or none.
+	cut(l: i32, i: i32): i32 {
+		if (i >= this.to(l)) {
+			return none
+		}
+		const r = this.list()
+		this.first[r] = i
+		this.after[r] = this.after[l]
+		this.after[l] = i
+		return r
+	}
+
+	/// The tokens of a and of b, which follow a's, as one list.
+	join(a: i32, b: i32): i32 {
+		if (this.size(b) == 0) {
+			return a
+		}
+		if (this.size(a) == 0) {
+			return b
+		}
+		this.after[a] = this.after[b]
+		return a
+	}
+
+	/// Whether l has a token of kind k.
+	includes(l: i32, k: Kind): bool {
+		for (const i of this.from(l) ... this.to(l) - 1) {
+			if (this.kind[i] == k) {
+				return true
+			}
+		}
+		return false
+	}
+
+	/// Whether the last token of l is of kind k.
+	endsWith(l: i32, k: Kind): bool { return this.size(l) > 0 && this.kind[this.to(l) - 1] == k }
+
+	/// Whether l has only spaces, comments and newlines.
+	blank(l: i32): bool {
+		for (const i of this.from(l) ... this.to(l) - 1) {
+			const k = this.kind[i]
+			if (k != kind.space && k != kind.comment && k != kind.newline) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+/// The tree of s: its tokens, and its directives, documents and document ends.
+export function parse(s: string): Cst throws ParseError {
+	const p = new Parser(s)
+	new Lexer(s, p).run()
+	while (p.stack.length > 0) {
+		p.pop()
+	}
+	return p.c
+}
+
+/// The byte of s at i, -1 outside it.
+export function byte(s: string, i: i32): i32 { return if (i >= 0 && i < s.length) s[i] as i32 else -1 }
+
+function isEmpty(c: i32): bool { return c == -1 || c == space || c == lf || c == cr || c == tab }
+function isBlank(c: i32): bool { return c == space || c == tab }
+function isFlowIndicator(c: i32): bool {
+	return c == comma || c == lbracket || c == rbracket || c == lbrace || c == rbrace
+}
+/// Whether c is white space as a regular expression's \s takes it, of ASCII.
+function isWhite(c: i32): bool { return c == space || c >= tab && c <= cr }
+
+/// Whether a document marker, --- or ..., starts at i, followed by white space or the end.
+function isDocMarker(s: string, i: i32): bool {
+	const c = byte(s, i)
+	return (c == minus || c == dot) && byte(s, i + 1) == c && byte(s, i + 2) == c && isEmpty(byte(s, i + 3))
+}
+
+/// Where the line at i ends: at its line feed, or the carriage return before that.
+function lineEnd(s: string, i: i32): i32 {
+	let j = i
+	while (j < s.length && s[j] != lf) {
+		j++
+	}
+	return if (j > i && s[j - 1] == cr) j - 1 else j
+}
+
+/// Whether a line ends at i.
+function atLineEnd(s: string, i: i32): bool {
+	const c = byte(s, i)
+	return c == -1 || c == lf || c == cr && byte(s, i + 1) == lf
+}
+
+type State = "stream" | "document" | "flow"
+
+/// eemeli's lexer, which hands each token to the parser as it reads it.
+class Lexer {
+	s: string
+	p: Parser
+	pos = 0
+	/// Whether a : may follow at once as a flow key's indicator, as after a quoted scalar or a closing bracket.
+	flowKey = false
+	/// How deep flow collections nest.
+	flowLevel = 0
+	/// The least indentation a next line needs to continue the current scalar.
+	indentNext = 0
+	/// The indentation of the current line.
+	indentValue = 0
+
+	constructor(s: string, p: Parser) {
+		this.s = s
+		this.p = p
+	}
+
+	run() throws ParseError {
+		let state: State = "stream"
+		while (this.pos < this.s.length) {
+			state = switch (state) {
+				case "stream": this.stream()
+				case "document": this.document()
+				case "flow": this.flow()
+			}
+		}
+	}
+
+	/// The byte n past pos, -1 outside the source.
+	ch(n: i32): i32 { return byte(this.s, this.pos + n) }
+
+	/// The source up to end as a token of kind k, if not empty.
+	tok(k: Kind, end: i32) throws ParseError {
+		if (end > this.pos) {
+			this.p.next(k, this.pos, end)
+			this.pos = end
+		}
+	}
+
+	/// An empty token of kind k.
+	mark(k: Kind) throws ParseError { this.p.next(k, this.pos, this.pos) }
+
+	/// The source up to end as a scalar, which may be empty.
+	scalar(end: i32) throws ParseError {
+		this.p.next(kind.scalar, this.pos, end)
+		this.pos = end
+	}
+
+	/// Where a scalar continues on the line at offset, or -1 if it ends before.
+	continueScalar(offset: i32): i32 {
+		if (this.indentNext > 0) {
+			let indent = 0
+			while (byte(this.s, offset + indent) == space) {
+				indent++
+			}
+			const c = byte(this.s, offset + indent)
+			if (c == cr && byte(this.s, offset + indent + 1) == lf) {
+				return offset + indent + 1
+			}
+			return if (c == lf || indent >= this.indentNext) offset + indent else -1
+		}
+		return if (isDocMarker(this.s, offset)) -1 else offset
+	}
+
+	stream(): State throws ParseError {
+		const s = this.s
+		if (byte(s, this.pos) == 0xef && byte(s, this.pos + 1) == 0xbb && byte(s, this.pos + 2) == 0xbf) {
+			this.tok(kind.byteOrderMark, this.pos + 3)
+			return "stream"
+		}
+		if (this.ch(0) == percent) {
+			// The directive runs to the line's end, less the blanks before its end or a comment.
+			let i = this.pos + 1
+			while (!atLineEnd(s, i) && !(isBlank(byte(s, i)) && (atLineEnd(s, i + 1) || byte(s, i + 1) == hash))) {
+				i++
+			}
+			this.tok(kind.directive, i)
+			this.spaces(true)
+			if (this.ch(0) == hash) {
+				this.tok(kind.comment, lineEnd(s, this.pos))
+			}
+			this.newline()
+			return "stream"
+		}
+		let i = this.pos
+		while (isBlank(byte(s, i))) {
+			i++
+		}
+		const end = if (byte(s, i) == hash) lineEnd(s, i) else i
+		if (atLineEnd(s, end)) {
+			this.tok(kind.space, i)
+			this.tok(kind.comment, end)
+			this.newline()
+			return "stream"
+		}
+		this.mark(kind.docMode)
+		return this.lineStart()
+	}
+
+	lineStart(): State throws ParseError {
+		const s = this.s
+		if (isDocMarker(s, this.pos)) {
+			const dash = s[this.pos] == minus
+			this.tok(if (dash) kind.docStart else kind.docEnd, this.pos + 3)
+			if (this.spaces(true) > 0 && this.ch(0) == hash) {
+				this.tok(kind.comment, lineEnd(s, this.pos))
+			}
+			const nl = this.newline()
+			this.indentValue = 0
+			this.indentNext = 0
+			// A marker is one only at the start of a line, so the --- of `--- ---` is a scalar.
+			return if (!dash) "stream" else if (nl > 0) this.lineStart() else this.indicatorsAtLineStart()
+		}
+		return this.indicatorsAtLineStart()
+	}
+
+	/// The indentation and block indicators at the start of a line.
+	indicatorsAtLineStart(): State throws ParseError {
+		const s = this.s
+		this.indentValue = this.spaces(false)
+		// A comment line is no content, so it leaves what a scalar needs to continue as it is.
+		if (this.indentNext > this.indentValue && this.ch(0) != hash && !isEmpty(this.ch(1))) {
+			this.indentNext = this.indentValue
+		}
+		while (true) {
+			const c = this.ch(0)
+			if (c != minus && c != question && c != colon || !isEmpty(this.ch(1)) || this.ch(1) == cr) {
+				break
+			}
+			const start = this.pos
+			this.tok(if (c == minus) kind.seqItemInd else if (c == question) kind.explicitKeyInd else kind.mapValueInd,
+				start + 1)
+			let i = this.pos
+			while (isBlank(byte(s, i))) {
+				i++
+			}
+			this.tok(kind.space, i)
+			this.indentNext = this.indentValue + 1
+			this.indentValue += this.pos - start
+		}
+		return "document"
+	}
+
+	document(): State throws ParseError {
+		this.spaces(true)
+		this.indicators()
+		const c = this.ch(0)
+		switch (c) {
+			case hash, lf, -1:
+				if (c == hash) {
+					this.tok(kind.comment, lineEnd(this.s, this.pos))
+				}
+				this.newline()
+				return this.lineStart()
+			case lbrace, lbracket:
+				this.tok(if (c == lbrace) kind.flowMapStart else kind.flowSeqStart, this.pos + 1)
+				this.flowKey = false
+				this.flowLevel = 1
+				return "flow"
+			case rbrace, rbracket:
+				this.tok(if (c == rbrace) kind.flowMapEnd else kind.flowSeqEnd, this.pos + 1)
+				return "document"
+			case star:
+				this.alias()
+				return "document"
+			case quote, apostrophe:
+				this.quotedScalar(c as u8)
+				return "document"
+			case pipe, greater:
+				this.blockScalar()
+				return this.lineStart()
+			default:
+				if (c == cr && this.ch(1) == lf) {
+					this.tok(kind.newline, this.pos + 2)
+					return this.lineStart()
+				}
+				this.plainScalar()
+				return "document"
+		}
+	}
+
+	flow(): State throws ParseError {
+		let indent = -1
+		while (true) {
+			const nl = this.newline()
+			let sp = 0
+			if (nl > 0) {
+				sp = this.spaces(false)
+				indent = sp
+				this.indentValue = sp
+			}
+			sp += this.spaces(true)
+			if (nl + sp == 0) {
+				break
+			}
+		}
+		let c = this.ch(0)
+		// A ] or } as indented as the [ or { is technically invalid, but taken.
+		if (indent != -1 && indent < this.indentNext && c != hash
+				&& !(indent == this.indentNext - 1 && this.flowLevel == 1 && (c == rbracket || c == rbrace))
+				|| indent == 0 && byte(this.s, this.pos - 1) == lf && isDocMarker(this.s, this.pos)) {
+			this.flowLevel = 0
+			this.mark(kind.flowErrorEnd)
+			return this.lineStart()
+		}
+		while (c == comma) {
+			this.tok(kind.comma, this.pos + 1)
+			this.spaces(true)
+			this.flowKey = false
+			c = this.ch(0)
+		}
+		if (this.indicators()) {
+			c = this.ch(0)
+		}
+		switch (c) {
+			case lf, -1: {}
+			case hash: this.tok(kind.comment, lineEnd(this.s, this.pos))
+			case lbrace, lbracket:
+				this.tok(if (c == lbrace) kind.flowMapStart else kind.flowSeqStart, this.pos + 1)
+				this.flowKey = false
+				this.flowLevel += 1
+			case rbrace, rbracket:
+				this.tok(if (c == rbrace) kind.flowMapEnd else kind.flowSeqEnd, this.pos + 1)
+				this.flowKey = true
+				this.flowLevel -= 1
+				return if (this.flowLevel > 0) "flow" else "document"
+			case star: this.alias()
+			case quote, apostrophe:
+				this.flowKey = true
+				this.quotedScalar(c as u8)
+			case colon:
+				const next = this.ch(1)
+				if (this.flowKey || isEmpty(next) || next == comma) {
+					this.flowKey = false
+					this.tok(kind.mapValueInd, this.pos + 1)
+					this.spaces(true)
+				} else {
+					this.plainScalar()
+				}
+			default:
+				if (c != cr || this.ch(1) != lf) {
+					this.flowKey = false
+					this.plainScalar()
+				}
+		}
+		return "flow"
+	}
+
+	/// The anchors, tags and indicators at pos, each with the blanks after it; whether there were any.
+	indicators(): bool throws ParseError {
+		const s = this.s
+		let found = false
+		while (true) {
+			const c = this.ch(0)
+			let i = this.pos + 1
+			let k: Kind = kind.anchor
+			if (c == ampersand) {
+				while (!isWhite(byte(s, i)) && byte(s, i) != -1 && !isFlowIndicator(byte(s, i))) {
+					i++
+				}
+			} else if (c == exclamation) {
+				k = kind.tag
+				if (byte(s, i) == less) {
+					while (!isWhite(byte(s, i)) && byte(s, i) != -1 && byte(s, i) != greater) {
+						i++
+					}
+					if (byte(s, i) == greater) {
+						i++
+					}
+				} else {
+					while (true) {
+						const d = byte(s, i)
+						if (d == percent && isHexDigit(byte(s, i + 1) as u8) && isHexDigit(byte(s, i + 2) as u8)) {
+							i += 3
+						} else if (isAlphanumeric(d as u8) || isTagChar(d as u8)) {
+							i++
+						} else {
+							break
+						}
+					}
+				}
+			} else if (c == minus || c == question || c == colon) {
+				const next = this.ch(1)
+				const block = isEmpty(next)
+				if (!block && !isFlowIndicator(next)) {
+					break
+				}
+				// In a flow collection, a ? or - right before , ] or } is neither an indicator nor a plain scalar.
+				if (!block && c != colon && this.flowLevel > 0) {
+					throw new ParseError("syntax", this.pos)
+				}
+				found = true
+				if (this.flowLevel > 0) {
+					this.flowKey = false
+				} else if (block) {
+					this.indentNext = this.indentValue + 1
+				} else {
+					break
+				}
+				k = if (c == minus) kind.seqItemInd else if (c == question) kind.explicitKeyInd else kind.mapValueInd
+			} else {
+				break
+			}
+			found = true
+			this.tok(k, i)
+			this.spaces(true)
+		}
+		return found
+	}
+
+	quotedScalar(q: u8) throws ParseError {
+		const s = this.s
+		let end = find(s, q, this.pos + 1, s.length)
+		if (q == apostrophe) {
+			while (end != -1 && byte(s, end + 1) == apostrophe) {
+				end = find(s, apostrophe, end + 2, s.length)
+			}
+		} else {
+			while (end != -1) {
+				let n = 0
+				while (byte(s, end - 1 - n) == backslash) {
+					n++
+				}
+				if (n % 2 == 0) {
+					break
+				}
+				end = find(s, quote, end + 1, s.length)
+			}
+		}
+		// A line less indented than the scalar needs ends it, which is an error.
+		let nl = if (end == -1) -1 else find(s, lf, this.pos, end)
+		while (nl != -1) {
+			const cs = this.continueScalar(nl + 1)
+			if (cs == -1) {
+				throw new ParseError("syntax", nl - (if (byte(s, nl - 1) == cr) 1 else 0))
+			}
+			nl = find(s, lf, cs, end)
+		}
+		if (end == -1) {
+			throw new ParseError("syntax", s.length) // no closing quote, as in ''' whose last two quote each other
+		}
+		this.tok(if (q == apostrophe) kind.singleQuotedScalar else kind.doubleQuotedScalar, min(end + 1, s.length))
+	}
+
+	blockScalar() throws ParseError {
+		const s = this.s
+		let bsIndent = -1
+		let keep = false
+		let i = this.pos + 1
+		while (i < s.length && !isWhite(s[i]) && s[i] != hash) {
+			if (s[i] == plus) {
+				keep = true
+			} else if (s[i] >= one && s[i] <= nine) {
+				bsIndent = s[i] - one
+			}
+			i++
+		}
+		this.tok(kind.blockScalarHeader, i)
+		this.spaces(true)
+		let e = this.pos
+		while (!atLineEnd(s, e)) {
+			e++
+		}
+		// Only a comment may follow the header on its line.
+		if (e > this.pos && s[this.pos] != hash) {
+			throw new ParseError("syntax", this.pos)
+		}
+		if (e > this.pos) {
+			this.tok(kind.comment, e)
+		}
+		this.newline()
+
+		let nl = this.pos - 1
+		let indent = 0
+		i = this.pos
+		while (true) {
+			const c = byte(s, i)
+			if (c == space) {
+				indent++
+			} else if (c == lf) {
+				nl = i
+				indent = 0
+			} else if (c != cr || byte(s, i + 1) != lf) {
+				break
+			}
+			i++
+		}
+		if (indent >= this.indentNext) {
+			const step = if (this.indentNext == 0) 1 else this.indentNext
+			this.indentNext = if (bsIndent == -1) indent else bsIndent + step
+			while (nl != -1) {
+				const cs = this.continueScalar(nl + 1)
+				if (cs == -1) {
+					break
+				}
+				nl = find(s, lf, cs, s.length)
+			}
+			if (nl == -1) {
+				nl = s.length
+			}
+		}
+		// Trailing tabs less indented than the scalar are invalid, so it takes them for the composer to reject.
+		i = nl + 1
+		while (byte(s, i) == space) {
+			i++
+		}
+		if (byte(s, i) == tab) {
+			while (isEmpty(byte(s, i)) && byte(s, i) != -1) {
+				i++
+			}
+			nl = i - 1
+		} else if (!keep) {
+			// Trailing lines of spaces no more indented than its content are not its.
+			while (true) {
+				let j = nl - 1
+				if (byte(s, j) == cr) {
+					j--
+				}
+				const last = j
+				while (byte(s, j) == space) {
+					j--
+				}
+				if (byte(s, j) != lf || j < this.pos || j + 1 + this.indentNext <= last) {
+					break
+				}
+				nl = j
+			}
+		}
+		this.scalar(min(nl + 1, s.length))
+	}
+
+	plainScalar() throws ParseError {
+		const s = this.s
+		const inFlow = this.flowLevel > 0
+		let end = this.pos - 1
+		let i = this.pos - 1
+		while (true) {
+			i++
+			if (i >= s.length) {
+				break
+			}
+			let c = s[i] as i32
+			if (c == colon) {
+				const next = byte(s, i + 1)
+				if (isEmpty(next) || inFlow && isFlowIndicator(next)) {
+					break
+				}
+				end = i
+			} else if (isEmpty(c)) {
+				let next = byte(s, i + 1)
+				if (c == cr) {
+					if (next == lf) {
+						i++
+						c = lf
+						next = byte(s, i + 1)
+					} else {
+						end = i
+					}
+				}
+				if (next == hash || inFlow && isFlowIndicator(next)) {
+					break
+				}
+				if (c == lf) {
+					const cs = this.continueScalar(i + 1)
+					if (cs == -1) {
+						break
+					}
+					i = max(i, cs - 2) // past the blanks, but not a ' #'
+				}
+			} else {
+				if (inFlow && isFlowIndicator(c)) {
+					break
+				}
+				end = i
+			}
+		}
+		this.scalar(end + 1)
+	}
+
+	alias() throws ParseError {
+		let i = this.pos
+		while (!isEmpty(byte(this.s, i)) && !isFlowIndicator(byte(this.s, i))) {
+			i++
+		}
+		this.tok(kind.alias, i)
+	}
+
+	newline(): i32 throws ParseError {
+		const n = if (this.ch(0) == lf) 1 else if (this.ch(0) == cr && this.ch(1) == lf) 2 else 0
+		this.tok(kind.newline, this.pos + n)
+		return n
+	}
+
+	spaces(tabs: bool): i32 throws ParseError {
+		let i = this.pos
+		while (byte(this.s, i) == space || tabs && byte(this.s, i) == tab) {
+			i++
+		}
+		const n = i - this.pos
+		this.tok(kind.space, i)
+		return n
+	}
+}
+
+/// Whether c may be in a tag's name besides letters, digits and %-escapes.
+export function isTagChar(c: u8): bool {
+	switch (c) {
+		case minus, hash, semicolon, slash, question, colon, ascii.at, ampersand, equal, plus,
+			dollar, underscore, dot, exclamation, tilde, star, apostrophe, lparen, rparen:
+			return true
+		default: return false
+	}
+}
+
+/// Where c is first in s from from up to to, or -1.
+function find(s: string, c: u8, from: i32, to: i32): i32 {
+	for (const i of from ... to - 1) {
+		if (s[i] == c) {
+			return i
+		}
+	}
+	return -1
+}
+
+function isFlowToken(t: Tok | null): bool {
+	if (t == null) {
+		return false
+	}
+	switch (t.kind) {
+		case kind.alias, kind.scalar, kind.singleQuotedScalar, kind.doubleQuotedScalar, kind.flowCollection: return true
+		default: return false
+	}
+}
+
+/// The tokens that lead the props of a block mapping's first key, cut from the end of list prev: those after its
+/// last newline or indicator, less the spaces first.
+function keyStart(c: Cst, prev: i32): i32 {
+	let i = c.to(prev) - 1
+	while (i >= c.from(prev)) {
+		const k = c.kind[i]
+		if (k == kind.docStart || k == kind.explicitKeyInd || k == kind.mapValueInd || k == kind.seqItemInd
+				|| k == kind.newline) {
+			break
+		}
+		i--
+	}
+	i++
+	while (i < c.to(prev) && c.kind[i] == kind.space) {
+		i++
+	}
+	return c.cut(prev, i)
+}
+
+/// Whether the comments of list l are less indented than indent.
+function commentsBelow(c: Cst, l: i32, indent: i32): bool {
+	for (const i of c.from(l) ... c.to(l) - 1) {
+		if (c.kind[i] == kind.comment && c.indent[i] >= indent) {
+			return false
+		}
+	}
+	return true
+}
+
+/// In a flow sequence, an item with a key and sep but no : is a value.
+function fixFlowSeqItems(c: Cst, fc: Tok) {
+	if (fc.braces) {
+		return
+	}
+	for (const it of fc.items!) {
+		const sep = it.sep
+		if (sep != none && it.value == null && !c.includes(it.start, kind.explicitKeyInd)
+				&& !c.includes(sep, kind.mapValueInd)) {
+			const v = it.key
+			it.value = v
+			it.key = null
+			it.sep = none
+			// A block collection here is an error the composer finds, whichever tokens go with it.
+			if (v != null && isFlowToken(v)) {
+				v.tail = c.join(v.tail, sep)
+			}
+		}
+	}
+}
+
+function blockMap(at: i32, indent: i32, it: Item): Tok {
+	const t = new Tok(kind.blockMap, at, at, indent)
+	t.items = [it]
+	return t
+}
+
+/// eemeli's parser, which builds the tree from each token as the lexer reads it.
+class Parser {
+	s: string
+	c = new Cst()
+	/// The nodes being built, the innermost last.
+	stack: Tok[] = []
+	/// Whether spaces and sequence indicators count as indentation.
+	atNewLine = true
+	indent = 0
+	/// Whether on the line of a block mapping's key.
+	onKeyLine = false
+	/// The current token.
+	kind: Kind = kind.space
+	at = 0
+	end = 0
+
+	constructor(s: string) { this.s = s }
+
+	next(k: Kind, at: i32, end: i32) throws ParseError {
+		this.kind = k
+		this.at = at
+		this.end = end
+		if (k == kind.scalar) {
+			this.atNewLine = false
+			this.step()
+			return
+		}
+		this.step()
+		switch (k) {
+			case kind.newline:
+				this.atNewLine = true
+				this.indent = 0
+			case kind.space:
+				if (this.atNewLine && this.s[at] == space) {
+					this.indent += end - at
+				}
+			case kind.explicitKeyInd, kind.mapValueInd, kind.seqItemInd:
+				if (this.atNewLine) {
+					this.indent += end - at
+				}
+			case kind.byteOrderMark, kind.docMode, kind.flowErrorEnd: {}
+			default: this.atNewLine = false
+		}
+	}
+
+	/// The current token as a node.
+	src(): Tok { return new Tok(this.kind, this.at, this.end, this.indent) }
+
+	/// Adds the current token to the end of list l, or of a new list if none; the list.
+	push(l: i32): i32 { return this.c.add(l, this.kind, this.at, this.end, this.indent) }
+
+	fail(): ParseError { return new ParseError("syntax", this.at) }
+
+	peek(n: i32): Tok | null { return this.stack.at(this.stack.length - n) }
+
+	step() throws ParseError {
+		const top = this.peek(1)
+		if (this.kind == kind.docEnd && (top == null || top.kind != kind.docEnd)) {
+			while (this.stack.length > 0) {
+				this.pop()
+			}
+			this.stack.push(this.src())
+			return
+		}
+		if (top == null) {
+			this.stream()
+			return
+		}
+		switch (top.kind) {
+			case kind.document: this.document(top)
+			case kind.alias, kind.scalar, kind.singleQuotedScalar, kind.doubleQuotedScalar: this.scalar(top)
+			case kind.blockScalar: this.blockScalar(top)
+			case kind.blockMap: this.blockMap(top)
+			case kind.blockSeq: this.blockSequence(top)
+			case kind.flowCollection: this.flowCollection(top)
+			case kind.docEnd: this.documentEnd(top)
+			default: this.pop()
+		}
+	}
+
+	/// The node atop the stack, done, added to the one below.
+	pop() throws ParseError {
+		const c = this.c
+		const t = this.stack.pop()
+		const top = this.peek(1)
+		if (top == null) {
+			c.top.push(t)
+			return
+		}
+		if (t.kind == kind.blockScalar) {
+			t.indent = top.indent // a block scalar's is its parent's, not its header's
+		} else if (t.kind == kind.flowCollection && top.kind == kind.document) {
+			t.indent = 0
+		}
+		if (t.kind == kind.flowCollection) {
+			fixFlowSeqItems(c, t)
+		}
+		switch (top.kind) {
+			case kind.document: top.value = t
+			case kind.blockMap:
+				const items = top.items!
+				const it = items[items.length - 1]
+				if (it.value != null) {
+					items.push(new Item(none, t, c.list()))
+					this.onKeyLine = true
+					return
+				} else if (it.sep != none) {
+					it.value = t
+				} else {
+					it.key = t
+					it.sep = c.list()
+					this.onKeyLine = !it.explicitKey
+					return
+				}
+			case kind.blockSeq:
+				const items = top.items!
+				const it = items[items.length - 1]
+				if (it.value != null) {
+					const n = new Item()
+					n.value = t
+					items.push(n)
+				} else {
+					it.value = t
+				}
+			case kind.flowCollection:
+				const items = top.items!
+				const it = items.at(items.length - 1)
+				if (it == null || it.value != null) {
+					items.push(new Item(none, t, c.list()))
+				} else if (it.sep != none) {
+					it.value = t
+				} else {
+					it.key = t
+					it.sep = c.list()
+				}
+				return
+			default: throw new ParseError("syntax", t.at)
+		}
+		// A last item of only spaces, comments and newlines that are not more indented moves to the parent.
+		if ((t.kind == kind.blockMap || t.kind == kind.blockSeq)
+				&& (top.kind == kind.document || top.kind == kind.blockMap || top.kind == kind.blockSeq)) {
+			const items = t.items!
+			const last = items.at(items.length - 1)
+			if (last != null && last.sep == none && last.value == null && c.size(last.start) > 0 && c.blank(last.start)
+					&& (t.indent == 0 || commentsBelow(c, last.start, t.indent))) {
+				if (top.kind == kind.document) {
+					top.tail = last.start
+				} else {
+					top.items!.push(new Item(last.start))
+				}
+				items.pop()
+			}
+		}
+	}
+
+	stream() throws ParseError {
+		switch (this.kind) {
+			case kind.directive: this.c.top.push(this.src())
+			case kind.byteOrderMark, kind.space, kind.comment, kind.newline: {}
+			case kind.docMode, kind.docStart:
+				const doc = new Tok(kind.document, this.at, this.at, 0)
+				if (this.kind == kind.docStart) {
+					doc.start = this.push(none)
+				}
+				this.stack.push(doc)
+			default: throw this.fail()
+		}
+	}
+
+	document(doc: Tok) throws ParseError {
+		if (doc.value != null) {
+			this.lineEnd(doc)
+			return
+		}
+		switch (this.kind) {
+			case kind.docStart:
+				if (!this.c.blank(doc.start)) {
+					this.pop()
+					this.step()
+				} else {
+					doc.start = this.push(doc.start)
+				}
+			case kind.anchor, kind.tag, kind.space, kind.comment, kind.newline: doc.start = this.push(doc.start)
+			default:
+				const bv = this.startBlockValue(doc)
+				if (bv == null) {
+					throw this.fail()
+				}
+				this.stack.push(bv)
+		}
+	}
+
+	scalar(scalar: Tok) throws ParseError {
+		if (this.kind != kind.mapValueInd) {
+			this.lineEnd(scalar)
+			return
+		}
+		const start = keyStart(this.c, this.prevProps(this.peek(2)!))
+		const sep = this.push(scalar.tail)
+		scalar.tail = none
+		this.onKeyLine = true
+		this.stack[this.stack.length - 1] = blockMap(scalar.at, scalar.indent, new Item(start, scalar, sep))
+	}
+
+	blockScalar(scalar: Tok) throws ParseError {
+		switch (this.kind) {
+			case kind.space, kind.comment, kind.newline: scalar.start = this.push(scalar.start)
+			case kind.scalar:
+				scalar.from = this.at
+				scalar.end = this.end
+				this.atNewLine = true // its source takes its last line's newline
+				this.onKeyLine = false
+				this.indent = 0
+				this.pop()
+			default:
+				this.pop()
+				this.step()
+		}
+	}
+
+	blockMap(map: Tok) throws ParseError {
+		const c = this.c
+		const items = map.items!
+		const it = items[items.length - 1]
+		switch (this.kind) {
+			case kind.newline:
+				this.onKeyLine = false
+				if (it.value != null) {
+					this.afterValue(items, it.value!)
+				} else if (it.sep != none) {
+					it.sep = this.push(it.sep)
+				} else {
+					it.start = this.push(it.start)
+				}
+				return
+			case kind.space, kind.comment:
+				if (it.value != null) {
+					items.push(new Item(this.push(none)))
+				} else if (it.sep != none) {
+					it.sep = this.push(it.sep)
+				} else if (!this.indentedComment(items, it, map.indent)) {
+					it.start = this.push(it.start)
+				}
+				return
+		}
+		if (this.indent >= map.indent) {
+			const atMapIndent = !this.onKeyLine && this.indent == map.indent
+			const atNextItem = atMapIndent && (it.sep != none || it.explicitKey) && this.kind != kind.seqItemInd
+			// Of an empty value's tokens, those after a second newline not more indented go to the next item.
+			let start = none
+			if (atNextItem && it.sep != none && it.value == null) {
+				const sep = it.sep
+				let nl = 0
+				let second = 0
+				for (const i of c.from(sep) ... c.to(sep) - 1) {
+					switch (c.kind[i]) {
+						case kind.newline:
+							if (nl == 1) {
+								second = i
+							}
+							nl++
+						case kind.space: {}
+						case kind.comment:
+							if (c.indent[i] > map.indent) {
+								nl = 0
+							}
+						default: nl = 0
+					}
+				}
+				if (nl >= 2) {
+					start = c.cut(sep, second)
+				}
+			}
+			switch (this.kind) {
+				case kind.anchor, kind.tag:
+					if (atNextItem || it.value != null) {
+						items.push(new Item(this.push(start)))
+						this.onKeyLine = true
+					} else if (it.sep != none) {
+						it.sep = this.push(it.sep)
+					} else {
+						it.start = this.push(it.start)
+					}
+					return
+				case kind.explicitKeyInd:
+					if (it.sep == none && !it.explicitKey) {
+						it.start = this.push(it.start)
+						it.explicitKey = true
+					} else if (atNextItem || it.value != null) {
+						const n = new Item(this.push(start))
+						n.explicitKey = true
+						items.push(n)
+					} else {
+						const n = new Item(this.push(none))
+						n.explicitKey = true
+						this.stack.push(blockMap(this.at, this.indent, n))
+					}
+					this.onKeyLine = true
+					return
+				case kind.mapValueInd:
+					this.mapValue(items, it, start, atNextItem)
+					this.onKeyLine = true
+					return
+				case kind.alias, kind.scalar, kind.singleQuotedScalar, kind.doubleQuotedScalar:
+					const fs = this.src()
+					if (atNextItem || it.value != null) {
+						items.push(new Item(start, fs, c.list()))
+						this.onKeyLine = true
+					} else if (it.sep != none) {
+						this.stack.push(fs)
+					} else {
+						it.key = fs
+						it.sep = c.list()
+						this.onKeyLine = true
+					}
+					return
+				default:
+					const bv = this.startBlockValue(map)
+					if (bv != null) {
+						if (bv.kind == kind.blockSeq) {
+							if (!it.explicitKey && it.sep != none && !c.includes(it.sep, kind.newline)) {
+								throw this.fail() // a block sequence on the line of its key
+							}
+						} else if (atMapIndent && (it.sep != none || it.explicitKey || start != none)) {
+							items.push(new Item(start))
+						}
+						this.stack.push(bv)
+						return
+					}
+			}
+		}
+		this.pop()
+		this.step()
+	}
+
+	/// A : in a block mapping whose last item is it.
+	mapValue(items: Item[], it: Item, start: i32, atNextItem: bool) throws ParseError {
+		const c = this.c
+		const sep = it.sep
+		if (it.explicitKey) {
+			if (sep == none) {
+				if (atNextItem) {
+					it.sep = this.push(none)
+				} else {
+					this.stack.push(blockMap(this.at, this.indent, new Item(keyStart(c, it.start), null, this.push(none))))
+				}
+			} else if (it.value != null || atNextItem && c.includes(sep, kind.mapValueInd)) {
+				items.push(new Item(start, null, this.push(none)))
+			} else if (c.includes(sep, kind.mapValueInd)) {
+				// Props on the line of this : are its empty key's, as in `? k\n: &a : b`.
+				this.stack.push(blockMap(this.at, this.indent, new Item(keyStart(c, sep), null, this.push(none))))
+			} else if (isFlowToken(it.key) && !c.includes(sep, kind.newline)) {
+				const ks = keyStart(c, it.start)
+				const key = it.key
+				it.key = null
+				it.sep = none
+				this.stack.push(blockMap(this.at, this.indent, new Item(ks, key, this.push(sep))))
+			} else {
+				it.sep = this.push(c.join(sep, start)) // not at the next item after all
+			}
+		} else if (sep == none) {
+			it.sep = this.push(none)
+		} else if (it.value != null || atNextItem) {
+			items.push(new Item(start, null, this.push(none)))
+		} else if (c.includes(sep, kind.mapValueInd)) {
+			// Props on the line of this : are its empty key's, as in `k:\n  &a : b`.
+			this.stack.push(blockMap(this.at, this.indent, new Item(keyStart(c, sep), null, this.push(none))))
+		} else {
+			it.sep = this.push(sep)
+		}
+	}
+
+	/// A newline after value v of the last item of items: the end of v's line after a comment, else a next item.
+	afterValue(items: Item[], v: Tok) {
+		if (this.c.endsWith(v.tail, kind.comment)) {
+			v.tail = this.push(v.tail)
+		} else {
+			items.push(new Item(this.push(none)))
+		}
+	}
+
+	/// Whether the current comment, more indented than the collection's items, went to the end of the value before
+	/// it, with the last item's tokens.
+	indentedComment(items: Item[], it: Item, indent: i32): bool {
+		const c = this.c
+		if (this.kind != kind.comment || this.indent <= indent || !c.blank(it.start) || c.includes(it.start, kind.comment)) {
+			return false
+		}
+		const v = items.at(items.length - 2)?.value
+		if (v == null || v.tail == none) {
+			return false
+		}
+		v.tail = this.push(c.join(v.tail, it.start))
+		items.pop()
+		return true
+	}
+
+	blockSequence(seq: Tok) throws ParseError {
+		const items = seq.items!
+		const it = items[items.length - 1]
+		switch (this.kind) {
+			case kind.newline:
+				if (it.value != null) {
+					this.afterValue(items, it.value!)
+				} else {
+					it.start = this.push(it.start)
+				}
+				return
+			case kind.space, kind.comment:
+				if (it.value != null) {
+					items.push(new Item(this.push(none)))
+				} else if (!this.indentedComment(items, it, seq.indent)) {
+					it.start = this.push(it.start)
+				}
+				return
+			case kind.anchor, kind.tag:
+				if (it.value == null && this.indent > seq.indent) {
+					it.start = this.push(it.start)
+					return
+				}
+			case kind.seqItemInd:
+				if (this.indent == seq.indent) {
+					if (it.value != null || this.c.includes(it.start, kind.seqItemInd)) {
+						items.push(new Item(this.push(none)))
+					} else {
+						it.start = this.push(it.start)
+					}
+					return
+				}
+		}
+		if (this.indent > seq.indent) {
+			const bv = this.startBlockValue(seq)
+			if (bv != null) {
+				this.stack.push(bv)
+				return
+			}
+		}
+		this.pop()
+		this.step()
+	}
+
+	flowCollection(fc: Tok) throws ParseError {
+		const c = this.c
+		const items = fc.items!
+		const it = items.at(items.length - 1)
+		if (this.kind == kind.flowErrorEnd) {
+			while (true) {
+				this.pop()
+				const top = this.peek(1)
+				if (top == null || top.kind != kind.flowCollection) {
+					break
+				}
+			}
+		} else if (c.size(fc.tail) == 0) {
+			switch (this.kind) {
+				case kind.comma, kind.explicitKeyInd:
+					// A comma after a ? or props, on a later line, ends their item, whose node is empty.
+					if (it == null || it.sep != none || this.kind == kind.comma
+							&& (c.includes(it.start, kind.explicitKeyInd) || c.includes(it.start, kind.anchor)
+							|| c.includes(it.start, kind.tag))) {
+						items.push(new Item(this.push(none)))
+					} else {
+						it.start = this.push(it.start)
+					}
+				case kind.mapValueInd:
+					if (it == null || it.value != null) {
+						items.push(new Item(none, null, this.push(none)))
+					} else {
+						it.sep = this.push(it.sep)
+					}
+				case kind.space, kind.comment, kind.newline, kind.anchor, kind.tag:
+					if (it == null || it.value != null) {
+						items.push(new Item(this.push(none)))
+					} else if (it.sep != none) {
+						it.sep = this.push(it.sep)
+					} else {
+						it.start = this.push(it.start)
+					}
+				case kind.alias, kind.scalar, kind.singleQuotedScalar, kind.doubleQuotedScalar:
+					const fs = this.src()
+					if (it == null || it.value != null) {
+						items.push(new Item(none, fs, c.list()))
+					} else if (it.sep != none) {
+						this.stack.push(fs)
+					} else {
+						it.key = fs
+						it.sep = c.list()
+					}
+				case kind.flowMapEnd, kind.flowSeqEnd: fc.tail = this.push(fc.tail)
+				default:
+					const bv = this.startBlockValue(fc)
+					if (bv != null) {
+						this.stack.push(bv)
+					} else {
+						this.pop()
+						this.step()
+					}
+			}
+		} else {
+			const parent = this.peek(2)!
+			const last = if (parent.kind == kind.blockMap) parent.items![parent.items!.length - 1] else null
+			if (last != null && (this.kind == kind.mapValueInd && parent.indent == fc.indent
+					|| this.kind == kind.newline && last.sep == none)) {
+				if (this.kind == kind.mapValueInd && last.sep != none) {
+					throw this.fail() // a key on the line of a value, as in `a: {}: b`
+				}
+				this.pop()
+				this.step()
+			} else if (this.kind == kind.mapValueInd && parent.kind != kind.flowCollection) {
+				const start = keyStart(c, this.prevProps(parent))
+				fixFlowSeqItems(c, fc)
+				const sep = this.push(c.cut(fc.tail, c.from(fc.tail) + 1))
+				this.onKeyLine = true
+				this.stack[this.stack.length - 1] = blockMap(fc.at, fc.indent, new Item(start, fc, sep))
+			} else {
+				this.lineEnd(fc)
+			}
+		}
+	}
+
+	/// The list that may hold the props of a value that starts in parent.
+	prevProps(parent: Tok): i32 {
+		switch (parent.kind) {
+			case kind.document: return parent.start
+			case kind.blockMap:
+				const it = parent.items![parent.items!.length - 1]
+				return if (it.sep != none) it.sep else it.start
+			case kind.blockSeq: return parent.items![parent.items!.length - 1].start
+			default: return none
+		}
+	}
+
+	/// A node the current token starts as a value in parent, or null.
+	startBlockValue(parent: Tok): Tok | null {
+		switch (this.kind) {
+			case kind.alias, kind.scalar, kind.singleQuotedScalar, kind.doubleQuotedScalar: return this.src()
+			case kind.blockScalarHeader:
+				const t = new Tok(kind.blockScalar, this.at, this.end, this.indent)
+				t.start = this.push(none)
+				t.from = this.end
+				return t
+			case kind.flowMapStart, kind.flowSeqStart:
+				const t = new Tok(kind.flowCollection, this.at, this.end, this.indent)
+				t.items = []
+				t.braces = this.kind == kind.flowMapStart
+				return t
+			case kind.seqItemInd:
+				const t = new Tok(kind.blockSeq, this.at, this.at, this.indent)
+				t.items = [new Item(this.push(none))]
+				return t
+			case kind.explicitKeyInd:
+				this.onKeyLine = true
+				const it = new Item(this.push(keyStart(this.c, this.prevProps(parent))))
+				it.explicitKey = true
+				return blockMap(this.at, this.indent, it)
+			case kind.mapValueInd:
+				this.onKeyLine = true
+				return blockMap(this.at, this.indent, new Item(keyStart(this.c, this.prevProps(parent)), null,
+					this.push(none)))
+			default: return null
+		}
+	}
+
+	documentEnd(docEnd: Tok) throws ParseError {
+		if (this.kind != kind.docMode) {
+			docEnd.tail = this.push(docEnd.tail)
+			if (this.kind == kind.newline) {
+				this.pop()
+			}
+		}
+	}
+
+	/// The current token after a document, flow scalar or flow collection t.
+	lineEnd(t: Tok) throws ParseError {
+		switch (this.kind) {
+			case kind.comma, kind.docStart, kind.docEnd, kind.flowSeqEnd, kind.flowMapEnd, kind.mapValueInd:
+				this.pop()
+				this.step()
+			default:
+				if (this.kind == kind.newline) {
+					this.onKeyLine = false
+				}
+				t.tail = this.push(t.tail)
+				if (this.kind == kind.newline) {
+					this.pop()
+				}
+		}
+	}
+}
