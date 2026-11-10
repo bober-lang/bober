@@ -1,0 +1,476 @@
+//! The type fuzzer: it edits files whose tests pass, one small edit a time, and holds the checker to what it says of
+//! each mutant. Run in the repo's root, on files of it of different names, with a bober built -release:
+//!
+//!     build/bober build -release fuzz/types.bob && build/types --seed 1 -n 2000 tests/*.bob
+//!
+//! A mutant is checked, and one the checker accepts is built and run for debug and for release. Each of these is a
+//! finding, printed once per kind of edit and message, its mutant kept in found/ of --dir's directory of the seed:
+//!
+//! - `died`: the checker did not end with its errors or none.
+//! - `unbuilt`: a mutant it accepted does not compile.
+//! - `differ`: debug and release do not print the same.
+//! - `crash`: both builds end by a signal.
+//! - `unsound`: a cast fails that the mutant does not spell, with `as` or `!`: the checker's types were wrong.
+//! - `law`: an edit that shall mean nothing was rejected, or changed what the tests print.
+//!
+//! The edits that shall mean nothing are `laws` below, of a value e that is an argument, an initializer or a result,
+//! and `typed`: `const x: T = e` for `const x = e`, T an annotation of the same declaration spelling x's type.
+//!
+//! The others, which the checker may reject, and whose mutants may fail their tests but in both builds alike:
+//!
+//! - `swap`: two arguments of a call.
+//! - `graft`: a value of the same declaration in e's place.
+//! - `retype`: an annotation of the file in another's place.
+//! - `untype`: a variable's annotation dropped.
+
+import { getcwd } from "unistd.h"
+import { fromCString } from "../std/c"
+import { HashMap } from "../std/collections/hashmap"
+import { Rest, decode } from "../std/encoding/optarg"
+import { mkdirAll, readFile as read, writeFile } from "../std/fs"
+import { base, dir, isAbs, join } from "../std/fs/path"
+import { IoError } from "../std/io"
+import { ParseError, parseInt } from "../std/parse"
+import { run } from "../std/process"
+import { endsWith, indexOf, replace, split, startsWith } from "../std/string"
+import { Checked, Node, after, check, isTypeValue, normal, show } from "../src/check"
+import { Lexer, Loc, SyntaxError, Tok } from "../src/lex"
+
+class Flags {
+	seed: i64 = 1
+	n: i32 = 1000
+	dir = "/tmp/bober-fuzz"
+	bober = "build/bober"
+	files: string[] @Rest = []
+}
+
+/// A construct to edit: where its source is, the top-level declaration it is in, and the call it is an argument of.
+type Site = { n: Node, at: Loc, decl: i32, call: i32 }
+
+/// An edit: where it is, and what it puts there.
+type Mutant = { kind: string, src: string, at: i32, text: string }
+
+/// A file as the mutants have it: its imports from bober's root, as it is written elsewhere, and the prelude after it.
+class File implements Checked {
+	path: string
+	/// Where the mutants are written.
+	copy: string
+	src = ""
+	/// What its tests print.
+	out = ""
+	private toks: Tok[] = []
+	/// The index in toks of the token at a position.
+	private index = new HashMap[i32, i32]()
+	/// The arguments, initializers and results; the annotations; the variables of one name with an initializer.
+	values: Site[] = []
+	types: Site[] = []
+	vars: Site[] = []
+	/// The names of untyped consts, whose type is what their context wants (4.1), and of lets, which a closure does not
+	/// see narrowed.
+	private untyped: string[] = []
+	private lets: string[] = []
+	private decls: i32 = 0
+	private calls: i32 = 0
+
+	constructor(path: string, home: string) throws IoError | SyntaxError {
+		this.path = path
+		this.copy = join(home, base(path))
+		let src = read(path)
+		const ts = tokens(src)
+		for (const i of 1 ... ts.length - 1) {
+			const [from, at] = [ts[ts.length - i - 1].loc, ts[ts.length - i].loc]
+			if (ts[ts.length - i].kind == "string" && src.slice(from.pos, from.end()) == "from"
+				&& startsWith(src.slice(at.pos + 1, at.end()), ".")) {
+				src = splice(src, at, `"${normal(join(dir(path), src.slice(at.pos + 1, at.end() - 1)))}"`)
+			}
+		}
+		this.src = src + prelude
+		this.toks = tokens(this.src)
+		for (const i of 0 ... this.toks.length - 1) {
+			this.index.set(this.toks[i].loc.pos, i)
+		}
+	}
+
+	done(path: string) {}
+	declare(n: Node, path: string, src: string) {}
+	decl(n: Node, path: string, src: string) {
+		this.note(n, src)
+		if (path == this.copy) {
+			this.decls++
+			this.walk(n, n)
+		}
+	}
+
+	private walk(n: Node, up: Node): void {
+		if (n.kind == "call" || n.kind == "new") {
+			this.calls++
+			for (const a of n.parts.slice(1, n.parts.length)) {
+				this.value(a, this.calls)
+			}
+		}
+		const init = after(n, "=")
+		if (n.kind == "var" && init != null) {
+			this.value(init, 0)
+			if (n.parts[0].kind == "token") {
+				this.add(this.vars, n, 0)
+			}
+		}
+		this.note(n, this.src)
+		if (n.kind == "jump" && n.t.kind == "return" && n.parts.length > 0) {
+			this.value(n.parts[0], 0)
+		}
+		const ann = after(n, ":")
+		if (ann != null && (n.kind == "var" || n.kind == "param" || n.kind == "function" || n.kind == "method"
+			|| n.kind == "arrow" || n.kind == "prop" && up.kind == "members")) {
+			this.add(this.types, ann, 0)
+		}
+		for (const p of n.parts) {
+			this.walk(p, n)
+		}
+	}
+
+	/// Notes the name of n, of src, if n is an untyped const or a let.
+	private note(n: Node, src: string) {
+		const init = after(n, "=")
+		if (n.kind == "var" && n.parts[0].kind == "token") {
+			const name = src.slice(n.parts[0].t.loc.pos, n.parts[0].t.loc.end())
+			if (n.t.kind == "let") {
+				this.lets.push(name)
+			} else if (init?.type?.isUntyped() ?? false) {
+				this.untyped.push(name)
+			}
+		}
+	}
+
+	private value(n: Node, call: i32) {
+		const t = n.type
+		if (t != null && !isTypeValue(t) && n.t.kind != "...") {
+			this.add(this.values, n, call)
+		}
+	}
+
+	private add(to: Site[], n: Node, call: i32) {
+		const at = this.span(n)
+		if (at != null) {
+			to.push({ n: n, at: at, decl: this.decls, call: call })
+		}
+	}
+
+	/// The source of n: from its first token through its last, then through the brackets it leaves open, which are no
+	/// parts of it, and through the parentheses of a `new`, which are none either.
+	private span(n: Node): Loc | null {
+		const c = cover(n)
+		const first = this.index.get(c.pos)
+		if (first == null) {
+			return null
+		}
+		let i = first
+		let depth = nesting(this.toks[i])
+		while (this.toks[i].loc.end() < c.end() || depth > 0 || n.kind == "new" && this.toks[i].kind != ")") {
+			i++
+			depth += nesting(this.toks[i])
+		}
+		return if (depth < 0) null else c.join(this.toks[i].loc)
+	}
+
+	text(s: Site): string { return this.src.slice(s.at.pos, s.at.end()) }
+
+	/// A mutant by the edit of kind at random sites, or null if they do not take it.
+	mutant(kind: string, r: Rng): Mutant | null {
+		if (this.values.length == 0) {
+			return null
+		}
+		const e = r.of(this.values)
+		/// The annotations of a declaration that spell the type of a node.
+		const spelled = (of: Node, decl: i32) => this.types
+			.filter(a => a.decl == decl && show(a.n.type!) == show(of.type!)).map(a => this.text(a))
+		const law = laws.find(l => l[1].includes(kind))
+		if (law != null) {
+			const [gate, _] = law!
+			const ty = e.n.type!
+			const name = e.n.kind == "token" && e.n.t.kind == "ident"
+			const ts = spelled(e.n, e.decl)
+			const t = if (ts.length > 0) r.of(ts) else ""
+			const ok = (c: string, holds: bool) => indexOf(gate, c) < 0 || holds
+			return if ((indexOf(gate, "*") >= 0 || !literal(e.n)) && (indexOf(kind, "#") < 0 || t != "")
+				&& ok("n", e.n.kind == "member" || name && !this.untyped.includes(this.text(e)))
+				&& ok("c", !name || !this.lets.includes(this.text(e))) && ok("f", !ty.isLoose())
+				&& ok("a", e.n.kind != "arrow") && ok("o", !ty.hasNull() && ty.kind != "param")
+				&& ok("i", ty.kind == "int" && !ty.isUntyped()) && ok("d", ty.kind == "float" && !ty.isUntyped())
+				&& ok("b", ty.kind == "bool") && ok("s", show(ty) == "string"))
+				this.edit(kind, e.at, replace(replace(kind, "#", t), "@", `(${this.text(e)})`))
+				else null
+		}
+		switch (kind) {
+			case "swap":
+				const others = this.values.filter(o => o.call == e.call && o.call > 0 && o.at.pos != e.at.pos)
+				if (others.length == 0) {
+					return null
+				}
+				const o = r.of(others)
+				const [a, b] = if (o.at.pos < e.at.pos) [o, e] else [e, o]
+				const src = splice(splice(this.src, b.at, this.text(a)), a.at, this.text(b))
+				return { kind: kind, src: src, at: a.at.pos, text: `${this.text(b)} and ${this.text(a)}` }
+			case "graft":
+				const near = this.values.filter(o => o.decl == e.decl && o.at.pos != e.at.pos)
+				return if (near.length > 0) this.edit(kind, e.at, this.text(r.of(near))) else null
+			case "retype":
+				return if (this.types.length > 0) this.edit(kind, r.of(this.types).at, this.text(r.of(this.types))) else null
+		}
+		if (this.vars.length == 0) {
+			return null
+		}
+		const v = r.of(this.vars)
+		const name = v.n.parts[0].t.loc
+		const ann = this.types.filter(a => a.n == after(v.n, ":"))
+		if (kind == "untype") {
+			return if (ann.length > 0) this.edit(kind, Loc.at(name.end(), ann[0].at.end() - name.end()), "") else null
+		}
+		const vs = spelled(v.n.parts[0], v.decl)
+		return if (vs.length > 0 && after(v.n, ":") == null) this.edit(kind, Loc.at(name.end(), 0), `: ${r.of(vs)}`) else null
+	}
+
+	private edit(kind: string, at: Loc, text: string): Mutant {
+		return { kind: kind, src: splice(this.src, at, text), at: at.pos, text: text }
+	}
+}
+
+/// What the mutants have after the file.
+const prelude = `
+function fuzzId[T](v: T): T { return v }
+function fuzzYes(): bool { return true }
+function fuzzSome[T](v: T): T | null { return v }
+function fuzzApply[T](f: () => T): T { return f() }
+function fuzzPipe[T, R](v: T, f: (v: T) => R): R { return f(v) }
+function fuzzWrap[T](v: T): { v: T } { return { v: v } }
+function fuzzLast[T](...vs: T[]): T { return vs[vs.length - 1] }
+class FuzzBox[T] {
+	v: T
+	constructor(v: T) { this.v = v }
+	get(): T { return this.v }
+}
+`
+
+/// The edits that shall mean nothing, by what e shall be for them: each puts its text in e's place, @ standing for e
+/// parenthesized and # for an annotation of the same declaration that spells e's type. e shall not be a literal, which
+/// may be a const's initializer that names a type, unless the gate has `*`; and if it has `n`, a name or member, but
+/// an untyped const's, whose type is its own and not what its context wants; `c`, not a let's name, which a closure
+/// does not see narrowed; `f`, not loose; `a`, not a function literal, whose body counts in a call (3); `o`, not
+/// nullable; `i`, `d`, `b`, `s`, of a typed int, a float, a bool, a string.
+const laws: [string, string[]][] = [
+	["*", ["@", "(@ as (#))"]],
+	["f", ["(if (fuzzYes()) @ else @)", "(switch (fuzzYes()) { case true: @; default: @ })"]],
+	["n", ["fuzzId(@)", "[@][0]", "[...[@]][0]", "[@].map(fuzzV => fuzzV)[0]", "({ v: @ }).v", "({ ...{ v: @ } }).v",
+		"new FuzzBox(@).v", "new FuzzBox(@).get()", "fuzzPipe(@, fuzzV => fuzzV)", "fuzzWrap(@).v", "fuzzLast(@)"]],
+	["nc", ["(() => @)()", "(() => { return @ })()", "(() => { const fuzzV = @; return fuzzV })()", "fuzzApply(() => @)"]],
+	["a", ["fuzzId[#](@)", "new FuzzBox[#](@).v", "fuzzPipe[#, #](@, fuzzV => fuzzV)", "fuzzWrap[#](@).v",
+		"fuzzLast[#](@)"]],
+	["ac", ["fuzzApply[#](() => @)", "(() => { const fuzzV: # = @; return fuzzV })()",
+		"(() => { let fuzzV: # = @; return fuzzV })()", "(() => { const fuzzA: (#)[] = [@]; return fuzzA[0] })()"]],
+	["ao", ["fuzzSome[#](@)!", "(fuzzSome[#](@) ?? @)"]],
+	["ni", ["(@ + 0)", "(@ - 0)", "(@ * 1)", "(@ / 1)", "(@ | 0)", "(@ ^ 0)", "(@ << 0)", "(~~@)"]],
+	["nd", ["(@ * 1.0)", "(@ + -0.0)", "(@ / 1.0)"]],
+	["nb", ["(!!@)", "(@ && true)", "(@ || false)", "(@ == true)", "(if @ true else false)"]],
+	["ns", ["(@ + \"\")", "`${@}`"]],
+]
+/// The edits the checker may reject.
+const risky = ["swap", "graft", "retype", "untype"]
+
+
+/// Whether n is a number or string literal, possibly negated.
+function literal(n: Node): bool {
+	return n.kind == "token" && ["int", "float", "string"].includes(n.t.kind) || n.kind == "unary" && literal(n.parts[0])
+}
+
+/// The tokens of src but comments, a template's text between its expressions as the parser takes it.
+function tokens(src: string): Tok[] throws SyntaxError {
+	const l = new Lexer(src)
+	const out: Tok[] = []
+	/// The depth of brackets each template open is at.
+	const open: i32[] = []
+	let depth = 0
+	while (true) {
+		const t = if (open.length > 0 && open[open.length - 1] == depth) l.resume() else l.next()
+		if (t.kind == "eof") {
+			return out
+		}
+		if (t.kind == "templateHead") {
+			open.push(depth)
+		} else if (t.kind == "templateTail") {
+			open.pop()
+		} else {
+			depth += nesting(t)
+		}
+		if (t.kind != "comment") {
+			out.push(t)
+		}
+	}
+}
+
+/// 1 for a token that opens what another closes, -1 for one that closes it.
+function nesting(t: Tok): i32 {
+	return switch (t.kind) {
+		case "(", "[", "{", "templateHead": 1
+		case ")", "]", "}", "templateTail": -1
+		default: 0
+	}
+}
+
+/// From n's first token through the last of its parts.
+function cover(n: Node): Loc {
+	let c = Loc.at(n.t.loc.pos, n.t.loc.len)
+	for (const p of n.parts) {
+		c = c.join(cover(p))
+	}
+	return c
+}
+
+function splice(src: string, at: Loc, text: string): string { return src.slice(0, at.pos) + text + src.slice(at.end(), src.length) }
+
+/// The line and column of pos in src, from 1, as an error has them.
+function place(src: string, pos: i32): string {
+	const before = split(src.slice(0, pos), "\n")
+	return `${before.length}:${before[before.length - 1].length + 1}`
+}
+
+/// xorshift64.
+class Rng {
+	s: u64
+
+	constructor(seed: i64) { this.s = (seed as u64) * 0x9e3779b97f4a7c15 + 1 }
+
+	below(n: i32): i32 {
+		this.s ^= this.s << 13
+		this.s ^= this.s >> 7
+		this.s ^= this.s << 17
+		return (this.s % (n as u64)) as i32
+	}
+
+	of[T](xs: T[]): T { return xs[this.below(xs.length)] }
+}
+
+/// The line of out of a cast that failed in the file of name, where src spells none, if any.
+function unsound(name: string, src: string, out: string): string | null {
+	const lines = split(src, "\n")
+	for (const l of split(out, "\n")) {
+		const trap = indexOf(l, ": trap: cast to")
+		const at = split(l.slice(0, if (trap < 0) 0 else trap), ":")
+		if (at.length >= 3 && endsWith(" " + at[at.length - 3], " " + name)) {
+			try {
+				const line = lines[(parseInt(at[at.length - 2]) - 1) as i32]
+				const rest = line.slice((parseInt(at[at.length - 1]) - 1) as i32, line.length)
+				if (!startsWith(rest, "!") && !startsWith(rest, "as ")) {
+					return l
+				}
+			} catch (e: ParseError) {}
+		}
+	}
+	return null
+}
+
+/// Whether out has a test's line, so that the tests were built and ran.
+function ran(out: string): bool { return split(out, "\n").some(l => startsWith(l, "ok ") || startsWith(l, "FAIL ")) }
+
+/// The first line of a that b lacks at its place, if any.
+function differing(a: string, b: string): string {
+	const [as, bs] = [split(a, "\n"), split(b, "\n")]
+	let i = 0
+	while (i < as.length && i < bs.length && as[i] == bs[i]) {
+		i++
+	}
+	return if (i < as.length) as[i] else ""
+}
+
+function main(): i32 throws IoError | SyntaxError {
+	let f = new Flags()
+	try {
+		f = decode[Flags](args())
+	} catch (e: ParseError) {
+		print("usage: types [--seed n] [-n edits] [--dir dir] [--bober bober] file.bob...")
+		return 2
+	}
+	const home = join(f.dir, `${f.seed}`)
+	mkdirAll(join(home, "found"))
+	const bin = if (isAbs(f.bober)) f.bober else join(fromCString(getcwd(0, 0)), f.bober)
+	/// The exit status and the output of bober with args, in home, where its build/ is of one fuzzer alone, for at most
+	/// 10 s.
+	function bober(...args: string[]): [i32, string] throws IoError {
+		const status = run(["timeout", "10", "env", "-C", home, bin, ...args], join(home, "out"))
+		return [status, read(join(home, "out"))]
+	}
+	const files: File[] = []
+	for (const path of f.files) {
+		const file = new File(path, home)
+		writeFile(file.copy, file.src)
+		const [debug, out] = bober("test", base(path))
+		const [release, same] = bober("test", "-release", base(path))
+		file.out = out
+		check([file.copy], [], p => readFile(p), file)
+		if (debug != 0 || release != 0 || out != same) {
+			print(`${path}: left out, as its tests do not pass alike in debug (${debug}) and release (${release})`)
+		} else {
+			files.push(file)
+		}
+	}
+	if (files.length == 0) {
+		return 1
+	}
+	const kinds = ["typed", ...risky]
+	for (const [_, ts] of laws) {
+		kinds.push(...ts)
+	}
+	const r = new Rng(f.seed)
+	const seen = new HashMap[string, bool]()
+	let mutants = 0
+	let accepted = 0
+	let found = 0
+	for (const i of 1 ... f.n) {
+		const file = r.of(files)
+		const m = file.mutant(r.of(kinds), r)
+		if (m == null) {
+			continue
+		}
+		mutants++
+		const name = base(file.path)
+		const law = !risky.includes(m.kind)
+		writeFile(file.copy, m.src)
+		const [status, errors] = bober("check", name)
+		let what = ""
+		if (status > 1 || indexOf(errors, "trap: ") >= 0) {
+			what = `died: ${status} ${split(errors, "\n")[0]}`
+		} else if (status == 1 && law) {
+			what = `law: ${split(errors, "\n")[0]}`
+		} else if (status == 0) {
+			accepted++
+			const [debug, out] = bober("test", name)
+			const [release, same] = bober("test", "-release", name)
+			const cast = unsound(name, m.src, out)
+			if (debug == 124 || release == 124) {
+				// too slow to tell
+			} else if (debug != release || out != same) {
+				what = `differ: debug ${debug} ${differing(out, same)} | release ${release} ${differing(same, out)}`
+			} else if (debug >= 128) {
+				what = `crash: ${debug} ${differing(out, file.out)}`
+			} else if (!ran(out)) {
+				what = `unbuilt: ${split(out, "\n")[0]}`
+			} else if (cast != null) {
+				what = `unsound: ${cast}`
+			} else if (law && out != file.out) {
+				what = `law: ${differing(out, file.out)}`
+			}
+		}
+		if (what == "") {
+			continue
+		}
+		// Once per kind of edit and message, without the places in it.
+		const key = `${m.kind} ${split(what, " ").filter(w => indexOf(w, ".bob:") < 0).join(" ")}`
+		if (!seen.has(key)) {
+			seen.set(key, true)
+			found++
+			writeFile(join(home, "found", `${found}.bob`), m.src)
+			print(`${found}. ${m.kind} at ${file.path}:${place(file.src, m.at)}: ${m.text}\n   ${what}`)
+		}
+	}
+	print(`${mutants} mutants, ${accepted} accepted, ${found} findings in ${join(home, "found")}`)
+	return 0
+}
