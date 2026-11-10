@@ -844,6 +844,18 @@ class Emitter {
 				this.push(this.ir().binary("and", eq(0), eq(1)), kind.Bool)
 			case op.Add, op.Sub, op.Mul, op.Div, op.Rem, op.Pow, op.And, op.Or, op.Xor, op.Shl, op.Shr: this.arith(o)
 			case op.Neg: this.neg()
+			case op.Concat:
+				// Room for all made once, then each appended in it.
+				const xs = this.popN(n).map(x => this.cast(x, kind.String))
+				let room = this.i64Const(0)
+				for (const x of xs.slice(1, n)) {
+					room = this.ir().binary("add", room, this.strLen(x))
+				}
+				let r = this.langCall("reserve", [xs[0], room, this.bool(false)])
+				for (const x of xs.slice(1, n)) {
+					r = this.langCall("append", [r, x])
+				}
+				this.push(r, kind.String)
 		}
 		return i
 	}
