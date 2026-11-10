@@ -79,34 +79,54 @@ export function shared(buf: Ref, at: u64, n: i64): string {
 	return load[string](q)
 }
 
-/// a + b. A long one is b appended in place to a's buffer if a ends where it is used up and it has room, so that a
-/// string grown by += takes amortized constant time per append; else both in a new buffer of twice the room needed.
-/// A buffer is its capacity, how much is used and the bytes.
+/// a + b: b if a is empty, else in place if they fit, else b appended to the buffer reserve gives a, with twice the
+/// room needed, so that a string grown by += takes amortized constant time per append.
 export function concat(a: string, b: string): string {
-	const an = lenAt(addr(a))
-	const bn = lenAt(addr(b))
-	const n = an + bn
-	if (n <= 15) {
-		let w: u8[15]
-		memcpy(addr(w), bytesAt(addr(a)), an as u64)
-		memcpy(addr(w) + (an as u64), bytesAt(addr(b)), bn as u64)
-		return copy(addr(w), n)
-	}
+	return if (lenAt(addr(a)) == 0) b else append(reserve(a, lenAt(addr(b)), true), b)
+}
+
+/// a + b, with room after a in its buffer, or none if they fit in place.
+export function append(a: string, b: string): string {
 	const pa = addr(a)
-	let buf = load[Ref](pa + 16)
-	const old = deref(buf)
-	if (old == 0 || load[u64](pa + 8) + (an as u64) != 16 + load[u64](old + 8) || load[i64](old + 8) + bn > load[i64](old)) {
-		buf = alloc[u8](16 + 2 * n + 16)
-		const q = deref(buf)
-		store[i64](q, 2 * n + 16)
-		store[i64](q + 8, an)
-		memcpy(q + 16, bytesAt(addr(a)), an as u64)
+	const an = lenAt(pa)
+	const bn = lenAt(addr(b))
+	if (room(pa, an) < bn) {
+		let w: u8[15]
+		memcpy(addr(w), bytesAt(pa), an as u64)
+		memcpy(addr(w) + (an as u64), bytesAt(addr(b)), bn as u64)
+		return copy(addr(w), an + bn)
 	}
+	const buf = load[Ref](pa + 16)
 	const q = deref(buf)
 	const used = load[u64](q + 8)
 	memcpy(q + 16 + used, bytesAt(addr(b)), bn as u64)
 	store[u64](q + 8, used + (bn as u64))
-	return shared(buf, 16 + used - (an as u64), n)
+	return shared(buf, 16 + used - (an as u64), an + bn)
+}
+
+/// a, with room after it in its buffer for n more bytes unless a and they fit in place: a's own if it has the room,
+/// else a new one, of twice the room needed if twice or a ended its old one, else of just the room, as the compiler
+/// takes for a + b + c, appending b and c to it. A buffer is its capacity, how much is used and the bytes.
+export function reserve(a: string, n: i64, twice: bool): string {
+	const pa = addr(a)
+	const an = lenAt(pa)
+	const r = room(pa, an)
+	if (an + n <= 15 || r >= n) {
+		return a
+	}
+	const c = if (twice || r >= 0) 2 * (an + n) + 16 else an + n
+	const buf = alloc[u8](16 + c)
+	const q = deref(buf)
+	store[i64](q, c)
+	store[i64](q + 8, an)
+	memcpy(q + 16, bytesAt(addr(a)), an as u64) // where they are once allocating may have moved them
+	return shared(buf, 16, an)
+}
+
+/// How many bytes are free after the string at p, of length n, in its buffer if it ends where that is used up, else -1.
+function room(p: u64, n: i64): i64 {
+	const buf = deref(load[Ref](p + 16))
+	return if (buf != 0 && load[u64](p + 8) + (n as u64) == 16 + load[u64](buf + 8)) load[i64](buf) - load[i64](buf + 8) else -1
 }
 
 /// A buffer as concat's for n bytes, all used, for the caller to put at 16 on. Every long string's buffer is one,

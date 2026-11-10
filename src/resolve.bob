@@ -468,8 +468,8 @@ function numeral(x: Decl): bool {
 /// Whether t is a literal type or a union of them.
 function literals(p: Program, t: i32): bool { return p.kind(t) == kind.Literal || p.kind(t) == kind.Union && p.items(t).every(m => literals(p, m)) }
 
-/// A value on the operand stack: its type, its value if known, and the index of the constant op that pushed it, -1
-/// for none.
+/// A value on the operand stack: its type, its value if known, and the index of the op that pushed it if a later op
+/// may leave that out, folding or fusing it, else -1.
 type Slot = { t: i32, v: Known | null, at: i32 }
 
 /// Copies one decl's code for an instance: substitutes its env, folds what it knows, keeps the branch each If it
@@ -861,7 +861,14 @@ class Copy {
 				} else {
 					this.plain(o, 2, t)
 				}
-			case op.Add, op.Sub, op.Mul, op.Div, op.Rem, op.Xor, op.Shl, op.Shr: this.plain(o, 2, this.stack[this.stack.length - 2].t)
+			case op.Add:
+				const a = this.stack[this.stack.length - 2]
+				if (p.kind(a.t) == kind.String) {
+					this.concat(a)
+				} else {
+					this.plain(o, 2, a.t)
+				}
+			case op.Sub, op.Mul, op.Div, op.Rem, op.Xor, op.Shl, op.Shr: this.plain(o, 2, this.stack[this.stack.length - 2].t)
 			case op.Neg: this.plain(o, 1, this.top().t)
 		}
 	}
@@ -1222,6 +1229,22 @@ class Copy {
 		if (t != kind.None) {
 			this.push(t)
 		}
+	}
+
+	/// A string Add, into one Concat with the Adds or Concats that made its operands, a and the top, if they did.
+	private concat(a: Slot) throws CompileError {
+		const n = this.pieces(a) + this.pieces(this.top())
+		this.drop(2)
+		this.push(a.t, null, if (n == 2) this.emit(op.Add) else this.emit(op.Concat, n))
+	}
+
+	/// The strings s is made of, the op that concatenated them left out.
+	private pieces(s: Slot): i32 {
+		if (s.v != null || s.at < 0) {
+			return 1
+		}
+		this.dead[s.at] = true
+		return if (this.dst.ops[s.at] == op.Concat) this.dst.a(s.at) else 2
 	}
 
 	private emit(o: Opcode, a: i32 = 0, b: i32 = 0, c: i32 = 0): i32 throws CompileError {
