@@ -1,7 +1,10 @@
-//! The I/O of src/rt.h, through the libc of the target: the subset of POSIX that Linux, macOS and FreeBSD share. Only
-//! sockets wait: they are non-blocking, a call on one that would block gives BOBER_IO_AGAIN, and bober_io_ready parks its
-//! fiber until poll finds the socket ready; once no fiber is ready, bober_park polls (bober_io_wait). Without
-//! src/fiber.c, as in boot, the weak bober_park below polls in place.
+//! The I/O of src/rt.h, through the libc of the target: the subset of POSIX that Linux, macOS and FreeBSD share, and
+//! epoll or kqueue. Only sockets wait: they are non-blocking, a call on one that would block gives BOBER_IO_AGAIN, and
+//! bober_io_ready parks its fiber until the kernel finds the socket ready; once no fiber is ready, bober_park asks it
+//! (bober_io_wait). The kernel watches a descriptor from its first wait until its close, edge-triggered both ways, so a
+//! wait costs no system call: an edge marks it ready that way until a call on it would block, and a wait that finds it
+//! marked has the kernel look again, as the edge may be stale. Without src/fiber.c, as in boot, the weak bober_park below
+//! asks in place.
 
 #define _GNU_SOURCE  // statx
 #include "rt.h"
@@ -12,7 +15,6 @@
 #include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <poll.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,50 +35,135 @@ int64_t bober_mono(void) {
   return clock_gettime(CLOCK_MONOTONIC, &t), t.tv_sec * 1000000000 + t.tv_nsec;
 }
 
-/// A fiber parked until fd is ready, on its stack: done once it is, -1 if its deadline passed first.
-typedef struct Wait { uint64_t fiber; int fd, write, done; long deadline; struct Wait *next; } Wait;
-static Wait *waits;
+/// A fiber parked until fd is ready, on its stack: done once it is, -1 if its deadline passed first; at its index in
+/// the heap of deadlines, if it has one.
+typedef struct Wait { uint64_t fiber; int fd, write, done; long deadline, at; struct Wait *next; } Wait;
+/// A descriptor's, by way, read then write: who waits, in order, and whether it was ready since a call would block;
+/// whether the kernel watches it.
+typedef struct { Wait *waits[2]; char ready[2], watched; } Fd;
+static Fd *fds;
+static Wait **heap;  // the soonest deadline first
+static long nfds, deadlines, room, waiting;
+
+static void edge(int fd, int write);
+
+/// Has the kernel watch fd (ADD), look at it again (MOD), or forget it (DEL): 0, or -1 if it cannot, as epoll cannot a file.
+enum { ADD, MOD, DEL };
+static int q = -1;  // the kernel's queue
+#if defined(__linux__)
+#include <sys/epoll.h>
+static int queue(void) { return epoll_create1(EPOLL_CLOEXEC); }
+static int watch(int fd, int how) {
+  struct epoll_event e = {EPOLLIN | EPOLLOUT | EPOLLET, {.fd = fd}};
+  return epoll_ctl(q, how == ADD ? EPOLL_CTL_ADD : how == MOD ? EPOLL_CTL_MOD : EPOLL_CTL_DEL, fd, &e);
+}
+
+/// Gives edge what the kernel finds ready within ms, -1 for no limit.
+static void events(long ms) {
+  struct epoll_event e[256];
+  int n = epoll_wait(q, e, 256, ms);
+  if (n < 0 && errno != EINTR) perror("epoll_wait"), exit(1);
+  for (int i = 0; i < n; i++) {
+    if (e[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR)) edge(e[i].data.fd, 0);
+    if (e[i].events & (EPOLLOUT | EPOLLHUP | EPOLLERR)) edge(e[i].data.fd, 1);
+  }
+}
+#else
+#include <sys/event.h>
+static int queue(void) { return kqueue(); }
+static int watch(int fd, int how) {  // close forgets it; adding again looks again
+  struct kevent k[2];
+  EV_SET(&k[0], fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, 0);
+  EV_SET(&k[1], fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, 0);
+  return how == DEL ? 0 : kevent(q, k, 2, 0, 0, 0);
+}
+
+static void events(long ms) {
+  struct kevent e[256];
+  struct timespec t = {ms / 1000, ms % 1000 * 1000000};
+  int n = kevent(q, 0, 0, e, 256, ms < 0 ? 0 : &t);
+  if (n < 0 && errno != EINTR) perror("kevent"), exit(1);
+  for (int i = 0; i < n; i++) edge(e[i].ident, e[i].filter == EVFILT_WRITE);
+}
+#endif
+
+/// p, an array of *n items of size bytes, grown to hold item i, zero.
+static void *fit(void *p, long *n, long i, size_t size) {
+  long m = i < 32 ? 64 : 2 * i;
+  if (i < *n) return p;
+  if (!(p = realloc(p, m * size))) fputs("out of memory\n", stderr), exit(1);
+  return memset((char *)p + *n * size, 0, (m - *n) * size), *n = m, p;
+}
+
+/// Puts w at i in the heap and moves it up or down to where its deadline belongs.
+static void sift(Wait *w, long i) {
+  for (long up; i && heap[up = (i - 1) / 2]->deadline > w->deadline; i = up) (heap[i] = heap[up])->at = i;
+  for (long c; (c = 2 * i + 1) < deadlines; i = c) {
+    if (c + 1 < deadlines && heap[c + 1]->deadline < heap[c]->deadline) c++;
+    if (heap[c]->deadline >= w->deadline) break;
+    (heap[i] = heap[c])->at = i;
+  }
+  (heap[i] = w)->at = i;
+}
+
+/// Wakes w, done, taking it from its descriptor's waits and the heap.
+static void wake(Wait *w, int done) {
+  Wait **p = &fds[w->fd].waits[w->write];
+  while (*p != w) p = &(*p)->next;
+  *p = w->next;
+  if (w->deadline && w->at < --deadlines) sift(heap[deadlines], w->at);
+  w->done = done, waiting--, bober_wake(w->fiber);
+}
+
+/// fd has been ready to read or write: what waits for that wakes.
+static void edge(int fd, int write) {
+  Fd *f = &fds[fd];
+  for (f->ready[write] = 1; f->waits[write];) wake(f->waits[write], 1);
+}
 
 /// What a call that gave r gives: r, or the failure errno is, BOBER_IO_AGAIN for one that would block.
 static long result(long r) {
   return r >= 0 ? r : errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ? BOBER_IO_AGAIN : -errno;
 }
 
+/// What a call on fd to read or write that gave r gives, as result; one that would block ends fd's readiness that way.
+static long result_on(int fd, int write, long r) {
+  if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && (unsigned)fd < nfds) fds[fd].ready[write] = 0;
+  return result(r);
+}
+
 long bober_io_ready(int fd, int write, long timeout) {
+  if (fd < 0) return 0;
+  Fd *f = (fds = fit(fds, &nfds, fd, sizeof *fds)) + fd;
+  // One the kernel cannot watch, as a file or one closed, is always ready: the call on it tells.
+  if (!f->watched || f->ready[write]) {
+    if (q < 0 && (q = queue()) < 0) return -errno;
+    if (watch(fd, f->watched ? MOD : ADD)) return errno == EPERM || errno == EBADF ? 0 : -errno;
+    f->watched = 1, f->ready[write] = 0;
+  }
   long t = bober_mono();  // a deadline past the largest long saturates to it, which never comes
-  Wait w = {bober_self(), fd, write, 0, !timeout ? 0 : timeout > LONG_MAX - t ? LONG_MAX : t + timeout, waits};
-  waits = &w;
+  Wait w = {bober_self(), fd, write, 0, !timeout ? 0 : timeout > LONG_MAX - t ? LONG_MAX : t + timeout}, **p;
+  for (p = &f->waits[write]; *p;) p = &(*p)->next;
+  *p = &w, waiting++;
+  if (w.deadline) heap = fit(heap, &room, deadlines, sizeof *heap), sift(&w, deadlines++);
   while (!w.done) bober_park();
   return w.done < 0 ? -ETIMEDOUT : 0;
 }
 
 int bober_io_wait(void) {
-  static struct pollfd *fds;
-  static int cap;
-  int n = 0;
-  long soonest = 0, t = bober_mono();
-  for (Wait *w = waits; w; w = w->next, n++) {
-    if (n == cap && !(fds = realloc(fds, (cap = cap ? 2 * cap : 64) * sizeof *fds))) fputs("out of memory\n", stderr), exit(1);
-    fds[n] = (struct pollfd){w->fd, w->write ? POLLOUT : POLLIN, 0};
-    if (w->deadline && (!soonest || w->deadline < soonest)) soonest = w->deadline;
-  }
-  if (!n) return 0;
-  // In ms rounded up, at most poll's int; a later deadline is polled for again.
+  if (!waiting) return 0;
+  long t = bober_mono(), soonest = deadlines ? heap[0]->deadline : 0;
+  // In ms rounded up, at most an int's; a later deadline is waited for again.
   long ms = !soonest ? -1 : soonest <= t ? 0 : (soonest - t - 1) / 1000000 + 1;
-  if (poll(fds, n, ms > INT_MAX ? INT_MAX : ms) < 0 && errno != EINTR) perror("poll"), exit(1);
-  t = bober_mono();
-  // bober_wake only queues, so the list keeps the order fds has.
-  Wait **p = &waits;
-  for (int i = 0; *p; i++) {
-    Wait *w = *p;
-    if (fds[i].revents || (w->deadline && w->deadline <= t))
-      w->done = fds[i].revents ? 1 : -1, *p = w->next, bober_wake(w->fiber);
-    else p = &w->next;
-  }
+  events(ms > INT_MAX ? INT_MAX : ms);
+  for (t = bober_mono(); deadlines && heap[0]->deadline <= t;) wake(heap[0], -1);
   return 1;
 }
 
-void bober_io_cancel(void) { waits = 0; }
+void bober_io_cancel(void) {
+  for (long i = 0; i < nfds; i++) fds[i].waits[0] = fds[i].waits[1] = 0;
+  deadlines = waiting = 0;
+}
 
 const char *bober_io_kind(long r) {
   switch (-r) {
@@ -110,15 +197,20 @@ long bober_io_open(const char *path, const char *mode) {
   return result(open(path, flags | O_CLOEXEC, 0666));
 }
 
+/// Wakes what waits on fd, ended or closed, at once: before the peer's answer to it, and another descriptor's number.
+static void ended(int fd) {
+  for (int w = 0; w < 2 && (unsigned)fd < nfds; w++)
+    while (fds[fd].waits[w]) wake(fds[fd].waits[w], 1);
+}
+
 long bober_io_close(int fd) {
-  // What waits on fd wakes to find it closed, before another descriptor can take its number.
-  for (Wait **p = &waits; *p;)
-    if ((*p)->fd == fd) (*p)->done = 1, bober_wake((*p)->fiber), *p = (*p)->next;
-    else p = &(*p)->next;
+  ended(fd);
+  // The kernel forgets fd, which it would not for a dup's sake.
+  if ((unsigned)fd < nfds && fds[fd].watched) watch(fd, DEL), fds[fd] = (Fd){0};
   return result(close(fd));
 }
-long bober_io_read(int fd, void *buf, unsigned long n) { return result(read(fd, buf, n)); }
-long bober_io_write(int fd, const void *buf, unsigned long n) { return result(write(fd, buf, n)); }
+long bober_io_read(int fd, void *buf, unsigned long n) { return result_on(fd, 0, read(fd, buf, n)); }
+long bober_io_write(int fd, const void *buf, unsigned long n) { return result_on(fd, 1, write(fd, buf, n)); }
 long bober_io_sync(int fd) { return result(fsync(fd)); }
 long bober_io_mkdir(const char *path) { return result(mkdir(path, 0777)); }
 long bober_io_rename(const char *from, const char *to) { return result(rename(from, to)); }
@@ -257,7 +349,7 @@ long bober_io_accept(int fd) {
   case ECONNABORTED: case ENETDOWN: case EPROTO: case ENOPROTOOPT: case EHOSTDOWN: case ENONET: case EHOSTUNREACH:
   case EOPNOTSUPP: case ENETUNREACH: return BOBER_IO_AGAIN;
   }
-  return result(c);
+  return result_on(fd, 0, c);
 }
 
 long bober_io_recvfrom(int fd, void *buf, unsigned long n, char *host, int *port) {
@@ -265,16 +357,20 @@ long bober_io_recvfrom(int fd, void *buf, unsigned long n, char *host, int *port
   socklen_t len = sizeof sa;
   long r = recvfrom(fd, buf, n, 0, (void *)&sa, &len);
   if (r >= 0) *port = text(&sa, host);
-  return result(r);
+  return result_on(fd, 0, r);
 }
 
 long bober_io_sendto(int fd, const void *buf, unsigned long n, const char *host, int port) {
   struct sockaddr_storage sa;
   socklen_t len = address(host, port, &sa);
-  return len ? result(sendto(fd, buf, n, 0, (void *)&sa, len)) : -EINVAL;
+  return len ? result_on(fd, 1, sendto(fd, buf, n, 0, (void *)&sa, len)) : -EINVAL;
 }
 
-long bober_io_shutdown(int fd, int both) { return result(shutdown(fd, both ? SHUT_RDWR : SHUT_WR)); }
+long bober_io_shutdown(int fd, int both) {
+  long r = result(shutdown(fd, both ? SHUT_RDWR : SHUT_WR));
+  if (both) ended(fd);
+  return r;
+}
 
 int bober_io_idle(int fd) {
   char c;

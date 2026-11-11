@@ -164,15 +164,18 @@ int64_t bober_mono(void);
 
 /// The kind of IoError (std/io) failure r is.
 const char *bober_io_kind(long r);
-/// Parks until the socket fd is ready to read or, if write, to write: 0, or a failure once timeout passes.
+/// Parks until the socket fd is ready to read or, if write, to write, or is shut down or closed: 0, or a failure once
+/// timeout passes. The kernel watches fd from its first wait until bober_io_close.
 long bober_io_ready(int fd, int write, long timeout);
-/// Polls the sockets fibers wait on until one is ready and wakes their fibers; what bober_park does once no fiber is
-/// ready. 0, at once, if none waits: every fiber is parked, which bober_park then traps on.
+/// Waits for the kernel to find a socket fibers wait on ready, or for their soonest deadline, and wakes those fibers;
+/// what bober_park does once no fiber is ready. 0, at once, if none waits: every fiber is parked, which bober_park then
+/// traps on.
 int bober_io_wait(void);
 /// Forgets the fibers waiting, before they are dropped.
 void bober_io_cancel(void);
 /// A descriptor of the file at path, CLOEXEC, opened as fopen's mode, "r", "w", "a" or "x", and "+", opens it.
 long bober_io_open(const char *path, const char *mode);
+/// Closes fd, waking what waits on it. One waited on closes only so: the kernel watches by number, which another takes.
 long bober_io_close(int fd);
 /// Up to n bytes into buf; 0 at the end.
 long bober_io_read(int fd, void *buf, unsigned long n);
@@ -213,7 +216,7 @@ long bober_io_accept(int fd);
 long bober_io_recvfrom(int fd, void *buf, unsigned long n, char *host, int *port);
 /// Sends the n bytes of buf as a datagram to host and port: how many.
 long bober_io_sendto(int fd, const void *buf, unsigned long n, const char *host, int port);
-/// Ends fd's writes, or, if both, its reads too; the peer reads an end, and a fiber waiting on fd wakes.
+/// Ends fd's writes, or, if both, its reads too, waking what waits on fd; the peer reads an end.
 long bober_io_shutdown(int fd, int both);
 /// 1 if the connected fd has nothing to read and its peer has not ended, else 0.
 int bober_io_idle(int fd);

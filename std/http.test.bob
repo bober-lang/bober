@@ -1146,7 +1146,13 @@ test "a server out of descriptors with no connection to wait for throws, its lis
 		}
 	} catch (e: IoError) {}
 	fill.pop()!.close()
-	const c = dial(s.addr) // The last descriptor, which leaves the server's accept none.
+	// The last descriptor, which leaves the server's accept none; the server, failing, may reset it before it connects.
+	let c: Conn | null = null
+	try {
+		c = dial(s.addr)
+	} catch (e: IoError) {
+		assert e.kind == "ConnectionReset"
+	}
 	let kind = ""
 	try {
 		await job
@@ -1157,7 +1163,7 @@ test "a server out of descriptors with no connection to wait for throws, its lis
 	for (const l of fill) {
 		l.close()
 	}
-	c.close()
+	c?.close()
 	assert kind == "OutOfResources"
 	assert dial(s.addr) throws new IoError("ConnectionRefused", "dial", s.addr)
 }
