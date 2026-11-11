@@ -1,0 +1,25 @@
+//! x86-64 as the linker needs it: the page segments are aligned to, the code of a stub, and how a call holds its
+//! address.
+
+import { put } from "../../std/encoding/binary"
+import { Call, Machine, SlotRel32 } from "./object"
+
+/// A call's displacement is its last 4 bytes, which the fixup is at, from the end of them: the addend is -4. False if
+/// v is out of its reach, and for the kinds of other CPUs.
+export function apply(b: u8[], at: i32, kind: u8, v: u64, p: u64): bool {
+	const d = (v - p) as i64
+	if (kind != Call || d < -(1 << 31) || d >= 1 << 31) {
+		return false
+	}
+	put(b, at, d as u64, 4)
+	return true
+}
+
+export const x64: Machine = {
+	arch: "x86_64",
+	page: 0x1000,
+	// `jmp *slot(%rip)`.
+	stub: "\xff\x25\x00\x00\x00\x00",
+	stubFixups: [[2, SlotRel32, -4]],
+	apply: apply,
+}
