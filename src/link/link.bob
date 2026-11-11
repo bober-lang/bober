@@ -4,22 +4,30 @@
 //! and applies each fixup, through slots and stubs it makes for what the image imports. Every reference within the
 //! image binds to the definition there, so that a symbol several objects define weakly, as bober's type descriptors,
 //! has one address throughout, which code may reach relative to itself.
+//!
+//! An image may be kept, its file holding what its linker knows of it (keep.bob), for a later link to continue it: the
+//! objects it holds stay where they are, the room of those removed is free, and those added are laid out where there is
+//! room, which each segment has after it, as addresses only. What lazy objects and the linker itself link is frozen,
+//! linked for good as one unit. Of the objects given, the image keeps the symbols and the fixups a link may set anew,
+//! not their bytes. A link the image cannot take is Stale, and who links then links all anew.
 
 import { partitionPoint } from "../../std/algo"
 import { HashMap } from "../../std/collections/hashmap"
-import { put } from "../../std/encoding/binary"
+import { put, set } from "../../std/encoding/binary"
 import { alignUp, max, min } from "../../std/math"
 import { sortBy } from "../../std/sort"
 import { startsWith } from "../../std/string"
 import { Arch } from "../../std/os"
 import { CompileError } from "../error"
+import { Region, State, read, write } from "./keep"
 import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Image32, Init, Local, Machine, Object, Page, PageOff,
 	Rel32, Rel64, Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Unwind, Weak, Zero } from "./object"
 
-/// What a format's writer makes a file of. Its addresses are from where it is loaded, and are offsets in the file too.
+/// What a format's writer makes a file of. Its addresses are from where it is loaded; the file has each segment's
+/// bytes at its offset, which is its address but in a kept image, whose segments have room after them no file holds.
 export class Image {
 	arch: Arch
-	/// From address 0, where the writer's headers go, to the end of the last segment's bytes.
+	/// From offset 0, where the writer's headers go, to the end of the last segment's bytes.
 	bytes: u8[] = []
 	/// Ascending, each at a multiple of page but the first, which is after the headers.
 	segments: Segment[] = []
@@ -32,8 +40,8 @@ export class Image {
 	binds: Bind[] = []
 	/// The addresses of the pointers the loader adds the image's address to.
 	rebases: u64[] = []
-	/// From and to where the Unwind sections are, laid out as one, and the Init ones.
-	unwind: [u64, u64] = [0, 0]
+	/// From and to where the Unwind sections are, ascending, and the Init ones, laid out as one.
+	unwinds: [u64, u64][] = []
 	inits: [u64, u64] = [0, 0]
 	/// From and to where the Thread sections are, laid out as one, a thread's copy's template, and the largest of
 	/// their alignments.
@@ -42,16 +50,25 @@ export class Image {
 	descs: [u64, u64][] = []
 	/// Every symbol with a name the image defines, its value its address and its section 0, as defined.
 	symbols: Symbol[] = []
+	/// What the file holds right after bytes, which no one loads: of a kept image, which only elf.bob writes, what its
+	/// linker knows of it.
+	extra = ""
 
 	constructor(arch: Arch, page: u64) {
 		this.arch = arch
 		this.page = page
 	}
 
-	/// The segment the address at is in, or ends.
+	/// The segment the address at is in; if in none, the next one, else the last.
 	segment(at: u64): Segment {
 		const i = partitionPoint(this.segments, s => s.address + s.size + s.zero > at)
 		return this.segments[min(i, (this.segments.length - 1) as u32)]
+	}
+
+	/// Where bytes has the byte at the address at.
+	at(at: u64): i32 {
+		const s = this.segment(at)
+		return (s.offset + at - s.address) as i32
 	}
 }
 
@@ -68,21 +85,35 @@ export type Format = {
 	write: (image: Image) => string throws CompileError,
 }
 
-/// Bytes the loader maps, then zero bytes after them.
-export type Segment = { address: u64, size: u64, zero: u64, write: bool, exec: bool }
+/// Bytes the loader maps, which the file has at offset, then zero bytes after them.
+export type Segment = { address: u64, offset: u64, size: u64, zero: u64, write: bool, exec: bool }
 
 /// A pointer the loader sets to the address of a symbol the library, an index in the image's, defines, plus addend;
 /// to 0 if it does not and the bind is weak.
 export type Bind = { at: u64, library: i32, name: string, weak: bool, addend: i64 }
 
+/// What link throws when a continued image cannot take what it is asked to, who links then linking all anew.
+export class Stale {
+	msg: string
+
+	constructor(msg: string) { this.msg = msg }
+}
+
 /// The address of a section of a group whose sections another object's are taken of.
 const dropped: u64 = 0xffffffff_ffffffff
+
+/// The address of a slot or stub the linker's own unit makes, until it is laid out.
+const planned: u64 = 1
 
 /// Whether a fixup of kind is of its symbol's slot.
 const slotted = (kind: u8) => kind == SlotPage || kind == SlotPageOff || kind == SlotRel32
 
-/// The sections of each segment, by kind, in order.
+/// The sections of each segment, by kind, in order; and of a kept image's, where the Zero ones are a segment of their
+/// own, as each before the last has room after it: addresses no file holds, for what later links add. An image with a
+/// full region is linked anew, as is one whose code no longer reaches what it calls, on arm64 128 MB away.
 const regions: u8[][] = [[Code], [Const, Unwind], [Data, Init, Thread, Zero]]
+const keptRegions: u8[][] = [[Code], [Const, Unwind], [Data, Init, Thread], [Zero]]
+const room: u64 = 1 << 28
 
 /// A name the objects share: the definition taken for it, and its address once laid out.
 class Name {
@@ -97,23 +128,26 @@ class Name {
 	namer = -1
 	/// The library it is imported from, -1 if none.
 	library = -1
-	/// Its slot, as a symbol of the linker's own unit, and the offset of its stub there; -1 if it has none.
-	slot = -1
-	stub = -1
+	/// The address of its slot, and of its stub; 0 if it has none.
+	slot: u64 = 0
+	stub: u64 = 0
 	address: u64 = 0
 
 	constructor(name: string) { this.name = name }
 }
 
-/// An object as linked: per symbol, the index of its Name, -1 if it is local; per section, its address, or dropped.
+/// An object as linked: per symbol, the index of its Name, -1 if it is local; per section, its address, 0 while it is
+/// to be laid out, or dropped; and whether it is frozen.
 class Unit {
 	object: Object
 	names: i32[] = []
 	at: u64[]
+	frozen: bool
 
-	constructor(o: Object) {
+	constructor(o: Object, frozen = false) {
 		this.object = o
 		this.at = new u64[](o.sections.length)
+		this.frozen = frozen
 	}
 }
 
@@ -137,20 +171,74 @@ export class Linker {
 	private groups = new HashMap[string, i32]()
 	/// The names of Const sections of which one holds a pointer.
 	private pointed = new HashMap[string, bool]()
+	/// The names x of the `__start_x` and `__stop_x` defined.
+	private bounded: string[] = []
 	private errors: string[] = []
+	/// Whether the image is kept; what it keeps of its linker; how many units the continued image holds, the frozen one
+	/// first; and its file.
+	private keep: bool
+	private regions: u8[][]
+	private state = new State()
+	private loaded = 0
+	private old = ""
 
-	/// A linker of objects of machine's CPU into an image for format's writer.
-	constructor(machine: Machine, format: Format) {
+	/// A linker of objects of machine's CPU into an image for format's writer; if kept is not null, into one that is
+	/// kept, which continues the image whose file's bytes kept is, if it is one.
+	constructor(machine: Machine, format: Format, kept: string | null = null) {
 		this.machine = machine
 		this.format = format
+		this.keep = kept != null
+		this.regions = if (kept != null) keptRegions else regions
+		const s = if (kept != null) read(kept, format.headers, machine.arch) else null
+		if (s == null) {
+			return
+		}
+		this.state = s
+		this.units = s.units.map(e => {
+			const u = new Unit(e[0])
+			u.at = e[1]
+			return u
+		})
+		this.units[0].frozen = true
+		this.loaded = s.units.length
+		this.old = kept!
+		for (const [name, slot, stub] of s.slots) {
+			const n = this.names[this.name(name)]
+			n.slot = slot
+			n.stub = stub
+		}
+		// The sections of a bound name are laid out anew, as one, of the bytes they have.
+		for (const u of this.units) {
+			for (const i of 0 ... u.object.sections.length - 1) {
+				const sec = u.object.sections[i]
+				if (s.floating.includes(sec.name) && u.at[i] != dropped) {
+					const r = this.region(u.at[i])
+					const at = (r.file + u.at[i] - r.start) as i32
+					sec.bytes = if (sec.kind == Zero) "" else this.old.slice(at, at + (sec.size as i32))
+					this.free(u.at[i], sec.size)
+					u.at[i] = 0
+				}
+			}
+		}
 	}
 
-	/// Links o.
+	/// Links o, in a continued image after the objects it holds.
 	add(o: Object) {
 		if (o.arch != this.machine.arch) {
 			this.errors.push(`${o.name} is of ${o.arch}, not ${this.machine.arch}`)
 		}
 		this.units.push(new Unit(o))
+	}
+
+	/// The names of the objects given that the continued image holds, in order.
+	objects(): string[] { return this.units.slice(0, this.loaded).filter(u => !u.frozen).map(u => u.object.name) }
+
+	/// Unlinks the object of that name the continued image holds.
+	remove(name: string) {
+		const u = this.units.slice(0, this.loaded).find(u => !u.frozen && u.object.name == name)
+		if (u != null) {
+			this.unlink(u)
+		}
 	}
 
 	/// Links the object read returns if it defines one of names, which the linked ones name and none of them defines,
@@ -178,24 +266,25 @@ export class Linker {
 	/// Lets who loads the image find the symbol by its name.
 	export(name: string) { this.exported.push(name) }
 
-	/// The image; throws a CompileError naming the symbols no one defines or two do.
-	link(): Image throws CompileError {
-		// The objects given are resolved before any lazy one, and each lazy one linked before the next is looked for.
-		let k = 0
-		let w = 0
-		while (k < this.units.length || w < this.wanted.length) {
-			if (k < this.units.length) {
-				this.define(k)
-				k++
-			} else {
-				this.pull(this.names[this.wanted[w]])
-				w++
+	/// The image; throws a CompileError naming the symbols no one defines or two do, or if it continues one, a Stale
+	/// of whatever fails.
+	link(): Image throws CompileError | Stale {
+		try {
+			return this.make()
+		} catch (e: CompileError) {
+			if (this.loaded > 0) {
+				throw new Stale(e.msg)
 			}
+			throw e
 		}
-		this.settle()
+	}
+
+	private make(): Image throws CompileError {
+		this.resolve()
 		const own = this.plan()
+		const defined = (name: string) => this.names[this.name(name)].unit >= 0
 		for (const name of this.exported) {
-			if (this.names[this.name(name)].unit < 0) {
+			if (!defined(name)) {
 				this.errors.push(`${name} is exported but not defined`)
 			}
 		}
@@ -205,14 +294,28 @@ export class Linker {
 		this.units.push(own)
 		const image = new Image(this.machine.arch, this.machine.page)
 		image.libraries = this.libraries
-		this.layout(this.format.headers, image)
+		image.inits = this.state.inits
+		image.thread = this.state.thread
+		image.rebases = [...this.state.rebases]
+		image.descs = [...this.state.descs]
+		this.layout(this.format.headers + (if (this.keep) 16 else 0), image)
 		for (const n of this.names) {
 			if (n.section >= 0) {
 				n.address = this.units[n.unit].at[n.section] + n.value
 			}
 		}
+		// The slots and stubs own makes are where it is laid out.
+		for (const f of own.object.sections[1].fixups) {
+			this.names[own.names[f.symbol]].slot = own.at[1] + f.at
+		}
+		const stub = this.machine.stub.length as u64
+		for (const f of own.object.sections[0].fixups) {
+			this.names[own.names[f.symbol]].stub = own.at[0] + f.at - f.at % stub
+		}
 		this.fix(image)
-		for (const name of this.exported) {
+		// A continued image's exports are those it had, but the names no longer defined, and those asked for now.
+		const exports = [...this.state.exports.filter(e => defined(e) && !this.exported.includes(e)), ...this.exported]
+		for (const name of exports) {
 			image.exports.push([name, this.names[this.name(name)].address])
 		}
 		for (const u of this.units) {
@@ -222,16 +325,97 @@ export class Linker {
 				}
 			}
 		}
+		if (this.keep) {
+			this.save(image, exports)
+		}
 		return image
 	}
 
+	/// Resolves the names: the objects given before any lazy one, and each lazy one linked before the next is looked
+	/// for. The objects the continued image holds that name what no one defines are unlinked, and the names resolved
+	/// anew without them.
+	private resolve() throws CompileError {
+		let errors = this.errors.length
+		while (true) {
+			let k = 0
+			let w = 0
+			while (k < this.units.length || w < this.wanted.length) {
+				if (k < this.units.length) {
+					this.define(k)
+					k++
+				} else {
+					this.pull(this.names[this.wanted[w]])
+					w++
+				}
+			}
+			this.settle()
+			if (this.errors.length == errors) {
+				return
+			}
+			const missing = (s: Symbol) => {
+				if (s.binding != Global) {
+					return false
+				}
+				const n = this.names[this.index.get(s.name)!]
+				return n.unit < 0 && n.library < 0
+			}
+			const gone = this.units.slice(0, this.loaded).filter(u => !u.frozen && u.object.symbols.some(missing))
+			if (gone.length == 0) {
+				return
+			}
+			this.errors = this.errors.slice(0, errors)
+			for (const u of gone) {
+				this.unlink(u)
+			}
+			errors = this.errors.length
+			this.names = this.names.map(n => {
+				const m = new Name(n.name)
+				m.slot = n.slot
+				m.stub = n.stub
+				return m
+			})
+			this.wanted = []
+			this.groups = new HashMap[string, i32]()
+			this.pointed = new HashMap[string, bool]()
+			this.bounded = []
+			for (const k of 0 ... this.units.length - 1) {
+				const u = this.units[k]
+				u.names = []
+				u.at = if (k < this.loaded) u.at else new u64[](u.object.sections.length)
+			}
+		}
+	}
+
+	/// Unlinks u, an object the continued image holds, its room free then, but if it has sections the image has for
+	/// good.
+	private unlink(u: Unit) {
+		for (const i of 0 ... u.object.sections.length - 1) {
+			const sec = u.object.sections[i]
+			if (u.at[i] != dropped && this.pinned(sec)) {
+				this.errors.push(`${u.object.name} has ${sec.name}, which the image has for good`)
+			}
+			if (u.at[i] != 0 && u.at[i] != dropped) {
+				this.free(u.at[i], sec.size)
+			}
+		}
+		this.units = this.units.filter(x => x != u)
+		this.loaded--
+	}
+
 	/// Takes the groups of unit k's sections no unit before has, and its definitions over weak ones, and notes what it
-	/// names.
+	/// names; one over a definition of the frozen unit is an error, as the fixups to it are set for good, and so is a
+	/// unit a continued image does not hold with a section it has for good.
 	private define(k: i32) {
 		const u = this.units[k]
 		const o = u.object
+		if (this.loaded > 0 && k >= this.loaded && o.sections.some(s => this.pinned(s))) {
+			this.errors.push(`${o.name} has sections the image has for good`)
+		}
 		for (const i of 0 ... o.sections.length - 1) {
 			const sec = o.sections[i]
+			if (u.at[i] == dropped) {
+				continue // a kept object's, whose group another has
+			}
 			const group = sec.group
 			if (group != "") {
 				const owner = this.groups.get(group) ?? k
@@ -255,6 +439,9 @@ export class Linker {
 			const n = this.names[g]
 			if (s.section >= 0 && u.at[s.section] != dropped) {
 				if (n.unit < 0 || n.weak && s.binding == Global) {
+					if (n.unit == 0 && this.loaded > 0) {
+						this.errors.push(`${s.name} of ${o.name} is defined for good`)
+					}
 					n.unit = k
 					n.section = s.section
 					n.value = s.value
@@ -275,7 +462,7 @@ export class Linker {
 		const m = this.members.get(n.name) ?? -1
 		if (n.unit < 0 && m >= 0 && !this.taken[m]) {
 			this.taken[m] = true
-			this.units.push(new Unit(this.lazies[m]()))
+			this.units.push(new Unit(this.lazies[m](), this.keep))
 		}
 	}
 
@@ -306,11 +493,16 @@ export class Linker {
 	}
 
 	/// Defines n as the start of the first section named x, or as the stop of the last, if x is a C identifier; they
-	/// are of one kind, as only those are laid out together.
+	/// are of one kind, as only those are laid out together, and none is laid out for good, as those of a continued
+	/// image may be between others.
 	private bound(n: Name, x: string, stop: bool) {
 		if (!identifier(x)) {
 			return
 		}
+		if (!this.bounded.includes(x)) {
+			this.bounded.push(x)
+		}
+		let laid = this.state.sections.some(e => e[0] == x)
 		for (const k of 0 ... this.units.length - 1) {
 			const u = this.units[k]
 			for (const i of 0 ... u.object.sections.length - 1) {
@@ -318,6 +510,7 @@ export class Linker {
 				if (sec.name != x || u.at[i] == dropped) {
 					continue
 				}
+				laid = laid || u.at[i] != 0
 				if (n.unit >= 0 && this.kind(this.units[n.unit].object.sections[n.section]) != this.kind(sec)) {
 					this.errors.push(`${n.name} bounds sections of several kinds, as that of ${u.object.name}`)
 				}
@@ -328,22 +521,30 @@ export class Linker {
 				}
 			}
 		}
+		if (laid) {
+			this.errors.push(`${n.name} bounds sections the image has laid out`)
+		}
 	}
 
 	/// The linker's own unit: a slot for each name a fixup reaches through one, and a stub, and its slot, for each
-	/// import a call reaches.
+	/// import a call reaches, but those the image has. Their fixups reach a name by a weak symbol, so that the slot of
+	/// one a continued image no longer has is 0.
 	private plan(): Unit {
 		const stubs = new Section("stubs", Code)
 		const slots = new Section("slots", Data)
 		stubs.align = 4
 		slots.align = 8
-		const own = new Unit(new Object("linker", this.machine.arch))
+		const own = new Unit(new Object("linker", this.machine.arch), this.keep)
 		own.object.sections = [stubs, slots]
 		own.at = [0, 0]
 		for (const k of 0 ... this.units.length - 1) {
 			const u = this.units[k]
 			const o = u.object
 			for (const i of 0 ... o.sections.length - 1) {
+				if (u.at[i] == dropped && !this.groups.has(o.sections[i].group)) {
+					// A kept object's, whose bytes are gone, of a group no object has now.
+					this.errors.push(`${o.name} has ${o.sections[i].group}, which no object has now`)
+				}
 				if (u.at[i] == dropped) {
 					continue
 				}
@@ -358,14 +559,22 @@ export class Linker {
 					}
 					const n = this.names[g]
 					const call = this.stubbed(f.kind, n)
-					if (slot || call) {
-						this.slot(own, g)
+					if (!((slot || call) && n.slot == 0 || call && n.stub == 0)) {
+						continue
 					}
-					if (call && n.stub < 0) {
-						n.stub = stubs.bytes.length
+					const j = own.names.length
+					own.names.push(g)
+					own.object.symbols.push(new Symbol(n.name, Weak))
+					if (n.slot == 0) {
+						n.slot = planned
+						slots.fixups.push(new Fixup(8 * (slots.fixups.length as u64), Abs64, j, 0))
+					}
+					if (call && n.stub == 0) {
+						n.stub = planned
+						const at = stubs.bytes.length as u64
 						stubs.bytes += this.machine.stub
-						for (const [at, kind, addend] of this.machine.stubFixups) {
-							stubs.fixups.push(new Fixup((n.stub as u64) + at, kind, n.slot, addend))
+						for (const [off, kind, addend] of this.machine.stubFixups) {
+							stubs.fixups.push(new Fixup(at + off, kind, j, addend))
 						}
 					}
 				}
@@ -393,18 +602,6 @@ export class Linker {
 		this.names.push(n)
 	}
 
-	/// Gives the name g a slot in own, a pointer set to its address.
-	private slot(own: Unit, g: i32) {
-		const n = this.names[g]
-		if (n.slot >= 0) {
-			return
-		}
-		n.slot = own.names.length
-		own.names.push(g)
-		own.object.symbols.push(new Symbol(n.name, Global))
-		own.object.sections[1].fixups.push(new Fixup(8 * (n.slot as u64), Abs64, n.slot, 0))
-	}
-
 	/// Whether a fixup of kind reaches n through its stub: a call to an import, and if the loader sets only slots, any
 	/// reference to one but through its slot, the stub being the import's address as far as the image can tell.
 	private stubbed(kind: u8, n: Name): bool {
@@ -415,9 +612,16 @@ export class Linker {
 	/// image sets, so that those of a name stay together.
 	private kind(sec: Section): u8 { return if (sec.kind == Const && this.pointed.has(sec.name)) Data else sec.kind }
 
+	/// Whether sec is laid out for good in a kept image, and the object of it with it: an Init or Thread one, which the
+	/// image has as one, or one of a bound name a frozen unit has.
+	private pinned(sec: Section): bool {
+		return sec.kind == Init || sec.kind == Thread || this.state.pinned.includes(sec.name)
+	}
+
 	/// Lays the sections out from base on, each region of kinds a segment: those of a kind and name together, by their
-	/// order, after those of the kinds and names before.
-	private layout(base: u64, image: Image) {
+	/// order, after those of the kinds and names before; in a continued image, those to be laid out where there is room
+	/// for them as one.
+	private layout(base: u64, image: Image) throws CompileError {
 		const index = new HashMap[string, i32]()
 		const runs: [u8, string, i64[]][] = []
 		for (const k of 0 ... this.units.length - 1) {
@@ -435,72 +639,176 @@ export class Linker {
 				}
 			}
 		}
-		const order = (ref: i64) => this.units[ref >> 32].object.sections[ref & 0xffffffff].order
+		const sec = (ref: i64) => this.units[ref >> 32].object.sections[ref & 0xffffffff]
 		for (const r of runs) {
-			sortBy(r[2], (a: i64, b: i64) => order(a) < order(b))
+			sortBy(r[2], (a: i64, b: i64) => sec(a).order < sec(b).order)
 		}
-		let at = base
+		// Per run laid out now, or section laid out before: its name and kind, and from and to where it is.
+		const laid = [...this.state.sections]
+		const regions = this.regions
+		// How many bytes the continued image's file has where, and where bytes has them: its regions', but the holes,
+		// which are zeros, as elf.bob skips those in the Unwind sections.
+		const copies: [u64, u64, u64][] = []
 		let file = base
-		for (const region of regions) {
-			const start = at
-			let end = at
-			for (const kind of region) {
+		for (const r of 0 ... regions.length - 1) {
+			const fresh = this.state.regions.length == r
+			if (fresh) {
+				this.state.regions.push(new Region(if (r == 0) base else this.state.regions[r - 1].cap))
+			}
+			const region = this.state.regions[r]
+			const held: [u64, u64][] = []
+			let from = region.start
+			for (const [hole, last] of region.holes) {
+				held.push([from, hole])
+				from = last
+			}
+			held.push([from, region.top])
+			let end = if (regions[r][0] == Zero) region.start else region.top
+			for (const kind of regions[r]) {
 				for (const [rk, name, secs] of runs) {
 					if (rk != kind) {
 						continue
 					}
-					let align: u64 = 1
+					const todo: i64[] = []
 					for (const ref of secs) {
-						const u = this.units[ref >> 32]
-						const sec = u.object.sections[ref & 0xffffffff]
-						at = alignUp(at, sec.align)
-						u.at[ref & 0xffffffff] = at
-						at += sec.size
-						align = max(align, sec.align)
-					}
-					const from = this.units[secs[0] >> 32].at[secs[0] & 0xffffffff]
-					if (at > from) {
-						image.sections.push([name, from, at - from])
-						if (kind == Unwind) {
-							image.unwind = [if (image.unwind[1] == 0) from else image.unwind[0], at]
-						} else if (kind == Init) {
-							image.inits = [if (image.inits[1] == 0) from else image.inits[0], at]
-						} else if (kind == Thread) {
-							const [first, _, most] = image.thread
-							image.thread = [if (image.thread[1] == 0) from else first, at, max(most, align)]
+						const at = this.units[ref >> 32].at[ref & 0xffffffff]
+						if (at == 0) {
+							todo.push(ref)
+						} else if (partitionPoint(this.state.regions, x => x.cap > at) != (r as u32)) {
+							throw new CompileError(`${this.units[ref >> 32].object.name}: ${name} is of another kind now`)
+						} else {
+							laid.push([name, kind, at, at + sec(ref).size])
 						}
 					}
+					if (todo.length == 0) {
+						continue
+					}
+					const [from, to] = this.place(region, todo)
+					laid.push([name, kind, from, to])
+					if (to > from && kind == Init) {
+						image.inits = [if (image.inits[1] == 0) from else image.inits[0], to]
+					} else if (to > from && kind == Thread) {
+						const [first, _, most] = image.thread
+						let align = most
+						for (const ref of todo) {
+							align = max(align, sec(ref).align)
+						}
+						image.thread = [if (image.thread[1] == 0) from else first, to, align]
+					}
 					if (kind != Zero) {
-						end = at
+						end = region.top
 					}
 				}
 			}
-			if (at > start) {
-				image.segments.push({ address: start, size: end - start, zero: at - end, write: region[0] == Data,
-					exec: region[0] == Code })
-				file = end
+			if (fresh && r < regions.length - 1) {
+				region.cap = alignUp(region.top, image.page) + (if (this.keep) room else 0)
 			}
-			at = alignUp(at, image.page)
+			if (region.top > region.start) {
+				const was = region.file
+				// The loader maps pages, so the file has a segment where its address is, modulo the page.
+				region.file = file + (region.start - file) % image.page
+				for (const [a, b] of held.filter(h => h[1] > h[0] && regions[r][0] != Zero)) {
+					copies.push([was + a - region.start, b - a, region.file + a - region.start])
+				}
+				image.segments.push({ address: region.start, offset: region.file, size: end - region.start,
+					zero: region.top - end, write: regions[r][0] == Data || regions[r][0] == Zero, exec: regions[r][0] == Code })
+				file = if (end > region.start) region.file + end - region.start else file
+			}
+		}
+		const all = merged(laid)
+		image.sections = all.map(e => [e[0], e[2], e[3] - e[2]])
+		for (const i of 0 ... all.length - 1) {
+			const [_, kind, from, to] = all[i]
+			if (kind == Unwind && i > 0 && all[i - 1][1] == Unwind) {
+				image.unwinds[image.unwinds.length - 1] = [image.unwinds[image.unwinds.length - 1][0], to]
+			} else if (kind == Unwind) {
+				image.unwinds.push([from, to])
+			}
 		}
 		image.bytes = new u8[](file as i32)
+		for (const [from, size, to] of copies) {
+			set(image.bytes, to as i32, this.old.slice(from as i32, (from + size) as i32))
+		}
 		for (const u of this.units) {
 			for (const i of 0 ... u.object.sections.length - 1) {
 				const b = u.object.sections[i].bytes
-				if (u.at[i] != dropped) {
-					const to = u.at[i] as i32
-					for (const j of 0 ... b.length - 1) {
-						image.bytes[to + j] = b[j]
-					}
+				if (u.at[i] != dropped && b != "") {
+					set(image.bytes, image.at(u.at[i]), b)
 				}
 			}
 		}
 	}
 
+	/// Lays the sections refs out one after another in region r: in the first of its holes they fit, else at its top,
+	/// which stays below its cap. From and to where.
+	private place(r: Region, refs: i64[]): [u64, u64] throws CompileError {
+		const sec = (ref: i64) => this.units[ref >> 32].object.sections[ref & 0xffffffff]
+		const end = (from: u64) => {
+			let at = from
+			for (const ref of refs) {
+				at = alignUp(at, sec(ref).align) + sec(ref).size
+			}
+			return at
+		}
+		const align = sec(refs[0]).align
+		let from: u64 = 0
+		for (const i of 0 ... r.holes.length - 1) {
+			const [hole, last] = r.holes[i]
+			const at = alignUp(hole, align)
+			const to = end(at)
+			if (to > at && to <= last) {
+				const rest: [u64, u64][] = [[hole, at], [to, last]]
+				r.holes = [...r.holes.slice(0, i), ...rest.filter(h => h[1] > h[0]), ...r.holes.slice(i + 1, r.holes.length)]
+				from = at
+				break
+			}
+		}
+		if (from == 0) {
+			from = alignUp(r.top, align)
+			r.top = end(from)
+			if (r.top >= r.cap) {
+				throw new CompileError(`there is no room for ${sec(refs[0]).name}`)
+			}
+		}
+		let at = from
+		for (const ref of refs) {
+			at = alignUp(at, sec(ref).align)
+			this.units[ref >> 32].at[ref & 0xffffffff] = at
+			at += sec(ref).size
+		}
+		return [from, at]
+	}
+
+	/// The region of the continued image the address at is in.
+	private region(at: u64): Region { return this.state.regions[partitionPoint(this.state.regions, r => r.cap > at)] }
+
+	/// Frees size bytes at at for what is laid out later; the image has zeros there until then.
+	private free(at: u64, size: u64) {
+		if (size == 0) {
+			return
+		}
+		const r = this.region(at)
+		let a = partitionPoint(r.holes, h => h[0] > at) as i32
+		let b = a
+		let from = at
+		let to = at + size
+		if (a > 0 && r.holes[a - 1][1] == from) {
+			a--
+			from = r.holes[a][0]
+		}
+		if (b < r.holes.length && r.holes[b][0] == to) {
+			to = r.holes[b][1]
+			b++
+		}
+		const rest: [u64, u64][] = if (to == r.top) [] else [[from, to]]
+		r.top = if (to == r.top) from else r.top
+		r.holes = [...r.holes.slice(0, a), ...rest, ...r.holes.slice(b, r.holes.length)]
+	}
+
 	/// Sets the bytes each fixup is at, noting a pointer to an address in the image as a rebase, one to an import as a
-	/// bind, and a Desc as a desc; reaching an import relative to the code itself is only possible through a stub or
-	/// slot.
+	/// bind, and a Desc as a desc, which a frozen unit's fixup set for good the image keeps; reaching an import relative
+	/// to the code itself is only possible through a stub or slot.
 	private fix(image: Image) throws CompileError {
-		const own = this.units[this.units.length - 1]
 		for (const u of this.units) {
 			const o = u.object
 			for (const i of 0 ... o.sections.length - 1) {
@@ -509,6 +817,7 @@ export class Linker {
 				}
 				for (const f of o.sections[i].fixups) {
 					const p = u.at[i] + f.at
+					const stays = u.frozen && this.stable(u, f, p)
 					const g = u.names[f.symbol]
 					let s: u64 = 0
 					let inside = true
@@ -524,9 +833,9 @@ export class Linker {
 					} else {
 						const n = this.names[g]
 						if (slotted(f.kind)) {
-							s = own.at[1] + 8 * (n.slot as u64)
-						} else if (this.stubbed(f.kind, n) && u != own) { // a slot holds the import itself
-							s = own.at[0] + (n.stub as u64)
+							s = n.slot
+						} else if (this.stubbed(f.kind, n) && p != n.slot) { // a slot holds the import itself
+							s = n.stub
 						} else if (n.unit >= 0) {
 							s = n.address
 						} else {
@@ -547,18 +856,167 @@ export class Linker {
 						if (s < image.thread[0] || s >= image.thread[1]) {
 							throw new CompileError(`${place(o, i, f)} describes bytes that are no thread's own`)
 						}
-						image.descs.push([p, s + (f.addend as u64) - image.thread[0]])
+						const desc: [u64, u64] = [p, s + (f.addend as u64) - image.thread[0]]
+						image.descs.push(desc)
+						if (stays) {
+							this.state.descs.push(desc)
+						}
 						continue
 					}
 					if (inside && f.kind == Abs64) {
 						image.rebases.push(p)
+						if (stays) {
+							this.state.rebases.push(p)
+						}
 					}
-					if (!this.apply(image.bytes, p as i32, f.kind, s + (f.addend as u64), p)) {
+					if (!this.apply(image.bytes, image.at(p), f.kind, s + (f.addend as u64), p)) {
 						throw new CompileError(`${place(o, i, f)} cannot reach its symbol`)
 					}
 				}
 			}
 		}
+	}
+
+	/// Whether fixup f, at p, of a frozen unit is set for good: if it reaches a local symbol or a local's unshared
+	/// name, a name a frozen unit defines, a slot, or a stub.
+	private stable(u: Unit, f: Fixup, p: u64): bool {
+		const g = u.names[f.symbol]
+		if (g < 0) {
+			return true
+		}
+		const n = this.names[g]
+		return slotted(f.kind) || this.stubbed(f.kind, n) && p != n.slot || n.unit >= 0 && this.units[n.unit].frozen ||
+			(this.index.get(n.name) ?? -1) != g
+	}
+
+	/// Keeps in the image what a later link continues it from, which the 16 bytes after its headers say where the file
+	/// has: its units, the frozen ones as one and the others stripped; the slots and stubs of names; and exports.
+	private save(image: Image, exports: string[]) {
+		const s = this.state
+		for (const x of this.bounded) {
+			if (!s.pinned.includes(x) && this.units.some(u => u.frozen && u.object.sections.some(sec => sec.name == x))) {
+				s.pinned.push(x)
+			}
+		}
+		s.floating = this.bounded.filter(x => !s.pinned.includes(x))
+		s.units = [this.freeze(), ...this.units.filter(u => !u.frozen).map(u => this.strip(u))].map(u => [u.object, u.at])
+		s.slots = []
+		for (const g of 0 ... this.names.length - 1) {
+			const n = this.names[g]
+			if (n.slot != 0 && (this.index.get(n.name) ?? -1) == g) {
+				s.slots.push([n.name, n.slot, n.stub])
+			}
+		}
+		s.exports = exports
+		s.inits = image.inits
+		s.thread = image.thread
+		image.extra = write(s, this.machine.arch)
+		put(image.bytes, this.format.headers as i32, image.bytes.length as u64, 8)
+		put(image.bytes, (this.format.headers + 8) as i32, image.extra.length as u64, 8)
+	}
+
+	/// The frozen units as one, of a section per region from its start, of no bytes, that their symbols are in: those
+	/// with a name, but the weak definitions another unit's took over, which are references; and their fixups not set
+	/// for good. Notes where their sections are.
+	private freeze(): Unit {
+		const regions = this.state.regions
+		const o = new Object("the image", this.machine.arch)
+		o.sections = this.regions.map(r => new Section("", r[0]))
+		const region = (at: u64) => partitionPoint(regions, r => r.cap > at) as i32
+		// Per name, its symbol in o, which a frozen unit defines, or one of the bounds of sections laid out for good.
+		const symbols = new HashMap[i32, i32]()
+		const symbol = (g: i32) => {
+			const j = symbols.get(g) ?? o.symbols.length
+			if (j == o.symbols.length) {
+				const n = this.names[g]
+				const bounds = (x: string) => n.name == `__start_${x}` || n.name == `__stop_${x}`
+				const s = new Symbol(n.name, Weak)
+				if (n.section >= 0 && (this.units[n.unit].frozen || this.state.pinned.some(bounds))) {
+					s.binding = if (n.weak) Weak else Global
+					s.section = region(n.address)
+					s.value = n.address - regions[s.section].start
+				}
+				symbols.set(g, j)
+				o.symbols.push(s)
+			}
+			return j
+		}
+		const laid: [string, u8, u64, u64][] = []
+		for (const u of this.units.filter(u => u.frozen)) {
+			for (const i of 0 ... u.object.symbols.length - 1) {
+				const s = u.object.symbols[i]
+				if (s.binding != Local) {
+					const t = o.symbols[symbol(u.names[i])]
+					t.binding = if (t.section < 0 && (s.binding == Global || s.section >= 0)) Global else t.binding
+				} else if (s.name != "" && s.section >= 0 && u.at[s.section] != dropped) {
+					const at = u.at[s.section] + s.value
+					o.symbols.push(new Symbol(s.name, Local, region(at), at - regions[region(at)].start, s.size))
+				}
+			}
+			for (const i of 0 ... u.object.sections.length - 1) {
+				const sec = u.object.sections[i]
+				if (u.at[i] == dropped) {
+					continue
+				}
+				laid.push([sec.name, this.kind(sec), u.at[i], u.at[i] + sec.size])
+				for (const f of sec.fixups) {
+					const at = u.at[i] + f.at
+					if (!this.stable(u, f, at)) {
+						const r = region(at)
+						o.sections[r].fixups.push(new Fixup(at - regions[r].start, f.kind, symbol(u.names[f.symbol]), f.addend))
+					}
+				}
+			}
+		}
+		for (const x of this.state.pinned) {
+			for (const g of [this.index.get(`__start_${x}`) ?? -1, this.index.get(`__stop_${x}`) ?? -1]) {
+				if (g >= 0 && this.names[g].section >= 0) {
+					symbol(g)
+				}
+			}
+		}
+		// Two of a name are one for good only if nothing is between them, or can be laid out there: no other unit's
+		// section, and no hole.
+		for (const u of this.units.filter(u => !u.frozen)) {
+			for (const i of 0 ... u.object.sections.length - 1) {
+				if (u.at[i] != dropped) {
+					laid.push(["", 0, u.at[i], u.at[i] + u.object.sections[i].size])
+				}
+			}
+		}
+		for (const r of regions) {
+			for (const [from, to] of r.holes) {
+				laid.push(["", 0, from, to])
+			}
+		}
+		this.state.sections = merged([...this.state.sections, ...laid]).filter(e => e[0] != "")
+		const frozen = new Unit(o, true)
+		frozen.at = regions.map(r => r.start)
+		return frozen
+	}
+
+	/// u without the bytes of its sections, and but the fixups a later link sets again: of a shared name, or a pointer
+	/// or Desc, which the image's lists are made anew of, or in or to a section of a bound name, which is laid out anew.
+	private strip(u: Unit): Unit {
+		const o = new Object(u.object.name, u.object.arch)
+		o.symbols = u.object.symbols
+		const floats = (i: i32) => i >= 0 && this.state.floating.includes(u.object.sections[i].name)
+		for (const i of 0 ... u.object.sections.length - 1) {
+			const sec = u.object.sections[i]
+			const t = new Section(sec.name, sec.kind)
+			t.order = sec.order
+			t.align = sec.align
+			t.size = sec.size
+			t.group = sec.group
+			if (u.at[i] != dropped) {
+				t.fixups = sec.fixups.filter(f => o.symbols[f.symbol].binding != Local || f.kind == Abs64 || f.kind == Desc ||
+					floats(i) || floats(o.symbols[f.symbol].section))
+			}
+			o.sections.push(t)
+		}
+		const kept = new Unit(o)
+		kept.at = u.at
+		return kept
 	}
 
 	/// Sets the bytes of b at at by the rule of kind, v being S + A, or G + A for a slot's, and p their address: data
@@ -594,6 +1052,23 @@ export class Linker {
 		}
 		return g
 	}
+}
+
+/// The entries, a name and kind, and from and to where, but the empty ones, by address, those of a name and kind next
+/// to each other as one.
+function merged(entries: [string, u8, u64, u64][]): [string, u8, u64, u64][] {
+	const sorted = entries.filter(e => e[3] > e[2])
+	sortBy(sorted, (a, b) => a[2] < b[2])
+	const out: [string, u8, u64, u64][] = []
+	for (const e of sorted) {
+		const last = out.length - 1
+		if (last >= 0 && out[last][0] == e[0] && out[last][1] == e[1]) {
+			out[last] = [e[0], e[1], out[last][2], max(out[last][3], e[3])]
+		} else {
+			out.push(e)
+		}
+	}
+	return out
 }
 
 /// Where fixup f of section i of o is, for messages.

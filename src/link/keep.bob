@@ -1,0 +1,186 @@
+//! What the file of a kept image (link.bob) holds of its linker, for a later link to continue it: the State, which the
+//! 16 bytes after the format's headers give the offset and size of.
+
+import { Reader, Writer } from "../../std/encoding/binary"
+import { Arch } from "../../std/os"
+import { ParseError } from "../../std/parse"
+import { Fixup, Object, Section, Symbol } from "./object"
+
+/// What the state starts with, and the version of its encoding.
+const magic = "bober image 1"
+
+/// Where the sections of one of regions are: from start to top, of which holes, in order, are free; cap, which top
+/// stays below, where the next region starts; and file, where the image's file has its bytes.
+export class Region {
+	start: u64
+	top: u64
+	cap: u64 = 0xffffffff_ffffffff
+	file: u64 = 0
+	holes: [u64, u64][] = []
+
+	constructor(start: u64) {
+		this.start = start
+		this.top = start
+	}
+}
+
+/// What a link continues a kept image from, beside its bytes.
+export class State {
+	regions: Region[] = []
+	/// The objects of the frozen unit, then those given, stripped, and where their sections are.
+	units: [Object, u64[]][] = []
+	/// Per name with a slot, its address and that of its stub, 0 if none.
+	slots: [string, u64, u64][] = []
+	/// Of the frozen units: per name and kind, from and to where their sections are; the pointers the loader adds the
+	/// image's address to, and the descs, as Image has them.
+	sections: [string, u8, u64, u64][] = []
+	rebases: u64[] = []
+	descs: [u64, u64][] = []
+	inits: [u64, u64] = [0, 0]
+	thread: [u64, u64, u64] = [0, 0, 1]
+	/// The bound names whose sections are laid out for good, as a frozen unit has some, and those whose sections are
+	/// laid out anew each link.
+	pinned: string[] = []
+	floating: string[] = []
+	exports: string[] = []
+}
+
+/// s, of an image of arch, as bytes.
+export function write(s: State, arch: Arch): string {
+	const w = new Writer()
+	const str = (x: string) => {
+		w.uleb(x.length as u64)
+		w.raw(x)
+	}
+	w.raw(magic)
+	str(arch)
+	list(w, s.regions, r => {
+		w.uleb(r.start)
+		w.uleb(r.top)
+		w.uleb(r.cap)
+		w.uleb(r.file)
+		list(w, r.holes, h => {
+			w.uleb(h[0])
+			w.uleb(h[1])
+		})
+	})
+	list(w, s.units, u => {
+		str(u[0].name)
+		list(w, u[0].sections, sec => {
+			str(sec.name)
+			w.u8(sec.kind)
+			str(sec.order)
+			w.uleb(sec.align)
+			w.uleb(sec.size)
+			str(sec.group)
+			list(w, sec.fixups, f => {
+				w.uleb(f.at)
+				w.u8(f.kind)
+				w.uleb(f.symbol as u64)
+				w.sleb(f.addend)
+			})
+		})
+		list(w, u[1], at => w.uleb(at))
+		list(w, u[0].symbols, sym => {
+			str(sym.name)
+			w.u8(sym.binding)
+			w.sleb(sym.section as i64)
+			w.uleb(sym.value)
+			w.uleb(sym.size)
+		})
+	})
+	list(w, s.slots, e => {
+		str(e[0])
+		w.uleb(e[1])
+		w.uleb(e[2])
+	})
+	list(w, s.sections, e => {
+		str(e[0])
+		w.u8(e[1])
+		w.uleb(e[2])
+		w.uleb(e[3])
+	})
+	list(w, s.rebases, at => w.uleb(at))
+	list(w, s.descs, d => {
+		w.uleb(d[0])
+		w.uleb(d[1])
+	})
+	for (const v of [s.inits[0], s.inits[1], s.thread[0], s.thread[1], s.thread[2]]) {
+		w.uleb(v)
+	}
+	for (const names of [s.pinned, s.floating, s.exports]) {
+		list(w, names, str)
+	}
+	return w.bytes
+}
+
+/// The state in the file of a kept image of arch, whose format's headers take headers bytes; null if it holds none.
+export function read(file: string, headers: u64, arch: Arch): State | null {
+	try {
+		const r = new Reader(file)
+		r.pos = headers as i32
+		const at = r.fixed(8)
+		const size = r.fixed(8)
+		if (at > (file.length as u64) || size > (file.length as u64) - at) {
+			return null
+		}
+		r.pos = at as i32
+		const str = () => r.raw(r.uleb() as i32)
+		if (r.raw(magic.length) != magic || str() != arch) {
+			return null
+		}
+		const s = new State()
+		s.regions = many(r, () => {
+			const region = new Region(r.uleb())
+			region.top = r.uleb()
+			region.cap = r.uleb()
+			region.file = r.uleb()
+			region.holes = many(r, () => [r.uleb(), r.uleb()])
+			return region
+		})
+		s.units = many(r, () => {
+			const o = new Object(str(), arch)
+			o.sections = many(r, () => {
+				const sec = new Section(str(), r.u8())
+				sec.order = str()
+				sec.align = r.uleb()
+				sec.size = r.uleb()
+				sec.group = str()
+				sec.fixups = many(r, () => new Fixup(r.uleb(), r.u8(), r.uleb() as i32, r.sleb()))
+				return sec
+			})
+			const at = many(r, () => r.uleb())
+			o.symbols = many(r, () => new Symbol(str(), r.u8(), r.sleb() as i32, r.uleb(), r.uleb()))
+			return [o, at]
+		})
+		s.slots = many(r, () => [str(), r.uleb(), r.uleb()])
+		s.sections = many(r, () => [str(), r.u8(), r.uleb(), r.uleb()])
+		s.rebases = many(r, () => r.uleb())
+		s.descs = many(r, () => [r.uleb(), r.uleb()])
+		s.inits = [r.uleb(), r.uleb()]
+		s.thread = [r.uleb(), r.uleb(), r.uleb()]
+		s.pinned = many(r, str)
+		s.floating = many(r, str)
+		s.exports = many(r, str)
+		return s
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+/// Writes how many xs there are, then each by f.
+function list[T](w: Writer, xs: T[], f: (x: T) => void) {
+	w.uleb(xs.length as u64)
+	for (const x of xs) {
+		f(x)
+	}
+}
+
+/// What list wrote, each read by f.
+function many[T](r: Reader, f: () => T throws ParseError): T[] throws ParseError {
+	const xs: T[] = []
+	for (const _ of 1 ... (r.uleb() as i32)) {
+		xs.push(f())
+	}
+	return xs
+}

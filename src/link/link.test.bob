@@ -2,9 +2,9 @@
 
 import { CompileError } from "../error"
 import { addend, arm64 } from "./arm64"
-import { Image, Linker } from "./link"
-import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Local, Machine, Object, Page, PageOff, Rel32, Section,
-	SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Unwind, Weak } from "./object"
+import { Image, Linker, Stale } from "./link"
+import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Init, Local, Machine, Object, Page, PageOff, Rel32, Section,
+	SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Unwind, Weak, Zero } from "./object"
 import { x64 } from "./x64"
 
 /// An object named name of one section of kind, of the bytes of words, and of symbols.
@@ -28,8 +28,8 @@ function obj(name: string, kind: u8, words: u64[], symbols: Symbol[], fixups: Fi
 }
 
 /// A linker for machine, for a format of no file, whose loader sets a pointer to an import anywhere, or its slots only,
-/// and whose image starts at `__image`.
-function linker(bindsAnywhere = true, machine: Machine = arm64): Linker {
+/// and whose image starts at `__image`; of a kept image if kept is not null, as Linker's.
+function linker(bindsAnywhere = true, machine: Machine = arm64, kept: string | null = null): Linker {
 	return new Linker(machine, {
 		headers: 0x200,
 		bindsAnywhere: bindsAnywhere,
@@ -37,13 +37,34 @@ function linker(bindsAnywhere = true, machine: Machine = arm64): Linker {
 		read: (name: string, bytes: string) => new Object(name, "arm64"),
 		exports: (name: string, bytes: string) => [name],
 		write: (image: Image) => "",
-	})
+	}, kept)
 }
+
+/// A linker into a kept image, which continues the one whose file file is, with link's library.
+function kept(file = ""): Linker {
+	const l = linker(true, arm64, file)
+	l.library("libc.so", ["puts", "environ"])
+	return l
+}
+
+/// The image l links of objects too, with names exported.
+function keep(l: Linker, objects: Object[], names: string[] = []): Image throws CompileError | Stale {
+	for (const o of objects) {
+		l.add(o)
+	}
+	for (const name of names) {
+		l.export(name)
+	}
+	return l.link()
+}
+
+/// The file of image, as a format of none writes it.
+const file = (image: Image) => fromBytes(image.bytes) + image.extra
 
 /// The image of objects for machine, with names exported, and lazy ones as an archive's members, listed for the
 /// names they define; by linker.
 function link(objects: Object[], names: string[], lazy: Object[] = [], bindsAnywhere = true,
-	machine: Machine = arm64): Image throws CompileError {
+	machine: Machine = arm64): Image throws CompileError | Stale {
 	const l = linker(bindsAnywhere, machine)
 	for (const o of objects) {
 		l.add(o)
@@ -82,7 +103,7 @@ function section(image: Image, name: string): u64 {
 function get(image: Image, a: u64, n: i32 = 4): u64 {
 	let v: u64 = 0
 	for (const i of 0 ... n - 1) {
-		v = v | (image.bytes[(a as i32) + i] as u64) << 8 * i
+		v = v | (image.bytes[image.at(a) + i] as u64) << 8 * i
 	}
 	return v
 }
@@ -313,4 +334,129 @@ test "the format's start is the image's first byte, where no object defines it, 
 test "an object of another CPU is an error" {
 	assert link([obj("a", Data, [0], []), new Object("x", "x86_64")], []) throws new CompileError(
 		"x is of x86_64, not arm64")
+}
+
+/// An object as obj's whose section is named name.
+function named(name: string, o: Object): Object {
+	o.sections[0].name = name
+	return o
+}
+
+test "an object replaced in a kept image leaves the others' bytes where they are, and who calls it reaches it" {
+	const a = obj("a", Code, [0x94000000, 0xd65f03c0], [new Symbol("g", Global), new Symbol("f", Global, 0)],
+		[new Fixup(0, Call, 0, 0)])
+	const c = obj("c", Code, [7], [new Symbol("h", Global, 0)])
+	const first = keep(kept(), [a, obj("b", Code, [0xd65f03c0], [new Symbol("g", Global, 0)]), c], ["f", "g", "h"])
+	const l = kept(file(first))
+	assert l.objects().join(" ") == "a b c"
+	l.remove("b")
+	const image = keep(l, [obj("b", Code, [0xd503201f, 0xd503201f, 0xd65f03c0], [new Symbol("g", Global, 0)])])
+	const [f, g, h] = [at(image, "f"), at(image, "g"), at(image, "h")]
+	assert f == at(first, "f") && h == at(first, "h") && get(image, h) == 7 && g != at(first, "g")
+	assert get(image, f + 4) == 0xd65f03c0 && get(image, g + 8) == 0xd65f03c0
+	assert addend(get(image, f), Call) == (g as i64) - (f as i64)
+	assert kept(file(image)).objects().join(" ") == "a c b"
+}
+
+test "an object a kept image holds that names what is no longer defined is unlinked, and one added is stale" {
+	const a = obj("a", Code, [0x94000000], [new Symbol("g", Global), new Symbol("f", Global, 0)],
+		[new Fixup(0, Call, 0, 0)])
+	const b = obj("b", Code, [0xd65f03c0], [new Symbol("g", Global, 0)])
+	const first = file(keep(kept(), [a, b, obj("c", Data, [7], [new Symbol("h", Global, 0)])], ["f", "h"]))
+	const l = kept(first)
+	l.remove("b")
+	const image = l.link()
+	assert at(image, "f") == 0 && at(image, "h") != 0 && kept(file(image)).objects().join(" ") == "c"
+	const again = kept(first)
+	again.remove("b")
+	assert keep(again, [obj("d", Data, [0], [new Symbol("g", Global)])]) throws new Stale(
+		"g is not defined, but d names it")
+}
+
+test "the sections a kept image bounds stay one block" {
+	const x = obj("x", Data, [0, 0], [new Symbol("__start_types", Global), new Symbol("__stop_types", Global)],
+		[new Fixup(0, Abs64, 0, 0)])
+	const first = keep(kept(), [named("types", obj("a", Data, [1], [])), x, named("types", obj("b", Data, [2], []))],
+		["__start_types", "__stop_types"])
+	const l = kept(file(first))
+	l.remove("a")
+	const image = keep(l, [named("types", obj("a", Data, [3, 4, 5], []))])
+	const start = at(image, "__start_types")
+	assert at(image, "__stop_types") == start + 20 && get(image, start) == 2 && get(image, start + 8) == 3
+	const was = at(first, "__start_types")
+	assert get(image, start + 16) == 5 && start != was && get(image, was) == 0
+}
+
+test "a kept image holds a lazy object for good, and a definition over its weak one is stale" {
+	const a = obj("a", Code, [0x94000000], [new Symbol("lz", Global)], [new Fixup(0, Call, 0, 0)])
+	const z = obj("z", Code, [0xd65f03c0], [new Symbol("lz", Global, 0), new Symbol("w", Weak, 0)])
+	const l = kept()
+	l.lazy(["lz", "w"], () => z)
+	const first = file(keep(l, [a]))
+	assert kept(first).objects().join(" ") == "a"
+	assert keep(kept(first), [obj("d", Code, [0], [new Symbol("w", Global, 0)])]) throws new Stale(
+		"w of d is defined for good")
+}
+
+test "the sections a kept image has for good are not one where another object's are between" {
+	const wants = (name: string, x: string) => obj(name, Data, [0, 0], [new Symbol(x, Global)], [new Fixup(0, Abs64, 0, 0)])
+	const has = (name: string, x: string) => named("f", obj(name, Data, [1], [new Symbol(x, Global, 0)]))
+	const l = kept()
+	l.lazy(["x"], () => has("zx", "x"))
+	const first = file(keep(l, [wants("a", "x")]))
+	const m = kept(first)
+	m.lazy(["y"], () => has("zy", "y"))
+	const second = file(keep(m, [wants("b", "y")]))
+	assert keep(kept(second), []).sections.filter(s => s[0] == "f").length == 2
+}
+
+test "a region of a kept image has room its file does not hold, and one that is full is stale" {
+	const d = obj("d", Data, [7], [new Symbol("d", Global, 0)])
+	const first = keep(kept(), [obj("a", Code, [0xd65f03c0], []), d], ["d"])
+	assert at(first, "d") > 1 << 28 && first.bytes.length < 1 << 20
+	// What is after a region that grows is where it was, and later in the file.
+	const image = keep(kept(file(first)), [obj("c", Code, new u64[](0x8000), [])])
+	assert at(image, "d") == at(first, "d") && get(image, at(image, "d")) == 7
+	assert image.at(at(image, "d")) > first.at(at(first, "d"))
+	const b = obj("b", Code, [], [])
+	b.sections[0].size = 1 << 29
+	assert keep(kept(file(first)), [b]) throws new Stale("there is no room for text")
+}
+
+test "a group whose sections a kept object has dropped is taken by an object added, and else is stale" {
+	const k = (name: string, word: u64) => obj(name, Const, [word], [new Symbol("k", Weak, 0)], [], "k")
+	const first = file(keep(kept(), [k("a", 1), k("b", 2)], ["k"]))
+	const l = kept(first)
+	l.remove("a")
+	const image = keep(l, [k("c", 3)])
+	assert get(image, at(image, "k")) == 3
+	const again = kept(first)
+	again.remove("a")
+	assert again.link() throws new Stale("b has k, which no object has now")
+}
+
+test "the Zero sections of a kept image are a segment its file has no bytes of, and those it bounds one block" {
+	const zero = (name: string, size: u64) => {
+		const o = named("roots", obj(name, Zero, [], []))
+		o.sections[0].size = size
+		return o
+	}
+	const x = obj("x", Data, [0, 0], [new Symbol("__start_roots", Global), new Symbol("__stop_roots", Global)],
+		[new Fixup(0, Abs64, 0, 0)])
+	const first = keep(kept(), [zero("a", 8), x, zero("b", 16)], ["__start_roots", "__stop_roots"])
+	const last = first.segments[first.segments.length - 1]
+	assert last.size == 0 && last.zero == 24 && last.address == at(first, "__start_roots")
+	assert last.address >= (first.bytes.length as u64)
+	const l = kept(file(first))
+	l.remove("a")
+	const image = keep(l, [zero("a", 32)])
+	assert at(image, "__stop_roots") == at(image, "__start_roots") + 48 && image.bytes.length == first.bytes.length
+}
+
+test "an object a continued image links, a lazy one too, with a section the image has for good is stale" {
+	const first = file(keep(kept(), [obj("a", Code, [0xd65f03c0], [])]))
+	const l = kept(first)
+	l.lazy(["lz"], () => obj("z", Init, [0, 0], [new Symbol("lz", Global, 0)]))
+	assert keep(l, [obj("b", Data, [0, 0], [new Symbol("lz", Global)], [new Fixup(0, Abs64, 0, 0)])]) throws new Stale(
+		"z has sections the image has for good")
 }
