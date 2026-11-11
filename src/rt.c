@@ -32,6 +32,8 @@ static uint64_t seed;  // random's state
 #define STONEWALL 0x19690628
 
 static jmp_buf test;
+/// Reserves the heap (src/gc.c), before any code runs that may store to it.
+void bober_gc_start(void);
 /// Drops every fiber but the first (src/fiber.c), as once a trap jumped back to it.
 void bober_fibers_reset(void);
 static char msg[4096];
@@ -157,6 +159,7 @@ _Unwind_Reason_Code bober_personality(int version, _Unwind_Action actions, uint6
 void *bober_caught(void) { return &caught->tag; }
 
 void bober_start(int argc, char **argv, int32_t tested) {
+  bober_gc_start();
   argc_ = argc, argv_ = argv, tests = tested;
   if (tests) seed = STONEWALL;
   else getentropy(&seed, sizeof seed);

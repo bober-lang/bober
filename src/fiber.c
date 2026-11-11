@@ -2,6 +2,9 @@
 //! the callee-saved registers onto the stack it leaves, keeps its stack pointer in the fiber, and pops them from the
 //! stack it enters. A fiber's first frame returns to 0, where unwinding, and so a throw or the collector, stops. Each
 //! fiber but the running one keeps where it parked as libunwind's context, from which the collector walks its frames.
+//! Each fiber is on one of two lists, of those that ran since the last collection and of the others, each doubly
+//! linked, so that a fiber resumed moves to the first and one that ends leaves either, at once. A minor collection
+//! walks only the frames of the first (src/gc.c), as the others hold no young ref.
 
 #ifndef BOBER_ARCH
 #include "rt.h"
@@ -13,16 +16,26 @@
 #define STACK (1 << 20)  // of address space, committed as used
 #define GUARD (1 << 16)  // at its bottom, more than a frame takes, so that none steps over it
 
+typedef struct Link { struct Link *prev, *next; } Link;
 typedef struct Fiber {
+  Link link;  // in ran or idle
   void *sp;
   char *stack;  // null for the first fiber, on the process's stack
   unw_context_t parked;
   void *run;  // the function value a new fiber runs, until it starts
-  struct Fiber *next, *later;  // in the list of all, and in the queue of those ready
-  int dropped;                 // by bober_fibers_reset; bober_wake ignores it
+  struct Fiber *later;  // in the queue of those ready
+  int dropped;          // by bober_fibers_reset; bober_wake ignores it
 } Fiber;
 
-static Fiber first, *running = &first, *all = &first, *ready, *last, *dead;
+static Link ran, idle;  // those that ran since the last collection, the running one among them, and the others
+static Fiber first = {{&ran, &ran}}, *running = &first, *ready, *last, *dead;
+static Link ran = {&first.link, &first.link}, idle = {&idle, &idle};
+
+/// Takes f off its list.
+static void off(Fiber *f) { f->link.prev->next = f->link.next, f->link.next->prev = f->link.prev; }
+
+/// Puts f first on list l.
+static void onto(Fiber *f, Link *l) { f->link = (Link){l, l->next}, l->next->prev = &f->link, l->next = &f->link; }
 
 #if defined(__APPLE__)
 #define SYM(s) "_" #s
@@ -56,6 +69,7 @@ __asm__(".globl " SYM(bober_switch) "\n" SYM(bober_switch) ":\n"
 static void to(Fiber *f) {
   Fiber *self = running;
   running = f;
+  off(f), onto(f, &ran);
   unw_getcontext(&self->parked);
   bober_switch(&self->sp, f->sp);
   if (dead) munmap(dead->stack, STACK), free(dead), dead = 0;
@@ -76,9 +90,7 @@ static void begin(void) {
   void *f = self->run;
   self->run = 0;
   (*(void (**)(void *))f)(f);
-  Fiber **p = &all;
-  while (*p != self) p = &(*p)->next;
-  *p = self->next;
+  off(self);
   dead = self;
   next();
 }
@@ -98,7 +110,8 @@ void bober_fiber(uint64_t f) {
   *--top = (void *)begin;
   n->sp = top - 6;  // rbp, rbx and r12 to r15, as bober_switch pops them
 #endif
-  n->run = (void *)(uintptr_t)f, n->next = all, all = n;
+  n->run = (void *)(uintptr_t)f;
+  onto(n, &ran);
   running->later = ready, ready = running;  // the caller first, once n parks
   if (!last) last = running;
   to(n);
@@ -117,21 +130,27 @@ void bober_wake(uint64_t f) {
   last = w;
 }
 
-/// Calls visit with where each fiber but the running one parked, for the collector.
-void bober_parked(void (*visit)(unw_context_t *)) {
-  for (Fiber *f = all; f; f = f->next)
-    if (f != running) visit(&f->parked);
+/// Calls visit with where each fiber but the running one parked, for the collector: those that ran since the last
+/// collection, or, if all, every one; they then count as not run since.
+void bober_parked(void (*visit)(unw_context_t *), int all) {
+  for (Link *l = idle.next; all && l != &idle; l = l->next) visit(&((Fiber *)l)->parked);
+  for (Link *l = ran.next, *n; l != &ran; l = n) {
+    Fiber *f = (Fiber *)l;
+    n = l->next;
+    if (f != running) visit(&f->parked), off(f), onto(f, &idle);
+  }
 }
 
 /// Drops every fiber but the first, which runs again, as once a test that trapped jumped back to it. What outlives
 /// the test, as a Signal in a global, may still hold one, so its struct is kept, dropped.
 void bober_fibers_reset(void) {
   bober_io_cancel();  // their waits are on their stacks
-  while (all != &first) {
-    Fiber *f = all;
-    all = f->next;
-    munmap(f->stack, STACK), f->dropped = 1;
+  while (ran.next != &ran || idle.next != &idle) {
+    Fiber *f = (Fiber *)(ran.next != &ran ? ran.next : idle.next);
+    off(f);
+    if (f != &first) munmap(f->stack, STACK), f->dropped = 1;
   }
   if (dead) munmap(dead->stack, STACK), free(dead), dead = 0;
-  running = &first, first.next = 0, ready = last = 0;
+  running = &first, ready = last = 0;
+  onto(&first, &ran);
 }
