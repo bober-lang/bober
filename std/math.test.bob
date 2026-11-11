@@ -1,0 +1,784 @@
+import { abs, acos, acosh, alignUp, asin, asinh, atan, atan2, atanh, cbrt, ceil, clamp, copysign, cos, cosh, erf, erfc,
+	exp, exp10, exp2, expm1, fdim, floor, fma, fmax, fmin, fmod, frexp, gcd, hypot, ilogb, inf, isEven, isOdd, j0, j1,
+	jn, ldexp, lgamma, log, log10, log1p, log2, logb, max, min, modf, nan, nextafter, pow, remainder, remquo, rint,
+	round, sign, signbit, sin, sincos, sinh, sqrt, tan, tanh, tgamma, trunc, y0, y1, yn } from "./math"
+
+import { acos as cacos, acosf as cacosf, acosh as cacosh, acoshf as cacoshf, asin as casin, asinf as casinf,
+	asinh as casinh, asinhf as casinhf, atan as catan, atan2 as catan2, atan2f as catan2f, atanf as catanf,
+	atanh as catanh, atanhf as catanhf, cbrt as ccbrt, cbrtf as ccbrtf, ceil as cceil, ceilf as cceilf,
+	copysign as ccopysign, copysignf as ccopysignf, cos as ccos, cosf as ccosf, cosh as ccosh, coshf as ccoshf,
+	erf as cerf, erfc as cerfc, erfcf as cerfcf, erff as cerff, exp as cexp, exp10 as cexp10, exp10f as cexp10f,
+	exp2 as cexp2, exp2f as cexp2f, expf as cexpf, expm1 as cexpm1, expm1f as cexpm1f, fabs as cfabs, fabsf as cfabsf,
+	fdim as cfdim, fdimf as cfdimf, floor as cfloor, floorf as cfloorf, fma as cfma, fmaf as cfmaf, fmax as cfmax,
+	fmaxf as cfmaxf, fmin as cfmin, fminf as cfminf, fmod as cfmod, fmodf as cfmodf, frexp as cfrexp, frexpf as cfrexpf,
+	hypot as chypot, hypotf as chypotf, ilogb as cilogb, ilogbf as cilogbf, j0 as cj0, j0f as cj0f, j1 as cj1,
+	j1f as cj1f, jn as cjn, jnf as cjnf, lgamma_r as clgamma_r, lgammaf_r as clgammaf_r, log as clog, log10 as clog10,
+	log10f as clog10f, log1p as clog1p, log1pf as clog1pf, log2 as clog2, log2f as clog2f, logb as clogb,
+	logbf as clogbf, logf as clogf, modf as cmodf, modff as cmodff, nearbyint as cnearbyint, nearbyintf as cnearbyintf,
+	nextafter as cnextafter, nextafterf as cnextafterf, pow as cpow, powf as cpowf, remainder as cremainder,
+	remainderf as cremainderf, remquo as cremquo, remquof as cremquof, rint as crint, rintf as crintf, round as cround,
+	roundf as croundf, scalbn as cscalbn, scalbnf as cscalbnf, sin as csin, sincos as csincos, sincosf as csincosf,
+	sinf as csinf, sinh as csinh, sinhf as csinhf, sqrt as csqrt, sqrtf as csqrtf, tan as ctan, tanf as ctanf,
+	tanh as ctanh, tanhf as ctanhf, tgamma as ctgamma, tgammaf as ctgammaf, trunc as ctrunc, truncf as ctruncf,
+	y0 as cy0, y0f as cy0f, y1 as cy1, y1f as cy1f, yn as cyn, ynf as cynf } from "../vendor/libm/musl.h"
+
+import { addr, load } from "../builtin/mem"
+import { Float } from "./types"
+
+test "parity" {
+	assert isEven(0) && isEven(-2) && isEven(4) && !isEven(-3) && !isEven(7)
+	assert isOdd(1) && isOdd(-3) && !isOdd(0) && !isOdd(-2)
+}
+
+test "max and min" {
+	assert max(2, 3) == 3 && max(-1.5, -2.5) == -1.5
+	assert min(2, 3) == 2 && min(-1.5, -2.5) == -2.5
+}
+
+test "abs, sign and clamp" {
+	assert abs(-3) == 3 && abs(4) == 4 && abs(-2.5) == 2.5 && abs(7 as u8) == 7
+	assert 1.0 / abs(-0.0) == inf && !signbit(abs(-nan)) && !signbit(abs((-nan) as f32))
+	assert sign(-9) == -1 && sign(0) == 0 && sign(5) == 1 && sign(-0.5) == -1.0
+	assert clamp(5, 0, 3) == 3 && clamp(-1, 0, 3) == 0 && clamp(2, 0, 3) == 2
+}
+
+test "gcd and alignUp" {
+	assert gcd(12, 18) == 6 && gcd(-4, 6) == 2 && gcd(0, 5) == 5 && gcd(0, 0) == 0
+	assert alignUp(0, 8) == 0 && alignUp(1, 8) == 8 && alignUp(8, 8) == 8 && alignUp(10, 3) == 12
+}
+
+// The rest compares each float function with musl's, bit for bit, for f64 and f32: on edge values, hard ones, and
+// random ones. musl's libm is compiled by bobcc from vendor/musl (vendor/libm), not taken from the libc.a bober links:
+// clang compiled that, and contracts a*b+c into one fma where the target has it, and so rounds differently from bober,
+// which never does.
+test "rounding, magnitude and exponents" {
+	for (const x of inputs[f64]()) {
+		test `${show(x)}` {
+			same(floor(x), cfloor(x))
+			same(ceil(x), cceil(x))
+			same(trunc(x), ctrunc(x))
+			same(round(x), cround(x))
+			same(rint(x), crint(x))
+			same(rint(x), cnearbyint(x))
+			same(abs(x), cfabs(x))
+			const i = new f64[](1)
+			same(modf(x), [cmodf(x, i), i[0]])
+			const e = new i32[](1)
+			same(frexp(x), [cfrexp(x, e), e[0]])
+			assert ilogb(x) == cilogb(x)
+			same(logb(x), clogb(x))
+		}
+	}
+	for (const x of inputs[f32]()) {
+		test `${show(x)}` {
+			same(floor(x), cfloorf(x))
+			same(ceil(x), cceilf(x))
+			same(trunc(x), ctruncf(x))
+			same(round(x), croundf(x))
+			same(rint(x), crintf(x))
+			same(rint(x), cnearbyintf(x))
+			same(abs(x), cfabsf(x))
+			const i = new f32[](1)
+			same(modf(x), [cmodff(x, i), i[0]])
+			const e = new i32[](1)
+			same(frexp(x), [cfrexpf(x, e), e[0]])
+			assert ilogb(x) == cilogbf(x)
+			same(logb(x), clogbf(x))
+		}
+	}
+}
+
+test "sign, magnitude and remainders" {
+	for (const [x, y] of pairs[f64]()) {
+		test `${show(x)}, ${show(y)}` {
+			same(copysign(x, y), ccopysign(x, y))
+			same(fdim(x, y), cfdim(x, y))
+			same(fmax(x, y), cfmax(x, y))
+			same(fmin(x, y), cfmin(x, y))
+			same(nextafter(x, y), cnextafter(x, y))
+			same(fmod(x, y), cfmod(x, y))
+			same(remainder(x, y), cremainder(x, y))
+			const q = new i32[](1)
+			same(remquo(x, y), [cremquo(x, y, q), q[0]])
+		}
+	}
+	for (const [x, y] of pairs[f32]()) {
+		test `${show(x)}, ${show(y)}` {
+			same(copysign(x, y), ccopysignf(x, y))
+			same(fdim(x, y), cfdimf(x, y))
+			same(fmax(x, y), cfmaxf(x, y))
+			same(fmin(x, y), cfminf(x, y))
+			same(nextafter(x, y), cnextafterf(x, y))
+			same(fmod(x, y), cfmodf(x, y))
+			same(remainder(x, y), cremainderf(x, y))
+			const q = new i32[](1)
+			same(remquo(x, y), [cremquof(x, y, q), q[0]])
+		}
+	}
+}
+
+/// The exponents scalbn changes course at.
+const ns: i32[] = [-2147483648, -100000, -2200, -2150, -2098, -2097, -2096, -1200, -1100, -1080, -1076, -1075, -1074,
+	-1073, -1060, -1023, -1022, -1021, -1000, -200, -152, -151, -150, -149, -148, -127, -126, -125, -64, -1, 0, 1, 64,
+	126, 127, 128, 254, 255, 1000, 1023, 1024, 2046, 2047, 2048, 3000, 100000, 2147483647]
+
+/// Each edge with each of ns, then count random Ts and exponents in [-2200, 2200).
+function scaled[T extends Float](): [T, i32][] {
+	const out: [T, i32][] = []
+	for (const x of edges[T]()) {
+		for (const n of ns) {
+			out.push([x, n])
+		}
+	}
+	const r = new Rng()
+	for (const _ of 1 ... count) {
+		out.push([r.float[T](), ((r.next() % 4400) as i32) - 2200])
+	}
+	return out
+}
+
+test "ldexp" {
+	for (const [x, n] of scaled[f64]()) {
+		test `${show(x)}, ${n}` {
+			same(ldexp(x, n), cscalbn(x, n))
+		}
+	}
+	for (const [x, n] of scaled[f32]()) {
+		test `${show(x)}, ${n}` {
+			same(ldexp(x, n), cscalbnf(x, n))
+		}
+	}
+}
+
+test "roots" {
+	for (const x of inputs[f64]()) {
+		test `${show(x)}` {
+			same(sqrt(x), csqrt(x))
+			same(cbrt(x), ccbrt(x))
+		}
+	}
+	for (const x of inputs[f32]()) {
+		test `${show(x)}` {
+			same(sqrt(x), csqrtf(x))
+			same(cbrt(x), ccbrtf(x))
+		}
+	}
+}
+
+test "hypot" {
+	for (const [x, y] of pairs[f64]()) {
+		test `${show(x)}, ${show(y)}` {
+			same(hypot(x, y), chypot(x, y))
+		}
+	}
+	for (const [x, y] of pairs[f32]()) {
+		test `${show(x)}, ${show(y)}` {
+			same(hypot(x, y), chypotf(x, y))
+		}
+	}
+}
+
+/// Each triple of every fifth edge, then count random triples, a quarter of them with z a few ulps from -x*y.
+function triples[T extends Float](): [T, T, T][] {
+	const all = edges[T]()
+	const xs: T[] = []
+	for (const i of 0 ... all.length / 5 - 1) {
+		xs.push(all[i * 5])
+	}
+	const out: [T, T, T][] = []
+	for (const x of xs) {
+		for (const y of xs) {
+			for (const z of xs) {
+				out.push([x, y, z])
+			}
+		}
+	}
+	const r = new Rng()
+	for (const _ of 1 ... count) {
+		const x = r.float[T]()
+		const y = r.float[T]()
+		out.push([x, y, if ((r.next() & 3) == 0) r.near(-x * y) else r.float[T]()])
+	}
+	return out
+}
+
+/// x*y a few ulps from ±2^-1022, plus a tiny z: where fma rounds as a subnormal, or to the least normal.
+function least(r: Rng): [f64, f64, f64] {
+	const b = r.next()
+	const x = ofBits[f64](0x3ff0000000000000 | b >> 12 | (b & 1) << 63)
+	const y = ofBits[f64](bitsOf(ofBits[f64](0x0010000000000000) / x) + (b >> 1) % 9 - 4)
+	return [x, y, ofBits[f64](r.next() >> (54 + (b >> 4) % 10))]
+}
+
+test "fma" {
+	for (const [x, y, z] of [...triples[f64](), ...random(least)]) {
+		test `${show(x)}, ${show(y)}, ${show(z)}` {
+			same(fma(x, y, z), cfma(x, y, z))
+		}
+	}
+	for (const [x, y, z] of triples[f32]()) {
+		test `${show(x)}, ${show(y)}, ${show(z)}` {
+			same(fma(x, y, z), cfmaf(x, y, z))
+		}
+	}
+}
+
+/// Where the reduction changes course, by high word; multiples of pi/2, small and up to 2^1000 times, and odd ones of
+/// pi/4, where x / (pi/2) may round the wrong way; the f64 closest to one (Kahan and McDonald); and random ones up to
+/// 1e308: each with neighbors, and negated.
+function trigHard(): f64[] {
+	const xs: f64[] = []
+	const add = (x: f64) => {
+		for (const d of -3 ... 3) {
+			const y = ofBits[f64](bitsOf(x) + (d as u64))
+			xs.push(y)
+			xs.push(-y)
+		}
+	}
+	const highs: u64[] = [0x3e400000, 0x3e46a09e, 0x3e500000, 0x3fe59428, 0x3fe921fb, 0x4002d97c, 0x400921fb,
+		0x400f6a7a, 0x4012d97c, 0x4015fdbc, 0x401921fb, 0x401c463b, 0x413921fb, 0x7fefffff]
+	const lows: u64[] = [0, 1, 0x54442d18, 0x7fffffff, 0x80000000, 0xffffffff]
+	for (const hi of highs) {
+		for (const lo of lows) {
+			add(ofBits[f64](hi << 32 | lo))
+		}
+	}
+	for (const k of 1 ... 500) {
+		add((k as f64) * 1.5707963267948966)
+	}
+	for (const k of 0 ... 3000) {
+		add(((k as f64) + 0.5) * 1.5707963267948966)
+	}
+	let p = 1.5707963267948966
+	for (const _ of 1 ... 1000) {
+		add(p)
+		add(p * 3.0)
+		p *= 2.0
+	}
+	add(6381956970095103.0 * ofBits[f64](0x71c0000000000000)) // × 2^797
+	const r = new Rng()
+	for (const _ of 1 ... 2000) {
+		add(ofBits[f64](r.next() % 0x7fe0000000000000))
+	}
+	return xs
+}
+
+test "sin, cos and tan" {
+	for (const x of inputs(trigHard())) {
+		test `${show(x)}` {
+			same(sin(x), csin(x))
+			same(cos(x), ccos(x))
+			same(tan(x), ctan(x))
+			const [s, c] = [new f64[](1), new f64[](1)]
+			csincos(x, s, c)
+			same(sincos(x), [s[0], c[0]])
+		}
+	}
+	for (const x of inputs(trigHard().map(x => x as f32))) {
+		test `${show(x)}` {
+			same(sin(x), csinf(x))
+			same(cos(x), ccosf(x))
+			same(tan(x), ctanf(x))
+			const [s, c] = [new f32[](1), new f32[](1)]
+			csincosf(x, s, c)
+			same(sincos(x), [s[0], c[0]])
+		}
+	}
+}
+
+/// Where the functions change course, by high word, with neighbors, and negated.
+function atrigHard(): f64[] {
+	const xs: f64[] = []
+	const highs: u64[] = [0x00100000, 0x3c600000, 0x3e400000, 0x3e500000, 0x3fdc0000, 0x3fe00000, 0x3fe60000,
+		0x3fef3333, 0x3ff00000, 0x3ff30000, 0x40038000, 0x44100000]
+	const lows: u64[] = [0, 1, 0x7fffffff, 0x80000000, 0xffffffff]
+	for (const hi of highs) {
+		for (const lo of lows) {
+			for (const d of -2 ... 2) {
+				const y = ofBits[f64]((hi << 32 | lo) + (d as u64))
+				xs.push(y)
+				xs.push(-y)
+			}
+		}
+	}
+	return xs
+}
+
+/// y/x about the thresholds 2^±64 and 2^±26, as [y, x] and [x, y], each of either sign.
+function thresholds(): [f64, f64][] {
+	const out: [f64, f64][] = []
+	for (const x of [1.0, -1.0, 3.0, -0.75, 1e-300, -1e300]) {
+		for (const e of [-66, -65, -64, -63, -27, -26, -25, 25, 26, 27, 63, 64, 65, 66]) {
+			for (const d of -2 ... 2) {
+				const y = ofBits[f64](bitsOf(x * ldexp(1.0, e)) + (d as u64))
+				out.push([y, x])
+				out.push([-y, x])
+				out.push([x, y])
+				out.push([x, -y])
+			}
+		}
+	}
+	return out
+}
+
+test "asin, acos and atan" {
+	for (const x of inputs(atrigHard())) {
+		test `${show(x)}` {
+			same(asin(x), casin(x))
+			same(acos(x), cacos(x))
+			same(atan(x), catan(x))
+		}
+	}
+	for (const x of inputs(atrigHard().map(x => x as f32))) {
+		test `${show(x)}` {
+			same(asin(x), casinf(x))
+			same(acos(x), cacosf(x))
+			same(atan(x), catanf(x))
+		}
+	}
+}
+
+test "atan2" {
+	const xs = thresholds()
+	for (const [y, x] of pairs(xs)) {
+		test `${show(y)}, ${show(x)}` {
+			same(atan2(y, x), catan2(y, x))
+		}
+	}
+	for (const [y, x] of pairs(xs.map((p: [f64, f64]): [f32, f32] => [p[0] as f32, p[1] as f32]))) {
+		test `${show(y)}, ${show(x)}` {
+			same(atan2(y, x), catan2f(y, x))
+		}
+	}
+}
+
+test "exp, exp2 and expm1" {
+	for (const x of inputs[f64]()) {
+		test `${show(x)}` {
+			same(exp(x), cexp(x))
+			same(exp2(x), cexp2(x))
+			same(expm1(x), cexpm1(x))
+		}
+	}
+	for (const x of inputs[f32]()) {
+		test `${show(x)}` {
+			same(exp(x), cexpf(x))
+			same(exp2(x), cexp2f(x))
+			same(expm1(x), cexpm1f(x))
+		}
+	}
+}
+
+test "log, log2, log10 and log1p" {
+	for (const x of inputs[f64]()) {
+		test `${show(x)}` {
+			same(log(x), clog(x))
+			same(log2(x), clog2(x))
+			same(log10(x), clog10(x))
+			same(log1p(x), clog1p(x))
+		}
+	}
+	for (const x of inputs[f32]()) {
+		test `${show(x)}` {
+			same(log(x), clogf(x))
+			same(log2(x), clog2f(x))
+			same(log10(x), clog10f(x))
+			same(log1p(x), clog1pf(x))
+		}
+	}
+}
+
+/// pow on pairs, then on random x and y of x^y spread evenly in exponent over the finite results, about their limits
+/// too, and half the time on -x and y an integer, whose result is negative if it is odd.
+test "pow" {
+	const finite = random((r: Rng): [f64, f64] => {
+		const x = r.float[f64]()
+		const y = (r.unit() * 2160.0 - 1100.0) / log2(x)
+		return if ((r.next() & 1) == 0) [x, y] else [-x, trunc(y)]
+	})
+	for (const [x, y] of [...pairs[f64](), ...finite]) {
+		test `${show(x)}, ${show(y)}` {
+			same(pow(x, y), cpow(x, y))
+		}
+	}
+	const finitef = random((r: Rng): [f32, f32] => {
+		const x = r.float[f32]()
+		const y = ((r.unit() * 300.0 - 160.0) as f32) / log2(x)
+		return if ((r.next() & 1) == 0) [x, y] else [-x, trunc(y)]
+	})
+	for (const [x, y] of [...pairs[f32](), ...finitef]) {
+		test `${show(x)}, ${show(y)}` {
+			same(pow(x, y), cpowf(x, y))
+		}
+	}
+}
+
+test "exp10" {
+	for (const x of inputs[f64]()) {
+		test `${show(x)}` {
+			same(exp10(x), cexp10(x))
+		}
+	}
+	for (const x of inputs[f32]()) {
+		test `${show(x)}` {
+			same(exp10(x), cexp10f(x))
+		}
+	}
+}
+
+test "sinh, cosh, tanh and their inverses" {
+	for (const x of inputs[f64]()) {
+		test `${show(x)}` {
+			same(sinh(x), csinh(x))
+			same(cosh(x), ccosh(x))
+			same(tanh(x), ctanh(x))
+			same(asinh(x), casinh(x))
+			same(acosh(x), cacosh(x))
+			same(atanh(x), catanh(x))
+		}
+	}
+	for (const x of inputs[f32]()) {
+		test `${show(x)}` {
+			same(sinh(x), csinhf(x))
+			same(cosh(x), ccoshf(x))
+			same(tanh(x), ctanhf(x))
+			same(asinh(x), casinhf(x))
+			same(acosh(x), cacoshf(x))
+			same(atanh(x), catanhf(x))
+		}
+	}
+}
+
+test "erf and erfc" {
+	for (const x of inputs[f64]()) {
+		test `${show(x)}` {
+			same(erf(x), cerf(x))
+			same(erfc(x), cerfc(x))
+		}
+	}
+	for (const x of inputs[f32]()) {
+		test `${show(x)}` {
+			same(erf(x), cerff(x))
+			same(erfc(x), cerfcf(x))
+		}
+	}
+}
+
+/// x even in [-200, 200), where gamma reflects, overflows and underflows, or a few ulps from the integers and halves
+/// there, its poles and the zeros of lgamma among them; each half the time.
+function range[T extends Float](r: Rng): T {
+	const b = r.next()
+	return if ((b & 1) == 0) (r.unit() * 400.0 - 200.0) as T else r.near((((b >> 1) % 800) as T) * 0.5 - 200.0)
+}
+
+test "tgamma and lgamma" {
+	for (const x of [...inputs[f64](), ...random(range[f64])]) {
+		test `${show(x)}` {
+			same(tgamma(x), ctgamma(x))
+			const sign = new i32[](1)
+			same(lgamma(x), [clgamma_r(x, sign), sign[0]])
+		}
+	}
+	for (const x of [...inputs[f32](), ...random(range[f32])]) {
+		test `${show(x)}` {
+			same(tgamma(x), ctgammaf(x))
+			const sign = new i32[](1)
+			same(lgamma(x), [clgammaf_r(x, sign), sign[0]])
+		}
+	}
+}
+
+/// The greatest and least orders.
+const extremes: i32[] = [2147483647, -2147483647 - 1]
+/// The orders jn and yn are checked at: about where the recurrences change course, and negative.
+const orders: i32[] = [2, 3, 4, 5, 7, 10, 17, 32, 33, 34, 50, 100, 1000, -2, -3, -4, -5, -33, -50]
+
+/// Where the functions change course, by high word; the first zeros of j0, j1, y0 and y1, where the asymptotic forms
+/// lose the most; x about (k + 1/4) pi and (k + 3/4) pi, where sin x + cos x or sin x - cos x cancels, and pi/4 and
+/// 3pi/4 times 2^k to past 2^302; about each order; and random ones in [0, 64) and of exponents up to 2^330: each with
+/// its neighbors, and negated.
+function besselHard(): f64[] {
+	const xs: f64[] = []
+	const add = (x: f64) => {
+		for (const d of -1 ... 1) {
+			const y = ofBits[f64](bitsOf(x) + (d as u64))
+			xs.push(y)
+			xs.push(-y)
+		}
+	}
+	const highs: u64[] = [0x38000000, 0x3c900000, 0x3e100000, 0x3e400000, 0x3f200000, 0x40000000, 0x4006db6d,
+		0x40122e8b, 0x40200000, 0x48000000, 0x52d00000, 0x7fe00000, 0x7fefffff]
+	const lows: u64[] = [0, 1, 0xffffffff]
+	for (const hi of highs) {
+		for (const lo of lows) {
+			add(ofBits[f64](hi << 32 | lo))
+		}
+	}
+	const highsf: u32[] = [0x21800000, 0x33000000, 0x35800000, 0x39000000, 0x3a000000, 0x4036d917, 0x409173eb,
+		0x41000000, 0x58800000, 0x7f000000] // f32's
+	for (const b of highsf) {
+		add(ofBits[f32](b) as f64)
+	}
+	for (const z of [2.404825557695773, 5.520078110286311, 8.653727912911013, 11.791534439014281, 14.930917708487787,
+		3.8317059702075125, 7.015586669815619, 10.173468135062722, 13.323691936314223, 0.8935769662791675,
+		3.957678419314858, 7.086051060301773, 10.222345043496417, 2.197141326031017, 5.429681040794135,
+		8.596005868331169, 11.749154830839881]) {
+		add(z)
+	}
+	for (const k of 0 ... 100) {
+		add(((k as f64) + 0.25) * 3.141592653589793)
+		add(((k as f64) + 0.75) * 3.141592653589793)
+	}
+	let p = 0.7853981633974483
+	for (const _ of 1 ... 340) {
+		add(p)
+		add(p * 3.0)
+		p *= 2.0
+	}
+	for (const n of orders) {
+		const m = if (n < 0) -n else n
+		for (const t of [0.01, 0.1, 0.5, 0.9, 1.0, 1.1, 2.0, 10.0]) {
+			add((m as f64) * t)
+		}
+		add((m - 1) as f64)
+	}
+	const r = new Rng()
+	for (const _ of 1 ... 1000) {
+		add(bessel[f64](r))
+	}
+	return xs
+}
+
+/// A random x: of Rng.float; in [0, 64); or of an exponent from -35 to 330 (f32: -30 to 130); each a third
+/// of the time.
+function bessel[T extends Float](r: Rng): T {
+	const b = r.next()
+	switch (b % 3) {
+		case 0: return r.float[T]()
+		case 1: return (((b >> 11) as f64) / 140737488355328.0) as T // 2^47
+		default:
+			const [lo, span] = if (T == f32) [-30, 160] else [-35, 365]
+			const e = lo + (((b >> 2) % (span as u64)) as i32)
+			return ldexp(1.0 + r.unit(), e) as T
+	}
+}
+
+test "j0, y0, j1 and y1" {
+	for (const x of [...inputs(besselHard()), ...random(bessel[f64])]) {
+		test `${show(x)}` {
+			same(j0(x), cj0(x))
+			same(y0(x), cy0(x))
+			same(j1(x), cj1(x))
+			same(y1(x), cy1(x))
+		}
+	}
+	for (const x of [...inputs(besselHard().map(x => x as f32)), ...random(bessel[f32])]) {
+		test `${show(x)}` {
+			same(j0(x), cj0f(x))
+			same(y0(x), cy0f(x))
+			same(j1(x), cj1f(x))
+			same(y1(x), cy1f(x))
+		}
+	}
+}
+
+/// jn and yn at each order, of the random inputs a share; and at the least and greatest orders, where only 0, the
+/// infinities, x below 2^-29 and x above 2^302 end soon.
+test "jn and yn" {
+	const xs = [...besselHard(), ...random(bessel[f64], count / (orders.length as i64))]
+	for (const k of [0, 1, -1, ...orders]) {
+		for (const x of xs) {
+			test `${k}, ${show(x)}` {
+				same(jn(k, x), cjn(k, x))
+				same(yn(k, x), cyn(k, x))
+			}
+		}
+	}
+	const ends: f64[] = [0.0, -0.0, 1.0 / 0.0, -1.0 / 0.0, 0.0 / 0.0, 1e-10, -1e-10, 1e-300, 5e-324, 1e91, 1e300,
+		-1e300]
+	for (const k of [...extremes, 2147483646]) {
+		for (const x of ends) {
+			test `${k}, ${show(x)}` {
+				same(jn(k, x), cjn(k, x))
+			}
+		}
+	}
+	// y(n, x) reaches -infinity soon for x well below n
+	const yends: f64[] = [0.0, -0.0, 1.0 / 0.0, -1.0, 0.0 / 0.0, 0.5, 1.0, 10.0, 1e300]
+	for (const k of extremes) {
+		for (const x of yends) {
+			test `${k}, ${show(x)}` {
+				same(yn(k, x), cyn(k, x))
+			}
+		}
+	}
+}
+
+test "jn and yn for f32" {
+	const xs = [...besselHard().map(x => x as f32), ...random(bessel[f32], count / (orders.length as i64))]
+	for (const k of [0, 1, -1, ...orders]) {
+		for (const x of xs) {
+			test `${k}, ${show(x)}` {
+				same(jn(k, x), cjnf(k, x))
+				same(yn(k, x), cynf(k, x))
+			}
+		}
+	}
+	// without an asymptotic form, only 0, the infinities and x below 2^-20 end soon
+	const ends: f32[] = [0.0, -0.0, 1.0 / 0.0, 0.0 / 0.0, 1.0e-10, -1.0e-10, 1e-40]
+	const yends: f32[] = [0.0, -0.0, 1.0 / 0.0, -1.0, 0.0 / 0.0, 0.5, 1.0, 10.0]
+	for (const k of extremes) {
+		for (const x of ends) {
+			test `${k}, ${show(x)}` {
+				same(jn(k, x), cjnf(k, x))
+			}
+		}
+		for (const x of yends) {
+			test `${k}, ${show(x)}` {
+				same(yn(k, x), cynf(k, x))
+			}
+		}
+	}
+}
+
+/// The random inputs a test takes.
+const count = 100000
+
+/// The bits of x, widened.
+function bitsOf[T extends Float](x: T): u64 {
+	return if (T == f32) load[u32](addr(x)) as u64 else load[u64](addr(x))
+}
+
+/// The T of the low bits of b.
+function ofBits[T extends Float](b: u64): T {
+	if (T == f32) {
+		return load[T](addr(b as u32))
+	}
+	return load[T](addr(b))
+}
+
+/// An input of bits b: if a NaN, a quiet one, for musl leaves signaling NaNs unsupported, and LLVM, knowing fmax by its
+/// name, quiets them where musl's C would not.
+function input[T extends Float](b: u64): T {
+	const x = ofBits[T](b)
+	return if (x == x) x else ofBits[T](b | (if (T == f32) 0x400000 else 0x8000000000000))
+}
+
+/// Asserts a and b are one value: floats by their bits, or both NaN, so that -0 is not +0; anything else, as tuples of
+/// floats, by the shortest digits that read back as each float.
+function same[R](a: R, b: R) {
+	if (R == f32 || R == f64) {
+		assert a != a && b != b || bitsOf(a) == bitsOf(b)
+	} else {
+		assert `${a}` == `${b}`
+	}
+}
+
+/// x, also by its bits in hex.
+function show[T extends Float](x: T): string {
+	const b = bitsOf(x)
+	const hex = new u8[](if (T == f32) 8 else 16)
+	for (const i of 0 ... hex.length - 1) {
+		hex[i] = "0123456789abcdef"[(b >> (((hex.length - 1 - i) * 4) as u64) & 15) as i32]
+	}
+	return `${x} (0x${fromBytes(hex)})`
+}
+
+/// SplitMix64.
+class Rng {
+	s: u64 = 1
+
+	next(): u64 {
+		this.s += 0x9e3779b97f4a7c15
+		let z = this.s
+		z = (z ^ z >> 30) * 0xbf58476d1ce4e5b9
+		z = (z ^ z >> 27) * 0x94d049bb133111eb
+		return z ^ z >> 31
+	}
+
+	/// An f64 in [0, 1), of 53 random bits.
+	unit(): f64 { return ((this.next() >> 11) as f64) / 9007199254740992.0 }
+
+	/// A T: of random bits; of an exponent near 1's; a few ulps from a multiple of 1/2 below 4096; or of an
+	/// exponent near the subnormals' or where every T is an integer; each a quarter of the time.
+	float[T extends Float](): T {
+		const b = this.next()
+		const [mant, bias] = if (T == f32) [23, 127] else [52, 1023]
+		const m = (b >> 12) & ((1 as u64) << (mant as u64)) - 1
+		const sign = (b >> 11 & 1) << ((mant as u64) + (if (T == f32) 8 else 11))
+		const exp = (e: i64) => sign | (e as u64) << (mant as u64) | m
+		switch (b & 3) {
+			case 0: return input[T](b >> (if (T == f32) 32 else 0))
+			case 1: return ofBits[T](exp(bias - 40 + (((b >> 2) % 110) as i64)))
+			case 2:
+				const k = (((b >> 2) % 16384) as i64) - 8192
+				return input[T](bitsOf((k as T) * 0.5) + (b >> 16) % 7 - 3)
+			default:
+				const e = if ((b >> 2 & 1) == 0) ((b >> 3) % 40) as i64 else bias + mant - 4 + (((b >> 3) % 8) as i64)
+				return ofBits[T](exp(e))
+		}
+	}
+
+	/// A T a few ulps from x.
+	near[T extends Float](x: T): T { return input[T](bitsOf(x) + this.next() % 9 - 4) }
+}
+
+/// n inputs of gen, from a new Rng.
+function random[A](gen: (r: Rng) => A, n: i64 = count): A[] {
+	const r = new Rng()
+	const out: A[] = []
+	for (const _ of 1 ... n) {
+		out.push(gen(r))
+	}
+	return out
+}
+
+/// Values where functions change course: zeros, subnormals, the least and greatest normals, infinities, NaN, the
+/// integers and halves about 1 and about where every T is an integer, and a few constants and limits of exp; each
+/// with its neighbors up to ulps away, and negated.
+function edges[T extends Float](ulps: i64 = 2): T[] {
+	const bits: u64[] = if (T == f32) [0, 1, 0x7fffff, 0x800000, 0x7f7fffff, 0x7f800000, 0x7fc00000, 0x4b000000,
+		0x4b800000, 0x5f000000, 0x5f800000, 0x00400000, 0x0b800000, 0x3e800000]
+		else [0, 1, 0xfffffffffffff, 0x10000000000000, 0x7fefffffffffffff, 0x7ff0000000000000, 0x7ff8000000000000,
+		0x4330000000000000, 0x4340000000000000, 0x43e0000000000000, 0x43f0000000000000, 0x0008000000000000,
+		0x1e60000000000000, 0x3cb0000000000000]
+	const values: f64[] = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 7.0, 10.0, 100.0, 0.1, 0.75, 3.141592653589793,
+		2.718281828459045, 0.6931471805599453, 1.5707963267948966, 88.72283935546875, 709.782712893384,
+		745.1332191019411, 103.97208404541016, 1e-5, 1e10, 1e20, 1e300, 1e-300, 1e-310, 4294967296.0, 1.0e6]
+	const out: T[] = []
+	const add = (x: T) => {
+		for (const d of -ulps ... ulps) {
+			const y = input[T](bitsOf(x) + (d as u64))
+			out.push(y)
+			out.push(-y)
+		}
+	}
+	for (const b of bits) {
+		add(ofBits[T](b))
+	}
+	for (const v of values) {
+		add(v as T)
+	}
+	return out
+}
+
+/// The edges, then xs, then count random inputs.
+function inputs[T extends Float](xs: T[] = []): T[] { return [...edges[T](), ...xs, ...random(r => r.float[T]())] }
+
+/// Each pair of edges an ulp from theirs, then xs, then count random pairs, a quarter of them a few ulps apart.
+function pairs[T extends Float](xs: [T, T][] = []): [T, T][] {
+	const es = edges[T](1)
+	const out: [T, T][] = []
+	for (const x of es) {
+		for (const y of es) {
+			out.push([x, y])
+		}
+	}
+	out.append(xs)
+	const r = new Rng()
+	for (const _ of 1 ... count) {
+		const x = r.float[T]()
+		out.push([x, if ((r.next() & 3) == 0) r.near(x) else r.float[T]()])
+	}
+	return out
+}

@@ -1,0 +1,5530 @@
+//! Numeric helpers, and C's libm for f32 and f64 alike: each float function dispatches to its f64 or f32 version,
+//! suffixed F64 or F32 below, musl's libm ported bit for bit. Floats round to nearest and raise no exceptions, so
+//! nearbyint is rint and errno is never set.
+
+import { addr, load } from "../builtin/mem"
+import { Float, Integral, Numeric } from "./types"
+
+export const inf: f64 = 1.0 / 0.0
+export const nan: f64 = 0.0 / 0.0
+export const pi = 3.141592653589793
+export const ln2 = 0.6931471805599453
+export const ln10 = 2.302585092994046
+export const log2e = 1.4426950408889634
+export const log10e = 0.4342944819032518
+export const sqrt2 = 1.4142135623730951
+export const sqrtHalf = 0.7071067811865476
+
+export function isEven[T extends Integral](n: T): bool { return (n & 1) == 0 }
+export function isOdd[T extends Integral](n: T): bool { return !isEven(n) }
+export function max[T extends Numeric](a: T, b: T): T { return if (a > b) a else b }
+export function min[T extends Numeric](a: T, b: T): T { return if (a < b) a else b }
+
+/// |n|; of a float, its sign bit cleared, so that abs(-0.0) is +0 and a NaN is positive.
+export function abs[T extends Numeric](n: T): T {
+	if (T == f32) {
+		return fabsf(n as f32) as T
+	}
+	if (T == f64) {
+		return fabs(n as f64) as T
+	}
+	return if (n < (0 as T)) -n else n
+}
+
+export function sign[T extends Numeric](n: T): T { return (if (n > (0 as T)) 1 else if (n < (0 as T)) -1 else 0) as T }
+export function clamp[T extends Numeric](n: T, lo: T, hi: T): T { return min(max(n, lo), hi) }
+export function isNaN[T extends Float](x: T): bool { return x != x }
+/// Neither infinite nor NaN.
+export function isFinite[T extends Float](x: T): bool { return abs(x as f64) < inf }
+
+/// The greatest common divisor of a and b, never negative; gcd(0, 0) is 0.
+export function gcd[T extends Integral](a: T, b: T): T {
+	let x = a
+	let y = b
+	while (y != 0) {
+		const r = x % y
+		x = y
+		y = r
+	}
+	return abs(x)
+}
+
+/// The smallest multiple of align that is at least n, for n >= 0 and align > 0.
+export function alignUp[T extends Integral](n: T, align: T): T { return (n + align - 1) / align * align }
+
+// Rounding and the bits of floats.
+/// Whether x's sign bit is set, as for -0 and a negative NaN.
+export function signbit[T extends Float](x: T): bool {
+	return if (T == f32) signbitF32(x as f32) else signbitF64(x as f64)
+}
+
+/// x's magnitude with y's sign.
+export function copysign[T extends Float](x: T, y: T): T {
+	return (if (T == f32) copysignF32(x as f32, y as f32) else copysignF64(x as f64, y as f64)) as T
+}
+
+export function floor[T extends Float](x: T): T {
+	return (if (T == f32) floorF32(x as f32) else floorF64(x as f64)) as T
+}
+
+export function ceil[T extends Float](x: T): T { return (if (T == f32) ceilF32(x as f32) else ceilF64(x as f64)) as T }
+
+export function trunc[T extends Float](x: T): T {
+	return (if (T == f32) truncF32(x as f32) else truncF64(x as f64)) as T
+}
+
+/// x rounded to the nearest integer, halfway away from zero.
+export function round[T extends Float](x: T): T {
+	return (if (T == f32) roundF32(x as f32) else roundF64(x as f64)) as T
+}
+
+/// x rounded to the nearest integer, halfway to even.
+export function rint[T extends Float](x: T): T { return (if (T == f32) rintF32(x as f32) else rintF64(x as f64)) as T }
+
+/// x - n*y, n = x/y rounded toward zero, so of x's sign.
+export function fmod[T extends Float](x: T, y: T): T {
+	return (if (T == f32) fmodF32(x as f32, y as f32) else fmodF64(x as f64, y as f64)) as T
+}
+
+/// x - n*y, n = x/y rounded to the nearest integer, halfway to even.
+export function remainder[T extends Float](x: T, y: T): T {
+	return (if (T == f32) remainderF32(x as f32, y as f32) else remainderF64(x as f64, y as f64)) as T
+}
+
+/// remainder(x, y), and the last 3 bits of n at least, with n's sign.
+export function remquo[T extends Float](x: T, y: T): [T, i32] {
+	if (T == f32) {
+		const [r, q] = remquoF32(x as f32, y as f32)
+		return [r as T, q]
+	}
+	const [r, q] = remquoF64(x as f64, y as f64)
+	return [r as T, q]
+}
+
+/// x's fractional and integral parts, each with x's sign.
+export function modf[T extends Float](x: T): [T, T] {
+	if (T == f32) {
+		const [f, i] = modfF32(x as f32)
+		return [f as T, i as T]
+	}
+	const [f, i] = modfF64(x as f64)
+	return [f as T, i as T]
+}
+
+/// x as m 2^e, |m| in [1/2, 1), or m = x and e = 0 for 0, infinities and NaN.
+export function frexp[T extends Float](x: T): [T, i32] {
+	if (T == f32) {
+		const [m, e] = frexpF32(x as f32)
+		return [m as T, e]
+	}
+	const [m, e] = frexpF64(x as f64)
+	return [m as T, e]
+}
+
+/// x 2^n.
+export function ldexp[T extends Float](x: T, n: i32): T {
+	return (if (T == f32) scalbnf(x as f32, n) else scalbn(x as f64, n)) as T
+}
+
+/// The exponent of x: e where |x| is in [2^e, 2^(e+1)); the least i32 for 0 and NaN, the greatest for infinities.
+export function ilogb[T extends Float](x: T): i32 { return if (T == f32) ilogbF32(x as f32) else ilogbF64(x as f64) }
+/// ilogb(x) as a float: -infinity for 0, infinity for infinities, NaN for NaN.
+export function logb[T extends Float](x: T): T { return (if (T == f32) logbF32(x as f32) else logbF64(x as f64)) as T }
+
+/// The float after x toward y, or y if they are equal.
+export function nextafter[T extends Float](x: T, y: T): T {
+	return (if (T == f32) nextafterF32(x as f32, y as f32) else nextafterF64(x as f64, y as f64)) as T
+}
+
+/// x - y if x > y, else +0.
+export function fdim[T extends Float](x: T, y: T): T {
+	return (if (T == f32) fdimF32(x as f32, y as f32) else fdimF64(x as f64, y as f64)) as T
+}
+
+/// The greater of x and y, unless one is NaN, then the other; +0 over -0.
+export function fmax[T extends Float](x: T, y: T): T {
+	return (if (T == f32) fmaxF32(x as f32, y as f32) else fmaxF64(x as f64, y as f64)) as T
+}
+
+/// The lesser of x and y, unless one is NaN, then the other; -0 under +0.
+export function fmin[T extends Float](x: T, y: T): T {
+	return (if (T == f32) fminF32(x as f32, y as f32) else fminF64(x as f64, y as f64)) as T
+}
+
+// Roots and fma.
+export function sqrt[T extends Float](x: T): T { return (if (T == f32) sqrtF32(x as f32) else sqrtF64(x as f64)) as T }
+export function cbrt[T extends Float](x: T): T { return (if (T == f32) cbrtF32(x as f32) else cbrtF64(x as f64)) as T }
+
+/// sqrt(x*x + y*y), without undue overflow or underflow; infinity if either is, though the other be NaN.
+export function hypot[T extends Float](x: T, y: T): T {
+	return (if (T == f32) hypotF32(x as f32, y as f32) else hypotF64(x as f64, y as f64)) as T
+}
+
+/// x*y + z, rounded once.
+export function fma[T extends Float](x: T, y: T, z: T): T {
+	return (if (T == f32) fmaF32(x as f32, y as f32, z as f32) else fmaF64(x as f64, y as f64, z as f64)) as T
+}
+
+// Trigonometry, in radians.
+export function sin[T extends Float](x: T): T { return (if (T == f32) sinF32(x as f32) else sinF64(x as f64)) as T }
+export function cos[T extends Float](x: T): T { return (if (T == f32) cosF32(x as f32) else cosF64(x as f64)) as T }
+export function tan[T extends Float](x: T): T { return (if (T == f32) tanF32(x as f32) else tanF64(x as f64)) as T }
+
+/// [sin(x), cos(x)], at the cost of about one.
+export function sincos[T extends Float](x: T): [T, T] {
+	if (T == f32) {
+		const [s, c] = sincosF32(x as f32)
+		return [s as T, c as T]
+	}
+	const [s, c] = sincosF64(x as f64)
+	return [s as T, c as T]
+}
+
+/// In [-pi/2, pi/2]; NaN outside [-1, 1].
+export function asin[T extends Float](x: T): T { return (if (T == f32) asinF32(x as f32) else asinF64(x as f64)) as T }
+/// In [0, pi]; NaN outside [-1, 1].
+export function acos[T extends Float](x: T): T { return (if (T == f32) acosF32(x as f32) else acosF64(x as f64)) as T }
+/// In [-pi/2, pi/2].
+export function atan[T extends Float](x: T): T { return (if (T == f32) atanF32(x as f32) else atanF64(x as f64)) as T }
+
+/// The angle of the point (x, y) from the positive x axis, in [-pi, pi].
+export function atan2[T extends Float](y: T, x: T): T {
+	return (if (T == f32) atan2F32(y as f32, x as f32) else atan2F64(y as f64, x as f64)) as T
+}
+
+// Exponentials and logarithms.
+export function exp[T extends Float](x: T): T { return (if (T == f32) expF32(x as f32) else expF64(x as f64)) as T }
+export function exp2[T extends Float](x: T): T { return (if (T == f32) exp2F32(x as f32) else exp2F64(x as f64)) as T }
+
+export function exp10[T extends Float](x: T): T {
+	return (if (T == f32) exp10F32(x as f32) else exp10F64(x as f64)) as T
+}
+
+/// e^x - 1, accurate also near x = 0.
+export function expm1[T extends Float](x: T): T {
+	return (if (T == f32) expm1F32(x as f32) else expm1F64(x as f64)) as T
+}
+
+/// The natural logarithm; -infinity at 0, NaN below.
+export function log[T extends Float](x: T): T { return (if (T == f32) logF32(x as f32) else logF64(x as f64)) as T }
+export function log2[T extends Float](x: T): T { return (if (T == f32) log2F32(x as f32) else log2F64(x as f64)) as T }
+
+export function log10[T extends Float](x: T): T {
+	return (if (T == f32) log10F32(x as f32) else log10F64(x as f64)) as T
+}
+
+/// log(1 + x), accurate also near x = 0.
+export function log1p[T extends Float](x: T): T {
+	return (if (T == f32) log1pF32(x as f32) else log1pF64(x as f64)) as T
+}
+
+/// x to the power y, as C's pow: 1 if y is 0 or x is 1, even for NaN; NaN for x < 0 and y no integer.
+export function pow[T extends Float](x: T, y: T): T {
+	return (if (T == f32) powF32(x as f32, y as f32) else powF64(x as f64, y as f64)) as T
+}
+
+// Hyperbolic functions.
+export function sinh[T extends Float](x: T): T { return (if (T == f32) sinhF32(x as f32) else sinhF64(x as f64)) as T }
+export function cosh[T extends Float](x: T): T { return (if (T == f32) coshF32(x as f32) else coshF64(x as f64)) as T }
+export function tanh[T extends Float](x: T): T { return (if (T == f32) tanhF32(x as f32) else tanhF64(x as f64)) as T }
+
+export function asinh[T extends Float](x: T): T {
+	return (if (T == f32) asinhF32(x as f32) else asinhF64(x as f64)) as T
+}
+
+/// NaN for x < 1.
+export function acosh[T extends Float](x: T): T {
+	return (if (T == f32) acoshF32(x as f32) else acoshF64(x as f64)) as T
+}
+
+/// Infinite at ±1, NaN beyond.
+export function atanh[T extends Float](x: T): T {
+	return (if (T == f32) atanhF32(x as f32) else atanhF64(x as f64)) as T
+}
+
+// Special functions.
+/// The error function, 2/sqrt(pi) times the integral of e^(-t^2) from 0 to x.
+export function erf[T extends Float](x: T): T { return (if (T == f32) erfF32(x as f32) else erfF64(x as f64)) as T }
+/// 1 - erf(x), accurate also where erf(x) is near 1.
+export function erfc[T extends Float](x: T): T { return (if (T == f32) erfcF32(x as f32) else erfcF64(x as f64)) as T }
+
+/// The gamma function, (x-1)! at the positive integers; infinite at ±0, NaN at the negative integers.
+export function tgamma[T extends Float](x: T): T {
+	return (if (T == f32) tgammaF32(x as f32) else tgammaF64(x as f64)) as T
+}
+
+/// log|Γ(x)|, and the sign of Γ(x), as C's lgamma_r; infinite at the integers up to 0.
+export function lgamma[T extends Float](x: T): [T, i32] {
+	if (T == f32) {
+		const [l, s] = lgammaF32(x as f32)
+		return [l as T, s]
+	}
+	const [l, s] = lgammaF64(x as f64)
+	return [l as T, s]
+}
+
+// Bessel functions.
+/// The Bessel function of the first kind of order 0.
+export function j0[T extends Float](x: T): T { return (if (T == f32) j0F32(x as f32) else j0F64(x as f64)) as T }
+/// Of the first kind of order 1.
+export function j1[T extends Float](x: T): T { return (if (T == f32) j1F32(x as f32) else j1F64(x as f64)) as T }
+
+/// Of the first kind of order n.
+export function jn[T extends Float](n: i32, x: T): T {
+	return (if (T == f32) jnF32(n, x as f32) else jnF64(n, x as f64)) as T
+}
+
+/// Of the second kind of order 0: -infinity at 0, NaN below.
+export function y0[T extends Float](x: T): T { return (if (T == f32) y0F32(x as f32) else y0F64(x as f64)) as T }
+/// Of the second kind of order 1: -infinity at 0, NaN below.
+export function y1[T extends Float](x: T): T { return (if (T == f32) y1F32(x as f32) else y1F64(x as f64)) as T }
+
+/// Of the second kind of order n: -infinity at 0 for n >= 0, NaN below 0.
+export function yn[T extends Float](n: i32, x: T): T {
+	return (if (T == f32) ynF32(n, x as f32) else ynF64(n, x as f64)) as T
+}
+
+// # The bits of floats
+//
+// The bits of floats, as the functions below read and build them, musl's asuint64, asdouble, asuint and asfloat; and
+// the constants they share.
+/// x's IEEE 754 bits.
+function asU64(x: f64): u64 { return load[u64](addr(x)) }
+/// The f64 of the bits b.
+function asF64(b: u64): f64 { return load[f64](addr(b)) }
+/// x's IEEE 754 bits.
+function asU32(x: f32): u32 { return load[u32](addr(x)) }
+/// The f32 of the bits b.
+function asF32(b: u32): f32 { return load[f32](addr(b)) }
+
+const inff: f32 = 1.0 / 0.0
+const nanf: f32 = 0.0 / 0.0
+/// ln2 in two parts, the first with 32 trailing zero bits; and to f32, the first with 9.
+const ln2hi = 6.93147180369123816490e-01
+const ln2lo = 1.90821492927058770002e-10
+const ln2hif: f32 = 0.69313812255859375
+const ln2lof: f32 = 9.0580006144591607e-06
+/// 1.5 2^52: adding then subtracting it rounds an f64 below 2^51 to an integer, whose bits are then its low bits.
+const toint = 6755399441055744.0
+/// 2^52 and 2^23: an f64 or f32 at least it is an integer; adding then subtracting it rounds one below it to one.
+const two52 = 4503599627370496.0
+const two23: f32 = 8388608.0
+
+/// The leading zero bits of x, not 0, as musl's portable a_clz_64.
+function clz64(x: u64): i32 {
+	let y = (if (x >> 32 != 0) x >> 32 else x) as u32
+	let r = if (x >> 32 != 0) 0 else 32
+	for (const k of [16, 8, 4, 2]) {
+		if (y >> (k as u32) != 0) {
+			y >>= k as u32
+		} else {
+			r |= k
+		}
+	}
+	return r | (if (y >> 1 != 0) 0 else 1)
+}
+
+// # Sign, rounding, remainders and exponents
+//
+// The operations on a float's representation: its sign, rounding to an integer, remainders, scaling by powers of
+// two, its exponent, its neighbors, and comparisons that order NaN and signed zeros.
+//
+// Results are musl's bit for bit in round-to-nearest, which bober always rounds in, and raise no floating-point
+// exceptions.
+//
+// Ported from musl 1.2.5, MIT, Copyright © 2005-2020 Rich Felker, et al. (vendor/musl/COPYRIGHT).
+function fabs(x: f64): f64 { return asF64(asU64(x) & 0x7fffffffffffffff) }
+function fabsf(x: f32): f32 { return asF32(asU32(x) & 0x7fffffff) }
+
+/// x's magnitude with y's sign.
+function copysignF64(x: f64, y: f64): f64 {
+	return asF64(asU64(x) & 0x7fffffffffffffff | asU64(y) & 0x8000000000000000)
+}
+
+function copysignF32(x: f32, y: f32): f32 { return asF32(asU32(x) & 0x7fffffff | asU32(y) & 0x80000000) }
+/// Whether x's sign bit is set, as for -0 and a negative NaN.
+function signbitF64(x: f64): bool { return asU64(x) >> 63 != 0 }
+function signbitF32(x: f32): bool { return asU32(x) >> 31 != 0 }
+
+function floorF64(x: f64): f64 {
+	const i = asU64(x)
+	const e = (i >> 52 & 0x7ff) as i32
+	if (e >= 0x3ff + 52 || x == 0.0) {
+		return x
+	}
+	if (e <= 0x3ff - 1) {
+		return if (i >> 63 != 0) -1.0 else 0.0
+	}
+	// y = int(x) - x, where int(x) is an integer neighbor of x
+	const y = if (i >> 63 != 0) x - two52 + two52 - x else x + two52 - two52 - x
+	return if (y > 0.0) x + y - 1.0 else x + y
+}
+
+function floorF32(x: f32): f32 {
+	let u = asU32(x)
+	const e = ((u >> 23 & 0xff) as i32) - 0x7f
+	if (e >= 23) {
+		return x
+	}
+	if (e >= 0) {
+		const m: u32 = 0x007fffff >> (e as u32)
+		if ((u & m) == 0) {
+			return x
+		}
+		if (u >> 31 != 0) {
+			u += m
+		}
+		u &= ~m
+	} else if (u >> 31 == 0) {
+		u = 0
+	} else if (u << 1 != 0) {
+		return -1.0
+	}
+	return asF32(u)
+}
+
+function ceilF64(x: f64): f64 {
+	const i = asU64(x)
+	const e = (i >> 52 & 0x7ff) as i32
+	if (e >= 0x3ff + 52 || x == 0.0) {
+		return x
+	}
+	if (e <= 0x3ff - 1) {
+		return if (i >> 63 != 0) -0.0 else 1.0
+	}
+	const y = if (i >> 63 != 0) x - two52 + two52 - x else x + two52 - two52 - x
+	return if (y < 0.0) x + y + 1.0 else x + y
+}
+
+function ceilF32(x: f32): f32 {
+	let u = asU32(x)
+	const e = ((u >> 23 & 0xff) as i32) - 0x7f
+	if (e >= 23) {
+		return x
+	}
+	if (e >= 0) {
+		const m: u32 = 0x007fffff >> (e as u32)
+		if ((u & m) == 0) {
+			return x
+		}
+		if (u >> 31 == 0) {
+			u += m
+		}
+		u &= ~m
+	} else if (u >> 31 != 0) {
+		return -0.0
+	} else if (u << 1 != 0) {
+		return 1.0
+	}
+	return asF32(u)
+}
+
+/// x rounded toward zero.
+function truncF64(x: f64): f64 {
+	const i = asU64(x)
+	let e = ((i >> 52 & 0x7ff) as i32) - 0x3ff + 12
+	if (e >= 52 + 12) {
+		return x
+	}
+	if (e < 12) {
+		e = 1
+	}
+	const m = ~(0 as u64) >> (e as u64)
+	return asF64(i & ~m)
+}
+
+function truncF32(x: f32): f32 {
+	const i = asU32(x)
+	let e = ((i >> 23 & 0xff) as i32) - 0x7f + 9
+	if (e >= 23 + 9) {
+		return x
+	}
+	if (e < 9) {
+		e = 1
+	}
+	const m = ~(0 as u32) >> (e as u32)
+	return asF32(i & ~m)
+}
+
+/// x rounded to the nearest integer, halves away from zero.
+function roundF64(x: f64): f64 {
+	const i = asU64(x)
+	const e = (i >> 52 & 0x7ff) as i32
+	if (e >= 0x3ff + 52) {
+		return x
+	}
+	const a = if (i >> 63 != 0) -x else x
+	if (e < 0x3ff - 1) {
+		return 0.0 * x
+	}
+	let y = a + two52 - two52 - a
+	if (y > 0.5) {
+		y = y + a - 1.0
+	} else if (y <= -0.5) {
+		y = y + a + 1.0
+	} else {
+		y = y + a
+	}
+	return if (i >> 63 != 0) -y else y
+}
+
+function roundF32(x: f32): f32 {
+	const i = asU32(x)
+	const e = (i >> 23 & 0xff) as i32
+	if (e >= 0x7f + 23) {
+		return x
+	}
+	const a = if (i >> 31 != 0) -x else x
+	if (e < 0x7f - 1) {
+		return 0.0 * x
+	}
+	let y = a + two23 - two23 - a
+	if (y > 0.5) {
+		y = y + a - 1.0
+	} else if (y <= -0.5) {
+		y = y + a + 1.0
+	} else {
+		y = y + a
+	}
+	return if (i >> 31 != 0) -y else y
+}
+
+/// x rounded to the nearest integer, halves to even, as is nearbyint without a rounding mode to follow.
+function rintF64(x: f64): f64 {
+	const i = asU64(x)
+	if ((i >> 52 & 0x7ff) >= 0x3ff + 52) {
+		return x
+	}
+	const s = i >> 63 != 0
+	const y = if (s) x - two52 + two52 else x + two52 - two52
+	return if (y != 0.0) y else if (s) -0.0 else 0.0
+}
+
+function rintF32(x: f32): f32 {
+	const i = asU32(x)
+	if ((i >> 23 & 0xff) >= 0x7f + 23) {
+		return x
+	}
+	const s = i >> 31 != 0
+	const y = if (s) x - two23 + two23 else x + two23 - two23
+	return if (y != 0.0) y else if (s) -0.0 else 0.0
+}
+
+/// x - n*y, n the integer x/y truncates to: of x's sign and less than y in magnitude, and exact.
+function fmodF64(x: f64, y: f64): f64 {
+	let ux = asU64(x)
+	let uy = asU64(y)
+	let ex = (ux >> 52 & 0x7ff) as i32
+	let ey = (uy >> 52 & 0x7ff) as i32
+	const sx = ux >> 63
+	if (uy << 1 == 0 || y != y || ex == 0x7ff) {
+		return x * y / (x * y)
+	}
+	if (ux << 1 <= uy << 1) {
+		return if (ux << 1 == uy << 1) 0.0 * x else x
+	}
+	// normalize x and y
+	[ux, ex] = normalize(ux, ex)
+	[uy, ey] = normalize(uy, ey)
+	// x mod y
+	while (ex > ey) {
+		const i = ux - uy
+		if (i >> 63 == 0) {
+			if (i == 0) {
+				return 0.0 * x
+			}
+			ux = i
+		}
+		ux <<= 1
+		ex--
+	}
+	const i = ux - uy
+	if (i >> 63 == 0) {
+		if (i == 0) {
+			return 0.0 * x
+		}
+		ux = i
+	}
+	while (ux >> 52 == 0) {
+		ux <<= 1
+		ex--
+	}
+	return asF64(scaled(ux, ex) | sx << 63)
+}
+
+function fmodF32(x: f32, y: f32): f32 {
+	let ux = asU32(x)
+	let uy = asU32(y)
+	let ex = (ux >> 23 & 0xff) as i32
+	let ey = (uy >> 23 & 0xff) as i32
+	const sx = ux & 0x80000000
+	if (uy << 1 == 0 || y != y || ex == 0xff) {
+		return x * y / (x * y)
+	}
+	if (ux << 1 <= uy << 1) {
+		return if (ux << 1 == uy << 1) 0.0 * x else x
+	}
+	[ux, ex] = normalizef(ux, ex)
+	[uy, ey] = normalizef(uy, ey)
+	while (ex > ey) {
+		const i = ux - uy
+		if (i >> 31 == 0) {
+			if (i == 0) {
+				return 0.0 * x
+			}
+			ux = i
+		}
+		ux <<= 1
+		ex--
+	}
+	const i = ux - uy
+	if (i >> 31 == 0) {
+		if (i == 0) {
+			return 0.0 * x
+		}
+		ux = i
+	}
+	while (ux >> 23 == 0) {
+		ux <<= 1
+		ex--
+	}
+	return asF32(scaledf(ux, ex) | sx)
+}
+
+/// The significand of the bits u of a finite nonzero f64 of biased exponent e, with its leading 1 at bit 52, and the
+/// exponent, below 1 for a subnormal.
+function normalize(u: u64, e: i32): [u64, i32] {
+	if (e != 0) {
+		return [u & ~(0 as u64) >> 12 | (1 as u64) << 52, e]
+	}
+	let ex = 0
+	let i = u << 12
+	while (i >> 63 == 0) {
+		ex--
+		i <<= 1
+	}
+	return [u << ((1 - ex) as u64), ex]
+}
+
+function normalizef(u: u32, e: i32): [u32, i32] {
+	if (e != 0) {
+		return [u & ~(0 as u32) >> 9 | (1 as u32) << 23, e]
+	}
+	let ex = 0
+	let i = u << 9
+	while (i >> 31 == 0) {
+		ex--
+		i <<= 1
+	}
+	return [u << ((1 - ex) as u32), ex]
+}
+
+/// The bits of the f64 of significand m and exponent e as normalize gives them; a subnormal's when e is below 1.
+function scaled(m: u64, e: i32): u64 {
+	return if (e > 0) m - ((1 as u64) << 52) | (e as u64) << 52 else m >> ((1 - e) as u64)
+}
+
+function scaledf(m: u32, e: i32): u32 {
+	return if (e > 0) m - ((1 as u32) << 23) | (e as u32) << 23 else m >> ((1 - e) as u32)
+}
+
+/// The remainder of x/y, x - n*y with n the integer nearest x/y, halves to even; and the low 31 bits of |n|, with
+/// x/y's sign.
+function remquoF64(x: f64, y: f64): [f64, i32] {
+	let ux = asU64(x)
+	let uy = asU64(y)
+	let ex = (ux >> 52 & 0x7ff) as i32
+	let ey = (uy >> 52 & 0x7ff) as i32
+	const sx = ux >> 63 != 0
+	const sy = uy >> 63 != 0
+	if (uy << 1 == 0 || y != y || ex == 0x7ff) {
+		return [x * y / (x * y), 0]
+	}
+	if (ux << 1 == 0) {
+		return [x, 0]
+	}
+	[ux, ex] = normalize(ux, ex)
+	[uy, ey] = normalize(uy, ey)
+	let q: u32 = 0
+	if (ex < ey) {
+		if (ex + 1 != ey) {
+			return [x, 0]
+		}
+	} else {
+		// x mod y
+		while (ex > ey) {
+			const i = ux - uy
+			if (i >> 63 == 0) {
+				ux = i
+				q++
+			}
+			ux <<= 1
+			q <<= 1
+			ex--
+		}
+		const i = ux - uy
+		if (i >> 63 == 0) {
+			ux = i
+			q++
+		}
+		if (ux == 0) {
+			ex = -60
+		} else {
+			while (ux >> 52 == 0) {
+				ux <<= 1
+				ex--
+			}
+		}
+	}
+	// scale the result and decide between |x| and |x|-|y|
+	let r = asF64(scaled(ux, ex))
+	const ay = if (sy) -y else y
+	if (ex == ey || ex + 1 == ey && (2.0 * r > ay || 2.0 * r == ay && q % 2 != 0)) {
+		r -= ay
+		q++
+	}
+	const n = (q & 0x7fffffff) as i32
+	return [if (sx) -r else r, if (sx != sy) -n else n]
+}
+
+function remquoF32(x: f32, y: f32): [f32, i32] {
+	let ux = asU32(x)
+	let uy = asU32(y)
+	let ex = (ux >> 23 & 0xff) as i32
+	let ey = (uy >> 23 & 0xff) as i32
+	const sx = ux >> 31 != 0
+	const sy = uy >> 31 != 0
+	if (uy << 1 == 0 || y != y || ex == 0xff) {
+		return [x * y / (x * y), 0]
+	}
+	if (ux << 1 == 0) {
+		return [x, 0]
+	}
+	[ux, ex] = normalizef(ux, ex)
+	[uy, ey] = normalizef(uy, ey)
+	let q: u32 = 0
+	if (ex < ey) {
+		if (ex + 1 != ey) {
+			return [x, 0]
+		}
+	} else {
+		while (ex > ey) {
+			const i = ux - uy
+			if (i >> 31 == 0) {
+				ux = i
+				q++
+			}
+			ux <<= 1
+			q <<= 1
+			ex--
+		}
+		const i = ux - uy
+		if (i >> 31 == 0) {
+			ux = i
+			q++
+		}
+		if (ux == 0) {
+			ex = -30
+		} else {
+			while (ux >> 23 == 0) {
+				ux <<= 1
+				ex--
+			}
+		}
+	}
+	let r = asF32(scaledf(ux, ex))
+	const ay = if (sy) -y else y
+	if (ex == ey || ex + 1 == ey && (2.0 * r > ay || 2.0 * r == ay && q % 2 != 0)) {
+		r -= ay
+		q++
+	}
+	const n = (q & 0x7fffffff) as i32
+	return [if (sx) -r else r, if (sx != sy) -n else n]
+}
+
+/// x - n*y, n the integer nearest x/y, halves to even.
+function remainderF64(x: f64, y: f64): f64 { return remquoF64(x, y)[0] }
+function remainderF32(x: f32, y: f32): f32 { return remquoF32(x, y)[0] }
+
+/// x's fractional and integral parts, both of x's sign.
+function modfF64(x: f64): [f64, f64] {
+	const u = asU64(x)
+	const e = ((u >> 52 & 0x7ff) as i32) - 0x3ff
+	const sign = asF64(u & 0x8000000000000000)
+	// no fractional part
+	if (e >= 52) {
+		return [if (e == 0x400 && u << 12 != 0) x else sign, x]
+	}
+	// no integral part
+	if (e < 0) {
+		return [x, sign]
+	}
+	const mask = ~(0 as u64) >> 12 >> (e as u64)
+	if ((u & mask) == 0) {
+		return [sign, x]
+	}
+	const i = asF64(u & ~mask)
+	return [x - i, i]
+}
+
+function modfF32(x: f32): [f32, f32] {
+	const u = asU32(x)
+	const e = ((u >> 23 & 0xff) as i32) - 0x7f
+	const sign = asF32(u & 0x80000000)
+	if (e >= 23) {
+		return [if (e == 0x80 && u << 9 != 0) x else sign, x]
+	}
+	if (e < 0) {
+		return [x, sign]
+	}
+	const mask: u32 = 0x007fffff >> (e as u32)
+	if ((u & mask) == 0) {
+		return [sign, x]
+	}
+	const i = asF32(u & ~mask)
+	return [x - i, i]
+}
+
+/// x as f × 2^e with |f| in [1/2, 1), or f x and e 0 if x is 0, infinite or NaN.
+function frexpF64(x: f64): [f64, i32] {
+	const u = asU64(x)
+	const e = (u >> 52 & 0x7ff) as i32
+	if (e == 0) {
+		if (x == 0.0) {
+			return [x, 0]
+		}
+		const [f, k] = frexpF64(x * 18446744073709551616.0)
+		return [f, k - 64]
+	}
+	if (e == 0x7ff) {
+		return [x, 0]
+	}
+	return [asF64(u & 0x800fffffffffffff | 0x3fe0000000000000), e - 0x3fe]
+}
+
+function frexpF32(x: f32): [f32, i32] {
+	const u = asU32(x)
+	const e = (u >> 23 & 0xff) as i32
+	if (e == 0) {
+		if (x == 0.0) {
+			return [x, 0]
+		}
+		const [f, k] = frexpF32(x * 18446744073709551616.0)
+		return [f, k - 64]
+	}
+	if (e == 0xff) {
+		return [x, 0]
+	}
+	return [asF32(u & 0x807fffff | 0x3f000000), e - 0x7e]
+}
+
+/// x × 2^n, rounded once.
+function scalbn(x: f64, n: i32): f64 {
+	let y = x
+	let k = n
+	if (k > 1023) {
+		y *= 8.98846567431158e307 // 2^1023
+		k -= 1023
+		if (k > 1023) {
+			y *= 8.98846567431158e307
+			k -= 1023
+			if (k > 1023) {
+				k = 1023
+			}
+		}
+	} else if (k < -1022) {
+		// make sure the final k < -53 to avoid double rounding in the subnormal range
+		y *= asF64(0x0360000000000000) // 2^-1022 × 2^53
+		k += 1022 - 53
+		if (k < -1022) {
+			y *= asF64(0x0360000000000000)
+			k += 1022 - 53
+			if (k < -1022) {
+				k = -1022
+			}
+		}
+	}
+	return y * asF64(((0x3ff + k) as u64) << 52)
+}
+
+function scalbnf(x: f32, n: i32): f32 {
+	let y = x
+	let k = n
+	if (k > 127) {
+		y *= 1.7014118346046923e38 // 2^127
+		k -= 127
+		if (k > 127) {
+			y *= 1.7014118346046923e38
+			k -= 127
+			if (k > 127) {
+				k = 127
+			}
+		}
+	} else if (k < -126) {
+		y *= asF32(0x0c800000) // 2^-126 × 2^24
+		k += 126 - 24
+		if (k < -126) {
+			y *= asF32(0x0c800000)
+			k += 126 - 24
+			if (k < -126) {
+				k = -126
+			}
+		}
+	}
+	return y * asF32(((0x7f + k) as u32) << 23)
+}
+
+/// The least i32, the result of ilogb for 0 and NaN.
+const ilogb0 = -2147483648
+
+/// The exponent of x: e where |x| is in [2^e, 2^(e+1)); ilogb0 for 0 and NaN, the greatest i32 for infinities.
+function ilogbF64(x: f64): i32 {
+	let i = asU64(x)
+	let e = (i >> 52 & 0x7ff) as i32
+	if (e == 0) {
+		i <<= 12
+		if (i == 0) {
+			return ilogb0
+		}
+		// subnormal x
+		e = -0x3ff
+		while (i >> 63 == 0) {
+			e--
+			i <<= 1
+		}
+		return e
+	}
+	if (e == 0x7ff) {
+		return if (i << 12 != 0) ilogb0 else 2147483647
+	}
+	return e - 0x3ff
+}
+
+function ilogbF32(x: f32): i32 {
+	let i = asU32(x)
+	let e = (i >> 23 & 0xff) as i32
+	if (e == 0) {
+		i <<= 9
+		if (i == 0) {
+			return ilogb0
+		}
+		e = -0x7f
+		while (i >> 31 == 0) {
+			e--
+			i <<= 1
+		}
+		return e
+	}
+	if (e == 0xff) {
+		return if (i << 9 != 0) ilogb0 else 2147483647
+	}
+	return e - 0x7f
+}
+
+/// ilogb(x) as a float: -infinity for 0, infinity for infinities, NaN for NaN.
+function logbF64(x: f64): f64 {
+	if (x - x != x - x) {
+		return x * x
+	}
+	return if (x == 0.0) -1.0 / (x * x) else ilogbF64(x) as f64
+}
+
+function logbF32(x: f32): f32 {
+	if (x - x != x - x) {
+		return x * x
+	}
+	return if (x == 0.0) -1.0 / (x * x) else ilogbF32(x) as f32
+}
+
+/// The float after x toward y, or y if they are equal.
+function nextafterF64(x: f64, y: f64): f64 {
+	if (x != x || y != y) {
+		return x + y
+	}
+	const ux = asU64(x)
+	const uy = asU64(y)
+	if (ux == uy) {
+		return y
+	}
+	const ax = ux & 0x7fffffffffffffff
+	const ay = uy & 0x7fffffffffffffff
+	if (ax == 0) {
+		return if (ay == 0) y else asF64(uy & 0x8000000000000000 | 1)
+	}
+	return asF64(if (ax > ay || (ux ^ uy) >> 63 != 0) ux - 1 else ux + 1)
+}
+
+function nextafterF32(x: f32, y: f32): f32 {
+	if (x != x || y != y) {
+		return x + y
+	}
+	const ux = asU32(x)
+	const uy = asU32(y)
+	if (ux == uy) {
+		return y
+	}
+	const ax = ux & 0x7fffffff
+	const ay = uy & 0x7fffffff
+	if (ax == 0) {
+		return if (ay == 0) y else asF32(uy & 0x80000000 | 1)
+	}
+	return asF32(if (ax > ay || (ux ^ uy) >> 31 != 0) ux - 1 else ux + 1)
+}
+
+/// x - y if x is greater, else 0; NaN if either is.
+function fdimF64(x: f64, y: f64): f64 { return if (x != x) x else if (y != y) y else if (x > y) x - y else 0.0 }
+function fdimF32(x: f32, y: f32): f32 { return if (x != x) x else if (y != y) y else if (x > y) x - y else 0.0 }
+
+/// The greater of x and y, +0 of the zeros; the other if one is NaN.
+function fmaxF64(x: f64, y: f64): f64 {
+	if (x != x) {
+		return y
+	}
+	if (y != y) {
+		return x
+	}
+	if (signbitF64(x) != signbitF64(y)) {
+		return if (signbitF64(x)) y else x
+	}
+	return if (x < y) y else x
+}
+
+function fmaxF32(x: f32, y: f32): f32 {
+	if (x != x) {
+		return y
+	}
+	if (y != y) {
+		return x
+	}
+	if (signbitF32(x) != signbitF32(y)) {
+		return if (signbitF32(x)) y else x
+	}
+	return if (x < y) y else x
+}
+
+/// The lesser of x and y, -0 of the zeros; the other if one is NaN.
+function fminF64(x: f64, y: f64): f64 {
+	if (x != x) {
+		return y
+	}
+	if (y != y) {
+		return x
+	}
+	if (signbitF64(x) != signbitF64(y)) {
+		return if (signbitF64(x)) x else y
+	}
+	return if (x < y) x else y
+}
+
+function fminF32(x: f32, y: f32): f32 {
+	if (x != x) {
+		return y
+	}
+	if (y != y) {
+		return x
+	}
+	if (signbitF32(x) != signbitF32(y)) {
+		return if (signbitF32(x)) x else y
+	}
+	return if (x < y) x else y
+}
+
+// # Roots
+//
+// Square and cube roots, and the hypotenuse. sqrt is correctly rounded in integer arithmetic, not by the hardware's
+// instruction, so that it is musl's anywhere. Being correctly rounded, the instruction gives the same bits, and is
+// the fast path once bober's backend has it as an intrinsic.
+//
+// Ported from musl 1.2.5, MIT, Copyright © 2005-2020 Rich Felker, et al. (vendor/musl/COPYRIGHT). cbrt and cbrtf are
+// from FreeBSD: Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved. Developed at SunPro, a Sun
+// Microsystems, Inc. business. Permission to use, copy, modify, and distribute this software is freely granted,
+// provided that this notice is preserved. Optimized by Bruce D. Evans; cbrtf converted to float by Ian Lance Taylor,
+// Cygnus Support.
+/// 1/sqrt(x) to 8 bits, as 2^-16 times the entry of x's last exponent bit and first 6 significand bits, x in [1, 4).
+const rsqrtTab: u16[] = [0xb451, 0xb2f0, 0xb196, 0xb044, 0xaef9, 0xadb6, 0xac79, 0xab43, 0xaa14, 0xa8eb, 0xa7c8, 0xa6aa,
+	0xa592, 0xa480, 0xa373, 0xa26b, 0xa168, 0xa06a, 0x9f70, 0x9e7b, 0x9d8a, 0x9c9d, 0x9bb5, 0x9ad1, 0x99f0, 0x9913,
+	0x983a, 0x9765, 0x9693, 0x95c4, 0x94f8, 0x9430, 0x936b, 0x92a9, 0x91ea, 0x912e, 0x9075, 0x8fbe, 0x8f0a, 0x8e59,
+	0x8daa, 0x8cfe, 0x8c54, 0x8bac, 0x8b07, 0x8a64, 0x89c4, 0x8925, 0x8889, 0x87ee, 0x8756, 0x86c0, 0x862b, 0x8599,
+	0x8508, 0x8479, 0x83ec, 0x8361, 0x82d8, 0x8250, 0x81c9, 0x8145, 0x80c2, 0x8040, 0xff02, 0xfd0e, 0xfb25, 0xf947,
+	0xf773, 0xf5aa, 0xf3ea, 0xf234, 0xf087, 0xeee3, 0xed47, 0xebb3, 0xea27, 0xe8a3, 0xe727, 0xe5b2, 0xe443, 0xe2dc,
+	0xe17a, 0xe020, 0xdecb, 0xdd7d, 0xdc34, 0xdaf1, 0xd9b3, 0xd87b, 0xd748, 0xd61a, 0xd4f1, 0xd3cd, 0xd2ad, 0xd192,
+	0xd07b, 0xcf69, 0xce5b, 0xcd51, 0xcc4a, 0xcb48, 0xca4a, 0xc94f, 0xc858, 0xc764, 0xc674, 0xc587, 0xc49d, 0xc3b7,
+	0xc2d4, 0xc1f4, 0xc116, 0xc03c, 0xbf65, 0xbe90, 0xbdbe, 0xbcef, 0xbc23, 0xbb59, 0xba91, 0xb9cc, 0xb90a, 0xb84a,
+	0xb78c, 0xb6d0, 0xb617, 0xb560]
+
+/// a*b*2^-32 of the low 32 bits of each, rounded down.
+function mul32(a: u64, b: u64): u64 { return (a & 0xffffffff) * (b & 0xffffffff) >> 32 }
+
+/// a*b*2^-64, less at most 3.
+function mul64(a: u64, b: u64): u64 {
+	return (a >> 32) * (b >> 32) + ((a >> 32) * (b & 0xffffffff) >> 32) + ((a & 0xffffffff) * (b >> 32) >> 32)
+}
+
+function sqrtF64(x: f64): f64 {
+	let ix = asU64(x)
+	let top = ix >> 52
+	if (top - 1 >= 0x7ff - 1) {
+		// ±0, a negative, a subnormal, inf or NaN
+		if (ix * 2 == 0 || ix == 0x7ff0000000000000) {
+			return x
+		}
+		if (ix > 0x7ff0000000000000) {
+			return (x - x) / (x - x)
+		}
+		ix = asU64(x * 4503599627370496.0)
+		top = (ix >> 52) - 52
+	}
+	// x = 4^e m, m in [1, 4) as fixed point 2.62, and 2^e the result's exponent
+	const m = (ix << 11 | 0x8000000000000000) >> (top & 1)
+	top = (top + 0x3ff) >> 1
+	// r ~ 1/sqrt(m) and s ~ sqrt(m): from the table, by two Goldschmidt iterations in 32 bits and one in 64
+	const three: u64 = 0xc0000000
+	let r = (rsqrtTab[(ix >> 46) % 128] as u64) << 16
+	let s = mul32(m >> 32, r)
+	let u = three - mul32(s, r)
+	r = mul32(r, u) << 1
+	s = mul32(s, u) << 1
+	u = three - mul32(s, r)
+	r = mul32(r, u) << 33
+	s = mul64(m, r)
+	u = (three << 32) - mul64(s, r)
+	s = (mul64(s, u) - 2) >> 9
+	// s < sqrt(m) < s + 2^-52: round to s or s + 2^-52 by comparing (2^52 s + 1/2)^2 with 2^104 m
+	const d = s - ((m << 42) - s * s)
+	return asF64((s + (d >> 63)) & 0xfffffffffffff | top << 52)
+}
+
+function sqrtF32(x: f32): f32 {
+	let ix = asU32(x)
+	if (ix - 0x00800000 >= 0x7f800000 - 0x00800000) {
+		if (ix * 2 == 0 || ix == 0x7f800000) {
+			return x
+		}
+		if (ix > 0x7f800000) {
+			return (x - x) / (x - x)
+		}
+		ix = asU32(x * 8388608.0) - (23 << 23)
+	}
+	// as sqrt, in 32 bits, m as fixed point 2.30
+	const m = if ((ix & 0x00800000) != 0) ix << 7 & 0x7fffffff else ix << 8 | 0x80000000
+	const three: u32 = 0xc0000000
+	let r = (rsqrtTab[(ix >> 17) % 128] as u32) << 16
+	let s = mul32(m, r) as u32
+	let u = three - (mul32(s, r) as u32)
+	r = (mul32(r, u) as u32) << 1
+	s = (mul32(s, u) as u32) << 1
+	u = three - (mul32(s, r) as u32)
+	s = ((mul32(s, u) as u32) - 1) >> 6
+	const d = s - ((m << 16) - s * s)
+	return asF32((s + (d >> 31)) & 0x7fffff | ((ix >> 1) + (0x3f800000 >> 1)) & 0x7f800000)
+}
+
+/// cbrt's polynomial, 1/cbrt(r) to 2^-23.5 for |r - 1| < 1/10.
+const P0 = 1.87595182427177009643
+const P1 = -1.88497979543377169875
+const P2 = 1.621429720105354466140
+const P3 = -0.758397934778766047437
+const P4 = 0.145996192886612446982
+
+function cbrtF64(x: f64): f64 {
+	let u = asU64(x)
+	let hx = ((u >> 32) as u32) & 0x7fffffff
+	if (hx >= 0x7ff00000) {
+		return x + x
+	}
+	// cbrt(2^e (1 + m)) ~ 2^(e/3) (1 + (e%3 + m)/3): dividing x's top bits by 3 nearly does, to 5 bits, and adding a
+	// bias of (1023 - 1023/3 - 0.03306235651) 2^20 restores the exponent's and halves the error
+	if (hx < 0x00100000) {
+		u = asU64(x * 18014398509481984.0)
+		hx = ((u >> 32) as u32) & 0x7fffffff
+		if (hx == 0) {
+			return x
+		}
+		hx = hx / 3 + 696219795
+	} else {
+		hx = hx / 3 + 715094163
+	}
+	let t = asF64(u & 0x8000000000000000 | (hx as u64) << 32)
+	// to 23 bits by the polynomial in t^3/x
+	let r = t * t * (t / x)
+	t = t * (P0 + r * (P1 + r * P2) + r * r * r * (P3 + r * P4))
+	// rounded away from zero to 23 bits, so that it is above cbrt(x), by at most 2 of their ulps
+	t = asF64((asU64(t) + 0x80000000) & 0xffffffffc0000000)
+	// to 53 bits by a Newton step, with an error below 0.667 ulps
+	r = x / (t * t)
+	r = (r - t) / (t + t + r)
+	return t + t * r
+}
+
+function cbrtF32(x: f32): f32 {
+	let u = asU32(x)
+	let hx = u & 0x7fffffff
+	if (hx >= 0x7f800000) {
+		return x + x
+	}
+	// as cbrt, to 5 bits
+	if (hx < 0x00800000) {
+		if (hx == 0) {
+			return x
+		}
+		u = asU32(x * 16777216.0)
+		hx = (u & 0x7fffffff) / 3 + 642849266
+	} else {
+		hx = hx / 3 + 709958130
+	}
+	// to 16 bits by a Newton step, and to 47 by another, in f64 so that no term overflows
+	let t = asF32(u & 0x80000000 | hx) as f64
+	const xd = x as f64
+	for (const _ of 1 ... 2) {
+		const r = t * t * t
+		t = t * (xd + xd + r) / (xd + r + r)
+	}
+	return t as f32
+}
+
+/// x*x as hi + lo, x split into halves that multiply exactly.
+function sq(x: f64): [f64, f64] {
+	const xc = x * 134217729.0
+	const xh = x - xc + xc
+	const xl = x - xh
+	const hi = x * x
+	return [hi, xh * xh - hi + 2.0 * xh * xl + xl * xl]
+}
+
+/// sqrt(x*x + y*y), without undue overflow or underflow; inf if either is, though the other be NaN.
+function hypotF64(x: f64, y: f64): f64 {
+	let ux = asU64(x) & 0x7fffffffffffffff
+	let uy = asU64(y) & 0x7fffffffffffffff
+	if (ux < uy) {
+		[ux, uy] = [uy, ux]
+	}
+	const ex = (ux >> 52) as i32
+	const ey = (uy >> 52) as i32
+	let a = asF64(ux)
+	let b = asF64(uy)
+	if (ey == 0x7ff) {
+		return b
+	}
+	if (ex == 0x7ff || uy == 0) {
+		return a
+	}
+	if (ex - ey > 64) {
+		return a + b
+	}
+	// scaled by 2^±700 so that neither hi*hi overflows nor lo*lo underflows
+	let z = 1.0
+	if (ex > 0x3ff + 510) {
+		z = asF64(0x6bb0000000000000)
+		a *= asF64(0x1430000000000000)
+		b *= asF64(0x1430000000000000)
+	} else if (ey < 0x3ff - 450) {
+		z = asF64(0x1430000000000000)
+		a *= asF64(0x6bb0000000000000)
+		b *= asF64(0x6bb0000000000000)
+	}
+	const [ha, la] = sq(a)
+	const [hb, lb] = sq(b)
+	return z * sqrtF64(lb + la + hb + ha)
+}
+
+function hypotF32(x: f32, y: f32): f32 {
+	let ux = asU32(x) & 0x7fffffff
+	let uy = asU32(y) & 0x7fffffff
+	if (ux < uy) {
+		[ux, uy] = [uy, ux]
+	}
+	let a = asF32(ux)
+	let b = asF32(uy)
+	if (uy == 0xff << 23) {
+		return b
+	}
+	if (ux >= 0xff << 23 || uy == 0 || ux - uy >= 25 << 23) {
+		return a + b
+	}
+	// scaled by 2^±90, the sum in f64
+	let z: f32 = 1.0
+	if (ux >= (0x7f + 60) << 23) {
+		z = asF32(0x6c800000)
+		a *= asF32(0x12800000)
+		b *= asF32(0x12800000)
+	} else if (uy < (0x7f - 60) << 23) {
+		z = asF32(0x12800000)
+		a *= asF32(0x6c800000)
+		b *= asF32(0x6c800000)
+	}
+	return z * sqrtF32(((a as f64) * (a as f64) + (b as f64) * (b as f64)) as f32)
+}
+
+// # Fused multiply-add
+//
+// Fused multiply-add, x*y + z rounded once, in integer arithmetic, not by the hardware's instruction, so that it is
+// musl's anywhere. Being correctly rounded, the instruction gives the same bits, and is the fast path once bober's
+// backend has it as an intrinsic.
+//
+// Ported from musl 1.2.5, MIT, Copyright © 2005-2020 Rich Felker, et al. (vendor/musl/COPYRIGHT). fmaf is from FreeBSD:
+// Copyright (c) 2005-2011 David Schultz <das@FreeBSD.ORG>. All rights reserved. Redistribution and use in source and
+// binary forms, with or without modification, are permitted provided that the following conditions are met: 1.
+// Redistributions of source code must retain the above copyright notice, this list of conditions and the following
+// disclaimer. 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and
+// the following disclaimer in the documentation and/or other materials provided with the distribution. THIS SOFTWARE IS
+// PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+// TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL
+// THE AUTHOR OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+// DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+// OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+// TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+/// The exponent split gives an infinity or NaN; a zero's is above it.
+const zeroInfNan: i32 = 0x7ff - 0x3ff - 52 - 1
+
+/// x as its sign and m 2^e, m's top 10 bits and last bit 0.
+function split(x: f64): [bool, u64, i32] {
+	let ix = asU64(x)
+	let e = ((ix >> 52) & 0x7ff) as i32
+	if (e == 0) {
+		ix = asU64(x * 9223372036854775808.0)
+		e = ((ix >> 52) & 0x7ff) as i32
+		e = if (e != 0) e - 63 else 0x800
+	}
+	return [ix >> 63 != 0, (ix & 0xfffffffffffff | 0x10000000000000) << 1, e - (0x3ff + 52 + 1)]
+}
+
+/// x*y as 128 bits, high and low.
+function mul(x: u64, y: u64): [u64, u64] {
+	const t1 = (x & 0xffffffff) * (y & 0xffffffff)
+	const t2 = (x & 0xffffffff) * (y >> 32) + (x >> 32) * (y & 0xffffffff)
+	const lo = t1 + (t2 << 32)
+	return [(x >> 32) * (y >> 32) + (t2 >> 32) + ((t1 > lo) as u64), lo]
+}
+
+/// The bits of x shifted left by n.
+function shl(x: u64, n: i32): u64 { return x << (n as u64) }
+/// The bits of x shifted right by n.
+function shr(x: u64, n: i32): u64 { return x >> (n as u64) }
+
+function fmaF64(x: f64, y: f64, z: f64): f64 {
+	const [sx, mx, ex] = split(x)
+	const [sy, my, ey] = split(y)
+	const [sz, mz, ez] = split(z)
+	if (ex >= zeroInfNan || ey >= zeroInfNan || ez > zeroInfNan) {
+		return x * y + z
+	}
+	if (ez == zeroInfNan) {
+		return z
+	}
+	// r = x*y, then z shifted left by kz and r right by kr, kz + kr = d, so that their exponents are e = e + kr
+	let [rhi, rlo] = mul(mx, my)
+	let e = ex + ey
+	let d = ez - e
+	let zhi: u64 = 0
+	let zlo: u64 = 0
+	if (d > 0) {
+		if (d < 64) {
+			zlo = shl(mz, d)
+			zhi = shr(mz, 64 - d)
+		} else {
+			zhi = mz
+			e = ez - 64
+			d -= 64
+			if (d >= 64) {
+				rlo = 1
+				rhi = 0
+			} else if (d > 0) {
+				rlo = shl(rhi, 64 - d) | shr(rlo, d) | ((shl(rlo, 64 - d) != 0) as u64)
+				rhi = shr(rhi, d)
+			}
+		}
+	} else {
+		d = -d
+		zlo = if (d == 0) mz else if (d < 64) shr(mz, d) | ((shl(mz, 64 - d) != 0) as u64) else 1
+	}
+	// r ± z
+	let neg = sx != sy
+	let nonzero = true
+	if (neg == sz) {
+		rlo += zlo
+		rhi += zhi + ((rlo < zlo) as u64)
+	} else {
+		const t = rlo
+		rlo -= zlo
+		rhi = rhi - zhi - ((t < rlo) as u64)
+		if (rhi >> 63 != 0) {
+			rlo = -rlo
+			rhi = -rhi - ((rlo != 0) as u64)
+			neg = !neg
+		}
+		nonzero = rhi != 0
+	}
+	// rhi = the result's top 63 bits, the last sticky
+	if (nonzero) {
+		e += 64
+		d = clz64(rhi) - 1
+		rhi = shl(rhi, d) | shr(rlo, 64 - d) | ((shl(rlo, d) != 0) as u64)
+	} else if (rlo != 0) {
+		d = clz64(rlo) - 1
+		rhi = if (d < 0) rlo >> 1 | rlo & 1 else shl(rlo, d)
+	} else {
+		return x * y + z
+	}
+	e -= d
+	const signed = (m: u64) => (if (neg) -(m as i64) else m as i64) as f64
+	let r = signed(rhi)
+	if (e < -1022 - 62) {
+		// subnormal before rounding
+		if (e == -1022 - 63) {
+			const c = if (neg) -9223372036854775808.0 else 9223372036854775808.0
+			if (r == c) {
+				// the least normal, after rounding
+				return asF64(0x0010000000000000 | (neg as u64) << 63)
+			}
+			// a bit is lost when scaled: so that only the conversion rounds, add another on top, and take it off after
+			if (rhi << 53 != 0) {
+				r = 2.0 * signed(rhi >> 1 | rhi & 1 | 0x4000000000000000) - c
+			}
+		} else {
+			// rounded only once, when scaled
+			r = signed((rhi >> 10 | ((rhi << 54 != 0) as u64)) << 10)
+		}
+	}
+	return scalbn(r, e)
+}
+
+function fmaF32(x: f32, y: f32, z: f32): f32 {
+	// x*y is exact in f64 and the sum rounds once there; rounded to f32, it rounds twice only from halfway between two
+	const xy = (x as f64) * (y as f64)
+	const zd = z as f64
+	const result = xy + zd
+	let u = asU64(result)
+	if ((u & 0x1fffffff) != 0x10000000 || (u >> 52 & 0x7ff) == 0x7ff || result - xy == zd && result - zd == xy) {
+		return result as f32
+	}
+	// inexact and halfway: its last bit moved toward the error
+	const neg = u >> 63 != 0
+	const err = if (neg == (zd > xy)) xy - result + zd else zd - result + xy
+	u = if (neg == (err < 0.0)) u + 1 else u - 1
+	return asF64(u) as f32
+}
+
+// # Reduction by pi/2
+//
+// Arguments of the trigonometric functions reduced by multiples of pi/2: x = n pi/2 + y with |y| ~<= pi/4, y as a
+// sum y0 + y1 of two f64s, as musl's __rem_pio2, __rem_pio2f and __rem_pio2_large reduce them.
+//
+// Ported from musl 1.2.5, MIT, Copyright © 2005-2020 Rich Felker, et al. (vendor/musl/COPYRIGHT), from FreeBSD:
+// Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved. Developed at SunSoft, a Sun Microsystems, Inc.
+// business. Permission to use, copy, modify, and distribute this software is freely granted, provided that this notice
+// is preserved. Optimized by Bruce D. Evans.
+const pio4 = 0.7853981633974483
+const invpio2 = 6.36619772367581382433e-01
+/// pi/2 as pio2a + pio2b + pio2c + pio2ct, the first three of 33 bits each; pio2at is pi/2 - pio2a, pio2bt
+/// pi/2 - pio2a - pio2b.
+const pio2a = 1.57079632673412561417e+00
+const pio2at = 6.07710050650619224932e-11
+const pio2b = 6.07710050630396597660e-11
+const pio2bt = 2.02226624879595063154e-21
+const pio2c = 2.02226624871116645580e-21
+const pio2ct = 8.47842766036889956997e-32
+
+/// The exponent bits of x.
+function expo(x: f64): i32 { return (asU64(x) >> 52 & 0x7ff) as i32 }
+
+/// [n, y0, y1] of x, x - n pi/2 = y0 + y1 with |y0 + y1| ~<= pi/4; of inf or NaN, [0, NaN, NaN].
+function remPio2(x: f64): [i32, f64, f64] {
+	const u = asU64(x)
+	const sign = if (u >> 63 != 0) -1 else 1
+	const ix = (u >> 32 & 0x7fffffff) as u32
+	if (ix <= 0x400f6a7a) {
+		// |x| ~<= 5pi/4, unless about pi/2 or pi, where the first round cancels
+		if ((ix & 0xfffff) != 0x921fb) {
+			return near(x, sign * (if (ix <= 0x4002d97c) 1 else 2))
+		}
+	} else if (ix <= 0x401c463b) {
+		// |x| ~<= 9pi/4, unless about 3pi/2 or 2pi
+		if (ix != 0x4012d97c && ix != 0x401921fb) {
+			return near(x, sign * (if (ix <= 0x4015fdbc) 3 else 4))
+		}
+	} else if (ix >= 0x413921fb) {
+		// |x| ~>= 2^20 pi/2
+		if (ix >= 0x7ff00000) {
+			return [0, x - x, x - x]
+		}
+		// |x| scaled to [2^23, 2^24), in three 24-bit pieces, the last nonzero first
+		const tx = new f64[](3)
+		let z = asF64(u & 0xfffffffffffff | 0x4160000000000000)
+		for (const i of 0 ... 1) {
+			tx[i] = (z as i32) as f64
+			z = (z - tx[i]) * 16777216.0
+		}
+		tx[2] = z
+		let nx = 3
+		while (tx[nx - 1] == 0.0) {
+			nx--
+		}
+		const [n, y0, y1] = remPio2Large(tx, ((ix >> 20) as i32) - (0x3ff + 23), nx, 1)
+		return if (sign < 0) [-n, -y0, -y1] else [n, y0, y1]
+	}
+	// rint(x / (pi/2)), x less n pi/2 to 85 bits, or to 118 or 151 where those cancel
+	let fn = x * invpio2 + toint - toint
+	let n = fn as i32
+	let r = x - fn * pio2a
+	let w = fn * pio2at
+	if (r - w < -pio4 || r - w > pio4) {
+		// x * invpio2 rounded across a half
+		const d = if (r - w < -pio4) -1 else 1
+		n += d
+		fn += d as f64
+		r = x - fn * pio2a
+		w = fn * pio2at
+	}
+	let y0 = r - w
+	const ex = (ix >> 20) as i32
+	if (ex - expo(y0) > 16) {
+		let t = r
+		w = fn * pio2b
+		r = t - w
+		w = fn * pio2bt - ((t - r) - w)
+		y0 = r - w
+		if (ex - expo(y0) > 49) {
+			t = r
+			w = fn * pio2c
+			r = t - w
+			w = fn * pio2ct - ((t - r) - w)
+			y0 = r - w
+		}
+	}
+	return [n, y0, (r - y0) - w]
+}
+
+/// remPio2 of x within 9pi/4 of 0, about n pi/2, n in ±1 ... ±4, in one round.
+function near(x: f64, n: i32): [i32, f64, f64] {
+	const k = n as f64
+	const z = x - k * pio2a
+	const y0 = z - k * pio2at
+	return [n, y0, (z - y0) - k * pio2at]
+}
+
+/// pi/2 as f64 in 25 bits and the rest.
+const pio2fa = 1.57079631090164184570e+00
+const pio2fat = 1.58932547735281966916e-08
+
+/// [n, y] of x, x - n pi/2 = y with |y| ~<= pi/4; of inf or NaN, [0, NaN].
+function remPio2f(x: f32): [i32, f64] {
+	const u = asU32(x)
+	const ix = u & 0x7fffffff
+	if (ix < 0x4dc90fdb) {
+		// |x| ~< 2^28 pi/2, where 25 + 53 bits of pi/2 do
+		const xd = x as f64
+		// musl corrects n where y passes pi/4, which in round to nearest no f32 makes it do
+		const fn = xd * invpio2 + toint - toint
+		return [fn as i32, xd - fn * pio2fa - fn * pio2fat]
+	}
+	if (ix >= 0x7f800000) {
+		return [0, (x - x) as f64]
+	}
+	// |x| scaled to [2^23, 2^24)
+	const e0 = ((ix >> 23) as i32) - (0x7f + 23)
+	const [n, y, _] = remPio2Large([asF32(ix - ((e0 as u32) << 23)) as f64], e0, 1, 0)
+	return if (u >> 31 != 0) [-n, -y] else [n, y]
+}
+
+/// 2/pi in 24-bit pieces, as many as an f64's exponent needs.
+const ipio2: i32[] = [0xa2f983, 0x6e4e44, 0x1529fc, 0x2757d1, 0xf534dd, 0xc0db62, 0x95993c, 0x439041, 0xfe5163,
+	0xabdebb, 0xc561b7, 0x246e3a, 0x424dd2, 0xe00649, 0x2eea09, 0xd1921c, 0xfe1deb, 0x1cb129, 0xa73ee8, 0x8235f5,
+	0x2ebb44, 0x84e99c, 0x7026b4, 0x5f7e41, 0x3991d6, 0x398353, 0x39f49c, 0x845f8b, 0xbdf928, 0x3b1ff8, 0x97ffde,
+	0x05980f, 0xef2f11, 0x8b5a0a, 0x6d1f6d, 0x367ecf, 0x27cb09, 0xb74f46, 0x3f669e, 0x5fea2d, 0x7527ba, 0xc7ebe5,
+	0xf17b3d, 0x0739f7, 0x8a5292, 0xea6bfb, 0x5fb11f, 0x8d5d08, 0x560330, 0x46fc7b, 0x6babf0, 0xcfbc20, 0x9af436,
+	0x1da9e3, 0x91615e, 0xe61b08, 0x659985, 0x5f14a0, 0x68408d, 0xffd880, 0x4d7327, 0x310606, 0x1556ca, 0x73a8c9,
+	0x60e27b, 0xc08c6b]
+
+/// pi/2 in pieces of 24 bits.
+const pio2s: f64[] = [1.57079625129699707031e+00, 7.54978941586159635335e-08, 5.39030252995776476554e-15,
+	3.28200341580791294123e-22, 1.27065575308067607349e-29, 1.22933308981111328932e-36, 2.73370053816464559624e-44,
+	2.16741683877804819444e-51]
+
+/// [n mod 8, y0, y1] of x in pieces, x[i] an integer below 2^24 times 2^(e0 - 24 i), the first and last nonzero:
+/// x - n pi/2 = y0 + y1, by 2/pi to as many bits as that needs (Payne and Hanek). prec 0 is for an f32's 24 bits, and
+/// gives y1 0; prec 1 for an f64's 53.
+function remPio2Large(x: f64[], e0: i32, nx: i32, prec: i32): [i32, f64, f64] {
+	const jk = if (prec == 0) 3 else 4
+	const jx = nx - 1
+	const jv = if (e0 - 3 < 0) 0 else (e0 - 3) / 24
+	let q0 = e0 - 24 * (jv + 1)
+	const f = new f64[](20)
+	const q = new f64[](20)
+	const fq = new f64[](20)
+	const iq = new i32[](20)
+	// f[0 ... jx + jk] the pieces of 2/pi from ipio2[jv - jx]; q[i] the products with x
+	for (const i of 0 ... jx + jk) {
+		const j = jv - jx + i
+		f[i] = if (j < 0) 0.0 else ipio2[j] as f64
+	}
+	const product = (i: i32) => {
+		let fw = 0.0
+		for (const j of 0 ... jx) {
+			fw += x[j] * f[jx + i - j]
+		}
+		return fw
+	}
+	for (const i of 0 ... jk) {
+		q[i] = product(i)
+	}
+	let jz = jk
+	let z = 0.0
+	let n = 0
+	let ih = 0
+	while (true) {
+		// q in 24-bit integers, iq[0] its last
+		z = q[jz]
+		let j = jz
+		while (j > 0) {
+			const fw = ((5.960464477539063e-08 * z) as i32) as f64
+			iq[jz - j] = (z - 16777216.0 * fw) as i32
+			z = q[j - 1] + fw
+			j--
+		}
+		// n, and z its fraction
+		z = scalbn(z, q0)
+		z -= 8.0 * floorF64(z * 0.125)
+		n = z as i32
+		z -= n as f64
+		ih = 0
+		if (q0 > 0) {
+			const i = iq[jz - 1] >> (24 - q0)
+			n += i
+			iq[jz - 1] -= i << (24 - q0)
+			ih = iq[jz - 1] >> (23 - q0)
+		} else if (q0 == 0) {
+			ih = iq[jz - 1] >> 23
+		} else if (z >= 0.5) {
+			ih = 2
+		}
+		if (ih > 0) {
+			// past 1/2: 1 - q
+			n += 1
+			let carry = false
+			for (const i of 0 ... jz - 1) {
+				if (carry) {
+					iq[i] = 0xffffff - iq[i]
+				} else if (iq[i] != 0) {
+					carry = true
+					iq[i] = 0x1000000 - iq[i]
+				}
+			}
+			if (q0 == 1) {
+				iq[jz - 1] &= 0x7fffff
+			} else if (q0 == 2) {
+				iq[jz - 1] &= 0x3fffff
+			}
+			if (ih == 2) {
+				z = 1.0 - z
+				if (carry) {
+					z -= scalbn(1.0, q0)
+				}
+			}
+		}
+		// more pieces of 2/pi where these leave nothing
+		if (z != 0.0) {
+			break
+		}
+		let any = 0
+		for (const i of jk ... jz - 1) {
+			any |= iq[i]
+		}
+		if (any != 0) {
+			break
+		}
+		let k = 1
+		while (iq[jk - k] == 0) {
+			k++
+		}
+		for (const i of jz + 1 ... jz + k) {
+			f[jx + i] = ipio2[jv + i] as f64
+			q[i] = product(i)
+		}
+		jz += k
+	}
+	// less the zero pieces, or z in 24-bit pieces
+	if (z == 0.0) {
+		jz--
+		q0 -= 24
+		while (iq[jz] == 0) {
+			jz--
+			q0 -= 24
+		}
+	} else {
+		z = scalbn(z, -q0)
+		if (z >= 16777216.0) {
+			const fw = ((5.960464477539063e-08 * z) as i32) as f64
+			iq[jz] = (z - 16777216.0 * fw) as i32
+			jz++
+			q0 += 24
+			iq[jz] = fw as i32
+		} else {
+			iq[jz] = z as i32
+		}
+	}
+	// the pieces as floats, times pi/2
+	let fw = scalbn(1.0, q0)
+	let i = jz
+	while (i >= 0) {
+		q[i] = fw * (iq[i] as f64)
+		fw *= 5.960464477539063e-08
+		i--
+	}
+	i = jz
+	while (i >= 0) {
+		fw = 0.0
+		let k = 0
+		while (k <= jk && k <= jz - i) {
+			fw += pio2s[k] * q[i + k]
+			k++
+		}
+		fq[jz - i] = fw
+		i--
+	}
+	// summed, from the least
+	fw = 0.0
+	i = jz
+	while (i >= 0) {
+		fw += fq[i]
+		i--
+	}
+	const y0 = if (ih == 0) fw else -fw
+	if (prec == 0) {
+		return [n & 7, y0, 0.0]
+	}
+	fw = fq[0] - fw
+	for (const i of 1 ... jz) {
+		fw += fq[i]
+	}
+	return [n & 7, y0, if (ih == 0) fw else -fw]
+}
+
+// # Sine, cosine and tangent
+//
+// Sine, cosine and tangent, of x reduced to within pi/4 of 0 by remPio2. The kernels, k-prefixed, are musl's __sin,
+// __cos, __tan, __sindf, __cosdf and __tandf, of a reduced argument.
+//
+// Ported from musl 1.2.5, MIT, Copyright © 2005-2020 Rich Felker, et al. (vendor/musl/COPYRIGHT), from FreeBSD:
+// Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved. Developed at SunPro, a Sun Microsystems, Inc.
+// business. Permission to use, copy, modify, and distribute this software is freely granted, provided that this notice
+// is preserved. Copyright (C) 2004 by Sun Microsystems, Inc. All rights reserved (__tan). Permission to use, copy,
+// modify, and distribute this software is freely granted, provided that this notice is preserved. f32 kernels by Ian
+// Lance Taylor, Cygnus Support, and Bruce D. Evans; f32 functions optimized by Bruce D. Evans.
+// sin(x) ~ x + S1 x^3 + ... + S6 x^13 on [-pi/4, pi/4]
+const S1 = -1.66666666666666324348e-01
+const S2 = 8.33333333332248946124e-03
+const S3 = -1.98412698298579493134e-04
+const S4 = 2.75573137070700676789e-06
+const S5 = -2.50507602534068634195e-08
+const S6 = 1.58969099521155010221e-10
+
+/// sin(x + y), |x + y| ~<= pi/4, y a tail of x; iy 0 if there is none.
+function kSin(x: f64, y: f64, iy: i32): f64 {
+	const z = x * x
+	const w = z * z
+	const r = S2 + z * (S3 + z * S4) + z * w * (S5 + z * S6)
+	const v = z * x
+	if (iy == 0) {
+		return x + v * (S1 + z * r)
+	}
+	return x - ((z * (0.5 * y - v * r) - y) - v * S1)
+}
+
+// cos(x) ~ 1 - x^2/2 + C1 x^4 + ... + C6 x^14 on [-pi/4, pi/4]
+const C1 = 4.16666666666666019037e-02
+const C2 = -1.38888888888741095749e-03
+const C3 = 2.48015872894767294178e-05
+const C4 = -2.75573143513906633035e-07
+const C5 = 2.08757232129817482790e-09
+const C6 = -1.13596475577881948265e-11
+
+/// cos(x + y), |x + y| ~<= pi/4, y a tail of x.
+function kCos(x: f64, y: f64): f64 {
+	const z = x * x
+	let w = z * z
+	const r = z * (C1 + z * (C2 + z * C3)) + w * w * (C4 + z * (C5 + z * C6))
+	const hz = 0.5 * z
+	w = 1.0 - hz
+	return w + (((1.0 - w) - hz) + (z * r - x * y))
+}
+
+// tan(x) ~ x + T0 x^3 + ... + T12 x^27 on [0, 0.67434]
+const T0 = 3.33333333333334091986e-01
+const T1 = 1.33333333333201242699e-01
+const T2 = 5.39682539762260521377e-02
+const T3 = 2.18694882948595424599e-02
+const T4 = 8.86323982359930005737e-03
+const T5 = 3.59207910759131235356e-03
+const T6 = 1.45620945432529025516e-03
+const T7 = 5.88041240820264096874e-04
+const T8 = 2.46463134818469906812e-04
+const T9 = 7.81794442939557092300e-05
+const T10 = 7.14072491382608190305e-05
+const T11 = -1.85586374855275456654e-05
+const T12 = 2.59073051863633712884e-05
+const pio4lo = 3.06161699786838301793e-17
+
+/// tan(x + y), or if odd is 1, -1/tan(x + y); |x + y| ~<= pi/4, y a tail of x.
+function kTan(x0: f64, y0: f64, odd: i32): f64 {
+	let x = x0
+	let y = y0
+	const hx = (asU64(x) >> 32) as u32
+	const big = (hx & 0x7fffffff) >= 0x3fe59428 // |x| >= 0.6744: tan(pi/4 - x) instead
+	const neg = hx >> 31 != 0
+	if (big) {
+		if (neg) {
+			x = -x
+			y = -y
+		}
+		x = (pio4 - x) + (pio4lo - y)
+		y = 0.0
+	}
+	const z = x * x
+	let w = z * z
+	// odd and even terms apart
+	let r = T1 + w * (T3 + w * (T5 + w * (T7 + w * (T9 + w * T11))))
+	let v = z * (T2 + w * (T4 + w * (T6 + w * (T8 + w * (T10 + w * T12)))))
+	let s = z * x
+	r = y + z * (s * (r + v) + y) + s * T0
+	w = x + r
+	if (big) {
+		s = (1 - 2 * odd) as f64
+		v = s - 2.0 * (x + (r - w * w / (w + s)))
+		return if (neg) -v else v
+	}
+	if (odd == 0) {
+		return w
+	}
+	// -1/(x + r) to an ulp, by its high half and a Newton step
+	const w0 = asF64(asU64(w) & 0xffffffff00000000)
+	v = r - (w0 - x) // w0 + v = r + x
+	const a = -1.0 / w
+	const a0 = asF64(asU64(a) & 0xffffffff00000000)
+	return a0 + a * (1.0 + a0 * w0 + a0 * v)
+}
+
+// as S1 ... S4, C0 ... C3 and T0 ... T5, for f32's precision
+const SF1 = -0.16666666641626524
+const SF2 = 0.008333329385889463
+const SF3 = -0.00019839334836096632
+const SF4 = 2.718311493989822e-06
+const CF0 = -0.499999997251031
+const CF1 = 0.04166662332373906
+const CF2 = -0.001388676377460993
+const CF3 = 2.439044879627741e-05
+const TF0 = 0.3333313950307914
+const TF1 = 0.13339200271297674
+const TF2 = 0.05338123784456704
+const TF3 = 0.024528318116654728
+const TF4 = 0.002974357433599673
+const TF5 = 0.009465647849436732
+
+/// sin(x), |x| ~<= pi/4, to an f32.
+function kSinf(x: f64): f32 {
+	const z = x * x
+	const w = z * z
+	const r = SF3 + z * SF4
+	const s = z * x
+	return ((x + s * (SF1 + z * SF2)) + s * w * r) as f32
+}
+
+/// cos(x), |x| ~<= pi/4, to an f32.
+function kCosf(x: f64): f32 {
+	const z = x * x
+	const w = z * z
+	const r = CF2 + z * CF3
+	return (((1.0 + z * CF0) + w * CF1) + (w * z) * r) as f32
+}
+
+/// tan(x), or if odd is 1, -1/tan(x), |x| ~<= pi/4, to an f32.
+function kTanf(x: f64, odd: i32): f32 {
+	const z = x * x
+	let r = TF4 + z * TF5
+	const t = TF2 + z * TF3
+	const w = z * z
+	const s = z * x
+	const u = TF0 + z * TF1
+	r = (x + s * u) + (s * w) * (t + w * r)
+	return (if (odd != 0) -1.0 / r else r) as f32
+}
+
+function sinF64(x: f64): f64 {
+	const ix = (asU64(x) >> 32 & 0x7fffffff) as u32
+	if (ix <= 0x3fe921fb) {
+		// |x| ~<= pi/4
+		return if (ix < 0x3e500000) x else kSin(x, 0.0, 0)
+	}
+	if (ix >= 0x7ff00000) {
+		return x - x
+	}
+	const [n, y0, y1] = remPio2(x)
+	return switch (n & 3) {
+		case 0: kSin(y0, y1, 1)
+		case 1: kCos(y0, y1)
+		case 2: -kSin(y0, y1, 1)
+		default: -kCos(y0, y1)
+	}
+}
+
+function cosF64(x: f64): f64 {
+	const ix = (asU64(x) >> 32 & 0x7fffffff) as u32
+	if (ix <= 0x3fe921fb) {
+		return if (ix < 0x3e46a09e) 1.0 else kCos(x, 0.0)
+	}
+	if (ix >= 0x7ff00000) {
+		return x - x
+	}
+	const [n, y0, y1] = remPio2(x)
+	return switch (n & 3) {
+		case 0: kCos(y0, y1)
+		case 1: -kSin(y0, y1, 1)
+		case 2: -kCos(y0, y1)
+		default: kSin(y0, y1, 1)
+	}
+}
+
+function tanF64(x: f64): f64 {
+	const ix = (asU64(x) >> 32 & 0x7fffffff) as u32
+	if (ix <= 0x3fe921fb) {
+		return if (ix < 0x3e400000) x else kTan(x, 0.0, 0)
+	}
+	if (ix >= 0x7ff00000) {
+		return x - x
+	}
+	const [n, y0, y1] = remPio2(x)
+	return kTan(y0, y1, n & 1)
+}
+
+/// [sin(x), cos(x)].
+function sincosF64(x: f64): [f64, f64] {
+	const ix = (asU64(x) >> 32 & 0x7fffffff) as u32
+	if (ix <= 0x3fe921fb) {
+		return if (ix < 0x3e46a09e) [x, 1.0] else [kSin(x, 0.0, 0), kCos(x, 0.0)]
+	}
+	if (ix >= 0x7ff00000) {
+		return [x - x, x - x]
+	}
+	const [n, y0, y1] = remPio2(x)
+	const s = kSin(y0, y1, 1)
+	const c = kCos(y0, y1)
+	return switch (n & 3) {
+		case 0: [s, c]
+		case 1: [c, -s]
+		case 2: [-s, -c]
+		default: [-c, s]
+	}
+}
+
+/// k pi/2 rounded to f64, as pio2xk.
+const pio2x1 = 1.5707963267948966
+const pio2x2 = 3.141592653589793
+const pio2x3 = 4.71238898038469
+const pio2x4 = 6.283185307179586
+
+function sinF32(x: f32): f32 {
+	const u = asU32(x)
+	const neg = u >> 31 != 0
+	const ix = u & 0x7fffffff
+	const d = x as f64
+	if (ix <= 0x3f490fda) {
+		// |x| ~<= pi/4
+		return if (ix < 0x39800000) x else kSinf(d)
+	}
+	if (ix <= 0x407b53d1) {
+		// |x| ~<= 5pi/4
+		if (ix <= 0x4016cbe3) {
+			return if (neg) -kCosf(d + pio2x1) else kCosf(d - pio2x1)
+		}
+		return kSinf(if (neg) -(d + pio2x2) else -(d - pio2x2))
+	}
+	if (ix <= 0x40e231d5) {
+		// |x| ~<= 9pi/4
+		if (ix <= 0x40afeddf) {
+			return if (neg) kCosf(d + pio2x3) else -kCosf(d - pio2x3)
+		}
+		return kSinf(if (neg) d + pio2x4 else d - pio2x4)
+	}
+	if (ix >= 0x7f800000) {
+		return x - x
+	}
+	const [n, y] = remPio2f(x)
+	return switch (n & 3) {
+		case 0: kSinf(y)
+		case 1: kCosf(y)
+		case 2: kSinf(-y)
+		default: -kCosf(y)
+	}
+}
+
+function cosF32(x: f32): f32 {
+	const u = asU32(x)
+	const neg = u >> 31 != 0
+	const ix = u & 0x7fffffff
+	const d = x as f64
+	if (ix <= 0x3f490fda) {
+		return if (ix < 0x39800000) 1.0 else kCosf(d)
+	}
+	if (ix <= 0x407b53d1) {
+		if (ix > 0x4016cbe3) {
+			return -kCosf(if (neg) d + pio2x2 else d - pio2x2)
+		}
+		return if (neg) kSinf(d + pio2x1) else kSinf(pio2x1 - d)
+	}
+	if (ix <= 0x40e231d5) {
+		if (ix > 0x40afeddf) {
+			return kCosf(if (neg) d + pio2x4 else d - pio2x4)
+		}
+		return if (neg) kSinf(-d - pio2x3) else kSinf(d - pio2x3)
+	}
+	if (ix >= 0x7f800000) {
+		return x - x
+	}
+	const [n, y] = remPio2f(x)
+	return switch (n & 3) {
+		case 0: kCosf(y)
+		case 1: kSinf(-y)
+		case 2: -kCosf(y)
+		default: kSinf(y)
+	}
+}
+
+function tanF32(x: f32): f32 {
+	const u = asU32(x)
+	const neg = u >> 31 != 0
+	const ix = u & 0x7fffffff
+	const d = x as f64
+	if (ix <= 0x3f490fda) {
+		return if (ix < 0x39800000) x else kTanf(d, 0)
+	}
+	if (ix <= 0x407b53d1) {
+		if (ix <= 0x4016cbe3) {
+			return kTanf(if (neg) d + pio2x1 else d - pio2x1, 1)
+		}
+		return kTanf(if (neg) d + pio2x2 else d - pio2x2, 0)
+	}
+	if (ix <= 0x40e231d5) {
+		if (ix <= 0x40afeddf) {
+			return kTanf(if (neg) d + pio2x3 else d - pio2x3, 1)
+		}
+		return kTanf(if (neg) d + pio2x4 else d - pio2x4, 0)
+	}
+	if (ix >= 0x7f800000) {
+		return x - x
+	}
+	const [n, y] = remPio2f(x)
+	return kTanf(y, n & 1)
+}
+
+/// [sinf(x), cosf(x)].
+function sincosF32(x: f32): [f32, f32] {
+	const u = asU32(x)
+	const neg = u >> 31 != 0
+	const ix = u & 0x7fffffff
+	const d = x as f64
+	if (ix <= 0x3f490fda) {
+		return if (ix < 0x39800000) [x, 1.0] else [kSinf(d), kCosf(d)]
+	}
+	if (ix <= 0x407b53d1) {
+		if (ix <= 0x4016cbe3) {
+			return if (neg) [-kCosf(d + pio2x1), kSinf(d + pio2x1)] else [kCosf(pio2x1 - d), kSinf(pio2x1 - d)]
+		}
+		// -sin(x + c) is not sin(-(x + c)) where x + c is 0
+		const y = if (neg) d + pio2x2 else d - pio2x2
+		return [-kSinf(y), -kCosf(y)]
+	}
+	if (ix <= 0x40e231d5) {
+		if (ix <= 0x40afeddf) {
+			return if (neg) [kCosf(d + pio2x3), -kSinf(d + pio2x3)] else [-kCosf(d - pio2x3), kSinf(d - pio2x3)]
+		}
+		const y = if (neg) d + pio2x4 else d - pio2x4
+		return [kSinf(y), kCosf(y)]
+	}
+	if (ix >= 0x7f800000) {
+		return [x - x, x - x]
+	}
+	const [n, y] = remPio2f(x)
+	const s = kSinf(y)
+	const c = kCosf(y)
+	return switch (n & 3) {
+		case 0: [s, c]
+		case 1: [c, -s]
+		case 2: [-s, -c]
+		default: [-c, s]
+	}
+}
+
+// # Inverse trigonometric functions
+//
+// The inverse trigonometric functions, arcsine, arccosine and arctangent, and the arctangent of y/x in all four
+// quadrants.
+//
+// Ported from musl 1.2.5, MIT, Copyright © 2005-2020 Rich Felker, et al. (vendor/musl/COPYRIGHT), from FreeBSD:
+// Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved. Developed at SunSoft, a Sun Microsystems, Inc.
+// business. Permission to use, copy, modify, and distribute this software is freely granted, provided that this notice
+// is preserved. f32 versions by Ian Lance Taylor, Cygnus Support.
+const pio2Hi = 1.57079632679489655800e+00
+const pio2Lo = 6.12323399573676603587e-17
+// asin(x) ~ x + x^3 R(x^2) on [-0.5, 0.5], R a rational function
+const pS0 = 1.66666666666666657415e-01
+const pS1 = -3.25565818622400915405e-01
+const pS2 = 2.01212532134862925881e-01
+const pS3 = -4.00555345006794114027e-02
+const pS4 = 7.91534994289814532176e-04
+const pS5 = 3.47933107596021167570e-05
+const qS1 = -2.40339491173441421878e+00
+const qS2 = 2.02094576023350569471e+00
+const qS3 = -6.88283971605453293030e-01
+const qS4 = 7.70381505559019352791e-02
+
+function rational(z: f64): f64 {
+	const p = z * (pS0 + z * (pS1 + z * (pS2 + z * (pS3 + z * (pS4 + z * pS5)))))
+	const q = 1.0 + z * (qS1 + z * (qS2 + z * (qS3 + z * qS4)))
+	return p / q
+}
+
+/// x's upper 32 bits, its low ones 0.
+function upper(x: f64): f64 { return asF64(asU64(x) & 0xffffffff00000000) }
+
+function asinF64(x: f64): f64 {
+	const u = asU64(x)
+	const hx = (u >> 32) as u32
+	const ix = hx & 0x7fffffff
+	if (ix >= 0x3ff00000) {
+		// |x| >= 1, or NaN
+		if ((ix - 0x3ff00000 | (u as u32)) == 0) {
+			return x * pio2Hi
+		}
+		return 0.0 / (x - x)
+	}
+	if (ix < 0x3fe00000) {
+		// |x| < 0.5
+		if (ix < 0x3e500000 && ix >= 0x00100000) {
+			return x
+		}
+		return x + x * rational(x * x)
+	}
+	// asin(x) = pi/2 - 2 asin(sqrt((1 - |x|)/2))
+	const z = (1.0 - fabs(x)) * 0.5
+	const s = sqrtF64(z)
+	const r = rational(z)
+	let y = 0.0
+	if (ix >= 0x3fef3333) {
+		// |x| > 0.975
+		y = pio2Hi - (2.0 * (s + s * r) - pio2Lo)
+	} else {
+		// f + c = sqrt(z)
+		const f = upper(s)
+		const c = (z - f * f) / (s + f)
+		y = 0.5 * pio2Hi - (2.0 * s * r - (pio2Lo - 2.0 * c) - (0.5 * pio2Hi - 2.0 * f))
+	}
+	return if (hx >> 31 != 0) -y else y
+}
+
+function acosF64(x: f64): f64 {
+	const u = asU64(x)
+	const hx = (u >> 32) as u32
+	const ix = hx & 0x7fffffff
+	if (ix >= 0x3ff00000) {
+		if ((ix - 0x3ff00000 | (u as u32)) == 0) {
+			return if (hx >> 31 != 0) 2.0 * pio2Hi else 0.0
+		}
+		return 0.0 / (x - x)
+	}
+	if (ix < 0x3fe00000) {
+		if (ix <= 0x3c600000) {
+			// |x| < 2^-57
+			return pio2Hi
+		}
+		return pio2Hi - (x - (pio2Lo - x * rational(x * x)))
+	}
+	if (hx >> 31 != 0) {
+		// x < -0.5: acos(x) = pi - 2 asin(sqrt((1 + x)/2))
+		const z = (1.0 + x) * 0.5
+		const s = sqrtF64(z)
+		const w = rational(z) * s - pio2Lo
+		return 2.0 * (pio2Hi - (s + w))
+	}
+	// x > 0.5: acos(x) = 2 asin(sqrt((1 - x)/2))
+	const z = (1.0 - x) * 0.5
+	const s = sqrtF64(z)
+	const df = upper(s)
+	const c = (z - df * df) / (s + df)
+	const w = rational(z) * s + c
+	return 2.0 * (df + w)
+}
+
+/// atan of 0.5, 1, 1.5 and inf, each as a sum.
+const atanHi: f64[] = [4.63647609000806093515e-01, 7.85398163397448278999e-01, 9.82793723247329054082e-01,
+	1.57079632679489655800e+00]
+
+const atanLo: f64[] = [2.26987774529616870924e-17, 3.06161699786838301793e-17, 1.39033110312309984516e-17,
+	6.12323399573676603587e-17]
+
+// atan(x) ~ x - x^3 (aT0 + aT1 x^2 + ... + aT10 x^20) on [-7/16, 7/16]
+const aT0 = 3.33333333333329318027e-01
+const aT1 = -1.99999999998764832476e-01
+const aT2 = 1.42857142725034663711e-01
+const aT3 = -1.11111104054623557880e-01
+const aT4 = 9.09088713343650656196e-02
+const aT5 = -7.69187620504482999495e-02
+const aT6 = 6.66107313738753120669e-02
+const aT7 = -5.83357013379057348645e-02
+const aT8 = 4.97687799461593236017e-02
+const aT9 = -3.65315727442169155270e-02
+const aT10 = 1.62858201153657823623e-02
+
+function atanF64(x0: f64): f64 {
+	const hx = (asU64(x0) >> 32) as u32
+	const neg = hx >> 31 != 0
+	const ix = hx & 0x7fffffff
+	if (ix >= 0x44100000) {
+		// |x| >= 2^66
+		if (x0 != x0) {
+			return x0
+		}
+		return if (neg) -atanHi[3] else atanHi[3]
+	}
+	// x reduced to within 7/16 of 0 by atan(x) = atan(c) + atan((x - c)/(1 + xc)), c the id-th of 0.5, 1, 1.5 and inf
+	let x = x0
+	let id = -1
+	if (ix < 0x3fdc0000) {
+		// |x| < 0.4375
+		if (ix < 0x3e400000) {
+			return x
+		}
+	} else {
+		x = fabs(x)
+		if (ix < 0x3fe60000) {
+			id = 0
+			x = (2.0 * x - 1.0) / (2.0 + x)
+		} else if (ix < 0x3ff30000) {
+			id = 1
+			x = (x - 1.0) / (x + 1.0)
+		} else if (ix < 0x40038000) {
+			id = 2
+			x = (x - 1.5) / (1.0 + 1.5 * x)
+		} else {
+			id = 3
+			x = -1.0 / x
+		}
+	}
+	const z = x * x
+	const w = z * z
+	// odd and even terms apart
+	const s1 = z * (aT0 + w * (aT2 + w * (aT4 + w * (aT6 + w * (aT8 + w * aT10)))))
+	const s2 = w * (aT1 + w * (aT3 + w * (aT5 + w * (aT7 + w * aT9))))
+	if (id < 0) {
+		return x - x * (s1 + s2)
+	}
+	const r = atanHi[id] - (x * (s1 + s2) - atanLo[id] - x)
+	return if (neg) -r else r
+}
+
+const piLo = 1.2246467991473531772E-16
+
+/// The angle of the point (x, y) from the x axis, in [-pi, pi].
+function atan2F64(y: f64, x: f64): f64 {
+	if (x != x || y != y) {
+		return x + y
+	}
+	const ux = asU64(x)
+	const uy = asU64(y)
+	const lx = ux as u32
+	const ly = uy as u32
+	if ((((ux >> 32) as u32) - 0x3ff00000 | lx) == 0) {
+		// x = 1
+		return atanF64(y)
+	}
+	const m = (uy >> 63 | ux >> 62 & 2) as i32 // 2 sign(x) + sign(y)
+	const ix = (ux >> 32 & 0x7fffffff) as u32
+	const iy = (uy >> 32 & 0x7fffffff) as u32
+	if ((iy | ly) == 0) {
+		return switch (m) {
+			case 0, 1: y
+			case 2: pi
+			default: -pi
+		}
+	}
+	if ((ix | lx) == 0) {
+		return if ((m & 1) != 0) -pi / 2.0 else pi / 2.0
+	}
+	if (ix == 0x7ff00000) {
+		if (iy == 0x7ff00000) {
+			return switch (m) {
+				case 0: pi / 4.0
+				case 1: -pi / 4.0
+				case 2: 3.0 * pi / 4.0
+				default: -3.0 * pi / 4.0
+			}
+		}
+		return switch (m) {
+			case 0: 0.0
+			case 1: -0.0
+			case 2: pi
+			default: -pi
+		}
+	}
+	if (ix + (64 << 20) < iy || iy == 0x7ff00000) {
+		// |y/x| > 2^64
+		return if ((m & 1) != 0) -pi / 2.0 else pi / 2.0
+	}
+	// atan(|y/x|), without underflow where it is below 2^-64 and x < 0
+	const z = if ((m & 2) != 0 && iy + (64 << 20) < ix) 0.0 else atanF64(fabs(y / x))
+	return switch (m) {
+		case 0: z
+		case 1: -z
+		case 2: pi - (z - piLo)
+		default: (z - piLo) - pi
+	}
+}
+
+// as R, for f32's precision
+const pS0f: f32 = 1.6666586697e-01
+const pS1f: f32 = -4.2743422091e-02
+const pS2f: f32 = -8.6563630030e-03
+const qS1f: f32 = -7.0662963390e-01
+
+function rationalf(z: f32): f32 {
+	const p = z * (pS0f + z * (pS1f + z * pS2f))
+	const q = 1.0 + z * qS1f
+	return p / q
+}
+
+function asinF32(x: f32): f32 {
+	const hx = asU32(x)
+	const ix = hx & 0x7fffffff
+	if (ix >= 0x3f800000) {
+		if (ix == 0x3f800000) {
+			return ((x as f64) * pio2Hi) as f32
+		}
+		return 0.0 / (x - x)
+	}
+	if (ix < 0x3f000000) {
+		if (ix < 0x39800000 && ix >= 0x00800000) {
+			return x
+		}
+		return x + x * rationalf(x * x)
+	}
+	const z: f32 = (1.0 - fabsf(x)) * 0.5
+	const s = sqrtF64(z as f64)
+	const y = (pio2Hi - 2.0 * (s + s * (rationalf(z) as f64))) as f32
+	return if (hx >> 31 != 0) -y else y
+}
+
+const pio2Hif: f32 = 1.5707962513e+00
+const pio2Lof: f32 = 7.5497894159e-08
+
+function acosF32(x: f32): f32 {
+	const hx = asU32(x)
+	const ix = hx & 0x7fffffff
+	if (ix >= 0x3f800000) {
+		if (ix == 0x3f800000) {
+			return if (hx >> 31 != 0) 2.0 * pio2Hif else 0.0
+		}
+		return 0.0 / (x - x)
+	}
+	if (ix < 0x3f000000) {
+		if (ix <= 0x32800000) {
+			return pio2Hif
+		}
+		return pio2Hif - (x - (pio2Lof - x * rationalf(x * x)))
+	}
+	if (hx >> 31 != 0) {
+		const z: f32 = (1.0 + x) * 0.5
+		const s = sqrtF32(z)
+		const w = rationalf(z) * s - pio2Lof
+		return 2.0 * (pio2Hif - (s + w))
+	}
+	const z: f32 = (1.0 - x) * 0.5
+	const s = sqrtF32(z)
+	const df = asF32(asU32(s) & 0xfffff000)
+	const c = (z - df * df) / (s + df)
+	const w = rationalf(z) * s + c
+	return 2.0 * (df + w)
+}
+
+const atanHif: f32[] = [4.6364760399e-01, 7.8539812565e-01, 9.8279368877e-01, 1.5707962513e+00]
+const atanLof: f32[] = [5.0121582440e-09, 3.7748947079e-08, 3.4473217170e-08, 7.5497894159e-08]
+const aT0f: f32 = 3.3333328366e-01
+const aT1f: f32 = -1.9999158382e-01
+const aT2f: f32 = 1.4253635705e-01
+const aT3f: f32 = -1.0648017377e-01
+const aT4f: f32 = 6.1687607318e-02
+
+function atanF32(x0: f32): f32 {
+	const hx = asU32(x0)
+	const neg = hx >> 31 != 0
+	const ix = hx & 0x7fffffff
+	if (ix >= 0x4c800000) {
+		// |x| >= 2^26
+		if (x0 != x0) {
+			return x0
+		}
+		return if (neg) -atanHif[3] else atanHif[3]
+	}
+	let x = x0
+	let id = -1
+	if (ix < 0x3ee00000) {
+		if (ix < 0x39800000) {
+			return x
+		}
+	} else {
+		x = fabsf(x)
+		if (ix < 0x3f300000) {
+			id = 0
+			x = (2.0 * x - 1.0) / (2.0 + x)
+		} else if (ix < 0x3f980000) {
+			id = 1
+			x = (x - 1.0) / (x + 1.0)
+		} else if (ix < 0x401c0000) {
+			id = 2
+			x = (x - 1.5) / (1.0 + 1.5 * x)
+		} else {
+			id = 3
+			x = -1.0 / x
+		}
+	}
+	const z = x * x
+	const w = z * z
+	const s1 = z * (aT0f + w * (aT2f + w * aT4f))
+	const s2 = w * (aT1f + w * aT3f)
+	if (id < 0) {
+		return x - x * (s1 + s2)
+	}
+	const r = atanHif[id] - ((x * (s1 + s2) - atanLof[id]) - x)
+	return if (neg) -r else r
+}
+
+const pif: f32 = 3.1415927410e+00
+const piLof: f32 = -8.7422776573e-08
+
+/// The angle of the point (x, y) from the x axis, in [-pi, pi].
+function atan2F32(y: f32, x: f32): f32 {
+	if (x != x || y != y) {
+		return x + y
+	}
+	const ux = asU32(x)
+	const uy = asU32(y)
+	if (ux == 0x3f800000) {
+		return atanF32(y)
+	}
+	const m = (uy >> 31 | ux >> 30 & 2) as i32
+	const ix = ux & 0x7fffffff
+	const iy = uy & 0x7fffffff
+	if (iy == 0) {
+		return switch (m) {
+			case 0, 1: y
+			case 2: pif
+			default: -pif
+		}
+	}
+	if (ix == 0) {
+		return if ((m & 1) != 0) -pif / 2.0 else pif / 2.0
+	}
+	if (ix == 0x7f800000) {
+		if (iy == 0x7f800000) {
+			return switch (m) {
+				case 0: pif / 4.0
+				case 1: -pif / 4.0
+				case 2: 3.0 * pif / 4.0
+				default: -3.0 * pif / 4.0
+			}
+		}
+		return switch (m) {
+			case 0: 0.0
+			case 1: -0.0
+			case 2: pif
+			default: -pif
+		}
+	}
+	if (ix + (26 << 23) < iy || iy == 0x7f800000) {
+		return if ((m & 1) != 0) -pif / 2.0 else pif / 2.0
+	}
+	const z: f32 = if ((m & 2) != 0 && iy + (26 << 23) < ix) 0.0 else atanF32(fabsf(y / x))
+	return switch (m) {
+		case 0: z
+		case 1: -z
+		case 2: pif - (z - piLof)
+		default: (z - piLof) - pif
+	}
+}
+
+// # Exponentials
+//
+// e^x, 2^x and e^x - 1. exp and exp2 take 2^(k/N) from a table and e^r of the rest by a polynomial, in f64 for the
+// f32 ones, which also give pow its last step.
+//
+// Ported from musl 1.2.5, MIT, Copyright © 2005-2020 Rich Felker, et al. (vendor/musl/COPYRIGHT). exp, exp2, expf,
+// exp2f and their tables: Copyright (c) 2018, Arm Limited, MIT. expm1 and expm1f are from FreeBSD: Copyright (C) 1993
+// by Sun Microsystems, Inc. All rights reserved. Developed at SunPro, a Sun Microsystems, Inc. business. Permission to
+// use, copy, modify, and distribute this software is freely granted, provided that this notice is preserved. expm1f
+// converted to float by Ian Lance Taylor, Cygnus Support.
+/// The sign and exponent bits of x.
+function top12(x: f64): u32 { return (asU64(x) >> 52) as u32 }
+
+/// N/ln2 and -ln2/N in two parts, N = 128 the table's entries.
+const invln2N = 184.6649652337873
+const negln2hiN = -0.005415212348111709
+const negln2loN = -1.2864023111638346e-14
+/// exp2's toint/N.
+const shift2: f64 = toint / 128.0
+/// e^r - 1 - r, |r| < ln2/256, to 2^-66.
+const c2 = 0.49999999999996786
+const c3 = 0.16666666666665886
+const c4 = 0.0416666808410674
+const c5 = 0.008333335853059549
+/// 2^r - 1, |r| < 1/256, to 2^-65.
+const d1 = 0.6931471805599453
+const d2 = 0.24022650695909065
+const d3 = 0.0555041086686087
+const d4 = 0.009618131975721055
+const d5 = 0.0013332074570119598
+
+/// 2^(k/N) ~ H[k] (1 + T[k]) for k in [0, N): the bits of T[k], then those of H[k] less k 2^52/N.
+const expTab: u64[] = [0x0000000000000000, 0x3ff0000000000000, 0x3c9b3b4f1a88bf6e, 0x3feff63da9fb3335,
+	0xbc7160139cd8dc5d, 0x3fefec9a3e778061, 0xbc905e7a108766d1, 0x3fefe315e86e7f85, 0x3c8cd2523567f613,
+	0x3fefd9b0d3158574, 0xbc8bce8023f98efa, 0x3fefd06b29ddf6de, 0x3c60f74e61e6c861, 0x3fefc74518759bc8,
+	0x3c90a3e45b33d399, 0x3fefbe3ecac6f383, 0x3c979aa65d837b6d, 0x3fefb5586cf9890f, 0x3c8eb51a92fdeffc,
+	0x3fefac922b7247f7, 0x3c3ebe3d702f9cd1, 0x3fefa3ec32d3d1a2, 0xbc6a033489906e0b, 0x3fef9b66affed31b,
+	0xbc9556522a2fbd0e, 0x3fef9301d0125b51, 0xbc5080ef8c4eea55, 0x3fef8abdc06c31cc, 0xbc91c923b9d5f416,
+	0x3fef829aaea92de0, 0x3c80d3e3e95c55af, 0x3fef7a98c8a58e51, 0xbc801b15eaa59348, 0x3fef72b83c7d517b,
+	0xbc8f1ff055de323d, 0x3fef6af9388c8dea, 0x3c8b898c3f1353bf, 0x3fef635beb6fcb75, 0xbc96d99c7611eb26,
+	0x3fef5be084045cd4, 0x3c9aecf73e3a2f60, 0x3fef54873168b9aa, 0xbc8fe782cb86389d, 0x3fef4d5022fcd91d,
+	0x3c8a6f4144a6c38d, 0x3fef463b88628cd6, 0x3c807a05b0e4047d, 0x3fef3f49917ddc96, 0x3c968efde3a8a894,
+	0x3fef387a6e756238, 0x3c875e18f274487d, 0x3fef31ce4fb2a63f, 0x3c80472b981fe7f2, 0x3fef2b4565e27cdd,
+	0xbc96b87b3f71085e, 0x3fef24dfe1f56381, 0x3c82f7e16d09ab31, 0x3fef1e9df51fdee1, 0xbc3d219b1a6fbffa,
+	0x3fef187fd0dad990, 0x3c8b3782720c0ab4, 0x3fef1285a6e4030b, 0x3c6e149289cecb8f, 0x3fef0cafa93e2f56,
+	0x3c834d754db0abb6, 0x3fef06fe0a31b715, 0x3c864201e2ac744c, 0x3fef0170fc4cd831, 0x3c8fdd395dd3f84a,
+	0x3feefc08b26416ff, 0xbc86a3803b8e5b04, 0x3feef6c55f929ff1, 0xbc924aedcc4b5068, 0x3feef1a7373aa9cb,
+	0xbc9907f81b512d8e, 0x3feeecae6d05d866, 0xbc71d1e83e9436d2, 0x3feee7db34e59ff7, 0xbc991919b3ce1b15,
+	0x3feee32dc313a8e5, 0x3c859f48a72a4c6d, 0x3feedea64c123422, 0xbc9312607a28698a, 0x3feeda4504ac801c,
+	0xbc58a78f4817895b, 0x3feed60a21f72e2a, 0xbc7c2c9b67499a1b, 0x3feed1f5d950a897, 0x3c4363ed60c2ac11,
+	0x3feece086061892d, 0x3c9666093b0664ef, 0x3feeca41ed1d0057, 0x3c6ecce1daa10379, 0x3feec6a2b5c13cd0,
+	0x3c93ff8e3f0f1230, 0x3feec32af0d7d3de, 0x3c7690cebb7aafb0, 0x3feebfdad5362a27, 0x3c931dbdeb54e077,
+	0x3feebcb299fddd0d, 0xbc8f94340071a38e, 0x3feeb9b2769d2ca7, 0xbc87deccdc93a349, 0x3feeb6daa2cf6642,
+	0xbc78dec6bd0f385f, 0x3feeb42b569d4f82, 0xbc861246ec7b5cf6, 0x3feeb1a4ca5d920f, 0x3c93350518fdd78e,
+	0x3feeaf4736b527da, 0x3c7b98b72f8a9b05, 0x3feead12d497c7fd, 0x3c9063e1e21c5409, 0x3feeab07dd485429,
+	0x3c34c7855019c6ea, 0x3feea9268a5946b7, 0x3c9432e62b64c035, 0x3feea76f15ad2148, 0xbc8ce44a6199769f,
+	0x3feea5e1b976dc09, 0xbc8c33c53bef4da8, 0x3feea47eb03a5585, 0xbc845378892be9ae, 0x3feea34634ccc320,
+	0xbc93cedd78565858, 0x3feea23882552225, 0x3c5710aa807e1964, 0x3feea155d44ca973, 0xbc93b3efbf5e2228,
+	0x3feea09e667f3bcd, 0xbc6a12ad8734b982, 0x3feea012750bdabf, 0xbc6367efb86da9ee, 0x3fee9fb23c651a2f,
+	0xbc80dc3d54e08851, 0x3fee9f7df9519484, 0xbc781f647e5a3ecf, 0x3fee9f75e8ec5f74, 0xbc86ee4ac08b7db0,
+	0x3fee9f9a48a58174, 0xbc8619321e55e68a, 0x3fee9feb564267c9, 0x3c909ccb5e09d4d3, 0x3feea0694fde5d3f,
+	0xbc7b32dcb94da51d, 0x3feea11473eb0187, 0x3c94ecfd5467c06b, 0x3feea1ed0130c132, 0x3c65ebe1abd66c55,
+	0x3feea2f336cf4e62, 0xbc88a1c52fb3cf42, 0x3feea427543e1a12, 0xbc9369b6f13b3734, 0x3feea589994cce13,
+	0xbc805e843a19ff1e, 0x3feea71a4623c7ad, 0xbc94d450d872576e, 0x3feea8d99b4492ed, 0x3c90ad675b0e8a00,
+	0x3feeaac7d98a6699, 0x3c8db72fc1f0eab4, 0x3feeace5422aa0db, 0xbc65b6609cc5e7ff, 0x3feeaf3216b5448c,
+	0x3c7bf68359f35f44, 0x3feeb1ae99157736, 0xbc93091fa71e3d83, 0x3feeb45b0b91ffc6, 0xbc5da9b88b6c1e29,
+	0x3feeb737b0cdc5e5, 0xbc6c23f97c90b959, 0x3feeba44cbc8520f, 0xbc92434322f4f9aa, 0x3feebd829fde4e50,
+	0xbc85ca6cd7668e4b, 0x3feec0f170ca07ba, 0x3c71affc2b91ce27, 0x3feec49182a3f090, 0x3c6dd235e10a73bb,
+	0x3feec86319e32323, 0xbc87c50422622263, 0x3feecc667b5de565, 0x3c8b1c86e3e231d5, 0x3feed09bec4a2d33,
+	0xbc91bbd1d3bcbb15, 0x3feed503b23e255d, 0x3c90cc319cee31d2, 0x3feed99e1330b358, 0x3c8469846e735ab3,
+	0x3feede6b5579fdbf, 0xbc82dfcd978e9db4, 0x3feee36bbfd3f37a, 0x3c8c1a7792cb3387, 0x3feee89f995ad3ad,
+	0xbc907b8f4ad1d9fa, 0x3feeee07298db666, 0xbc55c3d956dcaeba, 0x3feef3a2b84f15fb, 0xbc90a40e3da6f640,
+	0x3feef9728de5593a, 0xbc68d6f438ad9334, 0x3feeff76f2fb5e47, 0xbc91eee26b588a35, 0x3fef05b030a1064a,
+	0x3c74ffd70a5fddcd, 0x3fef0c1e904bc1d2, 0xbc91bdfbfa9298ac, 0x3fef12c25bd71e09, 0x3c736eae30af0cb3,
+	0x3fef199bdd85529c, 0x3c8ee3325c9ffd94, 0x3fef20ab5fffd07a, 0x3c84e08fd10959ac, 0x3fef27f12e57d14b,
+	0x3c63cdaf384e1a67, 0x3fef2f6d9406e7b5, 0x3c676b2c6c921968, 0x3fef3720dcef9069, 0xbc808a1883ccb5d2,
+	0x3fef3f0b555dc3fa, 0xbc8fad5d3ffffa6f, 0x3fef472d4a07897c, 0xbc900dae3875a949, 0x3fef4f87080d89f2,
+	0x3c74a385a63d07a7, 0x3fef5818dcfba487, 0xbc82919e2040220f, 0x3fef60e316c98398, 0x3c8e5a50d5c192ac,
+	0x3fef69e603db3285, 0x3c843a59ac016b4b, 0x3fef7321f301b460, 0xbc82d52107b43e1f, 0x3fef7c97337b9b5f,
+	0xbc892ab93b470dc9, 0x3fef864614f5a129, 0x3c74b604603a88d3, 0x3fef902ee78b3ff6, 0x3c83c5ec519d7271,
+	0x3fef9a51fbc74c83, 0xbc8ff7128fd391f0, 0x3fefa4afa2a490da, 0xbc8dae98e223747d, 0x3fefaf482d8e67f1,
+	0x3c8ec3bc41aa2008, 0x3fefba1bee615a27, 0x3c842b94c3a9eb32, 0x3fefc52b376bba97, 0x3c8a64a931d185ee,
+	0x3fefd0765b6e4540, 0xbc8e37bae43be3ed, 0x3fefdbfdad9cbe14, 0x3c77893b4d91cd9d, 0x3fefe7c1819e90d8,
+	0x3c5305c14160cc89, 0x3feff3c22b8f71f1]
+
+/// scale (1 + tmp), scale of bits sbits whose exponent may have left its range, by k, the low 32 bits of ki,
+/// times 2^-k: by at most 460 up if bigUp, else by 1, or down into the subnormals, there rounding y once.
+function special(tmp: f64, sbits: u64, ki: u64, bigUp: bool): f64 {
+	if ((ki & 0x80000000) == 0) {
+		if (bigUp) {
+			const scale = asF64(sbits - (1009 << 52))
+			return asF64(0x7f00000000000000) * (scale + scale * tmp) // 2^1009
+		}
+		const scale = asF64(sbits - (1 << 52))
+		return 2.0 * (scale + scale * tmp)
+	}
+	const scale = asF64(sbits + (1022 << 52))
+	let y = scale + scale * tmp
+	if (fabs(y) < 1.0) {
+		// rounded to f64 before scaled into the subnormals, which would round it again
+		const one = if (y < 0.0) -1.0 else 1.0
+		let lo = scale - y + scale * tmp
+		const hi = one + y
+		lo = one - hi + y + lo
+		y = hi + lo - one
+		if (y == 0.0) {
+			y = asF64(asU64(scale) & 0x8000000000000000)
+		}
+	}
+	return asF64(0x0010000000000000) * y // 2^-1022
+}
+
+function expF64(x: f64): f64 {
+	const abstop = top12(x) & 0x7ff
+	if (abstop - 0x3c9 >= 0x408 - 0x3c9) {
+		// |x| < 2^-54, or at least 512, or NaN
+		if (abstop - 0x3c9 >= 0x80000000) {
+			return 1.0 + x
+		}
+		if (abstop >= 0x409) {
+			if (asU64(x) == 0xfff0000000000000) {
+				return 0.0
+			}
+			if (abstop >= 0x7ff) {
+				return 1.0 + x
+			}
+			return if (asU64(x) >> 63 != 0) 0.0 else inf
+		}
+		return expTail(x, 0.0, 0, true)
+	}
+	return expTail(x, 0.0, 0, false)
+}
+
+/// e^(x + xtail), negated if signBias is 0x40000, for |x| < 1024; near over- or underflow if near.
+function expTail(x: f64, xtail: f64, signBias: u64, near: bool): f64 {
+	// x = k ln2/N + r, |r| <= ln2/2N, so that e^x = 2^(k/N) e^r
+	const z = invln2N * x
+	let kd = z + toint
+	const ki = asU64(kd)
+	kd -= toint
+	let r = x + kd * negln2hiN + kd * negln2loN
+	r += xtail
+	// 2^(k/N) ~ scale (1 + tail), and e^x ~ scale + scale (tail + e^r - 1)
+	const idx = 2 * (ki % 128)
+	const tail = asF64(expTab[idx])
+	const sbits = expTab[idx + 1] + ((ki + signBias) << 45)
+	const r2 = r * r
+	const tmp = tail + r + r2 * (c2 + r * c3) + r2 * r2 * (c4 + r * c5)
+	if (near) {
+		return special(tmp, sbits, ki, true)
+	}
+	const scale = asF64(sbits)
+	return scale + scale * tmp
+}
+
+/// e^(x + xtail), negated if signBias is 0x40000, for |xtail| < 2^-15 and |xtail| <= |x|: pow's last step.
+function expPow(x: f64, xtail: f64, signBias: u64): f64 {
+	const abstop = top12(x) & 0x7ff
+	if (abstop - 0x3c9 >= 0x408 - 0x3c9) {
+		// |x| < 2^-54, or at least 512
+		if (abstop - 0x3c9 >= 0x80000000) {
+			const one = 1.0 + x
+			return if (signBias != 0) -one else one
+		}
+		if (abstop >= 0x409) {
+			const y = if (asU64(x) >> 63 != 0) 0.0 else inf
+			return if (signBias != 0) -y else y
+		}
+		return expTail(x, xtail, signBias, true)
+	}
+	return expTail(x, xtail, signBias, false)
+}
+
+function exp2F64(x: f64): f64 {
+	let abstop = top12(x) & 0x7ff
+	if (abstop - 0x3c9 >= 0x408 - 0x3c9) {
+		// |x| < 2^-54, or at least 512, or NaN
+		if (abstop - 0x3c9 >= 0x80000000) {
+			return 1.0 + x
+		}
+		if (abstop >= 0x409) {
+			if (asU64(x) == 0xfff0000000000000) {
+				return 0.0
+			}
+			if (abstop >= 0x7ff) {
+				return 1.0 + x
+			}
+			if (asU64(x) >> 63 == 0) {
+				return inf
+			}
+			if (asU64(x) >= 0xc090cc0000000000) {
+				// -1075
+				return 0.0
+			}
+		}
+		if (2 * asU64(x) > 2 * 0x408d000000000000) {
+			// |x| > 928
+			abstop = 0
+		}
+	}
+	// x = k/N + r, |r| <= 1/2N, so that 2^x = 2^(k/N) 2^r
+	let kd = x + shift2
+	const ki = asU64(kd)
+	kd -= shift2
+	const r = x - kd
+	const idx = 2 * (ki % 128)
+	const tail = asF64(expTab[idx])
+	const sbits = expTab[idx + 1] + (ki << 45)
+	const r2 = r * r
+	const tmp = tail + r * d1 + r2 * (d2 + r * d3) + r2 * r2 * (d4 + r * d5)
+	if (abstop == 0) {
+		return special(tmp, sbits, ki, false)
+	}
+	const scale = asF64(sbits)
+	return scale + scale * tmp
+}
+
+/// expm1's 1/ln2, and where it overflows.
+const invln2 = 1.44269504088896338700e+00
+const othreshold = 7.09782712893383973096e+02
+/// 6/x (1 + 2 (1/(e^x - 1) - 1/x)) as a polynomial in x^2/2, |x| < 0.35.
+const Q1 = -3.33333333333331316428e-02
+const Q2 = 1.58730158725481460165e-03
+const Q3 = -7.93650757867487942473e-05
+const Q4 = 4.00821782732936239552e-06
+const Q5 = -2.01099218183624371326e-07
+
+/// e^x - 1, exact for small x.
+function expm1F64(x: f64): f64 {
+	const u = asU64(x)
+	const hx = ((u >> 32) as u32) & 0x7fffffff
+	const sign = u >> 63 != 0
+	if (hx >= 0x4043687a) {
+		// |x| >= 56 ln2, or NaN
+		if (x != x) {
+			return x
+		}
+		if (sign) {
+			return -1.0
+		}
+		if (x > othreshold) {
+			return x * asF64(0x7fe0000000000000) // 2^1023
+		}
+	}
+	// x = k ln2 + hi - lo, k an integer, hi - lo in [-ln2/2, ln2/2]; c the error of x rounded
+	let k = 0
+	let y = x
+	let c = 0.0
+	if (hx > 0x3fd62e42) {
+		// |x| > ln2/2
+		let hi = 0.0
+		let lo = 0.0
+		if (hx < 0x3ff0a2b2) {
+			// and |x| < 1.5 ln2
+			k = if (sign) -1 else 1
+			hi = if (sign) x + ln2hi else x - ln2hi
+			lo = if (sign) -ln2lo else ln2lo
+		} else {
+			k = (invln2 * x + (if (sign) -0.5 else 0.5)) as i32
+			const t = k as f64
+			hi = x - t * ln2hi
+			lo = t * ln2lo
+		}
+		y = hi - lo
+		c = hi - y - lo
+	} else if (hx < 0x3c900000) {
+		// |x| < 2^-54
+		return x
+	}
+	const hfx = 0.5 * y
+	const hxs = y * hfx
+	const r1 = 1.0 + hxs * (Q1 + hxs * (Q2 + hxs * (Q3 + hxs * (Q4 + hxs * Q5))))
+	const t = 3.0 - r1 * hfx
+	let e = hxs * ((r1 - t) / (6.0 - y * t))
+	if (k == 0) {
+		return y - (y * e - hxs)
+	}
+	e = y * (e - c) - c
+	e -= hxs
+	// e^x ~ 2^k (y - e + 1)
+	if (k == -1) {
+		return 0.5 * (y - e) - 0.5
+	}
+	if (k == 1) {
+		return if (y < -0.25) -2.0 * (e - (y + 0.5)) else 1.0 + 2.0 * (y - e)
+	}
+	const twopk = asF64(((0x3ff + k) as u64) << 52)
+	if (k < 0 || k > 56) {
+		const z = y - e + 1.0
+		return (if (k == 1024) z * 2.0 * asF64(0x7fe0000000000000) else z * twopk) - 1.0
+	}
+	const twomk = asF64(((0x3ff - k) as u64) << 52)
+	return if (k < 20) (y - e + (1.0 - twomk)) * twopk else (y - (e + twomk) + 1.0) * twopk
+}
+
+/// expf's N/ln2, and exp2f's toint/N, N = 32.
+const invln2Nf = 46.16624130844683
+const shift2f: f64 = toint / 32.0
+/// 2^(r/N) - 1 for expf, and 2^r - 1 for exp2f, |r| < 1/2N, to 1.69 2^-34.
+const e0 = 1.6938359250920212e-06
+const e1 = 0.00023459809789509004
+const e2 = 0.021660849396613134
+const f0 = 0.05550361559341535
+const f1 = 0.2402284522445722
+const f2 = 0.6931471806916203
+
+/// The bits of 2^(i/N), less i 2^52/N, for i in [0, N).
+const exp2fTab: u64[] = [0x3ff0000000000000, 0x3fefd9b0d3158574, 0x3fefb5586cf9890f, 0x3fef9301d0125b51,
+	0x3fef72b83c7d517b, 0x3fef54873168b9aa, 0x3fef387a6e756238, 0x3fef1e9df51fdee1, 0x3fef06fe0a31b715,
+	0x3feef1a7373aa9cb, 0x3feedea64c123422, 0x3feece086061892d, 0x3feebfdad5362a27, 0x3feeb42b569d4f82,
+	0x3feeab07dd485429, 0x3feea47eb03a5585, 0x3feea09e667f3bcd, 0x3fee9f75e8ec5f74, 0x3feea11473eb0187,
+	0x3feea589994cce13, 0x3feeace5422aa0db, 0x3feeb737b0cdc5e5, 0x3feec49182a3f090, 0x3feed503b23e255d,
+	0x3feee89f995ad3ad, 0x3feeff76f2fb5e47, 0x3fef199bdd85529c, 0x3fef3720dcef9069, 0x3fef5818dcfba487,
+	0x3fef7c97337b9b5f, 0x3fefa4afa2a490da, 0x3fefd0765b6e4540]
+
+function expF32(x: f32): f32 {
+	const abstop = (asU32(x) >> 20) & 0x7ff
+	if (abstop >= 0x42b) {
+		// |x| >= 88, or NaN
+		if (asU32(x) == 0xff800000) {
+			return 0.0
+		}
+		if (abstop >= 0x7f8) {
+			return x + x
+		}
+		if (x > 88.72283172607422) {
+			// ln 2^128
+			return inf as f32
+		}
+		if (x < -103.97207641601562) {
+			// ln 2^-150
+			return 0.0
+		}
+	}
+	// x N/ln2 = k + r, |r| <= 1/2, so that e^x = 2^(k/N) 2^(r/N)
+	const z = invln2Nf * (x as f64)
+	let kd = z + toint
+	const ki = asU64(kd)
+	kd -= toint
+	const r = z - kd
+	const s = asF64(exp2fTab[ki % 32] + (ki << 47))
+	const y = (e0 * r + e1) * (r * r) + (e2 * r + 1.0)
+	return (y * s) as f32
+}
+
+function exp2F32(x: f32): f32 {
+	const abstop = (asU32(x) >> 20) & 0x7ff
+	if (abstop >= 0x430) {
+		// |x| >= 128, or NaN
+		if (asU32(x) == 0xff800000) {
+			return 0.0
+		}
+		if (abstop >= 0x7f8) {
+			return x + x
+		}
+		if (x > 0.0) {
+			return inf as f32
+		}
+		if (x <= -150.0) {
+			return 0.0
+		}
+	}
+	return exp2fTail(x as f64, 0)
+}
+
+/// 2^xd, negated if signBias is 0x10000, for xd in [-150, 128]: powf's last step, as exp2f's.
+function exp2fTail(xd: f64, signBias: u64): f32 {
+	// xd = k/N + r, |r| <= 1/2N, so that 2^xd = 2^(k/N) 2^r
+	let kd = xd + shift2f
+	const ki = asU64(kd)
+	kd -= shift2f
+	const r = xd - kd
+	const s = asF64(exp2fTab[ki % 32] + ((ki + signBias) << 47))
+	const y = (f0 * r + f1) * (r * r) + (f2 * r + 1.0)
+	return (y * s) as f32
+}
+
+/// expm1f's 1/ln2.
+const invln2f: f32 = 1.4426950216293335
+/// As expm1's q, |x| < 0.35, to 2^-30.
+const Q1f: f32 = -0.03333321213722229
+const Q2f: f32 = 0.0015807170420885086
+
+function expm1F32(x: f32): f32 {
+	const u = asU32(x)
+	const hx = u & 0x7fffffff
+	const sign = u >> 31 != 0
+	if (hx >= 0x4195b844) {
+		// |x| >= 27 ln2, or NaN
+		if (hx > 0x7f800000) {
+			return x
+		}
+		if (sign) {
+			return -1.0
+		}
+		if (hx > 0x42b17217) {
+			return x * asF32(0x7f000000) // 2^127
+		}
+	}
+	let k = 0
+	let y = x
+	let c: f32 = 0.0
+	if (hx > 0x3eb17218) {
+		// |x| > ln2/2
+		let hi: f32 = 0.0
+		let lo: f32 = 0.0
+		if (hx < 0x3f851592) {
+			// and |x| < 1.5 ln2
+			k = if (sign) -1 else 1
+			hi = if (sign) x + ln2hif else x - ln2hif
+			lo = if (sign) -ln2lof else ln2lof
+		} else {
+			k = (invln2f * x + (if (sign) -0.5 else 0.5)) as i32
+			const t = k as f32
+			hi = x - t * ln2hif
+			lo = t * ln2lof
+		}
+		y = hi - lo
+		c = hi - y - lo
+	} else if (hx < 0x33000000) {
+		// |x| < 2^-25
+		return x
+	}
+	const hfx: f32 = 0.5 * y
+	const hxs = y * hfx
+	const r1: f32 = 1.0 + hxs * (Q1f + hxs * Q2f)
+	const t: f32 = 3.0 - r1 * hfx
+	let e = hxs * ((r1 - t) / (6.0 - y * t))
+	if (k == 0) {
+		return y - (y * e - hxs)
+	}
+	e = y * (e - c) - c
+	e -= hxs
+	if (k == -1) {
+		return 0.5 * (y - e) - 0.5
+	}
+	if (k == 1) {
+		return if (y < -0.25) -2.0 * (e - (y + 0.5)) else 1.0 + 2.0 * (y - e)
+	}
+	const twopk = asF32(((0x7f + k) as u32) << 23)
+	if (k < 0 || k > 56) {
+		const z = y - e + 1.0
+		return (if (k == 128) z * 2.0 * asF32(0x7f000000) else z * twopk) - 1.0
+	}
+	const twomk = asF32(((0x7f - k) as u32) << 23)
+	return if (k < 23) (y - e + (1.0 - twomk)) * twopk else (y - (e + twomk) + 1.0) * twopk
+}
+
+// # Logarithms
+//
+// Logarithms: natural, base 2, base 10, and of 1 + x. log and log2 take log(c) of c near x's significand from a
+// table and log(z/c) by a polynomial, in f64 for the f32 ones; log10 and log1p reduce x to [sqrt(2)/2, sqrt(2)] and
+// take log((1 + s)/(1 - s)) by a polynomial in s.
+//
+// Ported from musl 1.2.5, MIT, Copyright © 2005-2020 Rich Felker, et al. (vendor/musl/COPYRIGHT). log, log2, logf,
+// log2f and their tables: Copyright (c) 2017-2018, Arm Limited, MIT. log10, log10f, log1p and log1pf are from FreeBSD:
+// Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved. Developed at SunPro, a Sun Microsystems, Inc.
+// business. Permission to use, copy, modify, and distribute this software is freely granted, provided that this notice
+// is preserved.
+/// x as k and the bits of z, x = 2^k z, z in [off, 2 off), and z's interval in a table of n, ix x's bits.
+function reduce(ix: u64, off: u64, bits: u64): [i32, u64, u64] {
+	const tmp = ix - off
+	return [((tmp as i64) >> 52) as i32, ix - (tmp & 0xfff0000000000000), (tmp >> (52 - bits)) % (1 << bits)]
+}
+
+/// log's ln2 in two parts, the first with 11 trailing zero bits, so that k times the first plus log(c) is exact.
+const logLn2hi = 0.6931471805598903
+const logLn2lo = 5.497923018708371e-14
+
+/// log(1 + r) - r for |r| < 0x1.fp-9, from r^2, to 2^-65.
+const logA: f64[] = [-0.5000000000000001, 0.33333333331825593, -0.2499999999622955, 0.20000304511814496,
+	-0.16667054827627667]
+
+/// log(1 + r) - r for 1 + r within [1 - 2^-4, 1 + 0x1.09p-4], from r^2, to 2^-62.
+const logB: f64[] = [-0.5, 0.3333333333333352, -0.24999999999998432, 0.19999999999320328, -0.16666666669929706,
+	0.14285715076560868, -0.12499997863982555, 0.11110712032936046, -0.10000486757818193, 0.09181994006195467,
+	-0.08328363062289341]
+
+/// 1/c and log(c) of c near the center of each of N = 128 intervals of [0x1.6p-1, 0x1.6p0]; 1/c is chosen so that
+/// k ln2 + log(c) is exact and log(c) nearly so.
+const logTab: f64[] = [1.4504249240398293, -0.3718565645633589, 1.442253508327276, -0.36620682668944937,
+	1.4341736174350004, -0.3605888069791945, 1.426183816329995, -0.3550022171419869, 1.4182825527052965,
+	-0.34944666968829097, 1.4104682921759335, -0.3439217713603284, 1.4027396147468003, -0.3384271921261188,
+	1.3950954438932313, -0.332962831494342, 1.3875338232485754, -0.32752794345742586, 1.3800539211058593,
+	-0.32212257167088865, 1.3726542695419708, -0.3167462884799761, 1.3653332798446802, -0.3113985598928366,
+	1.358090204587874, -0.3060794515165526, 1.3509234892132138, -0.300788424667644, 1.3438320840699889,
+	-0.2955252968476998, 1.3368146974742003, -0.29028969275850613, 1.329870114677736, -0.2850812793277555,
+	1.322997339161106, -0.27989987391470095, 1.316195352741367, -0.27474526621870154, 1.3094628125672239,
+	-0.2696169863701243, 1.3027990455471041, -0.26451506180308115, 1.2962024229438942, -0.2594387762767383,
+	1.2896726275815547, -0.2543884090981692, 1.2832080305745537, -0.24936321635129843, 1.276807885983376,
+	-0.24436312405975968, 1.2704714060687552, -0.23938801747897287, 1.2641976054949482, -0.23443761696705678,
+	1.257985357514882, -0.22951151871518505, 1.2518337750655457, -0.2246094963439873, 1.2457421919097305,
+	-0.21973149037705753, 1.2397094966625508, -0.2148770752847895, 1.2337348463589233, -0.210046029103637,
+	1.2278176973028803, -0.20523836373934046, 1.2219570190618474, -0.20045368751368642, 1.2161519732977757,
+	-0.1956917537758045, 1.2104018095009725, -0.19095237845203883, 1.204705805718973, -0.18623539250290833,
+	1.1990631185441964, -0.18154051731551135, 1.1934733004462308, -0.1768677957431919, 1.1879350812847385,
+	-0.17221657406412305, 1.1824481322833125, -0.16758697765942543, 1.1770114976921955, -0.16297859687290384,
+	1.1716248121809465, -0.15839151377804228, 1.1662869231674715, -0.15382513241456763, 1.1609977486762766,
+	-0.14927976358922024, 1.1557563220795803, -0.14475495398119165, 1.1505619105480347, -0.14025044090817573,
+	1.1454138888505974, -0.1357660466685502, 1.140311877374656, -0.1313018016355727, 1.1352550225747513,
+	-0.12685731518763532, 1.1302429094831266, -0.1224325737671279, 1.1252747693068048, -0.11802724521862729,
+	1.1203501571039876, -0.11364127671663482, 1.1154683327680124, -0.10927434611278386, 1.1106291463292157,
+	-0.10492665324943573, 1.1058315813301596, -0.10059761422644442, 1.1010752177696026, -0.09628717309055901,
+	1.0963597137952512, -0.09199534069557558, 1.0916844827550398, -0.08772190036688698, 1.0870487291277784,
+	-0.08346643613867855, 1.082452357388312, -0.07922916827544668, 1.0778948225025884, -0.0750099004750382,
+	1.0733751731601076, -0.07080805133352897, 1.068893585073351, -0.06662408085151128, 1.0644491706655506,
+	-0.06245745471915143, 1.0600414846328305, -0.0583080438042316, 1.0556701316181605, -0.05417576112313327,
+	1.051334750556926, -0.050060547896805474, 1.0470347288442157, -0.045962101199052086, 1.0427699229652954,
+	-0.04188056008865715, 1.0385395013738175, -0.03781540056183985, 1.034343418940345, -0.03376684757915882,
+	1.0301811073173315, -0.029734619131772888, 1.026052043621297, -0.025718470239212365, 1.0219561082336197,
+	-0.021718543925430822, 1.0178926505784922, -0.01773446126981071, 1.0138614436244586, -0.013766252464051831,
+	1.0098620186501341, -0.009813706322574944, 1.0058938559734134, -0.005876555150052809, 1.00195696235014,
+	-0.0019550499938532084, 0.9961089923088509, 0.0038985973556009412, 0.9884170338185201, 0.011650571286395461,
+	0.9808429191005297, 0.019342955478919066, 0.9733840169987446, 0.0269766014846482, 0.9660377568876556,
+	0.034552359728422744, 0.9588014945307369, 0.04207121767183253, 0.9516728569073111, 0.049533940950141186,
+	0.9446494635965822, 0.056941358295944156, 0.9377288993026223, 0.06429439168346107, 0.9309091073790681,
+	0.0715936354946507, 0.924187681612722, 0.07884010933776153, 0.9175626765599192, 0.08603438905970506,
+	0.9110320403624034, 0.09317721180013905, 0.9045935839762024, 0.10026951462748457, 0.8982456375922825,
+	0.10731170956330516, 0.8919860966782501, 0.11430473320717738, 0.8858131121185129, 0.12124928503033061,
+	0.879725075760676, 0.12814583422959913, 0.8737201372634685, 0.1349951636851756, 0.8677966405782273,
+	0.1417978768189414, 0.8619528050060739, 0.14855476039031146, 0.8561872354420692, 0.1552661937658968,
+	0.8504983927816893, 0.16193275688146969, 0.8448844572790304, 0.16855539792220497, 0.8393442741575965,
+	0.1751343179947753, 0.8338762249349438, 0.1816702989864325, 0.8284789320557778, 0.18816387146023317,
+	0.8231510800065832, 0.1946155228479256, 0.8178913903778707, 0.20102572579389744, 0.8126984007245374,
+	0.2073952090795501, 0.8075710029460227, 0.21372429840596396, 0.8025078881160415, 0.2200135945981856,
+	0.7975077379364331, 0.22626374162859975, 0.792569604966373, 0.23247494747693054, 0.7876923641254114,
+	0.23864766620658884, 0.7828746724940998, 0.24478265647405806, 0.7781155388790811, 0.25088025827324145,
+	0.7734139557869777, 0.2569408552510595, 0.7687687179914933, 0.26296511155101143, 0.7641790698041854,
+	0.2689531327189343, 0.7596438763692399, 0.27490553924610595, 0.7551621951078668, 0.2808227248478943,
+	0.7507331780216866, 0.286704979267256, 0.7463557196361751, 0.29255295645509705, 0.7420289364869653,
+	0.2983670386142876, 0.7377521537065876, 0.30414734587282055, 0.7335242966002608, 0.30989455774829366,
+	0.729344777457841, 0.31560871301871884]
+
+/// c, and c - the f64 of c, so that z/c - 1 is (z - c) (1/c) with nearly one rounding.
+const logTab2: f64[] = [0.6894531274426304, 2.60290652810535e-17, 0.6933593811533166, 5.1607448519931415e-17,
+	0.6972656502972674, 5.290672414887869e-17, 0.7011718886092148, 7.801030634806013e-18, 0.7050781228976939,
+	-2.471355337688684e-17, 0.7089843887644558, -4.6413389636862956e-17, 0.7128906815542553, 3.3387408065940366e-17,
+	0.7167968359278303, -2.6454587338050098e-17, 0.7207031520563163, 2.4284096334522285e-17, 0.7246093683054673,
+	4.85782435031982e-17, 0.7285155644718035, -1.3014776598894487e-17, 0.7324219036935506, -1.0402317671225898e-17,
+	0.73632811474659, 3.078291427467431e-17, 0.7402343715130797, -1.4304998976623033e-17, 0.7441405900738403,
+	-2.8625955785571303e-17, 0.7480468324364, 5.1609093535635645e-17, 0.7519531335902885, 4.423423949536319e-17,
+	0.7558594189116706, -4.683016762099508e-17, 0.7597656365502305, 4.466742007514772e-17, 0.7636719350887737,
+	-4.8134498775190266e-17, 0.767578087670501, -4.3371015350542286e-17, 0.7714844396979536, -2.515644472251707e-17,
+	0.7753905747966752, -4.163636184961329e-17, 0.7792968686084766, 3.3837161384165165e-17, 0.783203182701066,
+	4.379206565056758e-17, 0.7871094109030913, 2.7322930976146396e-17, 0.7910155783031153, -5.463661225364046e-17,
+	0.7949218121071572, -1.4320502634189868e-17, 0.7988281031542229, -4.0766731402809024e-17, 0.8027343109146796,
+	-4.0338264352540086e-17, 0.8066405901480322, 1.7241428071650815e-18, 0.8105469363625933, -4.5534218930924523e-17,
+	0.8144531571720115, 1.821216920589142e-17, 0.8183593894061396, 4.9864288025894273e-17, 0.8222656559018297,
+	4.335990416726689e-17, 0.8261719308006343, -5.422001471661127e-17, 0.830078177803083, -5.333603728929035e-17,
+	0.8339844538076674, -1.1270648442682386e-17, 0.8378905498984414, -3.165126734800398e-17, 0.8417968420618669,
+	1.1286283062565865e-17, 0.8457030568173808, 5.643595964448442e-18, 0.8496093725173733, -2.1687834632368187e-17,
+	0.8535155534462677, -2.2548234217914977e-17, 0.8574219432077146, 4.683260556353139e-17, 0.8613281129443706,
+	2.5148296884122795e-17, 0.8652342893532053, -8.672187570949467e-18, 0.8691405397938828, -1.2576268285559751e-17,
+	0.8730468608194392, -2.9930851265148e-17, 0.8769530685783117, 4.814801507681644e-17, 0.8808593488818101,
+	-9.10549533611022e-18, 0.8847655593409667, -3.512414651620766e-17, 0.888671840226208, 3.555261815374023e-17,
+	0.8925780870017613, 1.692380503540994e-17, 0.8964844367374554, -1.0837881791715702e-17, 0.9003905608862683,
+	5.2900545724138363e-17, 0.9042968358682077, 5.3330721088784517e-17, 0.9082031671057441, 1.8640040753232978e-17,
+	0.9121093993305497, 4.467972832054075e-17, 0.9160155849026457, -5.216213419585033e-18, 0.9199219622862499,
+	-2.7324731032846873e-17, 0.9238281880717143, -1.7769263393434193e-17, 0.9277343012727929, 4.943363080817441e-17,
+	0.9316407021562788, 4.164434042024055e-17, 0.935546825207466, 1.3011820859795741e-17, 0.9394530312562943,
+	-2.7332907838481398e-17, 0.9433593066844669, 2.342133170803292e-17, 0.9472655994038329, 1.6478717480487438e-17,
+	0.9511718313032721, -5.19608290131499e-18, 0.9550781578218178, -3.5565573220579e-17, 0.9589843147339043,
+	2.0816772146458738e-17, 0.9628906735633685, -3.471962826146841e-18, 0.9667968893972092, -3.68646834472642e-17,
+	0.9707031054025779, -3.4674108076868834e-18, 0.9746094325494931, 4.598152624774392e-17, 0.9785156054582722,
+	4.553145752392568e-17, 0.9824218687812282, -7.811259169418978e-18, 0.9863280690752917, 2.0375615178047467e-17,
+	0.9902342909546034, -1.344597043422914e-17, 0.9941406780264008, 1.51853723695054e-17, 0.9980468598715558,
+	-1.301926039598001e-17, 1.0039062067717412, -4.596120641744973e-17, 1.0117187035281372, -8.152405002665349e-17,
+	1.0195312424919558, 8.239927014757811e-17, 1.0273437641634193, 3.122851005327045e-17, 1.0351562274561221,
+	-1.3010212611128995e-17, 1.0429687539123276, -5.984116688633458e-17, 1.0507812561238108, 2.860923854822335e-17,
+	1.0585937308350133, -1.9962944508904598e-17, 1.0664062936992642, 5.291469130309099e-17, 1.0742187309945372,
+	1.0321575006732523e-16, 1.082031301537134, 9.021194373419119e-17, 1.0898438063644336, 5.202798992357953e-17,
+	1.0976562356711468, 5.898318482500785e-17, 1.1054688179463226, 8.846377690653252e-17, 1.113281220803328,
+	-9.529455965212574e-18, 1.1210937073167315, 6.765080709377787e-17, 1.1289062967338532, 1.0929327370933015e-16,
+	1.1367187631150848, 6.938570551230516e-17, 1.1445312490244826, 1.908841015045148e-17, 1.1523437096203593,
+	2.7744504138979832e-17, 1.1601563266482477, -1.5621964097491672e-17, 1.1679688257483505, -6.4191661495975e-17,
+	1.1757811754697645, -4.336465165059268e-17, 1.183593793665613, -3.8159292551356396e-17, 1.1914062331617676,
+	-2.94933042768015e-17, 1.1992187450577771, -6.244142916351348e-17, 1.2070312971249755, 7.458644622627413e-17,
+	1.2148438169965134, 2.7760519266147807e-17, 1.222656225220801, -7.025106921079665e-17, 1.2304687681290862,
+	3.7292622364618835e-17, 1.2382812116234925, 2.2558949940652082e-17, 1.2460936706149877, 8.499368944400665e-17,
+	1.2539063289686938, 1.039515474644361e-17, 1.2617188367227732, 3.297262223275499e-17, 1.2695311590462317,
+	4.509883253594155e-17, 1.277343660657941, -7.546987371769545e-17, 1.2851561882963496, 9.454295598818184e-17,
+	1.2929686521915196, -7.28545609119749e-17, 1.3007813359167737, -8.934357651462802e-17, 1.3085938093753886,
+	8.15257059458102e-17, 1.3164063202609564, 6.946341460765881e-18, 1.3242188320313901, -7.892731380721676e-17,
+	1.3320311786874468, -4.3384657500713545e-17, 1.3398436880573092, 9.627577954598792e-17, 1.3476563390295309,
+	4.2492400590204517e-17, 1.3554687641043626, -1.0843419551446047e-16, 1.3632813590971713, -8.50172782472025e-17,
+	1.3710936595522603, -7.110627206162922e-17]
+
+/// The bits of 1 - 2^-4 and 1 + 0x1.09p-4, about 1 where log takes log(1 + r) directly.
+const near1lo = asU64(0.9375)
+const near1hi = asU64(1.064697265625)
+
+function logF64(x: f64): f64 {
+	let ix = asU64(x)
+	const top = (ix >> 48) as u32
+	if (ix - near1lo < near1hi - near1lo) {
+		if (ix == 0x3ff0000000000000) {
+			return 0.0
+		}
+		const r = x - 1.0
+		const r2 = r * r
+		const r3 = r * r2
+		let y = r3
+			* (logB[1] + r * logB[2] + r2 * logB[3]
+			+ r3 * (logB[4] + r * logB[5] + r2 * logB[6] + r3 * (logB[7] + r * logB[8] + r2 * logB[9] + r3 * logB[10])))
+		// r - r^2/2 to more than f64: r split so that rhi^2 is exact
+		let w = r * 134217728.0
+		const rhi = r + w - w
+		const rlo = r - rhi
+		w = rhi * rhi * logB[0]
+		const hi = r + w
+		let lo = r - hi + w
+		lo += logB[0] * rlo * (rhi + r)
+		y += lo
+		y += hi
+		return y
+	}
+	if (top - 0x0010 >= 0x7ff0 - 0x0010) {
+		// below 2^-1022, or inf, or NaN
+		if (ix * 2 == 0) {
+			return -1.0 / 0.0
+		}
+		if (ix == 0x7ff0000000000000) {
+			return x
+		}
+		if ((top & 0x8000) != 0 || (top & 0x7ff0) == 0x7ff0) {
+			return (x - x) / (x - x)
+		}
+		ix = asU64(x * two52) - (52 << 52)
+	}
+	// log(x) = k ln2 + log(c) + log(z/c), r = z/c - 1
+	const [k, iz, i] = reduce(ix, 0x3fe6000000000000, 7)
+	const invc = logTab[2 * i]
+	const logc = logTab[2 * i + 1]
+	const z = asF64(iz)
+	const r = (z - logTab2[2 * i] - logTab2[2 * i + 1]) * invc
+	const kd = k as f64
+	// hi + lo = r + log(c) + k ln2
+	const w = kd * logLn2hi + logc
+	const hi = w + r
+	const lo = w - hi + r + kd * logLn2lo
+	const r2 = r * r
+	return lo + r2 * logA[0] + r * r2 * (logA[1] + r * logA[2] + r2 * (logA[3] + r * logA[4])) + hi
+}
+
+/// 1/ln2 in two parts, the first with 32 trailing zero bits.
+const invln2hi = 1.4426950407214463
+const invln2lo = 1.6751713164886512e-10
+
+/// log2(1 + r) - r/ln2 for |r| < 1/(2 N), from r^2.
+const log2A: f64[] = [-0.7213475204444882, 0.4808983469629985, -0.36067375954075914, 0.2885390073180969,
+	-0.2404693555628422, 0.2061202382173603]
+
+/// log2(1 + r) - r/ln2 for 1 + r within [1 - 0x1.5b51p-5, 1 + 0x1.6ab2p-5], from r^2.
+const log2B: f64[] = [-0.7213475204444817, 0.48089834696298744, -0.360673760222145, 0.2885390081805197,
+	-0.24044917405728863, 0.2060992861022954, -0.18033596705327856, 0.1603032746063156, -0.14483316576701266,
+	0.13046826811283835]
+
+/// As logTab and logTab2, of N = 64 intervals, log2(c) for log(c).
+const log2Tab: f64[] = [1.4463276106642393, -0.5323943771486483, 1.4301675812282968, -0.516184206053822,
+	1.4143648676229383, -0.5001543441974263, 1.3989068970611538, -0.4842999484799293, 1.3837838957784339,
+	-0.46861865624623533, 1.368983882697786, -0.4531054615783887, 1.3544972916324536, -0.43775750882059583,
+	1.3403139676437443, -0.4225709906127122, 1.3264249304188642, -0.40754302793970965, 1.3128203652112156,
+	-0.3926695240384106, 1.299492412370217, -0.3779482100565019, 1.28643198385998, -0.36337518101890964,
+	1.2736319291846832, -0.3489484089425332, 1.2610838968062879, -0.33466425780738973, 1.248780314313572,
+	-0.3205197000629596, 1.2367150450059063, -0.3065131231801388, 1.2248804968401878, -0.2926410022678283,
+	1.2132702353497795, -0.2789009220805383, 1.2018780785715362, -0.2652905529862437, 1.190697765061355,
+	-0.2518072602367738, 1.1797235410550593, -0.23844881494437686, 1.1689498986205256, -0.22521309705462045,
+	1.158371137408455, -0.21209756102439314, 1.1479820146386086, -0.1991000395789797, 1.1377775576851088,
+	-0.18621852970682085, 1.127753150630225, -0.17345131655361, 1.1179037012282074, -0.16079591649577196,
+	1.1082251967632821, -0.14825107384353942, 1.098712461056607, -0.13581387465410444, 1.0893619091634283,
+	-0.12348332762257996, 1.0801689912316736, -0.11125703807351783, 1.071129489697672, -0.09913289918449664,
+	1.0622406576750423, -0.08711065531497297, 1.0534977607927976, -0.07518724771330199, 1.044897877982342,
+	-0.06336194888240243, 1.0364370289499079, -0.0516324649456692, 1.0281122132034575, -0.039997735929773626,
+	1.0199202450036955, -0.028456341769015125, 1.0118577522306755, -0.017006489068080555, 1.003921649236766,
+	-0.005646678981520381, 0.9922480467550775, 0.011227277611396858, 0.9770993366178549, 0.033422853921138085,
+	0.9624059787315814, 0.05528248992573026, 0.9481480598286369, 0.07681573143713649, 0.9343065931261065,
+	0.09803204623631245, 0.9208633936884979, 0.11894094059630334, 0.9078013641840602, 0.13955143862290242,
+	0.8951048181512927, 0.15987146080919956, 0.882758574260473, 0.17990916589428707, 0.8707481902241709,
+	0.19967252559081317, 0.8590602881746972, 0.2191687127685782, 0.8476822044336688, 0.23840459427242422,
+	0.8366013284053287, 0.25738780610663525, 0.8258064913621258, 0.27612433583180973, 0.8152865101579193,
+	0.2946209507022104, 0.8050314363208223, 0.31288297359969874, 0.7950310492640542, 0.33091689015759584,
+	0.7852760432487271, 0.3487282100279572, 0.7757575660314712, 0.36632223233368677, 0.7664670566588946,
+	0.383704309808536, 0.7573965608078645, 0.4008792246509074, 0.7485380168514022, 0.41785250494945103,
+	0.7398844213755009, 0.4346281724315304, 0.7314286113178112, 0.45121103315341315]
+
+const log2Tab2: f64[] = [0.6914062848739648, 4.339971893418182e-17, 0.6992187580850853, 7.805593338712074e-18,
+	0.7070311366547563, 3.20843320369626e-17, 0.7148438556567389, 4.336491946473985e-17, 0.7226561915128084,
+	4.681890319761607e-17, 0.730468789763508, -1.647126642147294e-17, 0.7382812842650944, 2.0846837208642192e-17,
+	0.7460938437864584, -7.82131795361932e-18, 0.7539062159244969, -3.470987810015201e-17, 0.761718835645205,
+	1.2996798345429576e-17, 0.7695312342578777, -5.2071007285622585e-17, 0.7773438569208053, -4.513636731226183e-17,
+	0.7851561955110148, -2.0797044446832382e-17, 0.7929686538163826, -1.9947626198727574e-17, 0.8007813612514213,
+	1.472064871061342e-17, 0.8085937047812207, 5.290804109377209e-17, 0.816406173973453, -1.129659587857177e-17,
+	0.8242186867064328, 3.901543738154691e-17, 0.8320311501051142, -3.212482853127187e-17, 0.8398436860662717,
+	5.220081794706035e-18, 0.8476562221566525, -5.37416378988278e-17, 0.8554686571084844, 4.291992377471359e-18,
+	0.8632811779454657, 1.7319616935225806e-17, 0.8710937865301015, 1.8251073579011692e-17, 0.8789064200163806,
+	1.2113671810693101e-17, 0.8867188705623812, -2.431195196496269e-17, 0.894531433164887, -2.258952781769403e-17,
+	0.9023436779100781, 4.3322028821617186e-17, 0.9101562378188762, -5.2414676705491076e-18, 0.9179685755379005,
+	-2.3432856904274634e-17, 0.9257810658494647, 3.9914341909758727e-17, 0.9335939394986237, -1.8218382846902827e-17,
+	0.9414062555172099, 4.423669374431538e-17, 0.9492189136192009, -2.6059674623550364e-17, 0.9570313243730211,
+	-4.947019261946595e-17, 0.9648439529540691, -5.4644837229582306e-17, 0.9726564738338594, -5.4656321533328614e-17,
+	0.9804688208697894, -1.782581090537996e-18, 0.98828120632121, -5.2277711573086786e-18, 0.9960936700192217,
+	4.1586638841164565e-17, 1.007812515499802, 9.540912389137736e-17, 1.0234373952820537, 3.985821704561347e-17,
+	1.0390625391978199, -5.179495640960355e-18, 1.0546875982436061, -6.074512782488841e-17, 1.07031247275489,
+	-4.853656019321416e-17, 1.0859374005459401, -1.0233609026899023e-16, 1.101562565835984, 9.714504510281668e-17,
+	1.1171875960464082, -5.728631491659617e-17, 1.1328125595809087, -4.3353271744463366e-17, 1.1484376438870962,
+	5.029455257812864e-17, 1.1640626551656426, -1.3886091944776072e-17, 1.179687381390876, 9.535864385063222e-17,
+	1.19531246968748, 2.5970710873556995e-17, 1.2109374417129501, -1.0412863482435496e-16, 1.2265626715770166,
+	1.903080930681457e-17, 1.2421875157698543, 9.884933154288451e-17, 1.2578125104996614, 2.605028401046449e-17,
+	1.273437549250769, 3.128070230699857e-17, 1.2890625161616944, -4.506460293510891e-17, 1.3046875156762752,
+	-2.0874781900380847e-17, 1.3203123063212308, 8.50535702424751e-17, 1.3359374907988373, -3.99657459893118e-17,
+	1.351562448282023, 4.1576596545784e-17, 1.3671874254389709, -6.072295450780066e-17]
+
+/// The bits of 1 - 0x1.5b51p-5 and 1 + 0x1.6ab2p-5, about 1 where log2 takes log2(1 + r) directly.
+const near2lo = asU64(0.9576029777526855)
+const near2hi = asU64(1.0442743301391602)
+
+function log2F64(x: f64): f64 {
+	let ix = asU64(x)
+	const top = (ix >> 48) as u32
+	if (ix - near2lo < near2hi - near2lo) {
+		if (ix == 0x3ff0000000000000) {
+			return 0.0
+		}
+		const r = x - 1.0
+		const rhi = asF64(asU64(r) & 0xffffffff00000000)
+		const rlo = r - rhi
+		const hi = rhi * invln2hi
+		let lo = rlo * invln2hi + r * invln2lo
+		const r2 = r * r
+		const r4 = r2 * r2
+		const p = r2 * (log2B[0] + r * log2B[1])
+		const y = hi + p
+		lo += hi - y + p
+		lo += r4
+			* (log2B[2] + r * log2B[3] + r2 * (log2B[4] + r * log2B[5])
+			+ r4 * (log2B[6] + r * log2B[7] + r2 * (log2B[8] + r * log2B[9])))
+		return y + lo
+	}
+	if (top - 0x0010 >= 0x7ff0 - 0x0010) {
+		if (ix * 2 == 0) {
+			return -1.0 / 0.0
+		}
+		if (ix == 0x7ff0000000000000) {
+			return x
+		}
+		if ((top & 0x8000) != 0 || (top & 0x7ff0) == 0x7ff0) {
+			return (x - x) / (x - x)
+		}
+		ix = asU64(x * two52) - (52 << 52)
+	}
+	// log2(x) = k + log2(c) + log2(z/c)
+	const [k, iz, i] = reduce(ix, 0x3fe6000000000000, 6)
+	const invc = log2Tab[2 * i]
+	const logc = log2Tab[2 * i + 1]
+	const z = asF64(iz)
+	const kd = k as f64
+	const r = (z - log2Tab2[2 * i] - log2Tab2[2 * i + 1]) * invc
+	const rhi = asF64(asU64(r) & 0xffffffff00000000)
+	const rlo = r - rhi
+	const t1 = rhi * invln2hi
+	const t2 = rlo * invln2hi + r * invln2lo
+	// hi + lo = r/ln2 + log2(c) + k
+	const t3 = kd + logc
+	const hi = t3 + t1
+	const lo = t3 - hi + t1 + t2
+	const r2 = r * r
+	const r4 = r2 * r2
+	const p = log2A[0] + r * log2A[1] + r2 * (log2A[2] + r * log2A[3]) + r4 * (log2A[4] + r * log2A[5])
+	return lo + r2 * p + hi
+}
+
+/// log10(2) in two parts, the first with 32 trailing zero bits, and 1/ln10 in two.
+const ivln10hi = 4.34294481878168880939e-01
+const ivln10lo = 2.50829467116452752298e-11
+const log10_2hi = 3.01029995663611771306e-01
+const log10_2lo = 3.69423907715893078616e-13
+/// (log(1 + s) - log(1 - s))/s - 2 = lg1 s^2 + lg2 s^4 + ..., |s| <= 0.1716, to 2^-58.45.
+const lg1 = 6.666666666666735130e-01
+const lg2 = 3.999999999940941908e-01
+const lg3 = 2.857142874366239149e-01
+const lg4 = 2.222219843214978396e-01
+const lg5 = 1.818357216161805012e-01
+const lg6 = 1.531383769920937332e-01
+const lg7 = 1.479819860511658591e-01
+
+/// log(1 + f) - f + f^2/2, as s (f^2/2 + R(s)), s = f/(2 + f).
+function logTail(f: f64, hfsq: f64): f64 {
+	const s = f / (2.0 + f)
+	const z = s * s
+	const w = z * z
+	const t1 = w * (lg2 + w * (lg4 + w * lg6))
+	const t2 = z * (lg1 + w * (lg3 + w * (lg5 + w * lg7)))
+	return s * (hfsq + (t2 + t1))
+}
+
+function log10F64(x: f64): f64 {
+	let u = asU64(x)
+	let hx = (u >> 32) as u32
+	let k = 0
+	if (hx < 0x00100000 || hx >> 31 != 0) {
+		if (u << 1 == 0) {
+			return -1.0 / (x * x)
+		}
+		if (hx >> 31 != 0) {
+			return (x - x) / 0.0
+		}
+		// a subnormal, scaled up
+		k -= 54
+		u = asU64(x * 18014398509481984.0)
+		hx = (u >> 32) as u32
+	} else if (hx >= 0x7ff00000) {
+		return x
+	} else if (hx == 0x3ff00000 && u << 32 == 0) {
+		return 0.0
+	}
+	// x = 2^k (1 + f), 1 + f in [sqrt(2)/2, sqrt(2)]
+	hx += 0x3ff00000 - 0x3fe6a09e
+	k += ((hx >> 20) as i32) - 0x3ff
+	hx = (hx & 0x000fffff) + 0x3fe6a09e
+	const f = asF64((hx as u64) << 32 | u & 0xffffffff) - 1.0
+	const hfsq = 0.5 * f * f
+	// hi + lo = f - hfsq + s (hfsq + R) ~ log(1 + f), hi with 32 trailing zero bits
+	const hi = asF64(asU64(f - hfsq) & 0xffffffff00000000)
+	const lo = f - hi - hfsq + logTail(f, hfsq)
+	// valhi + vallo ~ log10(1 + f) + k log10(2)
+	let valhi = hi * ivln10hi
+	const dk = k as f64
+	const y = dk * log10_2hi
+	let vallo = dk * log10_2lo + (lo + hi) * ivln10lo + lo * ivln10hi
+	const w = y + valhi
+	vallo += y - w + valhi
+	valhi = w
+	return vallo + valhi
+}
+
+/// log(1 + x), exact for small x.
+function log1pF64(x: f64): f64 {
+	const hx = (asU64(x) >> 32) as u32
+	let k = 1
+	let c = 0.0
+	let f = 0.0
+	if (hx < 0x3fda827a || hx >> 31 != 0) {
+		// 1 + x < sqrt(2)+
+		if (hx >= 0xbff00000) {
+			// x <= -1
+			return if (x == -1.0) x / 0.0 else (x - x) / 0.0
+		}
+		if (hx << 1 < 0x3ca00000 << 1) {
+			// |x| < 2^-53
+			return x
+		}
+		if (hx <= 0xbfd2bec4) {
+			// sqrt(2)/2- <= 1 + x < sqrt(2)+
+			k = 0
+			f = x
+		}
+	} else if (hx >= 0x7ff00000) {
+		return x
+	}
+	if (k != 0) {
+		// 1 + x = 2^k (1 + f), 1 + f in [sqrt(2)/2, sqrt(2)], c the error of 1 + x rounded, divided by it
+		const u = asU64(1.0 + x)
+		let hu = ((u >> 32) as u32) + (0x3ff00000 - 0x3fe6a09e)
+		k = ((hu >> 20) as i32) - 0x3ff
+		if (k < 54) {
+			const v = asF64(u)
+			c = (if (k >= 2) 1.0 - (v - x) else x - (v - 1.0)) / v
+		}
+		hu = (hu & 0x000fffff) + 0x3fe6a09e
+		f = asF64((hu as u64) << 32 | u & 0xffffffff) - 1.0
+	}
+	const hfsq = 0.5 * f * f
+	const dk = k as f64
+	return logTail(f, hfsq) + (dk * ln2lo + c) - hfsq + f + dk * ln2hi
+}
+
+/// logf's 1/c and log(c) of c near the center of each of N = 16 intervals of [0x1.66p-1, 0x1.66p0].
+const logfTab: f64[] = [1.398907162146528, -0.33569133332882284, 1.3403141896637998, -0.2929040563774074,
+	1.286432210124115, -0.2518726580937369, 1.2367150214269895, -0.21245868807117255, 1.1906977166711752,
+	-0.17453945183745634, 1.1479821020556429, -0.1380057072319758, 1.1082251448272158, -0.10275976698545139,
+	1.0711297413057381, -0.06871392447020525, 1.036437278977283, -0.0357891387398228, 1.0, 0.0, 0.9492859795739057,
+	0.05204517742929496, 0.8951049428609004, 0.11081431298787942, 0.8476821620351103, 0.1652495223695143,
+	0.8050314851692001, 0.21687389031699977, 0.7664671008843108, 0.2659635028121397, 0.731428603316328,
+	0.3127556664073557]
+
+/// log(1 + r) - r, |r| < 1/(2 N), from r^2.
+const logfA: f64[] = [-0.25089342214237154, 0.333456765744066, -0.4999997485802103]
+
+function logF32(x: f32): f32 {
+	let ix = asU32(x)
+	if (ix == 0x3f800000) {
+		return 0.0
+	}
+	if (ix - 0x00800000 >= 0x7f800000 - 0x00800000) {
+		// below 2^-126, or inf, or NaN
+		if (ix * 2 == 0) {
+			return -1.0 / 0.0
+		}
+		if (ix == 0x7f800000) {
+			return x
+		}
+		if ((ix & 0x80000000) != 0 || ix * 2 >= 0xff000000) {
+			return (x - x) / (x - x)
+		}
+		ix = asU32(x * two23) - (23 << 23)
+	}
+	// log(x) = k ln2 + log(c) + log(z/c)
+	const [k, z, i] = reducef(ix)
+	const r = z * logfTab[2 * i] - 1.0
+	const y0 = logfTab[2 * i + 1] + (k as f64) * ln2
+	const r2 = r * r
+	const y = logfA[0] * r2 + (logfA[1] * r + logfA[2])
+	return (y * r2 + (y0 + r)) as f32
+}
+
+/// x as k and z, x = 2^k z, z in [0x1.66p-1, 0x1.66p0), and z's interval of 16, ix x's bits.
+function reducef(ix: u32): [i32, f64, u32] {
+	const tmp = ix - 0x3f330000
+	return [(tmp as i32) >> 23, asF32(ix - (tmp & 0xff800000)) as f64, (tmp >> 19) % 16]
+}
+
+/// As logfTab, log2(c) for log(c).
+const log2fTab: f64[] = [1.398907162146528, -0.48430022186289673, 1.3403141896637998, -0.42257122959194704,
+	1.286432210124115, -0.3633754347673556, 1.2367150214269895, -0.30651309567405577, 1.1906977166711752,
+	-0.25180720160537634, 1.1479821020556429, -0.19910014943794563, 1.1082251448272158, -0.14825100623281615,
+	1.0711297413057381, -0.09913323807318392, 1.036437278977283, -0.051632812977629436, 1.0, 0.0, 0.9492859795739057,
+	0.07508531937943004, 0.8951049428609004, 0.15987125980713107, 0.8476821620351103, 0.2384046664317681,
+	0.8050314851692001, 0.31288288605863257, 0.7664671008843108, 0.38370422656453185, 0.731428603316328,
+	0.451211048935815]
+
+/// log2(1 + r), |r| < 1/(2 N).
+const log2fA: f64[] = [-0.36051725506874704, 0.4811247078767291, -0.7213476299867769, 1.4426950186867042]
+
+function log2F32(x: f32): f32 {
+	let ix = asU32(x)
+	if (ix == 0x3f800000) {
+		return 0.0
+	}
+	if (ix - 0x00800000 >= 0x7f800000 - 0x00800000) {
+		if (ix * 2 == 0) {
+			return -1.0 / 0.0
+		}
+		if (ix == 0x7f800000) {
+			return x
+		}
+		if ((ix & 0x80000000) != 0 || ix * 2 >= 0xff000000) {
+			return (x - x) / (x - x)
+		}
+		ix = asU32(x * two23) - (23 << 23)
+	}
+	// log2(x) = k + log2(c) + log2(z/c)
+	const [k, z, i] = reducef(ix)
+	const r = z * log2fTab[2 * i] - 1.0
+	const y0 = log2fTab[2 * i + 1] + (k as f64)
+	const r2 = r * r
+	const y = log2fA[0] * r2 + (log2fA[1] * r + log2fA[2])
+	return (y * r2 + (log2fA[3] * r + y0)) as f32
+}
+
+/// As log10's, for f32: log10(2) and 1/ln10 in two parts, the first with 12 trailing zero bits.
+const ivln10hif: f32 = 0.434326171875
+const ivln10lof: f32 = -3.1689971365267411e-05
+const log10_2hif: f32 = 0.30102920532226562
+const log10_2lof: f32 = 7.9034151667656261e-07
+/// As lg1, ..., |s| <= 0.1716, to 2^-34.24.
+const lg1f: f32 = 0.66666662693023682
+const lg2f: f32 = 0.40000972151756287
+const lg3f: f32 = 0.28498786687850952
+const lg4f: f32 = 0.24279078841209412
+
+/// As logTail, for f32.
+function logTailf(f: f32, hfsq: f32): f32 {
+	const s = f / (2.0 + f)
+	const z = s * s
+	const w = z * z
+	const t1 = w * (lg2f + w * lg4f)
+	const t2 = z * (lg1f + w * lg3f)
+	return s * (hfsq + (t2 + t1))
+}
+
+function log10F32(x: f32): f32 {
+	let ix = asU32(x)
+	let k = 0
+	if (ix < 0x00800000 || ix >> 31 != 0) {
+		if (ix << 1 == 0) {
+			return -1.0 / (x * x)
+		}
+		if (ix >> 31 != 0) {
+			return (x - x) / 0.0
+		}
+		k -= 25
+		ix = asU32(x * 33554432.0)
+	} else if (ix >= 0x7f800000) {
+		return x
+	} else if (ix == 0x3f800000) {
+		return 0.0
+	}
+	ix += 0x3f800000 - 0x3f3504f3
+	k += ((ix >> 23) as i32) - 0x7f
+	ix = (ix & 0x007fffff) + 0x3f3504f3
+	const f = asF32(ix) - 1.0
+	const hfsq: f32 = 0.5 * f * f
+	const hi = asF32(asU32(f - hfsq) & 0xfffff000)
+	const lo = f - hi - hfsq + logTailf(f, hfsq)
+	const dk = k as f32
+	return dk * log10_2lof + (lo + hi) * ivln10lof + lo * ivln10hif + hi * ivln10hif + dk * log10_2hif
+}
+
+function log1pF32(x: f32): f32 {
+	const ix = asU32(x)
+	let k = 1
+	let c: f32 = 0.0
+	let f: f32 = 0.0
+	if (ix < 0x3ed413d0 || ix >> 31 != 0) {
+		if (ix >= 0xbf800000) {
+			return if (x == -1.0) x / 0.0 else (x - x) / 0.0
+		}
+		if (ix << 1 < 0x33800000 << 1) {
+			// |x| < 2^-24
+			return x
+		}
+		if (ix <= 0xbe95f619) {
+			k = 0
+			f = x
+		}
+	} else if (ix >= 0x7f800000) {
+		return x
+	}
+	if (k != 0) {
+		const v = 1.0 + x
+		let iu = asU32(v) + (0x3f800000 - 0x3f3504f3)
+		k = ((iu >> 23) as i32) - 0x7f
+		if (k < 25) {
+			c = (if (k >= 2) 1.0 - (v - x) else x - (v - 1.0)) / v
+		}
+		iu = (iu & 0x007fffff) + 0x3f3504f3
+		f = asF32(iu) - 1.0
+	}
+	const hfsq: f32 = 0.5 * f * f
+	const dk = k as f32
+	return logTailf(f, hfsq) + (dk * ln2lof + c) - hfsq + f + dk * ln2hif
+}
+
+// # Powers
+//
+// x^y and 10^x. pow takes log(x) to 68 bits from a table and a polynomial, and e^(y log(x)) as exp does; powf the
+// same in base 2 and in f64.
+//
+// Ported from musl 1.2.5, MIT, Copyright © 2005-2020 Rich Felker, et al. (vendor/musl/COPYRIGHT). pow, powf and their
+// tables: Copyright (c) 2017-2018, Arm Limited, MIT.
+/// Where pow's x^y has the sign of x, for x < 0 and y an odd integer, the bias of its exp's k.
+const signBias: u64 = 0x800 << 7
+const signBiasf: u64 = 1 << 16
+
+/// log(1 + r) for |r| < 0x1.6bp-8, scaled as the evaluation is.
+const powA: f64[] = [-0.5, -0.6666666666666679, 0.5000000000000007, 0.7999999995323976, -0.6666666663487739,
+	-1.142909628459501, 1.0000415263675542]
+
+/// 1/c, log(c) rounded to a multiple of 2^-43, and the rest of log(c), of c near the center of each of N = 128
+/// intervals of [0x1.69555p-1, 0x1.69555p0]; 1/c is a multiple of 1/N or 1/2N, so that z/c - 1 is exact.
+const powTab: f64[] = [1.4140625, -0.3464667673462145, 5.929407345889625e-15, 1.40625, -0.34092658697056777,
+	-2.544157440035963e-14, 1.3984375, -0.3353555419211034, -3.443525940775045e-14, 1.390625, -0.3297532863724655,
+	-2.500123826022799e-15, 1.3828125, -0.32411946865420305, -8.929337133850617e-15, 1.375, -0.31845373111855224,
+	1.7625431312172662e-14, 1.3671875, -0.31275571000389846, 1.5688303180062087e-15, 1.359375, -0.3070250352949415,
+	2.9655274673691784e-14, 1.3515625, -0.3012613305781997, 3.7923164802093147e-14, 1.34375, -0.2954642128938758,
+	3.993416384387844e-14, 1.3359375, -0.28963329258306203, 1.9352855826489123e-14, 1.3359375, -0.28963329258306203,
+	1.9352855826489123e-14, 1.328125, -0.28376817313062475, -1.9852665484979036e-14, 1.3203125, -0.27786845100342816,
+	-2.814323765595281e-14, 1.3125, -0.2719337154836694, 2.7643769993528702e-14, 1.3046875, -0.2659635484970977,
+	-4.025092402293806e-14, 1.296875, -0.25995752443691345, -1.2621729398885316e-14, 1.2890625, -0.25391520998095984,
+	-3.600176732637335e-15, 1.2890625, -0.25391520998095984, -3.600176732637335e-15, 1.28125, -0.2478361639045943,
+	1.3029797173308663e-14, 1.2734375, -0.2417199368871934, 4.8230289429940886e-14, 1.265625, -0.23556607131274632,
+	-2.0592242769647135e-14, 1.2578125, -0.22937410106487732, 3.149265065191484e-14, 1.25, -0.22314355131425145,
+	4.169796584527195e-14, 1.25, -0.22314355131425145, 4.169796584527195e-14, 1.2421875, -0.21687393830063684,
+	2.2477465222466186e-14, 1.234375, -0.21056476910735, 3.6507188831790577e-16, 1.2265625, -0.2042155414286526,
+	-3.827767260205414e-14, 1.2265625, -0.2042155414286526, -3.827767260205414e-14, 1.21875, -0.19782574332987224,
+	-4.7641388950792196e-14, 1.2109375, -0.19139485299967873, 4.9278276214647115e-14, 1.203125, -0.18492233849406148,
+	4.9485167661250996e-14, 1.203125, -0.18492233849406148, 4.9485167661250996e-14, 1.1953125, -0.1784076574728033,
+	-1.5003333854266542e-14, 1.1875, -0.17185025692663203, -2.7194441649495324e-14, 1.1875, -0.17185025692663203,
+	-2.7194441649495324e-14, 1.1796875, -0.1652495728952772, -2.99659267292569e-14, 1.171875, -0.15860503017665906,
+	2.0472357800461955e-14, 1.171875, -0.15860503017665906, 2.0472357800461955e-14, 1.1640625, -0.15191604202584585,
+	3.879296723063646e-15, 1.15625, -0.1451820098444614, -3.6506824353335045e-14, 1.1484375, -0.13840232285906495,
+	-5.4183331379008994e-14, 1.1484375, -0.13840232285906495, -5.4183331379008994e-14, 1.140625, -0.131576357788731,
+	1.1729485484531301e-14, 1.140625, -0.131576357788731, 1.1729485484531301e-14, 1.1328125, -0.12470347850091912,
+	-3.811763084710266e-14, 1.125, -0.11778303565643, 4.654729747598445e-14, 1.125, -0.11778303565643,
+	4.654729747598445e-14, 1.1171875, -0.11081436634026431, -2.5799991283069902e-14, 1.109375, -0.10379679368168127,
+	3.7700471749674615e-14, 1.109375, -0.10379679368168127, 3.7700471749674615e-14, 1.1015625, -0.09672962645856842,
+	1.7306161136093256e-14, 1.1015625, -0.09672962645856842, 1.7306161136093256e-14, 1.09375, -0.089612158689647,
+	-4.012913552726574e-14, 1.0859375, -0.08244366921110213, 2.7541708360737882e-14, 1.0859375, -0.08244366921110213,
+	2.7541708360737882e-14, 1.078125, -0.07522342123763792, 5.0396178134370583e-14, 1.078125, -0.07522342123763792,
+	5.0396178134370583e-14, 1.0703125, -0.06795066190852594, 1.8195060030168815e-14, 1.0625, -0.06062462181648698,
+	5.213620639136504e-14, 1.0625, -0.06062462181648698, 5.213620639136504e-14, 1.0546875, -0.053244514518837605,
+	2.532168943117445e-14, 1.0546875, -0.053244514518837605, 2.532168943117445e-14, 1.046875, -0.045809536031242715,
+	-5.148849572685811e-14, 1.046875, -0.045809536031242715, -5.148849572685811e-14, 1.0390625, -0.038318864302141264,
+	4.6652946995830086e-15, 1.0390625, -0.038318864302141264, 4.6652946995830086e-15, 1.03125, -0.03077165866670839,
+	-4.529814257790929e-14, 1.03125, -0.03077165866670839, -4.529814257790929e-14, 1.0234375, -0.023167059281490765,
+	-4.361324067851568e-14, 1.015625, -0.015504186535963527, -1.7274567499706107e-15, 1.015625, -0.015504186535963527,
+	-1.7274567499706107e-15, 1.0078125, -0.0077821404420319595, -2.298941004620351e-14, 1.0078125,
+	-0.0077821404420319595, -2.298941004620351e-14, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.9921875, 0.007843177461040796,
+	-1.4902732911301337e-14, 0.984375, 0.01574835696817445, -3.527980389655325e-14, 0.9765625, 0.023716526617363343,
+	-4.730054772033249e-14, 0.96875, 0.03174869831457272, 7.580310369375161e-15, 0.9609375, 0.039845908547249564,
+	-4.9893776716773285e-14, 0.953125, 0.048009219186383234, -2.262629393030674e-14, 0.9453125, 0.056239718322899535,
+	-2.345674491018699e-14, 0.94140625, 0.06038051098892083, -1.3352588834854848e-14, 0.93359375, 0.06871389254808946,
+	-3.765296820388875e-14, 0.92578125, 0.07711730334438016, 5.1128335719851986e-14, 0.91796875, 0.08559193033545398,
+	-5.046674438470119e-14, 0.9140625, 0.08985632912185793, 3.1218748807418837e-15, 0.90625, 0.09844007281321865,
+	3.3871241029241416e-14, 0.8984375, 0.10709813555638448, -1.7376727386423858e-14, 0.89453125, 0.11145544092528326,
+	3.957125899799804e-14, 0.88671875, 0.12022742699821265, -5.2849453521890294e-14, 0.8828125, 0.12464244520731427,
+	-3.767012502308738e-14, 0.875, 0.13353139262449076, 3.1859736349078334e-14, 0.87109375, 0.13800567301939282,
+	5.0900642926060466e-14, 0.86328125, 0.14701474296180095, 8.710783796122478e-15, 0.859375, 0.15154989812720032,
+	6.157896229122976e-16, 0.8515625, 0.16068238169043525, 3.821577743916796e-14, 0.84765625, 0.16528009093906348,
+	3.9440046718453496e-14, 0.83984375, 0.17453941635187675, 2.2924522154618074e-14, 0.8359375, 0.17920142945774842,
+	-3.742530094732263e-14, 0.83203125, 0.18388527877016259, -2.5223102140407338e-14, 0.82421875, 0.1933193110035063,
+	-1.0320443688698849e-14, 0.8203125, 0.19806991376208316, 1.0634128304268335e-14, 0.8125, 0.20763936477828793,
+	-4.3425422595242564e-14, 0.80859375, 0.21245865121420593, -1.2527395755711364e-14, 0.8046875, 0.21730127569003344,
+	-5.204008743405884e-14, 0.80078125, 0.22216746534115828, -3.979844515951702e-15, 0.79296875, 0.2319714654378231,
+	-4.7955860343296286e-14, 0.7890625, 0.2369097470783572, 5.015686013791602e-16, 0.78515625, 0.24187253642048745,
+	-7.252318953240293e-16, 0.78125, 0.2468600779315011, 2.4688324156011588e-14, 0.7734375, 0.2569104137850218,
+	5.465121253624792e-15, 0.76953125, 0.26197371574153294, 4.102651071698446e-14, 0.765625, 0.2670627852490952,
+	-4.996736502345936e-14, 0.76171875, 0.27217788591576664, 4.903580708156347e-14, 0.7578125, 0.27731928541618345,
+	5.089628039500759e-14, 0.75390625, 0.28248725557466514, 1.1782016386565151e-14, 0.74609375, 0.29290401643288533,
+	4.727452940514406e-14, 0.7421875, 0.29815337231912054, -4.4204083338755686e-14, 0.73828125, 0.3034304294199046,
+	1.548345993498083e-14, 0.734375, 0.30873548164959175, 2.1522127491642888e-14, 0.73046875, 0.3140688276249648,
+	1.1054030169005386e-14, 0.7265625, 0.31943077076641657, -5.534326352070679e-14, 0.72265625, 0.3248216194012912,
+	-5.351646604259541e-14, 0.71875, 0.33024168687052224, 5.4612144489920215e-14, 0.71484375, 0.3356912916381134,
+	2.8136969901227338e-14, 0.7109375, 0.3411707574027787, -1.156568624616423e-14]
+
+/// log(x) as y + tail to about 68 bits, ix the bits of x, normalized: a subnormal's with a negative exponent.
+function logPow(ix: u64): [f64, f64] {
+	// x = 2^k z, z in [0x1.69555p-1, 0x1.69555p0), and log(x) = k ln2 + log(c) + log(z/c), r = z/c - 1
+	const tmp = ix - 0x3fe6955500000000
+	const i = 3 * ((tmp >> 45) % 128)
+	const k = ((tmp as i64) >> 52) as i32
+	const iz = ix - (tmp & 0xfff0000000000000)
+	const z = asF64(iz)
+	const kd = k as f64
+	const invc = powTab[i]
+	const logc = powTab[i + 1]
+	const logctail = powTab[i + 2]
+	// z split so that rhi, rlo and rhi^2 are exact, |rlo| <= |r|
+	const zhi = asF64((iz + (1 << 31)) & 0xffffffff00000000)
+	const zlo = z - zhi
+	const rhi = zhi * invc - 1.0
+	const rlo = zlo * invc
+	const r = rhi + rlo
+	// k ln2 + log(c) + r
+	const t1 = kd * logLn2hi + logc
+	const t2 = t1 + r
+	const lo1 = kd * logLn2lo + logctail
+	const lo2 = t1 - t2 + r
+	// and - r^2/2
+	const ar = powA[0] * r
+	const ar2 = r * ar
+	const ar3 = r * ar2
+	const arhi = powA[0] * rhi
+	const arhi2 = rhi * arhi
+	const hi = t2 + arhi2
+	const lo3 = rlo * (ar + arhi)
+	const lo4 = t2 - hi + arhi2
+	// and log(1 + r) - r + r^2/2
+	const p = ar3 * (powA[1] + r * powA[2] + ar2 * (powA[3] + r * powA[4] + ar2 * (powA[5] + r * powA[6])))
+	const lo = lo1 + lo2 + lo3 + lo4 + p
+	const y = hi + lo
+	return [y, hi - y + lo]
+}
+
+/// 0 if the finite, non-zero f64 of bits iy is no integer, 1 if odd, 2 if even.
+function checkint(iy: u64): i32 {
+	const e = ((iy >> 52) & 0x7ff) as i32
+	if (e < 0x3ff) {
+		return 0
+	}
+	if (e > 0x3ff + 52) {
+		return 2
+	}
+	const one: u64 = 1 << ((0x3ff + 52 - e) as u64)
+	if ((iy & (one - 1)) != 0) {
+		return 0
+	}
+	return if ((iy & one) != 0) 1 else 2
+}
+
+/// Whether the f64 of bits i is 0, inf or NaN.
+function zeroinfnan(i: u64): bool { return 2 * i - 1 >= 2 * 0x7ff0000000000000 - 1 }
+
+function powF64(x: f64, y: f64): f64 {
+	let ix = asU64(x)
+	const iy = asU64(y)
+	let topx = (ix >> 52) as u32
+	const topy = (iy >> 52) as u32
+	let bias: u64 = 0
+	if (topx - 0x001 >= 0x7ff - 0x001 || (topy & 0x7ff) - 0x3be >= 0x43e - 0x3be) {
+		// x < 2^-1022, or inf or NaN; or |y| < 2^-65, at least 2^63, or NaN: x^y is inf or 0 if
+		// |y| > 1075 ln2 2^53, and ±1 if |y| < 2^-54/1075
+		if (zeroinfnan(iy)) {
+			if (2 * iy == 0 || ix == 0x3ff0000000000000) {
+				return 1.0
+			}
+			if (2 * ix > 2 * 0x7ff0000000000000 || 2 * iy > 2 * 0x7ff0000000000000) {
+				return x + y
+			}
+			if (2 * ix == 2 * 0x3ff0000000000000) {
+				return 1.0
+			}
+			if ((2 * ix < 2 * 0x3ff0000000000000) == (iy >> 63 == 0)) {
+				return 0.0 // |x| < 1 and y = inf, or |x| > 1 and y = -inf
+			}
+			return y * y
+		}
+		if (zeroinfnan(ix)) {
+			const x2 = x * x
+			const s = if (ix >> 63 != 0 && checkint(iy) == 1) -x2 else x2
+			return if (iy >> 63 != 0) 1.0 / s else s
+		}
+		// x and y finite, not 0
+		if (ix >> 63 != 0) {
+			const yint = checkint(iy)
+			if (yint == 0) {
+				return (x - x) / (x - x)
+			}
+			if (yint == 1) {
+				bias = signBias
+			}
+			ix &= 0x7fffffffffffffff
+			topx &= 0x7ff
+		}
+		if ((topy & 0x7ff) - 0x3be >= 0x43e - 0x3be) {
+			// y is no odd integer, so bias is 0
+			if (ix == 0x3ff0000000000000) {
+				return 1.0
+			}
+			if ((topy & 0x7ff) < 0x3be) {
+				// |y| < 2^-65: x^y ~ 1 + y log(x)
+				return if (ix > 0x3ff0000000000000) 1.0 + y else 1.0 - y
+			}
+			return if ((ix > 0x3ff0000000000000) == (topy < 0x800)) 1.0 / 0.0 else 0.0
+		}
+		if (topx == 0) {
+			// a subnormal x, normalized to a negative exponent
+			ix = (asU64(x * 4503599627370496.0) & 0x7fffffffffffffff) - (52 << 52)
+		}
+	}
+	const [hi, lo] = logPow(ix)
+	// y (hi + lo) as ehi + elo, y and hi split so that yhi lhi is exact
+	const yhi = asF64(iy & 0xfffffffff8000000)
+	const ylo = y - yhi
+	const lhi = asF64(asU64(hi) & 0xfffffffff8000000)
+	const llo = hi - lhi + lo
+	const ehi = yhi * lhi
+	const elo = ylo * lhi + y * llo
+	return expPow(ehi, elo, bias)
+}
+
+/// log2(1 + r), |r| < 1/(2 N).
+const powfA: f64[] = [0.288457581109214, -0.36092606229713164, 0.480898481472577, -0.7213474675006291,
+	1.4426950408774342]
+
+/// log2(x) in f64, ix the bits of x, normalized: a subnormal's with a negative exponent.
+function log2Powf(ix: u32): f64 {
+	const [k, z, i] = reducef(ix)
+	const r = z * log2fTab[2 * i] - 1.0
+	const y0 = log2fTab[2 * i + 1] + (k as f64)
+	const r2 = r * r
+	const y = powfA[0] * r + powfA[1]
+	const p = powfA[2] * r + powfA[3]
+	const r4 = r2 * r2
+	let q = powfA[4] * r + y0
+	q = p * r2 + q
+	return y * r4 + q
+}
+
+/// As checkint, of an f32's bits.
+function checkintf(iy: u32): i32 {
+	const e = ((iy >> 23) & 0xff) as i32
+	if (e < 0x7f) {
+		return 0
+	}
+	if (e > 0x7f + 23) {
+		return 2
+	}
+	const one: u32 = 1 << ((0x7f + 23 - e) as u32)
+	if ((iy & (one - 1)) != 0) {
+		return 0
+	}
+	return if ((iy & one) != 0) 1 else 2
+}
+
+function zeroinfnanf(i: u32): bool { return 2 * i - 1 >= 2 * 0x7f800000 - 1 }
+
+function powF32(x: f32, y: f32): f32 {
+	let ix = asU32(x)
+	const iy = asU32(y)
+	let bias: u64 = 0
+	if (ix - 0x00800000 >= 0x7f800000 - 0x00800000 || zeroinfnanf(iy)) {
+		// x < 2^-126, or inf or NaN; or y 0, inf or NaN
+		if (zeroinfnanf(iy)) {
+			if (2 * iy == 0 || ix == 0x3f800000) {
+				return 1.0
+			}
+			if (2 * ix > 2 * 0x7f800000 || 2 * iy > 2 * 0x7f800000) {
+				return x + y
+			}
+			if (2 * ix == 2 * 0x3f800000) {
+				return 1.0
+			}
+			if ((2 * ix < 2 * 0x3f800000) == ((iy & 0x80000000) == 0)) {
+				return 0.0
+			}
+			return y * y
+		}
+		if (zeroinfnanf(ix)) {
+			const x2 = x * x
+			const s = if ((ix & 0x80000000) != 0 && checkintf(iy) == 1) -x2 else x2
+			return if ((iy & 0x80000000) != 0) 1.0 / s else s
+		}
+		if ((ix & 0x80000000) != 0) {
+			const yint = checkintf(iy)
+			if (yint == 0) {
+				return (x - x) / (x - x)
+			}
+			if (yint == 1) {
+				bias = signBiasf
+			}
+			ix &= 0x7fffffff
+		}
+		if (ix < 0x00800000) {
+			ix = (asU32(x * 8388608.0) & 0x7fffffff) - (23 << 23)
+		}
+	}
+	const ylogx = (y as f64) * log2Powf(ix) // not overflowing, y an f32
+	if ((asU64(ylogx) >> 47 & 0xffff) >= asU64(126.0) >> 47) {
+		// |y log2(x)| >= 126
+		if (ylogx > 127.99999995700433) {
+			return (if (bias != 0) -1.0 / 0.0 else 1.0 / 0.0) as f32
+		}
+		if (ylogx <= -150.0) {
+			return if (bias != 0) -0.0 else 0.0
+		}
+	}
+	return exp2fTail(ylogx, bias)
+}
+
+/// Powers of ten exact as f64, 10^-15 to 10^15.
+const p10: f64[] = [1e-15, 1e-14, 1e-13, 1e-12, 1e-11, 1e-10, 1e-9, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0,
+	1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15]
+
+const log2_10 = 3.32192809488736234787031942948939
+
+/// 10^x: of x's integral part n from a table if |n| < 16, else pow(10, x).
+function exp10F64(x: f64): f64 {
+	const [y, n] = modfF64(x)
+	if ((asU64(n) >> 52 & 0x7ff) < 0x3ff + 4) {
+		const p = p10[(n as i32) + 15]
+		return if (y == 0.0) p else exp2F64(log2_10 * y) * p
+	}
+	return powF64(10.0, x)
+}
+
+/// The f32 powers of ten, 10^-7 to 10^7, each rounded once.
+const p10f: f32[] = [1.0000000116860974e-07, 9.9999999747524271e-07, 9.9999997473787516e-06, 9.9999997473787516e-05,
+	0.0010000000474974513, 0.0099999997764825821, 0.10000000149011612, 1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0,
+	1000000.0, 10000000.0]
+
+const log2_10f: f32 = 3.3219280242919922
+
+function exp10F32(x: f32): f32 {
+	const [y, n] = modfF32(x)
+	if ((asU32(n) >> 23 & 0xff) < 0x7f + 3) {
+		const p = p10f[(n as i32) + 7]
+		return if (y == 0.0) p else exp2F32(log2_10f * y) * p
+	}
+	return exp2F64(log2_10 * (x as f64)) as f32
+}
+
+// # Hyperbolic functions
+//
+// The hyperbolic functions and their inverses, of exp, expm1, log and log1p.
+//
+// Ported from musl 1.2.5, MIT, Copyright © 2005-2020 Rich Felker, et al. (vendor/musl/COPYRIGHT).
+/// ln2 rounded to an f32.
+const ln2f: f32 = 0.69314718246459961
+
+/// sign e^x/2 for x at least log of the greatest float: e^(x - k ln2) 2^(k-1), k = 2043 such that k ln2 rounds closely,
+/// 2^(k-1) as two factors, for it overflows.
+function expo2(x: f64, sign: f64): f64 {
+	const scale = asF64(0x7fc0000000000000) // 2^((k-1)/2)
+	return expF64(x - 1416.0996898839683) * (sign * scale) * scale
+}
+
+/// expo2 in f32, k = 235.
+function expo2f(x: f32, sign: f32): f32 {
+	const scale = asF32(0x7a000000)
+	return expF32(x - 162.88958740234375) * (sign * scale) * scale
+}
+
+function sinhF64(x: f64): f64 {
+	const h = if (asU64(x) >> 63 != 0) -0.5 else 0.5
+	const ax = asF64(asU64(x) & 0x7fffffffffffffff)
+	const w = (asU64(ax) >> 32) as u32
+	if (w < 0x40862e42) {
+		// |x| < log of the greatest f64
+		const t = expm1F64(ax)
+		if (w < 0x3ff00000) {
+			if (w < 0x3ff00000 - (26 << 20)) {
+				return x
+			}
+			return h * (2.0 * t - t * t / (t + 1.0))
+		}
+		return h * (t + t / (t + 1.0))
+	}
+	return expo2(ax, 2.0 * h)
+}
+
+function sinhF32(x: f32): f32 {
+	const h: f32 = if (asU32(x) >> 31 != 0) -0.5 else 0.5
+	const w = asU32(x) & 0x7fffffff
+	const ax = asF32(w)
+	if (w < 0x42b17217) {
+		const t = expm1F32(ax)
+		if (w < 0x3f800000) {
+			if (w < 0x3f800000 - (12 << 23)) {
+				return x
+			}
+			return h * (2.0 * t - t * t / (t + 1.0))
+		}
+		return h * (t + t / (t + 1.0))
+	}
+	return expo2f(ax, 2.0 * h)
+}
+
+function coshF64(x: f64): f64 {
+	const ax = asF64(asU64(x) & 0x7fffffffffffffff)
+	const w = (asU64(ax) >> 32) as u32
+	if (w < 0x3fe62e42) {
+		// |x| < ln2
+		if (w < 0x3ff00000 - (26 << 20)) {
+			return 1.0
+		}
+		const t = expm1F64(ax)
+		return 1.0 + t * t / (2.0 * (1.0 + t))
+	}
+	if (w < 0x40862e42) {
+		const t = expF64(ax)
+		return 0.5 * (t + 1.0 / t)
+	}
+	return expo2(ax, 1.0)
+}
+
+function coshF32(x: f32): f32 {
+	const w = asU32(x) & 0x7fffffff
+	const ax = asF32(w)
+	if (w < 0x3f317217) {
+		if (w < 0x3f800000 - (12 << 23)) {
+			return 1.0
+		}
+		const t = expm1F32(ax)
+		return 1.0 + t * t / (2.0 * (1.0 + t))
+	}
+	if (w < 0x42b17217) {
+		const t = expF32(ax)
+		return 0.5 * (t + 1.0 / t)
+	}
+	return expo2f(ax, 1.0)
+}
+
+/// (e^2x - 1)/(e^2x + 1), from expm1 of 2|x| or of -2|x|.
+function tanhF64(x: f64): f64 {
+	const ax = asF64(asU64(x) & 0x7fffffffffffffff)
+	const w = (asU64(ax) >> 32) as u32
+	let t = ax
+	if (w > 0x3fe193ea) {
+		// |x| > log(3)/2, or NaN
+		if (w > 0x40340000) {
+			t = 1.0 - 0.0 / ax // |x| > 20, or NaN
+		} else {
+			t = 1.0 - 2.0 / (expm1F64(2.0 * ax) + 2.0)
+		}
+	} else if (w > 0x3fd058ae) {
+		// |x| > log(5/3)/2
+		const e = expm1F64(2.0 * ax)
+		t = e / (e + 2.0)
+	} else if (w >= 0x00100000) {
+		const e = expm1F64(-2.0 * ax)
+		t = -e / (e + 2.0)
+	}
+	return if (asU64(x) >> 63 != 0) -t else t
+}
+
+function tanhF32(x: f32): f32 {
+	const w = asU32(x) & 0x7fffffff
+	const ax = asF32(w)
+	let t = ax
+	if (w > 0x3f0c9f54) {
+		if (w > 0x41200000) {
+			t = 1.0 + 0.0 / ax // |x| > 10, or NaN
+		} else {
+			t = 1.0 - 2.0 / (expm1F32(2.0 * ax) + 2.0)
+		}
+	} else if (w > 0x3e82c578) {
+		const e = expm1F32(2.0 * ax)
+		t = e / (e + 2.0)
+	} else if (w >= 0x00800000) {
+		const e = expm1F32(-2.0 * ax)
+		t = -e / (e + 2.0)
+	}
+	return if (asU32(x) >> 31 != 0) -t else t
+}
+
+/// log(|x| + sqrt(x^2 + 1)), of x's sign.
+function asinhF64(x: f64): f64 {
+	const e = asU64(x) >> 52 & 0x7ff
+	const ax = asF64(asU64(x) & 0x7fffffffffffffff)
+	let y = ax
+	if (e >= 0x3ff + 26) {
+		y = logF64(ax) + ln2 // |x| >= 2^26, inf or NaN
+	} else if (e >= 0x3ff + 1) {
+		y = logF64(2.0 * ax + 1.0 / (sqrtF64(ax * ax + 1.0) + ax))
+	} else if (e >= 0x3ff - 26) {
+		y = log1pF64(ax + ax * ax / (sqrtF64(ax * ax + 1.0) + 1.0))
+	}
+	return if (asU64(x) >> 63 != 0) -y else y
+}
+
+function asinhF32(x: f32): f32 {
+	const i = asU32(x) & 0x7fffffff
+	const ax = asF32(i)
+	let y = ax
+	if (i >= 0x3f800000 + (12 << 23)) {
+		y = logF32(ax) + ln2f
+	} else if (i >= 0x3f800000 + (1 << 23)) {
+		y = logF32(2.0 * ax + 1.0 / (sqrtF32(ax * ax + 1.0) + ax))
+	} else if (i >= 0x3f800000 - (12 << 23)) {
+		y = log1pF32(ax + ax * ax / (sqrtF32(ax * ax + 1.0) + 1.0))
+	}
+	return if (asU32(x) >> 31 != 0) -y else y
+}
+
+/// log(x + sqrt(x^2 - 1)); NaN for x < 1.
+function acoshF64(x: f64): f64 {
+	const e = asU64(x) >> 52 & 0x7ff
+	if (e < 0x3ff + 1) {
+		// |x| < 2
+		return log1pF64(x - 1.0 + sqrtF64((x - 1.0) * (x - 1.0) + 2.0 * (x - 1.0)))
+	}
+	if (e < 0x3ff + 26) {
+		return logF64(2.0 * x - 1.0 / (x + sqrtF64(x * x - 1.0)))
+	}
+	return logF64(x) + ln2
+}
+
+function acoshF32(x: f32): f32 {
+	const i = asU32(x)
+	if ((i & 0x7fffffff) < 0x3f800000 + (1 << 23)) {
+		return log1pF32(x - 1.0 + sqrtF32((x - 1.0) * (x - 1.0) + 2.0 * (x - 1.0)))
+	}
+	if (i < 0x3f800000 + (12 << 23)) {
+		// 2 <= x < 2^12
+		return logF32(2.0 * x - 1.0 / (x + sqrtF32(x * x - 1.0)))
+	}
+	return logF32(x) + ln2f
+}
+
+/// log((1 + x)/(1 - x))/2, as log1p(2x/(1 - x))/2.
+function atanhF64(x: f64): f64 {
+	const e = asU64(x) >> 52 & 0x7ff
+	const ax = asF64(asU64(x) & 0x7fffffffffffffff)
+	let y = ax
+	if (e >= 0x3ff - 1) {
+		y = 0.5 * log1pF64(2.0 * (ax / (1.0 - ax)))
+	} else if (e >= 0x3ff - 32) {
+		y = 0.5 * log1pF64(2.0 * ax + 2.0 * ax * ax / (1.0 - ax)) // |x| < 1/2
+	}
+	return if (asU64(x) >> 63 != 0) -y else y
+}
+
+function atanhF32(x: f32): f32 {
+	const i = asU32(x) & 0x7fffffff
+	const ax = asF32(i)
+	let y = ax
+	if (i >= 0x3f800000 - (1 << 23)) {
+		y = 0.5 * log1pF32(2.0 * (ax / (1.0 - ax)))
+	} else if (i >= 0x3f800000 - (32 << 23)) {
+		y = 0.5 * log1pF32(2.0 * ax + 2.0 * ax * ax / (1.0 - ax))
+	}
+	return if (asU32(x) >> 31 != 0) -y else y
+}
+
+// # The error function
+//
+// The error function erf(x) = 2/sqrt(pi) ∫₀ˣ e^(-t²) dt and its complement erfc(x) = 1 - erf(x). Below |x| =
+// 0.84375, x + x R(x²); to 1.25, a rational function about 1; beyond, erfc(x) ~ e^(-x² - 0.5625 + R(1/x²)) / x, with
+// e^(-x²) split so as not to lose x²'s low bits.
+//
+// Ported from musl 1.2.5, MIT, Copyright © 2005-2020 Rich Felker, et al. (vendor/musl/COPYRIGHT), from FreeBSD:
+// Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved. Developed at SunPro, a Sun Microsystems, Inc.
+// business. Permission to use, copy, modify, and distribute this software is freely granted, provided that this notice
+// is preserved. erff and erfcf converted to float by Ian Lance Taylor, Cygnus Support.
+/// erf(1) to 24 bits.
+const erx = 0.8450629115104675
+const efx8 = 1.0270333367641007
+// erf(x) ~ x + x pp(x²)/qq(x²) on [0, 0.84375]
+const pp0 = 0.12837916709551256
+const pp1 = -0.3250421072470015
+const pp2 = -0.02848174957559851
+const pp3 = -0.005770270296489442
+const pp4 = -2.3763016656650163e-05
+const qq1 = 0.39791722395915535
+const qq2 = 0.0650222499887673
+const qq3 = 0.005081306281875766
+const qq4 = 0.00013249473800432164
+const qq5 = -3.960228278775368e-06
+// erf(1 + s) - erx ~ pa(s)/qa(s) on [0.84375, 1.25]
+const pa0 = -0.0023621185607526594
+const pa1 = 0.41485611868374833
+const pa2 = -0.3722078760357013
+const pa3 = 0.31834661990116175
+const pa4 = -0.11089469428239668
+const pa5 = 0.035478304325618236
+const pa6 = -0.002166375594868791
+const qa1 = 0.10642088040084423
+const qa2 = 0.540397917702171
+const qa3 = 0.07182865441419627
+const qa4 = 0.12617121980876164
+const qa5 = 0.01363708391202905
+const qa6 = 0.011984499846799107
+// log(x erfc(x)) + x² + 0.5625 ~ ra(z)/sa(z), z = 1/x², on [1.25, 1/0.35]
+const ra0 = -0.009864944034847148
+const ra1 = -0.6938585727071818
+const ra2 = -10.558626225323291
+const ra3 = -62.375332450326006
+const ra4 = -162.39666946257347
+const ra5 = -184.60509290671104
+const ra6 = -81.2874355063066
+const ra7 = -9.814329344169145
+const sa1 = 19.651271667439257
+const sa2 = 137.65775414351904
+const sa3 = 434.56587747522923
+const sa4 = 645.3872717332679
+const sa5 = 429.00814002756783
+const sa6 = 108.63500554177944
+const sa7 = 6.570249770319282
+const sa8 = -0.0604244152148581
+// ... and ~ rb(z)/sb(z) on [1/0.35, 28]
+const rb0 = -0.0098649429247001
+const rb1 = -0.799283237680523
+const rb2 = -17.757954917754752
+const rb3 = -160.63638485582192
+const rb4 = -637.5664433683896
+const rb5 = -1025.0951316110772
+const rb6 = -483.5191916086514
+const sb1 = 30.33806074348246
+const sb2 = 325.7925129965739
+const sb3 = 1536.729586084437
+const sb4 = 3199.8582195085955
+const sb5 = 2553.0504064331644
+const sb6 = 474.52854120695537
+const sb7 = -22.44095244658582
+
+/// pp(z)/qq(z).
+function pq(z: f64): f64 {
+	return (pp0 + z * (pp1 + z * (pp2 + z * (pp3 + z * pp4))))
+		/ (1.0 + z * (qq1 + z * (qq2 + z * (qq3 + z * (qq4 + z * qq5)))))
+}
+
+/// erfc(x), |x| in [0.84375, 1.25).
+function erfc1(x: f64): f64 {
+	const s = fabs(x) - 1.0
+	const p = pa0 + s * (pa1 + s * (pa2 + s * (pa3 + s * (pa4 + s * (pa5 + s * pa6)))))
+	const q = 1.0 + s * (qa1 + s * (qa2 + s * (qa3 + s * (qa4 + s * (qa5 + s * qa6)))))
+	return 1.0 - erx - p / q
+}
+
+/// erfc(|x|), |x| in [0.84375, 28), ix its high word less the sign.
+function erfc2(ix: u32, x0: f64): f64 {
+	if (ix < 0x3ff40000) {
+		return erfc1(x0)
+	}
+	const x = fabs(x0)
+	const s = 1.0 / (x * x)
+	let r = 0.0
+	let q = 0.0
+	if (ix < 0x4006db6d) {
+		// |x| < 1/0.35
+		r = ra0 + s * (ra1 + s * (ra2 + s * (ra3 + s * (ra4 + s * (ra5 + s * (ra6 + s * ra7))))))
+		q = 1.0 + s * (sa1 + s * (sa2 + s * (sa3 + s * (sa4 + s * (sa5 + s * (sa6 + s * (sa7 + s * sa8)))))))
+	} else {
+		r = rb0 + s * (rb1 + s * (rb2 + s * (rb3 + s * (rb4 + s * (rb5 + s * rb6)))))
+		q = 1.0 + s * (sb1 + s * (sb2 + s * (sb3 + s * (sb4 + s * (sb5 + s * (sb6 + s * sb7))))))
+	}
+	const z = asF64(asU64(x) & 0xffffffff00000000) // so that z² is exact, and -x² = -z² + (z - x)(z + x)
+	return expF64(-z * z - 0.5625) * expF64((z - x) * (z + x) + r / q) / x
+}
+
+function erfF64(x: f64): f64 {
+	const sign = (asU64(x) >> 63) as i32
+	const ix = ((asU64(x) >> 32) as u32) & 0x7fffffff
+	if (ix >= 0x7ff00000) {
+		return ((1 - 2 * sign) as f64) + 1.0 / x // ±1, or NaN
+	}
+	if (ix < 0x3feb0000) {
+		// |x| < 0.84375
+		if (ix < 0x3e300000) {
+			return 0.125 * (8.0 * x + efx8 * x) // |x| < 2^-28
+		}
+		return x + x * pq(x * x)
+	}
+	const y = if (ix < 0x40180000) 1.0 - erfc2(ix, x) else 1.0 // |x| < 6
+	return if (sign != 0) -y else y
+}
+
+function erfcF64(x: f64): f64 {
+	const sign = (asU64(x) >> 63) as i32
+	const ix = ((asU64(x) >> 32) as u32) & 0x7fffffff
+	if (ix >= 0x7ff00000) {
+		return ((2 * sign) as f64) + 1.0 / x // 0 or 2, or NaN
+	}
+	if (ix < 0x3feb0000) {
+		// |x| < 0.84375
+		if (ix < 0x3c700000) {
+			return 1.0 - x // |x| < 2^-56
+		}
+		const y = pq(x * x)
+		if (sign != 0 || ix < 0x3fd00000) {
+			return 1.0 - (x + x * y) // x < 1/4
+		}
+		return 0.5 - (x - 0.5 + x * y)
+	}
+	if (ix < 0x403c0000) {
+		// |x| < 28
+		return if (sign != 0) 2.0 - erfc2(ix, x) else erfc2(ix, x)
+	}
+	return if (sign != 0) 2.0 else 0.0
+}
+
+const erxf: f32 = 0.8450629115104675
+const efx8f: f32 = 1.0270333290100098
+const pp0f: f32 = 0.12837916612625122
+const pp1f: f32 = -0.32504209876060486
+const pp2f: f32 = -0.028481749817728996
+const pp3f: f32 = -0.005770270247012377
+const pp4f: f32 = -2.3763017452438362e-05
+const qq1f: f32 = 0.3979172110557556
+const qq2f: f32 = 0.06502225250005722
+const qq3f: f32 = 0.0050813062116503716
+const qq4f: f32 = 0.0001324947370449081
+const qq5f: f32 = -3.9602282413397916e-06
+const pa0f: f32 = -0.0023621185682713985
+const pa1f: f32 = 0.41485610604286194
+const pa2f: f32 = -0.3722078800201416
+const pa3f: f32 = 0.31834661960601807
+const pa4f: f32 = -0.11089469492435455
+const pa5f: f32 = 0.03547830507159233
+const pa6f: f32 = -0.002166375517845154
+const qa1f: f32 = 0.10642088204622269
+const qa2f: f32 = 0.5403979420661926
+const qa3f: f32 = 0.07182865589857101
+const qa4f: f32 = 0.12617121636867523
+const qa5f: f32 = 0.01363708358258009
+const qa6f: f32 = 0.011984500102698803
+const ra0f: f32 = -0.009864944033324718
+const ra1f: f32 = -0.6938585638999939
+const ra2f: f32 = -10.558626174926758
+const ra3f: f32 = -62.37533187866211
+const ra4f: f32 = -162.39666748046875
+const ra5f: f32 = -184.60508728027344
+const ra6f: f32 = -81.28743743896484
+const ra7f: f32 = -9.814329147338867
+const sa1f: f32 = 19.65127182006836
+const sa2f: f32 = 137.6577606201172
+const sa3f: f32 = 434.5658874511719
+const sa4f: f32 = 645.3872680664062
+const sa5f: f32 = 429.0081481933594
+const sa6f: f32 = 108.63500213623047
+const sa7f: f32 = 6.570249557495117
+const sa8f: f32 = -0.06042441353201866
+const rb0f: f32 = -0.009864943102002144
+const rb1f: f32 = -0.7992832660675049
+const rb2f: f32 = -17.75795555114746
+const rb3f: f32 = -160.63638305664062
+const rb4f: f32 = -637.5664672851562
+const rb5f: f32 = -1025.0950927734375
+const rb6f: f32 = -483.5191955566406
+const sb1f: f32 = 30.33806037902832
+const sb2f: f32 = 325.7925109863281
+const sb3f: f32 = 1536.7296142578125
+const sb4f: f32 = 3199.858154296875
+const sb5f: f32 = 2553.05029296875
+const sb6f: f32 = 474.5285339355469
+const sb7f: f32 = -22.44095230102539
+
+function pqf(z: f32): f32 {
+	return (pp0f + z * (pp1f + z * (pp2f + z * (pp3f + z * pp4f))))
+		/ (1.0 + z * (qq1f + z * (qq2f + z * (qq3f + z * (qq4f + z * qq5f)))))
+}
+
+function erfc1f(x: f32): f32 {
+	const s = fabsf(x) - 1.0
+	const p = pa0f + s * (pa1f + s * (pa2f + s * (pa3f + s * (pa4f + s * (pa5f + s * pa6f)))))
+	const q = 1.0 + s * (qa1f + s * (qa2f + s * (qa3f + s * (qa4f + s * (qa5f + s * qa6f)))))
+	return 1.0 - erxf - p / q
+}
+
+function erfc2f(ix: u32, x0: f32): f32 {
+	if (ix < 0x3fa00000) {
+		return erfc1f(x0)
+	}
+	const x = fabsf(x0)
+	const s = 1.0 / (x * x)
+	let r: f32 = 0.0
+	let q: f32 = 0.0
+	if (ix < 0x4036db6d) {
+		r = ra0f + s * (ra1f + s * (ra2f + s * (ra3f + s * (ra4f + s * (ra5f + s * (ra6f + s * ra7f))))))
+		q = 1.0 + s * (sa1f + s * (sa2f + s * (sa3f + s * (sa4f + s * (sa5f + s * (sa6f + s * (sa7f + s * sa8f)))))))
+	} else {
+		r = rb0f + s * (rb1f + s * (rb2f + s * (rb3f + s * (rb4f + s * (rb5f + s * rb6f)))))
+		q = 1.0 + s * (sb1f + s * (sb2f + s * (sb3f + s * (sb4f + s * (sb5f + s * (sb6f + s * sb7f))))))
+	}
+	const z = asF32(asU32(x) & 0xffffe000)
+	return expF32(-z * z - 0.5625) * expF32((z - x) * (z + x) + r / q) / x
+}
+
+function erfF32(x: f32): f32 {
+	const sign = (asU32(x) >> 31) as i32
+	const ix = asU32(x) & 0x7fffffff
+	if (ix >= 0x7f800000) {
+		return ((1 - 2 * sign) as f32) + 1.0 / x
+	}
+	if (ix < 0x3f580000) {
+		if (ix < 0x31800000) {
+			return 0.125 * (8.0 * x + efx8f * x)
+		}
+		return x + x * pqf(x * x)
+	}
+	const y = if (ix < 0x40c00000) 1.0 - erfc2f(ix, x) else 1.0
+	return if (sign != 0) -y else y
+}
+
+function erfcF32(x: f32): f32 {
+	const sign = (asU32(x) >> 31) as i32
+	const ix = asU32(x) & 0x7fffffff
+	if (ix >= 0x7f800000) {
+		return ((2 * sign) as f32) + 1.0 / x
+	}
+	if (ix < 0x3f580000) {
+		if (ix < 0x23800000) {
+			return 1.0 - x
+		}
+		const y = pqf(x * x)
+		if (sign != 0 || ix < 0x3e800000) {
+			return 1.0 - (x + x * y)
+		}
+		return 0.5 - (x - 0.5 + x * y)
+	}
+	if (ix < 0x41e00000) {
+		return if (sign != 0) 2.0 - erfc2f(ix, x) else erfc2f(ix, x)
+	}
+	return if (sign != 0) 2.0 else 0.0
+}
+
+// # The gamma function
+//
+// The gamma function and the logarithm of its magnitude. tgamma is Lanczos's approximation with g = 6.0247,
+// reflected for x < 0; tgammaf is tgamma rounded. lgamma reduces x below 8 to [2, 3) and fits polynomials there and
+// about its minimum, takes Stirling's series beyond, and reflects for x < 0 through sin(pi x), whose sign is
+// gamma's.
+//
+// Ported from musl 1.2.5, MIT, Copyright © 2005-2020 Rich Felker, et al. (vendor/musl/COPYRIGHT); tgamma is musl's own,
+// its constants from Boost and Python. lgamma is from FreeBSD: Copyright (C) 1993 by Sun Microsystems, Inc. All rights
+// reserved. Developed at SunSoft, a Sun Microsystems, Inc. business. Permission to use, copy, modify, and distribute
+// this software is freely granted, provided that this notice is preserved. lgammaf converted to float by Ian Lance
+// Taylor, Cygnus Support.
+/// sin(pi x), x > 2^-100, of x mod 2 reduced to within 1/4 of a multiple of 1/2; of either sign where it is 0.
+function sinpi(x0: f64): f64 {
+	let x = 2.0 * (x0 * 0.5 - floorF64(x0 * 0.5))
+	const n = (((x * 4.0) as i32) + 1) / 2
+	x = (x - (n as f64) * 0.5) * pi
+	return switch (n) {
+		case 1: kCos(x, 0.0)
+		case 2: kSin(-x, 0.0, 0)
+		case 3: -kCos(x, 0.0)
+		default: kSin(x, 0.0, 0)
+	}
+}
+
+/// g - 1/2, where Lanczos's sum S is fitted for g.
+const gmhalf = 5.52468004077673
+
+/// S(x) = Snum(x)/Sden(x), the coefficients from the constant term up.
+const snum: f64[] = [23531376880.41076, 42919803642.6491, 35711959237.35567, 17921034426.03721, 6039542586.352028,
+	1439720407.3117216, 248874557.86205417, 31426415.585400194, 2876370.6289353725, 186056.26539522348,
+	8071.672002365816, 210.82427775157936, 2.5066282746310002]
+
+const sden: f64[] = [0.0, 39916800.0, 120543840.0, 150917976.0, 105258076.0, 45995730.0, 13339535.0, 2637558.0,
+	357423.0, 32670.0, 1925.0, 66.0, 1.0]
+
+/// (n-1)! for n from 1 to 23.
+const fact: f64[] = [1.0, 1.0, 2.0, 6.0, 24.0, 120.0, 720.0, 5040.0, 40320.0, 362880.0, 3628800.0, 39916800.0,
+	479001600.0, 6227020800.0, 87178291200.0, 1307674368000.0, 20922789888000.0, 355687428096000.0, 6402373705728000.0,
+	1.21645100408832e+17, 2.43290200817664e+18, 5.109094217170944e+19, 1.1240007277776077e+21]
+
+/// Lanczos's sum, x > 0: by Horner in x below 8, else in 1/x, as not to overflow.
+function lanczos(x: f64): f64 {
+	let num = 0.0
+	let den = 0.0
+	const n = snum.length - 1
+	for (const k of 0 ... n) {
+		const i = if (x < 8.0) n - k else k
+		num = (if (x < 8.0) num * x else num / x) + snum[i]
+		den = (if (x < 8.0) den * x else den / x) + sden[i]
+	}
+	return num / den
+}
+
+/// Γ(x): exact at the integers to 23; infinite at ±0 and beyond 171.62, NaN at the negative integers.
+function tgammaF64(x: f64): f64 {
+	const ix = ((asU64(x) >> 32) as u32) & 0x7fffffff
+	const sign = asU64(x) >> 63 != 0
+	if (ix >= 0x7ff00000) {
+		return x + inf // NaN at -infinity
+	}
+	if (ix < (0x3ff - 54) << 20) {
+		return 1.0 / x // |x| < 2^-54: 1/x
+	}
+	if (x == floorF64(x)) {
+		if (sign) {
+			return (x - x) / (x - x)
+		}
+		if (x <= 23.0) {
+			return fact[(x as i32) - 1]
+		}
+	}
+	if (ix >= 0x40670000) {
+		// |x| >= 184: overflows, or underflows to 0 of gamma's sign
+		if (sign) {
+			return if (floorF64(x) * 0.5 == floorF64(x * 0.5)) 0.0 else -0.0
+		}
+		return x * asF64(0x7fe0000000000000) // 2^1023
+	}
+	const absx = if (sign) -x else x
+	// y = x + g - 1/2, and its rounding error dy
+	let y = absx + gmhalf
+	let dy = if (absx > gmhalf) y - absx - gmhalf else y - gmhalf - absx
+	let z = absx - 0.5
+	let r = lanczos(absx) * expF64(-y)
+	if (x < 0.0) {
+		// Γ(x) Γ(-x) = -pi / (x sin(pi x)); sin(pi x) is not 0, for the integers are done
+		r = -pi / (sinpi(absx) * absx * r)
+		dy = -dy
+		z = -z
+	}
+	r += dy * (gmhalf + 0.5) * r / y
+	z = powF64(y, 0.5 * z)
+	return r * z * z
+}
+
+function tgammaF32(x: f32): f32 { return tgammaF64(x as f64) as f32 }
+
+// lgamma: polynomials about 2 (a), about the minimum tc (t), about 1 (u/v), on [2, 3) (s/r) and Stirling's (w);
+// tf = lgamma(tc), tt the negated tail of tf.
+const a0 = 0.07721566490153287
+const a1 = 0.3224670334241136
+const a2 = 0.06735230105312927
+const a3 = 0.020580808432516733
+const a4 = 0.007385550860814029
+const a5 = 0.0028905138367341563
+const a6 = 0.0011927076318336207
+const a7 = 0.0005100697921535113
+const a8 = 0.00022086279071390839
+const a9 = 0.00010801156724758394
+const a10 = 2.5214456545125733e-05
+const a11 = 4.4864094961891516e-05
+const tc = 1.4616321449683622
+const tf = -0.12148629053584961
+const tt = -3.638676997039505e-18
+const t0 = 0.48383612272381005
+const t1 = -0.1475877229945939
+const t2 = 0.06462494023913339
+const t3 = -0.032788541075985965
+const t4 = 0.01797067508118204
+const t5 = -0.010314224129834144
+const t6 = 0.006100538702462913
+const t7 = -0.0036845201678113826
+const t8 = 0.0022596478090061247
+const t9 = -0.0014034646998923284
+const t10 = 0.000881081882437654
+const t11 = -0.0005385953053567405
+const t12 = 0.00031563207090362595
+const t13 = -0.00031275416837512086
+const t14 = 0.0003355291926355191
+const u0 = -0.07721566490153287
+const u1 = 0.6328270640250934
+const u2 = 1.4549225013723477
+const u3 = 0.9777175279633727
+const u4 = 0.22896372806469245
+const u5 = 0.013381091853678766
+const v1 = 2.4559779371304113
+const v2 = 2.128489763798934
+const v3 = 0.7692851504566728
+const v4 = 0.10422264559336913
+const v5 = 0.003217092422824239
+const s0 = -0.07721566490153287
+const s1 = 0.21498241596060885
+const s2 = 0.325778796408931
+const s3 = 0.14635047265246445
+const s4 = 0.02664227030336386
+const s5 = 0.0018402845140733772
+const s6 = 3.194753265841009e-05
+const r1 = 1.3920053346762105
+const r2 = 0.7219355475671381
+const r3 = 0.17193386563280308
+const r4 = 0.01864591917156529
+const r5 = 0.0007779424963818936
+const r6 = 7.326684307446256e-06
+const w0 = 0.4189385332046727
+const w1 = 0.08333333333333297
+const w2 = -0.0027777777772877554
+const w3 = 0.0007936505586430196
+const w4 = -0.00059518755745034
+const w5 = 0.0008363399189962821
+const w6 = -0.0016309293409657527
+
+/// log|Γ(x)|, and the sign of Γ(x), 1 where it is infinite or NaN.
+function lgammaF64(x0: f64): [f64, i32] {
+	const sign = asU64(x0) >> 63 != 0
+	const ix = ((asU64(x0) >> 32) as u32) & 0x7fffffff
+	const x = if (sign) -x0 else x0
+	if (ix >= 0x7ff00000) {
+		return [x0 * x0, 1]
+	}
+	if (ix < (0x3ff - 70) << 20) {
+		return [-logF64(x), if (sign) -1 else 1] // |x| < 2^-70: -log|x|
+	}
+	let s = 1
+	let nadj = 0.0
+	if (sign) {
+		let t = sinpi(x)
+		if (t == 0.0) {
+			return [1.0 / (x - x), 1] // a negative integer
+		}
+		if (t > 0.0) {
+			s = -1
+		} else {
+			t = -t
+		}
+		nadj = logF64(pi / (t * x))
+	}
+	let r = 0.0
+	if ((ix == 0x3ff00000 || ix == 0x40000000) && (asU64(x0) as u32) == 0) {
+		r = 0.0 // 1 and 2
+	} else if (ix < 0x40000000) {
+		// x < 2: from lgamma(x + 1) - log(x) below 0.9, of x about 1, tc the minimum, or 2
+		let y = 0.0
+		let i = 0
+		if (ix <= 0x3feccccc) {
+			r = -logF64(x)
+			if (ix >= 0x3fe76944) {
+				y = 1.0 - x
+			} else if (ix >= 0x3fcda661) {
+				y = x - (tc - 1.0)
+				i = 1
+			} else {
+				y = x
+				i = 2
+			}
+		} else if (ix >= 0x3ffbb4c3) {
+			y = 2.0 - x // [1.7316, 2]
+		} else if (ix >= 0x3ff3b4c4) {
+			y = x - tc // [1.23, 1.73]
+			i = 1
+		} else {
+			y = x - 1.0
+			i = 2
+		}
+		if (i == 0) {
+			const z = y * y
+			const p1 = a0 + z * (a2 + z * (a4 + z * (a6 + z * (a8 + z * a10))))
+			const p2 = z * (a1 + z * (a3 + z * (a5 + z * (a7 + z * (a9 + z * a11)))))
+			r += y * p1 + p2 - 0.5 * y
+		} else if (i == 1) {
+			const z = y * y
+			const w = z * y
+			const p1 = t0 + w * (t3 + w * (t6 + w * (t9 + w * t12)))
+			const p2 = t1 + w * (t4 + w * (t7 + w * (t10 + w * t13)))
+			const p3 = t2 + w * (t5 + w * (t8 + w * (t11 + w * t14)))
+			r += tf + (z * p1 - (tt - w * (p2 + y * p3)))
+		} else {
+			const p1 = y * (u0 + y * (u1 + y * (u2 + y * (u3 + y * (u4 + y * u5)))))
+			const p2 = 1.0 + y * (v1 + y * (v2 + y * (v3 + y * (v4 + y * v5))))
+			r += -0.5 * y + p1 / p2
+		}
+	} else if (ix < 0x40200000) {
+		// x < 8: lgamma(2 + y) + log((y + 2) ... (y + i - 1)), i = floor(x)
+		const i = x as i32
+		const y = x - (i as f64)
+		const p = y * (s0 + y * (s1 + y * (s2 + y * (s3 + y * (s4 + y * (s5 + y * s6))))))
+		const q = 1.0 + y * (r1 + y * (r2 + y * (r3 + y * (r4 + y * (r5 + y * r6)))))
+		r = 0.5 * y + p / q
+		if (i >= 3) {
+			let z = 1.0
+			for (const k of 0 ... (i - 3)) {
+				z *= y + ((i - 1 - k) as f64)
+			}
+			r += logF64(z)
+		}
+	} else if (ix < 0x43900000) {
+		// x < 2^58: Stirling's series
+		const t = logF64(x)
+		const z = 1.0 / x
+		const y = z * z
+		const w = w0 + z * (w1 + y * (w2 + y * (w3 + y * (w4 + y * (w5 + y * w6)))))
+		r = (x - 0.5) * (t - 1.0) + w
+	} else {
+		r = x * (logF64(x) - 1.0)
+	}
+	return [if (sign) nadj - r else r, s]
+}
+
+// lgammaf's, as lgamma's.
+const a0f: f32 = 0.07721566408872604
+const a1f: f32 = 0.32246702909469604
+const a2f: f32 = 0.0673523023724556
+const a3f: f32 = 0.020580807700753212
+const a4f: f32 = 0.007385550998151302
+const a5f: f32 = 0.0028905137442052364
+const a6f: f32 = 0.0011927076848223805
+const a7f: f32 = 0.0005100697744637728
+const a8f: f32 = 0.00022086278477218002
+const a9f: f32 = 0.00010801156895468011
+const a10f: f32 = 2.5214456400135532e-05
+const a11f: f32 = 4.486409670789726e-05
+const tcf: f32 = 1.4616321325302124
+const tff: f32 = -0.12148628383874893
+const ttf: f32 = 6.697100651820165e-09
+const t0f: f32 = 0.4838361144065857
+const t1f: f32 = -0.14758771657943726
+const t2f: f32 = 0.06462494283914566
+const t3f: f32 = -0.03278854116797447
+const t4f: f32 = 0.017970675602555275
+const t5f: f32 = -0.010314224287867546
+const t6f: f32 = 0.006100538652390242
+const t7f: f32 = -0.0036845202557742596
+const t8f: f32 = 0.0022596477065235376
+const t9f: f32 = -0.0014034647028893232
+const t10f: f32 = 0.0008810818544588983
+const t11f: f32 = -0.0005385953118093312
+const t12f: f32 = 0.000315632059937343
+const t13f: f32 = -0.00031275415676645935
+const t14f: f32 = 0.00033552918466739357
+const u0f: f32 = -0.07721566408872604
+const u1f: f32 = 0.6328270435333252
+const u2f: f32 = 1.4549225568771362
+const u3f: f32 = 0.9777175188064575
+const u4f: f32 = 0.2289637327194214
+const u5f: f32 = 0.013381091877818108
+const v1f: f32 = 2.4559779167175293
+const v2f: f32 = 2.1284897327423096
+const v3f: f32 = 0.7692851424217224
+const v4f: f32 = 0.10422264784574509
+const v5f: f32 = 0.0032170924823731184
+const s0f: f32 = -0.07721566408872604
+const s1f: f32 = 0.21498242020606995
+const s2f: f32 = 0.3257787823677063
+const s3f: f32 = 0.14635047316551208
+const s4f: f32 = 0.026642270386219025
+const s5f: f32 = 0.0018402845598757267
+const s6f: f32 = 3.194753298885189e-05
+const r1f: f32 = 1.3920053243637085
+const r2f: f32 = 0.7219355702400208
+const r3f: f32 = 0.1719338595867157
+const r4f: f32 = 0.018645919859409332
+const r5f: f32 = 0.0007779424777254462
+const r6f: f32 = 7.32668422642746e-06
+const w0f: f32 = 0.418938547372818
+const w1f: f32 = 0.0833333358168602
+const w2f: f32 = -0.0027777778450399637
+const w3f: f32 = 0.0007936505717225373
+const w4f: f32 = -0.0005951875355094671
+const w5f: f32 = 0.0008363398956134915
+const w6f: f32 = -0.0016309292986989021
+
+/// sinpi in f32 to |x| mod 2's reduction, then in f64.
+function sinpif(x0: f32): f32 {
+	const x = 2.0 * (x0 * 0.5 - floorF32(x0 * 0.5))
+	const n = (((x * 4.0) as i32) + 1) / 2
+	const y = ((x - (n as f32) * 0.5) as f64) * 3.141592653589793
+	return switch (n) {
+		case 1: kCosf(y)
+		case 2: kSinf(-y)
+		case 3: -kCosf(y)
+		default: kSinf(y)
+	}
+}
+
+function lgammaF32(x0: f32): [f32, i32] {
+	const sign = asU32(x0) >> 31 != 0
+	const ix = asU32(x0) & 0x7fffffff
+	const x = if (sign) -x0 else x0
+	if (ix >= 0x7f800000) {
+		return [x0 * x0, 1]
+	}
+	if (ix < 0x35000000) {
+		return [-logF32(x), if (sign) -1 else 1] // |x| < 2^-21
+	}
+	let s = 1
+	let nadj: f32 = 0.0
+	if (sign) {
+		let t = sinpif(x)
+		if (t == 0.0) {
+			return [1.0 / (x - x), 1]
+		}
+		if (t > 0.0) {
+			s = -1
+		} else {
+			t = -t
+		}
+		nadj = logF32(pif / (t * x))
+	}
+	let r: f32 = 0.0
+	if (ix == 0x3f800000 || ix == 0x40000000) {
+		r = 0.0
+	} else if (ix < 0x40000000) {
+		let y: f32 = 0.0
+		let i = 0
+		if (ix <= 0x3f666666) {
+			r = -logF32(x)
+			if (ix >= 0x3f3b4a20) {
+				y = 1.0 - x
+			} else if (ix >= 0x3e6d3308) {
+				y = x - (tcf - 1.0)
+				i = 1
+			} else {
+				y = x
+				i = 2
+			}
+		} else if (ix >= 0x3fdda618) {
+			y = 2.0 - x
+		} else if (ix >= 0x3f9da620) {
+			y = x - tcf
+			i = 1
+		} else {
+			y = x - 1.0
+			i = 2
+		}
+		if (i == 0) {
+			const z = y * y
+			const p1 = a0f + z * (a2f + z * (a4f + z * (a6f + z * (a8f + z * a10f))))
+			const p2 = z * (a1f + z * (a3f + z * (a5f + z * (a7f + z * (a9f + z * a11f)))))
+			r += y * p1 + p2 - 0.5 * y
+		} else if (i == 1) {
+			const z = y * y
+			const w = z * y
+			const p1 = t0f + w * (t3f + w * (t6f + w * (t9f + w * t12f)))
+			const p2 = t1f + w * (t4f + w * (t7f + w * (t10f + w * t13f)))
+			const p3 = t2f + w * (t5f + w * (t8f + w * (t11f + w * t14f)))
+			r += tff + (z * p1 - (ttf - w * (p2 + y * p3)))
+		} else {
+			const p1 = y * (u0f + y * (u1f + y * (u2f + y * (u3f + y * (u4f + y * u5f)))))
+			const p2 = 1.0 + y * (v1f + y * (v2f + y * (v3f + y * (v4f + y * v5f))))
+			r += -0.5 * y + p1 / p2
+		}
+	} else if (ix < 0x41000000) {
+		const i = x as i32
+		const y = x - (i as f32)
+		const p = y * (s0f + y * (s1f + y * (s2f + y * (s3f + y * (s4f + y * (s5f + y * s6f))))))
+		const q = 1.0 + y * (r1f + y * (r2f + y * (r3f + y * (r4f + y * (r5f + y * r6f)))))
+		r = 0.5 * y + p / q
+		if (i >= 3) {
+			let z: f32 = 1.0
+			for (const k of 0 ... (i - 3)) {
+				z *= y + ((i - 1 - k) as f32)
+			}
+			r += logF32(z)
+		}
+	} else if (ix < 0x5c800000) {
+		const t = logF32(x)
+		const z = 1.0 / x
+		const y = z * z
+		const w = w0f + z * (w1f + y * (w2f + y * (w3f + y * (w4f + y * (w5f + y * w6f)))))
+		r = (x - 0.5) * (t - 1.0) + w
+	} else {
+		r = x * (logF32(x) - 1.0)
+	}
+	return [if (sign) nadj - r else r, s]
+}
+
+// # Bessel functions
+//
+// Bessel functions of the first and second kinds, j and y, of order 0, 1 and n.
+//
+// j0 and j1 are rational functions of x^2 below 2; y0 and y1 add (2/pi) j(x) log(x) to one. From 2 on, all four are
+// sqrt(2/(pi x)) (p(x) cos(x0) -+ q(x) sin(x0)), x0 = x - pi/4 or x - 3pi/4, p and q rational functions of 1/x^2 in
+// four bands of x, and sin(x0), cos(x0) by sin(x) +- cos(x) = -cos(2x)/(sin(x) -+ cos(x)) where that cancels. jn
+// recurs forward from j0 and j1 where n < x, else backward from a continued fraction, normalized by j0 or j1; yn
+// recurs forward from y0 and y1. Past 2^302, jn and yn take the asymptotic form alone.
+//
+// Ported from musl 1.2.5, MIT, Copyright © 2005-2020 Rich Felker, et al. (vendor/musl/COPYRIGHT), from FreeBSD:
+// Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved. Developed at SunSoft, a Sun Microsystems, Inc.
+// business. Permission to use, copy, modify, and distribute this software is freely granted, provided that this notice
+// is preserved. f32 versions by Ian Lance Taylor, Cygnus Support.
+/// 1/sqrt(pi) and 2/pi.
+const invsqrtpi = 5.64189583547756279280e-01
+const tpi = 6.36619772367581382433e-01
+const invsqrtpif: f32 = 5.6418961287e-01
+const tpif: f32 = 6.3661974669e-01
+
+/// x's high 32 bits.
+function high(x: f64): u32 { return (asU64(x) >> 32) as u32 }
+
+/// p[0] + z (p[1] + z (p[2] + ...)), as musl writes it out.
+function poly(p: f64[], z: f64): f64 {
+	let i = p.length - 1
+	let r = p[i]
+	while (i > 0) {
+		i--
+		r = p[i] + z * r
+	}
+	return r
+}
+
+function polyf(p: f32[], z: f32): f32 {
+	let i = p.length - 1
+	let r = p[i]
+	while (i > 0) {
+		i--
+		r = p[i] + z * r
+	}
+	return r
+}
+
+/// The band of p's and q's tables for x >= 2 of high word ix: [8, inf), [4.5454, 8), [2.8571, 4.5454) or [2, 2.8571).
+function band(ix: u32): i32 {
+	return if (ix >= 0x40200000) 0 else if (ix >= 0x40122e8b) 1 else if (ix >= 0x4006db6d) 2 else 3
+}
+
+function bandf(ix: u32): i32 {
+	return if (ix >= 0x41000000) 0 else if (ix >= 0x409173eb) 1 else if (ix >= 0x4036d917) 2 else 3
+}
+
+// Order 0.
+/// j0(x) ~ 1 - x^2/4 + x^4 R(x^2)/S(x^2) below 2: R, then S less 1.
+const j0r: f64[] = [1.56249999999999947958e-02, -1.89979294238854721751e-04, 1.82954049532700665670e-06,
+	-4.61832688532103189199e-09]
+
+const j0s: f64[] = [1.56191029464890010492e-02, 1.16926784663337450260e-04, 5.13546550207318111446e-07,
+	1.16614003333790000205e-09]
+
+/// y0(x) ~ U(x^2)/V(x^2) + (2/pi) j0(x) log(x) below 2: U, then V less 1.
+const y0u: f64[] = [-7.38042951086872317523e-02, 1.76666452509181115538e-01, -1.38185671945596898896e-02,
+	3.47453432093683650238e-04, -3.81407053724364161125e-06, 1.95590137035022920206e-08, -3.98205194132103398453e-11]
+
+const y0v: f64[] = [1.27304834834123699328e-02, 7.60068627350353253702e-05, 2.59150851840457805467e-07,
+	4.41110311332675467403e-10]
+
+const j0rf: f32[] = [1.5625000000e-02, -1.8997929874e-04, 1.8295404516e-06, -4.6183270541e-09]
+const j0sf: f32[] = [1.5619102865e-02, 1.1692678527e-04, 5.1354652442e-07, 1.1661400734e-09]
+
+const y0uf: f32[] = [-7.3804296553e-02, 1.7666645348e-01, -1.3818567619e-02, 3.4745343146e-04, -3.8140706238e-06,
+	1.9559013964e-08, -3.9820518410e-11]
+
+const y0vf: f32[] = [1.2730483897e-02, 7.6006865129e-05, 2.5915085189e-07, 4.4111031494e-10]
+
+/// p0's numerators, by band
+const p0R: f64[][] = [[0.00000000000000000000e+00, -7.03124999999900357484e-02, -8.08167041275349795626e+00,
+	-2.57063105679704847262e+02, -2.48521641009428822144e+03, -5.25304380490729545272e+03],
+	[-1.14125464691894502584e-11, -7.03124940873599280078e-02, -4.15961064470587782438e+00, -6.76747652265167261021e+01,
+	-3.31231299649172967747e+02, -3.46433388365604912451e+02],
+	[-2.54704601771951915620e-09, -7.03119616381481654654e-02, -2.40903221549529611423e+00, -2.19659774734883086467e+01,
+	-5.80791704701737572236e+01, -3.14479470594888503854e+01],
+	[-8.87534333032526411254e-08, -7.03030995483624743247e-02, -1.45073846780952986357e+00, -7.63569613823527770791e+00,
+	-1.11931668860356747786e+01, -3.23364579351335335033e+00]]
+
+/// p0's denominators less 1, by band
+const p0S: f64[][] = [[1.16534364619668181717e+02, 3.83374475364121826715e+03, 4.05978572648472545552e+04,
+	1.16752972564375915681e+05, 4.76277284146730962675e+04],
+	[6.07539382692300335975e+01, 1.05125230595704579173e+03, 5.97897094333855784498e+03, 9.62544514357774460223e+03,
+	2.40605815922939109441e+03],
+	[3.58560338055209726349e+01, 3.61513983050303863820e+02, 1.19360783792111533330e+03, 1.12799679856907414432e+03,
+	1.73580930813335754692e+02],
+	[2.22202997532088808441e+01, 1.36206794218215208048e+02, 2.70470278658083486789e+02, 1.53875394208320329881e+02,
+	1.46576176948256193810e+01]]
+
+/// q0's numerators, by band
+const q0R: f64[][] = [[0.00000000000000000000e+00, 7.32421874999935051953e-02, 1.17682064682252693899e+01,
+	5.57673380256401856059e+02, 8.85919720756468632317e+03, 3.70146267776887834771e+04],
+	[1.84085963594515531381e-11, 7.32421766612684765896e-02, 5.83563508962056953777e+00, 1.35111577286449829671e+02,
+	1.02724376596164097464e+03, 1.98997785864605384631e+03],
+	[4.37741014089738620906e-09, 7.32411180042911447163e-02, 3.34423137516170720929e+00, 4.26218440745412650017e+01,
+	1.70808091340565596283e+02, 1.66733948696651168575e+02],
+	[1.50444444886983272379e-07, 7.32234265963079278272e-02, 1.99819174093815998816e+00, 1.44956029347885735348e+01,
+	3.16662317504781540833e+01, 1.62527075710929267416e+01]]
+
+/// q0's denominators less 1, by band
+const q0S: f64[][] = [[1.63776026895689824414e+02, 8.09834494656449805916e+03, 1.42538291419120476348e+05,
+	8.03309257119514397345e+05, 8.40501579819060512818e+05, -3.43899293537866615225e+05],
+	[8.27766102236537761883e+01, 2.07781416421392987104e+03, 1.88472887785718085070e+04, 5.67511122894947329769e+04,
+	3.59767538425114471465e+04, -5.35434275601944773371e+03],
+	[4.87588729724587182091e+01, 7.09689221056606015736e+02, 3.70414822620111362994e+03, 6.46042516752568917582e+03,
+	2.51633368920368957333e+03, -1.49247451836156386662e+02],
+	[3.03655848355219184498e+01, 2.69348118608049844624e+02, 8.44783757595320139444e+02, 8.82935845112488550512e+02,
+	2.12666388511798828631e+02, -5.31095493882666946917e+00]]
+
+/// p0R, p0S, q0R and q0S in f32.
+const p0Rf: f32[][] = [[0.0000000000e+00, -7.0312500000e-02, -8.0816707611e+00, -2.5706311035e+02, -2.4852163086e+03,
+	-5.2530439453e+03],
+	[-1.1412546255e-11, -7.0312492549e-02, -4.1596107483e+00, -6.7674766541e+01, -3.3123129272e+02, -3.4643338013e+02],
+	[-2.5470459075e-09, -7.0311963558e-02, -2.4090321064e+00, -2.1965976715e+01, -5.8079170227e+01, -3.1447946548e+01],
+	[-8.8753431271e-08, -7.0303097367e-02, -1.4507384300e+00, -7.6356959343e+00, -1.1193166733e+01, -3.2336456776e+00]]
+
+const p0Sf: f32[][] = [[1.1653436279e+02, 3.8337448730e+03, 4.0597855469e+04, 1.1675296875e+05, 4.7627726562e+04],
+	[6.0753936768e+01, 1.0512523193e+03, 5.9789707031e+03, 9.6254453125e+03, 2.4060581055e+03],
+	[3.5856033325e+01, 3.6151397705e+02, 1.1936077881e+03, 1.1279968262e+03, 1.7358093262e+02],
+	[2.2220300674e+01, 1.3620678711e+02, 2.7047027588e+02, 1.5387539673e+02, 1.4657617569e+01]]
+
+const q0Rf: f32[][] = [[0.0000000000e+00, 7.3242187500e-02, 1.1768206596e+01, 5.5767340088e+02, 8.8591972656e+03,
+	3.7014625000e+04],
+	[1.8408595828e-11, 7.3242180049e-02, 5.8356351852e+00, 1.3511157227e+02, 1.0272437744e+03, 1.9899779053e+03],
+	[4.3774099900e-09, 7.3241114616e-02, 3.3442313671e+00, 4.2621845245e+01, 1.7080809021e+02, 1.6673394775e+02],
+	[1.5044444979e-07, 7.3223426938e-02, 1.9981917143e+00, 1.4495602608e+01, 3.1666231155e+01, 1.6252708435e+01]]
+
+const q0Sf: f32[][] = [[1.6377603149e+02, 8.0983447266e+03, 1.4253829688e+05, 8.0330925000e+05, 8.4050156250e+05,
+	-3.4389928125e+05],
+	[8.2776611328e+01, 2.0778142090e+03, 1.8847289062e+04, 5.6751113281e+04, 3.5976753906e+04, -5.3543427734e+03],
+	[4.8758872986e+01, 7.0968920898e+02, 3.7041481934e+03, 6.4604252930e+03, 2.5163337402e+03, -1.4924745178e+02],
+	[3.0365585327e+01, 2.6934811401e+02, 8.4478375244e+02, 8.8293585205e+02, 2.1266638184e+02, -5.3109550476e+00]]
+
+/// p0(x) = 1 + R/S, R and S of 1/x^2, x >= 2.
+function p0(x: f64): f64 {
+	const b = band(high(x) & 0x7fffffff)
+	const z = 1.0 / (x * x)
+	return 1.0 + poly(p0R[b], z) / (1.0 + z * poly(p0S[b], z))
+}
+
+/// q0(x) = (-1/8 + R/S)/x, R and S of 1/x^2, x >= 2.
+function q0(x: f64): f64 {
+	const b = band(high(x) & 0x7fffffff)
+	const z = 1.0 / (x * x)
+	return (-0.125 + poly(q0R[b], z) / (1.0 + z * poly(q0S[b], z))) / x
+}
+
+function p0f(x: f32): f32 {
+	const b = bandf(asU32(x) & 0x7fffffff)
+	const z: f32 = 1.0 / (x * x)
+	return 1.0 + polyf(p0Rf[b], z) / (1.0 + z * polyf(p0Sf[b], z))
+}
+
+function q0f(x: f32): f32 {
+	const b = bandf(asU32(x) & 0x7fffffff)
+	const z: f32 = 1.0 / (x * x)
+	return (-0.125 + polyf(q0Rf[b], z) / (1.0 + z * polyf(q0Sf[b], z))) / x
+}
+
+/// j0(x), or y0(x) if y, for x >= 2 of high word ix: 1/sqrt(pi x) (p0 (sin x + cos x) -+ q0 (sin x - cos x)), the
+/// sum that cancels taken as -cos(2x) over the other. From 2^1023, where 2x overflows, the sum as it is; from 2^129,
+/// without p0 and q0.
+function common0(ix: u32, x: f64, y: bool): f64 {
+	const s = sinF64(x)
+	const c = if (y) -cosF64(x) else cosF64(x)
+	let cc = s + c
+	if (ix < 0x7fe00000) {
+		let ss = s - c
+		const z = -cosF64(2.0 * x)
+		if (s * c < 0.0) {
+			cc = z / ss
+		} else {
+			ss = z / cc
+		}
+		if (ix < 0x48000000) {
+			cc = p0(x) * cc - q0(x) * (if (y) -ss else ss)
+		}
+	}
+	return invsqrtpi * cc / sqrtF64(x)
+}
+
+/// common0 in f32, past 2^127 and 2^50.
+function common0f(ix: u32, x: f32, y: bool): f32 {
+	const s = sinF32(x)
+	const c = if (y) -cosF32(x) else cosF32(x)
+	let cc = s + c
+	if (ix < 0x7f000000) {
+		let ss = s - c
+		const z = -cosF32(2.0 * x)
+		if (s * c < 0.0) {
+			cc = z / ss
+		} else {
+			ss = z / cc
+		}
+		if (ix < 0x58800000) {
+			cc = p0f(x) * cc - q0f(x) * (if (y) -ss else ss)
+		}
+	}
+	return invsqrtpif * cc / sqrtF32(x)
+}
+
+/// The Bessel function of the first kind of order 0.
+function j0F64(x: f64): f64 {
+	const ix = high(x) & 0x7fffffff
+	if (ix >= 0x7ff00000) {
+		return 1.0 / (x * x)
+	}
+	const a = fabs(x)
+	if (ix >= 0x40000000) {
+		return common0(ix, a, false)
+	}
+	if (ix >= 0x3f200000) {
+		// |x| >= 2^-13
+		const z = a * a
+		return (1.0 + a / 2.0) * (1.0 - a / 2.0) + z * (z * poly(j0r, z) / (1.0 + z * poly(j0s, z)))
+	}
+	return 1.0 - (if (ix >= 0x38000000) 0.25 * a * a else a)
+}
+
+function j0F32(x: f32): f32 {
+	const ix = asU32(x) & 0x7fffffff
+	if (ix >= 0x7f800000) {
+		return 1.0 / (x * x)
+	}
+	const a = fabsf(x)
+	if (ix >= 0x40000000) {
+		return common0f(ix, a, false)
+	}
+	if (ix >= 0x3a000000) {
+		// |x| >= 2^-11
+		const z = a * a
+		return (1.0 + a / 2.0) * (1.0 - a / 2.0) + z * (z * polyf(j0rf, z) / (1.0 + z * polyf(j0sf, z)))
+	}
+	return 1.0 - (if (ix >= 0x21800000) 0.25 * a * a else a)
+}
+
+/// The Bessel function of the second kind of order 0: -infinity at 0, NaN below.
+function y0F64(x: f64): f64 {
+	const u = asU64(x)
+	const ix = (u >> 32) as u32
+	if (u << 1 == 0) {
+		return -inf
+	}
+	if (ix >> 31 != 0) {
+		return nan
+	}
+	if (ix >= 0x7ff00000) {
+		return 1.0 / x
+	}
+	if (ix >= 0x40000000) {
+		return common0(ix, x, true)
+	}
+	if (ix >= 0x3e400000) {
+		// x >= 2^-27
+		const z = x * x
+		return poly(y0u, z) / (1.0 + z * poly(y0v, z)) + tpi * (j0F64(x) * logF64(x))
+	}
+	return y0u[0] + tpi * logF64(x)
+}
+
+function y0F32(x: f32): f32 {
+	const ix = asU32(x)
+	if (ix & 0x7fffffff == 0) {
+		return -inff
+	}
+	if (ix >> 31 != 0) {
+		return nanf
+	}
+	if (ix >= 0x7f800000) {
+		return 1.0 / x
+	}
+	if (ix >= 0x40000000) {
+		return common0f(ix, x, true)
+	}
+	if (ix >= 0x39000000) {
+		// x >= 2^-13
+		const z = x * x
+		return polyf(y0uf, z) / (1.0 + z * polyf(y0vf, z)) + tpif * (j0F32(x) * logF32(x))
+	}
+	return y0uf[0] + tpif * logF32(x)
+}
+
+// Order 1.
+/// j1(x) ~ x/2 + x^3 R(x^2)/S(x^2) below 2: R, then S less 1.
+const j1r: f64[] = [-6.25000000000000000000e-02, 1.40705666955189706048e-03, -1.59955631084035597520e-05,
+	4.96727999609584448412e-08]
+
+const j1s: f64[] = [1.91537599538363460805e-02, 1.85946785588630915560e-04, 1.17718464042623683263e-06,
+	5.04636257076217042715e-09, 1.23542274426137913908e-11]
+
+const j1rf: f32[] = [-6.2500000000e-02, 1.4070566976e-03, -1.5995563444e-05, 4.9672799207e-08]
+const j1sf: f32[] = [1.9153760746e-02, 1.8594678841e-04, 1.1771846857e-06, 5.0463624390e-09, 1.2354227016e-11]
+
+/// p1's numerators, by band
+const p1R: f64[][] = [[0.00000000000000000000e+00, 1.17187499999988647970e-01, 1.32394806593073575129e+01,
+	4.12051854307378562225e+02, 3.87474538913960532227e+03, 7.91447954031891731574e+03],
+	[1.31990519556243522749e-11, 1.17187493190614097638e-01, 6.80275127868432871736e+00, 1.08308182990189109773e+02,
+	5.17636139533199752805e+02, 5.28715201363337541807e+02],
+	[3.02503916137373618024e-09, 1.17186865567253592491e-01, 3.93297750033315640650e+00, 3.51194035591636932736e+01,
+	9.10550110750781271918e+01, 4.85590685197364919645e+01],
+	[1.07710830106873743082e-07, 1.17176219462683348094e-01, 2.36851496667608785174e+00, 1.22426109148261232917e+01,
+	1.76939711271687727390e+01, 5.07352312588818499250e+00]]
+
+/// p1's denominators less 1, by band
+const p1S: f64[][] = [[1.14207370375678408436e+02, 3.65093083420853463394e+03, 3.69562060269033463555e+04,
+	9.76027935934950801311e+04, 3.08042720627888811578e+04],
+	[5.92805987221131331921e+01, 9.91401418733614377743e+02, 5.35326695291487976647e+03, 7.84469031749551231769e+03,
+	1.50404688810361062679e+03],
+	[3.47913095001251519989e+01, 3.36762458747825746741e+02, 1.04687139975775130551e+03, 8.90811346398256432622e+02,
+	1.03787932439639277504e+02],
+	[2.14364859363821409488e+01, 1.25290227168402751090e+02, 2.32276469057162813669e+02, 1.17679373287147100768e+02,
+	8.36463893371618283368e+00]]
+
+/// q1's numerators, by band
+const q1R: f64[][] = [[0.00000000000000000000e+00, -1.02539062499992714161e-01, -1.62717534544589987888e+01,
+	-7.59601722513950107896e+02, -1.18498066702429587167e+04, -4.84385124285750353010e+04],
+	[-2.08979931141764104297e-11, -1.02539050241375426231e-01, -8.05644828123936029840e+00, -1.83669607474888380239e+02,
+	-1.37319376065508163265e+03, -2.61244440453215656817e+03],
+	[-5.07831226461766561369e-09, -1.02537829820837089745e-01, -4.61011581139473403113e+00, -5.78472216562783643212e+01,
+	-2.28244540737631695038e+02, -2.19210128478909325622e+02],
+	[-1.78381727510958865572e-07, -1.02517042607985553460e-01, -2.75220568278187460720e+00, -1.96636162643703720221e+01,
+	-4.23253133372830490089e+01, -2.13719211703704061733e+01]]
+
+/// q1's denominators less 1, by band
+const q1S: f64[][] = [[1.61395369700722909556e+02, 7.82538599923348465381e+03, 1.33875336287249578163e+05,
+	7.19657723683240939863e+05, 6.66601232617776375264e+05, -2.94490264303834643215e+05],
+	[8.12765501384335777857e+01, 1.99179873460485964642e+03, 1.74684851924908907677e+04, 4.98514270910352279316e+04,
+	2.79480751638918118260e+04, -4.71918354795128470869e+03],
+	[4.76651550323729509273e+01, 6.73865112676699709482e+02, 3.38015286679526343505e+03, 5.54772909720722782367e+03,
+	1.90311919338810798763e+03, -1.35201191444307340817e+02],
+	[2.95333629060523854548e+01, 2.52981549982190529136e+02, 7.57502834868645436472e+02, 7.39393205320467245656e+02,
+	1.55949003336666123687e+02, -4.95949898822628210127e+00]]
+
+/// p1R, p1S, q1R and q1S in f32.
+const p1Rf: f32[][] = [[0.0000000000e+00, 1.1718750000e-01, 1.3239480972e+01, 4.1205184937e+02, 3.8747453613e+03,
+	7.9144794922e+03],
+	[1.3199052094e-11, 1.1718749255e-01, 6.8027510643e+00, 1.0830818176e+02, 5.1763616943e+02, 5.2871520996e+02],
+	[3.0250391081e-09, 1.1718686670e-01, 3.9329774380e+00, 3.5119403839e+01, 9.1055007935e+01, 4.8559066772e+01],
+	[1.0771083225e-07, 1.1717621982e-01, 2.3685150146e+00, 1.2242610931e+01, 1.7693971634e+01, 5.0735230446e+00]]
+
+const p1Sf: f32[][] = [[1.1420736694e+02, 3.6509309082e+03, 3.6956207031e+04, 9.7602796875e+04, 3.0804271484e+04],
+	[5.9280597687e+01, 9.9140142822e+02, 5.3532670898e+03, 7.8446904297e+03, 1.5040468750e+03],
+	[3.4791309357e+01, 3.3676245117e+02, 1.0468714600e+03, 8.9081134033e+02, 1.0378793335e+02],
+	[2.1436485291e+01, 1.2529022980e+02, 2.3227647400e+02, 1.1767937469e+02, 8.3646392822e+00]]
+
+const q1Rf: f32[][] = [[0.0000000000e+00, -1.0253906250e-01, -1.6271753311e+01, -7.5960174561e+02, -1.1849806641e+04,
+	-4.8438511719e+04],
+	[-2.0897993405e-11, -1.0253904760e-01, -8.0564479828e+00, -1.8366960144e+02, -1.3731937256e+03, -2.6124443359e+03],
+	[-5.0783124372e-09, -1.0253783315e-01, -4.6101160049e+00, -5.7847221375e+01, -2.2824453735e+02, -2.1921012878e+02],
+	[-1.7838172539e-07, -1.0251704603e-01, -2.7522056103e+00, -1.9663616180e+01, -4.2325313568e+01, -2.1371921539e+01]]
+
+const q1Sf: f32[][] = [[1.6139537048e+02, 7.8253862305e+03, 1.3387534375e+05, 7.1965775000e+05, 6.6660125000e+05,
+	-2.9449025000e+05],
+	[8.1276550293e+01, 1.9917987061e+03, 1.7468484375e+04, 4.9851425781e+04, 2.7948074219e+04, -4.7191835938e+03],
+	[4.7665153503e+01, 6.7386511230e+02, 3.3801528320e+03, 5.5477290039e+03, 1.9031191406e+03, -1.3520118713e+02],
+	[2.9533363342e+01, 2.5298155212e+02, 7.5750280762e+02, 7.3939318848e+02, 1.5594900513e+02, -4.9594988823e+00]]
+
+/// y1(x) ~ x U(x^2)/V(x^2) + (2/pi) (j1(x) log(x) - 1/x) below 2: U, then V less 1.
+const y1u: f64[] = [-1.96057090646238940668e-01, 5.04438716639811282616e-02, -1.91256895875763547298e-03,
+	2.35252600561610495928e-05, -9.19099158039878874504e-08]
+
+const y1v: f64[] = [1.99167318236649903973e-02, 2.02552581025135171496e-04, 1.35608801097516229404e-06,
+	6.22741452364621501295e-09, 1.66559246207992079114e-11]
+
+const y1uf: f32[] = [-1.9605709612e-01, 5.0443872809e-02, -1.9125689287e-03, 2.3525259166e-05, -9.1909917899e-08]
+const y1vf: f32[] = [1.9916731864e-02, 2.0255257550e-04, 1.3560879779e-06, 6.2274145840e-09, 1.6655924903e-11]
+
+/// p1(x) = 1 + R/S, R and S of 1/x^2, x >= 2.
+function p1(x: f64): f64 {
+	const b = band(high(x) & 0x7fffffff)
+	const z = 1.0 / (x * x)
+	return 1.0 + poly(p1R[b], z) / (1.0 + z * poly(p1S[b], z))
+}
+
+/// q1(x) = (3/8 + R/S)/x, R and S of 1/x^2, x >= 2.
+function q1(x: f64): f64 {
+	const b = band(high(x) & 0x7fffffff)
+	const z = 1.0 / (x * x)
+	return (0.375 + poly(q1R[b], z) / (1.0 + z * poly(q1S[b], z))) / x
+}
+
+function p1f(x: f32): f32 {
+	const b = bandf(asU32(x) & 0x7fffffff)
+	const z: f32 = 1.0 / (x * x)
+	return 1.0 + polyf(p1Rf[b], z) / (1.0 + z * polyf(p1Sf[b], z))
+}
+
+function q1f(x: f32): f32 {
+	const b = bandf(asU32(x) & 0x7fffffff)
+	const z: f32 = 1.0 / (x * x)
+	return (0.375 + polyf(q1Rf[b], z) / (1.0 + z * polyf(q1Sf[b], z))) / x
+}
+
+/// j1(x), or y1(x) if y, for x >= 2 of high word ix, negated if neg: 1/sqrt(pi x) (p1 (sin x - cos x) -+
+/// q1 (-sin x - cos x)), as common0.
+function common1(ix: u32, x: f64, y: bool, neg: bool): f64 {
+	const s = if (y) -sinF64(x) else sinF64(x)
+	const c = cosF64(x)
+	let cc = s - c
+	if (ix < 0x7fe00000) {
+		let ss = -s - c
+		const z = cosF64(2.0 * x)
+		if (s * c > 0.0) {
+			cc = z / ss
+		} else {
+			ss = z / cc
+		}
+		if (ix < 0x48000000) {
+			cc = p1(x) * cc - q1(x) * (if (y) -ss else ss)
+		}
+	}
+	return invsqrtpi * (if (neg) -cc else cc) / sqrtF64(x)
+}
+
+/// common1 in f32, but for its sums and result, which musl takes in f64.
+function common1f(ix: u32, x: f32, y: bool, neg: bool): f32 {
+	const s = (if (y) -sinF32(x) else sinF32(x)) as f64
+	const c = cosF32(x) as f64
+	let cc = s - c
+	if (ix < 0x7f000000) {
+		let ss = -s - c
+		const z = cosF32(2.0 * x) as f64
+		if (s * c > 0.0) {
+			cc = z / ss
+		} else {
+			ss = z / cc
+		}
+		if (ix < 0x58800000) {
+			cc = (p1f(x) as f64) * cc - (q1f(x) as f64) * (if (y) -ss else ss)
+		}
+	}
+	return ((invsqrtpif as f64) * (if (neg) -cc else cc) / (sqrtF32(x) as f64)) as f32
+}
+
+/// The Bessel function of the first kind of order 1.
+function j1F64(x: f64): f64 {
+	const hx = high(x)
+	const ix = hx & 0x7fffffff
+	if (ix >= 0x7ff00000) {
+		return 1.0 / (x * x)
+	}
+	if (ix >= 0x40000000) {
+		return common1(ix, fabs(x), false, hx >> 31 != 0)
+	}
+	if (ix < 0x38000000) {
+		// |x| < 2^-127
+		return (0.5 + x) * x
+	}
+	const z = x * x
+	return (0.5 + z * poly(j1r, z) / (1.0 + z * poly(j1s, z))) * x
+}
+
+function j1F32(x: f32): f32 {
+	const hx = asU32(x)
+	const ix = hx & 0x7fffffff
+	if (ix >= 0x7f800000) {
+		return 1.0 / (x * x)
+	}
+	if (ix >= 0x40000000) {
+		return common1f(ix, fabsf(x), false, hx >> 31 != 0)
+	}
+	if (ix < 0x39000000) {
+		// |x| < 2^-13
+		return 0.5 * x
+	}
+	const z = x * x
+	return (0.5 + z * polyf(j1rf, z) / (1.0 + z * polyf(j1sf, z))) * x
+}
+
+/// The Bessel function of the second kind of order 1: -infinity at 0, NaN below.
+function y1F64(x: f64): f64 {
+	const u = asU64(x)
+	const ix = (u >> 32) as u32
+	if (u << 1 == 0) {
+		return -inf
+	}
+	if (ix >> 31 != 0) {
+		return nan
+	}
+	if (ix >= 0x7ff00000) {
+		return 1.0 / x
+	}
+	if (ix >= 0x40000000) {
+		return common1(ix, x, true, false)
+	}
+	if (ix < 0x3c900000) {
+		// x < 2^-54
+		return -tpi / x
+	}
+	const z = x * x
+	return x * (poly(y1u, z) / (1.0 + z * poly(y1v, z))) + tpi * (j1F64(x) * logF64(x) - 1.0 / x)
+}
+
+function y1F32(x: f32): f32 {
+	const ix = asU32(x)
+	if (ix & 0x7fffffff == 0) {
+		return -inff
+	}
+	if (ix >> 31 != 0) {
+		return nanf
+	}
+	if (ix >= 0x7f800000) {
+		return 1.0 / x
+	}
+	if (ix >= 0x40000000) {
+		return common1f(ix, x, true, false)
+	}
+	if (ix < 0x33000000) {
+		// x < 2^-25
+		return -tpif / x
+	}
+	const z = x * x
+	return x * (polyf(y1uf, z) / (1.0 + z * polyf(y1vf, z))) + tpif * (j1F32(x) * logF32(x) - 1.0 / x)
+}
+
+// Order n.
+/// sqrt(2) sin(x0) or, for j, sqrt(2) cos(x0), x0 = x - (2n + 1) pi/4, by n mod 4, from s = sin x and c = cos x.
+function shifted(m: i32, j: bool, x: f64): f64 {
+	const s = sinF64(x)
+	const c = cosF64(x)
+	if (j) {
+		return switch (m & 3) {
+			case 0: -c + s
+			case 1: -c - s
+			case 2: c - s
+			default: c + s
+		}
+	}
+	return switch (m & 3) {
+		case 0: -s - c
+		case 1: -s + c
+		case 2: s + c
+		default: s - c
+	}
+}
+
+/// The Bessel function of the first kind of order n; j(-n, x) = j(n, -x) = (-1)^n j(n, x).
+function jnF64(n: i32, x: f64): f64 {
+	if (x != x) {
+		return x
+	}
+	if (n == 0) {
+		return j0F64(x)
+	}
+	let sign = (asU64(x) >> 63) as i32
+	let y = x
+	let nm1 = n - 1 // |n| - 1, which holds for the least i32
+	if (n < 0) {
+		nm1 = -(n + 1)
+		y = -x
+		sign ^= 1
+	}
+	if (nm1 == 0) {
+		return j1F64(y)
+	}
+	sign &= n // signbit(x) for odd n
+	y = fabs(y)
+	let b = 0.0
+	if (y == 0.0 || y == inf) {
+		b = 0.0
+	} else if ((nm1 as f64) < y) {
+		if (high(y) >= 0x52d00000) {
+			// x > 2^302
+			b = invsqrtpi * shifted(nm1, true, y) / sqrtF64(y)
+		} else {
+			// j(n + 1, x) = 2n/x j(n, x) - j(n - 1, x)
+			let a = j0F64(y)
+			b = j1F64(y)
+			for (const i of 1 ... nm1) {
+				const t = b
+				b = b * (2.0 * (i as f64) / y) - a
+				a = t
+			}
+		}
+	} else if (high(y) < 0x3e100000) {
+		// x < 2^-29: (x/2)^n / n!, or 0 where that underflows
+		if (nm1 <= 32) {
+			const half = y * 0.5
+			let a = 1.0
+			b = half
+			for (const i of 2 ... nm1 + 1) {
+				a *= i as f64
+				b *= half
+			}
+			b = b / a
+		}
+	} else {
+		// Backward from j(n, x)/j(n - 1, x) as a continued fraction 1/(w - 1/(w + h - 1/(w + 2h - ...))), w = 2n/x
+		// and h = 2/x, of k terms, k where Q(0) = w, Q(1) = w(w + h) - 1, Q(k) = (w + kh) Q(k - 1) - Q(k - 2)
+		// passes 1e9.
+		const nf = (nm1 as f64) + 1.0
+		const w = 2.0 * nf / y
+		const h = 2.0 / y
+		let z = w + h
+		let q0 = w
+		let q1 = w * z - 1.0
+		let k = 1
+		while (q1 < 1.0e9) {
+			k += 1
+			z += h
+			const q = z * q1 - q0
+			q0 = q1
+			q1 = q
+		}
+		let t = 0.0
+		let i = k
+		while (i >= 0) {
+			t = 1.0 / (2.0 * ((i as f64) + nf) / y - t)
+			i--
+		}
+		let a = t
+		b = 1.0
+		// Past log of the greatest f64, n log(2n/x) estimating log((2/x)^n n!), b is kept from overflowing.
+		const scale = nf * logF64(fabs(w)) >= 7.09782712893383973096e+02
+		i = nm1
+		while (i > 0) {
+			const tb = b
+			b = b * (2.0 * (i as f64)) / y - a
+			a = tb
+			if (scale && b > asF64(0x5f30000000000000)) {
+				// 2^500
+				a /= b
+				t /= b
+				b = 1.0
+			}
+			i--
+		}
+		const j0x = j0F64(y)
+		const j1x = j1F64(y)
+		b = if (fabs(j0x) >= fabs(j1x)) t * j0x / b else t * j1x / a
+	}
+	return if (sign != 0) -b else b
+}
+
+function jnF32(n: i32, x: f32): f32 {
+	if (x != x) {
+		return x
+	}
+	if (n == 0) {
+		return j0F32(x)
+	}
+	let sign = (asU32(x) >> 31) as i32
+	let y = x
+	let nm1 = n - 1
+	if (n < 0) {
+		nm1 = -(n + 1)
+		y = -x
+		sign ^= 1
+	}
+	if (nm1 == 0) {
+		return j1F32(y)
+	}
+	sign &= n
+	y = fabsf(y)
+	let b: f32 = 0.0
+	if (y == 0.0 || y == inff) {
+		b = 0.0
+	} else if ((nm1 as f32) < y) {
+		let a = j0F32(y)
+		b = j1F32(y)
+		for (const i of 1 ... nm1) {
+			const t = b
+			b = b * (2.0 * (i as f32) / y) - a
+			a = t
+		}
+	} else if (asU32(y) < 0x35800000) {
+		// x < 2^-20: (x/2)^n / n!, n at most 9
+		const half = 0.5 * y
+		let a: f32 = 1.0
+		b = half
+		for (const i of 2 ... (if (nm1 > 8) 8 else nm1) + 1) {
+			a *= i as f32
+			b *= half
+		}
+		b = b / a
+	} else {
+		// as jn, to 1e4
+		const nf = (nm1 as f32) + 1.0
+		const w = 2.0 * nf / y
+		const h = 2.0 / y
+		let z = w + h
+		let q0 = w
+		let q1 = w * z - 1.0
+		let k = 1
+		while (q1 < 1.0e4) {
+			k += 1
+			z += h
+			const q = z * q1 - q0
+			q0 = q1
+			q1 = q
+		}
+		let t: f32 = 0.0
+		let i = k
+		while (i >= 0) {
+			t = 1.0 / (2.0 * ((i as f32) + nf) / y - t)
+			i--
+		}
+		let a = t
+		b = 1.0
+		const scale = nf * logF32(fabsf(w)) >= 88.721679688
+		i = nm1
+		while (i > 0) {
+			const tb = b
+			b = 2.0 * (i as f32) * b / y - a
+			a = tb
+			if (scale && b > asF32(0x5d800000)) {
+				// 2^60
+				a /= b
+				t /= b
+				b = 1.0
+			}
+			i--
+		}
+		const j0x = j0F32(y)
+		const j1x = j1F32(y)
+		b = if (fabsf(j0x) >= fabsf(j1x)) t * j0x / b else t * j1x / a
+	}
+	return if (sign != 0) -b else b
+}
+
+/// The Bessel function of the second kind of order n; y(-n, x) = (-1)^n y(n, x). -infinity at 0, NaN below.
+function ynF64(n: i32, x: f64): f64 {
+	if (x != x) {
+		return x
+	}
+	if (asU64(x) >> 63 != 0 && x != 0.0) {
+		return nan
+	}
+	if (x == inf) {
+		return 0.0
+	}
+	if (n == 0) {
+		return y0F64(x)
+	}
+	const nm1 = if (n < 0) -(n + 1) else n - 1
+	const neg = n < 0 && (n & 1) != 0
+	let b = 0.0
+	if (nm1 == 0) {
+		b = y1F64(x)
+	} else if (high(x) & 0x7fffffff >= 0x52d00000) {
+		// x > 2^302
+		b = invsqrtpi * shifted(nm1, false, x) / sqrtF64(x)
+	} else {
+		// y(n + 1, x) = 2n/x y(n, x) - y(n - 1, x), until -infinity
+		let a = y0F64(x)
+		b = y1F64(x)
+		let i = 0
+		while (i < nm1 && high(b) != 0xfff00000) {
+			i++
+			const t = b
+			b = (2.0 * (i as f64) / x) * b - a
+			a = t
+		}
+	}
+	return if (neg) -b else b
+}
+
+function ynF32(n: i32, x: f32): f32 {
+	if (x != x) {
+		return x
+	}
+	if (asU32(x) >> 31 != 0 && x != 0.0) {
+		return nanf
+	}
+	if (x == inff) {
+		return 0.0
+	}
+	if (n == 0) {
+		return y0F32(x)
+	}
+	const nm1 = if (n < 0) -(n + 1) else n - 1
+	const neg = n < 0 && (n & 1) != 0
+	let b: f32 = 0.0
+	if (nm1 == 0) {
+		b = y1F32(x)
+	} else {
+		let a = y0F32(x)
+		b = y1F32(x)
+		let i = 0
+		while (i < nm1 && asU32(b) != 0xff800000) {
+			i++
+			const t = b
+			b = (2.0 * (i as f32) / x) * b - a
+			a = t
+		}
+	}
+	return if (neg) -b else b
+}
