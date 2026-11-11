@@ -17,7 +17,7 @@ import {
 	TpdeBuildVaStart, TpdeBuildFrameAddress, TpdeBuildStackAlloc,
 	TpdeConstArray, TpdeConstCast, TpdeConstGEP, TpdeConstInt, TpdeConstIntOfString, TpdeConstNull, TpdeConstReal,
 	TpdeConstRealOfString, TpdeConstString, TpdeConstStruct, TpdeCtlz, TpdeCtpop, TpdeCttz, TpdeDeleteFunction,
-	TpdeDoubleType, TpdeEmitToFile, TpdeFAbs, TpdeFAdd, TpdeFDiv, TpdeFMul, TpdeFNeg, TpdeFPExt, TpdeFPToSI, TpdeFPToUI,
+	TpdeDoubleType, TpdeEmit, TpdeFAbs, TpdeFAdd, TpdeFDiv, TpdeFMul, TpdeFNeg, TpdeFPExt, TpdeFPToSI, TpdeFPToUI,
 	TpdeFPTrunc, TpdeFRem, TpdeFSub, TpdeFloatType, TpdeHoldsRef, TpdeLayout, TpdeRefType, TpdeSetCollected,
 	TpdeSetConstant, TpdeSetHidden, TpdeSetSection, TpdeFunctionType, TpdeGetBasicBlockTerminator, TpdeGetInsertBlock,
 	TpdeGetNamedFunction, TpdeGetNamedGlobal, TpdeGetParam, TpdeGetReturnType, TpdeGlobalGetValueType, TpdeIntEQ,
@@ -247,12 +247,24 @@ export class Tpde implements Backend {
 		})
 	}
 	verify() { checked(TpdeVerifyModule(this.m)) }
+	/// The object file's bytes.
+	object(): string {
+		let err: c.ptr = 0
+		let size: u64 = 0
+		const bytes = c.out(p => { size = c.out(n => { err = TpdeEmit(this.m, p, n) }) })
+		checked(err)
+		const s = c.fromCBytes(bytes, size)
+		free(bytes)
+		return s
+	}
 	/// Writes the object file; TPDE cannot write assembly.
 	emit(path: string, asm: bool) {
 		if (asm) {
 			throw new CompileError("assembly output is not supported by TPDE")
 		}
-		checked(withString(path, p => TpdeEmitToFile(this.m, p)))
+		if (!writeFile(path, this.object())) {
+			throw new CompileError(`cannot write ${path}`)
+		}
 	}
 }
 

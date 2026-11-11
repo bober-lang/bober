@@ -1,7 +1,7 @@
 // TPDE as a code generator behind a C API shaped like the part of LLVM-C that src/backend/llvm.bob uses: a module holds
 // types, constants, functions, globals and blocks, all handles of its own, 0 for none, and appends instructions at
 // the block it is positioned at. Nothing is checked as it is built; the first misuse or unsupported operation is
-// kept and reported by TpdeVerifyModule and TpdeEmitToFile, which return a message, or NULL when all is well.
+// kept and reported by TpdeVerifyModule and TpdeEmit, which return a message, or NULL when all is well.
 #pragma once
 #include <stdint.h>
 
@@ -142,8 +142,8 @@ TpdeValueRef TpdeLayout(TpdeModuleRef m, TpdeTypeRef t);
 void TpdeSetSection(TpdeModuleRef m, TpdeValueRef g, const char *name);
 
 const char *TpdeVerifyModule(TpdeModuleRef m);
-/// Writes an object file for this host.
-const char *TpdeEmitToFile(TpdeModuleRef m, const char *path);
+/// An object file for this host, of size bytes at *object, from malloc, for the caller to free.
+const char *TpdeEmit(TpdeModuleRef m, uint8_t **object, uint64_t *size);
 
 #ifdef __cplusplus
 }
