@@ -1,0 +1,26 @@
+//! Tests of src/link/pe: a written DLL read back.
+
+import { sort } from "../../std/sort"
+import { arm64 } from "./arm64"
+import { Linker } from "./link"
+import { Code, Global, Object, Section, Symbol } from "./object"
+import { pe } from "./pe"
+
+test "a written DLL's export directory names what the image exports" {
+	const sec = new Section(".text", Code)
+	sec.align = 4
+	sec.bytes = "\xc0\x03\x5f\xd6"
+	sec.size = 4
+	const o = new Object("a.obj", "arm64")
+	o.sections = [sec]
+	const names = ["b", "a", "ab", "c"]
+	o.symbols = names.map(n => new Symbol(n, Global, 0))
+	const l = new Linker(arm64, pe)
+	l.add(o)
+	for (const n of names) {
+		l.export(n)
+	}
+	const got = pe.exports("a.dll", pe.write(l.link()))
+	sort(names)
+	assert got.join(" ") == names.join(" ")
+}
