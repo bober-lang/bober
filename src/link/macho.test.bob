@@ -1,0 +1,45 @@
+//! Tests of src/link/macho: a written dylib read back.
+
+import { sort } from "../../std/sort"
+import { indexOf } from "../../std/string"
+import { CompileError } from "../error"
+import { arm64 } from "./arm64"
+import { Linker } from "./link"
+import { macho } from "./macho"
+import { Code, Global, Object, Section, Symbol, Unwind } from "./object"
+
+/// A section named name of kind, of 8 zero bytes.
+function section(name: string, kind: u8): Section {
+	const s = new Section(name, kind)
+	s.align = 4
+	s.bytes = "\x00\x00\x00\x00\x00\x00\x00\x00"
+	s.size = 8
+	return s
+}
+
+/// The dylib of an arm64 object of sections, its first exported as each of names.
+function dylib(sections: Section[], names: string[]): string throws CompileError {
+	const o = new Object("a.o", "arm64")
+	o.sections = sections
+	o.symbols = names.map(n => new Symbol(n, Global, 0))
+	const l = new Linker(arm64, macho)
+	l.add(o)
+	for (const n of names) {
+		l.export(n)
+	}
+	return macho.write(l.link())
+}
+
+test "a written dylib's export trie holds the names the image exports, of shared prefixes too" {
+	const names = ["_a", "_ab", "_abc", "_b", "_ba"]
+	const got = macho.exports("a.dylib", dylib([section("__text", Code)], names))
+	sort(got)
+	assert got.join(" ") == names.join(" ")
+}
+
+test "the Unwind sections are __eh_frame however named, and a long name is cut to 16 bytes" {
+	const d = dylib([section("__text", Code), section(".eh_frame", Unwind), section("bober_type_descriptors", Code)],
+		["_a"])
+	assert indexOf(d, "__eh_frame\x00\x00\x00\x00\x00\x00__TEXT") > 0 && indexOf(d, ".eh_frame") < 0
+	assert indexOf(d, "bober_type_descr__TEXT") > 0
+}
