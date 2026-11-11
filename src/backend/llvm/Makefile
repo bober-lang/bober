@@ -1,6 +1,7 @@
 # Builds the sysroot that bober links its programs against, statically, in build/musl: musl with the host's Linux
-# headers, then libunwind, libc++abi and libc++ built against it by the system's clang, from the LLVM of bober.pkg, and
-# that clang's compiler-rt builtins, since bobcc links against the sysroot alone. Run as make -C src/backend/llvm.
+# headers, then libunwind, libc++abi and libc++ built against it by the system's clang, from the LLVM of bober.pkg,
+# position-independent, as images link them too, and that clang's compiler-rt builtins, since bobcc links against the
+# sysroot alone. Run as make -C src/backend/llvm.
 root := $(abspath ../../..)
 out := $(root)/build
 sysroot := $(out)/musl
@@ -19,7 +20,7 @@ $(sysroot)/usr/lib/libc++.a: $(sysroot)/usr/lib/libc.a
 		-DLIBCXXABI_ENABLE_SHARED=OFF -DLIBCXXABI_USE_COMPILER_RT=ON -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
 		-DLIBCXXABI_ENABLE_STATIC_UNWINDER=ON -DLIBCXXABI_STATICALLY_LINK_UNWINDER_IN_STATIC_LIBRARY=ON -DLIBCXXABI_HAS_CXA_THREAD_ATEXIT_IMPL=OFF \
 		-DLIBCXX_ENABLE_SHARED=OFF -DLIBCXX_USE_COMPILER_RT=ON -DLIBCXX_HAS_MUSL_LIBC=ON \
-		-DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON -DLLVM_INCLUDE_TESTS=OFF
+		-DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON -DLLVM_INCLUDE_TESTS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 	ninja -C $(src)/build install-unwind install-cxxabi install-cxx
 	cp $(shell clang -print-libgcc-file-name -rtlib=compiler-rt) $(sysroot)/usr/lib/libclang_rt.builtins.a
 	rm -rf $(src)
