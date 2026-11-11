@@ -1,0 +1,469 @@
+//! COFF and PE32+, of x86-64 and arm64: objects read as Objects, the names a DLL exports, and an Image written as a
+//! DLL. This is the only file of the linker that knows COFF or PE.
+
+import { slash } from "../../std/ascii"
+import { get, put } from "../../std/encoding/binary"
+import { alignUp, max } from "../../std/math"
+import { sortBy } from "../../std/sort"
+import { indexOf, startsWith } from "../../std/string"
+import { CompileError } from "../error"
+import { addend } from "./arm64"
+import { decimal, le, pad, str, u } from "./bytes"
+import { Format, Image } from "./link"
+import { Abs64, Call, Code, Const, Data, Fixup, Global, Image32, Init, Local, Object, Page, PageOff, Rel32, Section,
+	SlotPage, SlotPageOff, SlotRel32, Symbol, Unwind, Weak, Zero } from "./object"
+
+/// The room the writer needs before the first linked address: a page of the largest the linker uses, as a section
+/// starts at a page and the headers are less.
+const headers: u64 = 0x10000
+
+/// The COFF header's machine of x86-64 and of arm64.
+const AMD64: u64 = 0x8664
+const ARM64: u64 = 0xaa64
+
+/// Section characteristics: code, zeros, information and bytes not linked, of more relocations than their count holds,
+/// discardable, run, read, written; and initialized data, which the writer's data sections are.
+const SCN_CNT_CODE: u64 = 0x20
+const SCN_CNT_INITIALIZED_DATA: u64 = 0x40
+const SCN_CNT_UNINITIALIZED_DATA: u64 = 0x80
+const SCN_LNK_INFO: u64 = 0x200
+const SCN_LNK_REMOVE: u64 = 0x800
+const SCN_LNK_NRELOC_OVFL: u64 = 0x01000000
+const SCN_MEM_DISCARDABLE: u64 = 0x02000000
+const SCN_MEM_EXECUTE: u64 = 0x20000000
+const SCN_MEM_READ: u64 = 0x40000000
+const SCN_MEM_WRITE: u64 = 0x80000000
+
+/// A symbol's storage class: seen by all objects, seen in its object, a label there, a weak external.
+const EXTERNAL: u64 = 2
+const STATIC: u64 = 3
+const LABEL: u64 = 6
+const WEAK_EXTERNAL: u64 = 105
+/// The COMDAT selection of a section dropped with the section it is associated with.
+const ASSOCIATIVE: u64 = 5
+
+/// x86-64's relocation types: none, S + A of 8 bytes, of 4 bytes from the image, and of 4 bytes from 4 to 9 bytes on.
+const AMD64_ABSOLUTE: u64 = 0
+const AMD64_ADDR64: u64 = 1
+const AMD64_ADDR32NB: u64 = 3
+const AMD64_REL32: u64 = 4
+const AMD64_REL32_5: u64 = 9
+/// arm64's, of data as x86-64's, and of instructions: b and bl, adrp, add, and the loads and stores.
+const ARM64_ABSOLUTE: u64 = 0
+const ARM64_ADDR32NB: u64 = 2
+const ARM64_BRANCH26: u64 = 3
+const ARM64_PAGEBASE_REL21: u64 = 4
+const ARM64_PAGEOFFSET_12A: u64 = 6
+const ARM64_PAGEOFFSET_12L: u64 = 7
+const ARM64_ADDR64: u64 = 14
+const ARM64_REL32: u64 = 17
+
+/// Where a DLL is loaded unless taken: above 4 GiB, so that a pointer not rebased is not one.
+const IMAGE_BASE: u64 = 0x180000000
+/// The COFF header's characteristics of an image: run, of addresses over 2 GiB, a DLL.
+const DLL: u64 = 0x2022
+/// The optional header's magic of PE32+; DllCharacteristics: 64-bit address randomization, rebased, data not run.
+const PE32_PLUS: u64 = 0x20b
+const DLL_CHARACTERISTICS: u64 = 0x160
+/// The subsystem of a program of the console, which a DLL of no window is.
+const WINDOWS_CUI: u64 = 3
+/// A base relocation that adds to 8 bytes.
+const REL_BASED_DIR64: u64 = 10
+
+/// The COFF object bytes, read from the file name, as an Object. The sections not linked, as the linker's directives
+/// and debug information, are dropped with their relocations. A section named `.text$a` is a `.text` section of order
+/// `a`: those of one name are laid out together, by their order.
+function read(name: string, bytes: string): Object throws CompileError {
+	const machine = if (bytes.length < 20) 0 else u(bytes, 0, 2)
+	if (machine != AMD64 && machine != ARM64 || u(bytes, 16, 2) != 0) {
+		throw new CompileError(`${name}: not an x86-64 or arm64 COFF object`)
+	}
+	const x64 = machine == AMD64
+	const count = u(bytes, 2, 2) as i32
+	const symtab = u(bytes, 8, 4) as i32
+	const records = u(bytes, 12, 4) as i32
+	const strings = symtab + 18 * records
+	if (20 + 40 * count > bytes.length || strings + 4 > bytes.length) {
+		throw new CompileError(`${name}: truncated`)
+	}
+	const o = new Object(name, if (x64) "x86_64" else "arm64")
+	// Per section of the file, from 1, its index in o, -1 if it is not linked; and its COMDAT selection and the section
+	// that one associates it with.
+	const index: i32[] = [-1]
+	const selection = new u64[](count + 1)
+	const associate = new i32[](count + 1)
+	for (const i of 0 ... count - 1) {
+		const h = 20 + 40 * i
+		const flags = u(bytes, h + 36, 4)
+		const full = nameAt(bytes, h, strings)
+		const at = u(bytes, h + 20, 4)
+		const size = u(bytes, h + 16, 4)
+		if ((flags & (SCN_LNK_INFO | SCN_LNK_REMOVE | SCN_MEM_DISCARDABLE)) != 0) {
+			index.push(-1)
+			continue
+		}
+		const dollar = indexOf(full, "$")
+		const s = new Section(if (dollar < 0) full else full.slice(0, dollar), kindOf(full, flags))
+		s.order = if (dollar < 0) "" else full.slice(dollar + 1, full.length)
+		// Alignment bits of 0 are 16 bytes, as LLVM reads them.
+		const align = flags >> 20 & 15
+		s.align = if (align == 0) 16 else 1 << (align - 1)
+		s.size = size
+		if (s.kind != Zero && at + size > (bytes.length as u64)) {
+			throw new CompileError(`${name}: section ${full} is truncated`)
+		}
+		s.bytes = if (s.kind == Zero) "" else bytes.slice(at as i32, (at + size) as i32)
+		index.push(o.sections.length)
+		o.sections.push(s)
+	}
+
+	// Per record of the symbol table, the index of its symbol in o; -1 for an auxiliary record and for those no fixup
+	// may refer to: a file's name, an absolute value as `@feat.00`, debug information.
+	const syms: i32[] = []
+	// The weak externals, as their symbol in o and the record of the symbol that is theirs if no object defines them.
+	const weak: [i32, i32][] = []
+	let r = 0
+	while (r < records) {
+		const p = symtab + 18 * r
+		const sym = nameAt(bytes, p, strings)
+		const number = u(bytes, p + 12, 2) as i32
+		const cls = bytes[p + 16] as u64
+		const aux = bytes[p + 17] as i32
+		const section = if (number > 0 && number <= count) index[number] else -1
+		syms.push(o.symbols.length)
+		if (cls == WEAK_EXTERNAL) {
+			weak.push([o.symbols.length, u(bytes, p + 18, 4) as i32])
+			o.symbols.push(new Symbol(sym, Weak))
+		} else if (cls == EXTERNAL && number == 0) {
+			if (u(bytes, p + 8, 4) != 0) {
+				throw new CompileError(`${name}: common symbol ${sym} cannot be linked`)
+			}
+			// `__imp_x` is the slot of x, which its fixups name.
+			o.symbols.push(new Symbol(if (startsWith(sym, "__imp_")) sym.slice(6, sym.length) else sym, Global))
+		} else if ((cls == EXTERNAL || cls == STATIC || cls == LABEL) && number > 0 && number <= count) {
+			// A static symbol with an auxiliary record is its section's, which has its COMDAT selection; the
+			// symbol after it of a COMDAT section whose copies are alike names the section's group. A symbol of a
+			// section that is not linked has no address, and is no definition.
+			const own = cls == STATIC && aux > 0
+			o.symbols.push(new Symbol(if (own) "" else sym, if (cls == EXTERNAL && section >= 0) Global else Local,
+				section, u(bytes, p + 8, 4)))
+			if (own) {
+				selection[number] = bytes[p + 32] as u64
+				associate[number] = u(bytes, p + 30, 2) as i32
+			} else if (section >= 0 && selection[number] > 1 && selection[number] != ASSOCIATIVE &&
+				o.sections[section].group == "") {
+				o.sections[section].group = sym
+			}
+		} else {
+			syms[r] = -1
+		}
+		for (const _ of 1 ... aux) {
+			syms.push(-1)
+		}
+		r += 1 + aux
+	}
+	// A weak external whose symbol is defined here is a weak definition there, else a weak reference.
+	for (const [s, d] of weak) {
+		const def = if (d < syms.length) syms[d] else -1
+		if (def >= 0 && o.symbols[def].section >= 0) {
+			o.symbols[s].section = o.symbols[def].section
+			o.symbols[s].value = o.symbols[def].value
+		}
+	}
+	for (const i of 1 ... count) {
+		const a = associate[i]
+		if (index[i] >= 0 && selection[i] == ASSOCIATIVE && a > 0 && a <= count && index[a] >= 0) {
+			o.sections[index[i]].group = o.sections[index[a]].group
+		}
+	}
+
+	for (const i of 1 ... count) {
+		if (index[i] < 0) {
+			continue
+		}
+		const s = o.sections[index[i]]
+		const h = 20 + 40 * (i - 1)
+		let at = u(bytes, h + 24, 4) as i32
+		let n = u(bytes, h + 32, 2) as i32
+		if ((u(bytes, h + 36, 4) & SCN_LNK_NRELOC_OVFL) != 0) {
+			// The count is the first relocation's address, and counts it too.
+			n = (u(bytes, at, 4) as i32) - 1
+			at += 10
+		}
+		if (at + 10 * n > bytes.length) {
+			throw new CompileError(`${name}: relocations of ${s.name} are truncated`)
+		}
+		for (const j of 0 ... n - 1) {
+			const p = at + 10 * j
+			const off = u(bytes, p, 4)
+			const rec = u(bytes, p + 4, 4) as i32
+			const rt = u(bytes, p + 8, 2)
+			const [k, a] = fixup(x64, rt, s.bytes, off as i32)
+			if (k == 255) {
+				continue
+			}
+			const sym = if (rec < syms.length) syms[rec] else -1
+			const raw = if (rec < records) nameAt(bytes, symtab + 18 * rec, strings) else ""
+			// What reaches `__imp_x`, which no object defines, reaches the slot of x.
+			let kind = k
+			if (sym >= 0 && o.symbols[sym].section < 0 && startsWith(raw, "__imp_")) {
+				kind = switch (k) {
+					case Rel32: SlotRel32
+					case Page: SlotPage
+					case PageOff: SlotPageOff
+					default: -1
+				}
+			}
+			if (kind < 0 || sym < 0) {
+				throw new CompileError(`${name}: relocation ${rt} of ${s.name}+${off} to ${raw} cannot be linked`)
+			}
+			s.fixups.push(new Fixup(off, kind as u8, sym, a))
+		}
+	}
+	return o
+}
+
+/// The kind of a section of name full and characteristics flags: the function table of `.pdata`, which is the
+/// unwinder's; and the pointers to C++'s initializers, which those of `.CRT$XC` are.
+function kindOf(full: string, flags: u64): u8 {
+	return if (full == ".pdata") Unwind else if (startsWith(full, ".CRT$XC")) Init
+		else if ((flags & SCN_MEM_EXECUTE) != 0) Code else if ((flags & SCN_CNT_UNINITIALIZED_DATA) != 0) Zero
+		else if ((flags & SCN_MEM_WRITE) != 0) Data else Const
+}
+
+/// The kind of fixup of relocation type rt of x86-64 or arm64, and its addend, which the bytes b at at hold; kind 255
+/// for a relocation that is none, -1 for one the linker does not know. A REL32_n is relative to n bytes after the end
+/// of its 4, which the addend takes away.
+function fixup(x64: bool, rt: u64, b: string, at: i32): [i32, i64] {
+	const w = if (at + 4 <= b.length) u(b, at, 4) else 0
+	const word = (w as i32) as i64
+	const wide = if (at + 8 <= b.length) u(b, at, 8) as i64 else 0
+	if (x64) {
+		return if (rt == AMD64_ABSOLUTE) [255, 0] else if (rt == AMD64_ADDR64) [Abs64, wide]
+			else if (rt == AMD64_ADDR32NB) [Image32, word]
+			else if (rt >= AMD64_REL32 && rt <= AMD64_REL32_5) [Rel32, word - ((rt - AMD64_REL32 + 4) as i64)]
+			else [-1, 0]
+	}
+	return switch (rt) {
+		case ARM64_ABSOLUTE: [255, 0]
+		case ARM64_ADDR64: [Abs64, wide]
+		case ARM64_ADDR32NB: [Image32, word]
+		case ARM64_REL32: [Rel32, word - 4]
+		case ARM64_BRANCH26: [Call, addend(w, Call)]
+		// COFF's convention: adrp's immediate holds the addend in bytes, not pages as the CPU reads it.
+		case ARM64_PAGEBASE_REL21: [Page, addend(w, Page) >> 12]
+		case ARM64_PAGEOFFSET_12A, ARM64_PAGEOFFSET_12L: [PageOff, addend(w, PageOff)]
+		default: [-1, 0]
+	}
+}
+
+/// The names the DLL bytes, read from the file name, exports, by its export directory.
+function exports(name: string, bytes: string): string[] throws CompileError {
+	const pe = if (bytes.length < 64) 0 else u(bytes, 60, 4) as i32
+	if (pe == 0 || pe + 24 + 240 > bytes.length || bytes.slice(pe, pe + 4) != "PE\x00\x00" ||
+		u(bytes, pe + 24, 2) != PE32_PLUS) {
+		throw new CompileError(`${name}: not a PE32+ image`)
+	}
+	// The optional header is after the COFF header's 24 bytes and is 240; the export directory's address is at 112.
+	const dir = u(bytes, pe + 24 + 112, 4)
+	if (dir == 0) {
+		return []
+	}
+	// The file offset of address a, by the header of the section it is in.
+	const offset = (a: u64) => {
+		let at: u64 = 0
+		for (const i of 0 ... (u(bytes, pe + 6, 2) as i32) - 1) {
+			const h = pe + 24 + (u(bytes, pe + 20, 2) as i32) + 40 * i
+			const va = u(bytes, h + 12, 4)
+			at = if (a >= va && a < va + u(bytes, h + 16, 4)) a - va + u(bytes, h + 20, 4) else at
+		}
+		return at as i32
+	}
+	// The directory's count of names is at 24, and the address of their addresses at 32.
+	const e = offset(dir)
+	const names = offset(u(bytes, e + 32, 4))
+	const out: string[] = []
+	for (const i of 0 ... (u(bytes, e + 24, 4) as i32) - 1) {
+		out.push(str(bytes, offset(u(bytes, names + 4 * i, 4))))
+	}
+	return out
+}
+
+/// The image as a DLL. A section header maps each segment and one more, past them all, the loader's tables: the
+/// export directory, the import directory, and the base relocations. The import directory has a descriptor per run of
+/// consecutive slots of one library, the only pointers it binds. The exception directory is the Unwind sections,
+/// `.pdata`. Nothing in a DLL runs the image's Init pointers by itself; who loads it runs them. The image changes: the
+/// slots hold their names, the rebased pointers IMAGE_BASE more, and the function table is sorted.
+function write(image: Image): string {
+	const x64 = image.arch == "x86_64"
+	const page = image.page
+	const segs = image.segments
+	const last = segs[segs.length - 1]
+	// The loader's tables are at address base, and at offset file in the file, both multiples of a page.
+	const file = alignUp(image.bytes.length as u64, page)
+	const base = alignUp(last.address + last.size + last.zero, page)
+	let tail = ""
+	const place = (s: string) => {
+		tail = pad(tail, alignUp(tail.length, 8)) + s
+		return base + ((tail.length - s.length) as u64)
+	}
+
+	const exported = image.exports.slice(0, image.exports.length)
+	sortBy(exported, (a, b) => a[0] < b[0])
+	let addresses = ""
+	let names = ""
+	let ordinals = ""
+	for (const i of 0 ... exported.length - 1) {
+		addresses += le(exported[i][1], 4)
+		names += le(place(exported[i][0] + "\x00"), 4)
+		ordinals += le(i as u64, 2)
+	}
+	const n = exported.length as u64
+	const exportAt = place([
+		le(0, 12), // flags, time stamp, version
+		le(place("\x00"), 4), // the DLL's name, which the loader takes from the file's
+		le(1, 4), // the first ordinal
+		le(n, 4), // addresses
+		le(n, 4), // names
+		le(place(addresses), 4),
+		le(place(names), 4),
+		le(place(ordinals), 4),
+	].join(""))
+
+	// A descriptor of the lookup table, the library's name and the slots the loader sets; each slot and its entry in
+	// the lookup table hold the address of the name. A weak bind has no form here, and is a plain one.
+	let descriptors = ""
+	let i = 0
+	while (i < image.binds.length) {
+		const first = image.binds[i]
+		let lookup = ""
+		let j = i
+		while (j < image.binds.length && image.binds[j].library == first.library &&
+			image.binds[j].at == first.at + 8 * ((j - i) as u64)) {
+			const hint = place(le(0, 2) + image.binds[j].name + "\x00")
+			lookup += le(hint, 8)
+			put(image.bytes, image.binds[j].at as i32, hint, 8)
+			j++
+		}
+		const dll = place(image.libraries[first.library] + "\x00")
+		descriptors += le(place(lookup + le(0, 8)), 4) + le(0, 8) + le(dll, 4) + le(first.at, 4)
+		i = j
+	}
+	const importAt = place(descriptors + le(0, 20))
+	let slots: [u64, u64] = [0, 0]
+	for (const b of image.binds) {
+		slots = [if (slots[1] == 0 || b.at < slots[0]) b.at else slots[0], max(slots[1], b.at + 8)]
+	}
+
+	// A block of base relocations per 4 KiB page, of 2 bytes per pointer, padded to 4; and the pointers they add the
+	// image's address less IMAGE_BASE to as the address they were linked at.
+	const rebases = image.rebases.slice(0, image.rebases.length)
+	sortBy(rebases, (a, b) => a < b)
+	let relocs = ""
+	i = 0
+	while (i < rebases.length) {
+		const at = rebases[i] & ~0xfff
+		let block = ""
+		while (i < rebases.length && (rebases[i] & ~0xfff) == at) {
+			block += le(REL_BASED_DIR64 << 12 | rebases[i] & 0xfff, 2)
+			put(image.bytes, rebases[i] as i32, get(image.bytes, rebases[i] as i32, 8) + IMAGE_BASE, 8)
+			i++
+		}
+		block = pad(block, alignUp(block.length, 4))
+		relocs += le(at, 4) + le((8 + block.length) as u64, 4) + block
+	}
+	const relocAt = place(relocs)
+
+	// The function table, sorted by the address of each function, as the unwinder searches it. No row is of a
+	// function in a dropped section: a COMDAT function's `.pdata` is a section associative to it, dropped with it.
+	const [from, to] = image.unwind
+	const entry = if (x64) 12 else 8
+	const rows: u8[][] = []
+	for (const k of 0 ... ((to - from) as i32) / entry - 1) {
+		rows.push(image.bytes.slice((from as i32) + entry * k, (from as i32) + entry * (k + 1)))
+	}
+	sortBy(rows, (a, b) => get(a, 0, 4) < get(b, 0, 4))
+	for (const k of 0 ... rows.length - 1) {
+		for (const m of 0 ... entry - 1) {
+			image.bytes[(from as i32) + entry * k + m] = rows[k][m]
+		}
+	}
+
+	let sections = ""
+	for (const s of segs) {
+		const flags = SCN_MEM_READ | (if (s.exec) SCN_CNT_CODE | SCN_MEM_EXECUTE else SCN_CNT_INITIALIZED_DATA) |
+			(if (s.write) SCN_MEM_WRITE else 0)
+		sections += section(if (s.exec) ".text" else if (s.write) ".data" else ".rdata", s.size + s.zero, s.address,
+			alignUp(s.size, page), if (s.size > 0) s.address else 0, flags)
+	}
+	const size = tail.length as u64
+	sections += section(".tables", size, base, alignUp(size, page), file, SCN_MEM_READ | SCN_CNT_INITIALIZED_DATA)
+	const dir = (at: u64, size: u64) => le(if (size > 0) at else 0, 4) + le(size, 4)
+	const optional = [
+		le(PE32_PLUS, 2),
+		le(0, 22), // linker version, sizes of code and data, entry point and code: none a DLL needs
+		le(IMAGE_BASE, 8),
+		le(page, 4), // alignment of sections in memory
+		le(page, 4), // and in the file
+		le(6, 4), // version of Windows, 6.0: Vista
+		le(0, 4), // version of the image
+		le(6, 4), // version of the subsystem
+		le(0, 4), // reserved
+		le(alignUp(base + size, page), 4), // size of the image
+		le(headers, 4),
+		le(0, 4), // checksum, which only a driver needs
+		le(WINDOWS_CUI, 2),
+		le(DLL_CHARACTERISTICS, 2),
+		le(0x100000, 8), // stack reserved, 1 MiB, and committed, 4 KiB, as for a program
+		le(0x1000, 8),
+		le(0x100000, 8), // heap reserved and committed
+		le(0x1000, 8),
+		le(0, 4), // loader flags
+		le(16, 4), // directories
+		dir(exportAt, 40),
+		dir(importAt, (descriptors.length + 20) as u64),
+		dir(0, 0), // resources
+		dir(from, to - from), // exceptions
+		dir(0, 0), // certificates
+		dir(relocAt, relocs.length as u64),
+		le(0, 48), // debug, architecture, global pointer, TLS, load configuration, bound imports
+		dir(slots[0], slots[1] - slots[0]),
+		le(0, 24), // delayed imports, .NET, reserved
+	].join("")
+	const head = [
+		"MZ",
+		le(0, 58),
+		le(64, 4), // where the PE header is, at the end of the DOS one
+		"PE\x00\x00",
+		le(if (x64) AMD64 else ARM64, 2),
+		le((segs.length + 1) as u64, 2), // sections
+		le(0, 12), // time stamp, symbol table, symbols
+		le(optional.length as u64, 2),
+		le(DLL, 2),
+		optional,
+		sections,
+	].join("")
+	for (const k of 0 ... head.length - 1) {
+		image.bytes[k] = head[k]
+	}
+	return pad(fromBytes(image.bytes), file as i32) + pad(tail, alignUp(size, page) as i32)
+}
+
+/// A section header: its name, size and address in memory, size and offset in the file, and flags.
+function section(name: string, size: u64, at: u64, raw: u64, offset: u64, flags: u64): string {
+	return pad(name, 8) + le(size, 4) + le(at, 4) + le(raw, 4) + le(offset, 4) + le(0, 12) + le(flags, 4)
+}
+
+/// The name in the 8 bytes at at, padded with NULs. A longer one is in the string table at strings: a symbol's at the
+/// offset in the 4 bytes after 4 zero ones, a section's at the decimal one after a `/`.
+function nameAt(b: string, at: i32, strings: i32): string {
+	if (u(b, at, 4) == 0) {
+		return str(b, strings + (u(b, at + 4, 4) as i32))
+	} else if (b[at] == slash) {
+		return str(b, strings + decimal(b.slice(at + 1, at + 8)))
+	}
+	return str(b.slice(at, at + 8) + "\x00", 0)
+}
+
+export const pe: Format = { headers: headers, bindsAnywhere: false, start: "__ImageBase", read: read, exports: exports,
+	write: write }
