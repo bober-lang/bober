@@ -15,9 +15,9 @@ import { Format, Image, Segment } from "./link"
 import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Init, Local, Object, Page, PageOff, Rel32, Rel64,
 	Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Unwind, Weak, Zero } from "./object"
 
-/// The room the writer needs before the first linked address: the ELF header and 8 program headers, a PT_LOAD per
-/// segment, of at most 3, and one for the loader's tables, PT_DYNAMIC, PT_TLS, PT_GNU_EH_FRAME and PT_GNU_STACK.
-const headers: u64 = 64 + 8 * 56
+/// The room the writer needs before the first linked address: the ELF header and 9 program headers, a PT_LOAD per
+/// segment, of at most 4, and one for the loader's tables, PT_DYNAMIC, PT_TLS, PT_GNU_EH_FRAME and PT_GNU_STACK.
+const headers: u64 = 64 + 9 * 56
 
 /// e_ident: the magic, 64-bit, little-endian, version 1.
 const ident = "\x7fELF\x02\x01\x01"
@@ -341,7 +341,7 @@ function write(image: Image): string throws CompileError {
 	const segs = image.segments
 	const last = segs[segs.length - 1]
 	// The loader's tables are at address base, and at offset file in the file, both multiples of a page.
-	const file = alignUp(image.bytes.length as u64, image.page)
+	const file = alignUp((image.bytes.length + image.extra.length) as u64, image.page)
 	const base = alignUp(last.address + last.size + last.zero, image.page)
 	let tail = ""
 	const place = (s: string) => {
@@ -378,7 +378,7 @@ function write(image: Image): string throws CompileError {
 		const at = image.rebases[i]
 		put(rela, 24 * i, at, 8)
 		put(rela, 24 * i + 8, if (x64) R_X86_64_RELATIVE else R_AARCH64_RELATIVE, 8)
-		put(rela, 24 * i + 16, get(image.bytes, at as i32, 8), 8)
+		put(rela, 24 * i + 16, get(image.bytes, image.at(at), 8), 8)
 	}
 	for (const i of 0 ... image.binds.length - 1) {
 		const b = image.binds[i]
@@ -396,9 +396,8 @@ function write(image: Image): string throws CompileError {
 	}
 	const relaAt = place(fromBytes(rela))
 
-	const [from, to] = image.unwind
-	const hdrAt = if (to > from) place(fromBytes(frames(image.bytes, from, to, base + alignUp(tail.length as u64, 8))))
-		else 0
+	const at = base + alignUp(tail.length as u64, 8)
+	const hdrAt = if (image.unwinds.length > 0) place(fromBytes(frames(image, at))) else 0
 	const hdrSize = base + (tail.length as u64) - hdrAt
 
 	let dyn = needed.map(at => le(DT_NEEDED, 8) + le(at as u64, 8)).join("")
@@ -433,7 +432,7 @@ function write(image: Image): string throws CompileError {
 		const sflags = SHF_ALLOC | (if (seg.write) SHF_WRITE else 0) | (if (seg.exec) SHF_EXECINSTR else 0) |
 			(if (threaded(image, at)) SHF_TLS else 0)
 		const sht = if (at >= seg.address + seg.size && size > 0) SHT_NOBITS else SHT_PROGBITS
-		section(name, sht, sflags, at, at, size, 0, 0, 0)
+		section(name, sht, sflags, at, image.at(at) as u64, size, 0, 0, 0)
 	}
 	const t = (at: u64) => file + at - base
 	const dynsymIndex = section(".dynsym", SHT_DYNSYM, SHF_ALLOC, symAt, t(symAt), dynsym.length as u64, n + 2, 1, 24)
@@ -454,14 +453,14 @@ function write(image: Image): string throws CompileError {
 	for (const i of 0 ... segs.length - 1) {
 		const s = segs[i]
 		const start = if (i == 0) 0 else s.address
-		phdrs += program(PT_LOAD, flags(s), start, start, s.address + s.size - start, s.address + s.size + s.zero - start,
-			image.page)
+		phdrs += program(PT_LOAD, flags(s), s.offset + start - s.address, start, s.address + s.size - start,
+			s.address + s.size + s.zero - start, image.page)
 	}
 	phdrs += program(PT_LOAD, PF_R | PF_W, file, base, loaded, loaded, image.page)
 	phdrs += program(PT_DYNAMIC, PF_R | PF_W, t(dynAt), dynAt, dyn.length as u64, dyn.length as u64, 8)
 	const [tfrom, tto, talign] = image.thread
 	if (tto > tfrom) {
-		phdrs += program(PT_TLS, PF_R, tfrom, tfrom, tto - tfrom, tto - tfrom, talign)
+		phdrs += program(PT_TLS, PF_R, image.at(tfrom) as u64, tfrom, tto - tfrom, tto - tfrom, talign)
 	}
 	if (hdrAt != 0) {
 		phdrs += program(PT_GNU_EH_FRAME, PF_R, t(hdrAt), hdrAt, hdrSize, hdrSize, 4)
@@ -473,7 +472,8 @@ function write(image: Image): string throws CompileError {
 	for (const i of 0 ... head.length - 1) {
 		image.bytes[i] = head[i]
 	}
-	return fromBytes(image.bytes) + zeros((file as i32) - image.bytes.length) + tail
+	const body = fromBytes(image.bytes) + image.extra
+	return body + zeros((file as i32) - body.length) + tail
 }
 
 /// A program header.
@@ -538,25 +538,30 @@ function hash(syms: Symbol[]): u8[] {
 	return b
 }
 
-/// The eh_frame_hdr, at address at, of the call frame information in b from from to to: where that is, and a table
-/// for the unwinder to search, of the code address of each FDE and its own, sorted.
-function frames(b: u8[], from: u64, to: u64, at: u64): u8[] throws CompileError {
+/// The eh_frame_hdr, at address at, of the call frame information of image, from and to where its unwinds say: where
+/// the first is, and a table for the unwinder to search, of the code address of each FDE and its own, sorted.
+function frames(image: Image, at: u64): u8[] throws CompileError {
+	const b = image.bytes
+	const spans = image.unwinds
 	const fdes: [u64, u64][] = []
-	let p = from
-	while (p + 4 <= to) {
-		const size = get(b, p as i32, 4)
-		const cie = get(b, (p + 4) as i32, 4)
-		// An FDE of a dropped function was not fixed up, and its pc is its own address.
-		const pc = if (size != 0 && cie != 0) pointer(b, p + 8, encoding(b, (p + 4 - cie) as i32)) else from
-		if (pc < from || pc >= to) {
-			fdes.push([pc, p])
+	for (const [from, to] of spans) {
+		const d = from - (image.at(from) as u64) // what an address here is more than where b has it
+		let p = from
+		while (p + 4 <= to) {
+			const size = get(b, (p - d) as i32, 4)
+			const cie = get(b, (p + 4 - d) as i32, 4)
+			// An FDE of a dropped function was not fixed up, and its pc is its own address.
+			const pc = if (size != 0 && cie != 0) pointer(b, p + 8, encoding(b, (p + 4 - cie - d) as i32), d) else from
+			if (pc < from || pc >= to) {
+				fdes.push([pc, p])
+			}
+			p += 4 + size
 		}
-		p += 4 + size
 	}
 	sortBy(fdes, (x, y) => x[0] < y[0])
 	const h = new u8[](12 + 8 * fdes.length)
 	put(h, 0, 0x3b031b01, 4) // version 1; eh_frame_ptr pcrel sdata4; fde_count udata4; table datarel sdata4
-	put(h, 4, from - at - 4, 4)
+	put(h, 4, spans[0][0] - at - 4, 4)
 	put(h, 8, fdes.length as u64, 4)
 	for (const i of 0 ... fdes.length - 1) {
 		put(h, 12 + 8 * i, fdes[i][0] - at, 4)
@@ -588,12 +593,12 @@ function encoding(b: u8[], cie: i32): u64 throws CompileError {
 	return if (b[c] == 0) 0 else b[p] as u64
 }
 
-/// The address the pointer at p holds in encoding enc: of the size and sign of its low 4 bits, and relative to p if
-/// its next 3 are 1, else absolute.
-function pointer(b: u8[], p: u64, enc: u64): u64 throws CompileError {
+/// The address the pointer at the address p, which b has d before, holds in encoding enc: of the size and sign of its
+/// low 4 bits, and relative to p if its next 3 are 1, else absolute.
+function pointer(b: u8[], p: u64, enc: u64, d: u64): u64 throws CompileError {
 	const n = size(enc)
 	const shift = 64 - 8 * n
-	let v = get(b, p as i32, n)
+	let v = get(b, (p - d) as i32, n)
 	v = if ((enc & 8) != 0) (((v << shift) as i64) >> shift) as u64 else v
 	if ((enc & 0x70) > 0x10) {
 		throw new CompileError(`unwind tables: pointer encoding ${enc} is not supported`)

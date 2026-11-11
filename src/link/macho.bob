@@ -421,12 +421,14 @@ function write(image: Image): string throws CompileError {
 	// The image's sections, but its Unwind ones, however the objects name them, are one, `__eh_frame`, as the unwinder
 	// finds them by that name.
 	const sections: [string, u64, u64][] = []
+	const spans = image.unwinds
+	const [from, to] = if (spans.length > 0) [spans[0][0], spans[spans.length - 1][1]] else [0, 0]
 	let unwind = false
 	for (const s of image.sections) {
-		if (s[1] < image.unwind[0] || s[1] >= image.unwind[1]) {
+		if (s[1] < from || s[1] >= to) {
 			sections.push(s)
 		} else if (!unwind) {
-			sections.push(["__eh_frame", s[1], image.unwind[1] - s[1]])
+			sections.push(["__eh_frame", s[1], to - s[1]])
 			unwind = true
 		}
 	}
