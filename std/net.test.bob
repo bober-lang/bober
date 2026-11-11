@@ -25,6 +25,13 @@ function serve(l: Listener, n: i32) throws IoError {
 	}
 }
 
+/// Waits up to ms, 0 for no limit, for fd to read, adding ms to late if it timed out.
+function wait(fd: i32, ms: i64, late: i64[]) {
+	if (bober_io_ready(fd, 0, ms * millisecond) != 0) {
+		late.push(ms)
+	}
+}
+
 /// What the echo at addr gives back for s.
 function roundTrip(addr: string, s: string): string throws IoError | ParseError {
 	const c = dial(addr)
@@ -159,6 +166,37 @@ test "close ends what waits, the peer reading an end, and again does nothing" {
 		kind = e.kind
 	}
 	assert kind != ""
+}
+
+test "waits on one socket each end at their own deadline, in its order, or once it is ready" {
+	const l = listen("127.0.0.1:0")
+	const accepted = async l.accept()
+	const c = dial(`${l.addr}`)
+	const s = await accepted
+	const late: i64[] = []
+	const jobs = [async wait(c.fd, 30, late), async wait(c.fd, 10, late), async wait(c.fd, 0, late),
+		async wait(c.fd, 20, late)]
+	await jobs[0]
+	assert late == [10, 20, 30]
+	s.write("x")
+	await jobs[2]
+	assert late.length == 3
+	s.close()
+	c.close()
+	l.close()
+}
+
+test "a wait on a socket made ready while none waited ends at once" {
+	const l = listen("127.0.0.1:0")
+	const accepted = async l.accept()
+	const c = dial(`${l.addr}`)
+	const s = await accepted
+	s.write("x")
+	bober_io_ready(l.fd, 0, 20 * millisecond) // A round of the kernel's events, with none waiting on c.
+	assert bober_io_ready(c.fd, 0, 50 * millisecond) == 0
+	s.close()
+	c.close()
+	l.close()
 }
 
 test "a closed socket is BadResource, whoever has its descriptor now" {
