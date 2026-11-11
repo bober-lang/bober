@@ -1,0 +1,75 @@
+//! AArch64 as the linker needs it: the page segments are aligned to, the code of a stub, how each kind of fixup sets
+//! the instruction it is at, and the addend an instruction holds.
+
+import { get, put } from "../../std/encoding/binary"
+import { Call, Machine, Page, PageOff, SlotPage, SlotPageOff } from "./object"
+
+/// False if v is out of the instruction's reach or not aligned to the size it scales its offset by.
+export function apply(b: u8[], at: i32, kind: u8, v: u64, p: u64): bool {
+	const d = (v - p) as i64
+	switch (kind) {
+		case Call:
+			// b and bl: a 26-bit word offset, ±128 MiB.
+			if ((d & 3) != 0 || d < -(1 << 27) || d >= 1 << 27) {
+				return false
+			}
+			patch(b, at, 0x03ffffff, (d >> 2) as u64)
+		case Page:
+			// adrp: a 21-bit offset in pages, its low 2 bits at 29 and the rest at 5, ±4 GiB.
+			const pages = ((v >> 12) - (p >> 12)) as i64
+			if (pages < -(1 << 20) || pages >= 1 << 20) {
+				return false
+			}
+			const n = pages as u64
+			patch(b, at, 0x60ffffe0, (n & 3) << 29 | (n >> 2 & 0x7ffff) << 5)
+		case PageOff:
+			// add and the loads and stores of an unsigned offset: 12 bits at 10, scaled by the size accessed.
+			const scale = scaleOf(get(b, at, 4))
+			const off = v & 0xfff
+			if ((off & ((1 << scale) - 1)) != 0) {
+				return false
+			}
+			patch(b, at, 0x003ffc00, off >> scale << 10)
+	}
+	return true
+}
+
+/// The addend the instruction word holds, in bytes, for a format that keeps it there; apply's inverse. A Call's is
+/// the displacement. A Page's is the distance from the instruction's page to the target's, a whole number of pages.
+/// A PageOff's is the offset in the page, which a load or store holds in units of the size it accesses.
+export function addend(word: u64, kind: u8): i64 {
+	return switch (kind) {
+		case Call: sx(word & 0x03ffffff, 26) << 2
+		case Page: sx((word >> 29 & 3) | (word >> 3 & 0x1ffffc), 21) << 12
+		case PageOff: ((word >> 10 & 0xfff) << scaleOf(word)) as i64
+		default: 0
+	}
+}
+
+/// The log2 of the bytes the load or store word accesses, which its offset counts in; 0 for an add. A load or store of
+/// an unsigned offset has its size in bits 31-30, which is 16 bytes for a vector register (bit 26) of size 0 and opc
+/// (bits 23-22) 2 or 3.
+function scaleOf(word: u64): u64 {
+	if ((word & 0x3b000000) != 0x39000000) {
+		return 0
+	}
+	const size = word >> 30
+	return if (size == 0 && (word & 0x04800000) == 0x04800000) 4 else size
+}
+
+/// The low bits of v, sign-extended.
+function sx(v: u64, bits: u64): i64 { return ((v << (64 - bits)) as i64) >> (64 - bits) }
+
+/// Sets the bits of mask in the instruction at at to those of bits.
+function patch(b: u8[], at: i32, mask: u64, bits: u64) { put(b, at, get(b, at, 4) & ~mask | bits & mask, 4) }
+
+export const arm64: Machine = {
+	arch: "arm64",
+	// 64 KiB, the largest an arm64 kernel uses, so that an image loads on any.
+	page: 0x10000,
+	// `adrp x16, slot; ldr x17, [x16, :lo12:slot]; br x17`, x16 and x17 being the registers a call may clobber on its
+	// way.
+	stub: "\x10\x00\x00\x90\x11\x02\x40\xf9\x20\x02\x1f\xd6",
+	stubFixups: [[0, SlotPage, 0], [4, SlotPageOff, 0]],
+	apply: apply,
+}

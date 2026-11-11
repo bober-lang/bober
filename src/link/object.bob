@@ -1,0 +1,134 @@
+//! What the linker (link.bob) links: an Object is what one compilation made, as its sections, the symbols they define
+//! and name, and the fixups that put a symbol's address into a section's bytes. It is the same whatever file held it:
+//! a reader per format (elf.bob) makes Objects, and nothing else here knows a format; nor a CPU, but its Machine.
+//!
+//! In a fixup's rule, S is the address of its symbol, A its addend, P the address of the bytes it sets, and G that of
+//! the symbol's slot, a pointer the linker makes that holds S. Addresses are from where the image is loaded.
+
+import { Arch } from "../../std/os"
+
+/// Code, which is run and not written.
+export const Code: u8 = 0
+/// Bytes that are read only; but sections of a name of which one holds a pointer, which who loads the image sets, the
+/// linker lays out as Data.
+export const Const: u8 = 1
+/// Bytes that are written.
+export const Data: u8 = 2
+/// Bytes that are written and start as zeros, which no file holds.
+export const Zero: u8 = 3
+/// The unwinder's rules for the code, as its format has them: DWARF call frame information, or Windows' table of
+/// functions.
+export const Unwind: u8 = 4
+/// Pointers to the functions that run when the image is loaded, in order.
+export const Init: u8 = 5
+/// Bytes each thread has its own copy of, which starts as the section's bytes, or as zeros if it holds none.
+export const Thread: u8 = 6
+
+/// S + A, 8 bytes.
+export const Abs64: u8 = 0
+/// S + A - P, 4 bytes, and 8.
+export const Rel32: u8 = 1
+export const Rel64: u8 = 2
+/// The displacement to S + A of the branch at P, or to a stub that jumps there where S is in another image.
+export const Call: u8 = 3
+/// The page of S + A, from that of P, in the instruction at P, and the offset of S + A in its page in the add, load or
+/// store at P: arm64's way to an address.
+export const Page: u8 = 4
+export const PageOff: u8 = 5
+/// As Page and PageOff, of G.
+export const SlotPage: u8 = 6
+export const SlotPageOff: u8 = 7
+/// G + A - P, 4 bytes.
+export const SlotRel32: u8 = 8
+/// S + A, 4 bytes, which no loader adds the image's address to: an offset in the image.
+export const Image32: u8 = 9
+/// The format's descriptor of S + A, S being in a Thread section, which who loads the image sets so that code finds a
+/// thread's copy of it.
+export const Desc: u8 = 10
+
+/// Seen in its object only; seen by all objects, which may define it once; or seen by all, and defined by any number
+/// of them, of which one is taken, and if by none and not imported, 0.
+export const Local: u8 = 0
+export const Global: u8 = 1
+export const Weak: u8 = 2
+
+export class Section {
+	/// As the compiler named it. Sections of one name and kind are laid out together, and the symbols
+	/// `__start_<name>` and `__stop_<name>` are the bounds of those whose name is a C identifier.
+	name: string
+	kind: u8
+	/// Where it is laid out among those of its name: by order, as strings compare, then as linked.
+	order = ""
+	/// A power of two.
+	align: u64 = 1
+	/// What it holds before its fixups; a Zero one's is empty, and a Thread one's may be.
+	bytes = ""
+	size: u64 = 0
+	fixups: Fixup[] = []
+	/// Not "" for a section that several objects may hold, as a C++ inline function's: of those of one group, the
+	/// first linked object's are taken.
+	group = ""
+
+	constructor(name: string, kind: u8) {
+		this.name = name
+		this.kind = kind
+	}
+}
+
+export class Symbol {
+	name: string
+	binding: u8
+	/// The section of its object that defines it, and its offset there; -1 if another object or image does.
+	section: i32
+	value: u64
+	size: u64
+
+	constructor(name: string, binding: u8, section: i32 = -1, value: u64 = 0, size: u64 = 0) {
+		this.name = name
+		this.binding = binding
+		this.section = section
+		this.value = value
+		this.size = size
+	}
+}
+
+/// Sets the bytes at offset at of its section by the rule of kind, for the symbol, an index in its object's.
+export class Fixup {
+	at: u64
+	kind: u8
+	symbol: i32
+	addend: i64
+
+	constructor(at: u64, kind: u8, symbol: i32, addend: i64) {
+		this.at = at
+		this.kind = kind
+		this.symbol = symbol
+		this.addend = addend
+	}
+}
+
+export class Object {
+	/// The file it was read from, for messages.
+	name: string
+	/// The CPU its code is of.
+	arch: Arch
+	sections: Section[] = []
+	symbols: Symbol[] = []
+
+	constructor(name: string, arch: Arch) {
+		this.name = name
+		this.arch = arch
+	}
+}
+
+/// A CPU as the linker needs it (arm64.bob): its name; the page size segments are aligned to; the code of a stub, which
+/// jumps to the address in a slot, and its fixups, as offset, kind and addend, of the slot's symbol; and apply, which
+/// sets the instruction of b at at by the rule of kind, a Call, Page or PageOff, v being S + A and p the instruction's
+/// address, and is false if v is out of its reach. The other kinds set data, which the linker does itself.
+export type Machine = {
+	arch: Arch,
+	page: u64,
+	stub: string,
+	stubFixups: [u64, u8, i64][],
+	apply: (b: u8[], at: i32, kind: u8, v: u64, p: u64) => bool,
+}
