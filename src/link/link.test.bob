@@ -1,0 +1,294 @@
+//! Tests of src/link: hand-made Objects linked, and arm64's fixups on known instructions.
+
+import { CompileError } from "../error"
+import { addend, arm64 } from "./arm64"
+import { Image, Linker } from "./link"
+import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Local, Machine, Object, Page, PageOff, Rel32, Section,
+	SlotPage, SlotPageOff, Symbol, Thread, Unwind, Weak } from "./object"
+
+/// An object named name of one section of kind, of the bytes of words, and of symbols.
+function obj(name: string, kind: u8, words: u64[], symbols: Symbol[], fixups: Fixup[] = [], group = ""): Object {
+	const b = new u8[](4 * words.length)
+	for (const i of 0 ... words.length - 1) {
+		for (const j of 0 ... 3) {
+			b[4 * i + j] = (words[i] >> 8 * j) as u8
+		}
+	}
+	const sec = new Section(if (kind == Code) "text" else "data", kind)
+	sec.align = 8
+	sec.bytes = fromBytes(b)
+	sec.size = b.length as u64
+	sec.fixups = fixups
+	sec.group = group
+	const o = new Object(name, "arm64")
+	o.sections = [sec]
+	o.symbols = symbols
+	return o
+}
+
+/// A linker for machine, for a format of no file, whose loader sets a pointer to an import anywhere, or its slots only,
+/// and whose image starts at `__image`.
+function linker(bindsAnywhere = true, machine: Machine = arm64): Linker {
+	return new Linker(machine, {
+		headers: 0x200,
+		bindsAnywhere: bindsAnywhere,
+		start: "__image",
+		read: (name: string, bytes: string) => new Object(name, "arm64"),
+		exports: (name: string, bytes: string) => [name],
+		write: (image: Image) => "",
+	})
+}
+
+/// The image of objects for machine, with names exported, and lazy ones as an archive's members, listed for the
+/// names they define; by linker.
+function link(objects: Object[], names: string[], lazy: Object[] = [], bindsAnywhere = true,
+	machine: Machine = arm64): Image throws CompileError {
+	const l = linker(bindsAnywhere, machine)
+	for (const o of objects) {
+		l.add(o)
+	}
+	for (const o of lazy) {
+		l.lazy(o.symbols.filter(s => s.binding != Local && s.section >= 0).map(s => s.name), () => o)
+	}
+	l.library("libc.so", ["puts", "environ"])
+	for (const name of names) {
+		l.export(name)
+	}
+	return l.link()
+}
+
+/// The address the image exports name at.
+function at(image: Image, name: string): u64 {
+	for (const [n, a] of image.exports) {
+		if (n == name) {
+			return a
+		}
+	}
+	return 0
+}
+
+/// The address of the sections of image named name.
+function section(image: Image, name: string): u64 {
+	for (const [n, a, _] of image.sections) {
+		if (n == name) {
+			return a
+		}
+	}
+	return 0
+}
+
+/// The n bytes of image at address a, little-endian.
+function get(image: Image, a: u64, n: i32 = 4): u64 {
+	let v: u64 = 0
+	for (const i of 0 ... n - 1) {
+		v = v | (image.bytes[(a as i32) + i] as u64) << 8 * i
+	}
+	return v
+}
+
+test "a strong definition is taken over a weak one, and the first weak one over the others" {
+	const a = obj("a", Data, [1, 0], [new Symbol("x", Weak, 0), new Symbol("y", Weak, 0, 4)])
+	const b = obj("b", Data, [2, 0], [new Symbol("x", Global, 0), new Symbol("y", Weak, 0)])
+	const image = link([a, b], ["x", "y"])
+	assert get(image, at(image, "x")) == 2 && get(image, at(image, "y")) == 0
+}
+
+test "a name defined twice, or wanted and not defined, is an error naming the objects" {
+	const a = obj("a", Data, [0], [new Symbol("x", Global, 0), new Symbol("u", Global)])
+	const b = obj("b", Data, [0], [new Symbol("x", Global, 0), new Symbol("v", Global)])
+	assert link([a, b], []) throws new CompileError(
+		"x is defined in a and b\nu is not defined, but a names it\nv is not defined, but b names it")
+	assert link([obj("c", Data, [0], [])], ["w"]) throws new CompileError("w is exported but not defined")
+}
+
+test "a weak name no one defines is 0" {
+	const a = obj("a", Data, [0, 0], [new Symbol("w", Weak), new Symbol("p", Global, 0)], [new Fixup(0, Abs64, 0, 8)])
+	const image = link([a], ["p"])
+	assert get(image, at(image, "p"), 8) == 8 && image.rebases.length == 0 && image.binds.length == 0
+}
+
+test "a lazy object is linked when a linked one wants what it defines, and only then" {
+	const main = obj("main", Code, [0x94000000], [new Symbol("f", Global)], [new Fixup(0, Call, 0, 0)])
+	const f = obj("f.o", Code, [0x94000000], [new Symbol("f", Global, 0), new Symbol("g", Global)],
+		[new Fixup(0, Call, 1, 0)])
+	const g = obj("g.o", Code, [0xd65f03c0], [new Symbol("g", Global, 0)])
+	const h = obj("h.o", Code, [0xd65f03c0], [new Symbol("h", Global, 0)])
+	const image = link([main], ["f", "g"], [h, g, f])
+	assert image.symbols.map(s => s.name).join(" ") == "f g"
+	assert get(image, at(image, "f")) == 0x94000000 | (at(image, "g") - at(image, "f")) >> 2
+}
+
+test "a lazy object is read only once a linked one wants a name it is listed for" {
+	const l = linker()
+	l.add(obj("main", Code, [0x94000000], [new Symbol("f", Global)], [new Fixup(0, Call, 0, 0)]))
+	const read: string[] = []
+	for (const name of ["g", "f"]) {
+		l.lazy([name], () => {
+			read.push(name)
+			return obj(name, Code, [0xd65f03c0], [new Symbol(name, Global, 0)])
+		})
+	}
+	l.link()
+	assert read.join(" ") == "f"
+}
+
+test "of the sections of a group, the first object's are taken, and its symbols there" {
+	const a = obj("a", Const, [1], [new Symbol("k", Weak, 0)], [], "k")
+	const b = obj("b", Const, [2], [new Symbol("k", Weak, 0), new Symbol("only", Weak, 0)], [], "k")
+	const c = obj("c", Const, [3], [new Symbol("k", Weak, 0), new Symbol("only", Global, 0)], [], "k")
+	assert link([a, b], ["only"]) throws new CompileError("only is exported but not defined")
+	assert link([a, c], ["k"]) throws new CompileError("only is not defined, but c names it")
+	const image = link([a, b], ["k"])
+	assert get(image, at(image, "k")) == 1 && image.sections.length == 1 && image.sections[0][2] == 4
+}
+
+test "__start_ and __stop_ are the bounds of the sections of a name, if it is a C identifier" {
+	const a = obj("a", Data, [1, 2], [new Symbol("__start_data", Global), new Symbol("__stop_data", Global)])
+	const b = obj("b", Data, [3], [new Symbol("__stop_data", Global)])
+	const image = link([a, b], ["__start_data", "__stop_data"])
+	assert at(image, "__start_data") == section(image, "data") && at(image, "__stop_data") == section(image, "data") + 12
+	assert link([obj("c", Data, [0], [new Symbol("__start_.x", Global)])], []) throws new CompileError(
+		"__start_.x is not defined, but c names it")
+	const kinds = " bounds sections of several kinds, as that of d"
+	assert link([a, obj("d", Const, [0], [])], []) throws new CompileError(`__start_data${kinds}\n__stop_data${kinds}`)
+}
+
+test "a call to an import goes through a stub, a pointer to it is bound, and one to the image rebased" {
+	const code = obj("a", Code, [0x94000000, 0x90000000, 0xf9400000], [new Symbol("puts", Global),
+		new Symbol("main", Global, 0), new Symbol("here", Local, 0, 4)],
+		[new Fixup(0, Call, 0, 0), new Fixup(4, SlotPage, 2, 0), new Fixup(8, SlotPageOff, 2, 0)])
+	const data = obj("b", Data, [0, 0, 0, 0], [new Symbol("environ", Global), new Symbol("main", Global),
+		new Symbol("p", Global, 0)], [new Fixup(0, Abs64, 0, 16), new Fixup(8, Abs64, 1, 4)])
+	const image = link([code, data], ["main", "p"])
+	const main = at(image, "main")
+	const p = at(image, "p")
+	const stubs = section(image, "stubs")
+	const slots = section(image, "slots")
+	// The stub of puts loads its slot, which the loader binds; the slot of the local holds its address.
+	assert get(image, main) == 0x94000000 | (stubs - main) >> 2
+	assert get(image, stubs + 8) == 0xd61f0220 && (get(image, stubs + 4) & 0xffc003ff) == 0xf9400211
+	assert image.binds.map(b => `${b.name}@${b.at}+${b.addend}`).join(" ") == `environ@${p}+16 puts@${slots}+0`
+	assert image.rebases.join(" ") == `${p + 8} ${slots + 8}`
+	assert get(image, p + 8, 8) == main + 4 && get(image, slots + 8, 8) == main + 4
+	assert get(image, main + 8) == 0xf9400000 | ((slots + 8) & 0xfff) >> 3 << 10
+}
+
+test "a call to a weak name no one defines goes through a stub whose slot is 0" {
+	const a = obj("a", Code, [0x94000000], [new Symbol("w", Weak), new Symbol("main", Global, 0)],
+		[new Fixup(0, Call, 0, 0)])
+	const image = link([a], ["main"])
+	assert get(image, section(image, "slots"), 8) == 0 && image.binds.length == 0 && image.rebases.length == 0
+}
+
+test "the unwind rules of a dropped section are not fixed up" {
+	const b = obj("b", Code, [0xd65f03c0], [new Symbol("", Local, 0)], [], "f")
+	const eh = new Section(".eh_frame", Unwind)
+	eh.bytes = "\0\0\0\0"
+	eh.size = 4
+	eh.fixups = [new Fixup(0, Rel32, 0, 0)]
+	b.sections.push(eh)
+	const image = link([obj("a", Code, [0xd65f03c0], [], [], "f"), b], [])
+	assert get(image, section(image, ".eh_frame"), 4) == 0
+}
+
+test "read-only bytes of a name of which some hold a pointer are laid out as data, and a pointer in code is an error" {
+	const c = obj("c", Const, [0, 0], [new Symbol("c", Global, 0)], [new Fixup(0, Abs64, 0, 0)])
+	const d = obj("d", Const, [0, 0], [new Symbol("d", Global, 0)])
+	const image = link([d, c], ["c", "d"])
+	assert image.segment(at(image, "c")).write && at(image, "c") == at(image, "d") + 8 && image.rebases.length == 1
+	const t = obj("t", Code, [0, 0], [new Symbol("t", Global, 0)], [new Fixup(0, Abs64, 0, 0)])
+	assert link([t], []) throws new CompileError("t: text+0 is a pointer in bytes that are not written")
+}
+
+test "a pointer to an import relative to itself is an error" {
+	const a = obj("a", Code, [0x90000000], [new Symbol("puts", Global)], [new Fixup(0, Page, 0, 0)])
+	assert link([a], []) throws new CompileError("a: text+0 reaches puts relative to itself, but it is not in the image")
+}
+
+test "if the loader sets only slots, any reference to an import but through its slot is to its stub" {
+	const a = obj("a", Data, [0, 0], [new Symbol("puts", Global), new Symbol("p", Global, 0)], [new Fixup(0, Abs64, 0, 0)])
+	const image = link([a], ["p"], [], false)
+	const slots = section(image, "slots")
+	const p = at(image, "p")
+	assert get(image, p, 8) == section(image, "stubs") && image.rebases.join(" ") == `${p}`
+	assert image.binds.map(b => `${b.name}@${b.at}`).join(" ") == `puts@${slots}`
+}
+
+/// The word w with the fixup of kind of m applied at 0x10000 for v, 0 if out of reach.
+function fixed(w: u64, kind: u8, v: u64, m: Machine = arm64): u64 {
+	const b = new u8[](4)
+	for (const j of 0 ... 3) {
+		b[j] = (w >> 8 * j) as u8
+	}
+	if (!m.apply(b, 0, kind, v, 0x10000)) {
+		return 0
+	}
+	return (b[0] as u64) | (b[1] as u64) << 8 | (b[2] as u64) << 16 | (b[3] as u64) << 24
+}
+
+test "arm64 fixups set the immediate of known instructions" {
+	assert fixed(0x94000000, Call, 0x10010) == 0x94000004 // bl .+16
+	assert fixed(0x94000000, Call, 0xfff0) == 0x97fffffc // bl .-16
+	assert fixed(0x94000000, Call, 0x10000 + (1 << 27)) == 0
+	assert fixed(0x94000000, Call, 0x10002) == 0
+	assert fixed(0x90000010, Page, 0x23456) == 0xf0000090 // adrp x16, .+0x13000
+	assert fixed(0x90000010, Page, 0x0) == 0x90ffff90 // adrp x16, .-0x10000
+	assert fixed(0x91000000, PageOff, 0x12345) == 0x910d1400 // add x0, x0, #0x345
+	assert fixed(0xf9400001, PageOff, 0x1238) == 0xf9411c01 // ldr x1, [x0, #0x238]
+	assert fixed(0xf9400001, PageOff, 0x1234) == 0
+	assert fixed(0xb9400001, PageOff, 0x1234) == 0xb9423401 // ldr w1, [x0, #0x234]
+	assert fixed(0x3dc00000, PageOff, 0x1230) == 0x3dc08c00 // ldr q0, [x0, #0x230]
+	assert fixed(0x39400000, PageOff, 0x1fff) == 0x397ffc00 // ldrb w0, [x0, #0xfff]
+}
+
+test "an arm64 instruction's addend is what its fixup set, from 0x10000" {
+	assert addend(0x97fffffc, Call) == -16 && addend(0x94000004, Call) == 16
+	assert addend(0xf0000090, Page) == 0x13000 && addend(0x90ffff90, Page) == -0x10000
+	assert addend(0xf9411c01, PageOff) == 0x238 && addend(0x3dc08c00, PageOff) == 0x230
+}
+
+test "sections of one name are laid out by their order, then as linked" {
+	const a = obj("a", Data, [1], [new Symbol("a", Global, 0)])
+	const b = obj("b", Data, [2], [new Symbol("b", Global, 0)])
+	const c = obj("c", Data, [3], [new Symbol("c", Global, 0)])
+	a.sections[0].order = "z"
+	const image = link([a, b, c], ["a", "b", "c"])
+	assert at(image, "b") < at(image, "c") && at(image, "c") < at(image, "a")
+}
+
+test "the Thread sections are laid out together after the data, and a Desc is noted with S + A's offset there" {
+	const t = obj("t", Thread, [1, 2], [new Symbol("x", Global, 0, 4), new Symbol("y", Local, 1, 4),
+		new Symbol("p", Global, 2)])
+	const tbss = new Section("tbss", Thread)
+	tbss.align = 16
+	tbss.size = 8
+	const descs = new Section("data", Data)
+	descs.size = 32
+	descs.bytes = fromBytes(new u8[](32))
+	descs.fixups = [new Fixup(0, Desc, 0, 2), new Fixup(16, Desc, 1, 0)]
+	t.sections = [t.sections[0], tbss, descs]
+	t.sections[0].name = "tdata"
+	const image = link([t], ["p"])
+	const [from, to, align] = image.thread
+	const p = at(image, "p")
+	assert from > p && image.segment(from).write && from == section(image, "tdata") && get(image, from) == 1
+	assert to == section(image, "tbss") + 8 && align == 16
+	assert image.descs.map(e => `${e[0] - p}:${e[1]}`).join(" ") == `0:6 16:${section(image, "tbss") - from + 4}`
+}
+
+test "a Desc reaches only a thread's own bytes" {
+	const d = obj("d", Data, [0, 0, 0, 0], [new Symbol("p", Global, 0)], [new Fixup(0, Desc, 0, 0)])
+	assert link([d], []) throws new CompileError("d: data+0 describes bytes that are no thread's own")
+}
+
+test "the format's start is the image's first byte, where no object defines it, and a pointer to it is rebased" {
+	const a = obj("a", Data, [0, 0], [new Symbol("__image", Weak), new Symbol("p", Global, 0)],
+		[new Fixup(0, Abs64, 0, 8)])
+	const image = link([a], ["p"])
+	assert get(image, at(image, "p"), 8) == 8 && image.rebases.join(" ") == `${at(image, "p")}`
+}
+
+test "an object of another CPU is an error" {
+	assert link([obj("a", Data, [0], []), new Object("x", "x86_64")], []) throws new CompileError(
+		"x is of x86_64, not arm64")
+}
