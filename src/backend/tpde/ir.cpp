@@ -6,7 +6,6 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 
 #include "ir.hpp"
 
@@ -529,7 +528,7 @@ TpdeValueRef TpdeLayout(TpdeModuleRef m, TpdeTypeRef t) {
 }
 void TpdeSetSection(TpdeModuleRef m, TpdeValueRef g, const char *name) { m->sym(g).section = name; }
 
-const char *TpdeEmitToFile(TpdeModuleRef m, const char *path) {
+const char *TpdeEmit(TpdeModuleRef m, uint8_t **object, uint64_t *size) {
 	if (const char *err = TpdeVerifyModule(m)) {
 		return err;
 	}
@@ -538,10 +537,10 @@ const char *TpdeEmitToFile(TpdeModuleRef m, const char *path) {
 		m->msg = m->error.empty() ? "TPDE could not compile the module" : m->error;
 		return m->msg.c_str();
 	}
-	std::ofstream f(path, std::ios::binary);
-	f.write(reinterpret_cast<const char *>(obj.data()), obj.size());
-	m->msg = "cannot write " + std::string(path);
-	return f ? nullptr : m->msg.c_str();
+	*size = obj.size();
+	*object = static_cast<uint8_t *>(malloc(obj.size()));
+	memcpy(*object, obj.data(), obj.size());
+	return nullptr;
 }
 
 } // extern "C"
