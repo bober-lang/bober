@@ -204,7 +204,7 @@ function main(): i32 {
 	if (!linking) {
 		return 0
 	}
-	const status = link(o.isysroot, [...objects, ...a.link], exe, o.shared)
+	const status = link(o.isysroot, [...objects, ...a.link], exe, if (o.shared) "shared" else "static")
 	for (const f of objects) {
 		try {
 			remove(f)
@@ -243,15 +243,17 @@ export function object(sysroot: string, src: string, out: string, dirs: string[]
 	m.emit(out, false)
 }
 
-/// Links args, objects and the linker's options, into the executable out with the C library of sysroot, static but on
-/// macOS, or into a shared library, as ld.lld or on macOS ld64.lld does; returns its exit status.
-export function link(sysroot: string, args: string[], out: string, shared = false): i32 {
+/// Links args, objects and the linker's options, into out with the C library of sysroot, as ld.lld or on macOS ld64.lld
+/// does: an executable, static but on macOS, or one position-independent that loads the C library, or a shared library;
+/// returns its exit status.
+export function link(sysroot: string, args: string[], out: string, kind: "static" | "pie" | "shared" = "static"): i32 {
 	const lib = sysroot + "/usr/lib" // musl's
 	const argv = if (os == "macos") [
-		"ld64.lld", if (shared) "-dylib" else "-execute", "-arch", arch, "-platform_version", "macos", "11.0", "11.0",
-		"-syslibroot", sysroot, "-o", out, ...args, "-lSystem",
+		"ld64.lld", if (kind == "shared") "-dylib" else "-execute", "-arch", arch, "-platform_version", "macos", "11.0",
+		"11.0", "-syslibroot", sysroot, "-o", out, ...args, "-lSystem",
 	] else [
-		"ld.lld", ...(if (shared) ["-shared"] else ["-static", `${lib}/crt1.o`]), "--eh-frame-hdr", "-o", out,
+		"ld.lld", ...(if (kind == "shared") ["-shared"] else if (kind == "pie") ["-pie", `${lib}/Scrt1.o`]
+			else ["-static", `${lib}/crt1.o`]), "--eh-frame-hdr", "-o", out,
 		`${lib}/crti.o`, ...args, `-L${lib}`, "--start-group", "-lc", "-lunwind", `${lib}/libclang_rt.builtins.a`,
 		"--end-group", `${lib}/crtn.o`,
 	]
