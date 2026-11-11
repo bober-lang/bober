@@ -2,12 +2,10 @@
 //! libxml2 writes for it in noent, with its entities expanded, or both fail; each of errors must fail where libxml2
 //! reports an error.
 
-import { contains } from "../algo"
+import { indexOf, stableSort } from "../algo"
 import { glob, readFile } from "../fs"
 import { base } from "../fs/path"
-import { ParseError } from "../parse"
-import { sortBy } from "../sort"
-import { indexOf } from "../string"
+import { ParseError } from "../string"
 import { Node, parse, serialize, xmlnsNS } from "./xml"
 
 const root = "vendor/xml-tests/libxml2"
@@ -19,14 +17,14 @@ const skipped = ["ent2", "xhtml1", "xhtmlcomp", "ent11", "errors/ns-ent.xml"]
 
 test "libxml2" {
 	for (const f of glob(`${root}/test/*`)) {
-		if (!contains(skipped, base(f))) {
+		if (!skipped.includes(base(f))) {
 			test `${base(f)}` {
 				assert canonical(f) == canonical(`${root}/noent/${base(f)}`)
 			}
 		}
 	}
 	for (const f of glob(`${root}/errors/*.xml`)) {
-		if (!contains(skipped, `errors/${base(f)}`)) {
+		if (!skipped.includes(`errors/${base(f)}`)) {
 			test `errors/${base(f)}` {
 				assert (canonical(f) == "error") == (indexOf(readFile(f + ".err"), " error :") >= 0)
 			}
@@ -40,7 +38,7 @@ function canonical(path: string): string {
 	try {
 		const doc = parse(readFile(path), 1 << 16)
 		for (const el of doc.elements()) {
-			sortBy(el.attrs, (a, b) => a.ns == xmlnsNS && b.ns != xmlnsNS)
+			stableSort(el.attrs, (a, b) => a.ns == xmlnsNS && b.ns != xmlnsNS)
 		}
 		return serialize(doc)
 	} catch (e: ParseError) {

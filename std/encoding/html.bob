@@ -2,14 +2,14 @@
 //! as in a browser, any text makes a document, and parse errors are not reported. The input is UTF-8, the encoding is
 //! not sniffed, and scripts do not run. A template's contents are its children.
 
-import { contains, insertAt, position, removeAt } from "../algo"
 
+import { endsWith, indexOf, occurs, startsWith } from "../algo"
 import { ampersand as amp, exclamation, greater, isAlphabetic, isAlphanumeric, isDigit, less, minus, question, quote,
 	semicolon, slash, toLower, underscore, x } from "../ascii"
 
 import * as ascii from "../ascii"
 import { HashMap } from "../collections/hashmap"
-import { endsWith, indexOf, lower, occurs, replace, startsWith, utf8 } from "../string"
+import { lower, replace, utf8 } from "../string"
 import { entities } from "./html/entities"
 import { Attribute, htmlNS, mathNS, Node, svgNS, xlinkNS, xmlNS, xmlnsNS } from "./xml"
 
@@ -772,7 +772,7 @@ class Parser {
 				this.root(t)
 				return
 			}
-			case "end": if (!contains(["head", "body", "html", "br"], t.name)) {
+			case "end": if (!["head", "body", "html", "br"].includes(t.name)) {
 				return
 			}
 		}
@@ -806,7 +806,7 @@ class Parser {
 					this.mode = "inHead"
 					return
 				}
-			case "end": if (!contains(["head", "body", "html", "br"], t.name)) {
+			case "end": if (!["head", "body", "html", "br"].includes(t.name)) {
 				return
 			}
 		}
@@ -873,7 +873,7 @@ class Parser {
 					this.templateModes.pop()
 					this.reset()
 					return
-				default: if (!contains(["body", "html", "br"], t.name)) {
+				default: if (!["body", "html", "br"].includes(t.name)) {
 					return
 				}
 			}
@@ -951,7 +951,7 @@ class Parser {
 					this.inHead(t)
 					return
 				}
-				if (!contains(["body", "html", "br"], t.name)) {
+				if (!["body", "html", "br"].includes(t.name)) {
 					return
 				}
 		}
@@ -1229,7 +1229,7 @@ class Parser {
 			const n = this.open[k]
 			if (isHTML(n, name)) {
 				this.generateImplied(name)
-				this.open = this.open.slice(0, position(this.open, n))
+				this.open = this.open.slice(0, this.open.indexOf(n))
 				return
 			}
 			if (isSpecial(n)) {
@@ -1242,7 +1242,7 @@ class Parser {
 	/// The adoption agency algorithm for an end tag named subject.
 	adoption(subject: string) {
 		const cur = this.current()
-		if (isHTML(cur, subject) && position(this.active, cur) < 0) {
+		if (isHTML(cur, subject) && this.active.indexOf(cur) < 0) {
 			this.open.pop()
 			return
 		}
@@ -1252,7 +1252,7 @@ class Parser {
 				this.anyOtherEnd(subject)
 				return
 			}
-			const si = position(this.open, fe)
+			const si = this.open.indexOf(fe)
 			if (si < 0) {
 				this.active = this.active.filter(e => e != fe)
 				return
@@ -1274,8 +1274,8 @@ class Parser {
 			}
 			const block = fb
 			const common = this.open[si - 1]
-			let bookmark = position(this.active, fe)
-			let ni = position(this.open, block)
+			let bookmark = this.active.indexOf(fe)
+			let ni = this.open.indexOf(block)
 			let last = block
 			let inner = 0
 			while (true) {
@@ -1285,16 +1285,16 @@ class Parser {
 				if (node == fe) {
 					break
 				}
-				let ai = position(this.active, node)
+				let ai = this.active.indexOf(node)
 				if (inner > 3 && ai >= 0) {
-					this.active = removeAt(this.active, ai)
+					this.active.remove(ai)
 					if (ai < bookmark) {
 						bookmark--
 					}
 					ai = -1
 				}
 				if (ai < 0) {
-					this.open = removeAt(this.open, ni)
+					this.open.remove(ni)
 					continue
 				}
 				const el = clone(node)
@@ -1315,14 +1315,14 @@ class Parser {
 			el.children = block.children
 			block.children = []
 			block.insert(el)
-			const fi = position(this.active, fe)
-			this.active = removeAt(this.active, fi)
+			const fi = this.active.indexOf(fe)
+			this.active.remove(fi)
 			if (fi < bookmark) {
 				bookmark--
 			}
-			this.active = insertAt(this.active, bookmark, el)
-			this.open = removeAt(this.open, position(this.open, fe))
-			this.open = insertAt(this.open, position(this.open, block) + 1, el)
+			this.active.insert(bookmark, el)
+			this.open.remove(this.open.indexOf(fe))
+			this.open.insert(this.open.indexOf(block) + 1, el)
 		}
 	}
 
@@ -1444,7 +1444,7 @@ class Parser {
 		const name = t.name
 		if (t.kind == "end" && (name == "caption" || name == "table")
 			|| t.kind == "start"
-			&& contains(["caption", "col", "colgroup", "tbody", "td", "tfoot", "th", "thead", "tr"], name)) {
+			&& ["caption", "col", "colgroup", "tbody", "td", "tfoot", "th", "thead", "tr"].includes(name)) {
 			if (!this.inScope("caption", "table")) {
 				return
 			}
@@ -1456,7 +1456,7 @@ class Parser {
 				this.process(t)
 			}
 		} else if (t.kind != "end"
-			|| !contains(["body", "col", "colgroup", "html", "tbody", "td", "tfoot", "th", "thead", "tr"], name)) {
+			|| !["body", "col", "colgroup", "html", "tbody", "td", "tfoot", "th", "thead", "tr"].includes(name)) {
 			this.inBody(t)
 		}
 	}
@@ -1515,13 +1515,13 @@ class Parser {
 			if (name != "tr") {
 				this.process(t)
 			}
-		} else if (t.kind == "end" && contains(sections, name)) {
+		} else if (t.kind == "end" && sections.includes(name)) {
 			if (this.inScope(name, "table")) {
 				this.clearTo(["tbody", "tfoot", "thead", "template", "html"])
 				this.open.pop()
 				this.mode = "inTable"
 			}
-		} else if (t.kind == "start" && contains(["caption", "col", "colgroup", ...sections], name)
+		} else if (t.kind == "start" && ["caption", "col", "colgroup", ...sections].includes(name)
 			|| t.kind == "end" && name == "table") {
 			if (sections.some(s => this.inScope(s, "table"))) {
 				this.clearTo(["tbody", "tfoot", "thead", "template", "html"])
@@ -1530,7 +1530,7 @@ class Parser {
 				this.process(t)
 			}
 		} else if (t.kind != "end"
-			|| !contains(["body", "caption", "col", "colgroup", "html", "td", "th", "tr"], name)) {
+			|| !["body", "caption", "col", "colgroup", "html", "td", "th", "tr"].includes(name)) {
 			this.inTable(t)
 		}
 	}
@@ -1542,8 +1542,8 @@ class Parser {
 			this.insert(t)
 			this.mode = "inCell"
 			this.active.push(null)
-		} else if (t.kind == "end" && contains(["tr", "table", "tbody", "tfoot", "thead"], name)
-			|| t.kind == "start" && contains(["caption", "col", "colgroup", "tbody", "tfoot", "thead", "tr"], name)) {
+		} else if (t.kind == "end" && ["tr", "table", "tbody", "tfoot", "thead"].includes(name)
+			|| t.kind == "start" && ["caption", "col", "colgroup", "tbody", "tfoot", "thead", "tr"].includes(name)) {
 			if (!this.inScope(name, "table") && t.kind == "end" && name != "tr" && name != "table"
 				|| !this.inScope("tr", "table")) {
 				return
@@ -1554,7 +1554,7 @@ class Parser {
 			if (name != "tr" || t.kind == "start") {
 				this.process(t)
 			}
-		} else if (t.kind != "end" || !contains(["body", "caption", "col", "colgroup", "html", "td", "th"], name)) {
+		} else if (t.kind != "end" || !["body", "caption", "col", "colgroup", "html", "td", "th"].includes(name)) {
 			this.inTable(t)
 		}
 	}
@@ -1569,8 +1569,8 @@ class Parser {
 				this.mode = "inRow"
 			}
 		} else if (t.kind == "start"
-			&& contains(["caption", "col", "colgroup", "tbody", "td", "tfoot", "th", "thead", "tr"], name)
-			|| t.kind == "end" && contains(["table", "tbody", "tfoot", "thead", "tr"], name)) {
+			&& ["caption", "col", "colgroup", "tbody", "td", "tfoot", "th", "thead", "tr"].includes(name)
+			|| t.kind == "end" && ["table", "tbody", "tfoot", "thead", "tr"].includes(name)) {
 			if (if (t.kind == "start") this.inScope("td", "table") || this.inScope("th", "table")
 				else this.inScope(name, "table")) {
 				this.generateImplied()
@@ -1579,7 +1579,7 @@ class Parser {
 				this.mode = "inRow"
 				this.process(t)
 			}
-		} else if (t.kind != "end" || !contains(["body", "caption", "col", "colgroup", "html"], name)) {
+		} else if (t.kind != "end" || !["body", "caption", "col", "colgroup", "html"].includes(name)) {
 			this.inBody(t)
 		}
 	}
@@ -1718,7 +1718,7 @@ class Parser {
 				this.framesetOk = this.framesetOk && isAllSpace(replace(t.data, "\0", ""))
 			case "comment", "instruction": this.comment(t)
 			case "start":
-				if (contains(breakout, t.name)
+				if (breakout.includes(t.name)
 					|| t.name == "font"
 					&& (t.attr("color") != null || t.attr("face") != null || t.attr("size") != null)) {
 					this.popForeign()
@@ -1832,7 +1832,7 @@ class Parser {
 		if (p.kind == "document") {
 			return
 		}
-		const prev = p.children.at(if (ref == null) p.children.length - 1 else position(p.children, ref) - 1)
+		const prev = p.children.at(if (ref == null) p.children.length - 1 else p.children.indexOf(ref) - 1)
 		if (prev != null && prev.kind == "text") {
 			prev.data += s
 		} else {
@@ -1927,17 +1927,17 @@ class Parser {
 			k--
 		}
 		if (same >= 3) {
-			this.active = removeAt(this.active, first)
+			this.active.remove(first)
 		}
 		this.active.push(el)
 	}
 
 	reconstruct() {
 		let k = this.active.length - 1
-		if (k < 0 || this.active[k] == null || position(this.open, this.active[k]!) >= 0) {
+		if (k < 0 || this.active[k] == null || this.open.indexOf(this.active[k]!) >= 0) {
 			return
 		}
-		while (k > 0 && this.active[k - 1] != null && position(this.open, this.active[k - 1]!) < 0) {
+		while (k > 0 && this.active[k - 1] != null && this.open.indexOf(this.active[k - 1]!) < 0) {
 			k--
 		}
 		while (k < this.active.length) {
@@ -2057,8 +2057,8 @@ function adjustAttrs(t: Token, ns: string) {
 		} else if (ns == svgNS) {
 			a.name = svgAttrs.get(a.name) ?? a.name
 		}
-		if (contains(["xlink:actuate", "xlink:arcrole", "xlink:href", "xlink:role", "xlink:show", "xlink:title",
-			"xlink:type"], a.name)) {
+		if (["xlink:actuate", "xlink:arcrole", "xlink:href", "xlink:role", "xlink:show", "xlink:title",
+			"xlink:type"].includes(a.name)) {
 			a.ns = xlinkNS
 		} else if (a.name == "xml:lang" || a.name == "xml:space") {
 			a.ns = xmlNS
@@ -2098,7 +2098,7 @@ const quirkyPrefixes = ["+//silmaril//dtd html pro v0r11 19970101//", "-//as//dt
 function isQuirky(t: Token): bool {
 	const pub = lower(t.publicId ?? "")
 	const sys = t.systemId ?? ""
-	return t.quirks || t.name != "html" || contains(quirkyIds, pub)
+	return t.quirks || t.name != "html" || quirkyIds.includes(pub)
 		|| lower(sys) == "http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd"
 		|| quirkyPrefixes.some(p => startsWith(pub, p))
 		|| sys == ""
@@ -2121,24 +2121,24 @@ function merge(el: Node, t: Token) { el.attrs.append(t.attrs.filter(a => el.attr
 /// Whether n is in HTML's namespace, as an element without one is taken to be.
 function inHTML(n: Node): bool { return n.ns == htmlNS || n.ns == "" }
 function isHTML(n: Node, name: string): bool { return inHTML(n) && n.name == name }
-function isHTMLOf(n: Node, names: string[]): bool { return inHTML(n) && contains(names, n.name) }
+function isHTMLOf(n: Node, names: string[]): bool { return inHTML(n) && names.includes(n.name) }
 
 function isSpecial(n: Node): bool {
 	if (inHTML(n)) {
-		return contains(special, n.name)
+		return special.includes(n.name)
 	}
 	return isMathText(n) || n.ns == mathNS && n.name == "annotation-xml"
-		|| n.ns == svgNS && contains(svgIntegration, n.name)
+		|| n.ns == svgNS && svgIntegration.includes(n.name)
 }
 
 /// Whether n bounds the default scope.
 function isScoping(n: Node): bool {
-	return if (inHTML(n)) contains(["applet", "caption", "html", "table", "td", "th", "marquee", "object", "select",
-		"template"], n.name)
+	return if (inHTML(n)) ["applet", "caption", "html", "table", "td", "th", "marquee", "object", "select",
+		"template"].includes(n.name)
 		else isSpecial(n)
 }
 
-function isMathText(n: Node): bool { return n.ns == mathNS && contains(["mi", "mo", "mn", "ms", "mtext"], n.name) }
+function isMathText(n: Node): bool { return n.ns == mathNS && ["mi", "mo", "mn", "ms", "mtext"].includes(n.name) }
 
 /// Whether n is an HTML integration point.
 function isIntegration(n: Node): bool {
@@ -2146,7 +2146,7 @@ function isIntegration(n: Node): bool {
 		const e = lower(n.attr("encoding") ?? "")
 		return e == "text/html" || e == "application/xhtml+xml"
 	}
-	return n.ns == svgNS && contains(svgIntegration, n.name)
+	return n.ns == svgNS && svgIntegration.includes(n.name)
 }
 
 /// The SVG elements that are HTML integration points.
@@ -2187,7 +2187,7 @@ function write(n: Node, out: string[]): void {
 				out.push(` ${a.name}="${escape(a.value, true)}"`)
 			}
 			out.push(">")
-			if (inHTML(n) && contains(voids, n.name)) {
+			if (inHTML(n) && voids.includes(n.name)) {
 				return
 			}
 			for (const c of n.children) {

@@ -1,0 +1,226 @@
+//! Helpers on strings, and integers parsed from them strictly: ASCII digits only, an optional `-`, no whitespace,
+//! prefixes or `_`.
+
+import { backslash, cr, digit, isControl, isSpace, lf, minus, n, quote, r, rbrace, t, tab, toLower, u, x,
+	zero } from "./ascii"
+
+import { endsWith, indexOf, startsWith } from "./algo"
+import { Integral } from "./types"
+
+/// The pieces of s between each sep, which must not be empty; [""] for an empty s.
+export function split(s: string, sep: string): string[] {
+	assert sep != ""
+	const out: string[] = []
+	let start = 0
+	let i = indexOf(s, sep)
+	while (i >= 0) {
+		out.push(s.slice(start, i))
+		start = i + sep.length
+		i = indexOf(s, sep, start)
+	}
+	out.push(s.slice(start, s.length))
+	return out
+}
+
+/// s with each from, which must not be empty, replaced by to.
+export function replace(s: string, from: string, to: string): string { return split(s, from).join(to) }
+
+/// s with ASCII's letters in lower case.
+export function lower(s: string): string {
+	let out = ""
+	for (const ch of s) {
+		out += chr(toLower(ch))
+	}
+	return out
+}
+
+/// s without leading or trailing whitespace.
+export function trim(s: string): string {
+	let i = 0
+	let j = s.length
+	while (i < j && isSpace(s[i])) {
+		i++
+	}
+	while (j > i && isSpace(s[j - 1])) {
+		j--
+	}
+	return s.slice(i, j)
+}
+
+/// s without affix at both of its ends, where it is at both and s is more than the two.
+export function strip(s: string, affix: string): string {
+	const n = affix.length
+	return if (s.length > 2 * n && startsWith(s, affix) && endsWith(s, affix)) s.slice(n, s.length - n) else s
+}
+
+/// The UTF-8 bytes of the code point cp.
+export function utf8(cp: i64): string {
+	if (cp < 0x80) {
+		return chr(cp as u8)
+	}
+	if (cp < 0x800) {
+		return chr((0xc0 | cp >> 6) as u8) + chr((0x80 | cp & 0x3f) as u8)
+	}
+	if (cp < 0x10000) {
+		return chr((0xe0 | cp >> 12) as u8) + chr((0x80 | cp >> 6 & 0x3f) as u8) + chr((0x80 | cp & 0x3f) as u8)
+	}
+	return chr((0xf0 | cp >> 18) as u8) + chr((0x80 | cp >> 12 & 0x3f) as u8) + chr((0x80 | cp >> 6 & 0x3f) as u8)
+		+ chr((0x80 | cp & 0x3f) as u8)
+}
+
+/// The code point of the UTF-8 sequence at i in s, and where it ends; U+FFFD and i + 1 where it is not valid UTF-8:
+/// cut short, overlong, a surrogate or past U+10FFFF.
+export function codePoint(s: string, i: i32): [i64, i32] {
+	// Ported from Go's unicode/utf8.DecodeRuneInString (BSD-3-Clause, Copyright 2009 The Go Authors).
+	const lead = s[i]
+	if (lead < 0x80) {
+		return [lead, i + 1]
+	}
+	const size = if (lead < 0xc2) 0 else if (lead < 0xe0) 2 else if (lead < 0xf0) 3 else if (lead < 0xf5) 4 else 0
+	if (size == 0) {
+		return [0xfffd, i + 1]
+	}
+	// The second byte's range is narrower after the leads that could otherwise start an overlong, a surrogate or
+	// a code point past U+10FFFF.
+	let lo: u8 = switch (lead) {
+		case 0xe0: 0xa0
+		case 0xf0: 0x90
+		default: 0x80
+	}
+	let hi: u8 = switch (lead) {
+		case 0xed: 0x9f
+		case 0xf4: 0x8f
+		default: 0xbf
+	}
+	let cp: i64 = lead & (0x7f >> size)
+	for (const j of 1 ... size - 1) {
+		const b = s.at(i + j) ?? 0
+		if (b < lo || b > hi) {
+			return [0xfffd, i + 1]
+		}
+		cp = cp << 6 | b & 0x3f
+		lo = 0x80
+		hi = 0xbf
+	}
+	return [cp, i + size]
+}
+
+/// The code point of the UTF-8 sequence that ends at end in s, and where it starts: the one codePoint decodes from its
+/// lead byte, else U+FFFD and end - 1, so that s decodes the same backward as forward.
+export function lastCodePoint(s: string, end: i32): [i64, i32] {
+	let i = end - 1
+	while (i > 0 && i > end - 4 && s[i] & 0xc0 == 0x80) {
+		i--
+	}
+	const [cp, next] = codePoint(s, i)
+	return if (next == end) [cp, i] else [0xfffd, end - 1]
+}
+
+/// s as a bober string literal.
+export function quoted(s: string): string {
+	let q = ""
+	for (const ch of s) {
+		q += escape(ch)
+	}
+	return `"${q}"`
+}
+
+/// The string that q, a bober string literal, stands for.
+export function unquoted(q: string): string {
+	let s = ""
+	let i = 1
+	while (i < q.length - 1) {
+		const esc = q[i + 1]
+		if (q[i] != backslash) {
+			s += chr(q[i])
+			i++
+		} else if (esc == x) {
+			s += chr(digit(q[i + 2])! * 16 + digit(q[i + 3])!)
+			i += 4
+		} else if (esc == u) {
+			let cp: i64 = 0
+			i += 3
+			while (q[i] != rbrace) {
+				cp = cp * 16 + digit(q[i])!
+				i++
+			}
+			s += utf8(cp)
+			i++
+		} else {
+			s += switch (esc) {
+				case n: "\n"
+				case r: "\r"
+				case t: "\t"
+				case zero: "\0"
+				default: chr(esc)
+			}
+			i += 2
+		}
+	}
+	return s
+}
+
+const hex = "0123456789abcdef"
+
+/// ch as it appears in a bober string literal.
+export function escape(ch: u8): string {
+	return switch (ch) {
+		case quote: "\\\""
+		case backslash: "\\\\"
+		case lf: "\\n"
+		case cr: "\\r"
+		case tab: "\\t"
+		default: if (isControl(ch)) `\\x${chr(hex[ch >> 4])}${chr(hex[ch & 15])}` else chr(ch)
+	}
+}
+
+/// at is the offending character; for "range", the number's start.
+export class ParseError {
+	kind: "syntax" | "range"
+	at: i32
+
+	constructor(kind: "syntax" | "range", at: i32) {
+		this.kind = kind
+		this.at = at
+	}
+}
+
+/// s whole as an integer in radix 2…36.
+export function parseInt[T extends Integral = i32](s: string, radix: i32 = 10): T throws ParseError {
+	const [v, end] = scanInt[T](s, 0, radix)
+	if (end != s.length) {
+		throw new ParseError("syntax", end)
+	}
+	return v
+}
+
+/// The integer at s[start] in radix 2…36, and the index after its last digit.
+export function scanInt[T extends Integral = i32](s: string, start: i32 = 0,
+	radix: i32 = 10): [T, i32] throws ParseError {
+	assert radix >= 2 && radix <= 36
+	const zero = 0 as T
+	const neg = start < s.length && s[start] == minus
+	if (neg && zero - 1 > zero) {
+		throw new ParseError("syntax", start)
+	}
+	const r = radix as T
+	let v = zero
+	const first = if (neg) start + 1 else start
+	let i = first
+	while (i < s.length) {
+		const d = digit(s[i])
+		if (d == null || d >= radix) {
+			break
+		}
+		const next = if (neg) v * r - (d as T) else v * r + (d as T)
+		if (next / r != v) {
+			throw new ParseError("range", start)
+		}
+		v = next
+		i += 1
+	}
+	if (i == first) {
+		throw new ParseError("syntax", i)
+	}
+	return [v, i]
+}

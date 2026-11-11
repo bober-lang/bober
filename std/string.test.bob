@@ -1,0 +1,91 @@
+import { ParseError, codePoint, lastCodePoint, parseInt, quoted, replace, scanInt, split, strip, trim, unquoted,
+	utf8 } from "./string"
+
+test "split" {
+	assert split("a,b,,c", ",") == ["a", "b", "", "c"] && split("", ",") == [""]
+	assert split("a::b::", "::") == ["a", "b", ""] && split("ab", ",") == ["ab"] && split(",", ",") == ["", ""]
+}
+
+test "replace" {
+	assert replace("a.b.c", ".", "::") == "a::b::c" && replace("aaa", "aa", "b") == "ba" && replace("", "x", "y") == ""
+}
+
+test "trim" {
+	assert trim("  a b\t\n") == "a b" && trim(" \r\n ") == "" && trim("x") == "x"
+	assert strip("__a__", "__") == "a" && strip("__a", "__") == "__a" && strip("____", "__") == "____"
+}
+
+test "quoted" {
+	assert quoted("") == "\"\"" && quoted("héllo") == "\"héllo\""
+	assert quoted("a\"b\\c\n\t\r\x01\x7f") == "\"a\\\"b\\\\c\\n\\t\\r\\x01\\x7f\""
+}
+
+test "utf8" {
+	assert utf8(0x41) == "A" && utf8(0xe9) == "é" && utf8(0x20ac) == "€" && utf8(0x1f600) == "\u{1F600}"
+}
+
+test "codePoint" {
+	assert codePoint("A", 0)[0] == 0x41 && codePoint("é", 0)[1] == 2 && codePoint("x€", 1)[0] == 0x20ac
+	assert codePoint("\u{1F600}", 0)[0] == 0x1f600 && codePoint("\u{10FFFF}", 0)[1] == 4
+	assert codePoint("\u{D7FF}", 0)[0] == 0xd7ff && codePoint("\u{800}", 0)[0] == 0x800
+	assert codePoint("\u{10000}", 0)[0] == 0x10000 && codePoint("\u{E000}", 0)[0] == 0xe000
+	for (const bad of ["\x80", "\xc0\x80", "\xc1\xbf", "\xe0\x9f\xbf", "\xed\xa0\x80", "\xf0\x8f\xbf\xbf",
+		"\xf4\x90\x80\x80", "\xf5\x80\x80\x80", "\xe2\x82", "\xe2\x82A", "\xff"]) {
+		const [cp, end] = codePoint(bad, 0)
+		assert cp == 0xfffd && end == 1
+	}
+}
+
+test "lastCodePoint" {
+	assert lastCodePoint("A", 1)[0] == 0x41 && lastCodePoint("xé", 3)[1] == 1 && lastCodePoint("\u{1F600}", 4)[1] == 0
+	// As forward: \xe0\xa0\x80 then \x80, and \xc3 then \xa9 cut off.
+	assert lastCodePoint("\xe0\xa0\x80\x80", 4)[1] == 3 && lastCodePoint("\xe0\xa0\x80\x80", 3)[0] == 0x800
+	assert lastCodePoint("\xc3\xa9", 1)[0] == 0xfffd && lastCodePoint("\x80\x80\x80\x80\x80", 5)[1] == 4
+}
+
+test "unquoted" {
+	assert unquoted("\"\"") == "" && unquoted("\"héllo\"") == "héllo"
+	assert unquoted("\"a\\\"b\\\\c\\n\\t\\r\\0\\x41\\u{20ac}\\$\"") == "a\"b\\c\n\t\r\0A€$"
+}
+
+test "whole strings" {
+	assert parseInt("0") == 0 && parseInt("42") == 42 && parseInt("-42") == -42
+	assert parseInt("007") == 7
+	assert parseInt("ff", 16) == 255 && parseInt("FF", 16) == 255 && parseInt("-z", 36) == -35
+	assert parseInt("101", 2) == 5 && parseInt("-0") == 0 && parseInt("Zz", 36) == 1295
+}
+
+test "no JS leniency" {
+	assert parseInt("") throws new ParseError("syntax", 0)
+	assert parseInt("-") throws new ParseError("syntax", 1)
+	assert parseInt("+1") throws new ParseError("syntax", 0)
+	assert parseInt(" 1") throws new ParseError("syntax", 0)
+	assert parseInt("1 ") throws new ParseError("syntax", 1)
+	assert parseInt("12px") throws new ParseError("syntax", 2)
+	assert parseInt("0x10") throws new ParseError("syntax", 1)
+	assert parseInt("1_0") throws new ParseError("syntax", 1)
+	assert parseInt("12", 2) throws new ParseError("syntax", 1)
+	assert parseInt("--1") throws new ParseError("syntax", 1)
+	assert parseInt("g", 16) throws new ParseError("syntax", 0)
+	assert parseInt("é") throws new ParseError("syntax", 0)
+}
+
+test "the bounds of i32" {
+	assert parseInt("2147483647") == 2147483647 && parseInt("-2147483648") == -2147483647 - 1
+	assert parseInt("2147483648") throws new ParseError("range", 0)
+	assert parseInt("-2147483649") throws new ParseError("range", 0)
+	assert parseInt("99999999999") throws new ParseError("range", 0)
+	assert parseInt("-99999999999") throws new ParseError("range", 0)
+	assert parseInt("7fffffff", 16) == 2147483647 && parseInt("-80000000", 16) == -2147483647 - 1
+	assert parseInt("80000000", 16) throws new ParseError("range", 0)
+}
+
+test "a prefix from a start" {
+	const [v, end] = scanInt("x=-12;", 2)
+	assert v == -12 && end == 5
+	const [w, stop] = scanInt("1f!", 0, 16)
+	assert w == 31 && stop == 2
+	assert scanInt("ab", 2) throws new ParseError("syntax", 2)
+	assert scanInt("a-x", 1) throws new ParseError("syntax", 2)
+	assert scanInt("x=99999999999", 2) throws new ParseError("range", 2)
+}

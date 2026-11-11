@@ -1,0 +1,51 @@
+//! scanInt against the vendored integer suites in vendor/parse-tests, whose `int_case` tables (cases.h) are imported
+//! from their C source.
+
+import { I16, I32, I64, I8, OK, RANGE, U16, U32, U64, U8 } from "../vendor/parse-tests/cases.h"
+import { freebsd_sscanf } from "../vendor/parse-tests/freebsd/sscanf_test.c"
+import { go_atoi } from "../vendor/parse-tests/go/atoi.c"
+import { netbsd_strtoi } from "../vendor/parse-tests/netbsd/t_strtoi.c"
+import { netbsd_strtol } from "../vendor/parse-tests/netbsd/t_strtol.c"
+import { openbsd_strtol } from "../vendor/parse-tests/openbsd/strtoltest.c"
+import { openbsd_strtonum } from "../vendor/parse-tests/openbsd/strtonumtest.c"
+import { ParseError, scanInt } from "./string"
+import { Integral } from "./types"
+
+/// A row of an int_case table; unit is 1 for narrow input, the only kind until string16 and string32.
+interface Case { in: u64; len: i32; unit: u8; type: u8; radix: u8; err: u8; at: i32; value: u64 }
+
+function check[T extends Integral](r: Case, s: string) {
+	if (r.err == OK) {
+		const [v, end] = scanInt[T](s, 0, r.radix)
+		assert (v as u64) == r.value
+		assert end == r.at
+	} else {
+		assert scanInt[T](s, 0, r.radix) throws new ParseError(if (r.err == RANGE) "range" else "syntax", r.at)
+	}
+}
+
+const tables: [string, Case[]][] = [["openbsd/strtoltest.c", [...openbsd_strtol]],
+	["openbsd/strtonumtest.c", [...openbsd_strtonum]], ["netbsd/t_strtol.c", [...netbsd_strtol]],
+	["netbsd/t_strtoi.c", [...netbsd_strtoi]], ["freebsd/sscanf_test.c", [...freebsd_sscanf]], ["go/atoi.c", [...go_atoi]]]
+
+test "vendored ints" {
+	for (const [file, rows] of tables) {
+		test `${file}` {
+			for (const r of rows.filter(r => r.unit == 1)) {
+				const s = fromBytes(r.in, r.len as u64)
+				test `"${s}" as ${r.type} radix ${r.radix}` {
+					switch (r.type as i32) {
+						case I8: check[i8](r, s)
+						case I16: check[i16](r, s)
+						case I32: check[i32](r, s)
+						case I64: check[i64](r, s)
+						case U8: check[u8](r, s)
+						case U16: check[u16](r, s)
+						case U32: check[u32](r, s)
+						case U64: check[u64](r, s)
+					}
+				}
+			}
+		}
+	}
+}

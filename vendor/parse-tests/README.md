@@ -1,8 +1,7 @@
 # parse-tests
 
 Integer and float parsing cases from other projects' test suites, reduced to data under bober's strict semantics.
-Each file defines arrays of `int_case` or `float_case` (`cases.h`), which `std/parse.vendor.test.bob` imports from it.
-`make` builds `build/libparsetests.dylib`, which holds them.
+Each file defines arrays of `int_case` or `float_case` (`cases.h`), which `std/string.vendor.test.bob` imports from it.
 
 Each row is a scan from index 0:
 - `OK`: `at` is the index after the number.

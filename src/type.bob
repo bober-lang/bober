@@ -31,12 +31,11 @@
 //! assignment and passing copy the reference, so all holders see one object, and `==` compares identity, except that
 //! strings compare by code units, functions do not compare, and an assert compares by value (§5.5).
 
-import { contains, lowerBound, position, unique } from "../std/algo"
+import { contains, lowerBound, merge, position, unique } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
 import { combine, fnv } from "../std/hash"
 import { maxOf } from "../std/limits"
 import { min } from "../std/math"
-import { merge } from "../std/sort"
 
 export type Kind = "null" | "bool" | "int" | "float" | "string" | "literal" | "array" | "fixed" | "tuple" | "object"
 	| "class" | "interface" | "function" | "async" | "union" | "param"
@@ -584,7 +583,9 @@ export class Type {
 	static union(ts: Type[]): Type {
 		let ms: Type[] = []
 		for (const t of ts) {
-			ms = merge(ms, t.alternatives(), (a, b) => a.id < b.id)
+			const mid = ms.length
+			ms.append(t.alternatives())
+			merge(ms, mid, (a, b) => a.id < b.id)
 		}
 		ms = unique(ms)
 		return if (ms.length == 1) ms[0] else if (ms.length == 0) Empty else intern({ ...new Type("union"), types: ms })

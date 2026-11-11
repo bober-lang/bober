@@ -6,15 +6,14 @@
 //! takes its first class. A Rest field takes the unknown keys, an unknown table's under its dotted path. A key or
 //! table defined twice is rejected. Dates and times are not supported.
 
-import { contains } from "../algo"
 import * as ascii from "../ascii"
+import { startsWith } from "../algo"
 import { apostrophe, backslash, digit, dot, equal, hash, isAlphanumeric, isControl, isDigit, lbrace, lbracket, lf,
 	minus, nul, plus, quote, rbrace, rbracket, space, tab, underscore, zero } from "../ascii"
 import { parseFloat } from "../float"
 import { inf, isFinite, isNaN, nan } from "../math"
 import { quoted, Unknown } from "./json"
-import { ParseError, parseInt } from "../parse"
-import { startsWith, utf8 } from "../string"
+import { ParseError, parseInt, utf8 } from "../string"
 import { Decodable, Float, has, Integral } from "../types"
 
 /// Tags an Unknown[] field to take the keys no other field takes, and to encode them back.
@@ -253,7 +252,7 @@ class Decoder {
 	/// Marks path defined, or throws a ParseError at at if it was.
 	define(path: string[], at: i32) throws ParseError {
 		const k = path.map(key).join(".")
-		if (contains(this.defined, k)) {
+		if (this.defined.includes(k)) {
 			throw new ParseError("syntax", at)
 		}
 		this.defined.push(k)
@@ -262,7 +261,7 @@ class Decoder {
 	/// Whether the array of tables at path was begun before, marking it begun and what is in its new element not.
 	again(path: string[]): bool {
 		const k = path.map(key).join(".")
-		const begun = contains(this.arrays, k)
+		const begun = this.arrays.includes(k)
 		this.arrays = [k, ...this.arrays.filter(a => a != k && !startsWith(a, `${k}.`))]
 		this.defined = this.defined.filter(a => !startsWith(a, `${k}.`))
 		return begun

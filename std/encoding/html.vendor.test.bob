@@ -4,11 +4,10 @@
 //! tests' lone surrogates, which UTF-8 cannot hold, scripted_*.dat's scripts, and selectedcontent's copy of the
 //! selected option, which the select element's DOM makes.
 
-import { contains } from "../algo"
+import { indexOf, sort, startsWith } from "../algo"
 import { glob, readFile } from "../fs"
 import { base } from "../fs/path"
-import { sortBy } from "../sort"
-import { indexOf, split, startsWith, trim } from "../string"
+import { split, trim } from "../string"
 import { decode, quoted, Rest, Unknown } from "./json"
 import { parse, parseFragment, serialize, State, Tokenizer } from "./html"
 import { htmlNS, mathNS, Node, svgNS, xlinkNS, xmlNS, xmlnsNS } from "./xml"
@@ -189,7 +188,7 @@ function cases(text: string): Case[] {
 		body = ""
 	}
 	for (const line of split(text, "\n")) {
-		if (contains(headers, line)) {
+		if (headers.includes(line)) {
 			flush()
 			if ((line == "#data" || line == "#description") && section == "#document") {
 				out.push(c)
@@ -233,7 +232,7 @@ function dump(nodes: Node[], pad: string, out: string[]): void {
 			case "element":
 				out.push(`| ${pad}<${prefix(n.ns)}${n.name}>`)
 				const attrs = n.attrs.map(a => `| ${pad}  ${prefix(a.ns)}${if (a.ns == "") a.name else a.name.slice(indexOf(a.name, ":") + 1, a.name.length)}="${a.value}"`)
-				sortBy(attrs, (a, b) => a < b)
+				sort(attrs)
 				out.append(attrs)
 				if (n.ns == htmlNS && n.name == "template") {
 					out.push(`| ${pad}  content`)

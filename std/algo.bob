@@ -1,0 +1,215 @@
+//! Searching and sorting arrays, and strings as u8 arrays.
+
+import { less } from "./functional"
+import { Ordered } from "./types"
+
+/// Whether xs starts with prefix.
+export function startsWith[T](xs: T[readonly], prefix: T[readonly]): bool { return occurs(xs, 0, prefix) }
+
+/// Whether xs ends with suffix.
+export function endsWith[T](xs: T[readonly], suffix: T[readonly]): bool {
+	return occurs(xs, xs.length - suffix.length, suffix)
+}
+
+/// The index of the first sub in xs at or after from, or -1.
+export function indexOf[T](xs: T[readonly], sub: T[readonly], from: i32 = 0): i32 {
+	let i = if (from < 0) 0 else from
+	if (sub.length == 0) {
+		return if (i <= xs.length) i else -1
+	}
+	const last = xs.length - sub.length
+	while (i <= last) {
+		const k = find(xs, sub[0], i)
+		if (k < 0 || k > last) {
+			return -1
+		}
+		if (occurs(xs, k, sub)) {
+			return k
+		}
+		i = k + 1
+	}
+	return -1
+}
+
+/// The index of the last sub in xs, or -1.
+export function lastIndexOf[T](xs: T[readonly], sub: T[readonly]): i32 {
+	let i = xs.length - sub.length
+	while (i >= 0 && !occurs(xs, i, sub)) {
+		i--
+	}
+	return i
+}
+
+/// Whether sub is in xs at i.
+export function occurs[T](xs: T[readonly], i: i32, sub: T[readonly]): bool {
+	if (i < 0 || i + sub.length > xs.length) {
+		return false
+	}
+	for (const j of 0 ... sub.length - 1) {
+		if (xs[i + j] != sub[j]) {
+			return false
+		}
+	}
+	return true
+}
+
+/// The index of the first x in xs at or after from, or -1.
+function find[T](xs: T[readonly], x: T, from: i32): i32 {
+	let i = from
+	while (i < xs.length && xs[i] != x) {
+		i++
+	}
+	return if (i < xs.length) i else -1
+}
+
+/// The first i where xs[i] >= v, or xs.length; xs shall be ascending.
+export function lowerBound[T extends Ordered](xs: T[readonly], v: T): u32 { return partitionPoint(xs, x => x >= v) }
+
+/// The first i where xs[i] > v, or xs.length; xs shall be ascending.
+export function upperBound[T extends Ordered](xs: T[readonly], v: T): u32 { return partitionPoint(xs, x => x > v) }
+
+/// The first i where past(xs[i]), or xs.length; past shall be false then true along xs.
+export function partitionPoint[T](xs: T[readonly], past: (x: T) => bool): u32 {
+	let lo: u32 = 0
+	let hi = xs.length as u32
+	while (lo < hi) {
+		const mid = (lo + hi) / 2
+		if (past(xs[mid])) {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo
+}
+
+/// xs without each element that equals the one before it.
+export function unique[T](xs: T[readonly]): T[] {
+	const out: T[] = []
+	for (const x of xs) {
+		if (out.length == 0 || out[out.length - 1] != x) {
+			out.push(x)
+		}
+	}
+	return out
+}
+
+/// Sorts xs in place, ascending; equal elements may change order (see stableSort).
+export function sort[T extends Ordered](xs: T[]) { sortBy(xs, less[T]) }
+
+/// Sorts xs in place by before, which says strictly whether a goes before b: n log n expected.
+export function sortBy[T](xs: T[], before: (a: T, b: T) => bool) { quicksort(xs, 0, xs.length, before) }
+
+/// Sorts xs in place by before, equal elements kept in order: n log² n, nothing allocated.
+export function stableSort[T](xs: T[], before: (a: T, b: T) => bool) {
+	// Insertion-sorted runs, merged in place.
+	const n = xs.length
+	let size = 20
+	let lo = 0
+	while (lo < n) {
+		insertion(xs, lo, if (lo + size < n) lo + size else n, before)
+		lo += size
+	}
+	while (size < n) {
+		lo = 0
+		while (lo + size < n) {
+			symMerge(xs, lo, lo + size, if (lo + 2 * size < n) lo + 2 * size else n, before)
+			lo += 2 * size
+		}
+		size *= 2
+	}
+}
+
+/// Merges in place xs[0:mid] and xs[mid:], each sorted by before; of equal elements, those of the first come first.
+export function merge[T](xs: T[], mid: i32, before: (a: T, b: T) => bool) { symMerge(xs, 0, mid, xs.length, before) }
+
+// Partitions around the median of three, and sorts by insertion once short.
+function quicksort[T](xs: T[], lo: i32, hi: i32, before: (a: T, b: T) => bool): void {
+	while (hi - lo > 12) {
+		const [a, b, c] = [xs[lo], xs[(lo + hi) / 2], xs[hi - 1]]
+		const p = if (before(a, b)) (if (before(b, c)) b else if (before(a, c)) c else a)
+			else if (before(a, c)) a
+			else if (before(b, c)) c
+			else b
+		let i = lo
+		let j = hi - 1
+		while (i <= j) {
+			while (before(xs[i], p)) {
+				i++
+			}
+			while (before(p, xs[j])) {
+				j--
+			}
+			if (i <= j) {
+				swap(xs, i, j)
+				i++
+				j--
+			}
+		}
+		// The shorter side recursively, so the stack stays log n deep.
+		if (j - lo < hi - i) {
+			quicksort(xs, lo, j + 1, before)
+			lo = i
+		} else {
+			quicksort(xs, i, hi, before)
+			hi = j + 1
+		}
+	}
+	insertion(xs, lo, hi, before)
+}
+
+/// Sorts xs[lo:hi] by before, stably, by insertion.
+function insertion[T](xs: T[], lo: i32, hi: i32, before: (a: T, b: T) => bool) {
+	for (const i of lo + 1 ... hi - 1) {
+		const x = xs[i]
+		let j = i
+		while (j > lo && before(x, xs[j - 1])) {
+			xs[j] = xs[j - 1]
+			j--
+		}
+		xs[j] = x
+	}
+}
+
+/// Merges the sorted xs[lo:mid] and xs[mid:hi] in place, stably.
+// SymMerge, from Kim and Kutzner's "Stable Minimum Storage Merging by Symmetric Comparisons", as Go's sort.Stable.
+function symMerge[T](xs: T[], lo: i32, mid: i32, hi: i32, before: (a: T, b: T) => bool): void {
+	if (lo >= mid || mid >= hi) {
+		return
+	}
+	const half = (lo + hi) / 2
+	const n = half + mid
+	let start = if (mid > half) n - hi else lo
+	let r = if (mid > half) half else mid
+	while (start < r) {
+		const c = (start + r) / 2
+		if (before(xs[n - 1 - c], xs[c])) {
+			r = c
+		} else {
+			start = c + 1
+		}
+	}
+	const end = n - start
+	// xs[mid:end] moved in front of xs[start:mid].
+	reverse(xs, start, mid)
+	reverse(xs, mid, end)
+	reverse(xs, start, end)
+	symMerge(xs, lo, start, half, before)
+	symMerge(xs, half, end, hi, before)
+}
+
+function reverse[T](xs: T[], lo: i32, hi: i32) {
+	let i = lo
+	let j = hi - 1
+	while (i < j) {
+		swap(xs, i, j)
+		i++
+		j--
+	}
+}
+
+function swap[T](xs: T[], i: i32, j: i32) {
+	const x = xs[i]
+	xs[i] = xs[j]
+	xs[j] = x
+}

@@ -1,0 +1,131 @@
+import { endsWith, indexOf, lastIndexOf, lowerBound, merge, occurs, partitionPoint, sort, sortBy, stableSort,
+	startsWith, unique, upperBound } from "./algo"
+import { greater } from "./functional"
+
+test "bounds of a present run" {
+	const xs = [1, 2, 2, 2, 5]
+	assert lowerBound(xs, 2) == 1 && upperBound(xs, 2) == 4
+}
+
+test "bounds at, between and beyond the ends" {
+	const xs = [1, 3, 5]
+	assert lowerBound(xs, 0) == 0 && upperBound(xs, 0) == 0
+	assert lowerBound(xs, 1) == 0 && upperBound(xs, 1) == 1
+	assert lowerBound(xs, 4) == 2 && upperBound(xs, 4) == 2
+	assert lowerBound(xs, 5) == 2 && upperBound(xs, 5) == 3
+	assert lowerBound(xs, 9) == 3 && upperBound(xs, 9) == 3
+}
+
+test "bounds of an empty array" {
+	const xs: i32[] = []
+	assert lowerBound(xs, 1) == 0 && upperBound(xs, 1) == 0
+}
+
+test "bounds of strings" {
+	const xs = ["a", "b", "b", "c"]
+	assert lowerBound(xs, "b") == 1 && upperBound(xs, "b") == 3
+}
+
+test "partition point" {
+	const xs = [5, 3, 3, 1]
+	assert partitionPoint(xs, x => x <= 3) == 1 && partitionPoint(xs, x => x < 3) == 3
+}
+
+test "bounds, partition point and unique of a string's u8s" {
+	assert lowerBound("abbbd", 98) == 1 && upperBound("abbbd", 98) == 4 && partitionPoint("aaz", x => x > 97) == 2
+	assert unique("aabccc") == ([97, 98, 99] as u8[])
+}
+
+test "unique" {
+	assert unique([1, 1, 2, 3, 3, 3, 1]) == [1, 2, 3, 1] && unique([] as i32[]) == [] && unique(["a"]) == ["a"]
+}
+
+test "sort numbers and strings" {
+	const xs = [5, 3, 9, 1, 3, 0]
+	sort(xs)
+	assert xs == [0, 1, 3, 3, 5, 9]
+	sortBy(xs, greater[i32])
+	assert xs == [9, 5, 3, 3, 1, 0]
+	const ss = ["pear", "fig", "apple", ""]
+	sort(ss)
+	assert ss == ["", "apple", "fig", "pear"]
+	const none: i32[] = []
+	sort(none)
+	const one = [1]
+	sort(one)
+	assert none == [] && one == [1]
+}
+
+/// n pairs of a key below keys and their index, from a fixed seed.
+function pairs(n: i32, keys: i32): [i32, i32][] {
+	const xs: [i32, i32][] = []
+	let seed: u32 = 7
+	for (const i of 0 ... n - 1) {
+		seed = seed * 1664525 + 1013904223
+		xs.push([((seed >> 8) as i32) % keys, i])
+	}
+	return xs
+}
+
+test "sort long, shuffled, sorted, reversed and equal runs" {
+	for (const keys of [1, 10, 1000000]) {
+		const xs = pairs(1000, keys)
+		for (const run of 0 ... 2) {
+			sortBy(xs, (a, b) => a[0] < b[0])
+			for (const i of 1 ... xs.length - 1) {
+				assert xs[i - 1][0] <= xs[i][0]
+			}
+			xs.reverse()
+		}
+		const seen = xs.map(x => x[1])
+		sort(seen)
+		assert seen == pairs(1000, keys).map(x => x[1])
+	}
+}
+
+test "stableSort keeps equal elements in order" {
+	for (const n of [0, 1, 19, 20, 21, 1000]) {
+		const xs = pairs(n, 10)
+		stableSort(xs, (a, b) => a[0] < b[0])
+		for (const i of 1 ... xs.length - 1) {
+			const [a, b] = [xs[i - 1], xs[i]]
+			assert a[0] < b[0] || a[0] == b[0] && a[1] < b[1]
+		}
+	}
+}
+
+test "merge in place" {
+	const before = (a: i32, b: i32) => a < b
+	const xs = [1, 4, 6, 2, 4, 7, 8]
+	merge(xs, 3, before)
+	assert xs == [1, 2, 4, 4, 6, 7, 8]
+	const ys = [1, 2]
+	merge(ys, 0, before)
+	const zs = [3]
+	merge(zs, 1, before)
+	assert ys == [1, 2] && zs == [3]
+	const ps: [i32, string][] = [[1, "x"], [2, "x"], [1, "y"], [2, "y"]]
+	merge(ps, 2, (a, b) => a[0] < b[0])
+	assert ps == [[1, "x"], [1, "y"], [2, "x"], [2, "y"]]
+}
+
+test "prefixes and suffixes" {
+	assert startsWith("__builtin_x", "__builtin_") && startsWith("a", "") && !startsWith("a", "ab")
+	assert endsWith("f.c", ".c") && !endsWith("c", ".c")
+}
+
+test "indexOf" {
+	assert indexOf("X=1=2", "=") == 1 && indexOf("ab", "b") == 1 && indexOf("X", "=") == -1 && indexOf("", "=") == -1
+	assert lastIndexOf("X=1=2", "=") == 3 && lastIndexOf("ab", "ab") == 0 && lastIndexOf("X", "=") == -1
+		&& lastIndexOf("", "") == 0
+	assert indexOf("a=b=c", "=", 2) == 3 && indexOf("a=b", "=", 2) == -1
+}
+
+test "the same on arrays, and a string's u8s with them" {
+	const xs = [3, 1, 4, 1, 5, 9, 2, 6]
+	assert startsWith(xs, [3, 1]) && endsWith(xs, [2, 6]) && !startsWith(xs, [1])
+	assert indexOf(xs, [1, 5]) == 3 && indexOf(xs, [1], 2) == 3 && lastIndexOf(xs, [1]) == 3 && occurs(xs, 4, [5, 9])
+	assert indexOf("a=b", [61] as u8[]) == 1 && startsWith([97, 98] as u8[], "a") && endsWith(["x", "y"], ["y"])
+	const long = "a string longer than one held inline, to the end"
+	assert indexOf(long, "end") == long.length - 3 && lastIndexOf(long, "in") == 33
+}
