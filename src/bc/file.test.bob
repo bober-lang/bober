@@ -6,18 +6,23 @@ import * as decl from "./decl"
 import { abi, read, write } from "./file"
 import * as kind from "./kind"
 import { Program } from "./program"
-import { show } from "./show"
+import { showDecl } from "./show"
 
 /// The modules of main.bob of source src, where it imports lib.bob of source lib.
 function lowered(src: string, lib: string = ""): Program {
 	return lower(["main.bob"], [], path => if (path == "main.bob") src else if (path == "lib.bob") lib else null)
 }
 
-/// Module m of p shown, with its top-level decls, inits and deps.
+/// Module m of p shown, with its top-level decls, inits and deps; its decls as a file has them.
 function shown(p: Program, m: i32): string {
 	const x = p.modules[m]
 	const names = (ds: i32[]) => ds.map(d => p.strings[p.decls[d].name]).join(", ")
-	return `[${names(x.decls)}] [${names(x.inits)}] [${x.deps.map(d => p.modules[d].path).join(", ")}]\n${show(p, m)}`
+	return `[${names(x.decls)}] [${names(x.inits)}] [${x.deps.map(d => p.modules[d].path).join(", ")}]\n${owned(p, x.decls)}`
+}
+
+/// The decls ds of p shown, each before those it owns.
+function owned(p: Program, ds: i32[]): string {
+	return ds.map(d => showDecl(p, d) + owned(p, p.decls[d].members)).join("")
 }
 
 /// Writes each module of p, reads them all into a new Program, and asserts each reads back as it was written, of the

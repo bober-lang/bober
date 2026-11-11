@@ -7,34 +7,30 @@ import * as kind from "./kind"
 import * as op from "./op"
 import { Code, Program } from "./program"
 
-/// Module m of p: each decl of it in the order made, a line of it and the ops of its code, one per line, indented by
-/// block.
+/// Module m of p: each decl of it in the order made.
 export function show(p: Program, m: i32): string {
 	let s = ""
 	for (const i of 0 ... p.decls.length - 1) {
-		const d = p.decls[i]
-		if (d.module != m) {
-			continue
-		}
-		if (d.doc != 0) {
-			s += `/// ${p.strings[d.doc]}\n`
-		}
-		s += `${mods(d.mods)}${decl.names[d.kind]} ${qualified(p, i)}${params(p, i)}`
-		if (d.type != 0) {
-			s += `${if (d.kind == decl.Interface || d.kind == decl.Alias) " =" else ":"} ${showType(p, d.type)}`
-		}
-		if (d.supers != 0) {
-			s += ` ${if (d.kind == decl.Class) "implements" else "extends"} ${types(p, d.supers, ", ")}`
-		}
-		if (d.throws != 0) {
-			s += ` throws ${types(p, d.throws, " | ")}`
-		}
-		s += "\n"
-		if (d.code != null) {
-			s += showCode(p, d.code!)
-		}
+		s += if (p.decls[i].module == m) showDecl(p, i) else ""
 	}
 	return s
+}
+
+/// Decl i of p: its doc, a line of it, and the ops of its code, one per line, indented by block.
+export function showDecl(p: Program, i: i32): string {
+	const d = p.decls[i]
+	let s = if (d.doc != 0) `/// ${p.strings[d.doc]}\n` else ""
+	s += `${mods(d.mods)}${decl.names[d.kind]} ${qualified(p, i)}${params(p, i)}`
+	if (d.type != 0) {
+		s += `${if (d.kind == decl.Interface || d.kind == decl.Alias) " =" else ":"} ${showType(p, d.type)}`
+	}
+	if (d.supers != 0) {
+		s += ` ${if (d.kind == decl.Class) "implements" else "extends"} ${types(p, d.supers, ", ")}`
+	}
+	if (d.throws != 0) {
+		s += ` throws ${types(p, d.throws, " | ")}`
+	}
+	return s + "\n" + (if (d.code != null) showCode(p, d.code!) else "")
 }
 
 /// Code c's locals on a line, if any, and its captures, then its ops, one per line, indented by block.
