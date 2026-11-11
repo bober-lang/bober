@@ -1,10 +1,11 @@
-//! Tests of src/link: hand-made Objects linked, and arm64's fixups on known instructions.
+//! Tests of src/link: hand-made Objects linked, and arm64's and x86-64's fixups on known instructions.
 
 import { CompileError } from "../error"
 import { addend, arm64 } from "./arm64"
 import { Image, Linker } from "./link"
 import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Local, Machine, Object, Page, PageOff, Rel32, Section,
-	SlotPage, SlotPageOff, Symbol, Thread, Unwind, Weak } from "./object"
+	SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Unwind, Weak } from "./object"
+import { x64 } from "./x64"
 
 /// An object named name of one section of kind, of the bytes of words, and of symbols.
 function obj(name: string, kind: u8, words: u64[], symbols: Symbol[], fixups: Fixup[] = [], group = ""): Object {
@@ -245,6 +246,27 @@ test "an arm64 instruction's addend is what its fixup set, from 0x10000" {
 	assert addend(0x97fffffc, Call) == -16 && addend(0x94000004, Call) == 16
 	assert addend(0xf0000090, Page) == 0x13000 && addend(0x90ffff90, Page) == -0x10000
 	assert addend(0xf9411c01, PageOff) == 0x238 && addend(0x3dc08c00, PageOff) == 0x230
+}
+
+test "an x86-64 call's displacement is of 32 bits, from the end of the instruction by the addend, -4" {
+	assert fixed(0, Call, 0x10010 - 4, x64) == 0xc // call .+16, from its opcode at 0xffff
+	assert fixed(0, Call, 0x10000 - (1 << 31), x64) == 0x80000000
+	assert fixed(0, Call, 0x10000 + (1 << 31), x64) == 0
+	assert fixed(0, Page, 0x23456, x64) == 0
+}
+
+test "an x86-64 call to an import jumps through its slot in a stub, and a load of a slot is relative to itself" {
+	// call puts; mov here@GOTPCREL(%rip), %rax
+	const a = obj("a", Code, [0xe8, 0x058b4800, 0], [new Symbol("puts", Global), new Symbol("main", Global, 0),
+		new Symbol("here", Local, 0, 5)], [new Fixup(1, Call, 0, -4), new Fixup(8, SlotRel32, 2, -4)])
+	a.arch = "x86_64"
+	const image = link([a], ["main"], [], true, x64)
+	const main = at(image, "main")
+	const stubs = section(image, "stubs")
+	const slots = section(image, "slots")
+	assert get(image, main + 1) == stubs - main - 5 && get(image, main + 8) == slots + 8 - main - 12
+	assert get(image, stubs, 2) == 0x25ff && get(image, stubs + 2) == slots - stubs - 6
+	assert get(image, slots + 8, 8) == main + 5 && image.binds.map(b => b.name).join(" ") == "puts"
 }
 
 test "sections of one name are laid out by their order, then as linked" {
