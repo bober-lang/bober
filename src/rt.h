@@ -38,6 +38,8 @@ typedef struct { int64_t size; uint64_t refs[]; } bober_layout;
 /// n new zero bytes, 16-aligned, of values laid out as l, or of none holding a ref if l is null: a ref, which may
 /// point into them anywhere. It may collect, so that refs held across it move.
 void *bober_alloc(int64_t n, const bober_layout *l);
+/// Marks the card of place p, where a ref may have been stored, as the write barrier of compiled code does.
+void bober_written(void *p);
 /// A number, from 1, that is p's alone while what p points into lives, however it moves; 0 for null.
 uint64_t bober_id(void *p);
 /// n bytes from C's malloc, which the collector neither moves nor frees, for C to hold; exits if out of memory.

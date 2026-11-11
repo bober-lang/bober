@@ -229,6 +229,8 @@ export interface Backend {
 	/// Has the collector walk the frames of the module's functions: each ref they hold across a call is kept where
 	/// it finds and updates it.
 	collected()
+	/// Whether it marks the card of each place a ref is stored at itself, so that emit need not at each store.
+	marks(): bool
 	/// Whether a value of t holds a ref.
 	holdsRef(t: Type): bool
 	/// Where the refs in a value of t are, the layout bober_alloc takes (src/rt.h), or null if it holds none.
@@ -359,12 +361,24 @@ export class Nothing implements Backend {
 	line(n: u32, col: u32) {}
 	debugLocal(name: string, p: Value, t: Type, line: u32) {}
 	collected() {}
+	marks(): bool { return false }
 	holdsRef(t: Type): bool { return false }
 	layout(t: Type): Value { return this.fresh() }
 	root(g: Value) {}
 	described(g: Value) {}
 	verify() {}
 	emit(path: string, asm: bool) {}
+}
+
+/// Marks with b the card of place q, for the next minor collection, which scans what overlaps a card marked
+/// (src/gc.c): the byte of its 512 bytes among those after the heap's 64 GiB, of which heap is the address, or the one
+/// after them for a place outside the heap, in a frame or global.
+export function mark(b: Backend, heap: Value, q: Value) {
+	const i64 = b.int(64)
+	const card = b.binary("lshr", b.binary("sub", b.cast("ptrtoint", q, i64), heap), b.constInt(i64, 9))
+	const n = b.constInt(i64, 0x8000000)
+	const at = b.binary("add", heap, b.binary("add", b.select(b.icmp("ult", card, n), card, n), b.constInt(i64, 0x1000000000)))
+	b.store(b.constInt(b.int(8), 1), b.cast("inttoptr", at, b.ptr()), false)
 }
 
 /// A generator's codes for the Backend's names, from the pairs of its table.

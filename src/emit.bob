@@ -29,7 +29,7 @@ import { fromBits } from "../std/float"
 import { max, min } from "../std/math"
 import { endsWith, startsWith } from "../std/string"
 import { Frame as AbiFrame, attrs, call as cCall, held as heldAs, signature } from "./backend/abi"
-import { Backend, Binary, Block, Cmp, FCmp, Type as IrType, Value } from "./backend/backend"
+import { Backend, Binary, Block, Cmp, FCmp, Type as IrType, Value, mark } from "./backend/backend"
 import * as decl from "./bc/decl"
 import { Embed, Extern, Static } from "./bc/decl"
 import * as kind from "./bc/kind"
@@ -157,7 +157,7 @@ class Emitter {
 	facts: Facts
 	/// The module's decls, members and nested ones included.
 	private decls: i32[] = []
-	/// The runtime's functions by name, without bober_.
+	/// The runtime's functions, and its heap's start, by name, without bober_.
 	private rts = new HashMap[string, Value]()
 	/// By type id, what the functions of their names make of it in this module's backend, as learned or not.
 	private structs = new HashMap[i32, IrType]()
@@ -198,6 +198,8 @@ class Emitter {
 	private code = new Code()
 	/// Per local of the code, whether a Fresh boxes it.
 	private fresh: bool[] = []
+	/// And whether it is in a cell, on the heap, so that storing to it marks a card.
+	private cells: bool[] = []
 	private ret = 0
 	/// Its decl, whether it initializes its this, local 0, as a constructor or field initializer does, and the loads of
 	/// that this, which it may write.
@@ -298,6 +300,7 @@ class Emitter {
 		}
 		libc("memcpy", ptr)
 		libc("memcmp", i32)
+		this.rts.set("heap", b.extern("bober_heap", i64))
 		if (this.dyn) {
 			declare("type_of", i64, [i64, i64, ptr, ptr])
 			declare("field_of", i64, [i64, ptr, i64, ptr])
@@ -594,6 +597,7 @@ class Emitter {
 				const k = capAt[i]
 				const at = b.field(b.struct(ts), b.param(f, 0), (k + 1) as u32)
 				this.locals[i] = if (copied[k]) at else b.load(this.ref, at, false)
+				cells[i] = true
 				if (!copied[k]) {
 					b.invariant(this.locals[i])
 				}
@@ -603,6 +607,7 @@ class Emitter {
 				// A T[n] holding refs is a cell too: its refs are elements, not values the collector finds in the frame.
 				const k = this.kindOf(t)
 				const cell = cells[i] || k == kind.FixedArray && this.b.holdsRef(mem)
+				cells[i] = cell
 				const l = if (cell) this.alloc(mem) else b.alloca(mem, 0)
 				this.locals[i] = l
 				if (c.locals[i].name != 0 && !cell) {
@@ -628,6 +633,7 @@ class Emitter {
 				}
 			}
 		}
+		this.cells = cells
 		const start = b.block(f)
 		this.start(start)
 		this.ops(0, c.ops.length)
@@ -786,6 +792,7 @@ class Emitter {
 				const [q, s] = this.place(obj, name)
 				if (s.embed && this.isHeld(v) && this.same(v.t, s.t)) {
 					this.ir().store(v.v, q, false)
+					this.written(q, this.b.typeOf(v.v))
 				} else if (s.embed) {
 					this.copy(this.heap(v), { v: q, t: this.norm(s.t) })
 				} else {
@@ -871,7 +878,15 @@ class Emitter {
 		if (this.held[n]) {
 			this.ir().store(this.unboxed(v), this.locals[n], false)
 		} else {
-			this.put(this.local(n), this.heap(this.taken(v)), this.code.locals[n].type)
+			this.putLocal(n, this.local(n), this.heap(this.taken(v)), this.code.locals[n].type)
+		}
+	}
+
+	/// Stores v, of type t, at q, the place of local n, marking its card if that is a cell.
+	private putLocal(n: i32, q: Value, v: V, t: i32) {
+		this.put(q, v, t)
+		if (this.cells[n]) {
+			this.written(q, this.mem(t))
 		}
 	}
 
@@ -930,7 +945,7 @@ class Emitter {
 	private leaveBlock(f: Frame) {
 		if (!this.dead) {
 			if (f.op == op.Default) {
-				this.put(this.locals[f.local], this.pop(), this.code.locals[f.local].type)
+				this.putLocal(f.local, this.locals[f.local], this.pop(), this.code.locals[f.local].type)
 			} else if (f.slot != 0) {
 				this.put(f.slot, this.pop(), f.t)
 			}
@@ -1086,7 +1101,7 @@ class Emitter {
 		this.start(no)
 		this.rethrow(caught)
 		this.start(yes)
-		this.put(this.locals[local], v, t)
+		this.putLocal(local, this.locals[local], v, t)
 	}
 
 	/// A Try's finally: in the landing pad of what its body or handler throws, and then on the normal path.
@@ -1517,6 +1532,7 @@ class Emitter {
 			this.jump(done)
 			this.start(pad)
 			this.ir().store(this.landing(), into.v, false)
+			this.written(into.v, this.unionTy)
 			this.ir().store(this.bool(true), threw, false)
 			this.jump(done)
 			this.start(done)
@@ -3388,11 +3404,21 @@ class Emitter {
 	private write(q: Value, v: V, t: i32, elem = false) {
 		if (this.dynamic(t)) {
 			const u = this.spill(this.cast(v, t), this.unionTy) // first, as it may collect
-			this.rt("store", [this.desc(t), this.raw(q), u], false)
-		} else if (this.packed(this.norm(t))) {
+			this.rt("store", [this.desc(t), this.raw(q), u], false) // which marks the card
+			return
+		}
+		if (this.packed(this.norm(t))) {
 			this.pack(q, v, t)
 		} else {
 			this.put(q, v, t, elem)
+		}
+		this.written(q, this.stored(t))
+	}
+
+	/// Marks the card of place q, where a value of t was stored, if it holds a ref and the backend marks none itself.
+	private written(q: Value, t: IrType) {
+		if (this.b.holdsRef(t) && !this.b.marks()) {
+			mark(this.ir(), this.ir().load(this.i64, this.rts.get("heap")!, false), q)
 		}
 	}
 
