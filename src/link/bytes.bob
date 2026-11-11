@@ -1,0 +1,60 @@
+//! The bytes of files, as the formats' readers and writers take them apart and put them together.
+
+import { isDigit, zero } from "../../std/ascii"
+import { indexOf } from "../../std/string"
+
+/// The n bytes of s at at, little-endian.
+export function u(s: string, at: i32, n: i32): u64 {
+	let v: u64 = 0
+	for (const i of 0 ... n - 1) {
+		v = v | (s[at + i] as u64) << 8 * i
+	}
+	return v
+}
+
+/// The n bytes of s at at, big-endian.
+export function big(s: string, at: i32, n: i32): u64 {
+	let v: u64 = 0
+	for (const i of 0 ... n - 1) {
+		v = v << 8 | (s[at + i] as u64)
+	}
+	return v
+}
+
+/// The string at at in s, up to a NUL.
+export function str(s: string, at: i32): string { return s.slice(at, indexOf(s, "\x00", at)) }
+
+/// v's low n bytes, little-endian, zeros after its 8.
+export function le(v: u64, n: i32): string {
+	let s = ""
+	for (const i of 0 ... n - 1) {
+		s += chr(if (i < 8) (v >> 8 * i) as u8 else 0)
+	}
+	return s
+}
+
+/// n zero bytes.
+export function zeros(n: i32): string { return fromBytes(new u8[](n)) }
+
+/// v's low n bytes, big-endian.
+export function be(v: u64, n: i32): string {
+	let s = ""
+	for (const i of 0 ... n - 1) {
+		s += chr((v >> 8 * (n - 1 - i)) as u8)
+	}
+	return s
+}
+
+/// The field of n bytes of s: its first n, or s padded with NULs.
+export function pad(s: string, n: i32): string { return if (s.length > n) s.slice(0, n) else s + zeros(n - s.length) }
+
+/// The number the digits s starts with spell.
+export function decimal(s: string): i32 {
+	let n = 0
+	let i = 0
+	while (i < s.length && isDigit(s[i])) {
+		n = 10 * n + ((s[i] - zero) as i32)
+		i++
+	}
+	return n
+}

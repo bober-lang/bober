@@ -1,0 +1,50 @@
+//! Tests of src/link/ar: archives of each dialect, made by hand.
+
+import { CompileError } from "../error"
+import { members } from "./ar"
+import { be, le } from "./bytes"
+
+/// A member's header, of its name as the header holds it, and its bytes, padded to an even size.
+function member(id: string, body: string): string {
+	return field(id, 48) + field(`${body.length}`, 10) + "`\n" + body + (if (body.length % 2 == 1) "\n" else "")
+}
+
+/// s, padded with spaces to n bytes.
+function field(s: string, n: i32): string {
+	let out = s
+	while (out.length < n) {
+		out += " "
+	}
+	return out
+}
+
+/// The members of the archive of parts, as `name=bytes`, then `:name` per name the index lists for it.
+function read(parts: string[]): string throws CompileError {
+	return members("x.a", "!<arch>\n" + parts.join("")).map(m => `${m[0]}=${m[1]}${m[2].map(n => ":" + n).join("")}`)
+		.join(" ")
+}
+
+test "GNU's members are named in the header, or in the member of long names by their offset there" {
+	const names = "a_rather_long_name.o/\nanother_long_name.o/\n"
+	const index = member("/", be(0, 4))
+	assert read([index, member("//", names), member("a.o/", "A"), member("/0", "BB"), member("/22", "C")])
+		== "x.a(a.o)=A x.a(a_rather_long_name.o)=BB x.a(another_long_name.o)=C"
+}
+
+test "Microsoft's long names end in a NUL, and BSD's start the member" {
+	assert read([member("/", be(0, 4)), member("//", "first_long_name.obj\x00second_long_name.obj\x00"),
+		member("/0", "A"), member("/20", "B")]) == "x.a(first_long_name.obj)=A x.a(second_long_name.obj)=B"
+	assert read([member("#1/20", "__.SYMDEF SORTED\x00\x00\x00\x00" + le(0, 8)), member("b.o", "B"),
+		member("#1/20", "a_rather_long_name.o" + "CC")]) == "x.a(b.o)=B x.a(a_rather_long_name.o)=CC"
+}
+
+test "the symbol index lists the names each member defines, by the member's offset" {
+	// GNU's, big-endian, of 22 bytes, so that the members are at 8 + 60 + 22 and 62 after.
+	assert read([member("/", be(3, 4) + be(90, 4) + be(152, 4) + be(90, 4) + "f\x00g\x00h\x00"), member("a.o/", "A"),
+		member("b.o/", "B")]) == "x.a(a.o)=A:f:h x.a(b.o)=B:g"
+	// BSD's, little-endian, of 28 bytes.
+	const pairs = le(0, 4) + le(96, 4) + le(2, 4) + le(158, 4)
+	assert read([member("__.SYMDEF", le(16, 4) + pairs + le(4, 4) + "f\x00g\x00"), member("a.o", "A"),
+		member("b.o", "B")]) == "x.a(a.o)=A:f x.a(b.o)=B:g"
+	assert read([member("a.o/", "A")]) throws new CompileError("x.a: has no symbol index")
+}

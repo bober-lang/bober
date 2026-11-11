@@ -1,0 +1,86 @@
+//! ar archives, GNU's and BSD's, as static libraries are, whose members the linker links lazily.
+
+import { isDigit, slash } from "../../std/ascii"
+import { HashMap } from "../../std/collections/hashmap"
+import { indexOf, replace, startsWith } from "../../std/string"
+import { CompileError } from "../error"
+import { big, decimal, str, u } from "./bytes"
+
+/// The members of the archive bytes, read from the file name, each as `name(member)`, its bytes, and the names its
+/// symbol index lists for it, which are those it defines. A member is a 60-byte header, of its name, padded with
+/// spaces, and its size in decimal at 48, then its bytes, padded to an even size. A name too long for the header is
+/// `/` and its offset in the member `//`, where each name ends in `/\n`, or a NUL in Microsoft's. BSD's, as Apple's,
+/// are: a name ends in a space, or is `#1/` and the size of the name the member starts with, padded with NULs; the
+/// symbol index is `__.SYMDEF`. The index precedes the members.
+export function members(name: string, bytes: string): [string, string, string[]][] throws CompileError {
+	if (bytes.slice(0, 8) != "!<arch>\n") {
+		throw new CompileError(`${name}: not an archive`)
+	}
+	const out: [string, string, string[]][] = []
+	const index = new HashMap[i32, string[]]()
+	let indexed = false
+	let names = ""
+	let at = 8
+	while (at + 60 <= bytes.length) {
+		const id = bytes.slice(at, at + 16)
+		const size = decimal(bytes.slice(at + 48, at + 58))
+		if (at + 60 + size > bytes.length) {
+			throw new CompileError(`${name}: truncated`)
+		}
+		const body = bytes.slice(at + 60, at + 60 + size)
+		const listed = index.get(at) ?? []
+		if (id[0] != slash) {
+			const n = if (startsWith(id, "#1/")) decimal(id.slice(3, 16)) else 0
+			const end = indexOf(id, "/")
+			const member = if (n > 0) body.slice(0, indexOf(body.slice(0, n) + "\x00", "\x00"))
+				else id.slice(0, if (end > 0) end else indexOf(id + " ", " "))
+			if (startsWith(member, "__.SYMDEF")) {
+				indexed = true
+				bsd(body.slice(n, body.length), if (startsWith(member, "__.SYMDEF_64")) 8 else 4, index)
+			} else {
+				out.push([`${name}(${member})`, body.slice(n, body.length), listed])
+			}
+		} else if (isDigit(id[1])) {
+			const from = decimal(id.slice(1, 16))
+			out.push([`${name}(${names.slice(from, indexOf(names, "\x00", from))})`, body, listed])
+		} else if (id[1] == slash) {
+			names = replace(body, "/\n", "\x00\n")
+		} else if (!indexed) { // Microsoft's second index is of another layout
+			indexed = true
+			gnu(body, if (startsWith(id, "/SYM64/")) 8 else 4, index)
+		}
+		at += 60 + size + size % 2
+	}
+	if (!indexed && out.length > 0) {
+		throw new CompileError(`${name}: has no symbol index`)
+	}
+	return out
+}
+
+/// Adds the names of GNU's symbol index b to index, per the offset of the member defining each: of w bytes each,
+/// big-endian, the count of names, then each's offset, then the names, each ending in a NUL.
+function gnu(b: string, w: i32, index: HashMap[i32, string[]]) {
+	const count = big(b, 0, w) as i32
+	let at = w * (1 + count)
+	for (const i of 1 ... count) {
+		const s = str(b, at)
+		list(index, big(b, w * i, w) as i32, s)
+		at += s.length + 1
+	}
+}
+
+/// Adds the names of BSD's symbol index b to index, as gnu: of w bytes each, little-endian, the size of the pairs of
+/// a name's offset in the names and its member's offset, then those, then the size of the names, and them.
+function bsd(b: string, w: i32, index: HashMap[i32, string[]]) {
+	const size = u(b, 0, w) as i32
+	for (const i of 0 ... size / (2 * w) - 1) {
+		list(index, u(b, 2 * w * (i + 1), w) as i32, str(b, 2 * w + size + (u(b, w + 2 * w * i, w) as i32)))
+	}
+}
+
+/// Adds name to the names of index of the member at at.
+function list(index: HashMap[i32, string[]], at: i32, name: string) {
+	const names = index.get(at) ?? []
+	names.push(name)
+	index.set(at, names)
+}

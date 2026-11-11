@@ -1,0 +1,626 @@
+//! ELF64, little-endian, of x86-64 and arm64: relocatable objects read as Objects, the symbols a shared library
+//! defines, and an Image written as a shared library. This is the only file of the linker that knows ELF.
+
+import { partitionPoint } from "../../std/algo"
+import { L, P, R, z } from "../../std/ascii"
+import { HashMap } from "../../std/collections/hashmap"
+import { get, put } from "../../std/encoding/binary"
+import { alignUp, max } from "../../std/math"
+import { Arch } from "../../std/os"
+import { sortBy } from "../../std/sort"
+import { startsWith } from "../../std/string"
+import { CompileError } from "../error"
+import { le, str, u, zeros } from "./bytes"
+import { Format, Image, Segment } from "./link"
+import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Init, Local, Object, Page, PageOff, Rel32, Rel64,
+	Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Unwind, Weak, Zero } from "./object"
+
+/// The room the writer needs before the first linked address: the ELF header and 8 program headers, a PT_LOAD per
+/// segment, of at most 3, and one for the loader's tables, PT_DYNAMIC, PT_TLS, PT_GNU_EH_FRAME and PT_GNU_STACK.
+const headers: u64 = 64 + 8 * 56
+
+/// e_ident: the magic, 64-bit, little-endian, version 1.
+const ident = "\x7fELF\x02\x01\x01"
+/// e_type of a relocatable object and of a shared one.
+const ET_REL: u64 = 1
+const ET_DYN: u64 = 3
+/// e_machine of x86-64 and of arm64.
+const EM_X86_64: u64 = 62
+const EM_AARCH64: u64 = 183
+
+/// sh_type: bytes, a symbol table, a string table, relocations with addends, a symbol hash table, the dynamic section,
+/// bytes no file holds, the dynamic symbol table, pointers to the functions run on load and on unload and before the
+/// rest, and a group of sections.
+const SHT_PROGBITS: u64 = 1
+const SHT_SYMTAB: u64 = 2
+const SHT_STRTAB: u64 = 3
+const SHT_RELA: u64 = 4
+const SHT_HASH: u64 = 5
+const SHT_DYNAMIC: u64 = 6
+const SHT_NOBITS: u64 = 8
+const SHT_DYNSYM: u64 = 11
+const SHT_INIT_ARRAY: u64 = 14
+const SHT_FINI_ARRAY: u64 = 15
+const SHT_PREINIT_ARRAY: u64 = 16
+const SHT_GROUP: u64 = 17
+/// sh_flags: written, loaded, run, thread-local.
+const SHF_WRITE: u64 = 1
+const SHF_ALLOC: u64 = 2
+const SHF_EXECINSTR: u64 = 4
+const SHF_TLS: u64 = 0x400
+/// A group's flag that only one of the groups of its signature is linked.
+const GRP_COMDAT: u64 = 1
+
+/// st_shndx: undefined, the first reserved index, an absolute value, a common symbol.
+const SHN_UNDEF: u64 = 0
+const SHN_LORESERVE: u64 = 0xff00
+const SHN_ABS: u64 = 0xfff1
+const SHN_COMMON: u64 = 0xfff2
+/// st_info's binding, the high 4 bits.
+const STB_LOCAL: u64 = 0
+const STB_GLOBAL: u64 = 1
+const STB_WEAK: u64 = 2
+/// st_info's type, the low 4 bits: none, data, code, a section, thread-local data, code that picks code on load.
+const STT_NOTYPE: u64 = 0
+const STT_OBJECT: u64 = 1
+const STT_FUNC: u64 = 2
+const STT_SECTION: u64 = 3
+const STT_TLS: u64 = 6
+const STT_GNU_IFUNC: u64 = 10
+
+/// r_info's type of arm64's relocations, by the instruction or datum they set.
+const R_AARCH64_NONE: u64 = 0
+const R_AARCH64_ABS64: u64 = 257
+const R_AARCH64_PREL64: u64 = 260
+const R_AARCH64_PREL32: u64 = 261
+const R_AARCH64_ADR_PREL_PG_HI21: u64 = 275
+const R_AARCH64_ADD_ABS_LO12_NC: u64 = 277
+const R_AARCH64_LDST8_ABS_LO12_NC: u64 = 278
+const R_AARCH64_JUMP26: u64 = 282
+const R_AARCH64_CALL26: u64 = 283
+const R_AARCH64_LDST16_ABS_LO12_NC: u64 = 284
+const R_AARCH64_LDST32_ABS_LO12_NC: u64 = 285
+const R_AARCH64_LDST64_ABS_LO12_NC: u64 = 286
+const R_AARCH64_LDST128_ABS_LO12_NC: u64 = 299
+const R_AARCH64_ADR_GOT_PAGE: u64 = 311
+const R_AARCH64_LD64_GOT_LO12_NC: u64 = 312
+/// The first and last of those by which code reaches a thread-local as an executable's may, initial and local exec.
+const R_AARCH64_TLSIE_MOVW_GOTTPREL_G1: u64 = 539
+const R_AARCH64_TLSLE_LDST64_TPREL_LO12_NC: u64 = 559
+/// Those of the sequence by which code reaches a thread-local through its descriptor: its page, its first pointer,
+/// its offset in its page, and the call of the first pointer.
+const R_AARCH64_TLSDESC_ADR_PAGE21: u64 = 562
+const R_AARCH64_TLSDESC_LD64_LO12: u64 = 563
+const R_AARCH64_TLSDESC_ADD_LO12: u64 = 564
+const R_AARCH64_TLSDESC_CALL: u64 = 569
+/// Of x86-64's: a pointer, a displacement, a call's, a slot's, a displacement of 64 bits, and a slot's again, of
+/// instructions a linker may rewrite to use the symbol itself, which this one does not.
+const R_X86_64_NONE: u64 = 0
+const R_X86_64_64: u64 = 1
+const R_X86_64_PC32: u64 = 2
+const R_X86_64_PLT32: u64 = 4
+const R_X86_64_GOTPCREL: u64 = 9
+const R_X86_64_PC64: u64 = 24
+const R_X86_64_GOTPCRELX: u64 = 41
+const R_X86_64_REX_GOTPCRELX: u64 = 42
+/// Of the loader's: the image's address plus the addend; and a thread-local's descriptor, of the image's own thread's
+/// copy at the addend.
+const R_AARCH64_RELATIVE: u64 = 1027
+const R_X86_64_RELATIVE: u64 = 8
+const R_AARCH64_TLSDESC: u64 = 1031
+
+/// p_type: a mapped segment, the dynamic section, the template of a thread's copy, the eh_frame_hdr, the stack's
+/// permissions.
+const PT_LOAD: u64 = 1
+const PT_DYNAMIC: u64 = 2
+const PT_TLS: u64 = 7
+const PT_GNU_EH_FRAME: u64 = 0x6474e550
+const PT_GNU_STACK: u64 = 0x6474e551
+/// p_flags.
+const PF_X: u64 = 1
+const PF_W: u64 = 2
+const PF_R: u64 = 4
+
+/// d_tag: the end, a library needed, the symbol hash table, string table and symbol table, the relocations, their
+/// size and the size of one, the size of the string table and of a symbol, the functions run on load and their size.
+const DT_NULL: u64 = 0
+const DT_NEEDED: u64 = 1
+const DT_HASH: u64 = 4
+const DT_STRTAB: u64 = 5
+const DT_SYMTAB: u64 = 6
+const DT_RELA: u64 = 7
+const DT_RELASZ: u64 = 8
+const DT_RELAENT: u64 = 9
+const DT_STRSZ: u64 = 10
+const DT_SYMENT: u64 = 11
+const DT_INIT_ARRAY: u64 = 25
+const DT_INIT_ARRAYSZ: u64 = 27
+
+/// The relocatable object bytes, read from the file name, as an Object of its loaded sections; those not loaded, as
+/// symbol tables, notes and comments, and the relocations of them are dropped. The functions of `.init_array.N` run
+/// in ascending N, before those of `.init_array`. A thread-local the code reaches through a descriptor has one in a
+/// section `.tlsdesc` the reader adds, per symbol and addend, of a local symbol the code's fixups refer to.
+function read(name: string, bytes: string): Object throws CompileError {
+	if (bytes.length < 64 || bytes.slice(0, 7) != ident || u(bytes, 16, 2) != ET_REL || u(bytes, 18, 2) != EM_X86_64 &&
+		u(bytes, 18, 2) != EM_AARCH64) {
+		throw new CompileError(`${name}: not an x86-64 or arm64 ELF64 relocatable object`)
+	}
+	const shoff = u(bytes, 40, 8) as i32
+	const count = u(bytes, 60, 2) as i32
+	// An object of 65280 sections or more has their count elsewhere, and 0 here.
+	if (count == 0 || shoff + 64 * count > bytes.length) {
+		throw new CompileError(`${name}: truncated, or of too many sections`)
+	}
+	const sh = (i: u64, field: i32, n: i32) => u(bytes, shoff + 64 * (i as i32) + field, n)
+	const strings = sh(u(bytes, 62, 2), 24, 8) as i32
+	const o = new Object(name, if (u(bytes, 18, 2) == EM_X86_64) "x86_64" else "arm64")
+	// Per section of the file, its index in o, -1 if it is not loaded.
+	const index: i32[] = []
+	let symtab: u64 = 0
+	for (const i of 0 ... count - 1) {
+		const k = i as u64
+		const sht = sh(k, 4, 4)
+		const flags = sh(k, 8, 8)
+		const at = sh(k, 24, 8)
+		const size = sh(k, 32, 8)
+		symtab = if (sht == SHT_SYMTAB) k else symtab
+		if ((flags & SHF_ALLOC) == 0) {
+			index.push(-1)
+			continue
+		}
+		const full = str(bytes, strings + (sh(k, 0, 4) as i32))
+		const s = new Section(plain(full), kindOf(sht, flags))
+		s.kind = if (s.name == ".eh_frame") Unwind else s.kind
+		if (s.kind == Init) {
+			// The N of `.init_array.N`, of 5 digits, so that they sort as the numbers.
+			const n = if (startsWith(full, ".init_array.")) full.slice(12, full.length) else "65535"
+			s.order = ("00000" + n).slice(n.length, n.length + 5)
+		}
+		if (sht == SHT_FINI_ARRAY || sht == SHT_PREINIT_ARRAY || sht != SHT_NOBITS &&
+			at + size > (bytes.length as u64)) {
+			throw new CompileError(`${name}: section ${s.name} cannot be linked`)
+		}
+		s.align = max(sh(k, 48, 8), 1)
+		s.size = size
+		s.bytes = if (sht == SHT_NOBITS) "" else bytes.slice(at as i32, (at + size) as i32)
+		index.push(o.sections.length)
+		o.sections.push(s)
+	}
+	if (symtab != 0) {
+		const at = sh(symtab, 24, 8) as i32
+		const names = sh(sh(symtab, 40, 4), 24, 8) as i32
+		for (const e of 0 ... ((sh(symtab, 32, 8) / 24) as i32) - 1) {
+			const p = at + 24 * e
+			const info = bytes[p + 4] as u64
+			const shndx = u(bytes, p + 6, 2)
+			const sym = if ((info & 15) == STT_SECTION) "" else str(bytes, names + (u(bytes, p, 4) as i32))
+			const section = if (shndx == SHN_UNDEF || shndx >= SHN_LORESERVE) -1 else index[shndx as i32]
+			const bind = info >> 4
+			if ((info & 15) == STT_GNU_IFUNC || shndx == SHN_COMMON || shndx >= SHN_LORESERVE &&
+				(shndx != SHN_ABS || bind != STB_LOCAL) || bind > STB_WEAK) {
+				throw new CompileError(`${name}: symbol ${sym} cannot be linked`)
+			}
+			// A symbol of a section that is not loaded has no address, and is no definition.
+			const binding = if (bind == STB_LOCAL || section < 0 && shndx != SHN_UNDEF) Local
+				else if (bind == STB_WEAK) Weak else Global
+			o.symbols.push(new Symbol(sym, binding, section, u(bytes, p + 8, 8), u(bytes, p + 16, 8)))
+		}
+	}
+	const tls = new Section(".tlsdesc", Data)
+	tls.align = 8
+	const descs = new HashMap[string, i32]()
+	for (const i of 0 ... count - 1) {
+		const k = i as u64
+		const sht = sh(k, 4, 4)
+		const at = sh(k, 24, 8) as i32
+		const size = sh(k, 32, 8) as i32
+		const info = sh(k, 44, 4) as i32
+		if (sht == SHT_GROUP && (u(bytes, at, 4) & GRP_COMDAT) != 0) {
+			for (const m of 1 ... size / 4 - 1) {
+				const s = index[u(bytes, at + 4 * m, 4) as i32]
+				if (s >= 0) {
+					o.sections[s].group = o.symbols[info].name
+				}
+			}
+		} else if (sht == SHT_RELA && index[info] >= 0) {
+			for (const r of 0 ... size / 24 - 1) {
+				const p = at + 24 * r
+				const rinfo = u(bytes, p + 8, 8)
+				const rt = rinfo & 0xffffffff
+				const kind = fixup(o.arch, rt)
+				let sym = (rinfo >> 32) as i32
+				let addend = u(bytes, p + 16, 8) as i64
+				if (kind < 0) {
+					const exec = rt >= R_AARCH64_TLSIE_MOVW_GOTTPREL_G1 && rt <= R_AARCH64_TLSLE_LDST64_TPREL_LO12_NC
+					throw new CompileError(if (exec)
+						`${name}: reaches a thread-local as an executable does; compile it position-independent (-fPIC)`
+						else `${name}: relocation ${rt} cannot be linked`)
+				}
+				if (rt >= R_AARCH64_TLSDESC_ADR_PAGE21 && rt <= R_AARCH64_TLSDESC_ADD_LO12) {
+					// Of the descriptor of sym + addend, of which the object has one.
+					const key = `${sym}+${addend}`
+					if (!descs.has(key)) {
+						descs.set(key, o.symbols.length)
+						o.symbols.push(new Symbol("", Local, o.sections.length, tls.size))
+						tls.fixups.push(new Fixup(tls.size, Desc, sym, addend))
+						tls.size += 16
+					}
+					sym = descs.get(key)!
+					addend = 0
+				}
+				if (kind != 255) {
+					o.sections[index[info]].fixups.push(new Fixup(u(bytes, p, 8), kind as u8, sym, addend))
+				}
+			}
+		}
+	}
+	if (tls.size > 0) {
+		tls.bytes = zeros(tls.size as i32)
+		o.sections.push(tls)
+	}
+	return o
+}
+
+/// A section's name less what a compiler adds to it to give each function and datum a section of its own, as the f of
+/// `.text.f`: the linker lays out by name, and the writer has a section header per name.
+function plain(name: string): string {
+	for (const p of [".text", ".rodata", ".data.rel.ro", ".data", ".bss", ".tdata", ".tbss", ".init_array"]) {
+		if (name == p || startsWith(name, p + ".")) {
+			return p
+		}
+	}
+	return name
+}
+
+/// The kind of a loaded section.
+function kindOf(sht: u64, flags: u64): u8 {
+	return if ((flags & SHF_TLS) != 0) Thread else if (sht == SHT_NOBITS) Zero else if (sht == SHT_INIT_ARRAY) Init
+		else if ((flags & SHF_EXECINSTR) != 0) Code else if ((flags & SHF_WRITE) != 0) Data else Const
+}
+
+/// The kind of fixup of a relocation type of arch, 255 for none, -1 for one the linker does not know; that of one of a
+/// thread-local's descriptor is as of the descriptor's address.
+function fixup(arch: Arch, rt: u64): i32 {
+	if (arch == "x86_64") {
+		return switch (rt) {
+			case R_X86_64_NONE: 255
+			case R_X86_64_64: Abs64
+			case R_X86_64_PC32: Rel32
+			case R_X86_64_PC64: Rel64
+			case R_X86_64_PLT32: Call
+			case R_X86_64_GOTPCREL, R_X86_64_GOTPCRELX, R_X86_64_REX_GOTPCRELX: SlotRel32
+			default: -1
+		}
+	}
+	return switch (rt) {
+		case R_AARCH64_NONE: 255
+		case R_AARCH64_ABS64: Abs64
+		case R_AARCH64_PREL32: Rel32
+		case R_AARCH64_PREL64: Rel64
+		case R_AARCH64_CALL26, R_AARCH64_JUMP26: Call
+		case R_AARCH64_ADR_PREL_PG_HI21: Page
+		case R_AARCH64_ADD_ABS_LO12_NC, R_AARCH64_LDST8_ABS_LO12_NC, R_AARCH64_LDST16_ABS_LO12_NC,
+			R_AARCH64_LDST32_ABS_LO12_NC, R_AARCH64_LDST64_ABS_LO12_NC, R_AARCH64_LDST128_ABS_LO12_NC: PageOff
+		case R_AARCH64_ADR_GOT_PAGE: SlotPage
+		case R_AARCH64_LD64_GOT_LO12_NC: SlotPageOff
+		case R_AARCH64_TLSDESC_ADR_PAGE21: Page
+		case R_AARCH64_TLSDESC_LD64_LO12, R_AARCH64_TLSDESC_ADD_LO12: PageOff
+		case R_AARCH64_TLSDESC_CALL: 255
+		default: -1
+	}
+}
+
+/// The names of the symbols the shared library bytes, read from the file name, defines, by its dynamic symbol table.
+function exports(name: string, bytes: string): string[] throws CompileError {
+	if (bytes.length < 64 || bytes.slice(0, 7) != ident || u(bytes, 16, 2) != ET_DYN) {
+		throw new CompileError(`${name}: not an ELF64 shared library`)
+	}
+	const shoff = u(bytes, 40, 8) as i32
+	const sh = (i: u64, field: i32, n: i32) => u(bytes, shoff + 64 * (i as i32) + field, n)
+	const names: string[] = []
+	for (const i of 0 ... (u(bytes, 60, 2) as i32) - 1) {
+		const k = i as u64
+		if (sh(k, 4, 4) == SHT_DYNSYM) {
+			const at = sh(k, 24, 8) as i32
+			const strings = sh(sh(k, 40, 4), 24, 8) as i32
+			for (const e of 1 ... ((sh(k, 32, 8) / 24) as i32) - 1) {
+				if (u(bytes, at + 24 * e + 6, 2) != SHN_UNDEF) {
+					names.push(str(bytes, strings + (u(bytes, at + 24 * e, 4) as i32)))
+				}
+			}
+		}
+	}
+	return names
+}
+
+/// The image as an ELF shared library. A PT_LOAD maps each segment, the first also the headers before it, and one
+/// more, past them all, the loader's tables: the dynamic symbols, their hash table, the relocations, the
+/// eh_frame_hdr and the dynamic section, which glibc's loader writes. A section header per name of sections and a
+/// symbol table, which no loader reads, say what is where for debuggers and profilers.
+function write(image: Image): string throws CompileError {
+	const segs = image.segments
+	const last = segs[segs.length - 1]
+	// The loader's tables are at address base, and at offset file in the file, both multiples of a page.
+	const file = alignUp(image.bytes.length as u64, image.page)
+	const base = alignUp(last.address + last.size + last.zero, image.page)
+	let tail = ""
+	const place = (s: string) => {
+		tail += zeros(alignUp(tail.length, 8) - tail.length)
+		tail += s
+		return base + ((tail.length - s.length) as u64)
+	}
+
+	const dynamic: Symbol[] = []
+	const imported = new HashMap[string, i32]()
+	for (const b of image.binds) {
+		if (!imported.has(b.name)) {
+			imported.set(b.name, dynamic.length + 1)
+			dynamic.push(new Symbol(b.name, if (b.weak) Weak else Global))
+		}
+	}
+	for (const [name, at] of image.exports) {
+		dynamic.push(new Symbol(name, Global, 0, at))
+	}
+	let dynstr = "\x00"
+	const needed = image.libraries.map(l => {
+		const at = dynstr.length
+		dynstr += l + "\x00"
+		return at
+	})
+	const [dynsym, strs, _] = symbols(image, dynamic, dynstr)
+	const symAt = place(fromBytes(dynsym))
+	const strAt = place(strs)
+	const hashAt = place(fromBytes(hash(dynamic)))
+
+	const x64 = image.arch == "x86_64"
+	const rela = new u8[](24 * (image.rebases.length + image.binds.length + image.descs.length))
+	for (const i of 0 ... image.rebases.length - 1) {
+		const at = image.rebases[i]
+		put(rela, 24 * i, at, 8)
+		put(rela, 24 * i + 8, if (x64) R_X86_64_RELATIVE else R_AARCH64_RELATIVE, 8)
+		put(rela, 24 * i + 16, get(image.bytes, at as i32, 8), 8)
+	}
+	for (const i of 0 ... image.binds.length - 1) {
+		const b = image.binds[i]
+		const e = 24 * (image.rebases.length + i)
+		put(rela, e, b.at, 8)
+		put(rela, e + 8, (imported.get(b.name)! as u64) << 32 | (if (x64) R_X86_64_64 else R_AARCH64_ABS64), 8)
+		put(rela, e + 16, b.addend as u64, 8)
+	}
+	for (const i of 0 ... image.descs.length - 1) {
+		const [at, offset] = image.descs[i]
+		const e = 24 * (image.rebases.length + image.binds.length + i)
+		put(rela, e, at, 8)
+		put(rela, e + 8, R_AARCH64_TLSDESC, 8)
+		put(rela, e + 16, offset, 8)
+	}
+	const relaAt = place(fromBytes(rela))
+
+	const [from, to] = image.unwind
+	const hdrAt = if (to > from) place(fromBytes(frames(image.bytes, from, to, base + alignUp(tail.length as u64, 8))))
+		else 0
+	const hdrSize = base + (tail.length as u64) - hdrAt
+
+	let dyn = needed.map(at => le(DT_NEEDED, 8) + le(at as u64, 8)).join("")
+	for (const [tag, v] of [[DT_HASH, hashAt], [DT_STRTAB, strAt], [DT_SYMTAB, symAt], [DT_STRSZ, strs.length as u64],
+		[DT_SYMENT, 24], [DT_RELA, relaAt], [DT_RELASZ, rela.length as u64], [DT_RELAENT, 24]]) {
+		dyn += le(tag, 8) + le(v, 8)
+	}
+	if (image.inits[1] > image.inits[0]) {
+		dyn += le(DT_INIT_ARRAY, 8) + le(image.inits[0], 8) + le(DT_INIT_ARRAYSZ, 8) + le(image.inits[1] - image.inits[0], 8)
+	}
+	dyn += le(DT_NULL, 16)
+	const dynAt = place(dyn)
+	const loaded = tail.length as u64
+
+	// What is not loaded: the symbol table and the section headers.
+	const [symtab, strtab, locals] = symbols(image, image.symbols, "\x00")
+	const symtabAt = file + (place(fromBytes(symtab)) - base)
+	const strtabAt = file + (place(strtab) - base)
+	let shstrtab = "\x00"
+	let shdrs = le(0, 64)
+	let n: u64 = 0
+	const section = (name: string, sht: u64, flags: u64, at: u64, offset: u64, size: u64, link: u64, info: u64,
+		entsize: u64) => {
+		shdrs += le(shstrtab.length as u64, 4) + le(sht, 4) + le(flags, 8) + le(at, 8) + le(offset, 8) + le(size, 8) +
+			le(link, 4) + le(info, 4) + le(if (entsize > 0) 8 else 1, 8) + le(entsize, 8)
+		shstrtab += name + "\x00"
+		n++
+		return n
+	}
+	for (const [name, at, size] of image.sections) {
+		const seg = image.segment(at)
+		const sflags = SHF_ALLOC | (if (seg.write) SHF_WRITE else 0) | (if (seg.exec) SHF_EXECINSTR else 0) |
+			(if (threaded(image, at)) SHF_TLS else 0)
+		const sht = if (at >= seg.address + seg.size && size > 0) SHT_NOBITS else SHT_PROGBITS
+		section(name, sht, sflags, at, at, size, 0, 0, 0)
+	}
+	const t = (at: u64) => file + at - base
+	const dynsymIndex = section(".dynsym", SHT_DYNSYM, SHF_ALLOC, symAt, t(symAt), dynsym.length as u64, n + 2, 1, 24)
+	section(".dynstr", SHT_STRTAB, SHF_ALLOC, strAt, t(strAt), strs.length as u64, 0, 0, 0)
+	section(".hash", SHT_HASH, SHF_ALLOC, hashAt, t(hashAt), 8 * ((dynamic.length as u64) + 2), dynsymIndex, 0, 4)
+	section(".rela.dyn", SHT_RELA, SHF_ALLOC, relaAt, t(relaAt), rela.length as u64, dynsymIndex, 0, 24)
+	if (hdrAt != 0) {
+		section(".eh_frame_hdr", SHT_PROGBITS, SHF_ALLOC, hdrAt, t(hdrAt), hdrSize, 0, 0, 0)
+	}
+	section(".dynamic", SHT_DYNAMIC, SHF_ALLOC | SHF_WRITE, dynAt, t(dynAt), dyn.length as u64, dynsymIndex + 1, 0, 16)
+	section(".symtab", SHT_SYMTAB, 0, 0, symtabAt, symtab.length as u64, n + 2, locals, 24)
+	section(".strtab", SHT_STRTAB, 0, 0, strtabAt, strtab.length as u64, 0, 0, 0)
+	const shstrtabAt = file + (place(shstrtab + ".shstrtab\x00") - base)
+	section(".shstrtab", SHT_STRTAB, 0, 0, shstrtabAt, (shstrtab.length + 10) as u64, 0, 0, 0)
+	const shoff = file + (place(shdrs) - base)
+
+	let phdrs = ""
+	for (const i of 0 ... segs.length - 1) {
+		const s = segs[i]
+		const start = if (i == 0) 0 else s.address
+		phdrs += program(PT_LOAD, flags(s), start, start, s.address + s.size - start, s.address + s.size + s.zero - start,
+			image.page)
+	}
+	phdrs += program(PT_LOAD, PF_R | PF_W, file, base, loaded, loaded, image.page)
+	phdrs += program(PT_DYNAMIC, PF_R | PF_W, t(dynAt), dynAt, dyn.length as u64, dyn.length as u64, 8)
+	const [tfrom, tto, talign] = image.thread
+	if (tto > tfrom) {
+		phdrs += program(PT_TLS, PF_R, tfrom, tfrom, tto - tfrom, tto - tfrom, talign)
+	}
+	if (hdrAt != 0) {
+		phdrs += program(PT_GNU_EH_FRAME, PF_R, t(hdrAt), hdrAt, hdrSize, hdrSize, 4)
+	}
+	phdrs += program(PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 16)
+	const head = ident + le(0, 9) + le(ET_DYN, 2) + le(if (x64) EM_X86_64 else EM_AARCH64, 2) + le(1, 4) + le(0, 8) +
+		le(64, 8) + le(shoff, 8) + le(0, 4) + le(64, 2) + le(56, 2) + le((phdrs.length / 56) as u64, 2) + le(64, 2) +
+		le(n + 1, 2) + le(n, 2) + phdrs
+	for (const i of 0 ... head.length - 1) {
+		image.bytes[i] = head[i]
+	}
+	return fromBytes(image.bytes) + zeros((file as i32) - image.bytes.length) + tail
+}
+
+/// A program header.
+function program(pt: u64, flags: u64, offset: u64, at: u64, size: u64, memory: u64, align: u64): string {
+	return le(pt, 4) + le(flags, 4) + le(offset, 8) + le(at, 8) + le(at, 8) + le(size, 8) + le(memory, 8) + le(align, 8)
+}
+
+/// The permissions of a segment, as p_flags.
+function flags(s: Segment): u64 { return PF_R | (if (s.write) PF_W else 0) | (if (s.exec) PF_X else 0) }
+
+/// Whether the address at is in the template of a thread's copy, where a symbol's value is its offset.
+function threaded(image: Image, at: u64): bool { return at >= image.thread[0] && at < image.thread[1] }
+
+/// syms as an ELF symbol table, the locals first, with their string table, after strs; and the index of the first
+/// global.
+function symbols(image: Image, syms: Symbol[], strs: string): [u8[], string, u64] {
+	const b = new u8[](24 * (syms.length + 1))
+	let names = strs
+	let n = 1
+	let locals = 1
+	for (const local of [true, false]) {
+		for (const s of syms) {
+			if ((s.binding == Local) != local) {
+				continue
+			}
+			const e = 24 * n
+			const exec = s.section >= 0 && image.segment(s.value).exec
+			const tls = s.section >= 0 && threaded(image, s.value)
+			const bind = if (s.binding == Local) STB_LOCAL else if (s.binding == Weak) STB_WEAK else STB_GLOBAL
+			put(b, e, names.length as u64, 4)
+			b[e + 4] = (bind << 4 | (if (s.section < 0) STT_NOTYPE else if (tls) STT_TLS else if (exec) STT_FUNC
+				else STT_OBJECT)) as u8
+			put(b, e + 6, if (s.section < 0) SHN_UNDEF else 1 + (partitionPoint(image.sections, r => r[1] + r[2] > s.value) as u64),
+				2)
+			put(b, e + 8, if (tls) s.value - image.thread[0] else s.value, 8)
+			put(b, e + 16, s.size, 8)
+			names += s.name + "\x00"
+			n++
+		}
+		locals = if (local) n else locals
+	}
+	return [b, names, locals as u64]
+}
+
+/// The SysV hash table of a dynamic symbol table of syms after the null one: a bucket per symbol, the index of the
+/// first symbol whose name hashes to it, and per symbol the next.
+function hash(syms: Symbol[]): u8[] {
+	const n = syms.length + 1
+	const b = new u8[](4 * (2 + 2 * n))
+	put(b, 0, n as u64, 4)
+	put(b, 4, n as u64, 4)
+	for (const i of 1 ... n - 1) {
+		let h: u32 = 0
+		for (const j of 0 ... syms[i - 1].name.length - 1) {
+			h = (h << 4) + syms[i - 1].name[j]
+			h = (h ^ (h >> 24 & 0xf0)) & 0x0fffffff
+		}
+		const bucket = 8 + 4 * ((h % (n as u32)) as i32)
+		put(b, 8 + 4 * (n + i), get(b, bucket, 4), 4)
+		put(b, bucket, i as u64, 4)
+	}
+	return b
+}
+
+/// The eh_frame_hdr, at address at, of the call frame information in b from from to to: where that is, and a table
+/// for the unwinder to search, of the code address of each FDE and its own, sorted.
+function frames(b: u8[], from: u64, to: u64, at: u64): u8[] throws CompileError {
+	const fdes: [u64, u64][] = []
+	let p = from
+	while (p + 4 <= to) {
+		const size = get(b, p as i32, 4)
+		const cie = get(b, (p + 4) as i32, 4)
+		// An FDE of a dropped function was not fixed up, and its pc is its own address.
+		const pc = if (size != 0 && cie != 0) pointer(b, p + 8, encoding(b, (p + 4 - cie) as i32)) else from
+		if (pc < from || pc >= to) {
+			fdes.push([pc, p])
+		}
+		p += 4 + size
+	}
+	sortBy(fdes, (x, y) => x[0] < y[0])
+	const h = new u8[](12 + 8 * fdes.length)
+	put(h, 0, 0x3b031b01, 4) // version 1; eh_frame_ptr pcrel sdata4; fde_count udata4; table datarel sdata4
+	put(h, 4, from - at - 4, 4)
+	put(h, 8, fdes.length as u64, 4)
+	for (const i of 0 ... fdes.length - 1) {
+		put(h, 12 + 8 * i, fdes[i][0] - at, 4)
+		put(h, 16 + 8 * i, fdes[i][1] - at, 4)
+	}
+	return h
+}
+
+/// The encoding of the code addresses of the FDEs of the CIE at cie: that its augmentation gives after an R, else
+/// absolute. The augmentation is a string of letters, of which a z says data of those after it follow the CIE's
+/// alignments and return address register: an R's an encoding, a P's an encoding and a pointer in it, an L's a byte.
+function encoding(b: u8[], cie: i32): u64 throws CompileError {
+	const aug = cie + 9
+	let p = aug
+	while (b[p] != 0) {
+		p++
+	}
+	p = skip(b, skip(b, p + 1))
+	p = if (b[cie + 8] == 1) p + 1 else skip(b, p)
+	if (b[aug] != z) {
+		return 0
+	}
+	p = skip(b, p)
+	let c = aug + 1
+	while (b[c] != 0 && b[c] != R) {
+		p += if (b[c] == P) 1 + size(b[p] as u64) else if (b[c] == L) 1 else 0
+		c++
+	}
+	return if (b[c] == 0) 0 else b[p] as u64
+}
+
+/// The address the pointer at p holds in encoding enc: of the size and sign of its low 4 bits, and relative to p if
+/// its next 3 are 1, else absolute.
+function pointer(b: u8[], p: u64, enc: u64): u64 throws CompileError {
+	const n = size(enc)
+	const shift = 64 - 8 * n
+	let v = get(b, p as i32, n)
+	v = if ((enc & 8) != 0) (((v << shift) as i64) >> shift) as u64 else v
+	if ((enc & 0x70) > 0x10) {
+		throw new CompileError(`unwind tables: pointer encoding ${enc} is not supported`)
+	}
+	return if ((enc & 0x70) == 0x10) v + p else v
+}
+
+/// The size of a pointer of encoding enc.
+function size(enc: u64): i32 throws CompileError {
+	if ((enc & 7) == 1 || (enc & 7) > 4) {
+		throw new CompileError(`unwind tables: pointer encoding ${enc} is not supported`)
+	}
+	return switch (enc & 7) {
+		case 2: 2
+		case 3: 4
+		default: 8
+	}
+}
+
+/// p past the LEB128 number at p.
+function skip(b: u8[], p: i32): i32 {
+	let q = p
+	while (b[q] >= 0x80) {
+		q++
+	}
+	return q + 1
+}
+
+export const elf: Format = { headers: headers, bindsAnywhere: true, start: "__dso_handle", read: read, exports: exports,
+	write: write }
