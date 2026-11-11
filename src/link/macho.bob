@@ -1,0 +1,672 @@
+//! Mach-O, 64-bit, little-endian, of arm64 and x86-64: relocatable objects read as Objects, the names a dynamic library
+//! exports, and an Image written as a dynamic library. This is the only file of the linker that knows Mach-O.
+//!
+//! Names are as the files have them, C's with a leading `_`, and a library is named by its install name. Code unwinds
+//! by the DWARF call frame information of `__eh_frame` alone, which objects compiled with
+//! `-femit-dwarf-unwind=dwarf-only` have of every function; their compact unwind is dropped, as are debug sections.
+
+import { HashMap } from "../../std/collections/hashmap"
+import { partitionPoint } from "../../std/algo"
+import { ParseError } from "../../std/parse"
+import { Reader, Writer } from "../../std/encoding/binary"
+import { alignUp, min } from "../../std/math"
+import { sortBy } from "../../std/sort"
+import { indexOf, startsWith } from "../../std/string"
+import { CompileError } from "../error"
+import { be, le, pad, str, u, zeros } from "./bytes"
+import { Format, Image } from "./link"
+import { sha256 } from "./sha256"
+import { Abs64, Call, Code, Const, Data, Fixup, Global, Init, Local, Object, Page, PageOff, Rel32, Rel64, Section,
+	SlotPage, SlotPageOff, SlotRel32, Symbol, Unwind, Weak, Zero } from "./object"
+
+/// The room the writer needs before the first linked address, for the Mach-O header and its load commands; write
+/// throws if they need more, as for very many sections or libraries.
+const headers: u64 = 0x1000
+
+/// The magic of a 64-bit little-endian Mach-O file; its filetype of a relocatable object and of a dynamic library.
+const MH_MAGIC_64: u64 = 0xfeedfacf
+const MH_OBJECT: u64 = 1
+const MH_DYLIB: u64 = 6
+/// flags: no undefined names but those bound, for dyld to load, names bound in their library, no library re-exported.
+const MH_FLAGS: u64 = 0x1 | 0x4 | 0x80 | 0x100000
+/// cputype of arm64 and of x86-64, whose cpusubtype of all models is 0 and 3.
+const CPU_TYPE_ARM64: u64 = 0x0100000c
+const CPU_TYPE_X86_64: u64 = 0x01000007
+
+/// cmd of a load command: the symbol table, its parts for dyld, a library loaded and the library's own name, a
+/// segment, the UUID, the code signature, the tables of dyld's fixups and exports, of them only, the platform, the
+/// exports alone.
+const LC_SYMTAB: u64 = 0x2
+const LC_DYSYMTAB: u64 = 0xb
+const LC_LOAD_DYLIB: u64 = 0xc
+const LC_ID_DYLIB: u64 = 0xd
+const LC_SEGMENT_64: u64 = 0x19
+const LC_UUID: u64 = 0x1b
+const LC_CODE_SIGNATURE: u64 = 0x1d
+const LC_DYLD_INFO: u64 = 0x22
+const LC_DYLD_INFO_ONLY: u64 = 0x80000022
+const LC_BUILD_VERSION: u64 = 0x32
+const LC_DYLD_EXPORTS_TRIE: u64 = 0x80000033
+
+/// A section's type, the low byte of its flags: bytes no file holds, of either kind; pointers dyld or a stub sets;
+/// pointers to the functions run on load and on unload; and the first and last of thread-local storage's.
+const S_ZEROFILL: u64 = 0x1
+const S_GB_ZEROFILL: u64 = 0xc
+const S_NON_LAZY_SYMBOL_POINTERS: u64 = 0x6
+const S_SYMBOL_STUBS: u64 = 0x8
+const S_MOD_INIT_FUNC_POINTERS: u64 = 0x9
+const S_MOD_TERM_FUNC_POINTERS: u64 = 0xa
+const S_THREAD_LOCAL_REGULAR: u64 = 0x11
+const S_THREAD_LOCAL_INIT_FUNCTION_POINTERS: u64 = 0x15
+/// A section's attributes: of instructions only, or some; of debug information.
+const S_ATTR_PURE_INSTRUCTIONS: u64 = 0x80000000
+const S_ATTR_SOME_INSTRUCTIONS: u64 = 0x400
+const S_ATTR_DEBUG: u64 = 0x02000000
+
+/// n_type: the bits of a debugger's symbol, private extern, the bits of the type, extern; the types undefined,
+/// absolute and of a section.
+const N_STAB: u64 = 0xe0
+const N_PEXT: u64 = 0x10
+const N_TYPE: u64 = 0x0e
+const N_EXT: u64 = 0x01
+const N_UNDF: u64 = 0x0
+const N_ABS: u64 = 0x2
+const N_SECT: u64 = 0xe
+/// n_desc: a weak reference, a weak definition.
+const N_WEAK_REF: u64 = 0x40
+const N_WEAK_DEF: u64 = 0x80
+
+/// r_type of arm64's relocations, by the instruction or datum they set; ADDEND is the addend of the next one, and
+/// SUBTRACTOR's symbol is subtracted from the next one's.
+const ARM64_RELOC_UNSIGNED: u64 = 0
+const ARM64_RELOC_SUBTRACTOR: u64 = 1
+const ARM64_RELOC_BRANCH26: u64 = 2
+const ARM64_RELOC_PAGE21: u64 = 3
+const ARM64_RELOC_PAGEOFF12: u64 = 4
+const ARM64_RELOC_GOT_LOAD_PAGE21: u64 = 5
+const ARM64_RELOC_GOT_LOAD_PAGEOFF12: u64 = 6
+const ARM64_RELOC_POINTER_TO_GOT: u64 = 7
+const ARM64_RELOC_ADDEND: u64 = 10
+/// r_type of x86-64's: SIGNED_1 to SIGNED_4 are SIGNED followed by 1, 2 or 4 bytes of the instruction.
+const X86_64_RELOC_UNSIGNED: u64 = 0
+const X86_64_RELOC_SIGNED: u64 = 1
+const X86_64_RELOC_BRANCH: u64 = 2
+const X86_64_RELOC_GOT_LOAD: u64 = 3
+const X86_64_RELOC_GOT: u64 = 4
+const X86_64_RELOC_SUBTRACTOR: u64 = 5
+const X86_64_RELOC_SIGNED_1: u64 = 6
+const X86_64_RELOC_SIGNED_4: u64 = 8
+
+/// dyld's opcodes: of rebases, to set their type, to set the segment and offset, and to rebase there; of binds, to set
+/// the library, the name and its flags, the type, the addend, the segment and offset, and to bind there. 0 ends both.
+const REBASE_OPCODE_SET_TYPE_IMM: u8 = 0x10
+const REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: u8 = 0x20
+const REBASE_OPCODE_DO_REBASE_IMM_TIMES: u8 = 0x50
+const BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB: u8 = 0x20
+const BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM: u8 = 0x40
+const BIND_OPCODE_SET_TYPE_IMM: u8 = 0x50
+const BIND_OPCODE_SET_ADDEND_SLEB: u8 = 0x60
+const BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: u8 = 0x70
+const BIND_OPCODE_DO_BIND: u8 = 0x90
+/// Their type of a pointer, and the flag of a bind that is 0 if its library does not define the name.
+const TYPE_POINTER: u8 = 1
+const BIND_SYMBOL_FLAGS_WEAK_IMPORT: u8 = 1
+
+/// The install name of the library written, which nothing links against, and the identifier of its signature.
+const id = "image.dylib"
+
+/// The relocatable object bytes, read from the file name, as an Object of its sections but the debug ones and those
+/// for ld64 alone, as `__LD,__compact_unwind`. A section's name is without its segment.
+function read(name: string, bytes: string): Object throws CompileError {
+	const cmds = commands(name, bytes, MH_OBJECT)
+	const cpu = u(bytes, 4, 4)
+	if (cpu != CPU_TYPE_ARM64 && cpu != CPU_TYPE_X86_64) {
+		throw new CompileError(`${name}: not an x86-64 or arm64 Mach-O object`)
+	}
+	const x64 = cpu == CPU_TYPE_X86_64
+	const o = new Object(name, if (x64) "x86_64" else "arm64")
+	// Per section of the file, where its header is, and its index in o, -1 if it is dropped.
+	const shdrs: i32[] = []
+	const index: i32[] = []
+	let symtab = 0
+	for (const [cmd, at] of cmds) {
+		if (cmd == LC_SEGMENT_64) {
+			for (const i of 0 ... (u(bytes, at + 64, 4) as i32) - 1) {
+				shdrs.push(at + 72 + 80 * i)
+			}
+		} else if (cmd == LC_SYMTAB) {
+			symtab = at
+		}
+	}
+	const sh = (i: i32, field: i32, n: i32) => u(bytes, shdrs[i] + field, n)
+	for (const i of 0 ... shdrs.length - 1) {
+		const seg = name16(bytes, shdrs[i] + 16)
+		const flags = sh(i, 64, 4)
+		const st = flags & 0xff
+		if (seg == "__DWARF" || seg == "__LD" || (flags & S_ATTR_DEBUG) != 0) {
+			index.push(-1)
+			continue
+		}
+		const zero = st == S_ZEROFILL || st == S_GB_ZEROFILL
+		const sect = name16(bytes, shdrs[i])
+		const s = new Section(sect, kindOf(seg, sect, st, flags))
+		// Pointers and stubs only ld64 makes, functions run on unload and thread-local storage are not linked.
+		const unlinked = st >= S_NON_LAZY_SYMBOL_POINTERS && st <= S_SYMBOL_STUBS || st == S_MOD_TERM_FUNC_POINTERS ||
+			st >= S_THREAD_LOCAL_REGULAR && st <= S_THREAD_LOCAL_INIT_FUNCTION_POINTERS
+		if (unlinked || !zero && sh(i, 48, 4) + sh(i, 40, 8) > (bytes.length as u64)) {
+			throw new CompileError(`${name}: section ${seg},${s.name} cannot be linked`)
+		}
+		s.align = 1 << sh(i, 52, 4)
+		s.size = sh(i, 40, 8)
+		s.bytes = if (zero) "" else bytes.slice(sh(i, 48, 4) as i32, (sh(i, 48, 4) + s.size) as i32)
+		index.push(o.sections.length)
+		o.sections.push(s)
+	}
+
+	const count = if (symtab == 0) 0 else u(bytes, symtab + 12, 4) as i32
+	for (const e of 0 ... count - 1) {
+		// An nlist_64: the offset of its name in the strings, n_type, n_sect, n_desc and n_value.
+		const p = (u(bytes, symtab + 8, 4) as i32) + 16 * e
+		const sym = bounds(str(bytes, (u(bytes, symtab + 16, 4) + u(bytes, p, 4)) as i32))
+		const nt = bytes[p + 4] as u64
+		const n = bytes[p + 5] as i32
+		const desc = u(bytes, p + 6, 2)
+		const value = u(bytes, p + 8, 8)
+		const t = nt & N_TYPE
+		const ext = (nt & N_EXT) != 0
+		if ((nt & N_STAB) != 0) {
+			o.symbols.push(new Symbol("", Local))
+			continue
+		}
+		if (t != N_UNDF && t != N_ABS && t != N_SECT || t == N_ABS && ext || t == N_UNDF && value != 0) {
+			throw new CompileError(`${name}: symbol ${sym} cannot be linked`)
+		}
+		const section = if (t == N_SECT) index[n - 1] else -1
+		// A symbol of a section that is dropped has no address, and is no definition.
+		const binding = if (!ext || section < 0 && t != N_UNDF) Local
+			else if ((desc & (N_WEAK_REF | N_WEAK_DEF)) != 0) Weak else Global
+		o.symbols.push(new Symbol(sym, binding, section, if (section < 0) 0 else value - sh(n - 1, 32, 8)))
+	}
+	// A symbol per section, at its start, for the relocations that name a section rather than a symbol.
+	const base = o.symbols.length
+	for (const k of 0 ... o.sections.length - 1) {
+		o.symbols.push(new Symbol("", Local, k))
+	}
+
+	for (const i of 0 ... shdrs.length - 1) {
+		const k = index[i]
+		if (k < 0) {
+			continue
+		}
+		const sec = o.sections[k]
+		// The relocations, each with the addend of an ARM64_RELOC_ADDEND before it, and the symbol a SUBTRACTOR before
+		// it subtracts.
+		const relocs: Reloc[] = []
+		let addend: i64 = 0
+		let minus: [i32, i64] = [-1, 0]
+		for (const r of 0 ... (sh(i, 60, 4) as i32) - 1) {
+			// A relocation_info: the offset it sets, then the symbol or section it names in 24 bits, whether it is
+			// relative, its size's log2 in 2, whether it names a symbol, and its type in 4.
+			const p = (sh(i, 56, 4) as i32) + 8 * r
+			const at = u(bytes, p, 4)
+			const info = u(bytes, p + 4, 4)
+			const target = info & 0xffffff
+			const ext = (info >> 27 & 1) != 0
+			const rt = info >> 28
+			if (!x64 && rt == ARM64_RELOC_ADDEND) {
+				addend = ((target << 40) as i64) >> 40
+				continue
+			}
+			if (!ext && (target == 0 || target > (shdrs.length as u64) || index[(target as i32) - 1] < 0) ||
+				ext && target >= (base as u64)) {
+				throw new CompileError(`${name}: relocation at ${sec.name}+${at} is of a dropped section`)
+			}
+			const sym = if (ext) target as i32 else base + index[(target as i32) - 1]
+			const from = if (ext) 0 else sh((target as i32) - 1, 32, 8) as i64
+			if (rt == (if (x64) X86_64_RELOC_SUBTRACTOR else ARM64_RELOC_SUBTRACTOR)) {
+				minus = [sym, from]
+				continue
+			}
+			relocs.push({ at: at, rt: rt, pcrel: (info >> 24 & 1) != 0, size: 1 << (info >> 25 & 3), ext: ext, sym: sym,
+				from: from, addend: addend, minus: minus })
+			addend = 0
+			minus = [-1, 0]
+		}
+		for (const r of relocs) {
+			// The addend is given for arm64's relocations but UNSIGNED, and in place for the others, where it counts
+			// from the address in the object of the section a relocation that is not extern names; and, if relative,
+			// from the field's address for a section, and from its end for x86-64's symbol.
+			const shift = 64 - 8 * (r.size as i32)
+			let a = if (!x64 && r.rt != ARM64_RELOC_UNSIGNED) r.addend
+				else ((u(sec.bytes, r.at as i32, r.size as i32) << shift) as i64) >> shift
+			a -= r.from
+			if (r.pcrel && !r.ext) {
+				a += (sh(i, 32, 8) + r.at) as i64
+			} else if (r.pcrel && x64) {
+				a -= 4
+			}
+			let kind = fixup(x64, r.rt, r.pcrel, r.size)
+			if (r.minus[0] >= 0) {
+				// A - B + a, B in this section, is S + a' - P, B - P being known: of an UNSIGNED of 4 or 8 bytes.
+				const b = o.symbols[r.minus[0]]
+				kind = if (b.section != k || r.rt != 0 || r.size < 4) -1 else if (r.size == 4) Rel32 else Rel64
+				a += r.minus[1] + (r.at as i64) - (b.value as i64)
+			}
+			if (kind < 0) {
+				throw new CompileError(`${name}: relocation ${r.rt} at ${sec.name}+${r.at} cannot be linked`)
+			}
+			sec.fixups.push(new Fixup(r.at, kind as u8, r.sym, a))
+		}
+		if (x64 && sec.kind == Unwind) {
+			fdes(o, bytes, shdrs, index, base, i)
+		}
+	}
+	return o
+}
+
+/// A relocation as read: the offset it sets, its type, whether it is relative, its size in bytes, whether it is extern,
+/// the symbol it names or else that of the section it names, from that section's address in the object, else 0; the
+/// addend an ARM64_RELOC_ADDEND before it gives, and the symbol a SUBTRACTOR before it subtracts with its from, -1 if
+/// none.
+type Reloc = { at: u64, rt: u64, pcrel: bool, size: u64, ext: bool, sym: i32, from: i64, addend: i64,
+	minus: [i32, i64] }
+
+/// Adds to the fixups of x86-64's `__eh_frame`, section i of the file bytes, read as o, those its FDEs' pointers to
+/// their code and to their LSDA need: x86-64's assembler leaves those unrelocated, 8 bytes relative in the object's
+/// addresses. shdrs, index and base are read's.
+function fdes(o: Object, bytes: string, shdrs: i32[], index: i32[], base: i32, i: i32) throws CompileError {
+	const sec = o.sections[index[i]]
+	const address = (t: i32) => u(bytes, shdrs[t] + 32, 8)
+	const fixed = new HashMap[u64, bool]()
+	for (const f of sec.fixups) {
+		fixed.set(f.at, true)
+	}
+	// A CIE or FDE is its length past these 4 bytes, then 0 for a CIE; a FDE's then its code's address, the code's
+	// length, the length of its augmentation data and that data, which is the LSDA's address if 8 bytes.
+	let p = 0
+	while (p + 25 <= sec.bytes.length) {
+		const pointers: i32[] = if (u(sec.bytes, p + 4, 4) == 0) [] else if (sec.bytes[p + 24] == 8) [p + 8, p + 25]
+			else [p + 8]
+		for (const q of pointers) {
+			// The LSDA may be none, 0.
+			if (u(sec.bytes, q, 8) == 0 || fixed.has(q as u64)) {
+				continue
+			}
+			const to = address(i) + (q as u64) + u(sec.bytes, q, 8)
+			const t = partitionPoint(shdrs, h => u(bytes, h + 32, 8) + u(bytes, h + 40, 8) > to) as i32
+			if (t == shdrs.length || index[t] < 0 || to < address(t)) {
+				throw new CompileError(`${o.name}: the FDE at __eh_frame+${p} is of no section`)
+			}
+			sec.fixups.push(new Fixup(q as u64, Rel64, base + index[t], (to - address(t)) as i64))
+		}
+		p += 4 + (u(sec.bytes, p, 4) as i32)
+	}
+}
+
+/// The kind of a section of segment seg, named sect, of type and flags.
+function kindOf(seg: string, sect: string, st: u64, flags: u64): u8 {
+	return if (st == S_ZEROFILL || st == S_GB_ZEROFILL) Zero else if (st == S_MOD_INIT_FUNC_POINTERS) Init
+		else if (sect == "__eh_frame") Unwind
+		else if ((flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)) != 0) Code
+		else if (seg == "__TEXT") Const else Data
+}
+
+/// The kind of fixup of a relocation of type, pc-relative or not, of size bytes; -1 if the linker cannot link it.
+function fixup(x64: bool, rt: u64, pcrel: bool, size: u64): i32 {
+	if (x64) {
+		return if (rt == X86_64_RELOC_UNSIGNED && !pcrel && size == 8) Abs64 else if (!pcrel || size != 4) -1
+			else if (rt == X86_64_RELOC_BRANCH) Call
+			else if (rt == X86_64_RELOC_GOT_LOAD || rt == X86_64_RELOC_GOT) SlotRel32
+			else if (rt == X86_64_RELOC_SIGNED || rt >= X86_64_RELOC_SIGNED_1 && rt <= X86_64_RELOC_SIGNED_4) Rel32
+			else -1
+	}
+	return switch (rt) {
+		case ARM64_RELOC_UNSIGNED: if (pcrel || size != 8) -1 else Abs64
+		case ARM64_RELOC_BRANCH26: Call
+		case ARM64_RELOC_PAGE21: Page
+		case ARM64_RELOC_PAGEOFF12: PageOff
+		case ARM64_RELOC_GOT_LOAD_PAGE21: SlotPage
+		case ARM64_RELOC_GOT_LOAD_PAGEOFF12: SlotPageOff
+		case ARM64_RELOC_POINTER_TO_GOT: if (pcrel && size == 4) SlotRel32 else -1
+		default: -1
+	}
+}
+
+/// sym, or the linker's name of the bound it is of a section: `__start_<sect>` of `section$start$<seg>$<sect>`, and
+/// `__stop_<sect>` of `section$end$<seg>$<sect>`.
+function bounds(sym: string): string {
+	for (const [mach, ours] of [["section$start$", "__start_"], ["section$end$", "__stop_"]]) {
+		const d = if (startsWith(sym, mach)) indexOf(sym, "$", mach.length) else -1
+		if (d >= 0) {
+			return ours + sym.slice(d + 1, sym.length)
+		}
+	}
+	return sym
+}
+
+/// The load commands of the Mach-O file bytes, read from the file name, of filetype: each its cmd and where it is.
+function commands(name: string, bytes: string, filetype: u64): [u64, i32][] throws CompileError {
+	if (bytes.length < 32 || u(bytes, 0, 4) != MH_MAGIC_64 || u(bytes, 12, 4) != filetype) {
+		const what = if (filetype == MH_OBJECT) "relocatable object" else "dynamic library"
+		throw new CompileError(`${name}: not a 64-bit Mach-O ${what}`)
+	}
+	const cmds: [u64, i32][] = []
+	let at = 32
+	for (const _ of 1 ... (u(bytes, 16, 4) as i32)) {
+		if (at + 8 > bytes.length) {
+			throw new CompileError(`${name}: truncated`)
+		}
+		cmds.push([u(bytes, at, 4), at])
+		at += u(bytes, at + 4, 4) as i32
+	}
+	return cmds
+}
+
+/// The names the dynamic library bytes, read from the file name, exports, by its export trie.
+function exports(name: string, bytes: string): string[] throws CompileError {
+	let trie = ""
+	for (const [cmd, at] of commands(name, bytes, MH_DYLIB)) {
+		if (cmd == LC_DYLD_INFO || cmd == LC_DYLD_INFO_ONLY || cmd == LC_DYLD_EXPORTS_TRIE) {
+			const field = if (cmd == LC_DYLD_EXPORTS_TRIE) at + 8 else at + 40
+			trie = bytes.slice(u(bytes, field, 4) as i32, (u(bytes, field, 4) + u(bytes, field + 4, 4)) as i32)
+		}
+	}
+	// A node is the size of what it exports, that, and its edges: each a string and the offset of its node.
+	const r = new Reader(trie)
+	const names: string[] = []
+	const nodes: [u64, string][] = if (trie == "") [] else [[0, ""]]
+	try {
+		while (nodes.length > 0) {
+			const [node, prefix] = nodes.pop()
+			r.pos = node as i32
+			const size = r.uleb()
+			if (size > 0) {
+				names.push(prefix)
+			}
+			r.pos += size as i32
+			for (const _ of 1 ... (r.u8() as i32)) {
+				let edge = prefix
+				let c = r.u8()
+				while (c != 0) {
+					edge += chr(c)
+					c = r.u8()
+				}
+				nodes.push([r.uleb(), edge])
+			}
+		}
+	} catch (e: ParseError) {
+		throw new CompileError(`${name}: its export trie is truncated`)
+	}
+	return names
+}
+
+/// The image as a dynamic library: the segment `__TEXT` maps the headers and the segments not written, `__DATA` the one
+/// written, and `__LINKEDIT`, past them, dyld's tables of rebases, binds and exports, the symbol table, and an ad hoc
+/// code signature, without which arm64's macOS runs no code. A section header per name of sections says what is where.
+function write(image: Image): string throws CompileError {
+	const page = image.page
+	const segs = image.segments
+	const rw = segs.filter(s => s.write)
+	let text = headers
+	for (const s of segs) {
+		text = if (s.write) text else s.address + s.size
+	}
+	const last = segs[segs.length - 1]
+	// Per segment: its name, address, file size, memory size and protection.
+	const mapped: [string, u64, u64, u64, u64][] = [["__TEXT", 0, alignUp(text, page), alignUp(text, page), 5]]
+	for (const s of rw) {
+		mapped.push(["__DATA", s.address, alignUp(s.size, page), alignUp(s.size + s.zero, page), 3])
+	}
+	const where = (at: u64) => if (rw.length > 0 && at >= rw[0].address) 1 else 0
+	// The image's sections, but its Unwind ones, however the objects name them, are one, `__eh_frame`, as the unwinder
+	// finds them by that name.
+	const sections: [string, u64, u64][] = []
+	let unwind = false
+	for (const s of image.sections) {
+		if (s[1] < image.unwind[0] || s[1] >= image.unwind[1]) {
+			sections.push(s)
+		} else if (!unwind) {
+			sections.push(["__eh_frame", s[1], image.unwind[1] - s[1]])
+			unwind = true
+		}
+	}
+
+	// __LINKEDIT, at offset file in the file.
+	const file = alignUp(image.bytes.length as u64, page)
+	let tail = ""
+	const place = (s: string) => {
+		tail += s
+		return file + ((tail.length - s.length) as u64)
+	}
+	// Each table is padded to 8 bytes, as tools expect the next where its size ends.
+	const padded = (s: string) => s + zeros(alignUp(s.length, 8) - s.length)
+	const rebase = new Writer()
+	rebase.u8(REBASE_OPCODE_SET_TYPE_IMM | TYPE_POINTER)
+	for (const at of image.rebases) {
+		rebase.u8(REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (where(at) as u8))
+		rebase.uleb(at - mapped[where(at)][1])
+		rebase.u8(REBASE_OPCODE_DO_REBASE_IMM_TIMES | 1)
+	}
+	rebase.u8(0)
+	const bind = new Writer()
+	bind.u8(BIND_OPCODE_SET_TYPE_IMM | TYPE_POINTER)
+	for (const b of image.binds) {
+		bind.u8(BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB)
+		bind.uleb((b.library + 1) as u64)
+		bind.u8(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | (if (b.weak) BIND_SYMBOL_FLAGS_WEAK_IMPORT else 0))
+		bind.raw(b.name + "\x00")
+		bind.u8(BIND_OPCODE_SET_ADDEND_SLEB)
+		bind.sleb(b.addend)
+		bind.u8(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (where(b.at) as u8))
+		bind.uleb(b.at - mapped[where(b.at)][1])
+		bind.u8(BIND_OPCODE_DO_BIND)
+	}
+	bind.u8(0)
+	const rebased = padded(rebase.bytes)
+	const bound = padded(bind.bytes)
+	const exported = padded(trie(image.exports))
+	const info = [place(rebased), rebased.length as u64, place(bound), bound.length as u64, 0, 0, 0, 0, place(exported),
+		exported.length as u64]
+
+	// The symbol table: the symbols not exported, as local, then those exported, then those bound, as undefined.
+	let syms = ""
+	let strs = "\x00"
+	const nlist = (name: string, nt: u64, at: u64, desc: u64) => {
+		const sect = if ((nt & N_TYPE) == N_UNDF) 0
+			else min(1 + (partitionPoint(sections, r => r[1] + r[2] > at) as u64), sections.length as u64)
+		syms += le(strs.length as u64, 4) + le(nt, 1) + le(sect, 1) + le(desc, 2) + le(at, 8)
+		strs += name + "\x00"
+	}
+	const names = new HashMap[string, i32]()
+	for (const [name, _] of image.exports) {
+		names.set(name, 0)
+	}
+	for (const s of image.symbols) {
+		if (s.binding == Local || !names.has(s.name)) {
+			nlist(s.name, N_SECT | (if (s.binding == Local) 0 else N_PEXT), s.value, 0)
+		}
+	}
+	const locals = (syms.length / 16) as u64
+	for (const [name, at] of image.exports) {
+		nlist(name, N_SECT | N_EXT, at, 0)
+	}
+	const defined = (syms.length / 16) as u64
+	for (const b of image.binds) {
+		if (!names.has(b.name)) {
+			names.set(b.name, 0)
+			nlist(b.name, N_UNDF | N_EXT, 0, ((b.library + 1) as u64) << 8 | (if (b.weak) N_WEAK_REF else 0))
+		}
+	}
+	const n = (syms.length / 16) as u64
+	const symtab = [place(syms), n, place(strs), strs.length as u64]
+	tail += zeros(alignUp(tail.length, 16) - tail.length)
+
+	// The signature, of the file up to it, is last; it hashes each 4 KiB page of it. Its hashes are past its headers,
+	// the SuperBlob's 24 bytes and the CodeDirectory's 88, and the identifier.
+	const limit = file + (tail.length as u64)
+	const pages = ((limit + 0xfff) >> 12) as i32
+	const headed = alignUp(24 + 88 + id.length + 1, 16)
+	const signed = (headed + 32 * pages) as u64
+	const linkedit = (tail.length as u64) + signed
+
+	const sects = ["", ""]
+	for (const [name, at, size] of sections) {
+		const seg = image.segment(at)
+		const zero = at >= seg.address + seg.size
+		const st = if (zero) S_ZEROFILL else if (at >= image.inits[0] && at < image.inits[1]) S_MOD_INIT_FUNC_POINTERS
+			else 0
+		const flags = st | (if (seg.exec) S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS else 0)
+		// The image knows no alignment; the address's own, up to 2^16, accounts for the gap before the section.
+		let align: u64 = 0
+		while (align < 16 && ((at >> align) & 1) == 0) {
+			align++
+		}
+		sects[where(at)] += pad(name, 16) + pad(mapped[where(at)][0], 16) + le(at, 8) + le(size, 8) +
+			le(if (zero) 0 else at, 4) + le(align, 4) + zeros(8) + le(flags, 4) + zeros(12)
+	}
+	let cmds = ""
+	let ncmds: u64 = 0
+	const command = (cmd: u64, body: string) => {
+		cmds += le(cmd, 4) + le((8 + body.length) as u64, 4) + body
+		ncmds++
+	}
+	const segment64 = (name: string, at: u64, offset: u64, size: u64, memory: u64, prot: u64, sections: string) =>
+		command(LC_SEGMENT_64, pad(name, 16) + le(at, 8) + le(memory, 8) + le(offset, 8) + le(size, 8) + le(prot, 4) +
+		le(prot, 4) + le((sections.length / 80) as u64, 4) + le(0, 4) + sections)
+	for (const i of 0 ... mapped.length - 1) {
+		const [segname, at, size, memory, prot] = mapped[i]
+		segment64(segname, at, at, size, memory, prot, sects[i])
+	}
+	const end = alignUp(last.address + last.size + last.zero, page)
+	segment64("__LINKEDIT", end, file, linkedit, alignUp(linkedit, page), 1, "")
+	const dylib = (cmd: u64, name: string) => command(cmd, le(24, 4) + le(0, 4) + le(0x10000, 4) + le(0x10000, 4) +
+		pad(name, alignUp(name.length + 1, 8)))
+	dylib(LC_ID_DYLIB, id)
+	for (const l of image.libraries) {
+		dylib(LC_LOAD_DYLIB, l)
+	}
+	command(LC_DYLD_INFO_ONLY, info.map(v => le(v, 4)).join(""))
+	command(LC_SYMTAB, symtab.map(v => le(v, 4)).join(""))
+	command(LC_DYSYMTAB, [0, locals, locals, defined - locals, defined, n - defined].map(v => le(v, 4)).join("") +
+		zeros(48))
+	// The UUID, 0 until the pages are hashed.
+	const uuid = 32 + cmds.length + 8
+	command(LC_UUID, zeros(16))
+	// macOS 11.0, and of its SDK.
+	command(LC_BUILD_VERSION, le(1, 4) + le(0xb0000, 4) + le(0xb0000, 4) + le(0, 4))
+	command(LC_CODE_SIGNATURE, le(limit, 4) + le(signed, 4))
+	if (32 + (cmds.length as u64) > headers) {
+		throw new CompileError(`the Mach-O headers need ${32 + cmds.length} bytes, more than ${headers}`)
+	}
+	const x64 = image.arch == "x86_64"
+	const head = le(MH_MAGIC_64, 4) + le(if (x64) CPU_TYPE_X86_64 else CPU_TYPE_ARM64, 4) + le(if (x64) 3 else 0, 4) +
+		le(MH_DYLIB, 4) + le(ncmds, 4) + le(cmds.length as u64, 4) + le(MH_FLAGS, 4) + le(0, 4) + cmds
+	for (const i of 0 ... head.length - 1) {
+		image.bytes[i] = head[i]
+	}
+	const body = fromBytes(image.bytes) + zeros((file as i32) - image.bytes.length) + tail
+
+	// The hash of each 4 KiB page up to limit; the UUID is a hash of those with it 0, and the first page, which has it,
+	// is hashed again with it.
+	const hashes: string[] = []
+	for (const p of 0 ... pages - 1) {
+		hashes.push(sha256(body.slice(4096 * p, min(4096 * (p + 1), limit as i32))))
+	}
+	const first = body.slice(0, uuid) + sha256(hashes.join("")).slice(0, 16) + body.slice(uuid + 16, 4096)
+	hashes[0] = sha256(first)
+	// A SuperBlob, big-endian, of one CodeDirectory, which signs the file ad hoc, as a linker does.
+	const fields: [u64, i32][] = [
+		[0xfade0cc0, 4], // magic of a SuperBlob
+		[signed, 4], // length
+		[1, 4], // count of blobs
+		[0, 4], // type of the blob, a CodeDirectory
+		[24, 4], // its offset
+		[0, 4], // padding
+		[0xfade0c02, 4], // magic of a CodeDirectory
+		[signed - 24, 4], // length
+		[0x20400, 4], // version, with the fields of the executable segment
+		[0x20002, 4], // flags: ad hoc, signed by a linker
+		[(headed - 24) as u64, 4], // offset of the hashes
+		[88, 4], // offset of the identifier
+		[0, 4], // count of special slots
+		[pages as u64, 4], // count of pages hashed
+		[limit, 4], // bytes hashed
+		[32, 1], // size of a hash
+		[2, 1], // type of a hash, SHA-256
+		[0, 1], // platform
+		[12, 1], // log2 of the page size
+		[0, 8], // spare, and the offset of a scatter vector
+		[0, 8], // offset of the team's identifier, and spare
+		[0, 8], // bytes hashed, of 64 bits
+		[0, 8], // offset of the executable segment, __TEXT
+		[mapped[0][2], 8], // its size
+		[0, 8], // its flags: not the main executable's
+	]
+	const signature = fields.map(f => be(f[0], f[1])).join("") + pad(id, headed - 24 - 88) + hashes.join("")
+	return first + body.slice(4096, body.length) + signature
+}
+
+/// The export trie of names and their addresses, which dyld looks a name up in from its root: a node is the size of
+/// the address of the name spelled on the way to it, 0 if none, then flags 0 and that address; then its edges, each the
+/// letters the names past it share and the offset of its node. As offsets are ULEB128, of sizes by their values, the
+/// nodes are laid out until none moves.
+function trie(exports: [string, u64][]): string {
+	const xs = exports.slice(0, exports.length)
+	sortBy(xs, (a, b) => a[0] < b[0])
+	// Per node, the names it is a prefix of, from xs[lo] to xs[hi - 1], and its length; and its children.
+	const nodes: [i32, i32, i32][] = [[0, xs.length, 0]]
+	const children: i32[][] = []
+	while (children.length < nodes.length) {
+		const [lo, hi, depth] = nodes[children.length]
+		const kids: i32[] = []
+		let j = lo
+		while (j < hi && xs[j][0].length == depth) {
+			j++
+		}
+		while (j < hi) {
+			let k = j + 1
+			while (k < hi && xs[k][0][depth] == xs[j][0][depth]) {
+				k++
+			}
+			let d = depth + 1
+			while (d < xs[j][0].length && d < xs[k - 1][0].length && xs[j][0][d] == xs[k - 1][0][d]) {
+				d++
+			}
+			kids.push(nodes.length)
+			nodes.push([j, k, d])
+			j = k
+		}
+		children.push(kids)
+	}
+	const offsets = new u64[](nodes.length)
+	let moved = true
+	let w = new Writer()
+	while (moved) {
+		moved = false
+		w = new Writer()
+		for (const i of 0 ... nodes.length - 1) {
+			moved = moved || offsets[i] != (w.bytes.length as u64)
+			offsets[i] = w.bytes.length as u64
+			const [lo, hi, depth] = nodes[i]
+			const info = new Writer()
+			if (lo < hi && xs[lo][0].length == depth) {
+				info.u8(0)
+				info.uleb(xs[lo][1])
+			}
+			w.uleb(info.bytes.length as u64)
+			w.raw(info.bytes)
+			w.u8(children[i].length as u8)
+			for (const c of children[i]) {
+				w.raw(xs[nodes[c][0]][0].slice(depth, nodes[c][2]) + "\x00")
+				w.uleb(offsets[c])
+			}
+		}
+	}
+	return w.bytes
+}
+
+/// The name in the 16 bytes at at, padded with NULs.
+function name16(s: string, at: i32): string { return str(s.slice(at, at + 16) + "\x00", 0) }
+
+export const macho: Format = { headers: headers, bindsAnywhere: true, start: "___dso_handle", read: read,
+	exports: exports, write: write }
