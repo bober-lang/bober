@@ -53,7 +53,6 @@ import { isAbs, join } from "../../std/fs/path"
 import { combine, fnv } from "../../std/hash"
 import { min } from "../../std/math"
 import { ParseError } from "../../std/parse"
-import { sort } from "../../std/sort"
 import * as decl from "./decl"
 import * as kind from "./kind"
 import * as op from "./op"
@@ -201,7 +200,7 @@ class Table {
 class Out {
 	p: Program
 	m: i32
-	/// Its decls, in the order made.
+	/// Its decls, each before those it owns, in the order lowered, which is the same in every Program.
 	private order: i32[] = []
 	private own = new HashMap[i32, i32]()
 	/// The decls of other modules it uses, numbered after its own.
@@ -218,7 +217,6 @@ class Out {
 		for (const d of p.modules[m].decls) {
 			this.collect(d)
 		}
-		sort(this.order)
 		for (const i of 0 ... this.order.length - 1) {
 			this.own.set(this.order[i], i)
 		}
@@ -657,7 +655,8 @@ class Abi {
 		}
 	}
 
-	/// Adds the signature of decl d, of its members if a class or interface, its code if a const.
+	/// Adds the signature of decl d, of its members if a class or interface, its code if a const; with its doc, which
+	/// a type's descriptor holds, and whether it has code, as a call of one without is an intrinsic.
 	private decl(d: i32) {
 		if (this.done.has(d)) {
 			return
@@ -665,6 +664,7 @@ class Abi {
 		this.done.set(d, true)
 		const x = this.p.decls[d]
 		this.h = combine(combine(combine(this.h, x.hash), x.kind), x.mods)
+		this.h = combine(combine(this.h, fnv(this.p.strings[x.doc])), if (x.code == null) 0 else 1)
 		for (const t of x.params) {
 			this.h = combine(this.h, fnv(this.p.strings[t.name]))
 			this.type(t.constraint)

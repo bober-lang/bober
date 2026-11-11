@@ -24,6 +24,7 @@ import { toCString } from "../std/c"
 import { HashMap } from "../std/collections/hashmap"
 import { ScopedMap } from "../std/collections/scopedmap"
 import { bits } from "../std/float"
+import { sortBy } from "../std/sort"
 import { codePoint, endsWith, indexOf, unquoted } from "../std/string"
 import * as decl from "./bc/decl"
 import * as kind from "./bc/kind"
@@ -163,9 +164,11 @@ class Unit {
 	/// Its module.
 	m: i32
 	src = ""
-	/// Its top-level decls, and its variables and static fields, each in the order declared.
+	/// Its top-level decls, and its variables and static fields, each in the order its declarations are lowered, as
+	/// listed while listing: when a declaration is lowered, not declared ahead.
 	tops: i32[] = []
 	vars: i32[] = []
+	private listing = false
 	/// What is left to lower of the declaration being declared.
 	private jobs: (() => void)[] = []
 	/// Per decl, the decls of the module its code refers to or it owns, which a variable is initialized after.
@@ -177,9 +180,12 @@ class Unit {
 		this.m = l.lift.prog.addModule(path)
 	}
 
-	/// Lowers top-level declaration n, reusing the decls it was declared ahead with.
+	/// Lowers top-level declaration n, reusing the decls it was declared ahead with, and lists them.
 	lower(n: Node) {
-		for (const job of this.declare(n)) {
+		this.listing = true
+		const jobs = this.declare(n)
+		this.listing = false
+		for (const job of jobs) {
 			job()
 		}
 	}
@@ -279,7 +285,10 @@ class Unit {
 	private tags(n: Node): i32 { return this.prog.list((n.tags ?? []).map(t => this.ty(t))) }
 
 	/// The list of the types n lists after throws.
-	private throws(n: Node): i32 { return this.prog.list(after(n, "throws")?.type?.alternatives().map(t => this.ty(t)) ?? []) }
+	private throws(n: Node): i32 {
+		const t = after(n, "throws")?.type
+		return this.prog.list(if (t == null) [] else this.prog.members(this.ty(t)))
+	}
 
 	/// Drops the source, keeping its hash and where its lines end, then lists the module's top-level decls, and its
 	/// variables in the order they are initialized: consts, then lets, each after those it depends on (spec 3).
@@ -444,21 +453,24 @@ class Unit {
 	}
 
 	/// The decl of name in owner, -1 for none, of the checker's symbol if top-level, of type t: declared ahead, or else
-	/// now, added to tops if top-level and to list.
+	/// now; added to tops if top-level and to list when lowered, so that they are in the order its declarations are
+	/// lowered whatever was declared ahead, and a module is lowered the same in every program.
 	entry(symbol: string, owner: i32, name: string, k: decl.Kind, mods: i32, t: Type, doc: string, list: i32[] | null): i32 {
 		const ahead = if (owner < 0) this.l.lift.entries.get(symbol) ?? -1 else this.prog.find(this.m, owner, name)
+		const d = if (ahead >= 0) ahead else this.l.newDecl(this.m, owner, name, k, mods, t, doc)
 		if (ahead >= 0) {
-			this.prog.decls[ahead].mods = mods
-			this.prog.decls[ahead].doc = this.prog.intern(doc)
-			this.l.lift.types.set(ahead, t)
-			return ahead
-		}
-		const d = this.l.newDecl(this.m, owner, name, k, mods, t, doc)
-		if (owner < 0) {
+			this.prog.decls[d].mods = mods
+			this.prog.decls[d].doc = this.prog.intern(doc)
+			this.l.lift.types.set(d, t)
+		} else if (owner < 0) {
 			this.l.lift.entries.set(symbol, d)
-			this.tops.push(d)
 		}
-		list?.push(d)
+		if (this.listing) {
+			if (owner < 0) {
+				this.tops.push(d)
+			}
+			list?.push(d)
+		}
 		return d
 	}
 
@@ -1030,7 +1042,10 @@ class Gen {
 			this.op(op.Is, this.ty(Type.union(others)))
 			n++
 		}
-		for (const m of t.alternatives().filter(m => m.kind == "literal")) {
+		// In the order of the lowered union, by hash: the checker's, as it made them, is not the same in every program.
+		const literals = t.alternatives().filter(m => m.kind == "literal")
+		sortBy(literals, (a, b) => this.prog.hash(this.ty(a)) < this.prog.hash(this.ty(b)))
+		for (const m of literals) {
 			const j = this.ty(compared(st, m) ?? st)
 			this.op(op.Local, s)
 			this.cast(this.ty(st), j)
