@@ -23,7 +23,7 @@ import {
 	LLVMConstGEP2, LLVMConstInt, LLVMConstIntOfString, LLVMConstIntToPtr, LLVMConstNull, LLVMConstPtrToInt,
 	LLVMConstReal, LLVMConstRealOfString,
 	LLVMConstStringInContext2, LLVMConstStructInContext, LLVMConstTrunc, LLVMContextCreate, LLVMCountStructElementTypes,
-	LLVMCreateBuilderForModule, LLVMCreateEnumAttribute, LLVMCreateMemoryBufferWithMemoryRangeCopy,
+	LLVMCreateBuilderInContext, LLVMCreateEnumAttribute, LLVMCreateMemoryBufferWithMemoryRangeCopy,
 	LLVMCountParams, LLVMCreateStringAttribute, LLVMCreateTypeAttribute, LLVMDeleteFunction, LLVMDeleteGlobal, LLVMDisposeMessage,
 	LLVMDoubleTypeInContext, LLVMDoubleTypeKind, LLVMGetDataLayoutStr, LLVMGetEntryBasicBlock, LLVMGetFirstBasicBlock,
 	LLVMGetFirstFunction, LLVMGetFirstInstruction, LLVMGetFirstUse, LLVMGetIncomingBlock, LLVMGetMDKindIDInContext, LLVMGetInstructionOpcode,
@@ -93,6 +93,9 @@ export class LLVM implements Backend {
 	private ctx = context
 	private m: u64
 	private b: u64
+	/// Whether at has placed the builder. Before, it knows no module, and LLVM 24 aborts on any other use of it: it is
+	/// of the context, as LLVM 23 has no builder of a module.
+	private placed = false
 	private tm: u64
 	private td: u64
 	private level: u32
@@ -112,7 +115,7 @@ export class LLVM implements Backend {
 	/// The module name, for this machine, to be optimized at level, from 0 to 3 as -O takes.
 	constructor(name: string, level: u32 = 2) {
 		this.m = LLVMModuleCreateWithNameInContext(name, this.ctx)
-		this.b = LLVMCreateBuilderForModule(this.m)
+		this.b = LLVMCreateBuilderInContext(this.ctx)
 		this.level = level
 		native()
 		const t = [0 as u64]
@@ -265,13 +268,14 @@ export class LLVM implements Backend {
 	block(fn: Value): Block { return LLVMAppendBasicBlockInContext(this.ctx, fn, "") }
 	at(b: Block) {
 		LLVMPositionBuilderAtEnd(this.b, b)
+		this.placed = true
 		const sp = LLVMGetSubprogram(LLVMGetBasicBlockParent(b))
 		if (sp != this.sp) {
 			this.sp = sp
 			this.line(0, 0)
 		}
 	}
-	here(): Block { return LLVMGetInsertBlock(this.b) }
+	here(): Block { return if (this.placed) LLVMGetInsertBlock(this.b) else 0 }
 	ended(): bool { return LLVMGetBasicBlockTerminator(this.here()) != 0 }
 
 	ret(v: Value) { LLVMBuildRet(this.b, v) }
