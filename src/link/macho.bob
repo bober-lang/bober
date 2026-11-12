@@ -7,7 +7,7 @@
 
 import { HashMap } from "../../std/collections/hashmap"
 import { indexOf, partitionPoint, sortBy, startsWith } from "../../std/algo"
-import { ParseError } from "../../std/string"
+import { ParseError, replace, split, trim } from "../../std/string"
 import { Reader, Writer } from "../../std/encoding/binary"
 import { alignUp, min } from "../../std/math"
 import { CompileError } from "../error"
@@ -360,8 +360,21 @@ function commands(name: string, bytes: string, filetype: u64): [u64, i32][] thro
 	return cmds
 }
 
-/// The names the dynamic library bytes, read from the file name, exports, by its export trie.
+/// The names the dynamic library bytes, read from the file name, exports, by its export trie; or if bytes are an SDK's
+/// text stub of one, a .tbd, those of every list of symbols it has, of any target and kind: the library's and those
+/// of the libraries it re-exports that the stub has too.
 function exports(name: string, bytes: string): string[] throws CompileError {
+	if (startsWith(bytes, "--- !tapi-tbd")) {
+		const names: string[] = []
+		const lists = split(bytes, "symbols:")
+		for (const l of lists.slice(1, lists.length)) {
+			// A name with a `$` is quoted.
+			for (const n of split(replace(l.slice(indexOf(l, "[") + 1, indexOf(l, "]")), "'", ""), ",")) {
+				names.push(named(trim(n)))
+			}
+		}
+		return names
+	}
 	let trie = ""
 	for (const [cmd, at] of commands(name, bytes, MH_DYLIB)) {
 		if (cmd == LC_DYLD_INFO || cmd == LC_DYLD_INFO_ONLY || cmd == LC_DYLD_EXPORTS_TRIE) {
