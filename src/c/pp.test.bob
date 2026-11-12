@@ -203,6 +203,15 @@ test "#include_next continues the search after the includer's directory" {
 	assert pp("#include <a.h>", { path: "s1/a.h", content: "__has_include_next(<a.h>)" }) == ["0"]
 }
 
+test "the headers C leaves to the compiler are its own, where no directory has them" {
+	assert pp("#include <stdbool.h>\nbool true") == ["_Bool", "1"]
+	assert pp("#include \"stdbool.h\"\nbool", { path: "s2/stdbool.h", content: "" }) == ["bool"]
+	assert pp("#include <stdarg.h>\nva_end(ap)").join(" ") ==
+		"typedef __builtin_va_list va_list ; __builtin_va_end ( ap )"
+	assert pp("#include <stdalign.h>\nalignas alignof") == ["_Alignas", "_Alignof"]
+	assert pp("#include <stdnoreturn.h>\nnoreturn") == ["_Noreturn"]
+}
+
 test "#pragma once and include guards" {
 	const fs = new HashMap[string, string]()
 	fs.set("t.c",
