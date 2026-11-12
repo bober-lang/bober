@@ -331,7 +331,7 @@ class Emitter {
 		for (const d of this.decls) {
 			const c = p.decls[d].code
 			if (c != null) {
-				const frozen = if (this.facts.phase == "learned") this.frozen(c) else []
+				const frozen = if (this.facts.phase == "learned") this.frozen(c, this.envOf(d) ?? []) else []
 				for (const i of 0 ... c.ops.length - 1) {
 					if (c.ops[i] == op.Closure) {
 						const held = c.items(c.c(i)).map(l => frozen.length > 0 && frozen[l])
@@ -2926,17 +2926,17 @@ class Emitter {
 	}
 
 	/// The locals of c a closure can capture by value, as none is set once they are captured: each captured set at most
-	/// once, before the closures, and out of a loop unless made fresh in it, and set by none of the closures; and none
-	/// of c's own captures, which the code around may set.
-	private frozen(c: Code): bool[] {
+	/// once, before the closures, and out of a loop unless made fresh in it, and set by none of the closures; of c's own
+	/// captures, as own has them, those copied in, which nothing sets.
+	private frozen(c: Code, own: bool[]): bool[] {
 		const sets = c.locals.map(_ => 0)
 		const at = c.locals.map(_ => -1)
 		const looped = c.locals.map(_ => false)
 		const first = c.locals.map(_ => c.ops.length)
 		const fresh = c.locals.map(_ => false)
 		const ok = c.locals.map(l => this.kindOf(l.type) != kind.FixedArray)
-		for (const l of c.captures) {
-			ok[l] = false
+		for (const k of 0 ... c.captures.length - 1) {
+			ok[c.captures[k]] = own[k]
 		}
 		const open: Opcode[] = []
 		for (const k of 0 ... c.ops.length - 1) {
