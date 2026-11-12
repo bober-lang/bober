@@ -11,7 +11,7 @@ import { CompileError } from "../error"
 import { le, str, u, zeros } from "./bytes"
 import { Format, Image, Segment } from "./link"
 import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Init, Local, Object, Page, PageOff, Rel32, Rel64,
-	Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Unwind, Weak, Zero } from "./object"
+	Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Thread32, Unwind, Weak, Zero } from "./object"
 
 /// The room the writer needs before the first linked address: the ELF header and 10 program headers, a PT_LOAD per
 /// segment, of at most 5 (link.bob's keptRegions), and one for the loader's tables, PT_DYNAMIC, PT_TLS, PT_GNU_EH_FRAME
@@ -102,11 +102,18 @@ const R_X86_64_GOTPCREL: u64 = 9
 const R_X86_64_PC64: u64 = 24
 const R_X86_64_GOTPCRELX: u64 = 41
 const R_X86_64_REX_GOTPCRELX: u64 = 42
+/// Those by which code reaches a thread-local through `__tls_get_addr`: the displacement to its descriptor, to that of
+/// the image's own thread's copy, and the offset in the copy.
+const R_X86_64_TLSGD: u64 = 19
+const R_X86_64_TLSLD: u64 = 20
+const R_X86_64_DTPOFF32: u64 = 21
 /// Of the loader's: the image's address plus the addend; and a thread-local's descriptor, of the image's own thread's
-/// copy at the addend.
+/// copy at the addend; x86-64's sets but the descriptor's first word, the image's number among the loaded, whatever the
+/// addend.
 const R_AARCH64_RELATIVE: u64 = 1027
 const R_X86_64_RELATIVE: u64 = 8
 const R_AARCH64_TLSDESC: u64 = 1031
+const R_X86_64_DTPMOD64: u64 = 16
 
 /// p_type: a mapped segment, the dynamic section, the template of a thread's copy, the eh_frame_hdr, the stack's
 /// permissions.
@@ -138,7 +145,9 @@ const DT_INIT_ARRAYSZ: u64 = 27
 /// The relocatable object bytes, read from the file name, as an Object of its loaded sections; those not loaded, as
 /// symbol tables, notes and comments, and the relocations of them are dropped. The functions of `.init_array.N` run
 /// in ascending N, before those of `.init_array`. A thread-local the code reaches through a descriptor has one in a
-/// section `.tlsdesc` the reader adds, per symbol and addend, of a local symbol the code's fixups refer to.
+/// section `.tlsdesc` the reader adds, per symbol and addend, of a local symbol the code's fixups refer to. x86-64's
+/// is what `__tls_get_addr` takes, the image's number and the offset in a thread's copy, which is 0 in the one of the
+/// copy itself.
 function read(name: string, bytes: string): Object throws CompileError {
 	if (bytes.length < 64 || bytes.slice(0, 7) != ident || u(bytes, 16, 2) != ET_REL || u(bytes, 18, 2) != EM_X86_64 &&
 		u(bytes, 18, 2) != EM_AARCH64) {
@@ -235,17 +244,24 @@ function read(name: string, bytes: string): Object throws CompileError {
 						`${name}: reaches a thread-local as an executable does; compile it position-independent (-fPIC)`
 						else `${name}: relocation ${rt} cannot be linked`)
 				}
-				if (rt >= R_AARCH64_TLSDESC_ADR_PAGE21 && rt <= R_AARCH64_TLSDESC_ADD_LO12) {
-					// Of the descriptor of sym + addend, of which the object has one.
-					const key = `${sym}+${addend}`
+				const gd = rt == R_X86_64_TLSGD
+				const ld = rt == R_X86_64_TLSLD
+				if (gd || ld || rt >= R_AARCH64_TLSDESC_ADR_PAGE21 && rt <= R_AARCH64_TLSDESC_ADD_LO12) {
+					// Of the descriptor of sym + a, of which the object has one; x86-64's addend is a displacement's,
+					// and its one of the copy itself, of offset 0, names sym but as a thread's own.
+					const a = if (gd || ld) addend + 4 else addend
+					const key = if (ld) "" else `${sym}+${a}`
 					if (!descs.has(key)) {
 						descs.set(key, o.symbols.length)
 						o.symbols.push(new Symbol("", Local, o.sections.length, tls.size))
-						tls.fixups.push(new Fixup(tls.size, Desc, sym, addend))
+						tls.fixups.push(new Fixup(tls.size, Desc, sym, a))
+						if (gd) {
+							tls.fixups.push(new Fixup(tls.size + 8, Thread32, sym, a))
+						}
 						tls.size += 16
 					}
 					sym = descs.get(key)!
-					addend = 0
+					addend -= a
 				}
 				if (kind != 255) {
 					o.sections[index[info]].fixups.push(new Fixup(u(bytes, p, 8), kind as u8, sym, addend))
@@ -284,10 +300,11 @@ function fixup(arch: Arch, rt: u64): i32 {
 		return switch (rt) {
 			case R_X86_64_NONE: 255
 			case R_X86_64_64: Abs64
-			case R_X86_64_PC32: Rel32
+			case R_X86_64_PC32, R_X86_64_TLSGD, R_X86_64_TLSLD: Rel32
 			case R_X86_64_PC64: Rel64
 			case R_X86_64_PLT32: Call
 			case R_X86_64_GOTPCREL, R_X86_64_GOTPCRELX, R_X86_64_REX_GOTPCRELX: SlotRel32
+			case R_X86_64_DTPOFF32: Thread32
 			default: -1
 		}
 	}
@@ -390,7 +407,7 @@ function write(image: Image): string throws CompileError {
 		const [at, offset] = image.descs[i]
 		const e = 24 * (image.rebases.length + image.binds.length + i)
 		put(rela, e, at, 8)
-		put(rela, e + 8, R_AARCH64_TLSDESC, 8)
+		put(rela, e + 8, if (x64) R_X86_64_DTPMOD64 else R_AARCH64_TLSDESC, 8)
 		put(rela, e + 16, offset, 8)
 	}
 	const relaAt = place(fromBytes(rela))
