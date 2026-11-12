@@ -16,6 +16,39 @@ const dynamicMacros = ["__FILE__", "__FILE_NAME__", "__LINE__", "__COUNTER__", "
 	"__BASE_FILE__", "_Pragma", "__has_include", "__has_include_next", "__has_attribute", "__has_c_attribute",
 	"__has_cpp_attribute", "__has_builtin", "__has_feature", "__has_extension", "__has_warning", "__building_module"]
 
+/// Where the headers C leaves to the compiler are, after every directory: macOS's SDK has none of them.
+const own = "<bobcc>/"
+
+/// The header at path, if it is one of own's.
+function owned(path: string): string | null {
+	if (path == own + "stdarg.h") {
+		return `typedef __builtin_va_list va_list;
+#define va_start(ap, last) __builtin_va_start(ap, last)
+#define va_arg(ap, type) __builtin_va_arg(ap, type)
+#define va_copy(to, from) __builtin_va_copy(to, from)
+#define va_end(ap) __builtin_va_end(ap)
+`
+	}
+	if (path == own + "stdbool.h") {
+		return `#define bool _Bool
+#define true 1
+#define false 0
+#define __bool_true_false_are_defined 1
+`
+	}
+	if (path == own + "stdalign.h") {
+		return `#define alignas _Alignas
+#define alignof _Alignof
+#define __alignas_is_defined 1
+#define __alignof_is_defined 1
+`
+	}
+	if (path == own + "stdnoreturn.h") {
+		return "#define noreturn _Noreturn\n"
+	}
+	return null
+}
+
 class Macro {
 	/// Null for an object-like macro; a variadic one's last is __VA_ARGS__ or the name before its `...`.
 	params: string[] | null = null
@@ -30,7 +63,7 @@ class Source {
 	lexer: Lexer
 	/// Where the last token Preprocessor.token took is.
 	last = 0
-	/// The index in Preprocessor.dirs of the directory it was found in, -1 if not by a search.
+	/// The index in Preprocessor.dirs of the directory it was found in, their count for own, -1 if not by a search.
 	dir: i32
 	/// The conditionals open when it was entered.
 	depth: i32
@@ -643,8 +676,8 @@ export class Preprocessor {
 		throw CError.at(t, "expected \"FILENAME\" or <FILENAME>")
 	}
 
-	/// Where the header name is: its path, and the index in dirs of its directory, -1 for the includer's
-	/// or none; null if it is nowhere.
+	/// Where the header name is: its path, and the index in dirs of its directory, their count for own, -1 for the
+	/// includer's or none; null if it is nowhere.
 	private find(name: string, angled: bool, next: bool): [string, i32] | null {
 		for (const [path, i] of this.candidates(name, angled, next)) {
 			if (this.file(path) != null) {
@@ -654,8 +687,8 @@ export class Preprocessor {
 		return null
 	}
 
-	/// The paths where the header name may be, in search order, each with the index in dirs of its
-	/// directory. #include_next in a file found in dirs goes on from the directory after that.
+	/// The paths where the header name may be, in search order, each with the index in dirs of its directory: own is
+	/// the last, after them. #include_next in a file found in dirs goes on from the directory after that.
 	private candidates(name: string, angled: bool, next: bool): [string, i32][] {
 		if (isAbs(name)) {
 			return [[clean(name), -1]]
@@ -670,6 +703,7 @@ export class Preprocessor {
 		for (const i of first ... this.dirs.length - 1) {
 			paths.push([join(this.dirs[i], name), i])
 		}
+		paths.push([own + name, this.dirs.length])
 		return paths
 	}
 
@@ -679,7 +713,7 @@ export class Preprocessor {
 		if (known != null) {
 			return known
 		}
-		const src = this.read(path)
+		const src = owned(path) ?? this.read(path)
 		if (src == null) {
 			return null
 		}
