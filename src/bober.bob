@@ -14,11 +14,12 @@
 //! implementation-defined behavior.
 
 import { Handle } from "../builtin/sys"
-import { endsWith, indexOf, lastIndexOf, startsWith } from "../std/algo"
+import { endsWith, indexOf, lastIndexOf, sortBy, startsWith } from "../std/algo"
 import { fromCString } from "../std/c"
 import { Keys, Rest, Unknown, decode as decodeJson, encode, quoted } from "../std/encoding/json"
+import * as yaml from "../std/encoding/yaml"
 import { decode } from "../std/encoding/optarg"
-import { exists, glob, mkdirAll, readFile, remove, removeAll, rename, stat } from "../std/fs"
+import { exists, glob, mkdirAll, readDir, readFile, remove, removeAll, rename, stat } from "../std/fs"
 import { base, dir as parent, isAbs, join, rel } from "../std/fs/path"
 import { fnv } from "../std/hash"
 import { stdin, stdout } from "../std/io"
@@ -43,9 +44,11 @@ import { arm64 } from "./link/arm64"
 import { elf } from "./link/elf"
 import { Linker, Stale } from "./link/link"
 import { Const, Global, Object, Section, Symbol } from "./link/object"
+import { SyntaxError } from "./lex"
 import { lower } from "./lower"
 import { serve } from "./lsp"
 import { mono } from "./mono"
+import { Parser } from "./parse"
 import { builtin, root } from "./root"
 import { CLib, Package, load, nearest, out } from "./pkg"
 import * as process from "../std/process"
@@ -54,7 +57,7 @@ import { dup, getcwd, getpid, isatty } from "unistd.h"
 const usage = `usage: bober <command> [-I dir]... args
   build <main.bob> [linker args]  compile a program into build/<name>, and print the command that runs it
   run <main.bob> [args]           build it and run it with args
-  test <main.bob> [args]          build it and run its main module's tests
+  test [<main.bob> [args]]        build it and run its main module's tests, or each file's here and below
   check <file>...                report the type errors of the files and the modules they import; also lint
   format <file>...               rewrite each file in place in the one layout of its syntax tree
   lower <file>...                print the bytecode of each file
@@ -65,7 +68,9 @@ Its options are taken anywhere on the line, as a C compiler's, up to a --; the a
 -I adds a directory C headers are found in, as a C compiler takes it, before those of the nearest bober.pkg's C libraries.
 -release builds with LLVM, the whole program at -O2, for build, run and test; else each module with TPDE, to debug, once
 as lowered: a generic's code takes its type args' descriptors; on Linux arm64 into one shared library of all that is
-built there, build/image.so, which run and test load, and which a build links only what changed into.`
+built there, build/image.so, which run and test load, and which a build links only what changed into.
+test prints a YAML mapping of the tests, or of the files and directories with tests: each ok if all in it passed, else
+what failed in it, a test's trap after what it printed.`
 
 const dir = "build"
 
@@ -100,7 +105,7 @@ function main(): i32 {
 		print(`bad option ${argv[e.at + 1]}`)
 		return 2
 	}
-	if (f.args.length == 0 && argv[0] != "lsp" && argv[0] != "init") {
+	if (f.args.length == 0 && !["lsp", "init", "test"].includes(argv[0])) {
 		print(usage)
 		return 2
 	}
@@ -117,9 +122,18 @@ function command(cmd: string, f: Flags): i32 {
 	const argv = f.args
 	const dirs = f.I
 	switch (cmd) {
-		case "build", "run", "test":
+		case "test":
+			const [status, report] = if (argv.length == 0) testAll(".", dirs, f.release)
+				else runTests(argv[0], argv.slice(1, argv.length), dirs, f.release)
+			try {
+				stdout.write(yaml.emit(yaml.documents(report)))
+			} catch (e: ParseError | yaml.EncodeError) {
+				print(report)  // not UTF-8
+			}
+			return status
+		case "build", "run":
 			const rest = argv.slice(1, argv.length)
-			const program = build(argv[0], cmd == "test", if (cmd == "build") rest else [], dirs, f.release, cmd != "build")
+			const program = build(argv[0], false, if (cmd == "build") rest else [], dirs, f.release, cmd == "run")
 			if (cmd == "build") {
 				print(program.join(" "))
 				return 0
@@ -193,6 +207,64 @@ function init(name: string) {
 		throw new CompileError(`${n} is not @namespace/name`)
 	}
 	save("bober.pkg", `{\n\t"name": ${quoted(n)}\n}\n`)
+}
+
+/// The tests of each file that has some in d and below, but in build/, hidden directories and builtin/, which no
+/// program tests: 0 if all passed, and their report, a JSON object of d's files and directories with tests, each "ok"
+/// if all of its passed, else a file's report as runTests gives it, or a directory's as this.
+function testAll(d: string, includes: string[], release: bool): [i32, string] {
+	let status = 0
+	const entries: string[] = []
+	const es = readDir(d)
+	sortBy(es, (a, b) => a.name < b.name)
+	for (const e of es) {
+		const p = join(d, e.name)
+		const sub = e.isDirectory && e.name != "build" && !startsWith(e.name, ".")
+		if (sub || endsWith(e.name, ".bob") && !builtin(p) && hasTests(p)) {
+			const [s, report] = if (sub) testAll(p, includes, release) else runTests(p, [], includes, release)
+			if (report != "{}") {
+				entries.push(`${quoted(e.name)}:${if (s == 0) `"ok"` else report}`)
+				if (s != 0) {
+					status = 1
+				}
+			}
+		}
+	}
+	return [status, `{${entries.join(",")}}`]
+}
+
+/// Builds the program of main with its tests and runs them with args: its exit status, and its report, the JSON object
+/// src/rt.c prints, ended by the exit status if a crash cut it off, or else what failed as a JSON string.
+function runTests(main: string, args: string[], includes: string[], release: bool): [i32, string] {
+	try {
+		const out = `${dir}/${name(main)}.test.log`
+		const status = process.run([...build(main, true, [], includes, release, true), ...args], out)
+		const report = trim(readFile(out))
+		// A crash cuts the report off after the key of the test it was in.
+		for (const r of [report, `${report}${quoted(`exit ${status}`)}}`]) {
+			try {
+				decodeJson[Keys](r)
+				return [status, r]
+			} catch (e: ParseError) {}
+		}
+		return [if (status == 0) 1 else status, quoted(trim(`${report}\nexit ${status}`))]
+	} catch (e: CompileError | IoError) {
+		return [1, quoted(if (e instanceof IoError) e.message() else e.msg)]
+	}
+}
+
+/// Whether the file at path declares a test, or does not parse, which its test run then reports.
+function hasTests(path: string): bool {
+	const p = new Parser(readFile(path))
+	try {
+		let t = p.parse()
+		while (t != null && t.kind != "test") {
+			t = p.parse()
+		}
+		return t != null
+	} catch (e: SyntaxError) {
+		return true
+	}
 }
 
 /// Compiles the program of main, linked with the linker options args, into the executable build/<name>, or with tests

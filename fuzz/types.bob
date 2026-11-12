@@ -28,6 +28,7 @@ import { endsWith, indexOf, startsWith } from "../std/algo"
 import { fromCString } from "../std/c"
 import { HashMap } from "../std/collections/hashmap"
 import { Rest, decode } from "../std/encoding/optarg"
+import * as yaml from "../std/encoding/yaml"
 import { mkdirAll, readFile as read, writeFile } from "../std/fs"
 import { base, dir, isAbs, join } from "../std/fs/path"
 import { run } from "../std/process"
@@ -348,10 +349,10 @@ class Rng {
 	of[T](xs: T[]): T { return xs[this.below(xs.length)] }
 }
 
-/// The line of out of a cast that failed in the file of name, where src spells none, if any.
+/// The line of a message in the test report out of a cast that failed in the file of name, where src spells none.
 function unsound(name: string, src: string, out: string): string | null {
 	const lines = split(src, "\n")
-	for (const l of split(out, "\n")) {
+	for (const l of split(split(out, "\\n").join(`"`), `"`)) {
 		const trap = indexOf(l, ": trap: cast to")
 		const at = split(l.slice(0, if (trap < 0) 0 else trap), ":")
 		if (at.length >= 3 && endsWith(" " + at[at.length - 3], " " + name)) {
@@ -367,8 +368,14 @@ function unsound(name: string, src: string, out: string): string | null {
 	return null
 }
 
-/// Whether out has a test's line, so that the tests were built and ran.
-function ran(out: string): bool { return split(out, "\n").some(l => startsWith(l, "ok ") || startsWith(l, "FAIL ")) }
+/// Whether out is a test report, a mapping, so that the tests were built and ran.
+function ran(out: string): bool {
+	try {
+		return yaml.documents(out).some(d => d.root instanceof yaml.Map)
+	} catch (e: ParseError) {
+		return false
+	}
+}
 
 /// The first line of a that b lacks at its place, if any.
 function differing(a: string, b: string): string {
