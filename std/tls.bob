@@ -6,7 +6,7 @@
 import { endsWith } from "./algo"
 import { fromCString } from "./c"
 import { HashMap } from "./collections/hashmap"
-import { readFile } from "./fs"
+import { exists, readFile } from "./fs"
 import { Stream } from "./io"
 import { failure } from "../builtin/sys"
 import { Signal } from "../builtin/fiber"
@@ -19,7 +19,7 @@ import { MBEDTLS_ERR_NET_RECV_FAILED, MBEDTLS_ERR_NET_SEND_FAILED, MBEDTLS_ERR_S
 	bober_tls_write } from "./tls/tls.h"
 
 export class Config {
-	/// PEM roots a client trusts; null is the system's, /etc/ssl/certs/ca-certificates.crt.
+	/// PEM roots a client trusts; null is the system's: /etc/ssl/certs/ca-certificates.crt, else /etc/ssl/cert.pem.
 	roots: string | null = null
 	/// A server's PEM chain and key.
 	cert: string | null = null
@@ -194,7 +194,8 @@ function roots(pem: string | null, what: string): u64 throws IoError {
 	if (known != null) {
 		return known
 	}
-	const text = pem ?? readFile("/etc/ssl/certs/ca-certificates.crt")
+	const debian = "/etc/ssl/certs/ca-certificates.crt" // else that of macOS and Alpine
+	const text = pem ?? readFile(if (exists(debian)) debian else "/etc/ssl/cert.pem")
 	const out = new u64[](1)
 	check(bober_tls_chain(text, (text.length + 1) as u64, out), "roots", 0, what)
 	chains.set(key, out[0])
