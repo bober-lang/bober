@@ -127,10 +127,10 @@ test "a weak definition is one another module may override, also if a declaratio
 	assert has(ir, "@x = weak global")
 }
 
-test "an alias is another name of a function, global or alias defined in the unit, static if it is" {
+test "an alias is another name of a function, global or alias defined in the unit, static if it is; a static function may take the name itself" {
 	const ir = compile("static int f(void) { return 1; } extern __typeof__(f) g __attribute__((weak, alias(\"f\"))); static int h(void) __attribute__((alias(\"f\"))); int x; extern int y __attribute__((alias(\"x\"))); extern int z __attribute__((alias(\"y\")));")
-	assert has(ir, "@g = weak alias i32 (), ptr @f")
-	assert has(ir, "@h = internal alias i32 (), ptr @f")
+	assert has(ir, "define weak dso_local i32 @g()")
+	assert has(ir, "@h = internal alias i32 (), ptr @g")
 	assert has(ir, "@y = alias [4 x i8], ptr @x")
 	assert has(ir, "@z = alias [4 x i8], ptr @y")
 	assert error("int f(void); int g(void) __attribute__((alias(\"f\")));") == "t.c:1:47: \"f\" is not defined here"

@@ -255,7 +255,9 @@ export class LLVM implements Backend {
 	}
 	hidden(g: Value) { LLVMSetVisibility(g, LLVMHiddenVisibility as u32) }
 	alias(g: Value, to: Value): Value {
-		const a = LLVMAddAlias2(this.m, LLVMGlobalGetValueType(to), 0, to, "")
+		// A static to that is defined is given the name itself, as Mach-O has no weak alias.
+		const a = if (LLVMGetLinkage(to) == (LLVMInternalLinkage as u32) && !this.declared(to)) to
+			else LLVMAddAlias2(this.m, LLVMGlobalGetValueType(to), 0, to, "")
 		LLVMSetLinkage(a, LLVMGetLinkage(g)) // internal if static
 		this.replace(g, a)
 		return a
