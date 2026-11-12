@@ -121,7 +121,7 @@ static uint32_t take(int n, int kind) {
 
 /// Frees n pages from p, zeroing them.
 static void release(uint32_t p, int n) {
-  if (n > 1) madvise(at(p), (int64_t)n * PAGE, MADV_DONTNEED);
+  if (n > 1) mmap(at(p), (int64_t)n * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED, -1, 0);
   else memset(at(p), 0, PAGE);
   for (int i = 0; i < n; i++) pages[p + i].kind = FREE;
   if (p < hint) hint = p;
