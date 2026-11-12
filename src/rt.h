@@ -38,6 +38,9 @@ typedef struct { int64_t size; uint64_t refs[]; } bober_layout;
 /// n new zero bytes, 16-aligned, of values laid out as l, or of none holding a ref if l is null: a ref, which may
 /// point into them anywhere. It may collect, so that refs held across it move.
 void *bober_alloc(int64_t n, const bober_layout *l);
+/// The bytes of a page of the heap. An object of more has pages of its own, from one's start, and never moves; once it
+/// is not reached, they are mapped anew, which unmaps what bober_io_map mapped there but its first.
+#define BOBER_PAGE (1 << 16)
 /// Marks the card of place p, where a ref may have been stored, as the write barrier of compiled code does.
 void bober_written(void *p);
 /// A number, from 1, that is p's alone while what p points into lives, however it moves; 0 for null.
@@ -194,6 +197,8 @@ long bober_io_open(const char *path, const char *mode);
 long bober_io_close(int fd);
 /// Up to n bytes into buf; 0 at the end.
 long bober_io_read(int fd, void *buf, unsigned long n);
+/// Maps the n bytes of fd from its start at at, a page's address, in place of what is there: privately and read-only.
+long bober_io_map(int fd, void *at, unsigned long n);
 /// Writes up to n bytes of buf, without SIGPIPE: how many.
 long bober_io_write(int fd, const void *buf, unsigned long n);
 long bober_io_sync(int fd);
