@@ -1,7 +1,8 @@
-//! Values as a template converts them (spec 6.9), which a template's pieces are lowered to.
+//! Values as a template converts them (spec 6.9), which a template's pieces are lowered to, and as a failed assert shows
+//! them.
 
 import { formatFloat } from "../std/float"
-import { quoted } from "../std/string"
+import { quoted, split } from "../std/string"
 import { addr } from "./mem"
 import { copy } from "./string"
 
@@ -58,12 +59,69 @@ export function show[T](x: T): string {
 	return T.kind
 }
 
-/// x as an element or field of what show shows: a string quoted, else by its toString.
-function item[T](x: T): string {
+/// x as an element or field of what show shows, or a value a failed assert shows: a string quoted, else by its
+/// toString.
+export function item[T](x: T): string {
 	if (T.kind == "string") {
 		return quoted(x)
 	}
 	return `${x}`
+}
+
+/// a and b, which an assert failed to find equal, as it shows them: on a line each after two spaces, the lines only in a
+/// after -, those only in b after +, and those of both after a space, all but the two next to a change left out as ….
+export function diff(a: string, b: string): string {
+	const xs = split(a, "\n")
+	const ys = split(b, "\n")
+	let lo = 0
+	while (lo < xs.length && lo < ys.length && xs[lo] == ys[lo]) {
+		lo++
+	}
+	let n = xs.length
+	let m = ys.length
+	while (n > lo && m > lo && xs[n - 1] == ys[m - 1]) {
+		n--
+		m--
+	}
+	// common[(i - lo) * w + j - lo]: how many of xs[i:n] are among ys[j:m] in order, at most
+	const w = m - lo + 1
+	const common = new i32[]((n - lo + 1) * w)
+	for (const i of 1 ... n - lo) {
+		for (const j of 1 ... m - lo) {
+			const k = (n - lo - i) * w + m - lo - j
+			common[k] = if (xs[n - i] == ys[m - j]) common[k + w + 1] + 1
+				else if (common[k + w] > common[k + 1]) common[k + w] else common[k + 1]
+		}
+	}
+	const lines = xs.slice(0, lo).map(x => `  ${x}`)
+	let i = lo
+	let j = lo
+	while (i < n || j < m) {
+		const k = (i - lo) * w + j - lo
+		if (i < n && j < m && xs[i] == ys[j]) {
+			lines.push(`  ${xs[i]}`)
+			i++
+			j++
+		} else if (j == m || i < n && common[k + w] >= common[k + 1]) {
+			lines.push(`- ${xs[i]}`)
+			i++
+		} else {
+			lines.push(`+ ${ys[j]}`)
+			j++
+		}
+	}
+	lines.append(xs.slice(n, xs.length).map(x => `  ${x}`))
+	const changed = (k: i32) => k >= 0 && k < lines.length && lines[k][0] != 0x20
+	const near = (k: i32) => changed(k - 2) || changed(k - 1) || changed(k) || changed(k + 1) || changed(k + 2)
+	let out = ""
+	for (const k of 0 ... lines.length - 1) {
+		if (near(k)) {
+			out = `${out}\n  ${lines[k]}`
+		} else if (k == 0 || near(k - 1)) {
+			out = `${out}\n  …`
+		}
+	}
+	return out
 }
 
 function showUint(n: u64): string {

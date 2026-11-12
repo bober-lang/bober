@@ -72,17 +72,16 @@ static void position(const char *file, int32_t at, int *line, int *col) {
 }
 
 _Noreturn void bober_trap(const char *what, const char *file, int32_t at) {
-  int line, col;
+  int line, col, testLine, testCol;
   position(file, at, &line, &col);
-  if (line) snprintf(msg, sizeof msg, "%s:%d:%d: trap: %s", file, line, col, what);
-  else if (file) snprintf(msg, sizeof msg, "%s: trap: %s", file, what);
-  else snprintf(msg, sizeof msg, "trap: %s", what);
-  int testLine, testCol;  // of the test's statement running, noted if the trap is not on its line
   position(testFile, test ? testAt : -1, &testLine, &testCol);
-  if (testLine && (!file || strcmp(file, testFile) || line != testLine)) {
-    size_t n = strlen(msg);
-    snprintf(msg + n, sizeof msg - n, " (called at %s:%d)", testFile, testLine);
-  }
+  char called[512] = "";  // the test's statement running, noted on what's first line if the trap is not on its line
+  if (testLine && (!file || strcmp(file, testFile) || line != testLine))
+    snprintf(called, sizeof called, " (called at %s:%d)", testFile, testLine);
+  int n = line ? snprintf(msg, sizeof msg, "%s:%d:%d: ", file, line, col)
+          : file ? snprintf(msg, sizeof msg, "%s: ", file) : 0;
+  int first = strcspn(what, "\n");
+  snprintf(msg + n, sizeof msg - n, "trap: %.*s%s%s", first, what, called, what + first);
   if (test) longjmp(*test, 1);
   put(saved[1], msg, strlen(msg)), put(saved[1], "\n", 1);
   exit(1);
@@ -120,17 +119,22 @@ _Noreturn void bober_fail(const uint8_t *how, const char *file, int32_t at) {
   bober_trap(what, file, at);
 }
 
+/// Where the value last thrown was first thrown, for bober_uncaught.
+static const char *thrownFile;
+static int32_t thrownAt;
+
 void bober_throw(int64_t tag, int64_t bits, void *ref, const char *file, int32_t at) {
-  static const char *thrownFile;
-  static int32_t thrownAt, thrownKind;
-  if (file) thrownFile = file, thrownAt = at, thrownKind = *(const int64_t *)tag;
+  if (file) thrownFile = file, thrownAt = at;
   free(caught), caught = 0;  // A landing pad loads what it caught at once, so the last throw's is done with.
   Thrown *e = bober_malloc(sizeof(Thrown));
   *e = (Thrown){.tag = tag, .bits = bits, .ref = ref};
   memcpy(&e->header.exception_class, "bober\0\0\0", 8);
   _Unwind_RaiseException(&e->header);
+}
+
+_Noreturn void bober_uncaught(int64_t tag, int64_t bits, void *ref, const uint8_t *shown) {
   char what[2048] = "uncaught throw: ";
-  show(what + 16, sizeof what - 16, thrownKind, bits, ref);
+  show(what + 16, sizeof what - 16, shown ? 13 : *(const int64_t *)tag, bits, shown ? shown : ref);
   bober_trap(what, thrownFile, thrownAt);
 }
 

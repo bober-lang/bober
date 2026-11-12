@@ -267,6 +267,8 @@ export class Node {
 	kind: Syntax | "token"
 	t: Tok
 	parts: Node[] = []
+	/// Where its closing token is, if it has one, as Tree's end.
+	end = 0
 	/// Its value's type once checked; of a type expression, declaration or pattern, the type it stands for.
 	type: Type | null = null
 	/// A declaration's or member's tags (5.3), once typed.
@@ -1055,6 +1057,7 @@ class Checker {
 	/// t's construct, after reporting what in it 6.5 needs parenthesized.
 	private node(t: Tree): Node {
 		const n = new Node(t.kind, t.t)
+		n.end = t.end
 		for (const p of t.parts) {
 			n.parts.push(if (p instanceof Tree) this.node(p) else new Node("token", p))
 		}
@@ -4398,8 +4401,7 @@ class Checker {
 
 	private text(t: Tok): string { return this.src.slice(t.loc.pos, t.loc.end()) }
 
-	/// The source of p.
-	private source(p: Node): string { return this.src.slice(start(p).pos, stop(p)) }
+	private source(p: Node): string { return sourceOf(this.src, p) }
 
 	private key(t: Tok): string {
 		const s = this.text(t)
@@ -4638,9 +4640,12 @@ function start(p: Node): Loc {
 	return if (first.pos < p.t.loc.pos) first else p.t.loc
 }
 
-/// Where p's source ends.
+/// The source of p, of a module of source src.
+export function sourceOf(src: string, p: Node): string { return src.slice(start(p).pos, stop(p)) }
+
+/// Where p's source ends, after its closing token if it has one.
 function stop(p: Node): i32 {
-	let end = p.t.loc.end()
+	let end = if (p.end > p.t.loc.pos) p.end + 1 else p.t.loc.end()
 	for (const q of p.parts) {
 		const e = stop(q)
 		end = if (e > end) e else end

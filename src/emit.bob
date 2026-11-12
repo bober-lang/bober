@@ -293,6 +293,7 @@ class Emitter {
 		b.attr(declare("trap", v, [ptr, ptr, i32]), -1, "noreturn", 0)
 		b.attr(declare("fail", v, [this.ref, ptr, i32]), -1, "noreturn", 0)
 		declare("throw", v, [i64, i64, this.ref, ptr, i32])
+		b.attr(declare("uncaught", v, [i64, i64, this.ref, this.ref]), -1, "noreturn", 0)
 		declare("caught", ptr, [])
 		declare("start", v, [i32, ptr, i32])
 		declare("test", v, [ptr, ptr, ptr])
@@ -1128,9 +1129,16 @@ class Emitter {
 		return this.ir().load(this.unionTy, this.rt("caught", [], false), false)
 	}
 
-	/// Throws the union value u, where it is thrown being its site.
+	/// Throws the union value u, where it is thrown being its site; if nothing catches it, traps showing it, in a debug
+	/// build as a failed assert shows a value.
 	private raise(u: Value, path: Value, pos: i32) {
 		this.rt("throw", [this.tagOf(u), this.bitsOf(u), this.refOf(u), path, this.b.constInt(this.i32, pos)])
+		let shown = this.b.constZero(this.ref)
+		if (this.dyn) {
+			const item = this.lang("item")
+			shown = this.refOf(this.cast({ v: this.call(item.type, item.fn, [this.tagOf(u), u]), t: kind.String }, this.any))
+		}
+		this.rt("uncaught", [this.tagOf(u), this.bitsOf(u), this.refOf(u), shown], false)
 		this.ir().unreachable()
 		this.dead = true
 	}
