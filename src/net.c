@@ -1,7 +1,6 @@
 //! src/net.h on lwIP (vendor/lwip): no OS, its loopback alone, its time bober_mono(). A socket is a descriptor of
 //! /dev/null, a number no other descriptor has, which indexes the Sock that holds its pcb.
 
-#define WEAK  // net.h's functions, defined here
 #include "net.h"
 #include "rt.h"
 #include <errno.h>
@@ -159,7 +158,13 @@ static long flushed(long r) {
   return r;
 }
 
-long net_dial(const char *net, const char *host, int port) {
+static long net_close(int fd, int reset) {
+  Sock *s = sock(fd);
+  release(s, reset), free(s), socks[fd] = 0;
+  return flushed(close(fd) ? -errno : 0);
+}
+
+static long net_dial(const char *net, const char *host, int port) {
   ip_addr_t ip;
   long r = address(host, &ip, 1);
   if (r) return r;
@@ -175,9 +180,9 @@ long net_dial(const char *net, const char *host, int port) {
   return e == ERR_OK ? fd : (net_close(fd, 0), failure(e));  // connected once its fiber waits, as a kernel's
 }
 
-long net_connected(int fd) { return -sock(fd)->err; }
+static long net_connected(int fd) { return -sock(fd)->err; }
 
-long net_listen(const char *net, const char *host, int port) {
+static long net_listen(const char *net, const char *host, int port) {
   ip_addr_t ip;
   long r = address(host, &ip, 0);
   if (r) return r;
@@ -198,7 +203,7 @@ long net_listen(const char *net, const char *host, int port) {
   return s->fd;
 }
 
-long net_accept(int fd) {
+static long net_accept(int fd) {
   Sock *l = sock(fd), *s = l->in ? l->in->p : 0;
   if (!s) return l->pcb ? BOBER_IO_AGAIN : -EINVAL;
   long c = held(s);
@@ -206,9 +211,7 @@ long net_accept(int fd) {
   return c;
 }
 
-long net_read(int fd, void *buf, unsigned long n) { return net_recvfrom(fd, buf, n, 0, 0); }
-
-long net_recvfrom(int fd, void *buf, unsigned long n, char *host, int *port) {
+static long net_recvfrom(int fd, void *buf, unsigned long n, char *host, int *port) {
   Sock *s = sock(fd);
   if (s->udp) {  // a datagram, cut to n
     if (!s->in) return s->pcb ? BOBER_IO_AGAIN : -s->err;
@@ -228,17 +231,7 @@ long net_recvfrom(int fd, void *buf, unsigned long n, char *host, int *port) {
   return flushed(0), at || s->fin || s->shut == 2 ? at : s->pcb ? BOBER_IO_AGAIN : -s->err;
 }
 
-long net_write(int fd, const void *buf, unsigned long n) {
-  Sock *s = sock(fd);
-  if (s->udp) return net_sendto(fd, buf, n, 0, 0);
-  if (s->shut || !s->pcb) return s->shut || !s->err ? -EPIPE : -s->err;
-  struct tcp_pcb *pcb = s->pcb;
-  unsigned long k = n < tcp_sndbuf(pcb) ? n : tcp_sndbuf(pcb);
-  if (!s->connected || !k || tcp_write(pcb, buf, k, TCP_WRITE_FLAG_COPY) != ERR_OK) return BOBER_IO_AGAIN;
-  return tcp_output(pcb), flushed(k);
-}
-
-long net_sendto(int fd, const void *buf, unsigned long n, const char *host, int port) {
+static long net_sendto(int fd, const void *buf, unsigned long n, const char *host, int port) {
   Sock *s = sock(fd);
   struct udp_pcb *pcb = s->pcb;
   ip_addr_t ip;
@@ -254,7 +247,19 @@ long net_sendto(int fd, const void *buf, unsigned long n, const char *host, int 
   return pbuf_free(p), flushed(e == ERR_OK ? (long)n : failure(e));
 }
 
-long net_shutdown(int fd, int both) {
+static long net_read(int fd, void *buf, unsigned long n) { return net_recvfrom(fd, buf, n, 0, 0); }
+
+static long net_write(int fd, const void *buf, unsigned long n) {
+  Sock *s = sock(fd);
+  if (s->udp) return net_sendto(fd, buf, n, 0, 0);
+  if (s->shut || !s->pcb) return s->shut || !s->err ? -EPIPE : -s->err;
+  struct tcp_pcb *pcb = s->pcb;
+  unsigned long k = n < tcp_sndbuf(pcb) ? n : tcp_sndbuf(pcb);
+  if (!s->connected || !k || tcp_write(pcb, buf, k, TCP_WRITE_FLAG_COPY) != ERR_OK) return BOBER_IO_AGAIN;
+  return tcp_output(pcb), flushed(k);
+}
+
+static long net_shutdown(int fd, int both) {
   Sock *s = sock(fd);
   if (both || s->listening || s->udp) release(s, 0), s->shut = 2;
   else if (!s->pcb) return -ENOTCONN;
@@ -262,12 +267,12 @@ long net_shutdown(int fd, int both) {
   return flushed(0);
 }
 
-int net_idle(int fd) {
+static int net_idle(int fd) {
   Sock *s = sock(fd);
   return !s->in && !s->fin && s->pcb;
 }
 
-long net_name(int fd, int peer, char *host) {
+static long net_name(int fd, int peer, char *host) {
   Sock *s = sock(fd);
   if (!s || !s->pcb) return -ENOTCONN;
   struct tcp_pcb *t = s->pcb;
@@ -278,13 +283,7 @@ long net_name(int fd, int peer, char *host) {
   return s->udp ? (peer ? u->remote_port : u->local_port) : peer ? t->remote_port : t->local_port;
 }
 
-long net_close(int fd, int reset) {
-  Sock *s = sock(fd);
-  release(s, reset), free(s), socks[fd] = 0;
-  return flushed(close(fd) ? -errno : 0);
-}
-
-int net_ready(int fd, int write) {
+static int net_ready(int fd, int write) {
   Sock *s = sock(fd);
   if (!s) return -1;
   struct tcp_pcb *t = s->pcb;
@@ -292,7 +291,7 @@ int net_ready(int fd, int write) {
   return s->connected && tcp_sndbuf(t) && tcp_sndqueuelen(t) < TCP_SND_QUEUELEN;
 }
 
-long net_poll(void) {
+static long net_poll(void) {
   if (!netif_list) return 0;
   sys_check_timeouts(), flushed(0);
   for (long fd = 0; fd < nsocks; fd++)
@@ -304,3 +303,6 @@ long net_poll(void) {
     if (p->flags & TF_ACK_DELAY) return bober_mono() + sys_timeouts_sleeptime() * 1000000L;
   return 0;
 }
+
+struct bober_net bober_net = {net_dial, net_listen, net_accept, net_connected, net_read, net_write, net_recvfrom,
+                              net_sendto, net_shutdown, net_idle, net_name, net_close, net_ready, net_poll};
