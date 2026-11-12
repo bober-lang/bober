@@ -257,6 +257,18 @@ long bober_io_rename(const char *from, const char *to) { return result(rename(fr
 
 long bober_io_readlink(const char *path, void *buf, unsigned long n) { return result(readlink(path, buf, n)); }
 
+long bober_io_exe(char *buf) {
+#ifdef __APPLE__
+  int _NSGetExecutablePath(char *buf, uint32_t *size);  // of <mach-o/dyld.h>
+  char path[PATH_MAX] = "";
+  uint32_t n = sizeof path;
+  _NSGetExecutablePath(path, &n);
+#else
+  const char *path = "/proc/self/exe";
+#endif
+  return result(realpath(path, buf) ? (long)strlen(buf) : -1);
+}
+
 long bober_io_remove(const char *path) {
   struct stat s;
   return result(lstat(path, &s) ? -1 : S_ISDIR(s.st_mode) ? rmdir(path) : unlink(path));

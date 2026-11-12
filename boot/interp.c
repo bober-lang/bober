@@ -6,9 +6,6 @@
 #include <ffi.h>
 #endif
 #include <limits.h>
-#ifdef __APPLE__
-#include <mach-o/dyld.h>
-#endif
 #include <math.h>
 #include <pthread.h>
 #define GC_THREADS  // so that pthread_create registers the thread with the collector
@@ -1685,14 +1682,8 @@ static Mod *load(const char *path, Node *site) {
 static char *rooted(const char *path) {
   static char root[PATH_MAX];
   if (!*root) {
-#ifdef __APPLE__
-    char exe[PATH_MAX];
-    uint32_t n = sizeof exe;
-    _NSGetExecutablePath(exe, &n);
-    realpath(exe, root);
-#else
-    realpath("/proc/self/exe", root);
-#endif
+    long bober_io_exe(char *);
+    bober_io_exe(root);
     *strrchr(root, '/') = 0, *strrchr(root, '/') = 0;
   }
   char *p = alloc(strlen(root) + strlen(path) + 1);
