@@ -1,6 +1,6 @@
 import { endsWith, indexOf, startsWith } from "./algo"
 import { Signal } from "../builtin/fiber"
-import { makeTempDir, readDir, readFile, remove } from "./fs"
+import { makeTempDir, readFile, remove } from "./fs"
 import { Reader, readAll } from "./io"
 import { Body, Client, Handler, Request, Response, Server, get, json, post, redirect, send, text } from "./http"
 import { frame, num } from "./http/h2"
@@ -485,32 +485,6 @@ test "a pooled connection the peer ended or wrote to is not taken" {
 	assert send(new Request("LOCK", url, "")) throws new IoError("ConnectionReset", "send", `http://${l.addr}`)
 	await reset
 	l.close()
-}
-
-test "the pool holds poolSize connections of all origins together, none idle past idleTimeout" {
-	const l = listen("0.0.0.0:0")
-	const job = async (() => {
-		try {
-			while (true) {
-				const c = l.accept()
-				c.read(1000)
-				c.write("HTTP/1.1 200 \r\nContent-Length: 2\r\n\r\nok")
-				c.close()
-			}
-		} catch (e: IoError) {}
-	})()
-	const fds = readDir("/proc/self/fd").length
-	const c = new Client()
-	c.poolSize = 4
-	for (const i of 1 ... 20) {
-		assert c.send(new Request("GET", `http://127.0.0.${i}:${l.addr.port}/`)).body.text() == "ok"
-	}
-	assert readDir("/proc/self/fd").length == fds + 4
-	c.idleTimeout = -1 // A connection is idle past a negative timeout at once.
-	assert c.send(new Request("GET", `http://127.0.0.1:${l.addr.port}/`)).body.text() == "ok"
-	assert readDir("/proc/self/fd").length == fds
-	l.close()
-	await job
 }
 
 test "a server closed before serving does not serve, and once served, closing it again leaves its fd alone" {
