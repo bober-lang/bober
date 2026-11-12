@@ -1,7 +1,7 @@
 //! Mach-O, 64-bit, little-endian, of arm64 and x86-64: relocatable objects read as Objects, the names a dynamic library
 //! exports, and an Image written as a dynamic library. This is the only file of the linker that knows Mach-O.
 //!
-//! Names are as the files have them, C's with a leading `_`, and a library is named by its install name. Code unwinds
+//! Names are C's, which the files have after a `_`, and a library is named by its install name. Code unwinds
 //! by the DWARF call frame information of `__eh_frame` alone, which objects compiled with
 //! `-femit-dwarf-unwind=dwarf-only` have of every function; their compact unwind is dropped, as are debug sections.
 
@@ -165,7 +165,7 @@ function read(name: string, bytes: string): Object throws CompileError {
 	for (const e of 0 ... count - 1) {
 		// An nlist_64: the offset of its name in the strings, n_type, n_sect, n_desc and n_value.
 		const p = (u(bytes, symtab + 8, 4) as i32) + 16 * e
-		const sym = bounds(str(bytes, (u(bytes, symtab + 16, 4) + u(bytes, p, 4)) as i32))
+		const sym = named(str(bytes, (u(bytes, symtab + 16, 4) + u(bytes, p, 4)) as i32))
 		const nt = bytes[p + 4] as u64
 		const n = bytes[p + 5] as i32
 		const desc = u(bytes, p + 6, 2)
@@ -330,16 +330,16 @@ function fixup(x64: bool, rt: u64, pcrel: bool, size: u64): i32 {
 	}
 }
 
-/// sym, or the linker's name of the bound it is of a section: `__start_<sect>` of `section$start$<seg>$<sect>`, and
-/// `__stop_<sect>` of `section$end$<seg>$<sect>`.
-function bounds(sym: string): string {
+/// The linker's name of a file's sym: C's, which sym is after a `_`; and of the bound of a section, `__start_<sect>` of
+/// `section$start$<seg>$<sect>`, and `__stop_<sect>` of `section$end$<seg>$<sect>`. An archive's index has such too.
+export function named(sym: string): string {
 	for (const [mach, ours] of [["section$start$", "__start_"], ["section$end$", "__stop_"]]) {
 		const d = if (startsWith(sym, mach)) indexOf(sym, "$", mach.length) else -1
 		if (d >= 0) {
 			return ours + sym.slice(d + 1, sym.length)
 		}
 	}
-	return sym
+	return sym.slice(if (startsWith(sym, "_")) 1 else 0, sym.length)
 }
 
 /// The load commands of the Mach-O file bytes, read from the file name, of filetype: each its cmd and where it is.
@@ -395,7 +395,7 @@ function exports(name: string, bytes: string): string[] throws CompileError {
 	} catch (e: ParseError) {
 		throw new CompileError(`${name}: its export trie is truncated`)
 	}
-	return names
+	return names.map(named)
 }
 
 /// The image as a dynamic library: the segment `__TEXT` maps the headers and the segments not written, `__DATA` the one
@@ -454,7 +454,7 @@ function write(image: Image): string throws CompileError {
 		bind.u8(BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB)
 		bind.uleb((b.library + 1) as u64)
 		bind.u8(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | (if (b.weak) BIND_SYMBOL_FLAGS_WEAK_IMPORT else 0))
-		bind.raw(b.name + "\x00")
+		bind.raw("_" + b.name + "\x00")
 		bind.u8(BIND_OPCODE_SET_ADDEND_SLEB)
 		bind.sleb(b.addend)
 		bind.u8(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (where(b.at) as u8))
@@ -464,7 +464,7 @@ function write(image: Image): string throws CompileError {
 	bind.u8(0)
 	const rebased = padded(rebase.bytes)
 	const bound = padded(bind.bytes)
-	const exported = padded(trie(image.exports))
+	const exported = padded(trie(image.exports.map(e => ["_" + e[0], e[1]])))
 	const info = [place(rebased), rebased.length as u64, place(bound), bound.length as u64, 0, 0, 0, 0, place(exported),
 		exported.length as u64]
 
@@ -475,7 +475,7 @@ function write(image: Image): string throws CompileError {
 		const sect = if ((nt & N_TYPE) == N_UNDF) 0
 			else min(1 + (partitionPoint(sections, r => r[1] + r[2] > at) as u64), sections.length as u64)
 		syms += le(strs.length as u64, 4) + le(nt, 1) + le(sect, 1) + le(desc, 2) + le(at, 8)
-		strs += name + "\x00"
+		strs += "_" + name + "\x00"
 	}
 	const names = new HashMap[string, i32]()
 	for (const [name, _] of image.exports) {
@@ -668,5 +668,5 @@ function trie(exports: [string, u64][]): string {
 /// The name in the 16 bytes at at, padded with NULs.
 function name16(s: string, at: i32): string { return str(s.slice(at, at + 16) + "\x00", 0) }
 
-export const macho: Format = { headers: headers, bindsAnywhere: true, start: "___dso_handle", read: read,
+export const macho: Format = { headers: headers, bindsAnywhere: true, start: "__dso_handle", read: read,
 	exports: exports, write: write }
