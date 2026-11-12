@@ -1,0 +1,342 @@
+//! The system as std reaches it: files, sockets, paths, processes and the environment. A failure throws an IoError.
+
+import { BOBER_IO_AGAIN, BOBER_IO_HOST, bober_env, bober_io_accept, bober_io_close, bober_io_connected, bober_io_dial,
+	bober_io_idle, bober_io_ip, bober_io_ip_text, bober_io_kind, bober_io_list, bober_io_listen, bober_io_mkdir, bober_io_name,
+	bober_io_open, bober_io_read, bober_io_readlink, bober_io_ready, bober_io_recvfrom, bober_io_remove, bober_io_rename,
+	bober_io_reset, bober_io_run, bober_io_sendto, bober_io_shutdown, bober_io_stat, bober_io_sync, bober_io_write, bober_mono,
+	bober_tz } from "../src/rt.h"
+import { fromC } from "./c"
+import { IoError, Kind } from "./error"
+import { fromBytes } from "./string"
+
+/// The IoError of r < 0, a failure of the run time's I/O or of C glue such as std/tls's, as op's on what.
+export function failure(r: i64, op: string, what: string): IoError {
+	return new IoError(fromC(bober_io_kind(r)) as Kind, op, what)
+}
+
+/// r, a result of the run time's I/O, unless a failure, which it throws as op's on what.
+function checked(r: i64, op: string, what: string): i64 throws IoError {
+	if (r < 0) {
+		throw failure(r, op, what)
+	}
+	return r
+}
+
+const chunk: i32 = 1 << 16
+// What reads of up to chunk bytes share: one writes it only in the call of the run time's, which never parks, and
+// copies what came before it returns.
+let scratch = new u8[](chunk)
+
+/// An open file or socket. A call that can wait parks its fiber alone, until by, a monotonic() time, 0 for no limit,
+/// then throws TimedOut; once the handle is closed, a call throws BadResource.
+export class Handle {
+	private fd: i32 = -1
+	private closed = false
+
+	/// The standard input, 0, output, 1, or error, 2.
+	static stdio(n: i32): Handle { return Handle.of(n) }
+
+	/// The file at path, opened as C's fopen's mode: "r", "w", "a" or "x", and "+".
+	static open(path: string, mode: string): Handle throws IoError {
+		return Handle.of(checked(bober_io_open(cPath("open", path), mode), "open", path) as i32)
+	}
+
+	/// A socket of net, "tcp" or "udp", connected to host, an IP or a Unix socket's path, and port; a failure is of
+	/// "host:port", or the path.
+	static dial(net: string, host: string, port: i32, by: i64 = 0): Handle throws IoError {
+		const what = address(host, port)
+		const h = Handle.of(checked(bober_io_dial(net, cPath("dial", host), port), "dial", what) as i32)
+		try {
+			// Parked even if connected at once, as on loopback, so that a listener on another fiber gets to accept.
+			checked(bober_io_ready(h.fd, 1, left(by)), "dial", what)
+			checked(bober_io_connected(h.fd), "dial", what)
+			return h
+		} catch (e: IoError) {
+			h.closed = true
+			bober_io_close(h.fd)
+			throw e
+		}
+	}
+
+	/// A socket of net bound to host and port, as dial takes them, and listening unless "udp".
+	static listen(net: string, host: string, port: i32, backlog: i32 = 1024): Handle throws IoError {
+		return Handle.of(checked(bober_io_listen(net, cPath("listen", host), port, backlog), "listen", address(host, port)) as i32)
+	}
+
+	static private of(fd: i32): Handle {
+		const h = new Handle()
+		h.fd = fd
+		return h
+	}
+
+	/// Up to n > 0 bytes, or null at the end or once close interrupts the read.
+	read(n: i32, by: i64 = 0): string | null throws IoError {
+		const buf = if (n <= chunk) scratch else new u8[](n)
+		const got = this.waited(false, by, "read", () => bober_io_read(this.fd, buf, n as u64)) as i32
+		return if (got == 0) null else fromBytes(buf.slice(0, got))
+	}
+
+	/// Writes all of s.
+	write(s: string, by: i64 = 0) throws IoError {
+		let at = 0
+		while (at < s.length) {
+			const rest = s.slice(at, s.length)
+			at += this.waited(true, by, "write", () => bober_io_write(this.fd, rest, rest.length as u64)) as i32
+		}
+	}
+
+	/// The next connection to the listening socket.
+	accept(by: i64 = 0): Handle throws IoError {
+		return Handle.of(this.waited(false, by, "accept", () => bober_io_accept(this.fd)) as i32)
+	}
+
+	/// The next datagram, cut to n bytes, and its sender's host and port.
+	receive(n: i32, by: i64 = 0): [string, string, u16] throws IoError {
+		const buf = if (n <= chunk) scratch else new u8[](n)
+		const host = new u8[](BOBER_IO_HOST)
+		const port = new i32[](1)
+		const got = this.waited(false, by, "receive", () => bober_io_recvfrom(this.fd, buf, n as u64, host, port)) as i32
+		return [fromBytes(buf.slice(0, got)), upToNul(host), port[0] as u16]
+	}
+
+	/// Sends data as one datagram to host and port.
+	send(data: string, host: string, port: i32, by: i64 = 0) throws IoError {
+		this.waited(true, by, "send", () => bober_io_sendto(this.fd, data, data.length as u64, cPath("send", host), port))
+	}
+
+	/// The socket's host and port, as dial takes them.
+	local(): [string, u16] throws IoError { return this.name(0) }
+	/// Those of the socket's peer.
+	peer(): [string, u16] throws IoError { return this.name(1) }
+
+	/// Parks until it is ready to read: whether it is by then. Closed, it is: a call fails at once.
+	ready(by: i64): bool { return this.closed || bober_io_ready(this.fd, 0, left(by)) == 0 }
+
+	/// Whether the socket is open, with nothing unread and its peer not ended; never waits.
+	idle(): bool { return !this.closed && bober_io_idle(this.fd) != 0 }
+
+	/// Ends the socket's writes, or if both its reads too, waking the calls waiting; the peer reads an end.
+	shutdown(both: bool = false) throws IoError {
+		this.alive("shutdown")
+		this.checked(bober_io_shutdown(this.fd, if (both) 1 else 0), "shutdown")
+	}
+
+	/// Closes the socket with a reset: the peer's calls fail with ConnectionReset.
+	reset() throws IoError {
+		this.alive("reset")
+		this.closed = true
+		this.checked(bober_io_reset(this.fd), "reset")
+	}
+
+	/// Waits until what was written is on the device.
+	sync() throws IoError {
+		this.alive("sync")
+		this.checked(bober_io_sync(this.fd), "sync")
+	}
+
+	/// Closes it, waking the calls waiting; again, nothing.
+	close() throws IoError {
+		if (!this.closed) {
+			this.closed = true
+			this.checked(bober_io_close(this.fd), "close")
+		}
+	}
+
+	/// The descriptor, for C glue alone, as std/tls's, that makes the system's calls on it itself.
+	raw(): i32 { return this.fd }
+
+	/// What call gives, called again each time it would block once the handle is ready to read or, if write, to write.
+	/// Woken by close, a read gives 0, the end; another call throws.
+	private waited(write: bool, by: i64, op: string, call: () => i64): i64 throws IoError {
+		this.alive(op)
+		while (true) {
+			const r = call()
+			if (r != BOBER_IO_AGAIN) {
+				return this.checked(r, op)
+			}
+			this.checked(bober_io_ready(this.fd, if (write) 1 else 0, left(by)), op)
+			if (this.closed && op == "read") {
+				return 0
+			}
+			this.alive(op)
+		}
+	}
+
+	private name(peer: i32): [string, u16] throws IoError {
+		this.alive("sockname")
+		const host = new u8[](BOBER_IO_HOST)
+		const port = this.checked(bober_io_name(this.fd, peer, host), "sockname")
+		return [upToNul(host), port as u16]
+	}
+
+	private checked(r: i64, op: string): i64 throws IoError {
+		if (r < 0) {
+			throw failure(r, op, `${this.fd}`)
+		}
+		return r
+	}
+
+	// Once closed, the descriptor may be another's.
+	private alive(op: string) throws IoError {
+		if (this.closed) {
+			throw new IoError("BadResource", op, `${this.fd}`)
+		}
+	}
+}
+
+/// "host:port", a v6 host in brackets, or a Unix socket's path.
+function address(host: string, port: i32): string {
+	return if (port == 0 && host.some(c => c == 0x2f)) host else if (host.some(c => c == 0x3a)) `[${host}]:${port}`
+		else `${host}:${port}`
+}
+
+/// The ns from now until by, at least 1; 0, no limit, for by 0.
+function left(by: i64): i64 {
+	const t = by - bober_mono()
+	return if (by == 0) 0 else if (t < 1) 1 else t
+}
+
+/// What stat finds of a file; times are in ns since the epoch.
+export class FileInfo {
+	isFile: bool
+	isDirectory: bool
+	isSymlink: bool
+	size: i64
+	/// The permission bits.
+	mode: u32
+	modified: i64
+	accessed: i64
+	/// Null where the file system does not keep it.
+	born: i64 | null
+}
+
+/// Of the file at path, following a last symlink if follow.
+export function stat(path: string, follow: bool): FileInfo throws IoError {
+	const op = if (follow) "stat" else "lstat"
+	const s = bober_io_stat(cPath(op, path), if (follow) 1 else 0)
+	checked(s.err, op, path)
+	const i = new FileInfo()
+	const kind = fromC(s.kind)
+	i.isFile = kind == "file"
+	i.isDirectory = kind == "directory"
+	i.isSymlink = kind == "symlink"
+	i.size = s.size
+	i.mode = s.perm
+	i.modified = s.modified
+	i.accessed = s.accessed
+	i.born = if (s.born == 0) null else s.born
+	return i
+}
+
+export class DirEntry {
+	name: string
+	isFile: bool
+	isDirectory: bool
+	isSymlink: bool
+}
+
+/// The entries of the directory at path.
+export function readDir(path: string): DirEntry[] throws IoError {
+	let buf = new u8[](1 << 16)
+	let n = checked(bober_io_list(cPath("readDir", path), buf, buf.length as u64), "readDir", path) as i32
+	while (n > buf.length) {
+		buf = new u8[](2 * n) // with room for what is added meanwhile
+		n = checked(bober_io_list(path, buf, buf.length as u64), "readDir", path) as i32
+	}
+	const entries: DirEntry[] = []
+	let i = 0
+	while (i < n) {
+		const name = nul(buf, i)
+		const end = nul(buf, name + 1)
+		const kind = fromBytes(buf.slice(name + 1, end))
+		const e = new DirEntry()
+		e.name = fromBytes(buf.slice(i, name))
+		e.isFile = kind == "file"
+		e.isDirectory = kind == "directory"
+		e.isSymlink = kind == "symlink"
+		entries.push(e)
+		i = end + 1
+	}
+	return entries
+}
+
+export function mkdir(path: string) throws IoError { checked(bober_io_mkdir(cPath("mkdir", path)), "mkdir", path) }
+
+/// Removes a file or an empty directory.
+export function remove(path: string) throws IoError { checked(bober_io_remove(cPath("remove", path)), "remove", path) }
+
+export function rename(from: string, to: string) throws IoError {
+	checked(bober_io_rename(cPath("rename", from), cPath("rename", to)), "rename", from)
+}
+
+/// What the symlink at path points to.
+export function readlink(path: string): string throws IoError {
+	const buf = new u8[](4096)
+	const n = checked(bober_io_readlink(cPath("readlink", path), buf, 4096), "readlink", path)
+	return fromBytes(buf.slice(0, n as i32))
+}
+
+/// Runs argv as std/process's run does.
+export function run(argv: string[], out: string | null = null): i32 throws IoError {
+	for (const a of argv) {
+		cPath("run", a)
+	}
+	if (out != null) {
+		cPath("run", out!)
+	}
+	return checked(bober_io_run(argv[0], argv, out ?? (0 as u64)), "run", argv[0]) as i32
+}
+
+/// The value of the environment variable name, null if it is unset.
+export function env(name: string): string | null {
+	const p = bober_env(name)
+	return if (p == 0) null else fromC(p)
+}
+
+/// The local time zone as POSIX's TZ gives it, null if TZ is unset; in tests "UTC".
+export function tz(): string | null {
+	const p = bober_tz()
+	return if (p == 0) null else fromC(p)
+}
+
+/// The time in ns since a fixed point, which nothing sets back or forward.
+export function monotonic(): i64 { return bober_mono() }
+
+/// path, unless it holds a NUL, which C would take as its end: then an IoError, as op's.
+function cPath(op: string, path: string): string throws IoError {
+	for (const c of path) {
+		if (c == 0) {
+			throw new IoError("InvalidInput", op, path)
+		}
+	}
+	return path
+}
+
+/// The index of the first NUL in buf from i, or its length.
+function nul(buf: u8[], i: i32): i32 {
+	let j = i
+	while (j < buf.length && buf[j] != 0) {
+		j++
+	}
+	return j
+}
+
+/// Whether text is an IP, v4 or v6.
+export function isIp(text: string): bool { return ipBytes(text) != null }
+
+/// The 4 or 16 bytes of the IP text; null if it is not one.
+export function ipBytes(text: string): string | null {
+	const ip = new u8[](16)
+	const n = bober_io_ip(text, ip)
+	return if (n == 0) null else fromBytes(ip.slice(0, n))
+}
+
+/// The text of an IP of 4 or 16 bytes.
+export function ipText(ip: string): string {
+	const out = new u8[](BOBER_IO_HOST)
+	bober_io_ip_text(ip, ip.length, out)
+	return upToNul(out)
+}
+
+/// The text in buf up to its first NUL.
+function upToNul(buf: u8[]): string { return fromBytes(buf.slice(0, nul(buf, 0))) }

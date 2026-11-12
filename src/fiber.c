@@ -23,7 +23,7 @@ typedef struct Fiber {
   char *stack;  // null for the first fiber, on the process's stack
   unw_context_t parked;
   void *run;  // the function value a new fiber runs, until it starts
-  struct Fiber *later;  // in the queue of those ready
+  struct Fiber *later;  // in the queue of those ready; 0 if not queued or last
   int dropped;          // by bober_fibers_reset; bober_wake ignores it
 } Fiber;
 
@@ -81,6 +81,7 @@ static void next(void) {
     if (!bober_io_wait()) bober_trap("every fiber is parked", 0, -1);
   Fiber *f = ready;
   if (!(ready = f->later)) last = 0;
+  f->later = 0;
   if (f != running) to(f);
 }
 
@@ -123,8 +124,7 @@ void bober_park(void) { next(); }
 
 void bober_wake(uint64_t f) {
   Fiber *w = (Fiber *)(uintptr_t)f;
-  if (w->dropped) return;
-  w->later = 0;
+  if (w->dropped || w->later || w == last) return;  // dropped, or queued already
   if (last) last->later = w;
   else ready = w;
   last = w;
@@ -151,6 +151,6 @@ void bober_fibers_reset(void) {
     if (f != &first) munmap(f->stack, STACK), f->dropped = 1;
   }
   if (dead) munmap(dead->stack, STACK), free(dead), dead = 0;
-  running = &first, ready = last = 0;
+  running = &first, first.later = 0, ready = last = 0;
   onto(&first, &ran);
 }

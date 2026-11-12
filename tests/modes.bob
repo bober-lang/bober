@@ -177,6 +177,36 @@ test "a Type shows as its name, as an element too, and through a type param" {
 	assert `${i32} ${[Mark, string[]]} ${shown(1)}` == "i32 [Mark, string[]] i32"
 }
 
+function bits[T](): i32 { return T.bits }
+
+test "a number type's bits, through a type param too, and 0 for any other type" {
+	assert u8.bits == 8 && f64.bits == 64 && bits[i16]() == 16 && bits[f32]() == 32 && bits[string]() == 0
+}
+
+interface Num extends i8 | u16 | f64 {}
+
+/// T is an integer type after the if, which returns where it is a float.
+function ones[T extends Num](): T {
+	if (T.kind == "float") {
+		return 0.5
+	}
+	return ~(0 as T)
+}
+
+test "an if of a param's kind that returns narrows the param after it to the other kinds" {
+	assert ones[i8]() == -1 && ones[u16]() == 65535 && ones[f64]() == 0.5
+}
+
+interface Sized { size: i32 }
+
+class Box { size = 3 }
+
+test "a class spread into an array of an interface is one of the interface's" {
+	const boxes = [new Box()]
+	const all: Sized[] = [...boxes]
+	assert all[0].size == 3
+}
+
 test "Types are known through an array literal, a generic, and a closure of a call taking them" {
 	assert unmarked([i32, string]) && unmarked(id(Rec.fields[1].tags)) && !unmarked(id(Rec.fields[0].tags))
 }

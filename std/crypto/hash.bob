@@ -1,7 +1,6 @@
 //! Digests, MACs and keys from secrets: by Monocypher BLAKE2b, SHA-512 with its HMAC and HKDF, and Argon2id; by Mbed
 //! TLS's PSA crypto SHA-256 with its HMAC.
 
-import { toCBytes } from "../c"
 import { CryptoError } from "./error"
 import { CRYPTO_ARGON2_ID, crypto_argon2, crypto_argon2_config, crypto_argon2_extras, crypto_argon2_inputs,
 	crypto_blake2b_keyed } from "../../vendor/monocypher/monocypher.h"
@@ -10,7 +9,8 @@ import { PSA_ALG_HASH_MASK, PSA_ALG_HMAC_BASE, PSA_ALG_SHA_256, PSA_KEY_TYPE_HMA
 	psa_crypto_init, psa_destroy_key, psa_hash_compute, psa_import_key, psa_key_attributes_t, psa_mac_compute,
 	psa_set_key_algorithm, psa_set_key_type,
 	psa_set_key_usage_flags } from "../../vendor/mbedtls/tf-psa-crypto/include/psa/crypto.h"
-import { bober_free, bober_malloc } from "../../src/rt.h"
+import { free, malloc } from "../../builtin/c"
+import { memcpy } from "string.h"
 
 export function sha512(data: string): string {
 	const h = new u8[](64)
@@ -84,18 +84,25 @@ export function argon2id(password: string, salt: string, size: i32 = 32, kib: i3
 	c.nb_blocks = kib as u32
 	c.nb_passes = passes as u32
 	c.nb_lanes = 1
-	const i = new crypto_argon2_inputs() // whose pointers are u64 fields, so to C's memory
-	i.pass = toCBytes(password)
+	const i = new crypto_argon2_inputs() // whose pointers are u64 fields, so to C's memory, which copy gives
+	i.pass = copy(password)
 	i.pass_size = password.length as u32
-	i.salt = toCBytes(salt)
+	i.salt = copy(salt)
 	i.salt_size = salt.length as u32
-	const work = bober_malloc(1024 * (kib as u64))
+	const work = malloc(1024 * (kib as u64))
 	const h = new u8[](size)
 	crypto_argon2(h, size as u32, work, c, i, new crypto_argon2_extras())
-	bober_free(work)
-	bober_free(i.pass)
-	bober_free(i.salt)
+	free(work)
+	free(i.pass)
+	free(i.salt)
 	return fromBytes(h)
+}
+
+/// s's bytes in C's memory, for the caller to free.
+function copy(s: string): u64 {
+	const p = malloc(s.length as u64)
+	memcpy(p, s, s.length as u64)
+	return p
 }
 
 /// Whether a == b, in time that depends only on their lengths, for comparing MACs.

@@ -1,68 +1,7 @@
 //! Streams of bytes, after Deno's std/io: a Reader gives the bytes that come next, a Writer takes them, and a File
-//! does both on a descriptor. Every call goes through the run time's I/O (src/rt.h); one that fails throws an IoError.
+//! does both on a handle of the system's. A call that fails throws an IoError.
 
-import { fromCString } from "./c"
-import { BOBER_IO_AGAIN, bober_io_close, bober_io_kind, bober_io_read, bober_io_ready, bober_io_sync,
-	bober_io_write } from "../src/rt.h"
-
-/// What went wrong, named as Deno names its errors; Other for what is not named here. Tls is std/tls's.
-export type Kind = "NotFound" | "AlreadyExists" | "PermissionDenied" | "IsADirectory" | "NotADirectory" | "NotEmpty"
-	| "BrokenPipe" | "BadResource" | "ConnectionRefused" | "ConnectionReset" | "ConnectionAborted" | "NotConnected"
-	| "AddrInUse" | "AddrNotAvailable" | "TimedOut" | "Protocol" | "TooLarge" | "InvalidInput" | "OutOfResources"
-	| "Unsupported" | "Tls" | "Other"
-
-export class IoError {
-	kind: Kind
-	/// The call that failed and the path or descriptor it was given.
-	op: string
-	what: string
-
-	constructor(kind: Kind, op: string, what: string) {
-		this.kind = kind
-		this.op = op
-		this.what = what
-	}
-
-	message(): string { return `${this.op} ${this.what}: ${this.kind}` }
-}
-
-/// r, a result of the run time's I/O, unless it is a failure, which it throws as op's on what.
-export function checked(r: i64, op: string, what: string): i64 throws IoError {
-	if (r < 0) {
-		throw failure(r, op, what)
-	}
-	return r
-}
-
-/// The IoError of r, a failure of the run time's I/O, as op's on what.
-export function failure(r: i64, op: string, what: string): IoError {
-	return new IoError(fromCString(bober_io_kind(r)) as Kind, op, what)
-}
-
-/// What call, of the run time's I/O on fd, gives; each time it would block, this parks until fd is ready to read or,
-/// if write, to write, for at most timeout ns, 0 for no limit, and calls it again. A failure is thrown as op's on what.
-export function waited(fd: i32, write: bool, timeout: i64, op: string, what: string,
-	call: () => i64 throws IoError): i64 throws IoError {
-	while (true) {
-		const r = call()
-		if (r != BOBER_IO_AGAIN) {
-			return checked(r, op, what)
-		}
-		checked(bober_io_ready(fd, if (write) 1 else 0, timeout), op, what)
-	}
-}
-
-/// The buffer received reads up to chunk bytes into. Fibers can share it, as a read writes it only in the call of the
-/// run time's, which never parks, and received copies what came before it returns.
-let scratch = new u8[](chunk)
-
-/// Up to n > 0 bytes that read, a read of the run time's of at most n bytes into the buffer it is given, gives; null
-/// at the end.
-export function received(n: i32, read: (buf: u8[]) => i64 throws IoError): string | null throws IoError {
-	const buf = if (n <= chunk) scratch else new u8[](n)
-	const got = read(buf) as i32
-	return if (got == 0) null else fromBytes(buf.slice(0, got))
-}
+import { Handle } from "../builtin/sys"
 
 export interface Reader {
 	/// Up to n > 0 bytes, or null at the end.
@@ -74,36 +13,39 @@ export interface Writer {
 	write(s: string) throws IoError
 }
 
-export interface ReadWriter { ...Reader, ...Writer }
-
-/// An open file descriptor.
-export class File implements ReadWriter {
-	readonly fd: i32
-
-	constructor(fd: i32) { this.fd = fd }
-
-	read(n: i32): string | null throws IoError {
-		const what = `${this.fd}`
-		return received(n, buf => waited(this.fd, false, 0, "read", what, () => bober_io_read(this.fd, buf, n as u64)))
-	}
-
-	write(s: string) throws IoError {
-		const what = `${this.fd}`
-		let at = 0
-		while (at < s.length) {
-			const rest = s.slice(at, s.length)
-			at += waited(this.fd, true, 0, "write", what, () => bober_io_write(this.fd, rest, rest.length as u64)) as i32
-		}
-	}
-
-	/// Waits until what was written is on the device.
-	sync() throws IoError { checked(bober_io_sync(this.fd), "sync", `${this.fd}`) }
-	close() throws IoError { checked(bober_io_close(this.fd), "close", `${this.fd}`) }
+export interface Closer {
+	/// Frees what it holds; again, nothing.
+	close() throws IoError
 }
 
-export const stdin = new File(0)
-export const stdout = new File(1)
-export const stderr = new File(2)
+export interface ReadWriter { ...Reader, ...Writer }
+export interface ReadCloser { ...Reader, ...Closer }
+export interface ReadWriteCloser { ...ReadWriter, ...Closer }
+
+/// A connection, as net.Conn and tls.Conn are.
+export interface Stream {
+	...ReadWriteCloser
+	/// For each read and write, in ns; 0 for none.
+	timeout: i64
+}
+
+/// An open file.
+export class File implements ReadWriteCloser {
+	private h: Handle
+
+	constructor(h: Handle) { this.h = h }
+
+	read(n: i32): string | null throws IoError { return this.h.read(n) }
+	write(s: string) throws IoError { this.h.write(s) }
+	/// Waits until what was written is on the device.
+	sync() throws IoError { this.h.sync() }
+	/// Closes it; again, nothing.
+	close() throws IoError { this.h.close() }
+}
+
+export const stdin = new File(Handle.stdio(0))
+export const stdout = new File(Handle.stdio(1))
+export const stderr = new File(Handle.stdio(2))
 /// How many bytes readAll and copy ask for at a time.
 const chunk: i32 = 1 << 16
 

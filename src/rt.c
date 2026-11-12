@@ -31,7 +31,11 @@ static uint64_t seed;  // random's state
 #define OBERGEFELL 1435327200000000000
 #define STONEWALL 0x19690628
 
-static jmp_buf test;
+static jmp_buf *test;    // where a trap in the running test or subtest goes
+static char path[1024];  // the running test's name, then its running subtests', each after " / "
+static int subfailed;    // the running test's failed subtests
+static const char *testFile;  // the running test's source
+static int32_t testAt;        // where in it the statement running is, -1 before the first
 /// Reserves the heap (src/gc.c), before any code runs that may store to it.
 void bober_gc_start(void);
 /// Drops every fiber but the first (src/fiber.c), as once a trap jumped back to it.
@@ -74,7 +78,13 @@ _Noreturn void bober_trap(const char *what, const char *file, int32_t at) {
   if (line) snprintf(msg, sizeof msg, "%s:%d:%d: trap: %s", file, line, col, what);
   else if (file) snprintf(msg, sizeof msg, "%s: trap: %s", file, what);
   else snprintf(msg, sizeof msg, "trap: %s", what);
-  if (testing) longjmp(test, 1);
+  int testLine, testCol;  // of the test's statement running, noted if the trap is not on its line
+  position(testFile, testing ? testAt : -1, &testLine, &testCol);
+  if (testLine && (!file || strcmp(file, testFile) || line != testLine)) {
+    size_t n = strlen(msg);
+    snprintf(msg + n, sizeof msg - n, " (called at %s:%d)", testFile, testLine);
+  }
+  if (testing) longjmp(*test, 1);
   put(2, msg, strlen(msg)), put(2, "\n", 1);
   exit(1);
 }
@@ -103,6 +113,12 @@ static int show(char *buf, int n, int32_t kind, int64_t bits, const uint8_t *ref
   }
   default: return snprintf(buf, n, "<value>");
   }
+}
+
+_Noreturn void bober_fail(const uint8_t *how, const char *file, int32_t at) {
+  char what[2048] = "assert failed: ";
+  show(what + 15, sizeof what - 15, 13, 0, how);
+  bober_trap(what, file, at);
 }
 
 void bober_throw(int64_t tag, int64_t bits, void *ref, const char *file, int32_t at) {
@@ -171,19 +187,39 @@ const char *bober_arg(int32_t i) { return i < argc_ ? argv_[i] : 0; }
 
 const char *bober_env(const char *name) { return getenv(name); }
 
-/// Runs a test, printing whether it passed; a trap fails it.
-void bober_test(const char *name, void (*f)(void)) {
-  testing = true, seed = STONEWALL;
-  if (setjmp(test)) {
-    bober_fibers_reset();
-    char line[sizeof msg + 256];
-    put(1, line, snprintf(line, sizeof line, "FAIL %s: %s\n", name, msg));
-    failed = true;
+/// Prints that the test or subtest at path failed with msg.
+static void fail(void) {
+  bober_fibers_reset();
+  char line[sizeof msg + sizeof path + 16];
+  put(1, line, snprintf(line, sizeof line, "FAIL %s: %s\n", path, msg));
+  failed = true;
+}
+
+/// Runs a test, printing whether it passed; a trap fails it, as a failed subtest does once it returns.
+void bober_test(const char *name, const char *file, void (*f)(void)) {
+  testing = true, seed = STONEWALL, subfailed = 0, testFile = file, testAt = -1;
+  snprintf(path, sizeof path, "%s", name);
+  jmp_buf here;
+  if (setjmp(*(test = &here))) {
+    fail();
     return;
   }
   f();
-  put(1, "ok ", 3), put(1, name, strlen(name)), put(1, "\n", 1);
+  if (subfailed) snprintf(msg, sizeof msg, "failed subtests: %d", subfailed), fail();
+  else put(1, "ok ", 3), put(1, name, strlen(name)), put(1, "\n", 1);
 }
+
+void bober_subtest(const char *name, uint64_t f) {
+  size_t n = strlen(path);
+  snprintf(path + n, sizeof path - n, " / %s", name);
+  jmp_buf here, *up = test;
+  if (setjmp(*(test = &here))) fail(), subfailed++;
+  else (*(void (**)(void *))f)((void *)(uintptr_t)f);
+  test = up;
+  path[n] = 0;
+}
+
+void bober_mark(int32_t at) { testAt = at; }
 
 int32_t bober_tested(void) { return failed; }
 

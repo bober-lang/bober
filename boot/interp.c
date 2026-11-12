@@ -45,7 +45,7 @@ enum { UNINIT, BUSY, DONE };
 
 typedef struct Handler { struct Handler *up; jmp_buf jb; int depth; } Handler;
 
-Type *anytype;
+Type *anytype, *readonly; // readonly marks a `T[readonly]`, any value there.
 static Type *prims[K_STR + 1], *fntype, anyarr = {T_ARR}, anyobj = {T_OBJ};
 static Handler *handlers;
 static jmp_buf trapjb;
@@ -57,7 +57,7 @@ static Node *thrownat;
 static int depth, argc_;
 static char **argv_;
 static Mod *mods, *prelude, *strmethods, *arrmethods, *mem;
-static Sym *s_length, *s_toString, *s_constructor, *s_main, *s_members, *s_value, *s_kind, *s_name, *s_fields, *s_elem, *s_tags, *s_base, *s_args, *s_field[4];
+static Sym *s_length, *s_toString, *s_constructor, *s_main, *s_members, *s_value, *s_kind, *s_name, *s_fields, *s_elem, *s_tags, *s_base, *s_args, *s_bits, *s_field[4];
 static const char *primnames[] = {"null", "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "", "f32", "f64", "",
   "string"};
 
@@ -609,6 +609,10 @@ static Arr *fields(Type *t, Node *site) {
   return a;
 }
 
+// A number type's bits, as Type's bits gives them.
+static const int numbits[K_FLT] = {[K_I8] = 8, [K_I16] = 16, [K_I32] = 32, [K_I64] = 64, [K_U8] = 8, [K_U16] = 16,
+  [K_U32] = 32, [K_U64] = 64, [K_F32] = 32, [K_F64] = 64};
+
 static Val member(Val o, Node *n, int bind) {
   Sym *s = n->sym;
   Global *g = 0;
@@ -633,6 +637,7 @@ static Val member(Val o, Node *n, int bind) {
     if (s == s_args) return A(o.t->args ? o.t->args : mkarr(0));
     if (s == s_base) return TY(o.t->base ? o.t->base : o.t);
     if (o.t->tk == T_ARR && s == s_elem) return TY(o.t->elem ? o.t->elem : anytype);
+    if (s == s_bits) return I(K_I32, o.t->tk == T_PRIM && o.t->prim < K_FLT ? numbits[o.t->prim] : 0);
     if (o.t->tk == T_ARR && o.t->n >= 0 && s == s_length) return I(K_I32, o.t->n);
     if (o.t->tk == T_LIT && s == s_value) return o.t->lit;
     if (o.t->tk == T_UNION && s == s_members) {
@@ -681,7 +686,7 @@ static Val subscript(Val o, Node *n, Frame *f) {
     return TY(t);
   }
   if (o.k == K_TYPE && o.t->tk == T_CLASS && o.t->cls->def->ntp) return TY(instance(o.t->cls, n, f)->type);
-  if (o.k == K_TYPE) return o;
+  if (o.k == K_TYPE) return i.k == K_TYPE && i.t == readonly ? TY(anytype) : o;
   trap(n, "cannot subscript");
 }
 
@@ -960,12 +965,16 @@ static Val get(Type *t, ffi_type *ct, char *p) {
 /// Whether param q of a C function is a struct through a pointer: a class, not ...T (3.1).
 static int byref(Node *q, Frame *f) { return !(q->flags & F_EMBED) && q->a && evaltype(q->a, f)->tk == T_CLASS; }
 
-/// The array member of t if param q of a C function is a pointer that takes string | T[] | u64 (3.1), else 0.
+/// Whether t is string.
+static int isstr(Type *t) { return t->tk == T_PRIM && t->prim == K_STR; }
+
+/// The array member of t if param q of a C function is a pointer that takes string | T[] | u64 (3.1), else 0; of
+/// string[] | u64[] | u64, the u64[].
 static Type *elems(Node *q, Frame *f) {
-  Type *t = q->a ? evaltype(q->a, f) : 0;
+  Type *t = q->a ? evaltype(q->a, f) : 0, *r = 0;
   for (int i = 0; t && t->tk == T_UNION && i < t->n; i++)
-    if (t->mem[i]->tk == T_ARR) return t->mem[i];
-  return 0;
+    if (t->mem[i]->tk == T_ARR && (!r || isstr(r->elem))) r = t->mem[i];
+  return r;
 }
 
 static Fn *external(Node *d, Frame *f) {
@@ -988,14 +997,24 @@ static Val ccall(Fn *fn, Val *args, int na, Node *site) {
   char *refs[na + 1];  // the copy of each instance passed through a pointer, which C's changes go back from
   ffi_type *ct[na + 1];
   char *bufs[na + 1];  // the copy of each string or array passed through a pointer, which an array's changes go back from
+  char strs[na + 1];   // whether bufs[i] is a string[]'s copies, which go nowhere back
   for (int i = 0; i < na; i++) {
     Type *t = evaltype(d->v[i]->a, fn->env), *e = elems(d->v[i], fn->env);
     refs[i] = byref(d->v[i], fn->env) ? alloca((ct[i] = cty(t, 1, site))->size) : 0;
-    bufs[i] = 0;
+    bufs[i] = 0, strs[i] = 0;
     if (refs[i]) put(t, ct[i], args[i], refs[i], site), p[i] = &refs[i];
     else if (e && args[i].k == K_STR) {
       bufs[i] = calloc(args[i].s->len + 1, 1), p[i] = &bufs[i];
       memcpy(bufs[i], args[i].s->p, args[i].s->len);
+    } else if (e && args[i].k == K_ARR && (!args[i].a->len || args[i].a->v[0].k == K_STR)) {
+      size_t size = (args[i].a->len + 1) * sizeof(char *);  // the strings' addresses and a null pointer, then copies
+      for (int j = 0; j < args[i].a->len; j++) size += args[i].a->v[j].s->len + 1;
+      char **s = calloc(size, 1), *q = (char *)(s + args[i].a->len + 1);
+      for (int j = 0; j < args[i].a->len; j++) {
+        Str *x = args[i].a->v[j].s;
+        memcpy(s[j] = q, x->p, x->len), q += x->len + 1;
+      }
+      bufs[i] = (char *)s, strs[i] = 1, p[i] = &bufs[i];
     } else if (e && args[i].k == K_ARR) {
       int j = 0;
       while (j < i && !(bufs[j] && args[j].k == K_ARR && args[j].a == args[i].a)) j++;
@@ -1012,7 +1031,7 @@ static Val ccall(Fn *fn, Val *args, int na, Node *site) {
   for (int i = 0; i < na; i++) {  // in fresh values, so an embedded instance is replaced, not changed
     Type *t = evaltype(d->v[i]->a, fn->env), *e = elems(d->v[i], fn->env);
     if (refs[i]) memcpy(args[i].o->v, get(t, ct[i], refs[i]).o->v, nfields(t) * sizeof(Val));
-    if (bufs[i] && args[i].k == K_ARR)
+    if (bufs[i] && args[i].k == K_ARR && !strs[i])
       for (int j = 0; j < args[i].a->len; j++) args[i].a->v[j] = get(e->elem, ct[i], bufs[i] + j * ct[i]->size);
     free(bufs[i]);
   }
@@ -1421,51 +1440,27 @@ static Val bi_chr(Val self, Val *a, int n, Node *site) {
 }
 
 static Val bi_fromBytes(Val self, Val *a, int n, Node *site) {
-  if (!n || a[0].k != K_ARR) trap(site, "not an array");
+  if (n && a[0].k != K_ARR) {  // the n bytes at an address
+    char *p = (char *)(intptr_t)a[0].i;
+    if (!p && n > 1 && a[1].i) trap(site, "null bytes");
+    if (n > 1 && (uint64_t)a[1].i > INT32_MAX) trap(site, "string too long");
+    return S(mkstr(p, n > 1 ? a[1].i : 0));
+  }
+  if (!n) trap(site, "not an array");
   Str *s = mkstr("", 0);
   s->p = alloc(s->len = a[0].a->len);
   for (int i = 0; i < s->len; i++) s->p[i] = a[0].a->v[i].i;
   return S(s);
 }
 
-/// std/c's C memory, which rt.c gives and boot does not link; bi_toC's strndup must match it.
+/// The run time's C memory, which rt.c gives and boot does not link.
 void *bober_malloc(uint64_t n) { return malloc(n ? n : 1); }
 void bober_free(void *p) { free(p); }
-
-static Val bi_toC(Val self, Val *a, int n, Node *site) {
-  if (!n || a[0].k != K_STR || memchr(a[0].s->p, 0, a[0].s->len)) trap(site, "not a C string");
-  return I(K_U64, (intptr_t)strndup(a[0].s->p, a[0].s->len));
-}
 
 static Val bi_fromC(Val self, Val *a, int n, Node *site) {
   char *p = n ? (char *)(intptr_t)a[0].i : 0;
   if (!p) trap(site, "null C string");
   return S(mkstr(p, strlen(p)));
-}
-
-static Val bi_fromCN(Val self, Val *a, int n, Node *site) {
-  char *p = (char *)(intptr_t)a[0].i;
-  if (!p && a[1].i) trap(site, "null C string");
-  if ((uint64_t)a[1].i > INT32_MAX) trap(site, "string too long");
-  return S(mkstr(p, a[1].i));
-}
-
-static Val bi_toCN(Val self, Val *a, int n, Node *site) {
-  if (!n || a[0].k != K_STR) trap(site, "not a string");
-  char *p = malloc(a[0].s->len + 1);
-  p[a[0].s->len] = 0;
-  return I(K_U64, (intptr_t)memcpy(p, a[0].s->p, a[0].s->len));
-}
-
-static Val bi_peek(Val self, Val *a, int n, Node *site) {
-  if (!n || !a[0].i) trap(site, "load from null");
-  return I(K_U64, *(uint64_t *)(intptr_t)a[0].i);
-}
-
-static Val bi_poke(Val self, Val *a, int n, Node *site) {
-  if (n < 2 || !a[0].i) trap(site, "store to null");
-  *(uint64_t *)(intptr_t)a[0].i = a[1].i;
-  return NUL;
 }
 
 /// builtin/mem's addr: the address of a copy of x, as C holds it.
@@ -1568,11 +1563,30 @@ static Val bi_equals(Val self, Val *a, int n, Node *site) {
   return B(1);
 }
 
-static Val bi_includes(Val self, Val *a, int n, Node *site) {
-  if (n != 1) trap(site, "includes takes a value");
+static Val bi_indexOf(Val self, Val *a, int n, Node *site) {
+  if (n != 1) trap(site, "indexOf takes a value");
   for (int i = 0; i < self.a->len; i++)
-    if (eq(self.a->v[i], a[0])) return B(1);
-  return B(0);
+    if (eq(self.a->v[i], a[0])) return I(K_I32, i);
+  return I(K_I32, -1);
+}
+
+static Val bi_includes(Val self, Val *a, int n, Node *site) { return B(bi_indexOf(self, a, n, site).i >= 0); }
+
+static Val bi_remove(Val self, Val *a, int n, Node *site) {
+  Arr *r = self.a;
+  if (n != 1 || !isint(a[0].k) || a[0].i < 0 || a[0].i >= r->len) trap(site, "remove takes an index");
+  Val v = r->v[a[0].i];
+  memmove(r->v + a[0].i, r->v + a[0].i + 1, (--r->len - a[0].i) * sizeof(Val));
+  return v;
+}
+
+static Val bi_reverse(Val self, Val *a, int n, Node *site) {
+  Arr *r = self.a;
+  for (int i = 0, j = r->len - 1; i < j; i++, j--) {
+    Val x = r->v[i];
+    r->v[i] = r->v[j], r->v[j] = x;
+  }
+  return self;
 }
 
 static Val bi_pop(Val self, Val *a, int n, Node *site) {
@@ -1603,6 +1617,7 @@ static void init(void) {
   }
   global(prelude, intern("void", 4), 0, TY(prims[K_NULL]));
   global(prelude, intern("Type", 4), 0, TY(anytype));
+  global(prelude, intern("readonly", 8), 0, TY(readonly = newtype(T_ANY, 0)));
   builtin(prelude, "print", bi_print);
   builtin(prelude, "readFile", bi_readFile);
   builtin(prelude, "writeFile", bi_writeFile);
@@ -1613,12 +1628,7 @@ static void init(void) {
   builtin(prelude, "idOf", bi_idOf);
   builtin(prelude, "chr", bi_chr);
   builtin(prelude, "fromBytes", bi_fromBytes);
-  builtin(prelude, "toC", bi_toC);
   builtin(prelude, "fromC", bi_fromC);
-  builtin(prelude, "fromCN", bi_fromCN);
-  builtin(prelude, "toCN", bi_toCN);
-  builtin(prelude, "peek", bi_peek);
-  builtin(prelude, "poke", bi_poke);
   mem = alloc(sizeof(Mod));
   builtin(mem, "addr", bi_addr);
   builtin(mem, "load", bi_load);
@@ -1636,12 +1646,15 @@ static void init(void) {
   builtin(arrmethods, "find", bi_find);
   builtin(arrmethods, "equals", bi_equals);
   builtin(arrmethods, "includes", bi_includes);
+  builtin(arrmethods, "indexOf", bi_indexOf);
+  builtin(arrmethods, "remove", bi_remove);
+  builtin(arrmethods, "reverse", bi_reverse);
   builtin(arrmethods, "pop", bi_pop);
   builtin(arrmethods, "join", bi_join);
   s_length = intern("length", 6), s_toString = intern("toString", 8), s_members = intern("members", 7), s_value = intern("value", 5);
   s_constructor = intern("constructor", 11), s_main = intern("main", 4);
   s_kind = intern("kind", 4), s_name = intern("name", 4), s_fields = intern("fields", 6), s_elem = intern("elem", 4);
-  s_tags = intern("tags", 4), s_base = intern("base", 4), s_args = intern("args", 4);
+  s_tags = intern("tags", 4), s_base = intern("base", 4), s_args = intern("args", 4), s_bits = intern("bits", 4);
   s_field[0] = s_name, s_field[1] = intern("type", 4), s_field[2] = intern("readonly", 8), s_field[3] = s_tags;
   kwinit();
 }
@@ -1659,6 +1672,8 @@ static Mod *load(const char *path, Node *site) {
   char *real = realpath(path, 0);
   if (!real) fatal(site, "cannot open ", path);
   if (!strcmp(real, rooted("/builtin/mem.bob"))) return mem;  // its intrinsics have no body
+  // What builtin/sys.bob takes of these is the prelude's.
+  if (!strcmp(real, rooted("/builtin/string.bob")) || !strcmp(real, rooted("/builtin/c.bob"))) return prelude;
   Mod **tail = &mods;
   for (; *tail; tail = &(*tail)->next) if (!strcmp((*tail)->path, real)) return *tail;
   Mod *m = *tail = alloc(sizeof(Mod));
@@ -1794,6 +1809,8 @@ static void *run(void *unused) {
     exit(2);
   }
   init();
+  Sym *e = intern("IoError", 7);
+  add(prelude, e, lookup(load(rooted("/builtin/error.bob"), 0), e));
   Mod *m = load(argv_[2], 0);
   if (setjmp(trapjb)) {
     fflush(stdout);

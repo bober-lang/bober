@@ -1,20 +1,14 @@
-//! WebSockets, as RFC 6455 frames them, on a connection std/http upgraded: a server's handler accepts a request into
-//! one, a client connects to a URL. A Socket sends and receives messages, text or binary, each a string; pings are
-//! answered and fragments joined inside receive, up to maxMessage bytes, past which it is TooLarge. A frame that is
-//! not the protocol's, a masked one from a server or a bare one from a client, is a Protocol error, and either ends
-//! the socket. Reads and writes are bounded by the stream's timeout. The UTF-8 of a text is not checked. No extension
-//! is negotiated.
+//! WebSockets (RFC 6455) on a connection std/http upgraded: a server accepts a request into a Socket, a client
+//! connects to a URL.
 
 import { bytes } from "../crypto/random"
 import { decode as unbase64, encode as base64 } from "../encoding/base64"
-import { Client, Headers, Request, Response, send, text } from "../http"
-import { IoError } from "../io"
-import { ParseError } from "../parse"
-import { lower, split, trim } from "../string"
-import { monotonic, second } from "../time"
-import { parse } from "../url"
-import { Stream } from "./h1"
 import { Signal } from "../../builtin/fiber"
+import { Client, Headers, Request, Response, send, text } from "../http"
+import { Stream } from "../io"
+import { ParseError, lower, split, trim } from "../string"
+import { monotonic, second } from "../time"
+import { Url } from "../url"
 
 import { PSA_ALG_SHA_1, psa_crypto_init,
 	psa_hash_compute } from "../../vendor/mbedtls/tf-psa-crypto/include/psa/crypto.h"
@@ -288,7 +282,7 @@ export function accept(req: Request, handler: (ws: Socket) => void throws IoErro
 /// A socket to the ws, wss, http or https URL, offering protocols, through client or the default one.
 export function connect(url: string, client: Client | null = null,
 	protocols: string[] = []): Socket throws IoError | ParseError {
-	const u = parse(url)
+	const u = Url.parse(url)
 	switch (u.scheme) {
 		case "ws", "http": u.scheme = "http"
 		case "wss", "https": u.scheme = "https"

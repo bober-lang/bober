@@ -6,7 +6,7 @@
 //! repetition copies its operand. As in RE2, a lazy DFA finds where a match ends, one of the reversed pattern where it
 //! starts, and a Pike VM its groups.
 
-import { position } from "./algo"
+import { indexOf, occurs, sortBy } from "./algo"
 import { HashMap } from "./collections/hashmap"
 
 import { a, A, B, b, backslash, caret, colon, comma, d, digit, dollar, dot, isAlphanumeric, isDigit, isHexDigit,
@@ -14,9 +14,7 @@ import { a, A, B, b, backslash, caret, colon, comma, d, digit, dollar, dot, isAl
 	star, toLower, underscore, w, x, z, zero } from "./ascii"
 
 import { max, min } from "./math"
-import { ParseError } from "./parse"
-import { sortBy } from "./sort"
-import { codePoint, indexOf, lastCodePoint, occurs, replace, utf8 } from "./string"
+import { ParseError, codePoint, lastCodePoint, replace, utf8 } from "./string"
 
 const maxRune = 0x10ffff
 /// The code points beyond ASCII that fold to ASCII letters, the Kelvin sign and long s, with each case they fold to.
@@ -135,7 +133,7 @@ export class Regex {
 				const end = if (occurs(with, i, "$<")) indexOf(with, ">", i) else -1
 				const name = if (end > 0) with.slice(i + 2, end) else ""
 				if (name != "" && word(name)) {
-					out += group(position(this.names, name))
+					out += group(this.names.indexOf(name))
 					i = end + 1
 				} else if (with[i] == dollar && isDigit(with.at(i + 1) ?? 0)) {
 					out += group(with[i + 1] - zero)
@@ -443,7 +441,7 @@ class Parser {
 			if (this.eat(less) || occurs(this.s, this.i, "P<") && this.eat(P) && this.eat(less)) {
 				const end = indexOf(this.s, ">", this.i)
 				const name = if (end < 0) "" else this.s.slice(this.i, end)
-				if (name == "" || position(this.names, name) >= 0 || !word(name)) {
+				if (name == "" || this.names.indexOf(name) >= 0 || !word(name)) {
 					throw this.error(at)
 				}
 				this.names.push(name)
@@ -1067,11 +1065,11 @@ class Machine {
 	}
 }
 
-/// The threads at a position, in priority order: n instructions in pcs. The capture slots of the thread at pc are at pc
-/// times their number in slots.
+/// The threads at a position, in priority order: n instructions in pcs.
 class Threads {
 	pcs: i32[]
 	n = 0
+	/// The capture slots of the thread at pc, at pc times their number.
 	slots: i32[]
 
 	constructor(size: i32, slots: i32) {

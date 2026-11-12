@@ -13,16 +13,16 @@
 //! can catch. *implementation-defined* behavior is chosen by the implementation; a program shall not depend on
 //! implementation-defined behavior.
 
-import { endsWith, indexOf, lastIndexOf, split, startsWith } from "../std/string"
+import { Handle } from "../builtin/sys"
+import { endsWith, indexOf, lastIndexOf, startsWith } from "../std/algo"
 import { fromCString } from "../std/c"
 import { Keys, Rest, Unknown, decode as decodeJson, encode, quoted } from "../std/encoding/json"
 import { decode } from "../std/encoding/optarg"
-import { exists, glob, mkdirAll, open, readFile, remove, removeAll, rename, stat } from "../std/fs"
+import { exists, glob, mkdirAll, readFile, remove, removeAll, rename, stat } from "../std/fs"
 import { base, dir as parent, isAbs, join, rel } from "../std/fs/path"
 import { fnv } from "../std/hash"
-import { IoError } from "../std/io"
 import { arch, os } from "../std/os"
-import { ParseError } from "../std/parse"
+import { ParseError, split } from "../std/string"
 import { abi, write } from "./bc/file"
 import { Program } from "./bc/program"
 import { show } from "./bc/show"
@@ -287,7 +287,12 @@ function image(p: Program, o: Options, files: string[], pin: bool, fresh = false
 	} catch (e: Stale) {
 		return image(p, o, files, pin, true)
 	}
-	const fd = if (pin) dup(open(tmp).fd) else 0 // which, unlike open's, what the process runs has too
+	let fd = 0
+	if (pin) {
+		const h = Handle.open(tmp, "r")
+		fd = dup(h.raw()) // which, unlike h's, what the process runs has too
+		h.close()
+	}
 	rename(tmp, out)
 	return if (pin) `/proc/self/fd/${fd}` else out
 }
@@ -313,7 +318,7 @@ function unit(p: Program, m: i32, o: Options, name: string): Object {
 }
 
 /// The objects of the glue of p's modules of C headers but the bundle's, of source hash 0, compiled with includes and
-/// those of the packages of its other modules, and all C libraries of each package one of whose headers it imports,
+/// those of the packages of its modules, and all C libraries of each package one of whose headers it imports,
 /// which lld takes in any order, and of which it links what it uses; and whether one is CMake's, and so C++.
 function cObjects(p: Program, includes: string[]): [string[], bool] {
 	const packages: [string, string[]][] = []
@@ -321,9 +326,11 @@ function cObjects(p: Program, includes: string[]): [string[], bool] {
 	const cIncludes = includes.slice(0, includes.length)
 	for (const m of p.modules.filter(m => m.source != 0)) {
 		const path = split(m.path, ": ")[0]
+		if (startsWith(path, `${sysroot}/`)) {
+			continue
+		}
 		if (path != m.path) {
 			headers.push(path)
-			continue
 		}
 		const d = nearest(path)
 		if (d != null && !packages.some(e => e[0] == d)) {

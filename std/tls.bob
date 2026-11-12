@@ -1,16 +1,17 @@
-//! TLS on a std/net Conn, by Mbed TLS (std/tls/tls.h): a client's, the peer's certificate checked against roots and
-//! host, or a server's with a certificate of its own, the handshake done within the socket's timeout. A failure throws
-//! an IoError: the socket's, OutOfResources, or one of kind Tls whose code is Mbed TLS's. Mbed TLS has no TLS 1.3
-//! KeyUpdate, so one fails the read; peers send it when asked to, or as rustls does near AEAD's limit of 2^24 records.
+//! TLS on a std/net Conn, as a client or a server, by Mbed TLS. A failure throws an IoError.
 
-import { fromCBytes, fromCString } from "./c"
+// Mbed TLS has no TLS 1.3 KeyUpdate, so one fails the read; peers send it when asked to, or as rustls does near AEAD's
+// limit of 2^24 records.
+
+import { endsWith } from "./algo"
+import { fromCString } from "./c"
 import { HashMap } from "./collections/hashmap"
 import { readFile } from "./fs"
-import { IoError, ReadWriter, failure } from "./io"
-import * as net from "./net"
-import { endsWith } from "./string"
+import { Stream } from "./io"
+import { failure } from "../builtin/sys"
 import { Signal } from "../builtin/fiber"
-import { bober_free, bober_malloc } from "../src/rt.h"
+import * as net from "./net"
+import { free, malloc } from "../builtin/c"
 
 import { MBEDTLS_ERR_NET_RECV_FAILED, MBEDTLS_ERR_NET_SEND_FAILED, MBEDTLS_ERR_SSL_ALLOC_FAILED, bober_tls_alpn,
 	bober_tls_alpn_of, bober_tls_chain, bober_tls_close, bober_tls_errno, bober_tls_error, bober_tls_free, bober_tls_handshake,
@@ -29,7 +30,7 @@ export class Config {
 	insecure = false
 }
 
-export class Conn implements ReadWriter {
+export class Conn implements Stream {
 	/// The protocol agreed on, or null.
 	readonly alpn: string | null
 	/// For each read as a whole, and each record a write sends; the socket's at first.
@@ -53,12 +54,12 @@ export class Conn implements ReadWriter {
 
 	/// Up to n > 0 bytes, or null once the peer has closed; a peer gone without saying so is ConnectionReset.
 	read(n: i32): string | null throws IoError {
-		const p = bober_malloc(n as u64)
+		const p = malloc(n as u64)
 		try {
 			const got = this.call(this.reads, t => bober_tls_read(t, p, n as u64, this.timeout), "read")
-			return if (got == 0) null else fromCBytes(p, got as u64)
+			return if (got == 0) null else fromBytes(p, got as u64)
 		} finally {
-			bober_free(p)
+			free(p)
 		}
 	}
 
@@ -73,6 +74,9 @@ export class Conn implements ReadWriter {
 	write(s: string) throws IoError {
 		this.call(this.writes, t => bober_tls_write(t, s, s.length as u64, this.timeout), "write")
 	}
+
+	/// Ends the socket's reads and writes, waking those in flight, without telling the peer; nothing once closed.
+	end() { this.c.end() }
 
 	/// Tells the peer the connection is closing, after the writes in flight; it reads an end.
 	shutdown() throws IoError { this.call(this.writes, t => bober_tls_shutdown(t, this.timeout), "shutdown") }
@@ -160,7 +164,7 @@ export function server(c: net.Conn, cfg: Config): Conn throws IoError {
 
 /// What f makes of a context on c, with cfg's protocols; freed if f throws.
 function context(c: net.Conn, server: bool, cfg: Config, what: string, f: (t: u64) => Conn throws IoError): Conn throws IoError {
-	const t = bober_tls_new(c.fd, if (server) 1 else 0)
+	const t = bober_tls_new(c.handle.raw(), if (server) 1 else 0)
 	if (t == 0) {
 		throw new IoError("OutOfResources", "tls", what)
 	}

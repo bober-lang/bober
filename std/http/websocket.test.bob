@@ -1,8 +1,7 @@
 import { Request, Response, Server, get, send } from "../http"
 import { accept, connect } from "./websocket"
-import { IoError } from "../io"
-import { ParseError } from "../parse"
-import { monotonic, second } from "../time"
+import { ParseError } from "../string"
+import { millisecond, monotonic, second } from "../time"
 import { Signal } from "../../builtin/fiber"
 import * as net from "../net"
 
@@ -56,7 +55,7 @@ function app(req: Request): Response throws IoError | ParseError {
 			return res
 		// 16 MiB to a client that reads none of it within the 100 ms a write may take, then a word.
 		case "/flood": return accept(req, ws => {
-			ws.stream.timeout = 100_000_000
+			ws.stream.timeout = 100 * millisecond
 			try {
 				ws.send(repeat(repeat("x", 1 << 12), 1 << 12))
 			} catch (e: IoError) {}
@@ -82,9 +81,9 @@ function app(req: Request): Response throws IoError | ParseError {
 		})
 		// A close after 100 ms, nothing read till 100 ms after, then everything.
 		case "/shut": return accept(req, ws => {
-			pause(100_000_000)
+			pause(100 * millisecond)
 			ws.stream.write("\x88\x02\x03\xe8")
-			pause(100_000_000)
+			pause(100 * millisecond)
 			let got = ""
 			while (true) {
 				const p = ws.stream.read(1 << 16)
@@ -115,7 +114,7 @@ function app(req: Request): Response throws IoError | ParseError {
 					break
 				}
 				got = got.slice(if (got.length < 8) 0 else got.length - 8, got.length) + p
-				pause(16_000_000)
+				pause(16 * millisecond)
 			}
 			last = got.slice(got.length - 8, got.length - 6)
 			shut.wake()
@@ -129,7 +128,7 @@ function app(req: Request): Response throws IoError | ParseError {
 				ws.stream.write("\x82\x7e\x03\xe8")
 			}
 			for (const i of 1 ... 15) {
-				pause(100_000_000)
+				pause(100 * millisecond)
 				ws.stream.write(if (ping) "\x89\0" else "x")
 			}
 		})
@@ -297,14 +296,14 @@ test "close waits a second at most, and ends the socket even when sending fails"
 	// Nor longer for a peer that keeps sending.
 	for (const q of ["", "?ping"]) {
 		const drip = connect(`ws://${s.addr}/drip${q}`)
-		drip.stream.timeout = 300_000_000
+		drip.stream.timeout = 300 * millisecond
 		const start = monotonic()
 		drip.close()
 		assert monotonic() - start < second
 	}
 	// Nor when another fiber receives, which then reads for it.
 	const drip = connect(`ws://${s.addr}/drip?ping`)
-	drip.stream.timeout = 300_000_000
+	drip.stream.timeout = 300 * millisecond
 	const reader = async drip.receive()
 	const start = monotonic()
 	drip.close()
@@ -378,7 +377,7 @@ test "a close behind a send that takes over a second still goes" {
 	const job = async s.serve(app)
 	const ws = connect(`ws://${s.addr}/slow`)
 	const sending = async ws.send(repeat(repeat("x", 1 << 12), 1 << 11))
-	pause(50_000_000)
+	pause(50 * millisecond)
 	ws.close()
 	await sending
 	shut.wait()

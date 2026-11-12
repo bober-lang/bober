@@ -11,21 +11,20 @@
 //! A template is a chain of Adds of its pieces, each converted by the method show, and equality and zero values call
 //! builtin/'s functions. A method of a string or array is one of its class in builtin/ (Type.methods in src/type.bob). A
 //! function without a body is C's in a C header's module, else an intrinsic of builtin/. `async c` is a Call of
-//! builtin/'s start with the closure `() => c`, so that c's callee and args are evaluated on its fiber, and `await f` one
-//! of wait. spawn is not lowered, nor are a few constructs the compiler does not use; each throws where it is.
+//! builtin/'s start with the closure `() => c`, so that c's callee and args are evaluated on its fiber, `await f` one
+//! of wait, and `await ...fs` one of race. spawn is not lowered, nor are a few constructs the compiler does not use;
+//! each throws where it is.
 //!
 //! What is static (4.11) lowers as what it is at run time, as a debug build runs it, but in the form mono can fold
 //! where it knows the values of `Readonly` locals: a switch is a chain of Ifs on a Readonly subject, and a `for (const x
 //! of …)` over a tuple or an array an Each of a Readonly local.
 
-import { contains } from "../std/algo"
+import { endsWith, indexOf, sortBy } from "../std/algo"
 import { digit, isAlphabetic, lf, minus, o, underscore, x, zero } from "../std/ascii"
-import { toCString } from "../std/c"
 import { HashMap } from "../std/collections/hashmap"
 import { ScopedMap } from "../std/collections/scopedmap"
 import { bits } from "../std/float"
-import { sortBy } from "../std/sort"
-import { codePoint, endsWith, indexOf, unquoted } from "../std/string"
+import { codePoint, unquoted } from "../std/string"
 import * as decl from "./bc/decl"
 import * as kind from "./bc/kind"
 import * as op from "./bc/op"
@@ -40,7 +39,7 @@ import { Tok } from "./lex"
 import { Lift } from "./lift"
 import { builtinPath } from "./root"
 import { Bool, Field, Null, String, Type, basics, members } from "./type"
-import { free, strtod } from "stdlib.h"
+import { strtod } from "stdlib.h"
 
 /// The modules at paths and those they import, checked and lowered into one Program. Throws the type errors, or what
 /// is not lowered, as a CompileError.
@@ -141,12 +140,12 @@ export class Lower implements Checked {
 	/// yet lowered.
 	builtin(name: string): i32 {
 		const file = switch (name) {
-			case "zero": "mem"
+			case "zero", "subtest", "mark": "mem"
 			case "equal", "literal": "equal"
 			case "show": "show"
 			case "newArray": "array"
 			case "pow": "math"
-			default: "fiber" // start, wait and Future
+			default: "fiber" // start, wait, race and Future
 		}
 		const path = builtinPath(file)
 		const symbol = `${path}:${name}`
@@ -201,7 +200,8 @@ class Unit {
 		}
 		const mods = (if (isTok(n.parts[0], "export")) decl.Export else 0) | (if (n.t.kind == "const") decl.Readonly else 0)
 		const t = n.type ?? Type.function([], Null)
-		const ps = child(n, "typeParams")?.parts.map(p => p.type!) ?? [] // a function's or alias's
+		// A function's, with those of its `T[readonly]` params, or an alias's.
+		const ps = if (n.kind == "function") t.params else child(n, "typeParams")?.parts.map(p => p.type!) ?? []
 		switch (n.kind) {
 			case "test":
 				const d = this.l.newDecl(this.m, -1, unquoted(text), decl.Test, 0, t, n.doc)
@@ -334,7 +334,7 @@ class Unit {
 		const rs = this.refs.get(d)
 		if (rs == null) {
 			this.refs.set(d, [on])
-		} else if (!contains(rs, on)) {
+		} else if (!rs.includes(on)) {
 			rs.push(on)
 		}
 	}
@@ -345,7 +345,7 @@ class Unit {
 		const deps = this.prog.modules[this.m].deps
 		if (m == this.m) {
 			this.depend(from, d)
-		} else if (!contains(deps, m)) {
+		} else if (!deps.includes(m)) {
 			deps.push(m)
 		}
 	}
@@ -575,14 +575,14 @@ class Loop {
 	}
 }
 
-/// Where an assignment's target is: the ops that load and store it with their immediates, the type it holds, and the
-/// temps that keep its object and index for a compound assignment, or -1.
+/// Where an assignment's target is: the ops that load and store it with their immediates, and the type it holds.
 class Place {
 	load: Opcode
 	store: Opcode
 	a: i32
 	b: i32
 	type = 0
+	/// The temps that keep its object and index for a compound assignment, or -1.
 	obj = -1
 	index = -1
 	/// The place of the fixed array an element of which this is, loaded instead of a copy kept in obj.
@@ -623,6 +623,8 @@ class Gen {
 	private loops: Loop[] = []
 	/// Whether an assert's expression is being lowered, where == and != compare by value; its closures inherit it.
 	private asserting = false
+	/// Whether the code is a test's, or a closure's in one, each statement of which marks where the test is.
+	private testing: bool
 
 	constructor(u: Unit, owner: i32, result: Type, outer: Gen | null, typeParams: Type[]) {
 		this.u = u
@@ -632,6 +634,7 @@ class Gen {
 		this.outer = outer
 		this.typeParams = typeParams
 		this.asserting = outer?.asserting ?? false
+		this.testing = outer?.testing ?? (this.prog.decls[owner].kind == decl.Test)
 	}
 
 	/// Adds op o, unless the code is unreachable there.
@@ -694,7 +697,7 @@ class Gen {
 		}
 		this.op(op.End)
 		const c = this.code
-		c.retain(i => c.ops[i] != op.Fresh || contains(this.shared, c.a(i)))
+		c.retain(i => c.ops[i] != op.Fresh || this.shared.includes(c.a(i)))
 		return c
 	}
 
@@ -767,6 +770,11 @@ class Gen {
 
 	private stmt(p: Node) {
 		const pos = this.at(p)
+		if (this.testing) {
+			this.int(kind.I32, p.t.loc.pos)
+			this.callBuiltin("mark", 0)
+			this.op(op.Drop)
+		}
 		this.statement(p)
 		this.code.at = pos
 	}
@@ -850,9 +858,9 @@ class Gen {
 			case "jump": this.jump(p)
 			case "test":
 				this.expr(p.parts[0])
-				this.open(op.Test)
-				this.block(p.parts[1])
-				this.op(op.End)
+				this.closure(`${p.t.loc.pos}`, Type.function([], Null), new Node("params", p.t), p.parts[1])
+				this.callBuiltin("subtest", 0)
+				this.op(op.Drop)
 			default:
 				this.expr(p)
 				this.op(op.Drop)
@@ -1114,6 +1122,49 @@ class Gen {
 		this.op(op.End)
 	}
 
+	/// Asserts p, a conjunct at a time, and of a || the right if the left is false; a comparison's failure shows its
+	/// operands, as `${}` does.
+	private assert(p: Node) {
+		const how = p.t.kind
+		if (p.kind == "binary" && how == "&&") {
+			this.assert(p.parts[0])
+			return this.assert(p.parts[1])
+		}
+		if (p.kind == "binary" && how == "||") {
+			this.value(p.parts[0], Bool)
+			this.open(op.If, kind.None)
+			this.op(op.Else)
+			this.assert(p.parts[1])
+			return this.op(op.End)
+		}
+		if (p.kind != "binary" || !["==", "!=", "<", ">", "<=", ">="].includes(how) || p.parts.some(q => isTok(q, "null"))) {
+			this.value(p, Bool)
+			return this.op(op.Assert)
+		}
+		const [a, b] = p.parts
+		const jt = compared(a.type!, b.type!) ?? b.type!
+		const t = this.ty(jt)
+		const [l, r] = [this.temp(t), this.temp(t)]
+		this.to(a, t)
+		this.op(op.SetLocal, l)
+		this.to(b, t)
+		this.op(op.SetLocal, r)
+		this.op(op.Local, l)
+		this.op(op.Local, r)
+		this.compare(how, jt)
+		this.open(op.If, kind.None)
+		this.op(op.Else)
+		this.op(op.Local, l)
+		this.toString(jt)
+		this.op(op.Str, this.prog.intern(` ${how} `))
+		this.op(op.Add)
+		this.op(op.Local, r)
+		this.toString(jt)
+		this.op(op.Add)
+		this.op(op.Fail)
+		this.op(op.End)
+	}
+
 	/// Asserts that x throws a value equal to e, trapping if it returns; a value of another type propagates.
 	private throws(x: Node, e: Node) {
 		const t = this.ty(e.type!)
@@ -1150,8 +1201,7 @@ class Gen {
 				this.asserting = true
 				const e = after(p, "throws")
 				if (e == null) {
-					this.value(x!, Bool)
-					this.op(op.Assert)
+					this.assert(x!)
 				} else {
 					this.throws(x!, e!)
 				}
@@ -1483,9 +1533,7 @@ class Gen {
 						part(this.piece(q.t))
 					} else {
 						this.expr(q)
-						if (!q.type!.each(textual)) {
-							this.toString(q.type!)
-						}
+						this.toString(q.type!)
 						part(1)
 					}
 				}
@@ -1890,7 +1938,17 @@ class Gen {
 				this.callBuiltin("start", this.u.list([x.type!], false, this))
 			case "await":
 				if (x.t.kind == "...") {
-					throw this.fail(p, "a race, await ...")
+					const fs = x.parts[0]
+					const f = Type.async(t.types[1])
+					if (fs.kind != "array") {
+						this.expr(fs)
+					} else if (fs.parts.some(q => q.type != f)) {
+						throw this.fail(p, "racing futures of different types")
+					} else {
+						this.spread(op.Array, Type.array(f), fs.parts, (q: Node, i: i32) => this.value(q, f))
+					}
+					this.callBuiltin("race", this.u.list([t.types[1]], false, this))
+					return id
 				}
 				this.expr(x)
 				this.callBuiltin("wait", this.u.list([t], false, this))
@@ -2000,9 +2058,12 @@ class Gen {
 		}
 	}
 
-	/// Converts the value of type t on the stack to a string by its toString, or by builtin/'s show if its type has
-	/// none; a type param's is its instantiation's.
+	/// Converts the value of type t on the stack to a string, as `${}` does: by its toString, or by builtin/'s show if its
+	/// type has none; a type param's is its instantiation's; a string as is.
 	private toString(t: Type) {
+		if (t.each(textual)) {
+			return
+		}
 		const c = methods(t)
 		const m = if (c == null) null else this.u.l.member(c!, "toString")
 		if (m != null && this.prog.decls[m!].kind == decl.Function) {
@@ -2018,7 +2079,7 @@ class Gen {
 	/// (§5.5), but of Types, one per type.
 	private compare(how: string, t: Type) {
 		const references = ["array", "tuple", "object", "class", "interface", "union"]
-		if (!this.asserting || how != "==" && how != "!=" || !contains(references, t.kind) || isTypeValue(t)) {
+		if (!this.asserting || how != "==" && how != "!=" || !references.includes(t.kind) || isTypeValue(t)) {
 			return this.op(opcode(how))
 		}
 		this.callBuiltin("equal", this.u.list([t], false, this))
@@ -2159,8 +2220,5 @@ function float(s: string): f64 {
 			digits += chr(c)
 		}
 	}
-	const p = toCString(digits)
-	const f = strtod(p, 0)
-	free(p)
-	return f
+	return strtod(digits, 0)
 }

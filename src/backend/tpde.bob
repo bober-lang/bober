@@ -6,7 +6,6 @@
 import { CompileError } from "../error"
 import { Backend, Binary, Block, Cast, Cmp, FCmp, Operand, Type, Unary, Value, codes } from "./backend"
 import * as c from "../../std/c"
-import { withArray, withString } from "../../std/c"
 import {
 	TpdeABISizeOfType, TpdeAShr, TpdeAdd, TpdeAddAttributeAtIndex, TpdeAddExternal, TpdeAddFunction, TpdeAddGlobal, TpdeAnd,
 	TpdeAppendBasicBlock, TpdeArrayType, TpdeBSwap, TpdeBitCast, TpdeBuildAlloca, TpdeBuildAtomicLoad,
@@ -44,34 +43,29 @@ export class Tpde implements Backend {
 	ptr(): Type { return TpdePointerType(this.m) }
 	ref(): Type { return TpdeRefType(this.m) }
 	fn(result: Type, params: Type[]): Type {
-		return withArray(params, p => TpdeFunctionType(this.m, result, p, params.length as u32, 0))
+		return TpdeFunctionType(this.m, result, params, params.length as u32, 0)
 	}
 	variadic(result: Type, params: Type[]): Type {
-		return withArray(params, p => TpdeFunctionType(this.m, result, p, params.length as u32, 1))
+		return TpdeFunctionType(this.m, result, params, params.length as u32, 1)
 	}
 	struct(fields: Type[]): Type {
-		return withArray(fields, p => TpdeStructType(this.m, p, fields.length as u32, 0))
+		return TpdeStructType(this.m, fields, fields.length as u32, 0)
 	}
 	array(elem: Type, n: u64): Type { return TpdeArrayType(this.m, elem, n) }
 
 	constInt(t: Type, n: i64): Value { return TpdeConstInt(this.m, t, n as u64) }
 	constFloat(t: Type, x: f64): Value { return TpdeConstReal(this.m, t, x) }
 	constIntOf(t: Type, digits: string, radix: u8): Value {
-		return withString(digits, p => TpdeConstIntOfString(this.m, t, p, radix))
+		return TpdeConstIntOfString(this.m, t, digits, radix)
 	}
-	constFloatOf(t: Type, text: string): Value { return withString(text, p => TpdeConstRealOfString(this.m, t, p)) }
+	constFloatOf(t: Type, text: string): Value { return TpdeConstRealOfString(this.m, t, text) }
 	constZero(t: Type): Value { return TpdeConstNull(this.m, t) }
-	constBytes(s: string): Value {
-		const p = c.toCBytes(s)
-		const v = TpdeConstString(this.m, p, s.length as u64)
-		free(p)
-		return v
-	}
+	constBytes(s: string): Value { return TpdeConstString(this.m, s, s.length as u64) }
 	constStruct(fields: Value[]): Value {
-		return withArray(fields, p => TpdeConstStruct(this.m, p, fields.length as u32, 0))
+		return TpdeConstStruct(this.m, fields, fields.length as u32, 0)
 	}
 	constArray(elem: Type, elems: Value[]): Value {
-		return withArray(elems, p => TpdeConstArray(this.m, elem, p, elems.length as u64))
+		return TpdeConstArray(this.m, elem, elems, elems.length as u64)
 	}
 	sizeOf(t: Type): Value { return TpdeSizeOf(this.m, t) }
 	bytes(t: Type): u64 { return TpdeABISizeOfType(this.m, t) }
@@ -80,26 +74,23 @@ export class Tpde implements Backend {
 
 	function(name: string, t: Type, local: bool): Value {
 		const f = this.named(name)
-		return if (f != 0) f else withString(name, p => TpdeAddFunction(this.m, p, t, local as i32))
+		return if (f != 0) f else TpdeAddFunction(this.m, name, t, local as i32)
 	}
 	named(name: string): Value {
-		const f = withString(name, p => TpdeGetNamedFunction(this.m, p))
-		return if (f != 0) f else withString(name, p => TpdeGetNamedGlobal(this.m, p))
+		const f = TpdeGetNamedFunction(this.m, name)
+		return if (f != 0) f else TpdeGetNamedGlobal(this.m, name)
 	}
 	global(name: string, init: Value, local: bool, align: u32): Value {
-		return withString(name, p => TpdeAddGlobal(this.m, p, init, local as i32, align))
+		return TpdeAddGlobal(this.m, name, init, local as i32, align)
 	}
-	extern(name: string, t: Type): Value { return withString(name, p => TpdeAddExternal(this.m, p, t)) }
+	extern(name: string, t: Type): Value { return TpdeAddExternal(this.m, name, t) }
 	attr(fn: Value, index: i32, name: string, t: Type) {
-		withString(name, p => {
-			TpdeAddAttributeAtIndex(this.m, fn, index, p, t)
-			return 0
-		})
+		TpdeAddAttributeAtIndex(this.m, fn, index, name, t)
 	}
 	allocator(fn: Value) {}
-	constant(init: Value): Value { return withString("", p => TpdeAddGlobal(this.m, p, init, 1, 0)) }
+	constant(init: Value): Value { return TpdeAddGlobal(this.m, "", init, 1, 0) }
 	literal(name: string, init: Value): Value {
-		const g = withString(name, p => TpdeAddGlobal(this.m, p, init, 0, 0))
+		const g = TpdeAddGlobal(this.m, name, init, 0, 0)
 		TpdeSetConstant(this.m, g)
 		this.weak(g)
 		return g
@@ -171,28 +162,24 @@ export class Tpde implements Backend {
 	aliasing(access: Value, header: bool) {}
 	field(t: Type, p: Value, i: u32): Value { return TpdeBuildStructGEP(this.m, t, p, i) }
 	gep(t: Type, p: Value, indices: Value[]): Value {
-		return withArray(indices, a => TpdeBuildGEP(this.m, t, p, a, indices.length as u32))
+		return TpdeBuildGEP(this.m, t, p, indices, indices.length as u32)
 	}
 	extract(v: Value, i: u32): Value { return TpdeBuildExtractValue(this.m, v, i) }
 	insert(v: Value, e: Value, i: u32): Value { return TpdeBuildInsertValue(this.m, v, e, i) }
 	undef(t: Type): Value { return this.constZero(t) }
 	call(fnType: Type, fn: Value, args: Value[]): Value {
-		return withArray(args, a => TpdeBuildCall(this.m, fnType, fn, a, args.length as u32))
+		return TpdeBuildCall(this.m, fnType, fn, args, args.length as u32)
 	}
 	invoke(fnType: Type, fn: Value, args: Value[], then: Block, unwind: Block): Value {
-		return withArray(args, a => TpdeBuildInvoke(this.m, fnType, fn, a, args.length as u32, then, unwind))
+		return TpdeBuildInvoke(this.m, fnType, fn, args, args.length as u32, then, unwind)
 	}
 	landingPad(typeinfo: Value) { TpdeBuildLandingPad(this.m, typeinfo) }
 
 	constPacked(fields: Value[]): Value {
-		return withArray(fields, p => TpdeConstStruct(this.m, p, fields.length as u32, 1))
+		return TpdeConstStruct(this.m, fields, fields.length as u32, 1)
 	}
 	switch(v: Value, cases: i64[], targets: Block[], otherwise: Block) {
-		const ks: u64[] = []
-		for (const k of cases) {
-			ks.push(k as u64)
-		}
-		withArray(ks, k => withArray(targets, t => TpdeBuildSwitch(this.m, v, k, t, targets.length as u32, otherwise)))
+		TpdeBuildSwitch(this.m, v, cases, targets, targets.length as u32, otherwise)
 	}
 	unary(op: Unary, v: Value): Value { return TpdeBuildUnary(this.m, unaries.get(op)! as u32, v) }
 	copy(dst: Value, src: Value, bytes: i64) {
@@ -241,20 +228,16 @@ export class Tpde implements Backend {
 	/// A constant of init in the section, which the run time reads between the bounds the linker defines (src/rt.h).
 	private collect(init: Value, section: string) {
 		const e = this.constant(init)
-		withString(section, p => {
-			TpdeSetSection(this.m, e, p)
-			return 0
-		})
+		TpdeSetSection(this.m, e, section)
 	}
 	verify() { checked(TpdeVerifyModule(this.m)) }
 	/// The object file's bytes.
 	object(): string {
-		let err: c.ptr = 0
-		let size: u64 = 0
-		const bytes = c.out(p => { size = c.out(n => { err = TpdeEmit(this.m, p, n) }) })
-		checked(err)
-		const s = c.fromCBytes(bytes, size)
-		free(bytes)
+		const bytes: u64[] = [0]
+		const size: u64[] = [0]
+		checked(TpdeEmit(this.m, bytes, size))
+		const s = fromBytes(bytes[0], size[0])
+		free(bytes[0])
 		return s
 	}
 	/// Writes the object file; TPDE cannot write assembly.

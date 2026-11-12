@@ -6,11 +6,12 @@
 //!
 //! An import of a String ending in `.h` or `.c` takes names from a C file, found as `#include` String in the importing
 //! file would find it, with implementation-defined include directories. It shall list its names, each the file's: a
-//! function, with a prototype and not variadic, is a function called with the C ABI; an object is a `const` naming it
-//! in place; an enumeration constant, or an object-like macro expanding to string literals or to a constant expression
-//! of integer, floating or pointer type, is a `const`; an object-like macro expanding to a function's name is that
-//! function; a struct, by its tag or a typedef, is a class, and another typedef a type alias. A static function, inline
-//! in a header, is one too: the implementation gives it a symbol.
+//! function, with a prototype and not variadic, is a function called with the C ABI; an object is a `const` of a copy
+//! of it made as its module initializes, an array's a `T[]` of its elements; an enumeration constant, or an object-like
+//! macro expanding to string literals or to a constant expression of integer, floating or pointer type, is a `const`;
+//! an object-like macro expanding to a function's name is that function; a struct, by its tag or a typedef, is a class,
+//! and another typedef a type alias. A static function, inline in a header, is one too: the implementation gives it a
+//! symbol. A `.c` file imported from is compiled into the program.
 //!
 //! C types are bober types of fixed width: `_Bool` is `bool`, `char` and `signed char` `i8`, `short` `i16`, `int` and an
 //! enumeration `i32`, `long` and `long long` `i64`, their unsigned types the `u` ones, `float` `f32`, `double` and
@@ -19,32 +20,32 @@
 //! embedded; an array is `T[n]`. One returned from C is a new instance whose initializers and constructor do not run. A
 //! parameter that is a pointer to such a struct is its class: C is given the instance, and what C changes in it is
 //! changed in the instance; one that is the struct is `...T`, and C is given a copy. A parameter that is a pointer to a
-//! scalar `T` is `T[] | u64`, and one to a byte or `void` is `string | u8[] | u64`: C is given an array's elements, and
-//! what C changes in them is changed in the array, or a copy of a string's bytes and a NUL. C is given each value as
-//! the bytes of its C type, for the call only, which an implementation may copy in and back out: what C reads around
-//! them or keeps past the call is no bober value's. The builtin `fromBytes(xs: u8[])` is the string of xs. A union,
-//! bitfield, flexible array, array of unknown length, or a struct that packing or alignment lays out other than bober
-//! would, has no bober type, and a name whose declaration needs one shall not be imported. How a program finds a C
-//! function or object is implementation-defined. Bober's guarantees hold only while C keeps them: an imported object
-//! that C changes, or a function that breaks them, is at the program's own risk. The module std/c names C's types and
-//! converts strings to and from C.
+//! scalar `T` is `T[] | u64`, one to a byte or `void` is `string | u8[] | u64`, and one to a pointer to one is
+//! `string[] | u64[] | u64`: C is given an array's elements, and what C changes in them is changed in the array, or a
+//! copy of a string's bytes and a NUL, of a string[] an array of such copies and a null pointer, each for the call. C
+//! is given each value as the bytes of its C type, for the call only, which an implementation may copy in and back
+//! out: what C reads around them or keeps past the call is no bober value's. The builtin `fromBytes(xs)` is the string
+//! of a `u8[]`, `fromBytes(p, n)` of the n bytes at address p. A union, bitfield, flexible array, array of unknown
+//! length, or a struct that packing or alignment lays out other than bober would, has no bober type, and a name whose
+//! declaration needs one shall not be imported. How a program finds a C function or object is implementation-defined.
+//! Bober's guarantees hold only while C keeps them: an imported object that C changes, or a function that breaks them,
+//! is at the program's own risk. The module std/c names C's types and reads a C string.
 //!
 //! ```
-//! import * as c from "std/c"
-//! import { div, div_t, free, RAND_MAX, strtod } from "stdlib.h"
+//! import { fromCString } from "std/c"
+//! import { div, div_t, getenv, RAND_MAX, strtod } from "stdlib.h"
 //! import { sqlite3_open } from "../vendor/sqlite/sqlite3.h"
 //! import { printf } from "stdio.h"          // error: printf is variadic
 //! import * as libc from "string.h"         // error: names are listed
-//! const p = c.toCString("2.5"); strtod(p, 0) == 2.5; free(p)
 //! const d: div_t = div(7, 2); d.quot == 3
 //! strtod("2.5", 0) == 2.5                   // a string is given as a C string
+//! fromCString(getenv("HOME"))               // a char * is a u64
 //! ```
 
 import { Nothing } from "../backend/backend"
-import { contains } from "../../std/algo"
+import { endsWith, indexOf, startsWith } from "../../std/algo"
 import { isAlphanumeric, underscore } from "../../std/ascii"
 import { alignUp, max } from "../../std/math"
-import { indexOf, startsWith } from "../../std/string"
 import { dir, join } from "../../std/fs/path"
 import { os } from "../../std/os"
 import { CompileError } from "../error"
@@ -124,18 +125,24 @@ export function includesOf(importer: string, includes: string[],
 	return dirs
 }
 
-/// The C defining syms, of the declarations bind gives the header at path, that are static functions'; "" if none.
-/// The program compiles it with the headers of its packages' C libraries. Weak, as each set of names imported is a
-/// module of its own.
+/// The C defining syms, of the declarations bind gives the file at path, that are static functions' or objects'
+/// accessors, after a .c file itself; "" if none and a header. The program compiles it with the headers of its
+/// packages' C libraries. Weak, as each set of names imported is a module of its own.
 export function glue(path: string, syms: string[]): string {
 	let c = ""
 	for (const s of syms) {
 		if (startsWith(s, "bober_inline_")) {
 			const f = s.slice(13, s.length)
 			c += `extern __typeof__(${f}) ${s} __attribute__((weak, alias("${f}")));\n`
+		} else if (startsWith(s, "bober_object_")) {
+			const o = s.slice(13, s.length)
+			c += `__attribute__((weak)) __typeof__(${o}) ${s}(void) { return ${o}; }\n`
+		} else if (startsWith(s, "bober_element_")) {
+			const o = s.slice(14, s.length)
+			c += `__attribute__((weak)) __typeof__(${o}[0]) ${s}(int i) { return ${o}[i]; }\n`
 		}
 	}
-	return if (c == "") "" else `#include "${path}"\n${c}`
+	return if (c == "" && !endsWith(path, ".c")) "" else `#include "${path}"\n${c}`
 }
 
 class Binder {
@@ -180,8 +187,7 @@ class Binder {
 		} else if (d instanceof Val && d.known == "int") {
 			this.constant(n, d)
 		} else if (d instanceof Val && d.known == "addr") {
-			const t = this.type(d.ty)
-			this.out += `export const ${n}: ${t}\n`
+			this.object(n, d.ty)
 		} else {
 			throw new Unbindable("not declared")
 		}
@@ -232,7 +238,7 @@ class Binder {
 		if (!ft.prototyped) {
 			throw new Unbindable("without a prototype")
 		}
-		if (!contains(this.funcs, sym)) {
+		if (!this.funcs.includes(sym)) {
 			this.funcs.push(sym)
 			let params = ""
 			for (const i of 0 ... ft.params.length - 1) {
@@ -246,8 +252,32 @@ class Binder {
 		}
 	}
 
+	/// Object n of type t as a const of a copy of it, an array's a T[] of its elements, which accessors glue defines
+	/// read.
+	private object(n: string, t: Type) {
+		if (!(t instanceof Arr)) {
+			this.out += `export function bober_object_${n}(): ${this.type(t)}\nexport const ${n} = bober_object_${n}()\n`
+			return
+		}
+		const e = this.type(t.base)
+		if (t.base instanceof Arr) {
+			throw new Unbindable("an array of arrays")
+		}
+		this.type(t) // rejects one of unknown length
+		this.out += `export function bober_element_${n}(i: i32): ${e}
+export const ${n} = (() => {
+	const xs: ${e}[] = []
+	for (const i of 0 ... ${t.len! - 1}) {
+		xs.push(bober_element_${n}(i))
+	}
+	return xs
+})()
+`
+	}
+
 	/// A parameter's type: a struct by value is embedded; a pointer to one that is a class, the class; one to a byte
-	/// or void takes a string or a u8[], one to another scalar T a T[], and either a u64 too.
+	/// or void takes a string or a u8[], one to a pointer to one a string[] or u64[], one to another scalar T a T[],
+	/// and each a u64 too.
 	private param(t: Type): string {
 		if (t instanceof Record) {
 			return `...${this.type(t)}`
@@ -257,8 +287,10 @@ class Binder {
 			try {
 				return this.type(base)
 			} catch (e: Unbindable) {} // one bober cannot declare, as an incomplete struct, stays u64
-		} else if (base != null && (base.kind == "void" || base.kind == "int" && base.size == 1)) {
+		} else if (base != null && byte(base)) {
 			return "string | u8[] | u64"
+		} else if (base instanceof Ptr && byte(base.base)) {
+			return "string[] | u64[] | u64"
 		} else if (base != null
 			&& (base.kind == "bool" || base.kind == "ptr" || base.kind == "int" && base.size <= 8
 			|| base.kind == "float" && base.size <= 8)) {
@@ -361,5 +393,8 @@ function quoted(s: string): string {
 	}
 	return out + "\""
 }
+
+/// Whether t is a byte or void, a pointer to which takes a string.
+function byte(t: Type): bool { return t.kind == "void" || t.kind == "int" && t.size == 1 }
 
 function hex(d: u8): string { return "0123456789ABCDEF".slice(d, d + 1) }

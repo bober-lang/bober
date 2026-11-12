@@ -2,7 +2,7 @@ import { Date, DateTime, dateOf, daysInMonth, daysOf, deadline, fixed, formatDur
 	isLeap, isValid, local, maxDays, millisecond, minDays, minute, monotonic, parseHttpDate, parseRfc3339, posix,
 	rfc3339, second, tzif, utc } from "./time"
 import { maxOf, minOf } from "./limits"
-import { ParseError } from "./parse"
+import { ParseError } from "./string"
 
 /// The ParseError f throws, or null.
 function failure(f: () => i64): ParseError | null {
@@ -58,7 +58,7 @@ test "dates" {
 
 test "instants on a wall clock, to the ends of their span" {
 	assert `${utc.civil(0)}` == "1970-01-01T00:00:00" && `${utc.civil(-1)}` == "1969-12-31T23:59:59.999999999"
-	assert `${utc.civil(1_500_000_000)}` == "1970-01-01T00:00:01.5"
+	assert `${utc.civil(1500 * millisecond)}` == "1970-01-01T00:00:01.5"
 	assert `${utc.civil(max)}` == "2262-04-11T23:47:16.854775807"
 	assert `${utc.civil(min)}` == "1677-09-21T00:12:43.145224192"
 	assert utc.instant(utc.civil(max)) == max && utc.instant(utc.civil(min)) == min
@@ -68,7 +68,7 @@ test "instants on a wall clock, to the ends of their span" {
 
 test "RFC 3339" {
 	assert rfc3339(0) == "1970-01-01T00:00:00Z" && rfc3339(-1) == "1969-12-31T23:59:59.999999999Z"
-	assert rfc3339(1_000_000, fixed(-90 * 60)) == "1969-12-31T22:30:00.001-01:30"
+	assert rfc3339(millisecond, fixed(-90 * 60)) == "1969-12-31T22:30:00.001-01:30"
 	assert parseRfc3339("1985-04-12T23:20:50.52Z") == 482196050_520_000_000
 	assert parseRfc3339("1996-12-19T16:39:57-08:00") == 851042397 * second
 	assert parseRfc3339("1990-12-31t15:59:59.123456789z") == 662659199_123_456_789
@@ -107,7 +107,7 @@ test "durations as Go writes them" {
 }
 
 test "HTTP dates" {
-	assert httpDate(784111777_000_000_000) == "Sun, 06 Nov 1994 08:49:37 GMT"
+	assert httpDate(784111777 * second) == "Sun, 06 Nov 1994 08:49:37 GMT"
 	assert httpDate(0) == "Thu, 01 Jan 1970 00:00:00 GMT" && httpDate(-1) == "Wed, 31 Dec 1969 23:59:59 GMT"
 	assert parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT") == 784111777 * second
 	assert failure(() => parseHttpDate("Fri, 31 Dec 9999 23:59:59 GMT"))!.at == 12

@@ -3,14 +3,13 @@
 //! they are. Errors are thrown as strings. A program using it links the C libraries of bober.pkg; the boot
 //! interpreter has the system's.
 
+import { indexOf } from "../../std/algo"
 import { HashMap } from "../../std/collections/hashmap"
 import { CompileError } from "../error"
 import { Backend, Binary, Block, Cast, Cmp, FCmp, Operand, Type, Unary, Value, codes, mark } from "./backend"
 import { dollar, isAlphabetic, isDigit, percent } from "../../std/ascii"
-import { indexOf } from "../../std/string"
 import { arch, os } from "../../std/os"
 import * as c from "../../std/c"
-import { out, withArray, withString } from "../../std/c"
 import {
 	LLVMAdd, LLVMAddAttributeAtIndex, LLVMAddCallSiteAttribute, LLVMAddCase, LLVMAddClause, LLVMAddDestination, LLVMAddFunction,
 	LLVMAddGlobal, LLVMAddModuleFlag, LLVMAnd, LLVMAppendBasicBlockInContext, LLVMAppendModuleInlineAsm, LLVMAppendingLinkage, LLVMArrayType2, LLVMArrayTypeKind,
@@ -75,9 +74,6 @@ import {
 	LLVMDIBuilderFinalize, LLVMDIBuilderGetOrCreateSubrange, LLVMDIBuilderInsertDeclareRecordAtEnd, LLVMDWARFEmissionFull,
 	LLVMDWARFSourceLanguageC, LLVMGetSubprogram, LLVMSetSubprogram,
 } from "llvm-c/DebugInfo.h"
-import { free } from "stdlib.h"
-
-const noName = c.toCString("")
 
 /// The target triple of bober's OS and CPU.
 export const triple = `${if (arch == "arm64") "aarch64" else arch}-${switch (os) {
@@ -86,7 +82,6 @@ export const triple = `${if (arch == "arm64") "aarch64" else arch}-${switch (os)
 	case "freebsd": "unknown-freebsd"
 	case "windows": "pc-windows-msvc"
 }}`
-const target = c.toCString(triple)
 
 /// The name of section s of data: on Mach-O in segment __DATA.
 const section = (s: string) => if (os == "macos") `__DATA,${s}` else s
@@ -116,14 +111,14 @@ export class LLVM implements Backend {
 
 	/// The module name, for this machine, to be optimized at level, from 0 to 3 as -O takes.
 	constructor(name: string, level: u32 = 2) {
-		this.m = withString(name, p => LLVMModuleCreateWithNameInContext(p, this.ctx))
+		this.m = LLVMModuleCreateWithNameInContext(name, this.ctx)
 		this.b = LLVMCreateBuilderForModule(this.m)
 		this.level = level
 		native()
-		const t = out(t => checked(err => LLVMGetTargetFromTriple(target, t, err) as u64))
-		this.tm = LLVMCreateTargetMachine(t, target, noName, noName, level, LLVMRelocPIC as u32,
-			LLVMCodeModelDefault as u32)
-		LLVMSetTarget(this.m, target)
+		const t = [0 as u64]
+		checked(err => LLVMGetTargetFromTriple(triple, t, err) as u64)
+		this.tm = LLVMCreateTargetMachine(t[0], triple, "", "", level, LLVMRelocPIC as u32, LLVMCodeModelDefault as u32)
+		LLVMSetTarget(this.m, triple)
 		this.td = LLVMCreateTargetDataLayout(this.tm)
 		LLVMSetModuleDataLayout(this.m, this.td)
 	}
@@ -136,39 +131,34 @@ export class LLVM implements Backend {
 	/// In address space 1, the one of LLVM's statepoint-example GC.
 	ref(): Type { return LLVMPointerTypeInContext(this.ctx, 1) }
 	fn(result: Type, params: Type[]): Type {
-		return withArray(params, p => LLVMFunctionType(result, p, params.length as u32, 0))
+		return LLVMFunctionType(result, params, params.length as u32, 0)
 	}
 	variadic(result: Type, params: Type[]): Type {
-		return withArray(params, p => LLVMFunctionType(result, p, params.length as u32, 1))
+		return LLVMFunctionType(result, params, params.length as u32, 1)
 	}
 	struct(fields: Type[]): Type {
-		return withArray(fields, p => LLVMStructTypeInContext(this.ctx, p, fields.length as u32, 0))
+		return LLVMStructTypeInContext(this.ctx, fields, fields.length as u32, 0)
 	}
 	array(elem: Type, n: u64): Type { return LLVMArrayType2(elem, n) }
 
 	constInt(t: Type, n: i64): Value { return LLVMConstInt(t, n as u64, 1) }
 	constFloat(t: Type, x: f64): Value { return LLVMConstReal(t, x) }
 	constIntOf(t: Type, digits: string, radix: u8): Value {
-		return withString(digits, p => LLVMConstIntOfString(t, p, radix))
+		return LLVMConstIntOfString(t, digits, radix)
 	}
-	constFloatOf(t: Type, text: string): Value { return withString(text, p => LLVMConstRealOfString(t, p)) }
+	constFloatOf(t: Type, text: string): Value { return LLVMConstRealOfString(t, text) }
 	constZero(t: Type): Value { return LLVMConstNull(t) }
-	constBytes(s: string): Value {
-		const p = c.toCBytes(s)
-		const v = LLVMConstStringInContext2(this.ctx, p, s.length as u64, 1)
-		free(p)
-		return v
-	}
+	constBytes(s: string): Value { return LLVMConstStringInContext2(this.ctx, s, s.length as u64, 1) }
 	constStruct(fields: Value[]): Value {
-		return withArray(fields, p => LLVMConstStructInContext(this.ctx, p, fields.length as u32, 0))
+		return LLVMConstStructInContext(this.ctx, fields, fields.length as u32, 0)
 	}
 	constArray(elem: Type, elems: Value[]): Value {
-		return withArray(elems, p => LLVMConstArray2(elem, p, elems.length as u64))
+		return LLVMConstArray2(elem, elems, elems.length as u64)
 	}
 	sizeOf(t: Type): Value { return LLVMSizeOf(t) }
 	bytes(t: Type): u64 { return LLVMABISizeOfType(this.td, t) }
 	constOffset(p: Value, bytes: i64): Value {
-		return withArray([this.constInt(this.int(64), bytes)], i => LLVMConstGEP2(this.int(8), p, i, 1))
+		return LLVMConstGEP2(this.int(8), p, [this.constInt(this.int(64), bytes)], 1)
 	}
 	constCast(op: Cast, v: Value, to: Type): Value {
 		return switch (op) {
@@ -184,7 +174,7 @@ export class LLVM implements Backend {
 		if (f != 0) {
 			return f
 		}
-		const fn = linkage(withString(name, p => LLVMAddFunction(this.m, p, t)), local)
+		const fn = linkage(LLVMAddFunction(this.m, name, t), local)
 		// Unoptimized, a function keeps its frame pointer, as with clang, for debuggers and code that walks frames.
 		if (this.level == 0) {
 			LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex as u32, this.stringAttr("frame-pointer", "all"))
@@ -193,22 +183,21 @@ export class LLVM implements Backend {
 	}
 	/// The attribute key="value", one LLVM has no enum for.
 	private stringAttr(key: string, value: string): u64 {
-		return withString(key, k => withString(value, v =>
-			LLVMCreateStringAttribute(this.ctx, k, key.length as u32, v, value.length as u32)))
+		return LLVMCreateStringAttribute(this.ctx, key, key.length as u32, value, value.length as u32)
 	}
 	named(name: string): Value {
-		const f = withString(name, p => LLVMGetNamedFunction(this.m, p))
-		return if (f != 0) f else withString(name, p => LLVMGetNamedGlobal(this.m, p))
+		const f = LLVMGetNamedFunction(this.m, name)
+		return if (f != 0) f else LLVMGetNamedGlobal(this.m, name)
 	}
 	global(name: string, init: Value, local: bool, align: u32): Value {
-		const g = withString(name, p => LLVMAddGlobal(this.m, LLVMTypeOf(init), p))
+		const g = LLVMAddGlobal(this.m, LLVMTypeOf(init), name)
 		LLVMSetInitializer(g, init)
 		aligned(g, align)
 		return linkage(g, local)
 	}
-	extern(name: string, t: Type): Value { return withString(name, p => LLVMAddGlobal(this.m, t, p)) }
+	extern(name: string, t: Type): Value { return LLVMAddGlobal(this.m, t, name) }
 	attr(fn: Value, index: i32, name: string, t: Type) {
-		const kind = withString(name, p => LLVMGetEnumAttributeKindForName(p, name.length as u64) as u64) as u32
+		const kind = LLVMGetEnumAttributeKindForName(name, name.length as u64)
 		const a = if (kind == 0) this.stringAttr(name, "")
 			else if (t == 0) LLVMCreateEnumAttribute(this.ctx, kind, 0) else LLVMCreateTypeAttribute(this.ctx, kind, t)
 		if (LLVMIsAInstruction(fn) != 0) {
@@ -219,11 +208,11 @@ export class LLVM implements Backend {
 	}
 	allocator(fn: Value) {
 		this.attr(fn, 0, "noalias", 0)
-		const kind = withString("allockind", p => LLVMGetEnumAttributeKindForName(p, 9) as u64) as u32
+		const kind = LLVMGetEnumAttributeKindForName("allockind", 9)
 		LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex as u32, LLVMCreateEnumAttribute(this.ctx, kind, 17)) // alloc, zeroed
 	}
 	constant(init: Value): Value {
-		const g = LLVMAddGlobal(this.m, LLVMTypeOf(init), noName)
+		const g = LLVMAddGlobal(this.m, LLVMTypeOf(init), "")
 		LLVMSetInitializer(g, init)
 		LLVMSetGlobalConstant(g, 1)
 		LLVMSetLinkage(g, LLVMPrivateLinkage as u32)
@@ -231,7 +220,7 @@ export class LLVM implements Backend {
 		return g
 	}
 	literal(name: string, init: Value): Value {
-		const g = withString(name, p => LLVMAddGlobal(this.m, LLVMTypeOf(init), p))
+		const g = LLVMAddGlobal(this.m, LLVMTypeOf(init), name)
 		LLVMSetInitializer(g, init)
 		LLVMSetGlobalConstant(g, 1)
 		this.weak(g)
@@ -241,18 +230,15 @@ export class LLVM implements Backend {
 	isConstant(v: Value): bool { return LLVMIsConstant(v) != 0 }
 	replace(old: Value, by: Value) {
 		LLVMReplaceAllUsesWith(old, by)
-		let p: c.ptr = 0
-		const n = out(n => { p = LLVMGetValueName2(old, n) })
-		const name = c.fromCBytes(p, n)
+		const n = [0 as u64]
+		const p = LLVMGetValueName2(old, n)
+		const name = fromBytes(p, n[0])
 		if (LLVMIsAFunction(old) != 0) {
 			LLVMDeleteFunction(old)
 		} else {
 			LLVMDeleteGlobal(old)
 		}
-		withString(name, p => {
-			LLVMSetValueName2(by, p, name.length as u64)
-			return 0
-		})
+		LLVMSetValueName2(by, name, name.length as u64)
 	}
 	remove(fn: Value) {
 		// The builder may be in it, and must not stay in a deleted block.
@@ -266,7 +252,7 @@ export class LLVM implements Backend {
 	}
 	hidden(g: Value) { LLVMSetVisibility(g, LLVMHiddenVisibility as u32) }
 	alias(g: Value, to: Value): Value {
-		const a = LLVMAddAlias2(this.m, LLVMGlobalGetValueType(to), 0, to, noName)
+		const a = LLVMAddAlias2(this.m, LLVMGlobalGetValueType(to), 0, to, "")
 		LLVMSetLinkage(a, LLVMGetLinkage(g)) // internal if static
 		this.replace(g, a)
 		return a
@@ -276,7 +262,7 @@ export class LLVM implements Backend {
 	resultOf(t: Type): Type { return LLVMGetReturnType(t) }
 	valueType(f: Value): Type { return LLVMGlobalGetValueType(f) }
 
-	block(fn: Value): Block { return LLVMAppendBasicBlockInContext(this.ctx, fn, noName) }
+	block(fn: Value): Block { return LLVMAppendBasicBlockInContext(this.ctx, fn, "") }
 	at(b: Block) {
 		LLVMPositionBuilderAtEnd(this.b, b)
 		const sp = LLVMGetSubprogram(LLVMGetBasicBlockParent(b))
@@ -296,15 +282,15 @@ export class LLVM implements Backend {
 
 	binary(op: Binary, a: Value, b: Value): Value {
 		return if (op == "fpow") this.intrinsic("llvm.pow", [LLVMTypeOf(a)], [a, b])
-			else LLVMBuildBinOp(this.b, binaries.get(op)! as u32, a, b, noName)
+			else LLVMBuildBinOp(this.b, binaries.get(op)! as u32, a, b, "")
 	}
-	icmp(pred: Cmp, a: Value, b: Value): Value { return LLVMBuildICmp(this.b, cmps.get(pred)! as u32, a, b, noName) }
-	fcmp(pred: FCmp, a: Value, b: Value): Value { return LLVMBuildFCmp(this.b, fcmps.get(pred)! as u32, a, b, noName) }
+	icmp(pred: Cmp, a: Value, b: Value): Value { return LLVMBuildICmp(this.b, cmps.get(pred)! as u32, a, b, "") }
+	fcmp(pred: FCmp, a: Value, b: Value): Value { return LLVMBuildFCmp(this.b, fcmps.get(pred)! as u32, a, b, "") }
 	cast(op: Cast, v: Value, to: Type): Value {
 		if (op == "ptrtoint" && this.gc && LLVMTypeOf(v) == this.ref()) {
 			return this.call(this.fn(this.int(64), [this.ref()]), this.address(), [v])
 		}
-		return LLVMBuildCast(this.b, casts.get(op)! as u32, v, to, noName)
+		return LLVMBuildCast(this.b, casts.get(op)! as u32, v, to, "")
 	}
 	/// What a ref's address is taken by until statepoints: a call that reads memory, so that, unlike a ptrtoint,
 	/// LLVM does not reuse the address across one that may collect, leaving the ref dead there and so not reloaded.
@@ -317,17 +303,17 @@ export class LLVM implements Backend {
 		for (const a of ["nounwind", "willreturn", "gc-leaf-function"]) {
 			this.attr(f, LLVMAttributeFunctionIndex as i32, a, 0)
 		}
-		const read = withString("memory", p => LLVMGetEnumAttributeKindForName(p, 6) as u64) as u32
+		const read = LLVMGetEnumAttributeKindForName("memory", 6)
 		LLVMAddAttributeAtIndex(f, LLVMAttributeFunctionIndex as u32, LLVMCreateEnumAttribute(this.ctx, read, 21))
 		return f
 	}
-	select(cond: Value, yes: Value, no: Value): Value { return LLVMBuildSelect(this.b, cond, yes, no, noName) }
+	select(cond: Value, yes: Value, no: Value): Value { return LLVMBuildSelect(this.b, cond, yes, no, "") }
 	alloca(t: Type, align: u32): Value {
-		return aligned(LLVMBuildAlloca(this.b, t, noName), align)
+		return aligned(LLVMBuildAlloca(this.b, t, ""), align)
 	}
-	stackAlloc(bytes: Value): Value { return aligned(LLVMBuildArrayAlloca(this.b, this.int(8), bytes, noName), 16) }
+	stackAlloc(bytes: Value): Value { return aligned(LLVMBuildArrayAlloca(this.b, this.int(8), bytes, ""), 16) }
 	load(t: Type, p: Value, volatile: bool): Value {
-		const l = aligned(LLVMBuildLoad2(this.b, t, p, noName), loose(p))
+		const l = aligned(LLVMBuildLoad2(this.b, t, p, ""), loose(p))
 		LLVMSetVolatile(l, volatile as i32)
 		return l
 	}
@@ -337,28 +323,28 @@ export class LLVM implements Backend {
 		return s
 	}
 	invariant(access: Value) {
-		const kind = withString("invariant.group", p => LLVMGetMDKindIDInContext(this.ctx, p, 15) as u64) as u32
+		const kind = LLVMGetMDKindIDInContext(this.ctx, "invariant.group", 15)
 		LLVMSetMetadata(access, kind, LLVMMetadataAsValue(this.ctx, LLVMMDNodeInContext2(this.ctx, 0, 0)))
 	}
-	field(t: Type, p: Value, i: u32): Value { return LLVMBuildStructGEP2(this.b, t, p, i, noName) }
+	field(t: Type, p: Value, i: u32): Value { return LLVMBuildStructGEP2(this.b, t, p, i, "") }
 	gep(t: Type, p: Value, indices: Value[]): Value {
-		return withArray(indices, a => LLVMBuildGEP2(this.b, t, p, a, indices.length as u32, noName))
+		return LLVMBuildGEP2(this.b, t, p, indices, indices.length as u32, "")
 	}
-	extract(v: Value, i: u32): Value { return LLVMBuildExtractValue(this.b, v, i, noName) }
-	insert(v: Value, e: Value, i: u32): Value { return LLVMBuildInsertValue(this.b, v, e, i, noName) }
+	extract(v: Value, i: u32): Value { return LLVMBuildExtractValue(this.b, v, i, "") }
+	insert(v: Value, e: Value, i: u32): Value { return LLVMBuildInsertValue(this.b, v, e, i, "") }
 	undef(t: Type): Value { return LLVMGetPoison(t) }
 	call(fnType: Type, fn: Value, args: Value[]): Value {
-		return withArray(args, a => LLVMBuildCall2(this.b, fnType, fn, a, args.length as u32, noName))
+		return LLVMBuildCall2(this.b, fnType, fn, args, args.length as u32, "")
 	}
 	invoke(fnType: Type, fn: Value, args: Value[], then: Block, unwind: Block): Value {
-		return withArray(args, a => LLVMBuildInvoke2(this.b, fnType, fn, a, args.length as u32, then, unwind, noName))
+		return LLVMBuildInvoke2(this.b, fnType, fn, args, args.length as u32, then, unwind, "")
 	}
 	landingPad(typeinfo: Value) {
-		LLVMAddClause(LLVMBuildLandingPad(this.b, LLVMTokenTypeInContext(this.ctx), 0, 1, noName), typeinfo)
+		LLVMAddClause(LLVMBuildLandingPad(this.b, LLVMTokenTypeInContext(this.ctx), 0, 1, ""), typeinfo)
 	}
 
 	constPacked(fields: Value[]): Value {
-		return withArray(fields, p => LLVMConstStructInContext(this.ctx, p, fields.length as u32, 1))
+		return LLVMConstStructInContext(this.ctx, fields, fields.length as u32, 1)
 	}
 	switch(v: Value, cases: i64[], targets: Block[], otherwise: Block) {
 		const s = LLVMBuildSwitch(this.b, v, otherwise, cases.length as u32)
@@ -378,7 +364,7 @@ export class LLVM implements Backend {
 	}
 	unary(op: Unary, v: Value): Value {
 		if (op == "fneg") {
-			return LLVMBuildFNeg(this.b, v, noName)
+			return LLVMBuildFNeg(this.b, v, "")
 		}
 		const args = if (op == "ctlz" || op == "cttz") [v, this.constInt(this.int(1), 0)] else [v]
 		return this.intrinsic(`llvm.${op}`, [LLVMTypeOf(v)], args)
@@ -389,7 +375,7 @@ export class LLVM implements Backend {
 	aliasing(access: Value, header: bool) {
 		if (this.tbaa.length == 0) {
 			// Two scalar types under one root, each its own access tag, as type-based alias analysis has them.
-			const node = (ms: u64[]) => withArray(ms, p => LLVMMDNodeInContext2(this.ctx, p, ms.length as u64))
+			const node = (ms: u64[]) => LLVMMDNodeInContext2(this.ctx, ms, ms.length as u64)
 			const root = node([this.mdString("bober")])
 			for (const name of ["array header", "array element"]) {
 				const t = node([this.mdString(name), root])
@@ -398,27 +384,26 @@ export class LLVM implements Backend {
 		}
 		LLVMSetMetadata(access, this.tbaaKind(), LLVMMetadataAsValue(this.ctx, this.tbaa[if (header) 0 else 1]))
 	}
-	private tbaaKind(): u32 { return withString("tbaa", p => LLVMGetMDKindIDInContext(this.ctx, p, 4) as u64) as u32 }
-	private mdString(s: string): u64 { return withString(s, p => LLVMMDStringInContext2(this.ctx, p, s.length as u64)) }
+	private tbaaKind(): u32 { return LLVMGetMDKindIDInContext(this.ctx, "tbaa", 4) }
+	private mdString(s: string): u64 { return LLVMMDStringInContext2(this.ctx, s, s.length as u64) }
 	copy(dst: Value, src: Value, bytes: i64) {
 		LLVMBuildMemCpy(this.b, dst, 1, src, 1, this.constInt(this.int(64), bytes))
 	}
 	zero(dst: Value, bytes: i64) {
 		LLVMBuildMemSet(this.b, dst, this.constInt(this.int(8), 0), this.constInt(this.int(64), bytes), 1)
 	}
-	atomicLoad(t: Type, p: Value): Value { return this.ordered(LLVMBuildLoad2(this.b, t, p, noName), t) }
+	atomicLoad(t: Type, p: Value): Value { return this.ordered(LLVMBuildLoad2(this.b, t, p, ""), t) }
 	atomicStore(v: Value, p: Value) { this.ordered(LLVMBuildStore(this.b, v, p), LLVMTypeOf(v)) }
-	fence() { LLVMBuildFence(this.b, LLVMAtomicOrderingSequentiallyConsistent as u32, 0, noName) }
+	fence() { LLVMBuildFence(this.b, LLVMAtomicOrderingSequentiallyConsistent as u32, 0, "") }
 	trap() { this.intrinsic("llvm.trap", [], []) }
 	readable(p: Value, n: Value, align: i64) {
-		const f = withArray([] as Type[], q => LLVMGetIntrinsicDeclaration(this.m, withString("llvm.assume", s =>
-			LLVMLookupIntrinsicID(s, 11) as u64) as u32, q, 0))
+		const f = LLVMGetIntrinsicDeclaration(this.m, LLVMLookupIntrinsicID("llvm.assume", 11), 0, 0)
 		const bundles = [bundle("dereferenceable", [p, n])]
 		if (align > 1) {
 			bundles.push(bundle("align", [p, this.constInt(this.int(64), align)]))
 		}
-		withArray([this.constInt(this.int(1), 1)], args => withArray(bundles, bs =>
-			LLVMBuildCallWithOperandBundles(this.b, LLVMGlobalGetValueType(f), f, args, 1, bs, bundles.length as u32, noName)))
+		LLVMBuildCallWithOperandBundles(this.b, LLVMGlobalGetValueType(f), f, [this.constInt(this.int(1), 1)], 1, bundles,
+			bundles.length as u32, "")
 		for (const b of bundles) {
 			LLVMDisposeOperandBundle(b)
 		}
@@ -459,8 +444,8 @@ export class LLVM implements Backend {
 		const rt = if (types.length == 0) this.void() else if (types.length == 1) types[0] else this.struct(types)
 		const ft = this.fn(rt, argTypes)
 		const template = asmText(text)
-		const callee = withString(template, t => withString(cons, c =>
-			LLVMGetInlineAsm(ft, t, template.length as u64, c, cons.length as u64, 1, 0, LLVMInlineAsmDialectATT as u32, 0)))
+		const callee = LLVMGetInlineAsm(ft, template, template.length as u64, cons, cons.length as u64, 1, 0,
+			LLVMInlineAsmDialectATT as u32, 0)
 		const r = this.call(ft, callee, args)
 		for (const [k, t] of memory) {
 			this.attr(r, k + 1, "elementtype", t)
@@ -473,10 +458,7 @@ export class LLVM implements Backend {
 	}
 	hasAsm(): bool { return true }
 	moduleAsm(text: string) {
-		withString(text, p => {
-			LLVMAppendModuleInlineAsm(this.m, p, text.length as u64)
-			return 0
-		})
+		LLVMAppendModuleInlineAsm(this.m, text, text.length as u64)
 	}
 	common(g: Value) { LLVMSetLinkage(g, LLVMCommonLinkage as u32) }
 	threadLocal(g: Value) { LLVMSetThreadLocal(g, 1) }
@@ -484,8 +466,8 @@ export class LLVM implements Backend {
 
 	/// A call of the intrinsic name overloaded on types, with args.
 	private intrinsic(name: string, types: Type[], args: Value[]): Value {
-		const id = withString(name, p => LLVMLookupIntrinsicID(p, name.length as u64) as u64) as u32
-		const f = withArray(types, p => LLVMGetIntrinsicDeclaration(this.m, id, p, types.length as u64))
+		const id = LLVMLookupIntrinsicID(name, name.length as u64)
+		const f = LLVMGetIntrinsicDeclaration(this.m, id, types, types.length as u64)
 		return this.call(LLVMGlobalGetValueType(f), f, args)
 	}
 
@@ -498,30 +480,27 @@ export class LLVM implements Backend {
 
 	source(path: string, producer: string) {
 		this.di = LLVMCreateDIBuilder(this.m)
-		this.file = withString(path, p => LLVMDIBuilderCreateFile(this.di, p, path.length as u64, noName, 0))
-		withString(producer, p => LLVMDIBuilderCreateCompileUnit(this.di, LLVMDWARFSourceLanguageC as u32, this.file, p,
-			producer.length as u64, 0, noName, 0, 0, noName, 0, LLVMDWARFEmissionFull as u32, 0, 0, 0, noName, 0, noName, 0))
+		this.file = LLVMDIBuilderCreateFile(this.di, path, path.length as u64, "", 0)
+		LLVMDIBuilderCreateCompileUnit(this.di, LLVMDWARFSourceLanguageC as u32, this.file, producer,
+			producer.length as u64, 0, "", 0, 0, "", 0, LLVMDWARFEmissionFull as u32, 0, 0, 0, "", 0, "", 0)
 		const version = LLVMValueAsMetadata(this.constInt(this.int(32), LLVMDebugMetadataVersion() as i64))
-		withString("Debug Info Version", p => {
-			LLVMAddModuleFlag(this.m, LLVMModuleFlagBehaviorWarning as u32, p, 18, version)
-			return 0
-		})
+		LLVMAddModuleFlag(this.m, LLVMModuleFlagBehaviorWarning as u32, "Debug Info Version", 18, version)
 		LLVMSetIsNewDbgInfoFormat(this.m, 1)
 	}
 	debugFunction(fn: Value, line: u32) {
-		const t = withArray([], p => LLVMDIBuilderCreateSubroutineType(this.di, this.file, p, 0, 0))
-		let name: c.ptr = 0
-		const n = out(len => { name = LLVMGetValueName2(fn, len) })
-		LLVMSetSubprogram(fn, LLVMDIBuilderCreateFunction(this.di, this.file, name, n, name, n, this.file, line, t, 0, 1,
-			line, 0, 0))
+		const t = LLVMDIBuilderCreateSubroutineType(this.di, this.file, 0, 0, 0)
+		const n = [0 as u64]
+		const name = LLVMGetValueName2(fn, n)
+		LLVMSetSubprogram(fn, LLVMDIBuilderCreateFunction(this.di, this.file, name, n[0], name, n[0], this.file, line, t,
+			0, 1, line, 0, 0))
 	}
 	line(n: u32, col: u32) { LLVMSetCurrentDebugLocation2(this.b, this.location(n, col)) }
 	debugLocal(name: string, p: Value, t: Type, line: u32) {
 		if (this.sp == 0) {
 			return
 		}
-		const v = withString(name, s => LLVMDIBuilderCreateAutoVariable(this.di, this.sp, s, name.length as u64, this.file,
-			line, this.debugType(t), 1, 0, 0))
+		const v = LLVMDIBuilderCreateAutoVariable(this.di, this.sp, name, name.length as u64, this.file, line,
+			this.debugType(t), 1, 0, 0)
 		LLVMDIBuilderInsertDeclareRecordAtEnd(this.di, p, v, LLVMDIBuilderCreateExpression(this.di, 0, 0),
 			this.location(line, 0), this.here())
 	}
@@ -542,7 +521,7 @@ export class LLVM implements Backend {
 		const align = LLVMABIAlignmentOfType(this.td, t) * 8
 		const kind = LLVMGetTypeKind(t) as i32
 		const basic = (name: string, encoding: u32) =>
-			withString(name, p => LLVMDIBuilderCreateBasicType(di, p, name.length as u64, bits, encoding, 0))
+			LLVMDIBuilderCreateBasicType(di, name, name.length as u64, bits, encoding, 0)
 		// A struct's members, or an array's one range; its element type.
 		const parts: u64[] = []
 		let elem: u64 = 0
@@ -550,9 +529,9 @@ export class LLVM implements Backend {
 			for (const i of 0 ... (LLVMCountStructElementTypes(t) as i32) - 1) {
 				const f = LLVMStructGetTypeAtIndex(t, i as u32)
 				const name = `_${i}`
-				parts.push(withString(name, p => LLVMDIBuilderCreateMemberType(di, this.file, p, name.length as u64,
-					this.file, 0, LLVMABISizeOfType(this.td, f) * 8, LLVMABIAlignmentOfType(this.td, f) * 8,
-					LLVMOffsetOfElement(this.td, t, i as u32) * 8, 0, this.debugType(f))))
+				parts.push(LLVMDIBuilderCreateMemberType(di, this.file, name, name.length as u64, this.file, 0,
+					LLVMABISizeOfType(this.td, f) * 8, LLVMABIAlignmentOfType(this.td, f) * 8,
+					LLVMOffsetOfElement(this.td, t, i as u32) * 8, 0, this.debugType(f)))
 			}
 		} else if (kind == LLVMArrayTypeKind) {
 			parts.push(LLVMDIBuilderGetOrCreateSubrange(di, 0, LLVMGetArrayLength2(t) as i64))
@@ -560,10 +539,10 @@ export class LLVM implements Backend {
 		}
 		const d = if (kind == LLVMIntegerTypeKind) basic(`i${bits}`, if (bits == 8) 0x02 else 0x05)
 			else if (kind == LLVMFloatTypeKind || kind == LLVMDoubleTypeKind) basic(`f${bits}`, 0x04)
-			else if (kind == LLVMPointerTypeKind) LLVMDIBuilderCreatePointerType(di, 0, bits, align, 0, noName, 0)
-			else if (kind == LLVMArrayTypeKind) withArray(parts, p => LLVMDIBuilderCreateArrayType(di, bits, align, elem, p, 1))
-			else withArray(parts, p => LLVMDIBuilderCreateStructType(di, this.file, noName, 0, this.file, 0, bits,
-				align, 0, 0, p, parts.length as u32, 0, 0, noName, 0))
+			else if (kind == LLVMPointerTypeKind) LLVMDIBuilderCreatePointerType(di, 0, bits, align, 0, "", 0)
+			else if (kind == LLVMArrayTypeKind) LLVMDIBuilderCreateArrayType(di, bits, align, elem, parts, 1)
+			else LLVMDIBuilderCreateStructType(di, this.file, "", 0, this.file, 0, bits, align, 0, 0, parts,
+				parts.length as u32, 0, 0, "", 0)
 		this.debugTypes.set(t, d)
 		return d
 	}
@@ -577,13 +556,10 @@ export class LLVM implements Backend {
 		if (this.roots.length > 0) {
 			// Kept, unreferenced as they are, through optimizing and LTO to the linker.
 			const t = LLVMArrayType2(this.ptr(), this.roots.length as u64)
-			const used = withString("llvm.compiler.used", p => LLVMAddGlobal(this.m, t, p))
+			const used = LLVMAddGlobal(this.m, t, "llvm.compiler.used")
 			LLVMSetInitializer(used, this.constArray(this.ptr(), this.roots))
 			LLVMSetLinkage(used, LLVMAppendingLinkage as u32)
-			withString("llvm.metadata", p => {
-				LLVMSetSection(used, p)
-				return 0
-			})
+			LLVMSetSection(used, "llvm.metadata")
 			this.roots = []
 		}
 	}
@@ -592,10 +568,7 @@ export class LLVM implements Backend {
 	/// casts turn into integers.
 	collected() {
 		this.gc = true
-		withString(c.fromCString(LLVMGetDataLayoutStr(this.m)) + "-ni:1", p => {
-			LLVMSetDataLayout(this.m, p)
-			return 0
-		})
+		LLVMSetDataLayout(this.m, c.fromCString(LLVMGetDataLayoutStr(this.m)) + "-ni:1")
 	}
 
 	marks(): bool { return true }
@@ -633,14 +606,8 @@ export class LLVM implements Backend {
 	/// A constant of init in the section s, which the run time reads between the bounds the linker defines (src/rt.h).
 	private collect(init: Value, s: string) {
 		const e = this.constant(init)
-		withString(section(s), p => {
-			LLVMSetSection(e, p)
-			return 0
-		})
-		withString("bober.root", p => {
-			LLVMSetValueName2(e, p, 9) // as llvm.compiler.used takes, which LLVM makes unique
-			return 0
-		})
+		LLVMSetSection(e, section(s))
+		LLVMSetValueName2(e, "bober.root", 9) // as llvm.compiler.used takes, which LLVM makes unique
 		this.roots.push(e)
 	}
 
@@ -676,7 +643,7 @@ export class LLVM implements Backend {
 			this.statepoints()
 		}
 		const kind = if (asm) LLVMAssemblyFile else LLVMObjectFile
-		checked(err => withString(path, p => LLVMTargetMachineEmitToFile(this.tm, this.m, p, kind as u32, err) as u64))
+		checked(err => LLVMTargetMachineEmitToFile(this.tm, this.m, path, kind as u32, err) as u64)
 	}
 
 	/// Moves the module of other, verified, into this one, to be optimized with it as one.
@@ -691,7 +658,7 @@ export class LLVM implements Backend {
 
 	/// Runs LLVM's default pass pipeline at this module's level.
 	optimize() {
-		failed(withString(`default<O${this.level}>`, p => LLVMRunPasses(this.m, p, this.tm, LLVMCreatePassBuilderOptions())))
+		failed(LLVMRunPasses(this.m, `default<O${this.level}>`, this.tm, LLVMCreatePassBuilderOptions()))
 	}
 
 	/// Calls visit with each instruction of each function, which may add others around it or erase it.
@@ -738,7 +705,7 @@ export class LLVM implements Backend {
 		}
 		const n = if (kind == LLVMStructTypeKind) LLVMCountStructElementTypes(t) as i32 else LLVMGetArrayLength2(t) as i32
 		for (const i of 0 ... n - 1) {
-			this.parts(LLVMBuildExtractValue(this.b, v, i as u32, noName), LLVMBuildStructGEP2(this.b, t, p, i as u32, noName), s)
+			this.parts(LLVMBuildExtractValue(this.b, v, i as u32, ""), LLVMBuildStructGEP2(this.b, t, p, i as u32, ""), s)
 		}
 	}
 
@@ -792,16 +759,12 @@ export class LLVM implements Backend {
 		let f = LLVMGetFirstFunction(this.m)
 		while (f != 0) {
 			if (LLVMIsDeclaration(f) == 0) {
-				withString("statepoint-example", p => {
-					LLVMSetGC(f, p)
-					return 0
-				})
+				LLVMSetGC(f, "statepoint-example")
 				this.spillAll(f)
 			}
 			f = LLVMGetNextFunction(f)
 		}
-		failed(withString("function(sroa),rewrite-statepoints-for-gc", p =>
-			LLVMRunPasses(this.m, p, this.tm, LLVMCreatePassBuilderOptions())))
+		failed(LLVMRunPasses(this.m, "function(sroa),rewrite-statepoints-for-gc", this.tm, LLVMCreatePassBuilderOptions()))
 		LLVMSetModuleDataLayout(this.m, this.td) // the target's, which codegen and LTO take, now no ref is hidden
 		if (this.named("llvm.experimental.gc.statepoint.p0") != 0) {
 			this.moduleAsm(`.pushsection ${section("bober_stackmaps")}${if (os == "macos") "" else `,"aw"`}
@@ -816,7 +779,7 @@ export class LLVM implements Backend {
 				const call = LLVMGetUser(u)
 				u = LLVMGetNextUse(u)
 				LLVMPositionBuilderBefore(this.b, call)
-				LLVMReplaceAllUsesWith(call, LLVMBuildCast(this.b, LLVMPtrToInt as u32, LLVMGetOperand(call, 0), this.int(64), noName))
+				LLVMReplaceAllUsesWith(call, LLVMBuildCast(this.b, LLVMPtrToInt as u32, LLVMGetOperand(call, 0), this.int(64), ""))
 				LLVMInstructionEraseFromParent(call)
 			}
 			LLVMDeleteFunction(marker)
@@ -868,7 +831,7 @@ export class LLVM implements Backend {
 		const t = LLVMTypeOf(v)
 		const entry = LLVMGetEntryBasicBlock(fn)
 		LLVMPositionBuilderBefore(this.b, LLVMGetFirstInstruction(entry))
-		const slot = LLVMBuildAlloca(this.b, t, noName)
+		const slot = LLVMBuildAlloca(this.b, t, "")
 		if (LLVMIsAInstruction(v) == 0) {
 			LLVMPositionBuilderBefore(this.b, LLVMGetNextInstruction(slot))
 		} else if (invoke) {
@@ -894,19 +857,19 @@ export class LLVM implements Backend {
 				} else {
 					LLVMPositionBuilderBefore(this.b, user)
 				}
-				LLVMSetOperand(user, k as u32, LLVMBuildLoad2(this.b, t, slot, noName))
+				LLVMSetOperand(user, k as u32, LLVMBuildLoad2(this.b, t, slot, ""))
 			}
 		}
 	}
 
 	/// Adds the functions and globals of ir, LLVM assembly.
 	include(ir: string) {
-		const buf = withString(ir, p =>
-			withString("ir", name => LLVMCreateMemoryBufferWithMemoryRangeCopy(p, ir.length as u64, name)))
+		const buf = LLVMCreateMemoryBufferWithMemoryRangeCopy(ir, ir.length as u64, "ir")
 		// LLVMParseIRInContext takes buf.
-		const m = out(m => checked(err => LLVMParseIRInContext(this.ctx, buf, m, err) as u64))
-		LLVMSetModuleDataLayout(m, LLVMCreateTargetDataLayout(this.tm))
-		if (LLVMLinkModules2(this.m, m) != 0) {
+		const m = [0 as u64]
+		checked(err => LLVMParseIRInContext(this.ctx, buf, m, err) as u64)
+		LLVMSetModuleDataLayout(m[0], LLVMCreateTargetDataLayout(this.tm))
+		if (LLVMLinkModules2(this.m, m[0]) != 0) {
 			throw new CompileError("cannot link the included ir")
 		}
 	}
@@ -931,11 +894,7 @@ const fcmps = codes([["oeq", LLVMRealOEQ], ["ogt", LLVMRealOGT], ["oge", LLVMRea
 
 /// Sets LLVM's own options, as clang's -mllvm does: once in a process, before its first module.
 export function options(args: string[]) {
-	const argv = ["llvm", ...args].map(a => c.toCString(a))
-	withArray(argv, p => {
-		LLVMParseCommandLineOptions(argv.length, p, noName)
-		return 0
-	})
+	LLVMParseCommandLineOptions(args.length + 1, ["llvm", ...args], "")
 }
 
 /// Registers the targets bober compiles for, arm64, x86-64 and wasm, with their inline assembly parsers.
@@ -1012,7 +971,7 @@ function body(b: Block): Value {
 /// Whether the instruction i is of opcode op.
 /// An operand bundle, as an assume takes them.
 function bundle(tag: string, args: Value[]): u64 {
-	return withArray(args, a => withString(tag, t => LLVMCreateOperandBundle(t, tag.length as u64, a, args.length as u32)))
+	return LLVMCreateOperandBundle(tag, tag.length as u64, args, args.length as u32)
 }
 
 function isOp(i: Value, op: i32): bool {
@@ -1039,9 +998,10 @@ function linkage(v: Value, local: bool): Value {
 }
 
 /// Calls f with a place for LLVM's message, which is thrown if f returns nonzero.
-function checked(f: (err: c.ptr) => u64) {
-	let bad: u64 = 0
-	const msg = message(out(err => { bad = f(err) }))
+function checked(f: (err: u64[]) => u64) {
+	const err = [0 as u64]
+	const bad = f(err)
+	const msg = message(err[0])
 	if (bad != 0) {
 		throw new CompileError(msg)
 	}

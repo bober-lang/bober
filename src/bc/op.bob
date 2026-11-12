@@ -10,9 +10,9 @@
 //! `Local`, `Global`, `Member`, `Field` or `Subscript` that yields a FixedArray names its place, which the `SetLocal`,
 //! `SetGlobal`, `SetMember`, `SetField` or `SetSubscript` consuming it writes in place.
 //!
-//! Control flow is WebAssembly's. `Block`, `Loop`, `If`, `Each`, `Try`, `Test` and `Default` open a block to its `End`;
+//! Control flow is WebAssembly's. `Block`, `Loop`, `If`, `Each`, `Try` and `Default` open a block to its `End`;
 //! `Br n` leaves the n-th enclosing block, carrying its result if it has one, or restarts a `Loop`, or goes on to an
-//! `Each`'s next element. Nothing follows `Unreachable`, `Br`, `Return` or `Throw` before the next `Else`,
+//! `Each`'s next element. Nothing follows `Unreachable`, `Br`, `Return`, `Throw` or `Fail` before the next `Else`,
 //! `Catch`, `Finally` or `End`.
 //!
 //! A `Try` is its body, then a `Catch`, a `Finally` or both, in that order. A throw unwinds to the innermost `Try` of
@@ -72,107 +72,108 @@ export const Call: u8 = 16
 export const CallMethod: u8 = 17
 /// fn, args → T: calls a function value with that many args.
 export const CallRef: u8 = 18
-/// string →: opens a block run as the subtest of that name, which a runner may skip (§5.5).
-export const Test: u8 = 19
 /// v →
-export const Drop: u8 = 20
+export const Drop: u8 = 19
 /// → T: loads.
-export const Local: u8 = 21
+export const Local: u8 = 20
 /// T →: stores.
-export const SetLocal: u8 = 22
+export const SetLocal: u8 = 21
 /// → T: loads a Var, or a Function as a value, with the type args.
-export const Global: u8 = 23
+export const Global: u8 = 22
 /// T →: stores a Var.
-export const SetGlobal: u8 = 24
+export const SetGlobal: u8 = 23
 /// → bool
-export const False: u8 = 25
+export const False: u8 = 24
 /// → bool
-export const True: u8 = 26
+export const True: u8 = 25
 /// → T: an integer, wrapped to T, or converted if a float, as a param of one is.
-export const Int: u8 = 27
+export const Int: u8 = 26
 /// → T: an f64, by its bits, rounded to T.
-export const Float: u8 = 28
+export const Float: u8 = 27
 /// → string
-export const Str: u8 = 29
+export const Str: u8 = 28
 /// → null
-export const Null: u8 = 30
+export const Null: u8 = 29
 /// → Optional: a left-out argument.
-export const Missing: u8 = 31
+export const Missing: u8 = 30
 /// → Type: the type as a value, as typeof makes (§4.11).
-export const Type: u8 = 32
+export const Type: u8 = 31
 /// obj → T: reads a class field; an embedded one as a reference into obj.
-export const Member: u8 = 33
+export const Member: u8 = 32
 /// obj, v →: writes a class field; an embedded one by copying v in.
-export const SetMember: u8 = 34
+export const SetMember: u8 = 33
 /// obj → T: a field of an object, tuple ("0", "1", …) or Type (§4.11), or a length; a method bound.
-export const Field: u8 = 35
+export const Field: u8 = 34
 /// obj, v →: writes it.
-export const SetField: u8 = 36
+export const SetField: u8 = 35
 /// arr, k → T: an element of an array or fixed array, or a string's code unit, trapping outside; with a string k, the
 /// field of an object, class or tuple it names.
-export const Subscript: u8 = 37
+export const Subscript: u8 = 36
 /// arr, k, v →: writes it.
-export const SetSubscript: u8 = 38
+export const SetSubscript: u8 = 37
 /// arr → arr: an array or tuple pattern's check: traps on fewer elements than the count (§5.1).
-export const Unpack: u8 = 39
+export const Unpack: u8 = 38
 /// elems → T: makes an array or tuple of that many; one at a listed index is an array spread into it.
-export const Array: u8 = 40
+export const Array: u8 = 39
 /// values → T: makes an object of T's fields in order; one at a listed index is spread into it.
-export const Object: u8 = 41
+export const Object: u8 = 40
 /// args → T: constructs a class instance, tuple or array (§6.3).
-export const New: u8 = 42
+export const New: u8 = 41
 /// → fn: the function with the type args, capturing the listed locals by reference, which follow its params.
-export const Closure: u8 = 43
+export const Closure: u8 = 42
 /// v → T: every conversion and narrowing, a! included; traps as §6.6 says.
-export const Cast: u8 = 44
+export const Cast: u8 = 43
 /// v → bool: whether the type of a union's, object's or interface's tag fits T.
-export const Is: u8 = 45
+export const Is: u8 = 44
 /// bool →: traps if false.
-export const Assert: u8 = 46
+export const Assert: u8 = 45
 /// bool → bool
-export const Not: u8 = 47
+export const Not: u8 = 46
 /// a, b → bool: numbers by value, strings by code units, refs by identity, unions by tag, then value.
-export const Eq: u8 = 48
+export const Eq: u8 = 47
 /// a, b → bool: !Eq.
-export const Ne: u8 = 49
+export const Ne: u8 = 48
 /// a, b → bool: of numbers, or of strings by code units.
-export const Lt: u8 = 50
-export const Gt: u8 = 51
-export const Le: u8 = 52
-export const Ge: u8 = 53
+export const Lt: u8 = 49
+export const Gt: u8 = 50
+export const Le: u8 = 51
+export const Ge: u8 = 52
 /// a, b → T: of numbers, or strings concatenated.
-export const Add: u8 = 54
+export const Add: u8 = 53
 /// a, b → T: of numbers (§6.5).
-export const Sub: u8 = 55
-export const Mul: u8 = 56
+export const Sub: u8 = 54
+export const Mul: u8 = 55
 /// a, b → T: an integer one traps on zero.
-export const Div: u8 = 57
+export const Div: u8 = 56
 /// a, b → T: an integer one traps on zero; a float's is fmod.
-export const Rem: u8 = 58
+export const Rem: u8 = 57
 /// a, b → T: traps on a negative integer exponent.
-export const Pow: u8 = 59
+export const Pow: u8 = 58
 /// a, b → T: of integers or bools.
-export const And: u8 = 60
-export const Or: u8 = 61
-export const Xor: u8 = 62
+export const And: u8 = 59
+export const Or: u8 = 60
+export const Xor: u8 = 61
 /// a, b → T: of integers, the count modulo the width.
-export const Shl: u8 = 63
+export const Shl: u8 = 62
 /// a, b → T: as Shl, arithmetic for signed types.
-export const Shr: u8 = 64
+export const Shr: u8 = 63
 /// a → T: of a number; a float's sign flips, zero's too.
-export const Neg: u8 = 65
+export const Neg: u8 = 64
 /// Starts a new variable in the local where declared; closures made before keep the old one (§5.1).
-export const Fresh: u8 = 66
+export const Fresh: u8 = 65
 /// a, b → bool: an Eq of strings that are each a literal, by identity, as equal ones are one (§4.2).
-export const Same: u8 = 67
+export const Same: u8 = 66
 /// a, b, ... → string: the n strings concatenated, sized once; resolve fuses chained string Adds into it.
-export const Concat: u8 = 68
+export const Concat: u8 = 67
+/// msg →: traps, the assert failed, with msg saying how.
+export const Fail: u8 = 68
 
 export type Opcode = End | Unreachable | Block | Loop | If | Else | Each | Try | Catch | Finally | Throw | Br | BrIf
-	| BrNull | Default | Return | Call | CallMethod | CallRef | Test | Drop | Local | SetLocal | Global
+	| BrNull | Default | Return | Call | CallMethod | CallRef | Drop | Local | SetLocal | Global
 	| SetGlobal | False | True | Int | Float | Str | Null | Missing | Type | Member | SetMember | Field | SetField
 	| Subscript | SetSubscript | Unpack | Array | Object | New | Closure | Cast | Is | Assert | Not | Eq | Ne | Lt | Gt | Le
 	| Ge | Add | Sub | Mul | Div | Rem | Pow | And | Or | Xor | Shl | Shr | Neg | Fresh | Same | Concat
+	| Fail
 
 /// What an immediate is: an id of a table of the Program or of the Code, or a number.
 export const TypeId: u8 = 0
@@ -213,7 +214,6 @@ const table: [string, Imm[]][] = [
 	["Call", [DeclId, TypeList]],
 	["CallMethod", [StrId, Num]],
 	["CallRef", [Num]],
-	["Test", []],
 	["Drop", []],
 	["Local", [LocalId]],
 	["SetLocal", [LocalId]],
@@ -263,6 +263,7 @@ const table: [string, Imm[]][] = [
 	["Fresh", [LocalId]],
 	["Same", []],
 	["Concat", [Num]],
+	["Fail", []],
 ]
 
 /// Each opcode's name and immediates.
@@ -270,9 +271,9 @@ export const names = table.map(r => r[0])
 export const shape = table.map(r => r[1])
 
 /// The ops that open a block, that split one, and after which the rest of the block is unreachable.
-export const opens = flags([Block, Loop, If, Each, Try, Test, Default])
+export const opens = flags([Block, Loop, If, Each, Try, Default])
 export const splits = flags([Else, Catch, Finally])
-export const jumps = flags([Unreachable, Br, Return, Throw])
+export const jumps = flags([Unreachable, Br, Return, Throw, Fail])
 
 function flags(os: Opcode[]): bool[] {
 	const f = new bool[](table.length)

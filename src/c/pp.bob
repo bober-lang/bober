@@ -2,7 +2,6 @@
 
 import { CError, File, Lexer, Tok, precedence } from "./lex"
 import { character } from "./literal"
-import { contains, reversed } from "../../std/algo"
 import { HashMap } from "../../std/collections/hashmap"
 import { Set } from "../../std/collections/set"
 import { backslash, quote } from "../../std/ascii"
@@ -218,7 +217,7 @@ export class Preprocessor {
 			marked[0].bol = t.bol
 			marked[0].space = t.space
 		}
-		this.pending.push(...reversed(marked))
+		this.pending.push(...marked.reverse())
 	}
 
 	/// The arguments of a call to m, unexpanded, and the ) that ends it.
@@ -317,7 +316,7 @@ export class Preprocessor {
 	private expand(toks: Tok[], at: Tok): Tok[] {
 		const end: Tok = { ...new Tok(), file: at.file, pos: at.pos }
 		this.pending.push(end)
-		this.pending.push(...reversed(toks))
+		this.pending.push(...toks.slice(0, toks.length).reverse())
 		const out: Tok[] = []
 		while (true) {
 			const t = this.next()
@@ -375,8 +374,8 @@ export class Preprocessor {
 		}
 		name = strip(name, "__")
 		return switch (t.text) {
-			case "__has_attribute": contains(attributes, name)
-			case "__has_builtin": contains(builtins, name)
+			case "__has_attribute": attributes.includes(name)
+			case "__has_builtin": builtins.includes(name)
 			default: false
 		}
 	}
@@ -494,7 +493,7 @@ export class Preprocessor {
 		for (const t of line) {
 			unexpanded.push({ ...t, hide: new Set([t.text]) })
 		}
-		this.pending.push(...reversed(unexpanded))
+		this.pending.push(...unexpanded.reverse())
 	}
 
 	/// #define, from the line after it; at stands for the end of the line.
@@ -585,9 +584,9 @@ export class Preprocessor {
 			if (d.bol) {
 				continue
 			}
-			if (contains(["if", "ifdef", "ifndef"], d.text)) {
+			if (["if", "ifdef", "ifndef"].includes(d.text)) {
 				depth++
-			} else if (contains(["elif", "else", "endif"], d.text)) {
+			} else if (["elif", "else", "endif"].includes(d.text)) {
 				if (depth == 0) {
 					this.directive(s, hash)
 					return

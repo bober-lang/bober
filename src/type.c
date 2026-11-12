@@ -421,6 +421,9 @@ static bool has(const bober_type *c, bober_string name) {
   return bober_method_of(c, name.bytes, len(name)) || bober_field_of(c, name.bytes, len(name), &type) >= 0;
 }
 
+/// Where the bytes of string s are.
+static const char *bytes(const bober_string *s) { return (s->head & 0xff) == 0xff ? (const char *)s->ref + (uintptr_t)s->bytes : (const char *)s + 1; }
+
 int64_t bober_is(const bober_type *t, const bober_union *u) {
   for (int64_t i = 0; t->kind == KUNION && i < t->nparts; i++)
     if (bober_is(t->parts[i], u)) return 1;
@@ -435,10 +438,8 @@ int64_t bober_is(const bober_type *t, const bober_union *u) {
   if (u->tag != t->canon) return 0;
   if (t->kind != KLITERAL) return 1;
   if (t->held != STRING) return u->bits == (uint64_t)t->length;
-  const bober_string *s = u->ref;
   int64_t n = bober_length(u);
-  const char *p = (s->head & 0xff) == 0xff ? (const char *)s->ref + (uintptr_t)s->bytes : (const char *)s + 1;
-  return n == len(t->value) && !memcmp(p, t->value.bytes, n);
+  return n == len(t->value) && !memcmp(bytes(u->ref), t->value.bytes, n);
 }
 
 int64_t bober_length(const bober_union *u) {
@@ -450,6 +451,7 @@ int64_t bober_length(const bober_union *u) {
 void *bober_element(const bober_union *u, int64_t i, const bober_type **type, const char *file, int32_t at) {
   if (i < 0 || i >= bober_length(u)) bober_trap("index out of range", file, at);
   const bober_type *e = *type = u->tag->elem;
+  if (u->tag->held == STRING) return (char *)bytes(u->ref) + i;
   return (char *)(u->tag->kind == KFIXED ? u->ref : *(void **)((char *)u->ref + 16)) + i * e->size;
 }
 

@@ -1,6 +1,5 @@
-import { contains } from "../std/algo"
+import { startsWith } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
-import { startsWith } from "../std/string"
 import { show as shown } from "./bc/show"
 import { Checked, Node, TypeError, check, show } from "./check"
 import { CompileError } from "./error"
@@ -250,6 +249,7 @@ test "async takes a call, and await an async" {
 		== "47: expected a call after async; 65: expected a call after async; 88: expected a call after async"
 	assert errors(f + "const a: async string = async f()") == "55: expected async string, got async i32"
 	assert errors(f + "const a = await f()") == "47: expected an async, got i32"
+	assert errors(f + "const a = await ...f()\nconst xs = [1]\nconst b = await ...xs") == "50: cannot spread i32; 85: expected an async, got i32"
 }
 
 test "classes and interfaces" {
@@ -525,11 +525,19 @@ test "statements" {
 	assert errors("function f(a: bool) { while (a) { switch (1) { case 1: break } } }") == "55: break inside a case"
 	assert errors("function f() { break }") == "15: break outside a loop"
 	assert errors("function f(): i32 {\n\treturn 1\n\tf()\n}") == "31: warning: unreachable"
-	assert errors("function f() { test \"t\" {} }") == "15: a test is only at the top level or in a test"
-	assert errors("test \"t\" { const f = () => { test \"u\" {} } }") == "29: a test is only at the top level or in a test"
+	assert errors("function f() { test \"t\" {} }") == "15: a test is only at the top level or in a test, outside try"
+	assert errors("test \"t\" { const f = () => { test \"u\" {} } }") == "29: a test is only at the top level or in a test, outside try"
+	assert errors("test \"t\" { try { test \"u\" {} } catch (e: i32) {} }") == "17: a test is only at the top level or in a test, outside try"
 	assert errors("test \"t\" {\n\tconst s = \"x\"\n\ttest `sub ${s}` {}\n}") == ""
+	assert errors("test \"t\" { while (true) { test \"u\" { break } } }") == "37: break outside a loop"
 	assert errors("function f() { try { g() } catch (e) {} }\nfunction g() {}") == "34: a caught value needs a type"
 	assert errors("function f(s: string) { s[0] = 1 }") == "25: strings are immutable"
+	assert errors("function f(xs: u8[readonly]) { xs[0] = 1 }") == "33: the elements of u8[readonly] are not assignable"
+	assert errors("function f(xs: u8[readonly]) { xs.length = 0 }") == "34: length of u8[readonly] is not assignable"
+	assert errors("function f(a: u8[readonly], b: u8[readonly]): bool { return a == b }") == "62: cannot compare u8[readonly] and u8[readonly]"
+	assert errors("function f[T](xs: T[readonly]) {}\nconst x = f[u8](\"a\")") == "44: f takes a T[readonly], whose type is only inferred"
+	assert errors("const x: u8[readonly] = \"a\"") == "9: T[readonly] is only a declared function's param type"
+	assert errors("function f(xs: i32[readonly]) {}\nconst x = f(\"a\")") == "44: expected i32[readonly], got string"
 	assert errors("class A { constructor(x: i32) {} }\nclass B { a: ...A }")
 		== "45: A takes constructor arguments, which an embedded one is not given"
 	assert errors("function f(x: i32 | string): i32 {\n\tswitch (x) {\n\t\tcase string: return x.length\n\t\tcase i32: return x\n\t}\n\treturn 0\n}")
@@ -554,11 +562,11 @@ test "an error a function lists, or shall, but lets escape is warned of once, wh
 
 test "the compiler's own source checks" {
 	const files = ["src/lex.bob", "src/parse.bob", "src/format.bob", "src/type.bob", "src/check.bob",
-		"src/check.test.bob", "std/algo.bob", "std/ascii.bob", "std/math.bob", "std/string.bob", "std/parse.bob",
+		"src/check.test.bob", "std/algo.bob", "std/ascii.bob", "std/math.bob", "std/string.bob",
 		"std/collections/hashmap.bob", "std/collections/scopedmap.bob", "std/encoding/json.bob"]
 	let failed = ""
 	for (const e of check(files, [])) {
-		if (contains(files, e.path)) {
+		if (files.includes(e.path)) {
 			failed += `${e.path}:${e.loc.pos}: ${e.msg}\n`
 		}
 	}
@@ -625,10 +633,10 @@ const b = Box.of(1).map(x => \`\${x}\`).item\nconst c = new G()\nconst d = f(1) 
 class Sq implements Shape { area(): f64 { return 1.0 } }\nconst e: Shape = new Sq()`)
 	same(`${imports}const a: Op = 1\nconst b: i32 = Box.of("a").item\nconst c = f()\nconst d = f(1, "2")
 const x = new Box(1)\nconst e = x.secret\nconst h = Box.count\nfunction k() { x.item = 2 }\nconst s: Shape = 1`)
-	same(`import * as lib from "lib"\nimport { contains, unique } from "std/algo"\nimport { max } from "std/math"
+	same(`import * as lib from "lib"\nimport { unique } from "std/algo"\nimport { max } from "std/math"
 const a: lib.Op = lib.End\nconst b = lib.id(lib.N) + max(1, 2)\nconst xs: i32[] = [1]
 const c = unique([1, 2]).length + "abc".slice(1, 2).length
-const d = contains(["a"], lib.S) && xs.map(x => x + 1).length > 0`)
+const d = ["a"].includes(lib.S) && xs.map(x => x + 1).length > 0`)
 	same(`import { Writer } from "std/io"\nclass W implements Writer { write(s: string) {} }
 const w: Writer = new W()`)
 	const l = new Lower()

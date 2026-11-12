@@ -16,7 +16,6 @@
 //! may run. A type of what a local holds, Of or Member, is resolved by those values, through a memo the copy owns that
 //! is reset when one changes. A known value no op makes, a Type or an array or record of them, is never at run time.
 
-import { contains, position, removeAt } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
 import { bits, fromBits } from "../std/float"
 import * as decl from "./bc/decl"
@@ -63,7 +62,7 @@ export class Known {
 
 	/// A record's value of field name.
 	get(name: string): Known throws CompileError {
-		const i = position(this.names, name)
+		const i = this.names.indexOf(name)
 		if (i < 0) {
 			throw new CompileError(`no field ${name}`)
 		}
@@ -80,11 +79,11 @@ function closureValue(k: i32): Known {
 function array(items: Known[], names: string[] = []): Known { return new Known(null, -1, items, names) }
 function truth(b: bool): Known { return new Known(new Op(if (b) op.True else op.False)) }
 
-/// An instance's code once copied, and per op of it the type of the operand that decides how the op is written out:
-/// what a Cast converts or a Throw throws, and the union, interface or object a Field, SetField or CallMethod works on;
-/// else -1.
+/// An instance's code once copied, and what writing it out needs.
 export class Inst {
 	code: Code | null = null
+	/// Per op, the type of the operand that decides how it is written out: what a Cast converts or a Throw throws, and
+	/// the union, interface or object a Field, SetField or CallMethod works on; else -1.
 	info: i32[] = []
 	/// Of an instance for known values, per local of its decl's code what it holds on entry, else [].
 	values: (Known | null)[] = []
@@ -254,10 +253,22 @@ export class Instances {
 		return if (m < 0 || this.p.decls[m].params.length > 0) -1 else m
 	}
 
-	/// The instance of member(t, name), or -1.
+	/// The instance of member(t, name), or -1; of an interface, also of those it embeds.
 	memberOf(t: i32, name: i32): i32 throws CompileError {
+		const p = this.p
 		const m = this.member(t, name)
-		return if (m < 0) -1 else this.instance(m, this.p.b(t))
+		if (m >= 0) {
+			return this.instance(m, p.b(t))
+		}
+		if (this.nominal(t) == decl.Interface) {
+			for (const e of p.decls[p.a(t)].members.filter(e => embedded(p, e))) {
+				const r = this.memberOf(p.subst(p.decls[e].type, p.b(t)), name)
+				if (r >= 0) {
+					return r
+				}
+			}
+		}
+		return -1
 	}
 
 	/// Instances each field of t if a class of builtin/, whose fields are otherwise instanced only where named; what new
@@ -302,7 +313,7 @@ export class Instances {
 		const p = this.p
 		if (p.kind(t) == kind.Union) {
 			const fs = p.items(t).map(m => this.methodType(m, name))
-			if (fs.length == 0 || contains(fs, -1)) {
+			if (fs.length == 0 || fs.includes(-1)) {
 				return -1
 			}
 			const ps: i32[] = []
@@ -356,6 +367,7 @@ export class Instances {
 				}
 				return typeValue(r)
 			case "members": return array(p.members(t).map(typeValue))
+			case "bits": return this.int(if (kind.isInt(t) || kind.isFloat(t)) kind.width(t) else 0)
 			case "length": return this.int(if (p.kind(t) == kind.FixedArray) p.b(t) else if (p.kind(t) == kind.Func) p.items(t).length else 0)
 			case "value":
 				const a = p.a(t)
@@ -427,6 +439,9 @@ function kindName(p: Program, t: i32): string {
 
 /// The decl instance k is of.
 function source(p: Program, k: i32): i32 { return if (p.decls[k].generic < 0) k else p.decls[k].generic }
+
+/// Whether member d embeds its type.
+export function embedded(p: Program, d: i32): bool { return (p.decls[d].mods & decl.Embed) != 0 }
 
 /// Function type f as called at run time: without the params holding a Type, whose args are known, and of no result
 /// where it holds one, which is known.
@@ -660,9 +675,6 @@ class Copy {
 				const t = this.type(a)
 				this.open(o, t, t)
 			case op.Loop, op.Try: this.open(o, kind.None)
-			case op.Test:
-				this.pop()
-				this.open(o, kind.None)
 			case op.Default: this.open(o, kind.None, this.local(a))
 			case op.Each:
 				this.pop()
@@ -790,7 +802,10 @@ class Copy {
 					this.cut(base)
 					this.known(array(items))
 				} else {
+					// The elements of the arrays spread, which mono notes as converted to t's.
+					const from = spreads.map(j => this.stack[this.stack.length - b + j].t).filter(s => p.kind(s) == kind.Array)
 					this.plain(o, b, t, t, b, this.dst.list(spreads))
+					this.info[this.info.length - 1] = if (from.length > 0) p.union(from.map(s => p.a(s))) else -1
 				}
 			case op.New:
 				const t = this.type(a)
@@ -820,7 +835,7 @@ class Copy {
 				} else if (p.kind(v) != kind.Union && ![v, ...p.members(t)].some(m => ins.abstract(m))) {
 					// A value of one concrete type, a literal also of its base, is known to be a t or not, so that a
 					// branch it rules out, which may cast it to t, is dropped.
-					const is = contains(p.members(t), v) || p.kind(v) == kind.Literal && contains(p.members(t), p.a(v))
+					const is = p.members(t).includes(v) || p.kind(v) == kind.Literal && p.members(t).includes(p.a(v))
 					this.plain(op.Drop, 1, kind.None)
 					this.known(truth(is))
 				} else {
@@ -828,7 +843,7 @@ class Copy {
 					this.info[this.emit(o, t)] = this.pop().t
 					this.push(kind.Bool)
 				}
-			case op.Assert: this.plain(o, 1, kind.None)
+			case op.Assert, op.Fail: this.plain(o, 1, kind.None)
 			case op.Not:
 				const x = this.bool(this.top())
 				if (x >= 0) {
@@ -1033,7 +1048,7 @@ class Copy {
 		const s = if (t >= 0) this.static(t, name) else -1
 		if (s >= 0) {
 			// A static called through a type param: the type, known, leaves the stack; the args stay.
-			this.stack = removeAt(this.stack, this.stack.length - 1 - n)
+			this.stack.remove(this.stack.length - 1 - n)
 			this.call(s, p.b(t))
 			return
 		}
@@ -1085,7 +1100,7 @@ class Copy {
 	private setField(name: i32) throws CompileError {
 		const r = this.stack[this.stack.length - 2].t
 		const d = this.ins.memberOf(r, name)
-		if (d < 0 || (this.p.decls[d].mods & decl.Embed) == 0) {
+		if (d < 0 || !embedded(this.p, d)) {
 			this.cast(this.ins.fieldType(r, name))
 		}
 		this.note(this.emit(op.SetField, name), r)

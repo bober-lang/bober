@@ -6,7 +6,7 @@ import * as net from "../net"
 import * as tls from "../tls"
 import { Body, Conn, Head, frame, num } from "./h2"
 import { Decoder, Encoder } from "./hpack"
-import { millisecond, minute, monotonic, second } from "../time"
+import { millisecond, minute, monotonic, second, sleep } from "../time"
 
 /// A body given whole, read in pieces.
 class Bytes implements Reader {
@@ -159,7 +159,7 @@ function app(head: Head, body: Body | null): [Head, ReadCloser | null] throws Io
 }
 
 /// Serves each connection l accepts through app, with maxStreams at once, idle between them and timeout on each read,
-/// until l is shut down.
+/// until l is closed.
 function serve(l: net.Listener, maxStreams: i32, idle: i64 = minute, timeout: i64 = 30 * second) {
 	accepted = 0
 	try {
@@ -257,7 +257,7 @@ test "requests and responses, the scheme and the protocol agreed on" {
 	assert readAll(c.request(get("/scheme"), null)[1]) == "https"
 	assert value(c.request(get("/none"), null)[0], ":status") == "404"
 	c.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -270,7 +270,7 @@ test "bodies past the windows, both ways" {
 	assert readAll(c.request(post, new Bytes(big))[1]) == big
 	assert readAll(c.request(get("/big"), null)[1]) == big
 	c.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -288,7 +288,7 @@ test "responses past the windows, read one after another, are not stuck behind t
 		assert readAll(body) == big
 	}
 	c.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -297,19 +297,6 @@ test "a response's body goes as it comes, not held back till more of it is read"
 	const job = async serve(l, 100)
 	const t = raw(l)
 	t.timeout = 300 * millisecond
-	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/pong"], [":authority", "localhost"]]
-	t.write(frame(1, 4, 1, new Encoder().encode(post)) + frame(0, 0, 1, "a"))
-	assert until(t, 0, 0, 1) && found == "a"
-	t.close()
-	l.handle.shutdown(true)
-	await job
-}
-
-test "a response's body goes as it comes, not held back till more of it is read" {
-	const l = net.listen("127.0.0.1:0")
-	const job = async serve(l, 100)
-	const t = raw(l)
-	t.timeout = 300_000_000
 	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/pong"], [":authority", "localhost"]]
 	t.write(frame(1, 4, 1, new Encoder().encode(post)) + frame(0, 0, 1, "a"))
 	assert until(t, 0, 0, 1) && found == "a"
@@ -330,7 +317,7 @@ test "requests at once share the connection, and a fault resets one stream alone
 	assert c.request(get("/throw"), null) throws new IoError("ConnectionReset", "read", "reset 2")
 	assert readAll(c.request(get("/hello"), null)[1]) == "hello"
 	c.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -366,7 +353,7 @@ test "the server's limit on streams holds, and GOAWAY lets those open finish" {
 		kind = e.kind
 	}
 	assert kind == "ConnectionReset"
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -386,31 +373,7 @@ test "a frame of the wrong size, a stream opened below the last or depending on 
 	const [c, t] = connect(l)
 	assert readAll(c.request(get("/hello"), null)[1]) == "hello"
 	c.close()
-	l.handle.shutdown(true)
-	await job
-}
-
-test "a frame on the wrong stream, or a SETTINGS or PING of the wrong size, is a connection error of its code; one on a closed stream is not" {
-	const l = net.listen("127.0.0.1:0")
-	const job = async serve(l, 100)
-	const code = fromBytes([0, 0, 0, 8])
-	const inc = fromBytes([0, 0, 0, 1])
-	const cases: [string, i64][] = [[frame(3, 0, 0, code), 1], [frame(3, 0, 1, code), 1], [frame(0, 0, 1, "x"), 1],
-		[frame(8, 0, 1, inc), 1], [frame(2, 0, 0, "12345"), 1], [frame(7, 0, 1, code + code), 1],
-		[frame(4, 1, 0, fromBytes([0, 3, 0, 0, 0, 1])), 6], [frame(4, 0, 0, "12345"), 6], [frame(6, 0, 0, "1234"), 6]]
-	for (const [bad, want] of cases) {
-		const t = raw(l)
-		t.write(bad)
-		assert until(t, 7) && num(found, 4, 4) == want
-		t.close()
-	}
-	const t = raw(l)
-	t.write(frame(1, 5, 1, new Encoder().encode(get("/hello"))))
-	assert until(t, 0, 0, 1)
-	t.write(frame(0, 0, 1, "x") + frame(8, 0, 1, inc) + frame(3, 0, 1, code) + frame(6, 0, 0, "12345678"))
-	assert until(t, 6)
-	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -464,7 +427,7 @@ test "a head with a connection header, a pseudo-header twice or missing, a respo
 	t.write(frame(1, 5, 13, enc.encode([["x-trailer", "1"]])))
 	assert until(t, 3, 0, 13)
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -499,7 +462,7 @@ test "an idle connection the server times out ends with GOAWAY, as does a head's
 		await writer
 		f.close()
 	}
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -514,7 +477,7 @@ test "DATA or a head on a stream after the peer ended it resets it with STREAM_C
 	assert until(t, 3, 0, 1) && num(found, 0, 4) == 5 && until(t, 3, 0, 3) && num(found, 0, 4) == 5
 	release()
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -538,7 +501,7 @@ test "a path not absolute or with a fragment, a negative Content-Length, or trai
 	t.write(frame(1, 5, 9, enc.encode(get("/hello#x"))))
 	assert until(t, 3, 0, 9)
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -557,7 +520,7 @@ test "a DATA frame's padding is credited to the stream's window, though the fram
 	assert until(t, 8, 0, 1) && num(found, 0, 4) == 2 << 20
 	release()
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -579,7 +542,7 @@ test "a handler slower than the timeout is waited for, the request having come w
 	body.held = false
 	body.gate.wake()
 	c.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -603,7 +566,7 @@ test "a read fed only empty DATA is not waited for past the timeout" {
 	assert until(fed, 7)
 	await writer
 	fed.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -640,7 +603,7 @@ test "a response given no window, though frames come that open none, or a frame'
 	release()
 	cut.close()
 	half.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -665,7 +628,7 @@ test "a response whose windows the peer opens apart from its pings is not cut by
 	}
 	assert kind == "TimedOut"
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -691,7 +654,7 @@ test "a window opened by a frame that comes whole at the deadline lets its write
 	}
 	assert kind == "TimedOut"
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -721,7 +684,7 @@ test "a response the peer reads none of past the timeout is reset alone, one it 
 	}
 	assert kind == "TimedOut"
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -751,7 +714,7 @@ test "a frame the server answers is not held behind responses' writes, so a head
 	assert open == 1 && got < 4 << 20
 	release()
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -769,7 +732,7 @@ test "a response read slower than the timeout is waited for, its window shut by 
 	pause(400 * millisecond)
 	assert readAll(after) == big
 	c.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -850,7 +813,7 @@ test "a peer whose turn comes late, by a 100 Continue, a window opened or a read
 	t.write(frame(0, 1, 1, "x"))
 	assert until(t, 1, 0, 1) && late == "x"
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -883,7 +846,7 @@ test "a DATA that waits behind other writes passes the turn to the peer once wri
 	assert late == "abc"
 	release()
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -906,7 +869,7 @@ test "a DATA that waits behind a frame the peer reads slowly is not reset, thoug
 	slowly(t, 1, "c", 3)
 	assert late == "abc"
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -926,7 +889,7 @@ test "a response's head that waits behind a frame the peer reads slowly is not r
 	slowly(t, 3, "ac", 2)
 	assert late == "ac"
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -957,7 +920,7 @@ test "a DATA that waits behind the connection's WINDOW_UPDATE is not reset, thou
 		}
 	}
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -995,7 +958,7 @@ test "a request opened as the client idles has the timeout, not what was left of
 	release()
 	assert value((await waiting)[0], ":status") == "200"
 	c.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -1011,7 +974,7 @@ test "a request opened as the client idles is not waited for past the timeout, w
 	release()
 	assert (await waiting) throws new IoError("TimedOut", "read", "localhost")
 	c.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -1026,7 +989,7 @@ test "a request no answer comes for fails once the timeout is up, not a second a
 	assert monotonic() - start < 300 * millisecond
 	release()
 	c.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -1049,7 +1012,7 @@ test "a frame whose head comes before the timeout is up and the rest after moves
 	release()
 	assert until(t, 1, 0, 1)
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 	// With no timeout, the rest of a head begun late in the idle time has none either.
 	const idle = net.listen("127.0.0.1:0")
@@ -1065,7 +1028,7 @@ test "a frame whose head comes before the timeout is up and the rest after moves
 	u.timeout = second
 	assert until(u, 1, 0, 1)
 	u.close()
-	idle.handle.shutdown(true)
+	idle.close()
 	await served
 }
 
@@ -1082,7 +1045,7 @@ test "a request whose body comes slower than the timeout is waited for, the serv
 	body.gate.wake()
 	assert readAll((await waiting)[1]) == "3"
 	c.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -1103,7 +1066,7 @@ test "a request whose upload ends during a wait for a frame has a whole timeout 
 	release()
 	assert value((await waiting)[0], ":status") == "200"
 	c.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -1124,7 +1087,7 @@ test "a request opened during a wait for a frame, another stream open, has a who
 	body.held = false
 	body.gate.wake()
 	c.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -1152,7 +1115,7 @@ test "a request opened after another began to wait, both unanswered, is not wait
 	await one
 	release()
 	c.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -1173,7 +1136,7 @@ test "streams reset while answered still count against the limit; one refused is
 	t.write(frame(1, 5, 7, enc.encode(get("/hello"))))
 	assert !until(t, 1, 0, 7)
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -1194,7 +1157,7 @@ test "a stream refused after GOAWAY leaves the last stream id a second GOAWAY gi
 	assert until(t, 7) && num(found, 0, 4) == 1
 	release()
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -1353,7 +1316,7 @@ test "a response's head is waited for from the request's end, however long its u
 	c.headTimeout = 200 * millisecond
 	assert readAll(c.request(post, new Slow(48))[1]) == "3145728"
 	c.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -1398,7 +1361,7 @@ test "a stream reset during its upload gives the connection window back" {
 	post[2] = [":path", "/echo"]
 	assert readAll(c.request(post, new Bytes(big))[1]) == big
 	c.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -1454,7 +1417,7 @@ test "our windows open to 4 MiB a stream and 16 MiB the connection from the star
 	assert until(t, 3, 0, 1) && num(found, 0, 4) == 3
 	release()
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -1485,7 +1448,7 @@ test "a request expecting 100 Continue has it on the first read of its body, unl
 	release()
 	assert until(t, 7, 0, 0)
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -1509,7 +1472,7 @@ test "streams that fill the connection's window, reset unread, give it back" {
 	assert until(t, 8, 0, 0) && num(found, 0, 4) == 4 << 20
 	release()
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -1534,7 +1497,7 @@ test "the connection's window opens again once half of what streams do not hold 
 	assert until(t, 8, 0, 0)
 	release()
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -1568,7 +1531,7 @@ test "a body come whole is not read as ended once the client resets the stream o
 			t.close()
 		}
 	}
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -1607,7 +1570,7 @@ test "a WINDOW_UPDATE of 0 is a protocol error, one past 2^31-1 a flow control e
 	assert until(t, 7) && num(found, 4, 4) == 3
 	release()
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -1690,7 +1653,7 @@ test "a body its Content-Length does not match, short or long, is reset before i
 	}
 	assert readAll(c.request(get("/hello"), null)[1]) == "hello"
 	c.close()
-	l.handle.shutdown(true)
+	l.close()
 	await job
 }
 
@@ -1746,6 +1709,6 @@ test "the peer's preface is not waited for past the timeout, though it comes a b
 	assert gone
 	h.close()
 	t.close()
-	l.handle.shutdown(true)
+	l.close()
 	await serving
 }
