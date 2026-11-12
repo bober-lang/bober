@@ -1,0 +1,153 @@
+import { Client, Request, Response, Server, text } from "../http"
+import { Cookie, Jar, add, cookies, parseCookie } from "./cookie"
+import { ParseError } from "../string"
+import { second } from "../time"
+import { Url } from "../url"
+
+test "Set-Cookie parses and prints back" {
+	const s = "id=a3; Domain=example.com; Path=/; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Max-Age=3600; Secure; HttpOnly; SameSite=Lax"
+	const c = Cookie.parse(s)
+	assert c.name == "id" && c.value == "a3" && c.domain == "example.com" && c.path == "/" && c.maxAge == 3600
+	assert c.expires == 1445412480 * second && c.secure && c.httpOnly && c.sameSite == "Lax"
+	assert c.toString() == s
+	const d = Cookie.parse("x=1; domain=.Example.COM; max-age=soon; expires=never; samesite=strict")
+	assert d.domain == "example.com" && d.maxAge == null && d.expires == null && d.sameSite == "Strict"
+	assert d.toString() == "x=1; Domain=example.com; SameSite=Strict"
+	assert new Cookie("x", "a;b; Secure").toString() == "x=ab Secure"
+	assert new Cookie("x; Secure", "1").toString() == "x Secure=1"
+	const injected = new Cookie("x", "1")
+	injected.path = "/cart;Domain=example;Max-Age=99999999"
+	injected.domain = "a.example; Secure"
+	assert injected.toString() == "x=1; Domain=a.example Secure; Path=/cartDomain=exampleMax-Age=99999999"
+	assert Cookie.parse("=x") throws new ParseError("syntax", 0)
+	assert Cookie.parse("nothing") throws new ParseError("syntax", 0)
+	assert parseCookie("a=1; b=2; junk; a=3").map(p => `${p[0]}:${p[1]}`).join(",") == "a:1,b:2,a:3"
+	// Saturated past what ns since the epoch hold, as RFC 6265 §5.2.1 has it.
+	assert Cookie.parse("a=b; Expires=Fri, 31 Dec 9999 23:59:59 GMT").expires == 9_223_372_036_854_775_807
+	// RFC 6265 §5.1.1's tokens, in HTTP's three forms and older ones, two-digit years 70 to 99 in the 1900s.
+	for (const d of ["Sun, 06 Nov 1994 08:49:37 GMT", "Sunday, 06-Nov-94 08:49:37 GMT", "Sun Nov  6 08:49:37 1994",
+		"Sun, 06-Nov-1994 8:49:37 GMT", "nov 6 1994 08:49:37"]) {
+		assert Cookie.parse(`a=b; Expires=${d}`).expires == 784111777 * second
+	}
+	assert Cookie.parse("a=b; Expires=Thursday, 01-Jan-70 00:00:01 GMT").expires == second
+	assert Cookie.parse("a=b; Expires=Thu, 01 Jan 1970 00:00:01 GMT; Expires=junk").expires == second
+	assert Cookie.parse("a=b; Expires=Wed, 01-Jan-69 00:00:00 GMT").expires == 3_124_224_000 * second
+	for (const bad of ["yesterday", "Sun, 31 Feb 2016 00:00:00 GMT", "Sun, 06 Nov 1994 24:00:00 GMT", "06 Nov 1994"]) {
+		assert Cookie.parse(`a=b; Expires=${bad}`).expires == null
+	}
+	for (const old of ["a=b; Expires=Sun, 31 Dec 1899 23:59:59 GMT", "a=b; Expires=Sat, 27 Dec 1969 00:00:00 GMT"]) {
+		assert Cookie.parse(old).toString() == old
+	}
+	assert Cookie.parse("a=b; Expires=Mon, 01 Jan 1601 00:00:00 GMT").toString() == "a=b; Expires=Tue, 21 Sep 1677 00:12:43 GMT"
+	assert Cookie.parse("a=b; Expires=Fri, 31 Dec 1600 23:59:59 GMT").expires == null
+	assert Cookie.parse("a=b; Max-Age=99999999999999999999").maxAge == 9_223_372_036_854_775_807
+	assert Cookie.parse("a=b; Max-Age=99999999999999999999x").maxAge == null
+	// 4096 bytes of name and value at most, and 1024 of an attribute's value.
+	let v = "/"
+	while (v.length < 4096) {
+		v += v
+	}
+	assert Cookie.parse(`a=${v.slice(1, v.length)}`).value.length == 4095
+	assert Cookie.parse(`a=${v}`) throws new ParseError("syntax", 0)
+	const long = Cookie.parse(`a=b; Path=${v.slice(0, 1025)}; Domain=${v.slice(0, 1024)}`)
+	assert long.path == "" && long.domain.length == 1024
+}
+
+test "a jar keeps cookies by domain, path, security and time" {
+	const jar = new Jar()
+	const page = Url.parse("http://example.com/a/b")
+	jar.set(Cookie.parse("host=1"), page)
+	jar.set(Cookie.parse("wide=1; Domain=example.com"), page)
+	jar.set(Cookie.parse("other=1; Domain=other.com"), page)
+	jar.set(Cookie.parse("tld=1; Domain=com"), page)
+	jar.set(Cookie.parse("root=1; Path=/"), page)
+	jar.set(Cookie.parse("safe=1; Secure"), Url.parse("https://example.com/a/b"))
+	jar.set(Cookie.parse("plain=1; Secure"), page)
+	jar.set(Cookie.parse("gone=1; Max-Age=0"), page)
+	jar.set(Cookie.parse("old=1; Expires=Sun, 06 Nov 1994 08:49:37 GMT"), page)
+	const names = (url: string) => jar.get(Url.parse(url)).map(p => p[0]).join(",")
+	// Longest path first; host-only ones not below the host; the default path is the directory; a Secure one set over
+	// http is ignored.
+	assert names("http://example.com/a/x") == "host,wide,root"
+	assert names("https://example.com/a") == "host,wide,safe,root"
+	assert names("http://example.com/ab") == "root"
+	assert names("http://sub.example.com/a/b") == "wide"
+	assert names("http://other.com/a/b") == ""
+	// Over http, a Secure cookie is neither shadowed nor removed, from its domain or a subdomain, at its path or below.
+	jar.set(Cookie.parse("safe=2; Domain=example.com"), Url.parse("http://sub.example.com/a/b/c"))
+	jar.set(Cookie.parse("safe=; Max-Age=0"), page)
+	assert jar.get(Url.parse("https://example.com/a/b")).filter(p => p[0] == "safe").map(p => p[1]).join(",") == "1"
+	jar.set(Cookie.parse("host=2"), page)
+	assert jar.get(page).filter(p => p[0] == "host").map(p => p[1]).join(",") == "2"
+	jar.set(Cookie.parse("host=; Max-Age=-1"), page)
+	assert names("https://example.com/a/b") == "wide,safe,root"
+	jar.set(Cookie.parse("long=1; Max-Age=9223372036854775807"), page)
+	jar.set(Cookie.parse("root=; Path=/; Max-Age=-99999999999999999999"), page)
+	assert names("http://example.com/a/b") == "wide,long"
+	jar.set(Cookie.parse("long=2; Expires=Fri, 31 Dec 9999 23:59:59 GMT"), page)
+	assert jar.get(page).filter(p => p[0] == "long").map(p => p[1]).join(",") == "2"
+	jar.set(Cookie.parse("long=; Expires=Mon, 01 Jan 1601 00:00:00 GMT"), page)
+	assert names("http://example.com/a/b") == "wide"
+	// No IP is below a Domain.
+	const ip = new Jar()
+	ip.set(Cookie.parse("a=1; Domain=0.0.1"), Url.parse("http://10.0.0.1/"))
+	ip.set(Cookie.parse("b=1; Domain=0.1"), Url.parse("http://0.1/"))
+	assert ip.get(Url.parse("http://10.0.0.1/")).length == 0 && ip.get(Url.parse("http://10.0.1/")).length == 0
+	assert ip.get(Url.parse("http://0.1/")).length == 1
+	// A name whose last label ends in a digit is no IP.
+	ip.set(Cookie.parse("c=1; Domain=corp.lan1"), Url.parse("http://a.corp.lan1/"))
+	assert ip.get(Url.parse("http://b.corp.lan1/")).length == 1
+	// A __Secure- or __Host- name needs Secure over https, a __Host- one also no Domain and Path /.
+	const prefixed = new Jar()
+	const site = Url.parse("https://example.com/a/b")
+	prefixed.set(Cookie.parse("__Host-sid=1; Path=/"), page)
+	prefixed.set(Cookie.parse("__Secure-tok=1"), site)
+	prefixed.set(Cookie.parse("__Host-sub=1; Secure; Path=/; Domain=example.com"), site)
+	prefixed.set(Cookie.parse("__host-deep=1; Secure"), site)
+	prefixed.set(Cookie.parse("__Host-ok=1; Secure; Path=/"), site)
+	prefixed.set(Cookie.parse("__secure-ok=1; Secure"), site)
+	assert prefixed.get(site).map(p => p[0]).join(",") == "__secure-ok,__Host-ok"
+	// A domain keeps its 50 newest.
+	const many = new Jar()
+	for (const i of 1 ... 60) {
+		many.set(Cookie.parse(`c${i}=1`), page)
+	}
+	const kept = many.get(page)
+	assert kept.length == 50 && kept.every(p => p[0] != "c10") && kept.some(p => p[0] == "c11")
+}
+
+function app(req: Request): Response throws IoError | ParseError {
+	switch (req.url.path) {
+		case "/auth/login":
+			const res = text("in")
+			add(res, new Cookie("session", "s3cret"))
+			const theme = new Cookie("theme", "dark")
+			theme.path = "/"
+			add(res, theme)
+			return res
+		case "/whoami", "/auth/whoami": return text(cookies(req).map(p => `${p[0]}=${p[1]}`).join("; "))
+		default: return new Response(404)
+	}
+}
+
+test "a client keeps a server's cookies" {
+	const s = new Server()
+	s.addr = "127.0.0.1:0"
+	const job = async s.serve(app)
+	const base = `http://${s.addr}`
+	const c = new Client()
+	const jar = new Jar()
+	c.use(jar.middleware)
+	assert c.send(new Request("GET", `${base}/auth/login`)).body.text() == "in"
+	assert c.send(new Request("GET", `${base}/whoami`)).body.text() == "theme=dark"
+	assert c.send(new Request("GET", `${base}/auth/whoami`)).body.text() == "session=s3cret; theme=dark"
+	const own = new Request("GET", `${base}/auth/whoami`)
+	own.headers.set("cookie", "own=1")
+	assert c.send(own).body.text() == "own=1; session=s3cret; theme=dark"
+	// Sent again, the request carries the jar's pairs once: the jar gave its headers back.
+	assert own.headers.get("cookie") == "own=1" && c.send(own).body.text() == "own=1; session=s3cret; theme=dark"
+	assert c.send(new Request("GET", `${base}/auth/login`)).headers.all("set-cookie").length == 2
+	assert jar.get(Url.parse(`${base}/auth/login`)).length == 2
+	s.close()
+	await job
+}

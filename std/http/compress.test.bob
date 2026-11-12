@@ -1,0 +1,174 @@
+import { adler32, deflate } from "../compress/deflate"
+import { gunzip, gzip } from "../compress/gzip"
+import { Client, Request, Response, Server, get, text } from "../http"
+import { compress, decompress } from "./compress"
+import { Router } from "./router"
+import { Reader } from "../io"
+import { ParseError } from "../string"
+import { second } from "../time"
+
+class Pieces implements Reader {
+	pieces: string[]
+
+	constructor(pieces: string[]) { this.pieces = pieces }
+	read(n: i32): string | null throws IoError { return if (this.pieces.length == 0) null else this.pieces.pop() }
+}
+
+function page(): string {
+	let t = ""
+	while (t.length < 5000) {
+		t += "the quick brown fox jumps over the lazy dog. "
+	}
+	return t
+}
+
+test "a server gzips and a client ungzips" {
+	const app = new Router()
+	app.use(compress())
+	app.get("/page", (req, params) => text(page()))
+	app.get("/small", (req, params) => text("tiny"))
+	app.head("/page", (req, params) => {
+		const res = new Response(200)
+		res.headers.set("content-length", `${page().length}`)
+		return res
+	})
+	app.get("/stream", (req, params) => new Response(200, new Pieces(["c", "b", "a"])))
+	app.get("/part", (req, params) => text(page(), 206))
+	app.get("/range", (req, params) => {
+		const res = text(gzip(page()).slice(0, 100), 206)
+		res.headers.set("content-encoding", "gzip")
+		res.headers.set("x-asked", req.headers.get("accept-encoding") ?? "")
+		return res
+	})
+	app.get("/tagged", (req, params) => {
+		const res = text(page())
+		res.headers.set("etag", "\"v1\"")
+		res.headers.set("accept-ranges", "bytes")
+		return res
+	})
+	const s = new Server()
+	s.addr = "127.0.0.1:0"
+	const job = async s.serve(app.handle)
+	const base = `http://${s.addr}`
+	const raw = get(`${base}/page`)
+	assert raw.headers.get("content-encoding") == null && raw.headers.get("vary") == "accept-encoding"
+		&& raw.body.text() == page()
+	const req = new Request("GET", `${base}/page`)
+	req.headers.set("accept-encoding", "gzip")
+	const zipped = new Client().send(req)
+	assert zipped.headers.get("content-encoding") == "gzip" && zipped.headers.get("vary") == "accept-encoding"
+	assert gunzip(zipped.body.text()) == page()
+	const c = new Client()
+	c.use(decompress)
+	const res = c.send(new Request("GET", `${base}/page`))
+	assert res.headers.get("content-encoding") == null && res.headers.get("content-length") == null
+	assert res.body.length == null && res.body.text() == page()
+	const small = c.send(new Request("GET", `${base}/small`))
+	assert small.headers.get("content-encoding") == null && small.body.text() == "tiny"
+	assert c.send(new Request("GET", `${base}/stream`)).body.text() == "abc"
+	// A HEAD's response has the encoding but no body to undo it on; q=0 in any spelling refuses gzip.
+	const head = c.send(new Request("HEAD", `${base}/page`))
+	assert head.headers.get("content-encoding") == "gzip" && head.body.text() == ""
+	assert head.headers.get("vary") == "accept-encoding" && !head.headers.has("content-length")
+	// A range of encoded bytes is not decodable alone; a request for one does not ask for an encoding.
+	const ranged = new Request("GET", `${base}/range`)
+	ranged.headers.set("range", "bytes=0-99")
+	const part = c.send(ranged)
+	assert part.headers.get("x-asked") == "" && part.body.text() == gzip(page()).slice(0, 100)
+	req.headers.set("accept-encoding", "gzip;Q=0.00, *;q=0")
+	assert new Client().send(req).headers.get("content-encoding") == null
+	req.headers.set("accept-encoding", "gzip;q=0, *")
+	assert new Client().send(req).headers.get("content-encoding") == null
+	req.headers.set("accept-encoding", "x-gzip")
+	assert new Client().send(req).headers.get("content-encoding") == "gzip"
+	req.headers.set("accept-encoding", "br, *")
+	assert new Client().send(req).headers.get("content-encoding") == "gzip"
+	// A partial response is sent as it is; a gzipped one is not ranged and its ETag is weak.
+	req.url.path = "/part"
+	assert new Client().send(req).headers.get("content-encoding") == null
+	req.url.path = "/tagged"
+	const tagged = new Client().send(req).headers
+	assert tagged.get("etag") == "W/\"v1\"" && !tagged.has("accept-ranges")
+	s.close()
+	await job
+}
+
+test "closing a decompressed response frees its connection" {
+	const app = new Router()
+	app.get("/zipped", (req, params) => {
+		const res = new Response(200, new Pieces([gzip(page())]))
+		res.headers.set("content-encoding", "gzip")
+		return res
+	})
+	const s = new Server()
+	s.addr = "127.0.0.1:0"
+	s.maxConns = 1
+	const job = async s.serve(app.handle)
+	const c = new Client()
+	c.use(decompress)
+	c.headerTimeout = 1 * second
+	const res = c.send(new Request("GET", `http://${s.addr}/zipped`))
+	assert res.body.length == null
+	res.close()
+	assert c.send(new Request("GET", `http://${s.addr}/zipped`)).body.text() == page()
+	s.close()
+	await job
+}
+
+test "reading a deflated response to its end frees its connection" {
+	const a = adler32(page(), 1)
+	const trailer = fromBytes([(a >> 24) as u8, (a >> 16 & 0xff) as u8, (a >> 8 & 0xff) as u8, (a & 0xff) as u8])
+	const app = new Router()
+	app.get("/deflated", (req, params) => {
+		const res = new Response(200, new Pieces([trailer, "\x78\x9c" + deflate(page())]))
+		res.headers.set("content-encoding", "deflate")
+		return res
+	})
+	const s = new Server()
+	s.addr = "127.0.0.1:0"
+	s.maxConns = 1
+	const job = async s.serve(app.handle)
+	const c = new Client()
+	c.use(decompress)
+	c.headerTimeout = 1 * second
+	for (const i of 1 ... 2) {
+		assert c.send(new Request("GET", `http://${s.addr}/deflated`)).body.text() == page()
+	}
+	s.close()
+	await job
+}
+
+test "x-gzip is gzip" {
+	const res = decompress(new Request("GET", "http://x/"), req => {
+		const r = new Response(200, new Pieces([gzip(page())]))
+		r.headers.set("content-encoding", "x-gzip")
+		return r
+	})
+	assert res.headers.get("content-encoding") == null && res.body.text() == page()
+}
+
+/// A HEAD's answer with a Content-Length not a number.
+function odd(req: Request): Response {
+	const res = new Response(200)
+	res.headers.set("content-length", "2000 ")
+	return res
+}
+
+test "a HEAD's Content-Length not a number is left as it is" {
+	const req = new Request("HEAD", "http://x/")
+	req.headers.set("accept-encoding", "gzip")
+	const res = compress()(req, odd)
+	assert res.headers.get("content-encoding") == null && res.headers.get("content-length") == "2000 "
+}
+
+test "the handler's response, as one it gives every request, is left as it is, a 101 too" {
+	const kept = text(page())
+	kept.headers.set("etag", "\"v1\"")
+	const gz = new Request("GET", "http://x/")
+	gz.headers.set("accept-encoding", "gzip")
+	assert compress()(gz, req => kept).headers.get("content-encoding") == "gzip"
+	const plain = compress()(new Request("GET", "http://x/"), req => kept)
+	assert plain.headers.all("vary") == ["accept-encoding"] && !plain.headers.has("content-encoding")
+		&& plain.body.text() == page() && kept.headers.entries.length == 2 && kept.headers.get("etag") == "\"v1\""
+	assert compress(0)(gz, req => new Response(101)).headers.entries.length == 0
+}

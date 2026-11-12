@@ -1,4 +1,5 @@
-import { decode, encode, EncodeError, Rest } from "./toml"
+import * as encoding from "../encoding"
+import { decode, encode, EncodeError, Name, OmitEmpty, Rest, Skip } from "./toml"
 import { Unknown } from "./json"
 import { isNaN } from "../math"
 import { ParseError } from "../string"
@@ -70,6 +71,24 @@ function configured(): Config {
 	return c
 }
 
+class Tags {
+	a: i32 @Name["A"] @encoding.Name["x"] = 1
+	b: i32 @encoding.Name["B"] = 2
+	c: i32 @encoding.Skip = 3
+	d: string @encoding.OmitEmpty = ""
+	e: string @OmitEmpty = ""
+	f: i32 @Skip = 4
+}
+
+test "toml's own tags over ../encoding's" {
+	assert encode(new Tags()) == "A = 1\nB = 2\n"
+	const t = decode[Tags]("A = 4\nB = 5\nd = 'x'")
+	assert t.a == 4 && t.b == 5 && t.d == "x"
+	assert decode[Tags]("x = 4") throws new ParseError("syntax", 0)
+	assert decode[Tags]("c = 4") throws new ParseError("syntax", 0)
+	assert decode[Tags]("f = 4") throws new ParseError("syntax", 0)
+}
+
 test "encode tables" {
 	assert encode(configured())
 		== `title = "demo"
@@ -125,8 +144,8 @@ test "decode tables" {
 	want.origin.x = -1000
 	want.origin.y = 100.0
 	want.server = new Server()
-	want.server!.port = 31
-	want.server!.tags = ["a", "b"]
+	want.server.port = 31
+	want.server.tags = ["a", "b"]
 	want.points = [new Point(), new Point()]
 	want.points[1].x = 3
 	assert decode[Config](`# comment
@@ -154,7 +173,7 @@ test "decode dotted keys and inline tables" {
 	const want = new Config()
 	want.origin.x = 1
 	want.server = new Server()
-	want.server!.host = "h"
+	want.server.host = "h"
 	want.matrix = [[], [4]]
 	assert decode[Config](`origin.x = 1
 server = { host = "h", tags = [] }

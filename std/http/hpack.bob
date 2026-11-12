@@ -1,0 +1,294 @@
+//! HPACK (RFC 7541), the header compression of HTTP/2: an Encoder and a Decoder.
+
+import { ParseError } from "../string"
+
+/// The static table, index 1 first.
+const statics: [string, string][] = [[":authority", ""], [":method", "GET"], [":method", "POST"], [":path", "/"],
+	[":path", "/index.html"], [":scheme", "http"], [":scheme", "https"], [":status", "200"], [":status", "204"],
+	[":status", "206"], [":status", "304"], [":status", "400"], [":status", "404"], [":status", "500"],
+	["accept-charset", ""], ["accept-encoding", "gzip, deflate"], ["accept-language", ""], ["accept-ranges", ""],
+	["accept", ""], ["access-control-allow-origin", ""], ["age", ""], ["allow", ""], ["authorization", ""],
+	["cache-control", ""], ["content-disposition", ""], ["content-encoding", ""], ["content-language", ""],
+	["content-length", ""], ["content-location", ""], ["content-range", ""], ["content-type", ""], ["cookie", ""],
+	["date", ""], ["etag", ""], ["expect", ""], ["expires", ""], ["from", ""], ["host", ""], ["if-match", ""],
+	["if-modified-since", ""], ["if-none-match", ""], ["if-range", ""], ["if-unmodified-since", ""],
+	["last-modified", ""], ["link", ""], ["location", ""], ["max-forwards", ""], ["proxy-authenticate", ""],
+	["proxy-authorization", ""], ["range", ""], ["referer", ""], ["refresh", ""], ["retry-after", ""], ["server", ""],
+	["set-cookie", ""], ["strict-transport-security", ""], ["transfer-encoding", ""], ["user-agent", ""], ["vary", ""],
+	["via", ""], ["www-authenticate", ""]]
+
+/// The Huffman code's lengths, 5 to 30, of the symbols 0 to 256, each plus 32: the code is canonical, so they decide it.
+const lengths = "-7<<<<<<<8><<><<<<<<<<><<<<<<<<<&**,-&(+**(+(&&&%%%&&&&&&&'(/&,*-&''''''''''''''''''''''('(-3-.&/%&%&%&&&%''&&&%&'&%%&'''''/+.-<4644666767777787886787777567677865466775766856775565767746667667::436769:::;;:8935:;;:;855::<;;;48456557669988:7:;::;;;;;<;;;;;:>"
+
+/// The symbols in order of their code, and how many codes there are of each length.
+class Code {
+	order: i32[] = []
+	count = new i32[](31)
+}
+
+const code = canon()
+
+function canon(): Code {
+	const c = new Code()
+	for (const len of 1 ... 30) {
+		for (const sym of 0 ... 256) {
+			if (lengths[sym] - 32 == len) {
+				c.order.push(sym)
+				c.count[len]++
+			}
+		}
+	}
+	return c
+}
+
+/// The bytes s, in Huffman code, spells; null if its padding is past 7 bits or not of ones.
+function unhuff(s: string): string | null {
+	let out = ""
+	let bits: i64 = 0
+	let len = 0
+	let first: i64 = 0
+	let index = 0
+	for (const b of s) {
+		for (const i of 0 ... 7) {
+			bits = (bits << 1) | (((b >> (7 - i)) & 1) as i64)
+			len++
+			const n = code.count[len] as i64
+			if (bits - first < n) {
+				const sym = code.order[index + ((bits - first) as i32)]
+				if (sym == 256) {
+					return null
+				}
+				out += chr(sym as u8)
+				bits = 0
+				len = 0
+				first = 0
+				index = 0
+			} else {
+				first = (first + n) << 1
+				index += n as i32
+			}
+		}
+	}
+	if (len > 7 || bits != (1 << len) - 1) {
+		return null
+	}
+	return out
+}
+
+/// n in the integer code, after first's high bits, with bits of prefix.
+function integer(n: i64, bits: i32, first: i32): string {
+	const max: i32 = (1 << bits) - 1
+	if (n < max) {
+		return chr((first | (n as i32)) as u8)
+	}
+	let s = chr((first | max) as u8)
+	let v = n - max
+	while (v >= 128) {
+		s += chr((v & 127 | 128) as u8)
+		v = v >> 7
+	}
+	return s + chr(v as u8)
+}
+
+function literal(s: string): string { return integer(s.length, 7, 0) + s }
+
+/// Headers never indexed, as their values are secrets.
+function sensitive(name: string): bool {
+	return name == "authorization" || name == "proxy-authorization" || name == "cookie" || name == "set-cookie"
+}
+
+/// The static table and a dynamic one, indexed as one: 1 is the first static entry, 62 the newest dynamic.
+class Table {
+	/// The dynamic table's bytes, each entry 32 more than its name and value.
+	size: i64 = 0
+	/// Its bound.
+	cap: i64 = 4096
+	/// Oldest first.
+	private entries: [string, string][] = []
+
+	/// Entry i; null if none.
+	at(i: i64): [string, string] | null {
+		if (i >= 1 && i <= statics.length) {
+			return statics[(i - 1) as i32]
+		}
+		const k = this.entries.length - (i - statics.length)
+		if (i < 1 || k < 0) {
+			return null
+		}
+		return this.entries[k as i32]
+	}
+
+	/// The index of name with value, and of the first entry named name; 0 for none.
+	find(name: string, value: string): [i64, i64] {
+		let named: i64 = 0
+		for (const i of 0 ... statics.length + this.entries.length - 1) {
+			const [n, v] = if (i < statics.length) statics[i]
+				else this.entries[this.entries.length - 1 - (i - statics.length)]
+			if (n == name) {
+				if (v == value) {
+					return [i + 1, i + 1]
+				}
+				if (named == 0) {
+					named = i + 1
+				}
+			}
+		}
+		return [0, named]
+	}
+
+	add(name: string, value: string) {
+		this.entries.push([name, value])
+		this.size += name.length + value.length + 32
+		this.evict()
+	}
+
+	resize(cap: i64) {
+		this.cap = cap
+		this.evict()
+	}
+
+	private evict() {
+		let from = 0
+		while (this.size > this.cap) {
+			const [n, v] = this.entries[from]
+			this.size -= n.length + v.length + 32
+			from++
+		}
+		if (from > 0) {
+			this.entries = this.entries.slice(from, this.entries.length)
+		}
+	}
+}
+
+export class Encoder {
+	private table = new Table()
+	/// The least bound since the last block, which it tells first if below the last (RFC 7541 §4.2).
+	private least: i64 | null = null
+
+	/// Bounds the table by the peer's SETTINGS_HEADER_TABLE_SIZE, up to 4096; the next block tells it so.
+	limit(n: i64) {
+		this.table.resize(if (n < 4096) n else 4096)
+		this.least = if (this.least == null || this.table.cap < this.least!) this.table.cap else this.least
+	}
+
+	encode(headers: [string, string][]): string {
+		let out = ""
+		if (this.least != null) {
+			out = (if (this.least! < this.table.cap) integer(this.least!, 5, 32) else "")
+				+ integer(this.table.cap, 5, 32)
+			this.least = null
+		}
+		for (const [name, value] of headers) {
+			const [exact, named] = this.table.find(name, value)
+			if (sensitive(name)) {
+				out += integer(named, 4, 16) + (if (named == 0) literal(name) else "") + literal(value)
+			} else if (exact > 0) {
+				out += integer(exact, 7, 128)
+			} else {
+				out += integer(named, 6, 64) + (if (named == 0) literal(name) else "") + literal(value)
+				this.table.add(name, value)
+			}
+		}
+		return out
+	}
+}
+
+export class Decoder {
+	private table = new Table()
+	private src = ""
+	private at = 0
+
+	/// The headers of block; a range ParseError once their names and values, and 32 bytes a field, pass limit bytes, as
+	/// a field indexed in a byte is no less to keep (RFC 9113 §6.5.2). The table may be shrunk by block, at its start,
+	/// never grown past 4096.
+	decode(block: string, limit: i64): [string, string][] throws ParseError {
+		this.src = block
+		this.at = 0
+		const out: [string, string][] = []
+		let total: i64 = 0
+		while (this.at < block.length) {
+			const start = this.at
+			const b = block[this.at]
+			let pair: [string, string] = ["", ""]
+			if (b >= 128) {
+				pair = this.some(this.table.at(this.int(7)))
+			} else if (b >= 64) {
+				pair = this.pair(6)
+				this.table.add(pair[0], pair[1])
+			} else if (b >= 32) {
+				const cap = this.int(5)
+				if (cap > 4096 || out.length > 0) {
+					throw this.malformed()
+				}
+				this.table.resize(cap)
+				continue
+			} else {
+				pair = this.pair(4)
+			}
+			total += pair[0].length + pair[1].length + 32
+			if (total > limit) {
+				throw new ParseError("range", start)
+			}
+			out.push(pair)
+		}
+		return out
+	}
+
+	/// A literal: its name, by index unless 0, and its value.
+	private pair(bits: i32): [string, string] throws ParseError {
+		const i = this.int(bits)
+		const name = if (i == 0) this.string() else this.some(this.table.at(i))[0]
+		return [name, this.string()]
+	}
+
+	/// v; malformed if null.
+	private some[T](v: T | null): T throws ParseError {
+		if (v == null) {
+			throw this.malformed()
+		}
+		return v
+	}
+
+	private byte(): u8 throws ParseError {
+		if (this.at >= this.src.length) {
+			throw this.malformed()
+		}
+		const b = this.src[this.at]
+		this.at++
+		return b
+	}
+
+	private int(bits: i32): i64 throws ParseError {
+		const max: i32 = (1 << bits) - 1
+		let n = ((this.byte() as i32) & max) as i64
+		if (n < max) {
+			return n
+		}
+		let shift = 0
+		while (true) {
+			if (shift > 28) {
+				throw this.malformed()
+			}
+			const b = this.byte() as i64
+			n += (b & 127) << shift
+			if (b < 128) {
+				return n
+			}
+			shift += 7
+		}
+	}
+
+	private string(): string throws ParseError {
+		const huffman = this.at < this.src.length && this.src[this.at] >= 128
+		const n = this.int(7)
+		if (this.at + n > this.src.length) {
+			throw this.malformed()
+		}
+		const s = this.src.slice(this.at, this.at + (n as i32))
+		this.at += n as i32
+		// A slice would keep the whole block alive, as the table or a request may.
+		return this.some(if (huffman) unhuff(s) else s.copy())
+	}
+
+	private malformed(): ParseError { return new ParseError("syntax", this.at) }
+}

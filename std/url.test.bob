@@ -1,0 +1,89 @@
+import { ParseError } from "./string"
+import { monotonic, second } from "./time"
+import { Url } from "./url"
+
+test "every component parses and prints back" {
+	const s = "https://ann:pw@example.com:8443/a/b%20c;p?x=1&y=a+b&z#top"
+	const u = Url.parse(s)
+	assert u.scheme == "https" && u.user == "ann:pw" && u.host == "example.com" && u.port == 8443
+	assert u.path == "/a/b%20c;p" && u.fragment == "top"
+	assert u.query.get("x") == "1" && u.query.get("y") == "a b" && u.query.get("z") == "" && u.query.get("w") == null
+	assert u.toString() == s && u.origin() == "https://example.com:8443"
+	assert Url.parse("http://x/").origin() == "http://x"
+	const v = Url.parse("http://[::1]:80/p")
+	assert v.host == "[::1]" && v.port == 80 && v.path == "/p" && v.toString() == "http://[::1]:80/p"
+	const w = Url.parse("mailto:a@b")
+	assert w.scheme == "mailto" && w.host == "" && w.path == "a@b" && w.toString() == "mailto:a@b"
+	const r = Url.parse("../x?a=1#f")
+	assert r.scheme == "" && r.path == "../x" && r.query.get("a") == "1" && r.fragment == "f"
+	assert Url.parse("http://h:/p").port == null && Url.parse("file:///etc").path == "/etc"
+	assert Url.parse("HTTP://h").scheme == "http" && Url.parse("http://a@b@h/").user == "a@b"
+		&& Url.parse("http://a@b@h/").host == "h"
+	assert Url.parse("-x:y").scheme == "" && Url.parse("1x:y").scheme == "" && Url.parse("x-1.y+z:p").scheme == "x-1.y+z"
+	for (const t of ["http://h/?a=b%26c;d", "http://h/?sig=a%20b&q=", "http://h/?a&&b=%41", "http://h/p?",
+		"http://h/p#", "http://@h/", "http://h/p?#", "file:////x"]) {
+		assert Url.parse(t).toString() == t
+	}
+}
+
+test "errors are placed" {
+	assert Url.parse("http://h:8x/") throws new ParseError("syntax", 10)
+	assert Url.parse("http://h:70000/") throws new ParseError("range", 9)
+	assert Url.parse("http://h/a b") throws new ParseError("syntax", 10)
+	assert Url.parse("http://h/?a=1\r\n") throws new ParseError("syntax", 13)
+}
+
+test "a query decodes, edits and encodes" {
+	const q = Url.parse("?a=1&a=2&b=x%20y&&c").query
+	assert q.all("a").join(",") == "1,2" && q.get("b") == "x y" && q.has("c") && q.entries.length == 4
+	const stray = Url.parse("http://h/p?a=%2&b=1%+%4g%41").query
+	assert stray.get("a") == "%2" && stray.get("b") == "1% %4gA" && stray.toString() == "a=%2&b=1%+%4g%41"
+	q.set("a", "3")
+	q.append("d", "é &=")
+	q.delete("c")
+	assert q.toString() == "b=x+y&a=3&d=%C3%A9+%26%3D"
+	q.set("e", "a-b._~ z/")
+	assert q.toString() == "b=x+y&a=3&d=%C3%A9+%26%3D&e=a-b._~+z%2F"
+	const u = new Url()
+	u.scheme = "http"
+	u.host = "h"
+	u.path = "/"
+	u.query.set("q", "x y")
+	assert u.toString() == "http://h/?q=x+y"
+}
+
+test "resolves as RFC 3986 §5.4 shows" {
+	const base = Url.parse("http://a/b/c/d;p?q")
+	const cases = [["g:h", "g:h"], ["g", "http://a/b/c/g"], ["./g", "http://a/b/c/g"], ["g/", "http://a/b/c/g/"],
+		["/g", "http://a/g"], ["//g", "http://g"], ["?y", "http://a/b/c/d;p?y"], ["g?y", "http://a/b/c/g?y"],
+		["#s", "http://a/b/c/d;p?q#s"], ["g#s", "http://a/b/c/g#s"], ["g?y#s", "http://a/b/c/g?y#s"],
+		[";x", "http://a/b/c/;x"], ["g;x", "http://a/b/c/g;x"], ["g;x?y#s", "http://a/b/c/g;x?y#s"],
+		["", "http://a/b/c/d;p?q"], [".", "http://a/b/c/"], ["./", "http://a/b/c/"], ["..", "http://a/b/"],
+		["../", "http://a/b/"], ["../g", "http://a/b/g"], ["../..", "http://a/"], ["../../", "http://a/"],
+		["../../g", "http://a/g"], ["../../../g", "http://a/g"], ["../../../../g", "http://a/g"],
+		["/./g", "http://a/g"], ["/../g", "http://a/g"], ["g.", "http://a/b/c/g."], [".g", "http://a/b/c/.g"],
+		["g..", "http://a/b/c/g.."], ["..g", "http://a/b/c/..g"], ["./../g", "http://a/b/g"],
+		["./g/.", "http://a/b/c/g/"], ["g/./h", "http://a/b/c/g/h"], ["g/../h", "http://a/b/c/h"],
+		["g;x=1/./y", "http://a/b/c/g;x=1/y"], ["g;x=1/../y", "http://a/b/c/y"], ["g?y/./x", "http://a/b/c/g?y/./x"],
+		["g?y/../x", "http://a/b/c/g?y/../x"], ["g#s/./x", "http://a/b/c/g#s/./x"],
+		["g#s/../x", "http://a/b/c/g#s/../x"], ["http:g", "http:g"]]
+	for (const [ref, want] of cases) {
+		assert base.resolve(ref).toString() == want
+	}
+	assert Url.parse("http://h").resolve("p").toString() == "http://h/p"
+	assert base.resolve("-x:y").toString() == "http://a/b/c/-x:y"
+	assert Url.parse("http://a/b").resolve("g?").toString() == "http://a/g?"
+		&& Url.parse("http://a/b?").resolve("").toString() == "http://a/b?"
+		&& Url.parse("http://a/b").resolve("").toString() == "http://a/b"
+	assert Url.parse("b").resolve("./c:d").toString() == "./c:d" && Url.parse("x/a:b").toString() == "x/a:b"
+	const evil = Url.parse("foo:/a/b").resolve("..//evil")
+	assert evil.path == "//evil" && Url.parse(evil.toString()).host == "" && Url.parse(evil.toString()).path == "//evil"
+	// An empty authority is the target's too, not the base's.
+	assert base.resolve("///x").host == "" && base.resolve("///x").path == "/x" && base.resolve("//").host == ""
+	base.resolve("#s").query.set("q", "2")
+	assert base.toString() == "http://a/b/c/d;p?q"
+	// A .. drops a segment without copying those before: 300000 /a then 60000 /b/.. take a moment.
+	const long = new string[](300001).join("/a") + new string[](60001).join("/b/..")
+	const start = monotonic()
+	assert base.resolve(long).path.length == 600001 && monotonic() - start < second
+}

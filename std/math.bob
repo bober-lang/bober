@@ -1306,11 +1306,12 @@ function fmaF64(x: f64, y: f64, z: f64): f64 {
 	const [sx, mx, ex] = split(x)
 	const [sy, my, ey] = split(y)
 	const [sz, mz, ez] = split(z)
-	if (ex >= zeroInfNan || ey >= zeroInfNan || ez > zeroInfNan) {
+	if (ex >= zeroInfNan || ey >= zeroInfNan) {
 		return x * y + z
 	}
-	if (ez == zeroInfNan) {
-		return z
+	if (ez >= zeroInfNan) {
+		// A zero z leaves x*y, as musl after 1.2.5: x*y + z turns an underflowed -0 into +0.
+		return if (ez > zeroInfNan) x * y else z
 	}
 	// r = x*y, then z shifted left by kz and r right by kr, kz + kr = d, so that their exponents are e = e + kr
 	let [rhi, rlo] = mul(mx, my)

@@ -1,0 +1,1713 @@
+import { Signal } from "../../builtin/fiber"
+import { readFile } from "../fs"
+import { ReadCloser, Reader, readAll } from "../io"
+import { ParseError } from "../string"
+import * as net from "../net"
+import * as tls from "../tls"
+import { Body, Conn, Head, frame, num } from "./h2"
+import { Decoder, Encoder } from "./hpack"
+import { millisecond, minute, monotonic, second } from "../time"
+
+/// A body given whole, read in pieces.
+class Bytes implements Reader {
+	private s: string
+	private at = 0
+
+	constructor(s: string) { this.s = s }
+
+	read(n: i32): string | null throws IoError {
+		if (this.at >= this.s.length) {
+			return null
+		}
+		const to = if (this.at + n < this.s.length) this.at + n else this.s.length
+		const piece = this.s.slice(this.at, to)
+		this.at = to
+		return piece
+	}
+
+	close() {}
+}
+
+/// A body echoed as it comes; what it read, or its error's kind, in late.
+class Echo implements ReadCloser {
+	private body: Body
+
+	constructor(body: Body) { this.body = body }
+
+	read(n: i32): string | null throws IoError {
+		try {
+			const p = this.body.read(n)
+			late += p ?? ""
+			return p
+		} catch (e: IoError) {
+			late = e.kind
+			throw e
+		}
+	}
+
+	close() { this.body.close() }
+}
+
+/// A body of one piece, held back until released.
+class Held implements Reader {
+	piece: string | null
+	held = true
+	gate = new Signal()
+
+	constructor(piece: string) { this.piece = piece }
+
+	read(n: i32): string | null throws IoError {
+		while (this.held) {
+			this.gate.wait()
+		}
+		const p = this.piece
+		this.piece = null
+		return p
+	}
+
+	close() {}
+}
+
+const own = owning()
+const trusting = trust()
+/// 5 MiB, past a stream's window.
+const big = fill()
+
+/// Requests to /wait hold until released, counting those open and the most at once.
+let hold = true
+let open = 0
+let peak = 0
+
+const arrived = new Signal()
+const released = new Signal()
+
+/// What /late read of its body once released, or the error.
+let late = ""
+/// Connections accepted, and the server's side of the last.
+let accepted = 0
+let served: Conn | null = null
+
+function owning(): tls.Config {
+	const cfg = new tls.Config()
+	cfg.cert = readFile("tests/tls/cert.pem")
+	cfg.key = readFile("tests/tls/key.pem")
+	cfg.alpn = ["h2", "http/1.1"]
+	return cfg
+}
+
+function trust(): tls.Config {
+	const cfg = new tls.Config()
+	cfg.roots = own.cert
+	cfg.alpn = ["h2", "http/1.1"]
+	return cfg
+}
+
+function fill(): string {
+	let s = ""
+	for (const i of 1 ... 327680) {
+		s += "0123456789abcdef"
+	}
+	return s
+}
+
+function value(head: Head, name: string): string {
+	const p = head.find(p => p[0] == name)
+	return if (p == null) "" else p[1]
+}
+
+function get(path: string): Head {
+	return [[":method", "GET"], [":scheme", "https"], [":path", path], [":authority", "localhost"]]
+}
+
+function app(head: Head, body: Body | null): [Head, ReadCloser | null] throws IoError {
+	switch (value(head, ":path")) {
+		case "/hello": return [[[":status", "200"], ["content-type", "text/plain"]], new Bytes("hello")]
+		case "/scheme": return [[[":status", "200"]], new Bytes(value(head, ":scheme"))]
+		case "/echo": return [[[":status", "200"]], body]
+		case "/pong": return [[[":status", "200"]], new Echo(body!)]
+		case "/whole":
+			const whole = new Held(big + big)
+			whole.held = false
+			return [[[":status", "200"]], whole]
+		case "/count": return [[[":status", "200"]], new Bytes(`${readAll(body!).length}`)]
+		case "/big": return [[[":status", "200"], ["content-length", `${big.length}`]], new Bytes(big)]
+		case "/short": return [[[":status", "200"], ["content-length", "3"]], new Bytes("ab")]
+		case "/long": return [[[":status", "200"], ["content-length", "1"]], new Bytes("ab")]
+		case "/throw": throw new IoError("Other", "fail", "on purpose")
+		case "/wait":
+			open++
+			peak = if (open > peak) open else peak
+			arrived.wake()
+			while (hold) {
+				released.wait()
+			}
+			open--
+			return [[[":status", "200"]], null]
+		case "/late":
+			while (hold) {
+				released.wait()
+			}
+			try {
+				late = readAll(body!)
+			} catch (e: IoError) {
+				late = e.kind
+			}
+			arrived.wake()
+			return [[[":status", "200"]], null]
+		default: return [[[":status", "404"]], null]
+	}
+}
+
+/// Serves each connection l accepts through app, with maxStreams at once, idle between them and timeout on each read,
+/// until l is shut down.
+function serve(l: net.Listener, maxStreams: i32, idle: i64 = minute, timeout: i64 = 30 * second) {
+	accepted = 0
+	try {
+		while (true) {
+			const c = l.accept()
+			accepted++
+			const job = async connection(c, maxStreams, idle, timeout)
+		}
+	} catch (e: IoError) {}
+}
+
+function connection(c: net.Conn, maxStreams: i32, idle: i64, timeout: i64) {
+	try {
+		const t = tls.server(c, own)
+		const h = new Conn(t, true)
+		h.maxStreams = maxStreams
+		h.idleTimeout = idle
+		h.timeout = timeout
+		served = h
+		h.serve(app)
+	} catch (e: IoError) {}
+}
+
+function connect(l: net.Listener): [Conn, tls.Conn] throws IoError | ParseError {
+	const c = net.dial(`${l.addr}`)
+	const t = tls.client(c, "localhost", trusting)
+	return [new Conn(t, false), t]
+}
+
+/// A client of l writing frames itself, its preface and settings sent.
+function raw(l: net.Listener): tls.Conn throws IoError | ParseError {
+	const c = net.dial(`${l.addr}`)
+	const t = tls.client(c, "localhost", trusting)
+	t.write("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + frame(4, 0, 0, ""))
+	return t
+}
+
+let found = ""
+
+/// Whether a frame of kind, on stream id if given, comes on t before it ends, after skip bytes of preface; its payload
+/// is then in found.
+function until(t: tls.Conn, kind: u8, skip = 0, id: i64 = -1): bool throws IoError {
+	let s = ""
+	while (true) {
+		const p = t.read(1 << 16)
+		if (p == null) {
+			return false
+		}
+		s += p
+		if (skip > 0 && s.length >= skip) {
+			s = s.slice(skip, s.length)
+			skip = 0
+		}
+		while (skip == 0 && s.length >= 9) {
+			const n = num(s, 0, 3) as i32
+			if (s.length < 9 + n) {
+				break
+			}
+			if (s[3] == kind && (id < 0 || num(s, 5, 4) == id)) {
+				found = s.slice(9, 9 + n)
+				return true
+			}
+			s = s.slice(9 + n, s.length)
+		}
+	}
+}
+
+function release() {
+	hold = false
+	released.wake()
+}
+
+/// Waits ns, as a read of a connection never accepted times out.
+function pause(ns: i64) {
+	try {
+		const l = net.listen("127.0.0.1:0")
+		const c = net.dial(`${l.addr}`)
+		c.timeout = ns
+		try {
+			c.read(1)
+		} finally {
+			c.close()
+			l.close()
+		}
+	} catch (e: IoError) {}
+}
+
+test "requests and responses, the scheme and the protocol agreed on" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const [c, t] = connect(l)
+	assert t.alpn == "h2"
+	const [head, body] = c.request(get("/hello"), null)
+	assert head == [[":status", "200"], ["content-type", "text/plain"]] && readAll(body) == "hello"
+	assert readAll(c.request(get("/scheme"), null)[1]) == "https"
+	assert value(c.request(get("/none"), null)[0], ":status") == "404"
+	c.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "bodies past the windows, both ways" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const [c, t] = connect(l)
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/echo"], [":authority", "localhost"],
+		["content-length", `${big.length}`]]
+	assert readAll(c.request(post, new Bytes(big))[1]) == big
+	assert readAll(c.request(get("/big"), null)[1]) == big
+	c.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "responses past the windows, read one after another, are not stuck behind those unread" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100, minute, 5 * second) // A server stuck on a shut window gives up soon.
+	const [c, t] = connect(l)
+	// Those unread fill their windows, past the connection's.
+	const jobs = [1, 2, 3, 4, 5, 6].map(i => async c.request(get("/big"), null))
+	const bodies: Reader[] = []
+	for (const j of jobs) {
+		bodies.push((await j)[1])
+	}
+	for (const body of bodies) {
+		assert readAll(body) == big
+	}
+	c.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a response's body goes as it comes, not held back till more of it is read" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const t = raw(l)
+	t.timeout = 300 * millisecond
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/pong"], [":authority", "localhost"]]
+	t.write(frame(1, 4, 1, new Encoder().encode(post)) + frame(0, 0, 1, "a"))
+	assert until(t, 0, 0, 1) && found == "a"
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "requests at once share the connection, and a fault resets one stream alone" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const [c, t] = connect(l)
+	const jobs = [1, 2, 3, 4, 5, 6].map(i => async c.request(get("/hello"), null))
+	for (const j of jobs) {
+		assert readAll((await j)[1]) == "hello"
+	}
+	assert accepted == 1
+	assert c.request(get("/throw"), null) throws new IoError("ConnectionReset", "read", "reset 2")
+	assert readAll(c.request(get("/hello"), null)[1]) == "hello"
+	c.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "the server's limit on streams holds, and GOAWAY lets those open finish" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 2)
+	const [c, t] = connect(l)
+	assert readAll(c.request(get("/hello"), null)[1]) == "hello"
+	hold = true
+	peak = 0
+	const jobs = [1, 2, 3].map(i => async c.request(get("/wait"), null))
+	while (open < 2) {
+		arrived.wait()
+	}
+	assert peak == 2 && open == 2
+	release()
+	for (const j of jobs) {
+		assert value((await j)[0], ":status") == "200"
+	}
+	assert peak == 2
+	hold = true
+	const waiting = async c.request(get("/wait"), null)
+	while (open < 1) {
+		arrived.wait()
+	}
+	served!.close()
+	release()
+	assert value((await waiting)[0], ":status") == "200" && c.closed
+	let kind = ""
+	try {
+		c.request(get("/hello"), null)
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	assert kind == "ConnectionReset"
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a frame of the wrong size, a stream opened below the last or depending on itself, is a connection error, answered by GOAWAY" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const enc = new Encoder()
+	const below = frame(1, 5, 3, enc.encode(get("/hello"))) + frame(1, 5, 1, enc.encode(get("/hello")))
+	const self = frame(1, 0x25, 1, fromBytes([0, 0, 0, 1, 16]) + enc.encode(get("/hello")))
+	for (const bad of [frame(3, 0, 1, ""), frame(8, 0, 0, fromBytes([0, 0, 1])), frame(9, 4, 1, ""), below,
+		frame(2, 0, 1, fromBytes([0, 0, 0, 0])), frame(2, 0, 3, fromBytes([0, 0, 0, 3, 16])), self]) {
+		const t = raw(l)
+		t.write(bad)
+		assert until(t, 7)
+		t.close()
+	}
+	const [c, t] = connect(l)
+	assert readAll(c.request(get("/hello"), null)[1]) == "hello"
+	c.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a frame on the wrong stream, or a SETTINGS or PING of the wrong size, is a connection error of its code; one on a closed stream is not" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const code = fromBytes([0, 0, 0, 8])
+	const inc = fromBytes([0, 0, 0, 1])
+	const cases: [string, i64][] = [[frame(3, 0, 0, code), 1], [frame(3, 0, 1, code), 1], [frame(0, 0, 1, "x"), 1],
+		[frame(8, 0, 1, inc), 1], [frame(2, 0, 0, "12345"), 1], [frame(7, 0, 1, code + code), 1],
+		[frame(4, 1, 0, fromBytes([0, 3, 0, 0, 0, 1])), 6], [frame(4, 0, 0, "12345"), 6], [frame(6, 0, 0, "1234"), 6]]
+	for (const [bad, want] of cases) {
+		const t = raw(l)
+		t.write(bad)
+		assert until(t, 7) && num(found, 4, 4) == want
+		t.close()
+	}
+	const t = raw(l)
+	t.write(frame(1, 5, 1, new Encoder().encode(get("/hello"))))
+	assert until(t, 0, 0, 1)
+	t.write(frame(0, 0, 1, "x") + frame(8, 0, 1, inc) + frame(3, 0, 1, code) + frame(6, 0, 0, "12345678"))
+	assert until(t, 6)
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a head with a connection header, a pseudo-header twice or missing, a response's or a malformed header resets the stream; trailers after the reset are dropped" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const t = raw(l)
+	const enc = new Encoder()
+	const head = get("/hello")
+	head.push(["connection", "close"])
+	t.write(frame(1, 5, 1, enc.encode(head)))
+	assert until(t, 3)
+	head.pop()
+	head.push([":path", "/again"])
+	t.write(frame(1, 5, 3, enc.encode(head)))
+	assert until(t, 3)
+	t.write(frame(1, 4, 5, enc.encode(get("/throw"))))
+	assert until(t, 3)
+	t.write(frame(1, 5, 5, enc.encode([["x-trailer", "1"]])) + frame(6, 0, 0, "12345678"))
+	assert until(t, 6)
+	t.write(frame(1, 5, 7, enc.encode([[":status", "204"], ...get("/hello")])))
+	assert until(t, 3, 0, 7)
+	t.write(frame(1, 5, 9, enc.encode([...get("/hello"), ["x", "a\r\nb"]])))
+	assert until(t, 3, 0, 9)
+	t.write(frame(1, 5, 11, enc.encode([...get("/hello"), ["x y", "1"]])))
+	assert until(t, 3, 0, 11)
+	t.write(frame(1, 5, 13, enc.encode([["x-trailer", "1"]])))
+	assert until(t, 3, 0, 13)
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+/// Writes frames to t until the peer is gone.
+function flood(t: tls.Conn, frames: string) {
+	try {
+		while (true) {
+			t.write(frames)
+		}
+	} catch (e: IoError) {}
+}
+
+test "an idle connection the server times out ends with GOAWAY, as does a head's block, though frames keep coming" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100, 50 * millisecond, 50 * millisecond)
+	const t = raw(l)
+	assert until(t, 7)
+	t.close()
+	// Frames of a type unknown on an idle connection, and empty CONTINUATIONs in a block, move no deadline.
+	for (const [first, each] of [["", frame(0x20, 0, 0, "")], [frame(1, 0, 1, ""), frame(9, 0, 1, "")]]) {
+		let frames = ""
+		for (const _ of 1 ... 1000) {
+			frames += each
+		}
+		const f = raw(l)
+		f.timeout = 2 * second
+		f.write(first)
+		const writer = async flood(f, frames)
+		const start = monotonic()
+		assert until(f, 7) && monotonic() - start < 300 * millisecond
+		await writer
+		f.close()
+	}
+	l.handle.shutdown(true)
+	await job
+}
+
+test "DATA or a head on a stream after the peer ended it resets it with STREAM_CLOSED" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const t = raw(l)
+	const enc = new Encoder()
+	hold = true
+	t.write(frame(1, 5, 1, enc.encode(get("/wait"))) + frame(0, 0, 1, "x")
+		+ frame(1, 5, 3, enc.encode(get("/wait"))) + frame(1, 4, 3, enc.encode([["x-trailer", "1"]])))
+	assert until(t, 3, 0, 1) && num(found, 0, 4) == 5 && until(t, 3, 0, 3) && num(found, 0, 4) == 5
+	release()
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a path not absolute or with a fragment, a negative Content-Length, or trailers before the Content-Length or with a pseudo-header, reset the stream" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const t = raw(l)
+	const enc = new Encoder()
+	t.write(frame(1, 5, 1, enc.encode(get("@evil.com/x"))))
+	assert until(t, 3)
+	const post = get("/echo")
+	post.push(["content-length", "100"])
+	t.write(frame(1, 4, 3, enc.encode(post)) + frame(0, 0, 3, "ab") + frame(1, 5, 3, enc.encode([["x-trailer", "1"]])))
+	assert until(t, 3)
+	post.pop()
+	post.push(["content-length", "-1"])
+	t.write(frame(1, 4, 5, enc.encode(post)))
+	assert until(t, 3)
+	t.write(frame(1, 4, 7, enc.encode(get("/echo"))) + frame(1, 5, 7, enc.encode([[":path", "/"]])))
+	assert until(t, 3, 0, 7)
+	t.write(frame(1, 5, 9, enc.encode(get("/hello#x"))))
+	assert until(t, 3, 0, 9)
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a DATA frame's padding is credited to the stream's window, though the frame has no data and nothing reads" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const t = raw(l)
+	t.timeout = second
+	hold = true
+	// A frame of 16384 bytes, 256 of them padding, and 8191 of padding alone: half the window in padding.
+	let frames = frame(1, 4, 1, new Encoder().encode(get("/wait"))) + frame(0, 8, 1, chr(255) + big.slice(0, 16383))
+	for (const i of 1 ... 8191) {
+		frames += frame(0, 8, 1, chr(255) + big.slice(0, 255))
+	}
+	t.write(frames)
+	assert until(t, 8, 0, 1) && num(found, 0, 4) == 2 << 20
+	release()
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a handler slower than the timeout is waited for, the request having come whole or its body still coming" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100, 100 * millisecond, 50 * millisecond)
+	const [c, t] = connect(l)
+	hold = true
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/wait"], [":authority", "localhost"]]
+	const body = new Held("x")
+	const waiting = async c.request(get("/wait"), null)
+	const posting = async c.request(post, body)
+	while (open < 2) {
+		arrived.wait()
+	}
+	assert until(raw(l), 7) // Another connection's idle GOAWAY: past the timeout.
+	release()
+	assert value((await waiting)[0], ":status") == "200" && value((await posting)[0], ":status") == "200"
+	body.held = false
+	body.gate.wake()
+	c.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a read fed only empty DATA is not waited for past the timeout" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100, minute, 50 * millisecond)
+	const fed = raw(l)
+	fed.timeout = second
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/echo"], [":authority", "localhost"]]
+	fed.write(frame(1, 4, 1, new Encoder().encode(post)))
+	// One every 20 ms, each waking the read, for longer than GOAWAY is waited for.
+	const drip = () => {
+		try {
+			for (const _ of 1 ... 60) {
+				pause(20 * millisecond)
+				fed.write(frame(0, 0, 1, ""))
+			}
+		} catch (e: IoError) {}
+	}
+	const writer = async drip()
+	assert until(fed, 7)
+	await writer
+	fed.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a response given no window, though frames come that open none, or a frame's head or a head's block cut short, is not waited for past the timeout" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100, minute, 50 * millisecond)
+	const stuck = raw(l)
+	stuck.timeout = second
+	stuck.write(frame(1, 5, 1, new Encoder().encode(get("/big"))))
+	assert until(stuck, 7)
+	stuck.close()
+	// The connection's window opened by a byte at a time, the stream's not, and empty DATA on the stream.
+	let frames = ""
+	for (const _ of 1 ... 1000) {
+		frames += frame(8, 0, 0, fromBytes([0, 0, 0, 1])) + frame(0, 0, 1, "")
+	}
+	const fed = raw(l)
+	fed.timeout = 2 * second
+	fed.write(frame(1, 4, 1, new Encoder().encode(get("/big"))))
+	const writer = async flood(fed, frames)
+	const start = monotonic()
+	assert until(fed, 7) && monotonic() - start < 300 * millisecond
+	await writer
+	fed.close()
+	hold = true
+	const cut = raw(l)
+	cut.timeout = second
+	cut.write(frame(1, 5, 1, new Encoder().encode(get("/wait"))) + frame(6, 0, 0, "12345678").slice(0, 4))
+	assert until(cut, 7)
+	const half = raw(l)
+	half.timeout = second
+	half.write(frame(1, 5, 1, new Encoder().encode(get("/wait"))) + frame(1, 1, 3, new Encoder().encode(get("/hello"))))
+	assert until(half, 7)
+	release()
+	cut.close()
+	half.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a response whose windows the peer opens apart from its pings is not cut by the timeout" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100, minute, 200 * millisecond)
+	const t = raw(l)
+	t.write(frame(1, 5, 1, new Encoder().encode(get("/big"))))
+	const more = fromBytes([0, 0, 3, 232])
+	for (const _ of 1 ... 12) {
+		pause(50 * millisecond)
+		t.write(frame(8, 0, 0, more) + frame(8, 0, 1, more))
+		pause(10 * millisecond)
+		t.write(frame(6, 0, 0, "12345678"))
+	}
+	t.timeout = 100 * millisecond
+	let kind = ""
+	try {
+		assert !until(t, 7)
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	assert kind == "TimedOut"
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a window opened by a frame that comes whole at the deadline lets its writer go on" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100, minute, 200 * millisecond)
+	const t = raw(l)
+	t.write(frame(1, 5, 1, new Encoder().encode(get("/big"))))
+	// /big parked on both windows, which open to all of it by frames begun before the deadline, the last coming
+	// whole past it, a PING behind.
+	const more = fromBytes([0, 80, 0, 0])
+	const update = frame(8, 0, 0, more)
+	pause(130 * millisecond)
+	t.write(frame(8, 0, 1, more) + update.slice(0, 9))
+	pause(130 * millisecond)
+	t.write(update.slice(9, update.length) + frame(6, 0, 0, "12345678"))
+	t.timeout = 300 * millisecond
+	let kind = ""
+	try {
+		assert !until(t, 7)
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	assert kind == "TimedOut"
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a response the peer reads none of past the timeout is reset alone, one it reads or a handler slow to answer going on" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100, minute, 200 * millisecond)
+	const t = raw(l)
+	hold = true
+	const enc = new Encoder()
+	t.write(frame(1, 5, 1, enc.encode(get("/big"))) + frame(1, 5, 3, enc.encode(get("/big")))
+		+ frame(1, 5, 5, enc.encode(get("/wait"))))
+	const more = fromBytes([0, 0, 64, 0])
+	for (const _ of 1 ... 20) {
+		pause(50 * millisecond)
+		t.write(frame(8, 0, 0, more) + frame(8, 0, 1, more))
+	}
+	assert until(t, 3, 0, 3)
+	release()
+	t.timeout = second
+	assert until(t, 1, 0, 5)
+	t.timeout = 100 * millisecond
+	let kind = ""
+	try {
+		assert !until(t, 7)
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	assert kind == "TimedOut"
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a frame the server answers is not held behind responses' writes, so a head after it is read" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	hold = true
+	const t = raw(l)
+	const enc = new Encoder()
+	// Windows of 16 MiB a stream and 1 GiB the connection: none of the responses waits on one.
+	let frames = frame(4, 0, 0, fromBytes([0, 4, 1, 0, 0, 0])) + frame(8, 0, 0, fromBytes([64, 0, 0, 0]))
+	for (const id of [1, 3, 5]) {
+		frames += frame(1, 5, id, enc.encode(get("/big")))
+	}
+	t.write(frames)
+	pause(50 * millisecond)
+	t.write(frame(6, 0, 0, "12345678") + frame(1, 5, 7, enc.encode(get("/wait"))))
+	// Read at 2.5 MB/s, the PING's ACK waits for a frame or so of the others, not for a whole response of 5 MiB.
+	const start = monotonic()
+	let got = 0
+	while (open < 1 && got < 15 << 20) {
+		got += t.read(1 << 16)!.length
+		while ((got as i64) * 400 > monotonic() - start) {
+			pause(2 * millisecond)
+		}
+	}
+	assert open == 1 && got < 4 << 20
+	release()
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a response read slower than the timeout is waited for, its window shut by the reader" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const [c, t] = connect(l)
+	c.timeout = 150 * millisecond
+	const body = c.request(get("/big"), null)[1]
+	pause(400 * millisecond)
+	assert readAll(body) == big
+	// An upload done, though it shut its window, waits on nothing either.
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/big"], [":authority", "localhost"]]
+	const after = c.request(post, new Bytes(big.slice(0, 4 << 20)))[1]
+	pause(400 * millisecond)
+	assert readAll(after) == big
+	c.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a response's body no read waits on is not reset past the timeout, but kept till read" {
+	const l = net.listen("127.0.0.1:0")
+	const head = frame(1, 4, 1, new Encoder().encode([[":status", "200"]]))
+	const job = async peer(l, head, frame(0, 1, 1, "data"), 300 * millisecond)
+	const [c, t] = connect(l)
+	c.timeout = 200 * millisecond
+	const body = c.request(get("/a"), null)[1]
+	pause(500 * millisecond)
+	assert readAll(body) == "data"
+	c.close()
+	await job
+}
+
+test "a response's body a read waits on is not waited for past the timeout, though our upload has yet to end" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async peer(l, frame(1, 4, 1, new Encoder().encode([[":status", "200"]])))
+	const [c, t] = connect(l)
+	c.timeout = 200 * millisecond
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/a"], [":authority", "localhost"]]
+	const body = new Held("abc")
+	assert readAll(c.request(post, body)[1]) throws new IoError("TimedOut", "read", "localhost")
+	body.held = false
+	body.gate.wake()
+	c.close()
+	await job
+}
+
+test "a peer whose turn comes late, by a 100 Continue, a window opened or a read begun, has a whole timeout from then" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100, minute, 400 * millisecond)
+	const post = (expect: bool): Head => {
+		const h: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/late"], [":authority", "localhost"]]
+		if (expect) {
+			h.push(["expect", "100-continue"])
+		}
+		return h
+	}
+	const chunk = big.slice(0, 16384)
+	// The handlers read 300 ms into the 400, so the 100 or the window goes then, or nothing, the read alone: the peer
+	// answers 150 ms after.
+	for (const [streams, frames, kind] of [[1, 0, 1], [1, 256, 8], [5, 120, 8], [1, 0, 0]]) {
+		const t = raw(l)
+		t.timeout = 2 * second
+		hold = true
+		let out = ""
+		for (const i of 0 ... streams - 1) {
+			out += frame(1, 4, 2 * i + 1, new Encoder().encode(post(kind == 1)))
+			for (const j of 1 ... frames) {
+				out += frame(0, 0, 2 * i + 1, chunk)
+			}
+		}
+		t.write(out)
+		pause(300 * millisecond)
+		release()
+		// A 100 Continue, a WINDOW_UPDATE of the stream's, or of the connection's alone, five streams having used
+		// less than half each.
+		assert kind == 0 || until(t, kind as u8, 0, if (streams == 1) 1 else 0)
+		pause(150 * millisecond)
+		for (const i of 0 ... streams - 1) {
+			t.write(frame(0, 1, 2 * i + 1, "x"))
+		}
+		assert until(t, 1, 0, 1) && late.length == frames * 16384 + 1
+		t.close()
+	}
+	// Another stream ending as the 100 goes moves quiet past it: the wait still counts from when it began.
+	const t = raw(l)
+	t.timeout = 2 * second
+	hold = true
+	const enc = new Encoder()
+	t.write(frame(1, 4, 1, enc.encode(post(true))) + frame(1, 5, 3, enc.encode(get("/wait"))))
+	pause(300 * millisecond)
+	release()
+	assert until(t, 1, 0, 1)
+	pause(150 * millisecond)
+	t.write(frame(0, 1, 1, "x"))
+	assert until(t, 1, 0, 1) && late == "x"
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a DATA that waits behind other writes passes the turn to the peer once written, not as it begins" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100, minute, second)
+	hold = true
+	late = ""
+	const t = raw(l)
+	t.timeout = 3 * second
+	const enc = new Encoder()
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/pong"], [":authority", "localhost"]]
+	// Windows of 16 MiB a stream and 1 GiB the connection: two /big, unread, fill the socket and hold the writes.
+	t.write(frame(4, 0, 0, fromBytes([0, 4, 1, 0, 0, 0])) + frame(8, 0, 0, fromBytes([64, 0, 0, 0]))
+		+ frame(1, 4, 1, enc.encode(post)) + frame(0, 0, 1, "a"))
+	pause(50 * millisecond)
+	t.write(frame(1, 5, 3, enc.encode(get("/big"))) + frame(1, 5, 5, enc.encode(get("/big"))))
+	pause(400 * millisecond)
+	// "b" is echoed behind them; a head 50 ms on moves quiet past the echo's start.
+	const start = monotonic()
+	t.write(frame(0, 0, 1, "b"))
+	pause(50 * millisecond)
+	t.write(frame(1, 5, 7, enc.encode(get("/wait"))))
+	pause(350 * millisecond)
+	assert until(t, 0, 0, 1) && found == "a" && until(t, 0, 0, 1) && found == "b"
+	// Past the 1050 ms the head's wait ends at, but within the timeout of the echo, which went once read.
+	pause(start + 1200 * millisecond - monotonic())
+	t.write(frame(0, 1, 1, "c"))
+	pause(50 * millisecond)
+	assert late == "abc"
+	release()
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a DATA that waits behind a frame the peer reads slowly is not reset, though the timeout passes" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100, minute, 500 * millisecond)
+	late = ""
+	const t = raw(l)
+	t.timeout = 2 * second
+	const enc = new Encoder()
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/pong"], [":authority", "localhost"]]
+	// Windows of 16 MiB a stream and 1 GiB the connection, frames to 16 MiB: /whole's 10 MiB go in one write.
+	t.write(frame(4, 0, 0, fromBytes([0, 4, 1, 0, 0, 0, 0, 5, 0, 255, 255, 255]))
+		+ frame(8, 0, 0, fromBytes([64, 0, 0, 0])) + frame(1, 4, 1, enc.encode(post)) + frame(0, 0, 1, "a"))
+	pause(50 * millisecond)
+	t.write(frame(1, 5, 3, enc.encode(get("/whole"))))
+	pause(100 * millisecond)
+	// "b" has "a" echoed behind /whole: it waits past the timeout, "c" coming meanwhile.
+	t.write(frame(0, 0, 1, "b"))
+	slowly(t, 1, "c", 3)
+	assert late == "abc"
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a response's head that waits behind a frame the peer reads slowly is not reset, though the timeout passes" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100, minute, 500 * millisecond)
+	late = ""
+	const t = raw(l)
+	t.timeout = 2 * second
+	const enc = new Encoder()
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/pong"], [":authority", "localhost"]]
+	t.write(frame(4, 0, 0, fromBytes([0, 4, 1, 0, 0, 0, 0, 5, 0, 255, 255, 255]))
+		+ frame(8, 0, 0, fromBytes([64, 0, 0, 0])) + frame(1, 5, 1, enc.encode(get("/whole"))))
+	pause(100 * millisecond)
+	// /pong's head waits behind /whole, its body coming past the timeout.
+	t.write(frame(1, 4, 3, enc.encode(post)))
+	slowly(t, 3, "ac", 2)
+	assert late == "ac"
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a DATA that waits behind the connection's WINDOW_UPDATE is not reset, though the timeout passes" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100, minute, 500 * millisecond)
+	const t = raw(l)
+	t.timeout = 2 * second
+	const enc = new Encoder()
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/whole"], [":authority", "localhost"]]
+	// Frames to 4.5 MiB: /whole's 10 MiB, its request left open, go in three, the first filling the socket.
+	t.write(frame(4, 0, 0, fromBytes([0, 4, 1, 0, 0, 0, 0, 5, 0, 72, 0, 0]))
+		+ frame(8, 0, 0, fromBytes([64, 0, 0, 0])) + frame(1, 4, 1, enc.encode(post)))
+	pause(100 * millisecond)
+	// 8 MiB on a stream reset free half the connection's window: its WINDOW_UPDATE goes between the first two frames.
+	let flood = frame(1, 5, 3, enc.encode(get("/hello"))) + frame(3, 0, 3, fromBytes([0, 0, 0, 8]))
+	for (const _ of 1 ... 512) {
+		flood += frame(0, 0, 3, big.slice(0, 16384))
+	}
+	t.write(flood)
+	// Read at 5 MB/s, the second frame waits past the timeout.
+	const start = monotonic()
+	let got = 0
+	while (got < 10 << 20) {
+		got += t.read(1 << 16)!.length
+		while ((got as i64) * 200 > monotonic() - start) {
+			pause(2 * millisecond)
+		}
+	}
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+/// Reads t at 5 MB/s till late has n bytes, s sent as the last of stream id's body 750 ms on.
+function slowly(t: tls.Conn, id: i64, s: string, n: i32) throws IoError {
+	const start = monotonic()
+	let got = 0
+	let sent = false
+	while (late.length < n) {
+		if (!sent && monotonic() > start + 750 * millisecond) {
+			t.write(frame(0, 1, id, s))
+			sent = true
+		}
+		const to = got + (1 << 19)
+		while (got < to) {
+			got += t.read(1 << 16)!.length
+		}
+		pause(100 * millisecond)
+	}
+}
+
+test "a request opened as the client idles has the timeout, not what was left of the idle one" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const [c, t] = connect(l)
+	c.idleTimeout = 400 * millisecond
+	assert readAll(c.request(get("/hello"), null)[1]) == "hello" // The client idles from here.
+	pause(200 * millisecond)
+	hold = true
+	const waiting = async c.request(get("/wait"), null)
+	while (open < 1) {
+		arrived.wait()
+	}
+	pause(200 * millisecond)
+	release()
+	assert value((await waiting)[0], ":status") == "200"
+	c.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a request opened as the client idles is not waited for past the timeout, whatever is left of the idle one" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const [c, t] = connect(l)
+	c.timeout = 50 * millisecond
+	assert readAll(c.request(get("/hello"), null)[1]) == "hello" // The client idles from here.
+	hold = true
+	const waiting = async c.request(get("/wait"), null)
+	pause(300 * millisecond)
+	release()
+	assert (await waiting) throws new IoError("TimedOut", "read", "localhost")
+	c.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a request no answer comes for fails once the timeout is up, not a second after" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const [c, t] = connect(l)
+	c.timeout = 200 * millisecond
+	hold = true
+	const start = monotonic()
+	assert c.request(get("/wait"), null) throws new IoError("TimedOut", "read", "localhost")
+	assert monotonic() - start < 300 * millisecond
+	release()
+	c.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a frame whose head comes before the timeout is up and the rest after moves its stream on" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100, minute, 200 * millisecond)
+	hold = true
+	const t = raw(l)
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/count"], [":authority", "localhost"]]
+	const enc = new Encoder()
+	t.write(frame(1, 5, 1, enc.encode(get("/wait"))) + frame(1, 4, 3, enc.encode(post)))
+	const data = frame(0, 0, 3, big.slice(0, 16384))
+	pause(150 * millisecond)
+	t.write(data.slice(0, 9))
+	pause(100 * millisecond)
+	t.write(data.slice(9, data.length))
+	// The upload stalled after it is reset alone, the handler slow to answer going on.
+	t.timeout = second
+	assert until(t, 3, 0, 3)
+	release()
+	assert until(t, 1, 0, 1)
+	t.close()
+	l.handle.shutdown(true)
+	await job
+	// With no timeout, the rest of a head begun late in the idle time has none either.
+	const idle = net.listen("127.0.0.1:0")
+	const served = async serve(idle, 100, 300 * millisecond, 0)
+	const u = raw(idle)
+	const hello = frame(1, 5, 1, new Encoder().encode(get("/hello")))
+	pause(200 * millisecond)
+	u.write(frame(6, 0, 0, "12345678"))
+	pause(50 * millisecond)
+	u.write(hello.slice(0, 9))
+	pause(150 * millisecond)
+	u.write(hello.slice(9, hello.length))
+	u.timeout = second
+	assert until(u, 1, 0, 1)
+	u.close()
+	idle.handle.shutdown(true)
+	await served
+}
+
+test "a request whose body comes slower than the timeout is waited for, the server waiting on it" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const [c, t] = connect(l)
+	c.timeout = 50 * millisecond
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/count"], [":authority", "localhost"]]
+	const body = new Held("abc")
+	const waiting = async c.request(post, body)
+	pause(300 * millisecond)
+	body.held = false
+	body.gate.wake()
+	assert readAll((await waiting)[1]) == "3"
+	c.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a request whose upload ends during a wait for a frame has a whole timeout after it to be answered" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const [c, t] = connect(l)
+	c.timeout = 200 * millisecond
+	assert readAll(c.request(get("/hello"), null)[1]) == "hello" // Waits for a frame from here, each 200 ms at most.
+	hold = true
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/wait"], [":authority", "localhost"]]
+	const body = new Held("abc")
+	const waiting = async c.request(post, body)
+	pause(300 * millisecond) // Into the second wait.
+	body.held = false
+	body.gate.wake()
+	pause(150 * millisecond) // Past the second wait's end, short of a timeout after it.
+	release()
+	assert value((await waiting)[0], ":status") == "200"
+	c.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a request opened during a wait for a frame, another stream open, has a whole timeout after it to be answered" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const [c, t] = connect(l)
+	c.timeout = 200 * millisecond
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/echo"], [":authority", "localhost"]]
+	const body = new Held("abc")
+	c.request(post, body) // Its upload held, it waits on nothing; waits for a frame from here, each 200 ms at most.
+	hold = true
+	pause(300 * millisecond) // Into the second wait.
+	const waiting = async c.request(get("/wait"), null)
+	pause(150 * millisecond) // Past the second wait's end, short of a timeout after it.
+	release()
+	assert value((await waiting)[0], ":status") == "200"
+	body.held = false
+	body.gate.wake()
+	c.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a request opened after another began to wait, both unanswered, is not waited for a second timeout" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const [c, t] = connect(l)
+	c.timeout = 200 * millisecond
+	hold = true
+	const first = () => {
+		try {
+			c.request(get("/wait"), null)
+		} catch (e: IoError) {}
+	}
+	const one = async first()
+	pause(100 * millisecond) // Waits from here, past what the first wait for a frame counts from.
+	const start = monotonic()
+	let kind = ""
+	try {
+		c.request(get("/wait"), null)
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	assert kind == "TimedOut" && monotonic() - start < 260 * millisecond
+	await one
+	release()
+	c.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "streams reset while answered still count against the limit; one refused is closed, its id not to be opened again" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 2)
+	const t = raw(l)
+	const enc = new Encoder()
+	hold = true
+	peak = 0
+	for (const id of [1, 3, 5, 7]) {
+		t.write(frame(1, 5, id, enc.encode(get("/wait"))) + frame(3, 0, id, fromBytes([0, 0, 0, 8])))
+	}
+	t.write(frame(6, 0, 0, "12345678"))
+	assert until(t, 6)
+	assert peak == 2 && open == 2
+	release()
+	t.write(frame(1, 5, 7, enc.encode(get("/hello"))))
+	assert !until(t, 1, 0, 7)
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a stream refused after GOAWAY leaves the last stream id a second GOAWAY gives as it was" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const t = raw(l)
+	const enc = new Encoder()
+	hold = true
+	open = 0
+	t.write(frame(1, 5, 1, enc.encode(get("/wait"))))
+	while (open < 1) {
+		arrived.wait()
+	}
+	served!.close()
+	assert until(t, 7) && num(found, 0, 4) == 1
+	t.write(frame(1, 5, 3, enc.encode(get("/hello"))) + frame(3, 0, 1, ""))
+	assert until(t, 7) && num(found, 0, 4) == 1
+	release()
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+/// A server of l answering its one request with frames, then rest, if any, ns later.
+function peer(l: net.Listener, frames: string, rest = "", ns: i64 = 0) {
+	try {
+		const c = l.accept()
+		const t = tls.server(c, own)
+		t.write(frame(4, 0, 0, ""))
+		assert until(t, 1, 24)
+		t.write(frames)
+		if (rest != "") {
+			pause(ns)
+			t.write(rest)
+		}
+		assert until(t, 7)
+		t.close()
+	} catch (e: IoError) {}
+}
+
+test "a client passes over an interim response" {
+	const l = net.listen("127.0.0.1:0")
+	const enc = new Encoder()
+	const job = async peer(l,
+		frame(1, 4, 1, enc.encode([[":status", "100"]])) + frame(1, 5, 1, enc.encode([[":status", "200"]])))
+	const [c, t] = connect(l)
+	const [head, body] = c.request(get("/hello"), null)
+	assert head == [[":status", "200"]] && readAll(body) == ""
+	c.close()
+	await job
+}
+
+test "an interim response that ends the stream, data after it, a Content-Length ended with no body, a request's pseudo-header, or a :status not 3 digits from 100, or 101, resets it" {
+	const head = new Encoder().encode([[":status", "100"]])
+	const sized = new Encoder().encode([[":status", "200"], ["content-length", "5"]])
+	const asking = new Encoder().encode([[":status", "200"], [":path", "/"]])
+	const long = new Encoder().encode([[":status", "4294967496"]])
+	const odd = new Encoder().encode([[":status", "2x0"]])
+	const low = new Encoder().encode([[":status", "099"]])
+	const switching = new Encoder().encode([[":status", "101"]])
+	for (const frames of [frame(1, 5, 1, head), frame(1, 4, 1, head) + frame(0, 1, 1, ""), frame(1, 5, 1, sized),
+		frame(1, 5, 1, asking), frame(1, 5, 1, long), frame(1, 5, 1, odd),
+		frame(1, 5, 1, low), frame(1, 4, 1, switching)]) {
+		const l = net.listen("127.0.0.1:0")
+		const job = async peer(l, frames)
+		const [c, t] = connect(l)
+		assert c.request(get("/hello"), null) throws new IoError("ConnectionReset", "read", "reset")
+		c.close()
+		await job
+	}
+}
+
+test "DATA before a response's head resets its stream alone" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async (() => {
+		try {
+			const t = tls.server(l.accept(), own)
+			t.write(frame(4, 0, 0, ""))
+			assert until(t, 1, 24)
+			t.write(frame(0, 1, 1, "x"))
+			assert until(t, 1, 0, 3)
+			t.write(frame(1, 5, 3, new Encoder().encode([[":status", "200"]])))
+			assert until(t, 7)
+			t.close()
+		} catch (e: IoError) {}
+	})()
+	const [c, t] = connect(l)
+	assert c.request(get("/a"), null) throws new IoError("ConnectionReset", "read", "reset")
+	assert c.request(get("/b"), null)[0] == [[":status", "200"]]
+	c.close()
+	await job
+}
+
+test "a response's head not come by its deadline resets its stream alone, though the peer sends other frames" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async (() => {
+		try {
+			const t = tls.server(l.accept(), own)
+			t.write(frame(4, 0, 0, ""))
+			assert until(t, 1, 24)
+			for (const _ of 1 ... 10) {
+				pause(50 * millisecond)
+				t.write(frame(6, 0, 0, "12345678"))
+			}
+			assert until(t, 3, 0, 1)
+			assert until(t, 1, 0, 3)
+			t.write(frame(1, 5, 3, new Encoder().encode([[":status", "200"]])))
+			assert until(t, 7)
+			t.close()
+		} catch (e: IoError) {}
+	})()
+	const [c, t] = connect(l)
+	c.timeout = 2 * second
+	c.headTimeout = 200 * millisecond
+	assert c.request(get("/a"), null) throws new IoError("TimedOut", "read", "head")
+	c.headTimeout = 0
+	assert c.request(get("/b"), null)[0] == [[":status", "200"]]
+	c.close()
+	await job
+}
+
+test "a connection that refused a stream is not free till the peer ends one, though we reset ours meanwhile" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async (() => {
+		try {
+			const t = tls.server(l.accept(), own)
+			t.write(frame(4, 0, 0, ""))
+			assert until(t, 1, 24, 3)
+			t.write(frame(3, 0, 3, fromBytes([0, 0, 0, 7])))
+			for (const _ of 1 ... 10) {
+				pause(50 * millisecond)
+				t.write(frame(6, 0, 0, "12345678"))
+			}
+			assert until(t, 7)
+			t.close()
+		} catch (e: IoError) {}
+	})()
+	const [c, t] = connect(l)
+	c.timeout = 2 * second
+	c.headTimeout = 200 * millisecond
+	const a = async (() => {
+		try {
+			c.request(get("/a"), null)
+		} catch (e: IoError) {
+			return e.what
+		}
+		return ""
+	})()
+	assert c.request(get("/b"), null) throws new IoError("ConnectionReset", "read", "reset 7")
+	assert await a == "head" && !c.free()
+	c.close()
+	await job
+}
+
+/// A body of n pieces of 64 KiB, each after a pause of 10 ms.
+class Slow implements Reader {
+	n: i32
+
+	constructor(n: i32) { this.n = n }
+
+	read(k: i32): string | null throws IoError {
+		if (this.n == 0) {
+			return null
+		}
+		this.n--
+		pause(10 * millisecond)
+		return big.slice(0, 1 << 16)
+	}
+}
+
+test "a response's head is waited for from the request's end, however long its upload takes" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const [c, t] = connect(l)
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/count"], [":authority", "localhost"]]
+	c.headTimeout = 200 * millisecond
+	assert readAll(c.request(post, new Slow(48))[1]) == "3145728"
+	c.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a HEAD's response, a 204 or a 304 has no body, whatever its Content-Length or an interim one's says: DATA on it resets it" {
+	for (const [method, status] of [["HEAD", "200"], ["GET", "204"], ["GET", "304"]]) {
+		for (const sent of ["", "hello"]) {
+			const l = net.listen("127.0.0.1:0")
+			const enc = new Encoder()
+			const early = frame(1, 4, 1, enc.encode([[":status", "103"], ["content-length", "7"]]))
+			const job = async peer(l, early + frame(1, 4, 1, enc.encode([[":status", status], ["content-length", "5"]]))
+				+ frame(0, 1, 1, sent))
+			const [c, t] = connect(l)
+			const head: Head = [[":method", method], [":scheme", "https"], [":path", "/"], [":authority", "localhost"]]
+			const [got, body] = c.request(head, null)
+			assert value(got, ":status") == status
+			if (sent == "") {
+				assert readAll(body) == ""
+			} else {
+				assert readAll(body) throws new IoError("ConnectionReset", "read", "reset")
+			}
+			c.close()
+			await job
+		}
+	}
+}
+
+test "a stream reset during its upload gives the connection window back" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const [c, t] = connect(l)
+	c.timeout = second // Fails the last request fast, should the window stay shut.
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/hello"], [":authority", "localhost"]]
+	// Each upload is cancelled with 16 KiB still to send; 1025 lose more than the window, if not given back.
+	for (const i of 1 ... 1025) {
+		const body = new Held(big.slice(0, 1 << 14))
+		const [head, got] = c.request(post, body)
+		assert readAll(got) == "hello"
+		got.close()
+		body.held = false
+		body.gate.wake()
+	}
+	post[2] = [":path", "/echo"]
+	assert readAll(c.request(post, new Bytes(big))[1]) == big
+	c.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+/// A server of l taking one stream at a time, which answers the first request and ends at the second.
+function limiting(l: net.Listener) {
+	try {
+		const t = tls.server(l.accept(), own)
+		t.write(frame(4, 0, 0, fromBytes([0, 3, 0, 0, 0, 1])))
+		assert until(t, 1, 24)
+		t.write(frame(1, 5, 1, new Encoder().encode([[":status", "200"]])))
+		assert until(t, 1)
+		t.close()
+	} catch (e: IoError) {}
+}
+
+test "a request parked behind the peer's limit on streams as the connection ends was never sent, so may go again" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async limiting(l)
+	const [c, t] = connect(l)
+	assert readAll(c.request(get("/one"), null)[1]) == ""
+	const second = async c.request(get("/two"), null)
+	const third = async c.request(get("/three"), null)
+	assert (await second) throws new IoError("ConnectionReset", "read", "closed")
+	assert (await third) throws new IoError("ConnectionReset", "write", "goaway")
+	await job
+}
+
+test "a response complete before the upload is, then RST_STREAM(NO_ERROR), is read whole" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async peer(l,
+		frame(1, 4, 1, new Encoder().encode([[":status", "413"]])) + frame(0, 1, 1, "no")
+		+ frame(3, 0, 1, fromBytes([0, 0, 0, 0])))
+	const [c, t] = connect(l)
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/"], [":authority", "localhost"]]
+	const [head, body] = c.request(post, new Bytes(big))
+	assert head == [[":status", "413"]] && readAll(body) == "no"
+	c.close()
+	await job
+}
+
+test "our windows open to 4 MiB a stream and 16 MiB the connection from the start; a byte past a stream's resets it" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const t = raw(l)
+	t.timeout = second
+	assert until(t, 8, 0, 0) && num(found, 0, 4) == (16 << 20) - 65535
+	hold = true
+	let frames = frame(1, 4, 1, new Encoder().encode(get("/wait")))
+	for (const i of 1 ... 256) {
+		frames += frame(0, 0, 1, big.slice(0, 16384))
+	}
+	t.write(frames + frame(0, 0, 1, "!"))
+	assert until(t, 3, 0, 1) && num(found, 0, 4) == 3
+	release()
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a request expecting 100 Continue has it on the first read of its body, unless the response's head went first" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100, minute, 100 * millisecond)
+	const head = (path: string): string => new Encoder().encode([[":method", "POST"], [":scheme", "https"],
+		[":path", path], [":authority", "localhost"], ["expect", "100-continue"]])
+	for (const [path, status] of [["/count", "100"], ["/echo", "200"], ["/late", "100"]]) {
+		const t = raw(l)
+		t.timeout = second
+		hold = true
+		t.write(frame(1, 4, 1, head(path)))
+		if (path == "/late") {
+			// The peer waits for us, so a handler slow to read past the timeout does not time it out.
+			pause(300 * millisecond)
+			release()
+		}
+		assert until(t, 1, 0, 1) && new Decoder().decode(found, 1 << 16) == [[":status", status]]
+		t.close()
+	}
+	// Body bytes come before the handler reads, so none is owed: the peer stalling after is timed out.
+	const t = raw(l)
+	t.timeout = second
+	hold = true
+	t.write(frame(1, 4, 1, head("/late")) + frame(0, 0, 1, "abc"))
+	pause(50 * millisecond)
+	release()
+	assert until(t, 7, 0, 0)
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "streams that fill the connection's window, reset unread, give it back" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const t = raw(l)
+	t.timeout = second
+	assert until(t, 8, 0, 0)
+	hold = true
+	const enc = new Encoder()
+	for (const id of [1, 3, 5, 7]) {
+		let frames = frame(1, 4, id, enc.encode(get("/wait")))
+		for (const i of 1 ... 256) {
+			frames += frame(0, 0, id, big.slice(0, 16384))
+		}
+		t.write(frames)
+	}
+	// The window shut and nothing read, the resets alone must open it again: the first frees 4 MiB, all announced.
+	t.write(frame(3, 0, 1, fromBytes([0, 0, 0, 8])) + frame(3, 0, 3, fromBytes([0, 0, 0, 8])))
+	assert until(t, 8, 0, 0) && num(found, 0, 4) == 4 << 20
+	release()
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "the connection's window opens again once half of what streams do not hold unread is free" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const t = raw(l)
+	t.timeout = second
+	assert until(t, 8, 0, 0)
+	hold = true
+	const enc = new Encoder()
+	// 9 MiB held unread, 7 MiB read: never half of the whole window free, the window shut.
+	const streams: [i64, string, i32][] = [[1, "/wait", 256], [3, "/wait", 256], [5, "/wait", 64], [7, "/count", 256],
+		[9, "/count", 192]]
+	for (const [id, path, n] of streams) {
+		let frames = frame(1, 4, id, enc.encode(get(path)))
+		for (const i of 1 ... n) {
+			frames += frame(0, if (path == "/count" && i == n) 1 else 0, id, big.slice(0, 16384))
+		}
+		t.write(frames)
+	}
+	assert until(t, 8, 0, 0)
+	release()
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a body come whole is not read as ended once the client resets the stream or the connection ends" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/late"], [":authority", "localhost"],
+		["content-length", "11"]]
+	for (const reset of [true, false]) {
+		const t = raw(l)
+		hold = true
+		late = "unread"
+		t.write(frame(1, 4, 1, new Encoder().encode(post)) + frame(0, 0, 1, "hello ") + frame(0, 1, 1, "world"))
+		if (reset) {
+			t.write(frame(3, 0, 1, fromBytes([0, 0, 0, 8])) + frame(6, 0, 0, "12345678"))
+			assert until(t, 6)
+		} else {
+			t.write(frame(6, 0, 0, "12345678"))
+			assert until(t, 6)
+			t.close()
+			while (!served!.closed) {
+				pause(10 * millisecond)
+			}
+		}
+		release()
+		while (late == "unread") {
+			arrived.wait()
+		}
+		assert late == "ConnectionReset"
+		if (reset) {
+			t.close()
+		}
+	}
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a connection ended with no stream open tells the peer, which reads an end, not a cut" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async (() => {
+		const t = tls.server(l.accept(), own)
+		t.write(frame(4, 0, 0, ""))
+		return until(t, 7, 24) && !until(t, 7)
+	})()
+	const [c, t] = connect(l)
+	c.close()
+	assert await job
+	l.close()
+}
+
+test "a WINDOW_UPDATE of 0 is a protocol error, one past 2^31-1 a flow control error: the stream's, or on stream 0 the connection's" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	for (const code of [1, 3]) {
+		const inc = if (code == 1) fromBytes([0, 0, 0, 0]) else fromBytes([127, 255, 255, 255])
+		const t = raw(l)
+		hold = true
+		t.write(frame(1, 5, 1, new Encoder().encode(get("/wait"))) + frame(8, 0, 1, inc))
+		assert until(t, 3, 0, 1) && num(found, 0, 4) == code
+		t.write(frame(8, 0, 0, inc))
+		assert until(t, 7) && num(found, 4, 4) == code
+		release()
+		t.close()
+	}
+	// A stream's window near 2^31-1, which a larger SETTINGS_INITIAL_WINDOW_SIZE takes past it.
+	const t = raw(l)
+	hold = true
+	t.write(frame(1, 5, 1, new Encoder().encode(get("/wait"))) + frame(8, 0, 1, fromBytes([127, 255, 0, 0]))
+		+ frame(4, 0, 0, fromBytes([0, 4, 0, 1, 0, 0])))
+	assert until(t, 7) && num(found, 4, 4) == 3
+	release()
+	t.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a server's SETTINGS_ENABLE_PUSH of 1, or HEADERS on a stream the client did not open, even past a GOAWAY, is a connection error" {
+	const ok = new Encoder().encode([[":status", "200"]])
+	const bye = frame(7, 0, 0, fromBytes([0, 0, 0, 1, 0, 0, 0, 0]))
+	for (const bad of [frame(4, 0, 0, fromBytes([0, 2, 0, 0, 0, 1])), frame(4, 0, 0, "") + frame(1, 5, 2, ok),
+		frame(4, 0, 0, "") + frame(1, 5, 3, ok), frame(4, 0, 0, "") + bye + frame(1, 5, 2, ok)]) {
+		const l = net.listen("127.0.0.1:0")
+		const job = async (() => {
+			try {
+				const t = tls.server(l.accept(), own)
+				t.write(bad)
+				return until(t, 7, 24) && num(found, 4, 4) == 1 // Past the client's preface.
+			} catch (e: IoError) {
+				return false
+			}
+		})()
+		const [c, t] = connect(l)
+		try {
+			c.request(get("/hello"), null)
+		} catch (e: IoError) {}
+		l.close()
+		assert await job
+	}
+}
+
+/// A server of l letting open no stream, which wakes acked once the client has its settings, then pings every 20 ms,
+/// 50 times at most, until GOAWAY.
+function stingy(l: net.Listener, acked: Signal) {
+	try {
+		const t = tls.server(l.accept(), own)
+		t.write(frame(4, 0, 0, fromBytes([0, 3, 0, 0, 0, 0])))
+		assert until(t, 4, 24) && until(t, 4) // The client's settings, then its ack of ours.
+		acked.wake()
+		t.timeout = 20 * millisecond
+		let gone = false
+		for (const i of 1 ... 50) {
+			if (!gone) {
+				t.write(frame(6, 0, 0, "12345678"))
+				try {
+					gone = until(t, 7)
+				} catch (e: IoError) {}
+			}
+		}
+		t.close()
+	} catch (e: IoError) {}
+}
+
+test "a request the peer lets no stream open for is not waited for past the timeout, though it pings" {
+	const l = net.listen("127.0.0.1:0")
+	const acked = new Signal()
+	const job = async stingy(l, acked)
+	const [c, t] = connect(l)
+	c.timeout = 50 * millisecond
+	acked.wait()
+	let kind = ""
+	try {
+		c.request(get("/hello"), null)
+	} catch (e: IoError) {
+		kind = e.kind // The socket's, or once pings keep coming past the timeout, the frames'.
+	}
+	assert kind == "TimedOut"
+	l.close()
+	await job
+}
+
+test "a body its Content-Length does not match, short or long, is reset before it ends, a request's or a response's" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async serve(l, 100)
+	const [c, t] = connect(l)
+	for (const length of ["3", "1"]) {
+		const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/echo"], [":authority", "localhost"],
+			["content-length", length]]
+		// The request fails with the upload's error.
+		assert readAll(c.request(post, new Bytes("ab"))[1]) throws new IoError("Protocol", "write", "content-length")
+	}
+	for (const path of ["/short", "/long"]) {
+		assert readAll(c.request(get(path), null)[1]) throws new IoError("ConnectionReset", "read", "reset 2")
+	}
+	assert readAll(c.request(get("/hello"), null)[1]) == "hello"
+	c.close()
+	l.handle.shutdown(true)
+	await job
+}
+
+test "a write parked on a peer that reads nothing does not hold the end of the connection" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async (() => connection(l.accept(), 100, 0, 0))()
+	const t = raw(l)
+	// Windows open wide, so that the responses fill the socket.
+	let frames = frame(4, 0, 0, fromBytes([0, 4, 127, 255, 255, 255])) + frame(8, 0, 0, fromBytes([127, 0, 0, 0]))
+	const enc = new Encoder()
+	for (const id of [1, 3, 5, 7]) {
+		frames += frame(1, 5, id, enc.encode(get("/big")))
+	}
+	t.write(frames)
+	pause(200 * millisecond) // For the server's write to park, with no timeout.
+	for (const id of [1, 3, 5, 7]) {
+		t.write(frame(3, 0, id, fromBytes([0, 0, 0, 8])))
+	}
+	t.write(frame(7, 0, 0, fromBytes([0, 0, 0, 7, 0, 0, 0, 0])))
+	await job
+	t.close()
+	l.close()
+}
+
+/// Whether the connection l accepts, sending nothing past TLS, has GOAWAY within a second.
+function mute(l: net.Listener): bool throws IoError {
+	const t = tls.server(l.accept(), own)
+	t.timeout = second
+	return until(t, 7, 24)
+}
+
+test "the peer's preface is not waited for past the timeout, though it comes a byte at a time" {
+	const l = net.listen("127.0.0.1:0")
+	const job = async mute(l)
+	const c = net.dial(`${l.addr}`)
+	const s = tls.client(c, "localhost", trusting)
+	s.timeout = 100 * millisecond
+	const h = new Conn(s, false)
+	assert await job
+	const serving = async serve(l, 100, minute, 100 * millisecond)
+	const t = tls.client(net.dial(`${l.addr}`), "localhost", trusting)
+	t.timeout = 50 * millisecond
+	const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r" // Short of its last byte, which a frame's wait would follow.
+	let gone = false
+	for (const i of 0 ... preface.length - 1) {
+		if (!gone) {
+			t.write(preface.slice(i, i + 1))
+			try {
+				gone = until(t, 7)
+			} catch (e: IoError) {}
+		}
+	}
+	assert gone
+	h.close()
+	t.close()
+	l.handle.shutdown(true)
+	await serving
+}

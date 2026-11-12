@@ -1,0 +1,335 @@
+//! HTTP/1.1 messages as RFC 9112 frames them, for std/http.
+
+import { indexOf } from "../algo"
+import { cr, hash, isAlphanumeric, isControl, isHexDigit, semicolon, space, tab } from "../ascii"
+import { Reader, Stream } from "../io"
+import { max } from "../math"
+import { ParseError, formatInt, lower, scanInt, trim } from "../string"
+import { monotonic } from "../time"
+
+/// A stream read through a buffer, line by line or in pieces.
+export class Buffered {
+	readonly stream: Stream
+	/// When the reads must be done by, in ns of monotonic(), or 0: the stream's timeout is set from it before each.
+	deadline: i64 = 0
+	private buf = ""
+
+	constructor(stream: Stream) { this.stream = stream }
+	/// Whether bytes are buffered.
+	pending(): bool { return this.buf.length > 0 }
+
+	/// Reads more into the buffer; false at the end of the stream.
+	fill(): bool throws IoError {
+		if (this.deadline != 0) {
+			// Never 0, which is none: past the deadline, what has come is still read, and the stream's timeout is thrown.
+			this.stream.timeout = max(this.deadline - monotonic(), 1)
+		}
+		const s = this.stream.read(1 << 16)
+		if (s == null) {
+			return false
+		}
+		this.buf += s
+		return true
+	}
+
+	/// Up to n bytes; null at the end.
+	read(n: i32): string | null throws IoError {
+		if (this.buf.length == 0 && !this.fill()) {
+			return null
+		}
+		const k = if (n < this.buf.length) n else this.buf.length
+		const s = this.buf.slice(0, k)
+		this.buf = this.buf.slice(k, this.buf.length)
+		return s
+	}
+
+	/// The next line without its CRLF, or a bare LF, which is Protocol if crlf; TooLarge once more than limit bytes
+	/// came with no LF, though one whose LF came in the same read may pass it, ConnectionReset if the stream ends in
+	/// it, null if it ends before it.
+	line(limit: i64, crlf: bool = false): string | null throws IoError {
+		let from = 0
+		while (true) {
+			const i = indexOf(this.buf, "\n", from)
+			if (i >= 0) {
+				const cut = i > 0 && this.buf[i - 1] == cr
+				if (crlf && !cut) {
+					throw new IoError("Protocol", "read", "line")
+				}
+				const l = this.buf.slice(0, if (cut) i - 1 else i)
+				this.buf = this.buf.slice(i + 1, this.buf.length)
+				return l
+			}
+			if (this.buf.length > limit) {
+				throw new IoError("TooLarge", "read", "line")
+			}
+			from = this.buf.length
+			if (!this.fill()) {
+				if (this.buf.length == 0) {
+					return null
+				}
+				throw new IoError("ConnectionReset", "read", "line")
+			}
+		}
+	}
+}
+
+/// A stream handed over after a 101, reading what its buffer holds first.
+export class Upgraded implements Stream {
+	timeout: i64
+	private b: Buffered
+
+	constructor(b: Buffered) {
+		this.b = b
+		this.timeout = b.stream.timeout
+	}
+
+	read(n: i32): string | null throws IoError {
+		this.b.stream.timeout = this.timeout
+		return this.b.read(n)
+	}
+
+	write(s: string) throws IoError {
+		this.b.stream.timeout = this.timeout
+		this.b.stream.write(s)
+	}
+
+	close() throws IoError { this.b.stream.close() }
+}
+
+/// A message's head: its start line's three parts, the last of which may hold spaces or be missing, as a status's
+/// reason may, and its headers; null if the stream ends before it. A head of more than limit bytes is TooLarge.
+export function readHead(b: Buffered, limit: i64): [string[], [string, string][]] | null throws IoError {
+	let left = limit
+	let start = b.line(left)
+	if (start == "") {
+		start = b.line(left) // An empty line before, as a client may send after a body, is skipped (RFC 9112 §2.2).
+	}
+	if (start == null) {
+		return null
+	}
+	const a = indexOf(start, " ")
+	const c = if (a < 0) -1 else indexOf(start, " ", a + 1)
+	if (a <= 0) {
+		throw malformed(start)
+	}
+	const parts = if (c < 0) [start.slice(0, a), start.slice(a + 1, start.length), ""]
+		else [start.slice(0, a), start.slice(a + 1, c), start.slice(c + 1, start.length)]
+	const headers: [string, string][] = []
+	left -= start.length + 2
+	while (true) {
+		const l = ended(b.line(left), "head")
+		left -= l.length + 2
+		if (left < 0) {
+			throw new IoError("TooLarge", "read", "head")
+		}
+		if (l == "") {
+			return [parts, headers]
+		}
+		headers.push(field(l))
+	}
+}
+
+/// A header line's name, lowercased, and its value, trimmed, each of its own bytes, as a slice would keep the whole
+/// read alive; Protocol if the name is not a token or the value holds a control but HTAB.
+function field(l: string): [string, string] throws IoError {
+	const colon = indexOf(l, ":")
+	const name = if (colon < 0) "" else l.slice(0, colon)
+	const value = l.slice(colon + 1, l.length)
+	if (!isToken(name) || !isValue(value)) {
+		throw malformed(l)
+	}
+	return [lower(name).copy(), trim(value).copy()]
+}
+
+/// A start line and headers, as bytes; a name that is not a token, or a value holding a CR, LF or other control but
+/// HTAB, which would split the message, is a Protocol error.
+export function head(start: string, headers: [string, string][]): string throws IoError {
+	let s = `${start}\r\n`
+	for (const [name, value] of headers) {
+		if (!isToken(name) || !isValue(value)) {
+			throw malformed(`${name}: ${value}`)
+		}
+		s += `${name}: ${value}\r\n`
+	}
+	return `${s}\r\n`
+}
+
+/// s as a chunk of a chunked body; the empty one ends it.
+export function chunk(s: string): string { return `${formatInt(s.length, 16)}\r\n${s}\r\n` }
+
+/// A body read from b: of length bytes, of chunks, or to the stream's end if neither; then done, and onEnd is called
+/// with true. A read that throws leaves the stream at no message boundary, so every read after throws the same. A
+/// chunk's lines end in CRLF alone, as a bare LF one peer ends a line at and another not would smuggle a message in
+/// (RFC 9112 §7.1).
+export class Framed implements Reader {
+	done = false
+	/// Writes 100 Continue before the first read, for a request that expects it.
+	expect = false
+	private b: Buffered
+	private length: i64 | null
+	private chunked: bool
+	private left: i64
+	private onEnd: (clean: bool) => void
+	private failed: IoError | null = null
+	/// Chunk lines' bytes, CRLFs counted, beyond 16 a chunk and twice its size, summed: framing that no limit on data
+	/// sees, refused past 16 KiB as Go does.
+	private excess: i64 = 0
+
+	constructor(b: Buffered, length: i64 | null, chunked: bool, onEnd: (clean: bool) => void) {
+		this.b = b
+		this.length = length
+		this.chunked = chunked
+		this.left = length ?? 0
+		this.onEnd = onEnd
+	}
+
+	read(n: i32): string | null throws IoError {
+		if (this.done) {
+			return null
+		}
+		if (this.failed != null) {
+			throw this.failed
+		}
+		try {
+			return this.next(n)
+		} catch (e: IoError) {
+			this.failed = e
+			throw e
+		}
+	}
+
+	private next(n: i32): string | null throws IoError {
+		this.proceed()
+		if (this.chunked && this.left == 0) {
+			const l = ended(this.b.line(1024, true), "chunk")
+			this.left = size(l)
+			this.excess = if (this.left > 16384) 0 else max(this.excess + l.length - 14 - 2 * this.left, 0)
+			if (this.excess > 16384) {
+				throw new IoError("Protocol", "read", "chunk")
+			}
+			if (this.left == 0) {
+				this.trailers()
+				return this.end()
+			}
+		} else if (!this.chunked && this.length != null && this.left == 0) {
+			return this.end()
+		}
+		const want = if (this.length == null && !this.chunked) n
+			else if ((n as i64) < this.left) n
+			else this.left as i32
+		const s = this.b.read(want)
+		if (s == null) {
+			if (this.length != null || this.chunked) {
+				throw new IoError("ConnectionReset", "read", "body")
+			}
+			return this.end()
+		}
+		this.left -= s.length
+		if (this.chunked && this.left == 0 && this.b.line(2, true) != "") {
+			throw new IoError("Protocol", "read", "chunk")
+		}
+		return s
+	}
+
+	/// Ends the body before its end, calling onEnd with false, as for a connection not to be used again.
+	abort() {
+		if (!this.done) {
+			this.done = true
+			this.onEnd(false)
+		}
+	}
+
+	/// Skips the trailer fields after the last chunk; TooLarge past 8 KiB of them.
+	private trailers() throws IoError {
+		let left: i64 = 8192
+		while (true) {
+			const l = ended(this.b.line(left, true), "trailer")
+			left -= l.length + 2
+			if (left < 0) {
+				throw new IoError("TooLarge", "read", "trailers")
+			}
+			if (l == "") {
+				return
+			}
+			field(l)
+		}
+	}
+
+	/// Whether reading n more bytes may leave it unended: any chunked one, a known length if n or more are left.
+	exceeds(n: i64): bool { return !this.done && (this.length == null || this.left >= n) }
+
+	/// Writes 100 Continue, once, if the request expects it.
+	proceed() throws IoError {
+		if (this.expect) {
+			this.expect = false
+			this.b.stream.write("HTTP/1.1 100 Continue\r\n\r\n")
+		}
+	}
+
+	private end(): string | null {
+		this.done = true
+		this.onEnd(true)
+		return null
+	}
+}
+
+/// The size a chunk's first line gives, before any extension and the blanks before it: hex digits alone, no sign; the
+/// extension holds no control but HTAB.
+function size(l: string): i64 throws IoError {
+	try {
+		let [n, end] = scanInt[i64](l, 0, 16)
+		while (end < l.length && (l[end] == space || l[end] == tab)) {
+			end += 1
+		}
+		if (!isHexDigit(l[0]) || end < l.length && l[end] != semicolon || !isValue(l)) {
+			throw new IoError("Protocol", "read", l)
+		}
+		return n
+	} catch (e: ParseError) {
+		throw new IoError("Protocol", "read", l)
+	}
+}
+
+/// Whether s can be a request line's target: no space or control, which would end or split it, nor a fragment's #,
+/// which a target has none of (RFC 9112 §3.2).
+export function isTarget(s: string): bool {
+	for (const ch of s) {
+		if (ch == space || ch == hash || isControl(ch)) {
+			return false
+		}
+	}
+	return true
+}
+
+/// Whether s is a token: one or more of the characters a field name or a method may hold.
+export function isToken(s: string): bool {
+	if (s.length == 0) {
+		return false
+	}
+	for (const ch of s) {
+		if (!(isAlphanumeric(ch) || indexOf("!#$%&'*+-.^_`|~", chr(ch)) >= 0)) {
+			return false
+		}
+	}
+	return true
+}
+
+/// Whether s may be a field value: no control but HTAB.
+export function isValue(s: string): bool {
+	for (const ch of s) {
+		if (isControl(ch) && ch != tab) {
+			return false
+		}
+	}
+	return true
+}
+
+function malformed(line: string): IoError { return new IoError("Protocol", "read", line) }
+
+/// l, unless the stream ended before it: a ConnectionReset.
+function ended(l: string | null, what: string): string throws IoError {
+	if (l == null) {
+		throw new IoError("ConnectionReset", "read", what)
+	}
+	return l
+}

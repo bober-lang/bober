@@ -1,0 +1,1274 @@
+import { endsWith, indexOf, startsWith } from "./algo"
+import { Signal } from "../builtin/fiber"
+import { makeTempDir, readDir, readFile, remove } from "./fs"
+import { Reader, readAll } from "./io"
+import { Body, Client, Handler, Request, Response, Server, get, json, post, redirect, send, text } from "./http"
+import { frame, num } from "./http/h2"
+import { Decoder, Encoder } from "./http/hpack"
+import { maxOf } from "./limits"
+import { nan } from "./math"
+import { Conn, Listener, dial, listen } from "./net"
+import { Config, client, server as tlsServer } from "./tls"
+import { ParseError } from "./string"
+import { millisecond, monotonic, second } from "./time"
+
+class User {
+	name = ""
+	age = 0
+}
+
+/// A body given piece by piece, so that it streams.
+class Pieces implements Reader {
+	pieces: string[]
+
+	constructor(pieces: string[]) { this.pieces = pieces }
+	read(n: i32): string | null throws IoError { return if (this.pieces.length == 0) null else this.pieces.pop() }
+}
+
+/// A body whose end waits for gate.
+class Held implements Reader {
+	gate = new Signal()
+
+	read(n: i32): string | null throws IoError {
+		this.gate.wait()
+		return null
+	}
+}
+
+/// Bodies of /held and /huge the server closed.
+let released = 0
+/// Requests to /late served.
+let late = 0
+
+function app(req: Request): Response throws IoError | ParseError {
+	switch (req.url.path) {
+		case "/": return text("root")
+		case "/hello": return text("hello")
+		case "/scheme": return text(req.url.scheme)
+		case "/version": return text(req.version)
+		case "/query": return text(req.url.query.get("q") ?? "none")
+		case "/user":
+			const u = req.body.json[User]()
+			u.age++
+			return json(u, 201)
+		case "/nan": return json(nan)
+		case "/early": return new Response(103)
+		case "/99": return new Response(99)
+		case "/1000": return new Response(1000)
+		case "/stream": return new Response(200, new Pieces(["c", "b", "a"]))
+		case "/long", "/short":
+			const sent = new Response(200)
+			sent.body = new Body(new Pieces(if (req.url.path == "/long") ["c", "ab"] else ["a"]), 2)
+			return sent
+		case "/sized":
+			const sized = new Response(200)
+			sized.headers.set("content-length", "1234")
+			return sized
+		case "/held", "/held-none":
+			const held = new Response(if (req.url.path == "/held") 200 else 204)
+			held.body = new Body(new Pieces(["b", "a"]), null, () => {
+				released++
+			})
+			return held
+		// 64 MiB, past what a peer that reads none of it lets through.
+		case "/huge":
+			let mib = "x"
+			while (mib.length < 1 << 20) {
+				mib += mib
+			}
+			const pieces: string[] = []
+			for (const i of 1 ... 64) {
+				pieces.push(mib)
+			}
+			const huge = new Response(200)
+			huge.body = new Body(new Pieces(pieces), null, () => {
+				released++
+			})
+			return huge
+		case "/late":
+			late++
+			return text("late")
+		case "/echo-x": return text(req.headers.get("x-mw") ?? "none")
+		case "/host":
+			const host = new Response(204)
+			host.headers.set("x-host", req.headers.all("host").join(" "))
+			return host
+		case "/up", "/up-split":
+			const up = new Response(101)
+			up.headers.set("upgrade", "echo")
+			if (req.url.path == "/up-split") {
+				up.headers.set("x-bad", "a\r\nb")
+			}
+			up.upgrade = c => {
+				try {
+					c.write("!")
+					while (true) {
+						const s = c.read(100)
+						if (s == null || s == "bye") {
+							break
+						}
+						c.write(s)
+					}
+				} catch (e: IoError) {}
+			}
+			return up
+		case "/throw": throw new IoError("Other", "fail", "on purpose")
+		case "/small": return text(req.body.text(4))
+		case "/split":
+			const res = text("x")
+			res.headers.set("x-bad", "a\r\nb")
+			return res
+		case "/a": return redirect("/hello")
+		case "/far": return redirect("http://[::1]:1/hello")
+		case "/loop": return redirect("/loop", 302)
+		case "/moved": return redirect("/method", 301)
+		case "/see": return redirect("/method")
+		case "/method": return text(`${req.method} ${req.body.text()}`)
+		case "/echo": return new Response(200, req.body)
+		case "/cookie": return text(req.headers.get("cookie") ?? "none")
+		case "/to-cookie": return redirect("/cookie")
+		case "/cached": return new Response(304)
+		case "/bye":
+			const bye = text("x")
+			bye.headers.set("connection", "close")
+			bye.headers.set("keep-alive", "timeout=5")
+			return bye
+		case "/framed":
+			const framed = text("x")
+			framed.headers.set("content-length", "99")
+			return framed
+		default: return new Response(404)
+	}
+}
+
+/// A server to run app on a free port.
+function server(): Server {
+	const s = new Server()
+	s.addr = "127.0.0.1:0"
+	return s
+}
+
+test "a handler is a function" {
+	const res = app(new Request("GET", "http://x/hello"))
+	assert res.status == 200 && res.body.text() == "hello"
+		&& res.headers.get("Content-Type") == "text/plain; charset=utf-8"
+	assert app(new Request("GET", "http://x/none")).status == 404
+	assert new Response(200, "hello").body.text(2) throws new IoError("TooLarge", "read", "body")
+	// A body streaming another closes it, as a proxy's frees its upstream connection.
+	const before = released
+	new Response(200, app(new Request("GET", "http://x/held")).body).close()
+	assert released == before + 1
+}
+
+test "a client and a server exchange messages" {
+	const s = server()
+	const job = async s.serve(app)
+	const base = `http://${s.addr}`
+	const res = get(`${base}/hello`)
+	assert res.status == 200 && res.body.text() == "hello" && res.body.length == 5
+	assert res.headers.get("date") == "Fri, 26 Jun 2015 14:00:00 GMT"
+	const made = post(`${base}/user`, `{"name":"ann","age":40}`, "application/json")
+	assert made.status == 201 && made.body.json[User]().age == 41
+	assert get(`${base}/none`).status == 404
+	assert get(`${base}/throw`).status == 500 && get(`${base}/early`).status == 500
+	assert get(`${base}/99`).status == 500 && get(`${base}/1000`).status == 500
+	assert s.conns == 1
+	const streamed = get(`${base}/stream`)
+	assert streamed.body.length == null && streamed.body.read(10) == "a"
+	assert streamed.body.text() == "bc"
+	assert post(`${base}/echo`, "abc", "text/plain").body.text() == "abc"
+	assert send(new Request("POST", `${base}/echo`, new Pieces(["c", "b", "a"]))).body.text() == "abc"
+	s.close()
+	await job
+}
+
+test "limits and bad messages" {
+	const s = server()
+	const job = async s.serve(app)
+	const base = `http://${s.addr}`
+	assert post(`${base}/small`, "abc", "text/plain").body.text() == "abc"
+	assert post(`${base}/small`, "abcde", "text/plain").status == 500
+	let kind = ""
+	try {
+		get(`${base}/stream`).body.text(2)
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	assert kind == "TooLarge"
+	assert get(`${base}/split`).status == 500
+	const bad = new Request("GET", `${base}/hello`)
+	bad.headers.set("x", "a\nb")
+	assert send(bad) throws new IoError("Protocol", "read", "x: a\nb")
+	const raw = dial(s.addr)
+	raw.write("GET /hello HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n")
+	assert raw.read(200)!.slice(0, 13) == "HTTP/1.1 400 "
+	assert raw.read(100) == null
+	raw.close()
+	const neg = dial(s.addr)
+	neg.write("GET /hello HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n")
+	assert neg.read(200)!.slice(0, 13) == "HTTP/1.1 400 "
+	neg.close()
+	const evil = dial(s.addr)
+	evil.write("GET /hello HTTP/1.1\r\nHost: a/b\r\n\r\n")
+	assert evil.read(200)!.slice(0, 13) == "HTTP/1.1 400 "
+	evil.close()
+	const twice = dial(s.addr)
+	twice.write("GET /hello HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\n")
+	assert twice.read(200)!.slice(0, 13) == "HTTP/1.1 400 "
+	twice.close()
+	const star = dial(s.addr)
+	star.write("OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n") // The server's, as app answers 404.
+	assert star.read(200)!.slice(0, 13) == "HTTP/1.1 200 "
+	star.close()
+	const control = dial(s.addr)
+	control.write("G\x01T /hello HTTP/1.1\r\nHost: x\r\n\r\n")
+	assert control.read(200)!.slice(0, 13) == "HTTP/1.1 400 "
+	control.close()
+	const lowered = dial(s.addr)
+	lowered.write("get /method HTTP/1.1\r\nHost: x\r\n\r\n")
+	assert endsWith(lowered.read(500)!, "\r\n\r\nget ")
+	lowered.close()
+	const stray = dial(s.addr)
+	stray.write("GET /query?q=100% HTTP/1.1\r\nHost: x\r\n\r\n")
+	assert endsWith(stray.read(500)!, "\r\n\r\n100%")
+	stray.close()
+	const spaced = new Request("GET", `${base}/a`)
+	spaced.url.path = "/a b"
+	assert send(spaced) throws new IoError("Protocol", "send", "GET /a b")
+	assert get("http:///x") throws new IoError("Protocol", "send", "host")
+	const hostless = dial(s.addr)
+	hostless.write("GET path HTTP/1.1\r\nHost: x\r\n\r\n")
+	assert hostless.read(200)!.slice(0, 13) == "HTTP/1.1 400 "
+	hostless.close()
+	const absolute = dial(s.addr)
+	absolute.write("GET HTTP://X HTTP/1.1\r\nHost: x\r\n\r\n")
+	assert endsWith(absolute.read(500)!, "\r\n\r\nroot")
+	absolute.close()
+	for (const [target,
+		host] of [["http://x:80/hello", "x"], ["http://x/hello", "X:80"], ["http://x:0080/", "x:0080"]]) {
+		const same = dial(s.addr)
+		same.write(`GET ${target} HTTP/1.1\r\nHost: ${host}\r\n\r\n`)
+		assert same.read(200)!.slice(0, 13) == "HTTP/1.1 200 "
+		same.close()
+	}
+	// The scheme not served, userinfo, a bad host, not one Host, as HTTP/1.1 must have, or a fragment.
+	for (const head of ["/hello#x HTTP/1.1\r\nHost: x", "https://x/hello HTTP/1.1\r\nHost: x",
+		"http://u@x/hello HTTP/1.1\r\nHost: x",
+		"http://@x/hello HTTP/1.1\r\nHost: x", "http://a{b}/hello HTTP/1.1\r\nHost: x", "http://x/hello HTTP/1.1",
+		"http://x/hello HTTP/1.1\r\nHost: x\r\nHost: x"]) {
+		const other = dial(s.addr)
+		other.write(`GET ${head}\r\n\r\n`)
+		assert other.read(200)!.slice(0, 13) == "HTTP/1.1 400 "
+		other.close()
+	}
+	// An absolute target's host is the request's, whatever Host says.
+	const elsewhere = dial(s.addr)
+	elsewhere.write("GET http://Y:81/host HTTP/1.1\r\nHost: x\r\n\r\n")
+	assert indexOf(elsewhere.read(500)!, "\r\nx-host: Y:81\r\n") > 0
+	elsewhere.close()
+	// HTTP/1.0 may leave out Host, which HTTP/1.1 may not.
+	for (const [version, status] of [["1.0", "200"], ["1.1", "400"]]) {
+		const bare = dial(s.addr)
+		bare.write(`GET /hello HTTP/${version}\r\n\r\n`)
+		assert bare.read(200)!.slice(0, 13) == `HTTP/1.1 ${status} `
+		bare.close()
+	}
+	// A later HTTP/1.x is served as 1.1; another version is no request.
+	for (const [version, start, body] of [["1.2", "200", "HTTP/1.1"], ["1.10", "400", ""], ["2.0", "400", ""]]) {
+		const later = dial(s.addr)
+		later.write(`GET /version HTTP/${version}\r\nHost: x\r\n\r\n`)
+		const got = later.read(500)!
+		assert got.slice(0, 13) == `HTTP/1.1 ${start} ` && endsWith(got, "\r\n\r\n" + body)
+		later.close()
+	}
+	assert get(`${base}/framed`).headers.get("content-length") == "1"
+	const close = dial(s.addr)
+	close.write("GET /hello HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, Close\r\n\r\n")
+	assert close.read(200)!.slice(0, 13) == "HTTP/1.1 200 " && close.read(100) == null
+	close.close()
+	const held = dial(s.addr)
+	held.write("POST /hello HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n")
+	assert held.read(200)!.slice(0, 13) == "HTTP/1.1 200 " && held.read(100) == null
+	held.close()
+	const expects = dial(s.addr)
+	expects.write("POST /echo HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello")
+	let echoed = ""
+	while (!endsWith(echoed, "\r\n0\r\n\r\n")) {
+		echoed += expects.read(500)!
+	}
+	assert startsWith(echoed, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 ")
+		&& endsWith(echoed, "\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+	expects.close()
+	const expects10 = dial(s.addr)
+	expects10.write("POST /echo HTTP/1.0\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello")
+	const echoed10 = readAll(expects10)
+	assert startsWith(echoed10, "HTTP/1.1 200 ") && endsWith(echoed10, "\r\n\r\nhello")
+	expects10.close()
+	// A bare LF ends no chunk line, as a request could hide in what another parser takes for a chunk.
+	const smuggle = dial(s.addr)
+	smuggle.write("POST /hello HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\n\r\n"
+		+ "GET /smuggled HTTP/1.1\r\nHost: x\r\n\r\n")
+	const answered = readAll(smuggle)
+	assert startsWith(answered, "HTTP/1.1 200 ") && indexOf(answered, "HTTP/1.1", 1) < 0
+	smuggle.close()
+	// HTTP/1.0 has no Transfer-Encoding: its framing is faulty (RFC 9112 §6.1).
+	const chunked10 = dial(s.addr)
+	chunked10.write("POST /hello HTTP/1.0\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+	assert startsWith(readAll(chunked10), "HTTP/1.1 400 ")
+	chunked10.close()
+	const bye = dial(s.addr)
+	bye.write("GET /bye HTTP/1.1\r\nHost: x\r\n\r\n")
+	const said = bye.read(500)!
+	const at = indexOf(said, "connection: close\r\n")
+	assert at > 0 && indexOf(said, "connection", at + 1) < 0 && bye.read(100) == null
+	bye.close()
+	const old = dial(s.addr)
+	old.write("GET /stream HTTP/1.0\r\nHost: x\r\n\r\n")
+	let all = ""
+	while (true) {
+		const got = old.read(500)
+		if (got == null) {
+			break
+		}
+		all += got
+	}
+	assert indexOf(all, "transfer-encoding") < 0 && all.slice(all.length - 7, all.length) == "\r\n\r\nabc"
+	old.close()
+	// A body of more or fewer bytes than its length ends the connection after those it may send.
+	for (const [path, written] of [["/long", "ab"], ["/short", "a"]]) {
+		const pipelined = dial(s.addr)
+		pipelined.write(`GET ${path} HTTP/1.1\r\nHost: x\r\n\r\nGET /hello HTTP/1.1\r\nHost: x\r\n\r\n`)
+		const got = readAll(pipelined)
+		assert indexOf(got, "content-length: 2\r\n") > 0 && endsWith(got, `\r\n\r\n${written}`)
+		pipelined.close()
+	}
+	const cached = dial(s.addr)
+	cached.write("GET /cached HTTP/1.1\r\nHost: x\r\n\r\n")
+	const h304 = cached.read(500)!
+	assert h304.slice(0, 13) == "HTTP/1.1 304 " && indexOf(h304, "content-length") < 0
+	cached.close()
+	s.close()
+	await job
+	const l = listen("127.0.0.1:0")
+	let sent = ""
+	const peer = async (() => {
+		const c = l.accept()
+		sent = c.read(1000) ?? ""
+		c.write("HTTP/1.1 200 \r\nTransfer-Encoding: chunked\r\n\r\n-5\r\nhello\r\n0\r\n\r\n")
+		c.close()
+	})()
+	const smuggled = new Request("POST", `http://${l.addr}/`, "abc")
+	smuggled.headers.set("content-length", "99")
+	assert send(smuggled).body.text() throws new IoError("Protocol", "read", "-5")
+	assert indexOf(sent, "content-length: 3\r\n") > 0 && indexOf(sent, ": 99") < 0
+	await peer
+	const terse = async (() => {
+		const c = l.accept()
+		c.read(1000)
+		c.write("HTTP/1.1 200\r\nContent-Length: 2\r\n\r\nok")
+		c.close()
+	})()
+	assert get(`http://${l.addr}/`).body.text() == "ok"
+	await terse
+	// A status below 100, or a version not HTTP/1.x, is no response, nor an interim one.
+	for (const start of ["HTTP/1.1 099 x", "HTTP/1.1 000 x", "HTTP/1.99 200 x", "FOO 1 x", "HTTP/1.99 100 x",
+		"HTTP/2.0 200 x"]) {
+		const bad = async (() => {
+			const c = l.accept()
+			c.read(1000)
+			c.write(`${start}\r\nContent-Length: 0\r\n\r\n`)
+			c.close()
+		})()
+		assert get(`http://${l.addr}/`) throws new IoError("Protocol", "read", start)
+		await bad
+	}
+	const old10 = async (() => {
+		const c = l.accept()
+		c.read(1000)
+		c.write("HTTP/1.0 200 \r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n")
+		c.close()
+	})()
+	assert get(`http://${l.addr}/`) throws new IoError("Protocol", "read", "framing")
+	await old10
+	// A request that says close is not pooled; a body whose read fails frees its connection.
+	let closed = false
+	const once = async (() => {
+		const c = l.accept()
+		c.timeout = second
+		c.read(1000)
+		c.write("HTTP/1.1 200 \r\nContent-Length: 2\r\n\r\nok")
+		try {
+			closed = c.read(100) == null
+		} catch (e: IoError) {}
+		c.close()
+	})()
+	const closing = new Request("GET", `http://${l.addr}/`)
+	closing.headers.set("connection", "close")
+	assert send(closing).body.text() == "ok"
+	await once
+	assert closed
+	const cut = async (() => {
+		const c = l.accept()
+		c.read(1000)
+		c.write("HTTP/1.1 200 \r\nContent-Length: 100000\r\n\r\nabc")
+		c.close()
+	})()
+	const short = get(`http://${l.addr}/`)
+	assert short.body.text() throws new IoError("ConnectionReset", "read", "body")
+	assert short.body.read(1) == null
+	await cut
+	l.close()
+}
+
+test "an idle connection that times out is forgotten" {
+	const s = server()
+	s.idleTimeout = 50 * millisecond
+	const started = new Signal()
+	const gate = new Signal()
+	const job = async s.serve(req => {
+		started.wake()
+		gate.wait()
+		return text("late")
+	})
+	const raw = dial(s.addr)
+	assert raw.read(10) == null
+	raw.close()
+	// The next connection takes the fd number the timed-out one had; closing the server must not end it. The handler
+	// runs only once this fiber parks, so its wake comes after the wait.
+	const late = async get(`http://${s.addr}/`)
+	started.wait()
+	s.close()
+	gate.wake()
+	assert (await late).body.text() == "late"
+	await job
+}
+
+test "a pooled connection the peer ended or wrote to is not taken" {
+	const l = listen("127.0.0.1:0")
+	const url = `http://${l.addr}/`
+	const late = "HTTP/1.1 408 \r\nContent-Length: 0\r\n\r\n"
+	// The peer ends the kept connection, sends an unasked 408 on it, or sends that with the response.
+	for (const how of ["end", "408", "with"]) {
+		const first = async (() => {
+			const c = l.accept()
+			c.read(1000)
+			c.write(`HTTP/1.1 200 \r\nContent-Length: 2\r\n\r\nok${if (how == "with") late else ""}`)
+			if (how == "end") {
+				c.close()
+			} else if (how == "408") {
+				c.write(late)
+			}
+			return c
+		})()
+		assert get(url).body.text() == "ok"
+		const c = await first
+		const next = async (() => {
+			const d = l.accept()
+			d.read(1000)
+			d.write("HTTP/1.1 200 \r\nContent-Length: 4\r\n\r\nnext")
+			d.close()
+		})()
+		const res = send(new Request("POST", url, "x"))
+		assert res.status == 200 && res.body.text() == "next"
+		await next
+		c.close()
+	}
+	// One that ends after the request is sent again only if idempotent.
+	const reset = async (() => {
+		const c = l.accept()
+		c.read(1000)
+		c.write("HTTP/1.1 200 \r\nContent-Length: 2\r\n\r\nok")
+		c.read(1000)
+		c.close()
+	})()
+	assert get(url).body.text() == "ok"
+	assert send(new Request("LOCK", url, "")) throws new IoError("ConnectionReset", "send", `http://${l.addr}`)
+	await reset
+	l.close()
+}
+
+test "the pool holds poolSize connections of all origins together, none idle past idleTimeout" {
+	const l = listen("0.0.0.0:0")
+	const job = async (() => {
+		try {
+			while (true) {
+				const c = l.accept()
+				c.read(1000)
+				c.write("HTTP/1.1 200 \r\nContent-Length: 2\r\n\r\nok")
+				c.close()
+			}
+		} catch (e: IoError) {}
+	})()
+	const fds = readDir("/proc/self/fd").length
+	const c = new Client()
+	c.poolSize = 4
+	for (const i of 1 ... 20) {
+		assert c.send(new Request("GET", `http://127.0.0.${i}:${l.addr.port}/`)).body.text() == "ok"
+	}
+	assert readDir("/proc/self/fd").length == fds + 4
+	c.idleTimeout = -1 // A connection is idle past a negative timeout at once.
+	assert c.send(new Request("GET", `http://127.0.0.1:${l.addr.port}/`)).body.text() == "ok"
+	assert readDir("/proc/self/fd").length == fds
+	l.close()
+	await job
+}
+
+test "a server closed before serving does not serve, and once served, closing it again leaves its fd alone" {
+	const early = server()
+	early.close()
+	early.serve(app)
+	assert early.addr == "127.0.0.1:0"
+	const s = server()
+	const job = async s.serve(app)
+	s.close()
+	await job
+	const l = listen("127.0.0.1:0") // Likely on the fd the server's listener had.
+	s.close()
+	const c = dial(`${l.addr}`)
+	l.accept().close()
+	c.close()
+	l.close()
+	// A unix socket's accept, which a shutdown leaves ready but never failing.
+	const dir = makeTempDir("bober-http-")
+	const path = `${dir}/s`
+	const u = server()
+	u.addr = `unix:${path}`
+	const served = async u.serve(app)
+	assert u.addr == `unix:${path}`
+	u.close()
+	await served
+	remove(dir)
+}
+
+test "a header timeout of 0 is none" {
+	const s = server()
+	s.headerTimeout = 0
+	const job = async s.serve(app)
+	const c = new Client()
+	c.headerTimeout = 0
+	assert c.send(new Request("GET", `http://${s.addr}/hello`)).body.text() == "hello"
+	s.close()
+	await job
+}
+
+test "HEAD and redirects" {
+	const s = server()
+	const job = async s.serve(app)
+	const base = `http://${s.addr}`
+	const head = send(new Request("HEAD", `${base}/hello`))
+	assert head.status == 200 && head.headers.get("content-length") == "5" && head.body.text() == ""
+	// A HEAD's empty body keeps the length given, a GET's does not.
+	assert send(new Request("HEAD", `${base}/sized`)).headers.get("content-length") == "1234"
+	assert get(`${base}/sized`).headers.get("content-length") == "0"
+	// A body is closed whether it is sent or not.
+	const before = released
+	assert send(new Request("HEAD", `${base}/held`)).status == 200 && get(`${base}/held-none`).status == 204
+	assert get(`${base}/held`).body.text() == "ab"
+	const res = get(`${base}/a`)
+	assert res.status == 200 && res.body.text() == "hello"
+	const c = new Client()
+	c.maxRedirects = 2
+	assert c.send(new Request("GET", `${base}/loop`)).status == 302
+	assert c.send(new Request("GET", `${base}/far`)) throws new IoError("ConnectionRefused", "dial", "[::1]:1")
+	let hops = 0
+	c.use((req, next) => {
+		hops++
+		return next(req)
+	})
+	assert c.send(new Request("GET", `${base}/a`)).body.text() == "hello" && hops == 2
+	assert send(new Request("PUT", `${base}/moved`, "p")).body.text() == "PUT p"
+	assert send(new Request("POST", `${base}/moved`, "p")).body.text() == "GET "
+	assert send(new Request("PUT", `${base}/see`, "p")).body.text() == "GET "
+	const jar = new Client()
+	jar.use((req, next) => {
+		if (req.url.path == "/to-cookie") {
+			req.headers.set("cookie", "jar=1")
+		}
+		return next(req)
+	})
+	assert jar.send(new Request("GET", `${base}/to-cookie`)).body.text() == "none"
+	const own = new Request("GET", `${base}/to-cookie`)
+	own.headers.set("cookie", "own=1")
+	assert send(own).body.text() == "own=1"
+	s.close()
+	await job
+	assert released == before + 3
+}
+
+test "middleware and upgrades" {
+	const s = server()
+	const job = async s.serve(app)
+	const base = `http://${s.addr}`
+	const c = new Client()
+	c.use((req, next) => {
+		req.headers.set("x-mw", "in")
+		const res = next(req)
+		res.headers.set("x-mw", "out")
+		return res
+	})
+	const res = c.send(new Request("GET", `${base}/echo-x`))
+	assert res.body.text() == "in" && res.headers.get("x-mw") == "out"
+	assert get(`${base}/echo-x`).body.text() == "none"
+	assert c.send(new Request("GET", `${base}/up`)) throws new IoError("Protocol", "read", "101")
+	const ask = new Request("GET", `${base}/up`)
+	ask.headers.set("upgrade", "echo")
+	const up = c.send(ask)
+	assert up.status == 101 && up.headers.get("upgrade") == "echo"
+	const conn = up.stream!
+	assert conn.read(100) == "!"
+	conn.write("ping")
+	assert conn.read(100) == "ping"
+	conn.write("bye")
+	assert conn.read(100) == null
+	conn.close()
+	// A 101 that cannot be written is a 500, and the connection is not handed over.
+	const split = dial(s.addr)
+	split.write("GET /up-split HTTP/1.1\r\nHost: x\r\nUpgrade: echo\r\n\r\n")
+	const refused = split.read(500)!
+	assert refused.slice(0, 13) == "HTTP/1.1 500 " && endsWith(refused, "\r\n\r\n") && split.read(100) == null
+	split.close()
+	// An upgrade's body comes before the new protocol, asked for first when held back.
+	const body = dial(s.addr)
+	body.write("POST /up HTTP/1.1\r\nHost: x\r\nUpgrade: echo\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n")
+	assert body.read(500) == "HTTP/1.1 100 Continue\r\n\r\n"
+	body.write("hello")
+	let got = ""
+	while (!endsWith(got, "!")) {
+		got += body.read(500)!
+	}
+	body.write("ping")
+	assert got.slice(0, 13) == "HTTP/1.1 101 " && body.read(100) == "ping"
+	body.close()
+	// Past maxHeaders of it there is no upgrade, nor a response: the server lingers and closes.
+	let past = "a"
+	while (past.length <= s.maxHeaders) {
+		past += past
+	}
+	const big = dial(s.addr)
+	big.write(`POST /up HTTP/1.1\r\nHost: x\r\nUpgrade: echo\r\nContent-Length: ${past.length}\r\n\r\n${past}`)
+	big.shutdown()
+	assert readAll(big) == ""
+	big.close()
+	s.close()
+	await job
+}
+
+test "https" {
+	const s = server()
+	s.tls = new Config()
+	s.tls.cert = readFile("tests/tls/cert.pem")
+	s.tls.key = readFile("tests/tls/key.pem")
+	const job = async s.serve(app)
+	const base = `https://localhost${s.addr.slice(indexOf(s.addr, ":"), s.addr.length)}`
+	const c = new Client()
+	c.tls.roots = s.tls.cert
+	assert c.send(new Request("GET", `${base}/version`)).body.text() == "HTTP/2"
+	assert c.send(new Request("GET", `${base}/scheme`)).body.text() == "https" && s.conns == 1
+	assert c.send(new Request("GET", `${base}/bye`)).body.text() == "x"
+	const before = released
+	assert c.send(new Request("HEAD", `${base}/held`)).status == 200
+		&& c.send(new Request("GET", `${base}/held-none`)).status == 204 && released == before + 2
+	assert c.send(new Request("GET", `${base}/held`)).body.text() == "ab" && released == before + 3
+	const bad = new Request("GET", `${base}/hello`)
+	bad.headers.set("x", "a\nb")
+	assert c.send(bad) throws new IoError("Protocol", "read", "x: a\nb")
+	const cookies = new Request("GET", `${base}/cookie`)
+	cookies.headers.append("cookie", "a=1")
+	cookies.headers.append("cookie", "b=2")
+	assert c.send(cookies).body.text() == "a=1; b=2"
+	// An upgrade goes over HTTP/1.1, though the origin speaks HTTP/2.
+	const ask = new Request("GET", `${base}/up`)
+	ask.headers.set("upgrade", "echo")
+	const up = c.send(ask)
+	assert up.status == 101 && up.stream!.read(100) == "!"
+	up.stream!.close()
+	// First requests at once all succeed, whichever connection wins.
+	const fresh = new Client()
+	fresh.tls.roots = s.tls.cert
+	for (const j of [1, 2, 3].map(i => async fresh.send(new Request("GET", `${base}/hello`)))) {
+		assert (await j).body.text() == "hello"
+	}
+	s.close()
+	await job
+	// The connection the server ended goes once another connects.
+	const t = server()
+	t.tls = s.tls
+	const next = async t.serve(app)
+	assert c.send(new Request("GET", `https://localhost${t.addr.slice(indexOf(t.addr, ":"), t.addr.length)}/hello`))
+		.body.text() == "hello" && c.h2.length == 1
+	t.close()
+	await next
+}
+
+test "close returns at once, though an HTTP/2 peer reads none of a response" {
+	const s = server()
+	s.tls = new Config()
+	s.tls.cert = readFile("tests/tls/cert.pem")
+	s.tls.key = readFile("tests/tls/key.pem")
+	s.timeout = 0
+	const job = async s.serve(app)
+	const before = released
+	const cfg = new Config()
+	cfg.roots = s.tls.cert
+	cfg.alpn = ["h2"]
+	const t = client(dial(s.addr), "localhost", cfg)
+	// Windows opened wide, so that the server's write parks on the socket.
+	const get: [string, string][] = [[":method", "GET"], [":scheme", "https"], [":authority", "x"], [":path", "/huge"]]
+	t.write("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + frame(4, 0, 0, fromBytes([0, 4, 127, 255, 255, 255]))
+		+ frame(8, 0, 0, fromBytes([127, 0, 0, 0])) + frame(1, 5, 1, new Encoder().encode(get)))
+	let got = 0
+	while (got < 1 << 20) {
+		got += t.read(1 << 16)!.length
+	}
+	s.close()
+	// A stream opened after, refused, though the GOAWAY waits on the write.
+	const after: [string, string][] = [[":method", "GET"], [":scheme", "https"], [":authority", "x"],
+		[":path", "/late"]]
+	t.write(frame(1, 5, 3, new Encoder().encode(after)))
+	while (t.read(1 << 16) != null) {}
+	t.close()
+	await job
+	assert late == 0 && released == before + 1
+}
+
+test "an HTTP/2 server silent after the handshake is not waited for past the client's timeout" {
+	const l = listen("127.0.0.1:0")
+	const cfg = new Config()
+	cfg.cert = readFile("tests/tls/cert.pem")
+	cfg.key = readFile("tests/tls/key.pem")
+	cfg.alpn = ["h2"]
+	const job = async silent(l, cfg)
+	const c = new Client()
+	c.tls.roots = cfg.cert
+	c.timeout = 100 * millisecond
+	let kind = ""
+	try {
+		c.send(new Request("GET", `https://localhost:${l.addr.port}/`))
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	assert kind == "TimedOut"
+	l.close()
+	await job
+}
+
+/// Shakes hands with the one client of l, then reads what it sends, answering nothing, until it ends.
+function silent(l: Listener, cfg: Config) throws IoError {
+	const t = tlsServer(l.accept(), cfg)
+	while (t.read(1 << 16) != null) {}
+	t.close()
+}
+
+/// Writes head to the one client of l, then reads what it sends until it ends or 2 s pass.
+function answer(l: Listener, head: string) throws IoError {
+	const c = l.accept()
+	c.timeout = 2 * second
+	c.write(head)
+	try {
+		while (c.read(1 << 16) != null) {}
+	} catch (e: IoError) {}
+	c.close()
+}
+
+/// The first head an HTTP/2 server on s answers head with, sent as stream 1 with no END_STREAM.
+function h2head(s: Server, head: [string, string][]): [string, string][] throws IoError {
+	const cfg = new Config()
+	cfg.roots = s.tls!.cert
+	cfg.alpn = ["h2"]
+	const t = client(dial(s.addr), "localhost", cfg)
+	t.write("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + frame(4, 0, 0, "") + frame(1, 4, 1, new Encoder().encode(head)))
+	let got = ""
+	let n: i32 = 0
+	while (true) {
+		if (got.length >= 9) {
+			n = num(got, 0, 3) as i32
+			if (got.length >= 9 + n) {
+				if (got[3] == 1 && num(got, 5, 4) == 1) {
+					break
+				}
+				got = got.slice(9 + n, got.length)
+				continue
+			}
+		}
+		got += t.read(1 << 16)!
+	}
+	t.close()
+	return new Decoder().decode(got.slice(9, 9 + n), 1 << 16)
+}
+
+/// An https server to run app on a free port, speaking HTTP/2 alone.
+function h2server(): Server {
+	const s = server()
+	s.tls = new Config()
+	s.tls.cert = readFile("tests/tls/cert.pem")
+	s.tls.key = readFile("tests/tls/key.pem")
+	s.tls.alpn = ["h2"]
+	return s
+}
+
+test "an HTTP/2 request expecting 100 Continue has it before a response that streams, as over HTTP/1.1" {
+	const s = h2server()
+	const job = async s.serve(app)
+	// The first HEADERS on the stream, as the body is held back for it.
+	assert h2head(s, [[":method", "POST"], [":scheme", "https"], [":path", "/echo"], [":authority", "localhost"],
+		["expect", "100-continue"]]) == [[":status", "100"]]
+	s.close()
+	await job
+}
+
+test "an HTTP/2 request has one Host, from :authority or else Host, and is malformed if they differ" {
+	const s = h2server()
+	const job = async s.serve(app)
+	const host = (more: [string, string][]) => h2head(s, [[":method", "GET"], [":scheme", "https"], [":path", "/host"],
+		...more])
+	assert host([[":authority", "localhost"], ["host", "LocalHost"]])[1] == ["x-host", "localhost"]
+	assert host([["host", "localhost"]])[1] == ["x-host", "localhost"]
+	assert host([[":authority", "localhost"], ["host", "evil"]])[0] == [":status", "400"]
+	assert h2head(s, [[":method", "OPTIONS"], [":scheme", "https"], [":path", "*"], [":authority", "localhost"]])[0]
+		== [":status", "200"] // The server's, as app answers 404.
+	assert h2head(s, [[":method", "GET"], [":scheme", "https"], [":path", "*"], [":authority", "localhost"]])[0]
+		== [":status", "400"]
+	s.close()
+	await job
+}
+
+test "an HTTP/2 request's cookie fields are joined in one pass, however many fields come before them" {
+	const s = h2server()
+	s.maxHeaders = 1 << 22
+	const job = async s.serve(app)
+	const head: [string, string][] = [[":method", "GET"], [":scheme", "https"], [":path", "/hello"],
+		[":authority", "localhost"]]
+	for (const _ of 1 ... 8000) {
+		head.push(["a", ""])
+	}
+	for (const _ of 1 ... 2000) {
+		head.push(["cookie", ""])
+	}
+	const start = monotonic()
+	assert h2head(s, head)[0] == [":status", "200"] && monotonic() - start < 100 * millisecond
+	s.close()
+	await job
+}
+
+test "timeouts past what the clock can count are waited out, not up at once" {
+	const s = h2server()
+	const job = async s.serve(app)
+	const c = new Client()
+	c.tls.roots = s.tls!.cert
+	c.connectTimeout = maxOf[i64]()
+	c.timeout = maxOf[i64]()
+	c.headerTimeout = maxOf[i64]()
+	c.idleTimeout = maxOf[i64]()
+	for (const _ of 1 ... 2) {
+		assert c.send(new Request("GET", `https://localhost${s.addr.slice(indexOf(s.addr, ":"), s.addr.length)}/hello`))
+			.body.text() == "hello"
+	}
+	s.close()
+	await job
+}
+
+test "over HTTP/2 a burst of requests to a new origin keeps one connection, those dialled with it closing once done" {
+	const s = h2server()
+	const job = async s.serve(app)
+	const c = new Client()
+	c.tls.roots = s.tls!.cert
+	const url = `https://localhost${s.addr.slice(indexOf(s.addr, ":"), s.addr.length)}/hello`
+	const sends = [1, 2, 3, 4, 5, 6, 7, 8].map(_ => async c.send(new Request("GET", url)).body.text())
+	for (const f of sends) {
+		assert await f == "hello"
+	}
+	// The others end at the server as their GOAWAY comes: waited for a second at most, a read timing out each 10 ms.
+	const never = listen("127.0.0.1:0")
+	const quiet = dial(`${never.addr}`)
+	quiet.timeout = 10 * millisecond
+	for (const _ of 1 ... 100) {
+		if (s.conns == 1) {
+			break
+		}
+		try {
+			quiet.read(1)
+		} catch (e: IoError) {}
+	}
+	quiet.close()
+	never.close()
+	assert c.h2.length == 1 && s.conns == 1
+	s.close()
+	await job
+}
+
+test "closing an https server waits for the HTTP/2 responses in flight to be written" {
+	const s = server()
+	s.tls = new Config()
+	s.tls.cert = readFile("tests/tls/cert.pem")
+	s.tls.key = readFile("tests/tls/key.pem")
+	const started = new Signal()
+	const gate = new Signal()
+	const job = async s.serve(req => {
+		started.wake()
+		gate.wait()
+		return text("late")
+	})
+	const c = new Client()
+	c.tls.roots = s.tls.cert
+	const late = async c.send(new Request("GET",
+		`https://localhost${s.addr.slice(indexOf(s.addr, ":"), s.addr.length)}/`))
+	started.wait()
+	s.close()
+	gate.wake()
+	await job
+	assert s.conns == 0 && (await late).body.text() == "late"
+}
+
+/// Reads t, an HTTP/2 client's connection, up to its request's head and, if sent, its ack of our SETTINGS: all a
+/// request with no body sends, so that closing t does not reset it.
+function untilHead(t: Reader, sent: bool = true) throws IoError {
+	let got = ""
+	let at = 24
+	let seen = 0
+	while (seen < (if (sent) 2 else 1)) {
+		got += t.read(1 << 16)!
+		while (got.length >= at + 9) {
+			const n = num(got, at, 3) as i32
+			if (got.length < at + 9 + n) {
+				break
+			}
+			if (got[at + 3] == 1 || got[at + 3] == 4 && got[at + 4] == 1) {
+				seen++
+			}
+			at += 9 + n
+		}
+	}
+}
+
+test "over HTTP/2 an idempotent request goes again if the connection ends before its response's head, a POST not" {
+	const cfg = new Config()
+	cfg.cert = readFile("tests/tls/cert.pem")
+	cfg.key = readFile("tests/tls/key.pem")
+	cfg.alpn = ["h2"]
+	const c = new Client()
+	c.tls.roots = cfg.cert
+	const head = (fields: [string, string][], flags: u8) => frame(1, flags, 1, new Encoder().encode(fields))
+	// The first connection ends after the request, or after a response's head; the next answers.
+	const cut = head([[":status", "200"], ["content-length", "5"]], 4)
+	for (const [method, first] of [["GET", ""], ["POST", ""], ["GET", cut]]) {
+		const l = listen("127.0.0.1:0")
+		const peer = async (() => {
+			try {
+				for (const answer of [first, head([[":status", "204"]], 5)]) {
+					const t = tlsServer(l.accept(), cfg)
+					t.write(frame(4, 0, 0, ""))
+					untilHead(t)
+					t.write(answer)
+					t.close()
+				}
+			} catch (e: IoError) {}
+		})()
+		let status = 0
+		try {
+			status = c.send(new Request(method, `https://localhost:${l.addr.port}/`)).status
+		} catch (e: IoError) {}
+		assert status == (if (method == "GET" && first == "") 204 else 0)
+		l.close()
+		await peer
+	}
+}
+
+test "over HTTP/2 a response with no body, a HEAD's, a 204 or a 304, ends its stream, though the server does not" {
+	const cfg = new Config()
+	cfg.cert = readFile("tests/tls/cert.pem")
+	cfg.key = readFile("tests/tls/key.pem")
+	cfg.alpn = ["h2"]
+	const cases: [string, i32][] = [["HEAD", 200], ["GET", 204], ["GET", 304]]
+	for (const [method, status] of cases) {
+		const l = listen("127.0.0.1:0")
+		const peer = async (() => {
+			try {
+				const t = tlsServer(l.accept(), cfg)
+				t.write(frame(4, 0, 0, ""))
+				untilHead(t)
+				t.write(frame(1, 4, 1, new Encoder().encode([[":status", `${status}`]])))
+				while (t.read(1 << 16) != null) {}
+			} catch (e: IoError) {}
+		})()
+		const c = new Client()
+		c.tls.roots = cfg.cert
+		assert c.send(new Request(method, `https://localhost:${l.addr.port}/`)).status == status
+			&& c.h2[0][1].streams.size == 0
+		c.h2[0][1].close()
+		l.close()
+		await peer
+	}
+}
+
+test "over HTTP/2 a request goes on a new connection while those open are at the server's limit on streams, or know it not yet" {
+	const cfg = new Config()
+	cfg.cert = readFile("tests/tls/cert.pem")
+	cfg.key = readFile("tests/tls/key.pem")
+	cfg.alpn = ["h2"]
+	const one = frame(4, 0, 0, fromBytes([0, 3, 0, 0, 0, 1])) // SETTINGS_MAX_CONCURRENT_STREAMS 1
+	// The first connection's settings: a limit of 1, or none yet.
+	for (const settings of [one, ""]) {
+		const c = new Client()
+		c.tls.roots = cfg.cert
+		c.timeout = second
+		const l = listen("127.0.0.1:0")
+		const url = `https://localhost:${l.addr.port}/`
+		const ready = new Signal()
+		const done = new Signal()
+		const peer = async (() => {
+			try {
+				const first = tlsServer(l.accept(), cfg)
+				if (settings != "") {
+					first.write(settings)
+				}
+				untilHead(first, settings != "") // Never answered.
+				ready.wake()
+				const next = tlsServer(l.accept(), cfg)
+				next.write(one)
+				untilHead(next)
+				next.write(frame(1, 5, 1, new Encoder().encode([[":status", "204"]])))
+				done.wait()
+				first.close()
+				next.close()
+			} catch (e: IoError) {}
+		})()
+		const held = async (() => {
+			try {
+				c.send(new Request("GET", url))
+			} catch (e: IoError) {}
+		})()
+		ready.wait()
+		const start = monotonic()
+		assert c.send(new Request("GET", url)).status == 204 && monotonic() - start < 500 * millisecond
+		l.close()
+		done.wake()
+		await held
+		await peer
+	}
+}
+
+test "over HTTP/2 a request refused goes again on a new connection, as the server may be at a limit it does not tell" {
+	const cfg = new Config()
+	cfg.cert = readFile("tests/tls/cert.pem")
+	cfg.key = readFile("tests/tls/key.pem")
+	cfg.alpn = ["h2"]
+	const c = new Client()
+	c.tls.roots = cfg.cert
+	c.timeout = second
+	const l = listen("127.0.0.1:0")
+	const done = new Signal()
+	const peer = async (() => {
+		try {
+			const first = tlsServer(l.accept(), cfg)
+			first.write(frame(4, 0, 0, ""))
+			untilHead(first)
+			first.write(frame(3, 0, 1, fromBytes([0, 0, 0, 7]))) // REFUSED_STREAM, then nothing more.
+			const next = tlsServer(l.accept(), cfg)
+			next.write(frame(4, 0, 0, ""))
+			untilHead(next)
+			next.write(frame(1, 5, 1, new Encoder().encode([[":status", "204"]])))
+			done.wait()
+			first.close()
+			next.close()
+		} catch (e: IoError) {}
+	})()
+	const start = monotonic()
+	// The refusing connection, with no stream left that could free it, is closed and dropped.
+	assert c.send(new Request("GET", `https://localhost:${l.addr.port}/`)).status == 204
+		&& monotonic() - start < 500 * millisecond && c.h2.length == 1
+	l.close()
+	done.wake()
+	await peer
+}
+
+test "over HTTP/2 headerTimeout as it is at each request bounds the wait for its head" {
+	const cfg = new Config()
+	cfg.cert = readFile("tests/tls/cert.pem")
+	cfg.key = readFile("tests/tls/key.pem")
+	cfg.alpn = ["h2"]
+	const c = new Client()
+	c.tls.roots = cfg.cert
+	c.timeout = 2 * second
+	const l = listen("127.0.0.1:0")
+	const url = `https://localhost:${l.addr.port}/`
+	// The first request answered, then pings every 20 ms, 50 times at most, the second never.
+	const peer = async (() => {
+		try {
+			const t = tlsServer(l.accept(), cfg)
+			t.write(frame(4, 0, 0, ""))
+			untilHead(t)
+			t.write(frame(1, 5, 1, new Encoder().encode([[":status", "204"]])))
+			t.timeout = 20 * millisecond
+			for (const i of 1 ... 50) {
+				t.write(frame(6, 0, 0, "12345678"))
+				try {
+					while (t.read(1 << 16) != null) {} // Till a read times out.
+				} catch (e: IoError) {}
+			}
+			t.close()
+		} catch (e: IoError) {}
+	})()
+	assert c.send(new Request("GET", url)).status == 204
+	c.headerTimeout = 100 * millisecond
+	const start = monotonic()
+	let kind = ""
+	try {
+		c.send(new Request("GET", url))
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	assert kind == "TimedOut" && monotonic() - start < 500 * millisecond
+	l.close()
+	await peer
+}
+
+test "a TLS handshake the server never answers takes connectTimeout" {
+	const l = listen("127.0.0.1:0")
+	const c = new Client()
+	c.connectTimeout = 100 * millisecond
+	assert c.send(new Request("GET", `https://${l.addr}/`)) throws new IoError("TimedOut", "handshake", "127.0.0.1")
+	l.close()
+}
+
+test "an answer before the whole request body reaches the other side" {
+	let body = "x"
+	while (body.length < 1 << 23) {
+		body += body
+	}
+	// The server reads on past its response what the handler left unread, so that closing does not reset it, and
+	// says it closes, a streamed response too.
+	for (const streams of [false, true]) {
+		const s = server()
+		const job = async s.serve(req => if (streams) new Response(200, new Pieces(["no"])) else text("no"))
+		const c = dial(s.addr)
+		c.write(`POST / HTTP/1.1\r\nHost: x\r\nContent-Length: ${body.length}\r\n\r\n${body}`)
+		const got = readAll(c)
+		assert startsWith(got, "HTTP/1.1 200 ") && indexOf(got, "\r\nconnection: close\r\n") > 0
+			&& endsWith(got, if (streams) "\r\n\r\n2\r\nno\r\n0\r\n\r\n" else "\r\n\r\nno")
+		c.close()
+		s.close()
+		await job
+	}
+	// The client reads one that cut its body short.
+	const l = listen("127.0.0.1:0")
+	const early = async (() => {
+		const c = l.accept()
+		c.read(1000)
+		c.write("HTTP/1.1 413 \r\nContent-Length: 0\r\n\r\n")
+		c.close()
+	})()
+	assert post(`http://${l.addr}/`, body, "text/plain").status == 413
+	await early
+	l.close()
+}
+
+test "a response that comes while the request body goes, as an echo's past what the sockets buffer, is read meanwhile" {
+	let body = "x"
+	while (body.length < 1 << 23) {
+		body += body
+	}
+	const s = server()
+	s.timeout = second
+	const job = async s.serve(app)
+	const c = new Client()
+	c.timeout = second
+	const url = `http://${s.addr}/echo`
+	assert c.send(new Request("POST", url, body)).body.text() == body
+	assert c.send(new Request("POST", url, new Pieces([body]))).body.text() == body
+	s.close()
+	await job
+}
+
+test "headerTimeout counts from the request's end, though its body went past what the sockets buffer" {
+	let body = "x"
+	while (body.length < 1 << 23) {
+		body += body
+	}
+	const l = listen("127.0.0.1:0")
+	const job = async answer(l, "")
+	const c = new Client()
+	c.headerTimeout = 100 * millisecond
+	assert c.send(new Request("POST", `http://${l.addr}/`, body)) throws new IoError("TimedOut", "read", "head")
+	await job
+	l.close()
+}
+
+test "a response is not held back by a request body whose source still waits" {
+	const l = listen("127.0.0.1:0")
+	const job = async answer(l, "HTTP/1.1 403 \r\nContent-Length: 2\r\n\r\nno")
+	const held = new Held()
+	assert send(new Request("POST", `http://${l.addr}/`, held)).status == 403
+	held.gate.wake()
+	await job
+	l.close()
+}
+
+test "over TLS headerTimeout bounds a read begun before the request's end, a part of a record come as it ended" {
+	const l = listen("127.0.0.1:0")
+	const cfg = new Config()
+	cfg.cert = readFile("tests/tls/cert.pem")
+	cfg.key = readFile("tests/tls/key.pem")
+	const held = new Held()
+	const part = () => {
+		const c = l.accept()
+		const t = tlsServer(c, cfg)
+		t.read(1 << 16)
+		held.gate.wake()
+		c.write("\x17\x03\x03") // A record's header, begun.
+		c.timeout = 2 * second
+		try {
+			while (c.read(1 << 16) != null) {}
+		} catch (e: IoError) {}
+		c.close()
+	}
+	const job = async part()
+	const c = new Client()
+	c.tls.roots = cfg.cert
+	c.timeout = second
+	c.headerTimeout = 100 * millisecond
+	const t0 = monotonic()
+	let kind = ""
+	try {
+		c.send(new Request("POST", `https://localhost:${l.addr.port}/`, held))
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	assert kind == "TimedOut" && monotonic() - t0 < 600 * millisecond
+	await job
+	l.close()
+}
+
+test "headerTimeout bounds the head's reads though a byte of it came as the request ended" {
+	const l = listen("127.0.0.1:0")
+	const held = new Held()
+	// The status line, then a header a byte each 50 ms; the request's body ends as the first goes.
+	const drip = () => {
+		const c = l.accept()
+		c.read(1 << 16)
+		c.timeout = 50 * millisecond
+		try {
+			for (const s of ["HTTP/1.1 200 OK\r\n", "x", ":", " ", "y", "\r\n", "\r\n"]) {
+				c.write(s)
+				if (s == "x") {
+					held.gate.wake()
+				}
+				try {
+					c.read(1 << 16)
+				} catch (e: IoError) {}
+			}
+		} catch (e: IoError) {}
+		c.close()
+	}
+	const job = async drip()
+	const c = new Client()
+	c.headerTimeout = 100 * millisecond
+	let kind = ""
+	try {
+		c.send(new Request("POST", `http://${l.addr}/`, held))
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	assert kind == "TimedOut"
+	await job
+	l.close()
+}

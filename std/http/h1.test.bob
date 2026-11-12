@@ -1,0 +1,102 @@
+import { indexOf } from "../algo"
+import { Stream, readAll } from "../io"
+import { Buffered, Framed, readHead } from "./h1"
+
+/// A stream read a line at a time.
+class Lines implements Stream {
+	timeout: i64 = 0
+	private s: string
+
+	constructor(s: string) { this.s = s }
+
+	read(n: i32): string | null throws IoError {
+		if (this.s == "") {
+			return null
+		}
+		const end = indexOf(this.s, "\n") + 1
+		const line = this.s.slice(0, end)
+		this.s = this.s.slice(end, this.s.length)
+		return line
+	}
+
+	write(s: string) throws IoError {}
+	close() throws IoError {}
+}
+
+test "a head is bounded as a whole" {
+	const head = "GET /a-long-enough-request-target-to-matter HTTP/1.1\r\nx-1: a\r\nx-2: b\r\nx-3: c\r\nx-4: d\r\n\r\n"
+	const got = readHead(new Buffered(new Lines(head)), head.length)!
+	assert got[0][1] == "/a-long-enough-request-target-to-matter" && got[1].length == 4
+	assert readHead(new Buffered(new Lines(head)), head.length - 1) throws new IoError("TooLarge", "read", "head")
+}
+
+test "one empty line before the start line is skipped" {
+	assert readHead(new Buffered(new Lines("\r\nGET / HTTP/1.1\r\n\r\n")), 1024)![0] == ["GET", "/", "HTTP/1.1"]
+}
+
+test "a header value is trimmed of blanks alone, not of other controls" {
+	const value = (v: string) => readHead(new Buffered(new Lines(`GET / HTTP/1.1\r\nx:${v}\r\n\r\n`)), 1024)![1][0][1]
+	assert value(" \tchunked \t") == "chunked"
+	for (const v of ["\x0bchunked", "chunked\r"]) {
+		assert value(v) throws new IoError("Protocol", "read", `x:${v}`)
+	}
+}
+
+test "trailers are bounded as a whole" {
+	let body = "0\r\n"
+	for (const _ of 1 ... 2000) {
+		body += "x: y\r\n"
+	}
+	const framed = (s: string) => new Framed(new Buffered(new Lines(s)), null, true, clean => {})
+	assert framed("0\r\nx: y\r\n\r\n").read(1) == null
+	assert framed(body + "\r\n").read(1) throws new IoError("TooLarge", "read", "trailers")
+}
+
+test "a chunk size is hex digits without a sign, then blanks before any extension" {
+	const framed = (s: string) => new Framed(new Buffered(new Lines(s)), null, true, clean => {})
+	for (const l of ["00;x", "0 ;x", "0\t;x", "0 \t"]) {
+		assert framed(`${l}\r\n\r\n`).read(1) == null
+	}
+	for (const l of ["-0", "-0;x", "+0", "0 x"]) {
+		assert framed(`${l}\r\n\r\n`).read(1) throws new IoError("Protocol", "read", l)
+	}
+}
+
+test "a chunked body of mostly framing, as long extensions on tiny chunks, is refused" {
+	const chunks = (ext: i32) => {
+		let x = ""
+		for (const _ of 1 ... ext) {
+			x += "x"
+		}
+		let s = ""
+		for (const _ of 1 ... 20) {
+			s += `1;${x}\r\na\r\n`
+		}
+		return new Framed(new Buffered(new Lines(`${s}0\r\n\r\n`)), null, true, clean => {})
+	}
+	assert readAll(chunks(10)).length == 20
+	assert readAll(chunks(1000)) throws new IoError("Protocol", "read", "chunk")
+}
+
+test "a chunked body fails for good, not read past its error" {
+	const fails = (body: string, what: string) => {
+		const f = new Framed(new Buffered(new Lines(`${body}0\r\n\r\n`)), null, true, clean => {})
+		assert f.read(16) throws new IoError("Protocol", "read", what)
+		assert f.read(16) throws new IoError("Protocol", "read", what)
+		assert !f.done
+	}
+	fails("zz\r\n", "zz")
+	fails("1\r\nab\r\n", "chunk")
+}
+
+test "a chunk's lines end in CRLF alone, and its trailers are fields" {
+	const fails = (body: string, what: string) => {
+		const f = new Framed(new Buffered(new Lines(body)), null, true, clean => {})
+		assert f.read(16) throws new IoError("Protocol", "read", what)
+	}
+	fails("3\nabc\r\n0\r\n\r\n", "line")
+	fails("3\r\nabc\n0\r\n\r\n", "line")
+	fails("3;a\rb\r\nabc\r\n0\r\n\r\n", "3;a\rb")
+	fails("0\r\nx: y\n\r\n", "line")
+	fails("0\r\nx\r\n\r\n", "x")
+}

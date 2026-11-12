@@ -1,0 +1,99 @@
+//! Content-Encoding for std/http: a client middleware for gzip and deflate, and a server one that gzips.
+
+import { startsWith } from "../algo"
+import { Inflater } from "../compress/deflate"
+import { Gunzipper, gzip } from "../compress/gzip"
+import { Body, Handler, Middleware, Request, Response } from "../http"
+import { ParseError, lower, parseInt, replace, split, trim } from "../string"
+
+/// For Client.use: asks for gzip and deflate unless the request says what it accepts or asks for a Range, and
+/// decodes what comes back, x-gzip as gzip, into a body of unknown length, without Content-Encoding and
+/// Content-Length; a response with no body, to a HEAD or a 1xx, 204 or 304, or with part of one, a 206, is left as
+/// it is.
+export function decompress(req: Request, next: Handler): Response throws IoError | ParseError {
+	if (!req.headers.has("accept-encoding") && !req.headers.has("range")) {
+		req.headers.set("accept-encoding", "gzip, deflate")
+	}
+	const res = next(req)
+	const enc = lower(res.headers.get("content-encoding") ?? "")
+	const gz = enc == "gzip" || enc == "x-gzip"
+	const kept = req.method == "HEAD" || res.status < 200 || res.status == 204 || res.status == 206
+		|| res.status == 304 || res.body.length == 0
+	if (!gz && enc != "deflate" || kept) {
+		return res
+	}
+	const out = new Response(res.status)
+	out.body = new Body(if (gz) new Gunzipper(res.body) else new Inflater(res.body, true), null,
+		() => res.close())
+	out.headers = res.headers
+	out.headers.delete("content-encoding")
+	out.headers.delete("content-length")
+	out.stream = res.stream
+	return out
+}
+
+/// Whether a request accepts gzip: names it, or x-gzip, or else *, not with a q of zero in any of its spellings.
+function acceptsGzip(req: Request): bool {
+	const codings = split(req.headers.all("accept-encoding").join(","), ",")
+		.map(t => split(t, ";").map(x => lower(trim(x))))
+	const gzip = codings.filter(p => p[0] == "gzip" || p[0] == "x-gzip")
+	return (if (gzip.length > 0) gzip else codings.filter(p => p[0] == "*")).some(p =>
+		!p.slice(1, p.length).some(q => startsWith(q, "q=") && replace(replace(q, "0", ""), ".", "") == "q="))
+}
+
+class Compressor {
+	private minSize: i32
+
+	constructor(minSize: i32) { this.minSize = minSize }
+
+	handle(req: Request, next: Handler): Response throws IoError | ParseError {
+		const res = next(req)
+		const whole = res.body.whole
+		if (whole == null) {
+			return res
+		}
+		// A HEAD's empty body stands for a GET's of its Content-Length, whose gzipped length is not known; one not a
+		// number is left as it is.
+		const given = if (req.method == "HEAD" && whole == "") res.headers.get("content-length") else null
+		let size = whole.length as i64
+		if (given != null) {
+			try {
+				size = parseInt[i64](given)
+			} catch (e: ParseError) {
+				return res
+			}
+		}
+		if (size < this.minSize || res.status < 200 || res.status == 206 || res.status == 204 || res.status == 304
+			|| res.headers.has("content-encoding")) {
+			return res
+		}
+		// Another response, as the handler may give one it keeps to every request.
+		const out = new Response(res.status, whole)
+		out.headers.entries = [...res.headers.entries]
+		// Gzipped or not as the request accepts, so that a cache keeps the two apart.
+		out.headers.append("vary", "accept-encoding")
+		if (!acceptsGzip(req)) {
+			return out
+		}
+		if (given != null) {
+			out.headers.delete("content-length")
+			out.body.length = null
+		} else {
+			out.body = new Body(gzip(whole))
+		}
+		out.headers.set("content-encoding", "gzip")
+		// The bytes are others now: no range of them, and an ETag only weakly theirs.
+		out.headers.delete("accept-ranges")
+		const etag = out.headers.get("etag")
+		if (etag != null && !startsWith(etag, "W/")) {
+			out.headers.set("etag", `W/${etag}`)
+		}
+		return out
+	}
+}
+
+/// For Router.use: gzips a string body of at least minSize bytes when the request accepts gzip, unless the response
+/// is encoded yet, or partial or bodiless, a 206, 1xx, 204 or 304; one it would gzip varies by Accept-Encoding either
+/// way. The handler's response is left as it is.
+/// A HEAD's empty body counts as its Content-Length says, which is then dropped, so a HEAD has the headers a GET has.
+export function compress(minSize = 1024): Middleware { return new Compressor(minSize).handle }

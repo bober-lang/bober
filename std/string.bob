@@ -160,7 +160,8 @@ export function unquoted(q: string): string {
 	return s
 }
 
-const hex = "0123456789abcdef"
+/// The digits of radixes up to 36, lowercase.
+const digits = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 /// ch as it appears in a bober string literal.
 export function escape(ch: u8): string {
@@ -170,13 +171,14 @@ export function escape(ch: u8): string {
 		case lf: "\\n"
 		case cr: "\\r"
 		case tab: "\\t"
-		default: if (isControl(ch)) `\\x${chr(hex[ch >> 4])}${chr(hex[ch & 15])}` else chr(ch)
+		default: if (isControl(ch)) `\\x${chr(digits[ch >> 4])}${chr(digits[ch & 15])}` else chr(ch)
 	}
 }
 
-/// at is the offending character; for "range", the number's start.
+/// Why a parse failed.
 export class ParseError {
 	kind: "syntax" | "range"
+	/// The offending character; for "range", the start of what is out of range.
 	at: i32
 
 	constructor(kind: "syntax" | "range", at: i32) {
@@ -223,4 +225,21 @@ export function scanInt[T extends Integral = i32](s: string, start: i32 = 0,
 		throw new ParseError("syntax", i)
 	}
 	return [v, i]
+}
+
+/// n in radix 2…36, in lowercase digits.
+export function formatInt[T extends Integral](n: T, radix: i32 = 10): string {
+	assert radix >= 2 && radix <= 36
+	const zero = 0 as T
+	const r = radix as T
+	let s = ""
+	let v = n
+	while (true) {
+		const d = (v % r) as i32
+		s = chr(digits[if (d < 0) -d else d]) + s
+		v = v / r
+		if (v == zero) {
+			return if (n < zero) `-${s}` else s
+		}
+	}
 }

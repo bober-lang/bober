@@ -1,6 +1,8 @@
-import { decode, encode, EncodeError, Name, OmitEmpty, Rest, Skip, Unknown } from "./json"
+import * as encoding from "../encoding"
+import { decode, encode, EncodeError, Mapping, Name, OmitEmpty, Rest, Skip, Unknown } from "./json"
 import { inf, isNaN, nan } from "../math"
 import { ParseError } from "../string"
+import { monotonic, second } from "../time"
 
 class Point {
 	x: i32 = 0
@@ -74,6 +76,21 @@ test "tags rename, omit and skip fields" {
 	assert decode[User](`{"cache": "x"}`) throws new ParseError("syntax", 1)
 }
 
+class Tags {
+	a: i32 @Name["A"] @encoding.Name["x"] = 1
+	b: i32 @encoding.Name["B"] = 2
+	c: i32 @encoding.Skip = 3
+	d: string @encoding.OmitEmpty = ""
+}
+
+test "json's own tags over ../encoding's" {
+	assert encode(new Tags()) == `{"A":1,"B":2}`
+	const t = decode[Tags](`{"A": 4, "B": 5, "d": "x"}`)
+	assert t.a == 4 && t.b == 5 && t.d == "x"
+	assert decode[Tags](`{"x": 4}`) throws new ParseError("syntax", 1)
+	assert decode[Tags](`{"c": 4}`) throws new ParseError("syntax", 1)
+}
+
 test "decode scalars" {
 	assert decode[null]("null") == null
 	assert decode[bool](" true ")
@@ -92,7 +109,7 @@ test "decode classes, arrays and unions" {
 	want.corners[1].x = 3
 	want.corners[1].y = 2.0
 	want.parent = new Shape()
-	want.parent!.name = "p"
+	want.parent.name = "p"
 	want.kind = "closed"
 	assert decode[Shape](`{"corners": [{"x": 1}, {"y": 2, "x": 3}], "parent": {"name": "p"}, "kind": "closed"}`) == want
 	assert decode[Shape](encode(want)) == want
@@ -101,6 +118,8 @@ test "decode classes, arrays and unions" {
 	assert decode[u8[2]]("[1,2]")[1] == 2
 	assert decode[i32 | f64]("1.5") == 1.5
 	assert decode[i32 | f64]("1") instanceof i32
+	assert decode[i8 | u8]("300") throws new ParseError("range", 0)
+	assert decode[Point | null](`{"x": "1"}`) throws new ParseError("syntax", 6)
 }
 
 test "decode is strict" {
@@ -147,4 +166,95 @@ test "rest takes unknown keys" {
 	assert v.rest == [["a", `[1, {"b": null}]`], ["c", `"s"`]]
 	assert encode(v) == `{"x":2,"a":[1, {"b": null}],"c":"s"}`
 	assert decode[Loose](`{"a": [1,]}`) throws new ParseError("syntax", 9)
+	assert decode[Loose](`{"a": true, "b": null, "c": -1.5e400}`).rest == [["a", "true"], ["b", "null"], ["c", "-1.5e400"]]
+	assert decode[Loose](`{"a": nope}`) throws new ParseError("syntax", 7)
+}
+
+class Pkg {
+	deps: [string, [string, i32]][] @Mapping = []
+	modes: ["r" | "w", bool][] @Mapping @Name["m"] = []
+	ids: [i32, string][] @Mapping = []
+}
+
+class Flags {
+	f: [f64, bool][] @Mapping = []
+	b: [bool, i32][] @Mapping = []
+	u: [i32 | string | null, bool][] @Mapping = []
+}
+
+test "a mapping holds an object as its entries" {
+	const p = decode[Pkg](`{"deps": {"b": ["x", 1], "a": ["y", 2]}, "m": {"w": true}}`)
+	assert p.deps == [["b", ["x", 1]], ["a", ["y", 2]]] && p.modes == [["w", true]]
+	assert encode(p) == `{"deps":{"b":["x",1],"a":["y",2]},"m":{"w":true},"ids":{}}`
+	assert decode[Pkg](`{"deps": {}}`).deps == []
+	assert decode[Pkg](`{"deps": {"a": ["x", 1], "a": ["y", 2]}}`) throws new ParseError("syntax", 25)
+	assert decode[Pkg](`{"deps": {"a": ["x", 1], "b": ["y", 2], "a": ["z", 3]}}`) throws new ParseError("syntax", 40)
+	assert decode[Pkg](`{"m": {"x": true}}`) throws new ParseError("syntax", 7)
+	// An integer key is quoted, and only as encode writes it.
+	const ids = decode[Pkg](`{"ids": {"-1": "a", "7": "b"}}`)
+	assert ids.ids == [[-1, "a"], [7, "b"]] && encode(ids) == `{"deps":{},"m":{},"ids":{"-1":"a","7":"b"}}`
+	assert decode[Pkg](`{"ids": {"-0": "a"}}`) throws new ParseError("syntax", 9)
+	assert decode[Pkg](`{"ids": {7: "a"}}`) throws new ParseError("syntax", 9)
+	// So is a float's or a bool's.
+	const flags = decode[Flags](`{"f": {"1.5": true}, "b": {"false": 0}}`)
+	assert flags.f == [[1.5, true]] && flags.b == [[false, 0]]
+		&& encode(flags) == `{"f":{"1.5":true},"b":{"false":0},"u":{}}`
+	// A union's key reads back as the member it was, a string as one unless it reads as another's JSON.
+	flags.u = [[1, true], ["a", false], [null, true], ["\"1\"", false]]
+	const u = decode[Flags](encode(flags)).u
+	assert u == flags.u && u[0][0] instanceof i32 && u[3][0] instanceof string
+	assert decode[Flags](`{"u": {"01": true}}`).u[0][0] == "01"
+	assert decode[Flags](`{"f": {"1.50": true}}`) throws new ParseError("syntax", 7)
+	flags.f = [[inf, true]]
+	assert encode(flags) throws new EncodeError(inf)
+	// Keys sorted to find one twice, in n log n time whatever their hashes: 100000 take a moment.
+	let many = ""
+	for (const i of 1 ... 100000) {
+		many += `${if (i == 1) "" else ","}"${i}": ["x", ${i}]`
+	}
+	assert decode[Pkg](`{"deps": {${many}}}`).deps.length == 100000
+}
+
+class Chain {
+	next: Chain | null = null
+}
+
+function repeat(s: string, n: i32): string {
+	let out = ""
+	for (const _ of 1 ... n) {
+		out += s
+	}
+	return out
+}
+
+test "decode nests at most 128 deep" {
+	// Each level a class and a union, the most stack a level takes, on a fiber's stack.
+	const chain = (n: i32) => repeat(`{"next":`, n) + "null" + repeat("}", n)
+	const job = async decode[Chain](chain(128))
+	assert (await job).next != null
+	assert decode[Chain](chain(129)) throws new ParseError("range", 1024)
+	assert decode[Loose](`{"a":${repeat("[", 10000)}`) throws new ParseError("range", 132)
+	// A member that fails leaves none open.
+	assert decode[(i32[] | string[])[]](`[${repeat(`[1],["a"],`, 200)}[]]`).length == 401
+}
+
+class Add {
+	kind: "add" | "plus" = "add"
+	l: Add | Mul | null = null
+}
+
+class Mul {
+	kind: "mul" | "times" = "mul"
+	l: Add | Mul | null = null
+}
+
+test "union members that fail read 16 times the input for each member at most" {
+	// Add is tried first and fails only at the tag, after its l: each level would read the one below twice.
+	const ops = (n: i32) => repeat(`{"l":`, n) + "null" + repeat(`,"kind":"mul"}`, n)
+	assert (decode[Add | Mul | null](ops(3)) as Mul).l instanceof Mul
+	const start = monotonic()
+	assert decode[Add | Mul | null](ops(20)) throws new ParseError("range", 0)
+	assert monotonic() - start < second
+	// Over 2^31 bytes in all, as 16 times 64 MiB for each of 2 members, the budget does not wrap.
+	assert decode[(i32 | f64)[]]("[1.5]" + repeat(" ", 1 << 26))[0] == 1.5
 }

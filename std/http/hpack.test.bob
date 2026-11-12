@@ -1,0 +1,84 @@
+import * as hex from "../encoding/hex"
+import { Decoder, Encoder } from "./hpack"
+import { ParseError } from "../string"
+
+type Head = [string, string][]
+
+const requests: Head[] = [[[":method", "GET"], [":scheme", "http"], [":path", "/"], [":authority", "www.example.com"]],
+	[[":method", "GET"], [":scheme", "http"], [":path", "/"], [":authority", "www.example.com"],
+	["cache-control", "no-cache"]],
+	[[":method", "GET"], [":scheme", "https"], [":path", "/index.html"], [":authority", "www.example.com"],
+	["custom-key", "custom-value"]]]
+
+const responses: Head[] = [[[":status", "302"], ["cache-control", "private"], ["date", "Mon, 21 Oct 2013 20:13:21 GMT"],
+	["location", "https://www.example.com"]],
+	[[":status", "307"], ["cache-control", "private"], ["date", "Mon, 21 Oct 2013 20:13:21 GMT"],
+	["location", "https://www.example.com"]],
+	[[":status", "200"], ["cache-control", "private"], ["date", "Mon, 21 Oct 2013 20:13:22 GMT"],
+	["location", "https://www.example.com"], ["content-encoding", "gzip"],
+	["set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1"]]]
+
+test "requests, as RFC 7541 C.3 and C.4 code them" {
+	const plain = ["828684410f7777772e6578616d706c652e636f6d", "828684be58086e6f2d6361636865",
+		"828785bf400a637573746f6d2d6b65790c637573746f6d2d76616c7565"]
+	const huffman = ["828684418cf1e3c2e5f23a6ba0ab90f4ff", "828684be5886a8eb10649cbf",
+		"828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf"]
+	const sizes = [57, 110, 164]
+	const e = new Encoder()
+	const d = new Decoder()
+	const dh = new Decoder()
+	for (const i of 0 ... 2) {
+		assert hex.encode(e.encode(requests[i])) == plain[i]
+		assert d.decode(hex.decode(plain[i]), 1 << 16) == requests[i]
+		assert dh.decode(hex.decode(huffman[i]), 1 << 16) == requests[i]
+		assert e.table.size == sizes[i] && d.table.size == sizes[i] && dh.table.size == sizes[i]
+	}
+}
+
+test "responses with a table of 256 bytes, C.5 and C.6" {
+	const plain = ["4803333032580770726976617465611d4d6f6e2c203231204f637420323031332032303a31333a323120474d546e1768747470733a2f2f7777772e6578616d706c652e636f6d",
+		"4803333037c1c0bf",
+		"88c1611d4d6f6e2c203231204f637420323031332032303a31333a323220474d54c05a04677a69707738666f6f3d4153444a4b48514b425a584f5157454f50495541585157454f49553b206d61782d6167653d333630303b2076657273696f6e3d31"]
+	const huffman = ["488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f0b97c8e9ae82ae43d3",
+		"4883640effc1c0bf",
+		"88c16196d07abe941054d444a8200595040b8166e084a62d1bffc05a839bd9ab77ad94e7821dd7f2e6c7b335dfdfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007"]
+	const sizes = [222, 222, 215]
+	const e = new Encoder()
+	e.limit(256)
+	const d = new Decoder()
+	const dh = new Decoder()
+	dh.decode(hex.decode("3fe101"), 100)
+	for (const i of 0 ... 2) {
+		// The size update leads the first block; Set-Cookie, never indexed here, differs from C.5.3.
+		if (i < 2) {
+			assert hex.encode(e.encode(responses[i])) == (if (i == 0) "3fe101" else "") + plain[i]
+		}
+		assert d.decode(hex.decode((if (i == 0) "3fe101" else "") + plain[i]), 1 << 16) == responses[i]
+		assert dh.decode(hex.decode(huffman[i]), 1 << 16) == responses[i]
+		assert d.table.size == sizes[i] && dh.table.size == sizes[i]
+	}
+	assert d.table.cap == 256
+}
+
+test "secrets, limits and malformed blocks" {
+	const e = new Encoder()
+	assert hex.encode(e.encode([["set-cookie", "a"], ["x-secret", "b"]])) == "1f2801614008782d7365637265740162"
+	assert hex.encode(e.encode([["x-secret", "b"], ["authorization", "c"]])) == "be1f080163"
+	// Shrunk to 0 and grown back between blocks, the next tells both.
+	e.limit(0)
+	e.limit(4096)
+	assert hex.encode(e.encode([[":method", "GET"]])) == "203fe11f82"
+	const d = new Decoder()
+	assert d.decode(hex.decode("be"), 100) throws new ParseError("syntax", 1)
+	assert d.decode(hex.decode("3fe21f"), 100) throws new ParseError("syntax", 3)
+	assert d.decode(hex.decode("0a"), 100) throws new ParseError("syntax", 1)
+	assert d.decode(hex.decode("828684"), 10) throws new ParseError("range", 0)
+	// A field costs 32 bytes beyond its name and value, though indexed in a byte.
+	assert d.decode(hex.decode("82"), 41) throws new ParseError("range", 0)
+	assert d.decode(hex.decode("82"), 42) == [[":method", "GET"]]
+	assert d.decode(hex.decode("00ff"), 100) throws new ParseError("syntax", 2)
+}
+
+test "Huffman codes of 26 and 27 bits, 0xd5 and 0xd6" {
+	assert new Decoder().decode(hex.decode("00017887fffff9ffffff17"), 100) == [["x", hex.decode("d5d6")]]
+}

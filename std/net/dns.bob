@@ -1,0 +1,494 @@
+//! Names to IPs from /etc/hosts and the nameservers of /etc/resolv.conf, without the C library.
+
+import { endsWith, indexOf, lastIndexOf, startsWith } from "../algo"
+import { isSpace, hash } from "../ascii"
+import { HashMap } from "../collections/hashmap"
+import { Set } from "../collections/set"
+import { readFile } from "../fs"
+import { Handle, ipText, isIp } from "../../builtin/sys"
+import { min } from "../math"
+import { chr } from "../../builtin/string"
+import { ParseError, lower, parseInt, split } from "../string"
+import { deadline, hour, monotonic, second } from "../time"
+import { bytes } from "../crypto/random"
+
+const A: u16 = 1
+const CNAME: u16 = 5
+const AAAA: u16 = 28
+
+/// A record of an answer.
+class Record {
+	/// Its owner.
+	name: string
+	kind: u16
+	/// In seconds.
+	ttl: i64
+	/// An A's or AAAA's IP, a CNAME's name, else bytes.
+	data: string
+
+	constructor(name: string, kind: u16, ttl: i64, data: string) {
+		this.name = name
+		this.kind = kind
+		this.ttl = ttl
+		this.data = data
+	}
+}
+
+/// A message.
+class Message {
+	id: u16 = 0
+	/// Its response code.
+	rcode = 0
+	truncated = false
+	/// Its first question.
+	name = ""
+	qtype: u16 = 0
+	answers: Record[] = []
+}
+
+/// The IPs of a name and when they expire.
+class Entry {
+	ips: string[]
+	until: i64
+
+	constructor(ips: string[], until: i64) {
+		this.ips = ips
+		this.until = until
+	}
+}
+
+export class Resolver {
+	/// The nameservers, "ip:port", each tried in turn in each of the attempts.
+	servers = ["127.0.0.1:53", "[::1]:53"]
+	/// Names, lowercase, to their IPs, as /etc/hosts gives them.
+	hosts = new HashMap[string, string[]]()
+	/// For each try, in ns; 0 for none.
+	timeout: i64 = 2 * second
+	attempts = 2
+	/// The domains a name with fewer than ndots dots is tried in first, and any other after itself.
+	search: string[] = []
+	ndots = 1
+	private cache = new HashMap[string, Entry]()
+
+	/// The IPs of host, v6 first, or in the order /etc/hosts gives them; an IP as it is. Unless host ends in a dot it
+	/// is tried in each search domain too, and the last failure thrown. by, unless 0, is the monotonic() no try waits
+	/// past.
+	resolve(host: string, by: i64 = 0): string[] throws IoError {
+		const absolute = endsWith(host, ".") && host.length > 1
+		const name = lower(if (absolute) host.slice(0, host.length - 1) else host)
+		if (isIp(name)) {
+			return [name]
+		}
+		// Loopback, whatever the hosts file says (RFC 6761 §6.3).
+		if (name == "localhost" || endsWith(name, ".localhost")) {
+			return ["::1", "127.0.0.1"]
+		}
+		const known = this.hosts.get(name)
+		if (known != null) {
+			return known
+		}
+		const searched = if (absolute) [] else this.search.map(d => `${name}.${d}`)
+		const dots = split(name, ".").length - 1
+		let err: IoError | null = null
+		for (const n of if (dots < this.ndots) [...searched, name] else [name, ...searched]) {
+			try {
+				return this.lookup(n, by)
+			} catch (e: IoError) {
+				err = e
+			}
+		}
+		throw err ?? new IoError("NotFound", "resolve", name)
+	}
+
+	/// The IPs of name from the cache or the servers; a name the wire cannot carry is InvalidInput.
+	private lookup(name: string, by: i64): string[] throws IoError {
+		if (name.length > 253 || split(name, ".").some(l => l == "" || l.length > 63)) {
+			throw new IoError("InvalidInput", "resolve", name)
+		}
+		const hit = this.cache.get(name)
+		if (hit != null && monotonic() < hit.until) {
+			return hit.ips
+		}
+		const qs = [async this.query(name, AAAA, by), async this.query(name, A, by)]
+		const found: string[][] = [[], []]
+		let err: IoError | null = null
+		let ttl = hour
+		for (const _ of qs) {
+			try {
+				const [i, [got, t]] = await ...qs
+				found[i] = got
+				ttl = min(ttl, t)
+			} catch (e: IoError) {
+				err = e
+			}
+		}
+		const ips = [...found[0], ...found[1]]
+		if (ips.length == 0) {
+			throw err ?? new IoError("NotFound", "resolve", name)
+		}
+		// Half an answer, the other query failed rather than found nothing, is not kept: the next lookup asks again.
+		if (ttl > 0 && (err == null || err!.kind == "NotFound")) {
+			if (this.cache.size >= 4096) {
+				this.cache = new HashMap[string, Entry]()
+			}
+			this.cache.set(name, new Entry(ips, monotonic() + ttl))
+		}
+		return ips
+	}
+
+	/// The IPs of type t of name and their least TTL, in ns, from the first server to answer; NotFound at once.
+	private query(name: string, t: u16, by: i64): [string[], i64] throws IoError {
+		const id = bytes(2)
+		const q = encode((id[0] as u16) << 8 | (id[1] as u16), name, t)
+		let err: IoError | null = null
+		for (const _ of 1 ... this.attempts) {
+			for (const server of this.servers) {
+				try {
+					let m = this.exchange(server, q, "udp", by)
+					if (m.truncated) {
+						m = this.exchange(server, q, "tcp", by)
+					}
+					return answers(m, name, t, server)
+				} catch (e: IoError) {
+					if (e.kind == "NotFound") {
+						throw e
+					}
+					err = e
+				}
+			}
+		}
+		throw err ?? new IoError("NotFound", "resolve", name)
+	}
+
+	/// The server's reply to q, over UDP or TCP; a failure is resolve's of server.
+	private exchange(server: string, q: string, net: string, by: i64): Message throws IoError {
+		const [host, port] = address(server)
+		const end = if (this.timeout == 0) by
+			else if (by == 0) deadline(this.timeout) else min(by, deadline(this.timeout))
+		try {
+			const h = Handle.dial(net, host, port as i32, end)
+			try {
+				return reply(h, q, net, end)
+			} finally {
+				h.close()
+			}
+		} catch (e: IoError) {
+			throw new IoError(e.kind, "resolve", server)
+		}
+	}
+}
+
+/// The reply to q over h, by end, where over TCP a message has its length first; a reply with another id or question,
+/// or one that is not DNS, is a stray over UDP, and the server's fault over TCP.
+function reply(h: Handle, q: string, net: string, end: i64): Message throws IoError {
+	h.write(if (net == "tcp") fromBytes([(q.length >> 8) as u8, (q.length & 0xff) as u8]) + q else q, end)
+	const id = ((q[0] as u16) << 8) | (q[1] as u16)
+	while (true) {
+		let raw = exactly(h, if (net == "udp") 4096 else 2, net, end)
+		if (net == "tcp") {
+			raw = exactly(h, ((raw[0] as i32) << 8) | (raw[1] as i32), net, end)
+		}
+		try {
+			const m = decode(raw)
+			// A response, flagged QR, to q: its id and question.
+			if (m.id == id && (raw[2] & 0x80) != 0 && raw.length >= q.length
+				&& raw.slice(12, q.length) == q.slice(12, q.length)) {
+				return m
+			}
+		} catch (e: ParseError) {}
+		if (net == "tcp") {
+			throw new IoError("Protocol", "resolve", "")
+		}
+	}
+}
+
+/// Over UDP the next datagram, of up to n bytes; over TCP n bytes exactly, the server ending first its fault.
+function exactly(h: Handle, n: i32, net: string, end: i64): string throws IoError {
+	let s = ""
+	while (s.length < n) {
+		const got = h.read(n - s.length, end)
+		if (got == null && net == "tcp") {
+			throw new IoError("Protocol", "resolve", "")
+		}
+		s += got ?? ""
+		if (net == "udp") {
+			break
+		}
+	}
+	return s
+}
+
+/// The resolver of /etc/resolv.conf and /etc/hosts, made once per isolate; the defaults if they cannot be read.
+let system: Resolver | null = null
+
+/// The IPs of host as the system's resolver gives them, by as its.
+export function resolve(host: string, by: i64 = 0): string[] throws IoError {
+	if (system == null) {
+		const r = parseResolv(contents("/etc/resolv.conf"))
+		r.hosts = parseHosts(contents("/etc/hosts"))
+		system = r
+	}
+	return system!.resolve(host, by)
+}
+
+/// A resolver of the nameservers, search domains and ndots of resolv.conf; its other options are not read.
+function parseResolv(conf: string): Resolver {
+	const r = new Resolver()
+	const servers: string[] = []
+	for (const line of split(conf, "\n")) {
+		const f = fields(line)
+		if (f.length > 1 && f[0] == "nameserver") {
+			servers.push(if (indexOf(f[1], ":") < 0) `${f[1]}:53` else `[${f[1]}]:53`)
+		} else if (f.length > 0 && (f[0] == "search" || f[0] == "domain")) {
+			// "." is the root, as systemd-resolved writes when there is no domain to search.
+			r.search = f.slice(1, f.length).map(d => lower(if (endsWith(d, ".")) d.slice(0, d.length - 1) else d))
+				.filter(d => d != "")
+		} else if (f.length > 0 && f[0] == "options") {
+			for (const o of f) {
+				if (startsWith(o, "ndots:")) {
+					try {
+						const n = parseInt[i32](o.slice(6, o.length))
+						r.ndots = if (n > 15) 15 else n
+					} catch (e: ParseError) {}
+				}
+			}
+		}
+	}
+	if (servers.length > 0) {
+		r.servers = servers
+	}
+	return r
+}
+
+/// Names, lowercase, to their IPs in the order the lines of hosts give them; a line whose address is not an IP is
+/// skipped.
+function parseHosts(hosts: string): HashMap[string, string[]] {
+	const out = new HashMap[string, string[]]()
+	for (const line of split(hosts, "\n")) {
+		const f = fields(line)
+		for (const name of if (f.length > 1 && isIp(f[0])) f.slice(1, f.length) else []) {
+			const had = out.get(lower(name))
+			out.set(lower(name), if (had == null) [f[0]] else [...had, f[0]])
+		}
+	}
+	return out
+}
+
+/// The query of id for the records of type t of name, recursion desired.
+function encode(id: u16, name: string, t: u16): string {
+	return fromBytes([(id >> 8) as u8, (id & 0xff) as u8, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]) + labels(name)
+		+ fromBytes([(t >> 8) as u8, (t & 0xff) as u8, 0, 1])
+}
+
+/// name as the wire has it: each label after its length, then an empty one.
+function labels(name: string): string {
+	let out = ""
+	for (const l of split(name, ".")) {
+		if (l != "") {
+			out += fromBytes([l.length as u8]) + l
+		}
+	}
+	return out + "\0"
+}
+
+/// The message msg holds, its names decompressed, a truncated one's answers as far as they go; a ParseError at the
+/// first byte that cannot be.
+function decode(msg: string): Message throws ParseError {
+	const d = new Cursor(msg)
+	const m = new Message()
+	m.id = d.int(2) as u16
+	const flags = d.int(2)
+	m.rcode = (flags & 0xf) as i32
+	m.truncated = (flags & 0x200) != 0
+	const qd = d.int(2) as i32
+	const an = d.int(2) as i32
+	d.int(4)
+	for (const i of 1 ... qd) {
+		const name = d.name()
+		const t = d.int(2) as u16
+		d.int(2)
+		if (i == 1) {
+			m.name = name
+			m.qtype = t
+		}
+	}
+	try {
+		for (const _ of 1 ... an) {
+			const name = d.name()
+			const t = d.int(2) as u16
+			d.int(2)
+			const given = d.int(4)
+			const ttl = if (given >= 1 << 31) 0 else given // One with the top bit set is 0 (RFC 2181 §8).
+			const n = d.int(2) as i32
+			if ((t == A && n != 4) || (t == AAAA && n != 16)) {
+				throw new ParseError("syntax", d.at - 2)
+			}
+			const end = d.at + n
+			const data = switch (t) {
+				case A: ipText(d.bytes(4))
+				case AAAA: ipText(d.bytes(16))
+				case CNAME: d.name()
+				default: d.bytes(n)
+			}
+			d.at = end
+			m.answers.push(new Record(name, t, ttl, data))
+		}
+	} catch (e: ParseError) {
+		if (!m.truncated) {
+			throw e
+		}
+	}
+	return m
+}
+
+/// A place in a message, each read past its end a ParseError.
+class Cursor {
+	msg: string
+	at = 0
+
+	constructor(msg: string) { this.msg = msg }
+
+	bytes(n: i32): string throws ParseError {
+		if (n < 0 || this.at + n > this.msg.length) {
+			throw new ParseError("syntax", this.at)
+		}
+		this.at += n
+		return this.msg.slice(this.at - n, this.at)
+	}
+
+	/// A big-endian number of n bytes.
+	int(n: i32): i64 throws ParseError {
+		let v: i64 = 0
+		for (const b of this.bytes(n)) {
+			v = (v << 8) | (b as i64)
+		}
+		return v
+	}
+
+	/// A name of at most 255 bytes on the wire, following at most 127 pointers, one per label it can have, each of which
+	/// may point only before the labels it ends.
+	name(): string throws ParseError {
+		let out = ""
+		let at = this.at
+		let base = at
+		let after = -1
+		let hops = 0
+		while (true) {
+			if (at >= this.msg.length) {
+				throw new ParseError("syntax", at)
+			}
+			const n = this.msg[at] as i32
+			if (n >= 0xc0) {
+				if (at + 1 >= this.msg.length) {
+					throw new ParseError("syntax", at)
+				}
+				const to = ((n & 0x3f) << 8) | (this.msg[at + 1] as i32)
+				hops += 1
+				if (to >= base || hops > 127) {
+					throw new ParseError("syntax", at)
+				}
+				if (after < 0) {
+					after = at + 2
+				}
+				at = to
+				base = to
+			} else if (n == 0) {
+				this.at = if (after < 0) at + 1 else after
+				return out
+			} else {
+				if (n >= 0x40 || at + 1 + n > this.msg.length) {
+					throw new ParseError("syntax", at)
+				}
+				out += (if (out == "") "" else ".") + this.msg.slice(at + 1, at + 1 + n)
+				if (out.length > 253) {
+					throw new ParseError("syntax", at)
+				}
+				at += 1 + n
+			}
+		}
+	}
+}
+
+/// The IPs of type t for name in m, following CNAMEs, and their least TTL in ns, at most an hour; none is NotFound,
+/// an error code Protocol.
+function answers(m: Message, name: string, t: u16, server: string): [string[], i64] throws IoError {
+	if (m.rcode != 0 && m.rcode != 3) {
+		throw new IoError("Protocol", "resolve", server)
+	}
+	// The chain's names whatever their order, as a server may list an address before the CNAME to it; a loop ends.
+	const alias = new HashMap[string, string]()
+	for (const r of m.answers) {
+		if (r.kind == CNAME) {
+			alias.set(lower(r.name), lower(r.data))
+		}
+	}
+	const chain = new Set()
+	let owner: string | null = name
+	while (owner != null && !chain.has(owner)) {
+		chain.add(owner)
+		owner = alias.get(owner)
+	}
+	const ips: string[] = []
+	let ttl = hour
+	for (const r of m.answers) {
+		if (!chain.has(lower(r.name))) {
+			continue
+		}
+		if (r.kind == t) {
+			ips.push(r.data)
+		}
+		ttl = min(ttl, r.ttl * second)
+	}
+	if (ips.length == 0) {
+		throw new IoError("NotFound", "resolve", name)
+	}
+	return [ips, ttl]
+}
+
+/// The IP and port of a server's "ip:port", or "[v6]:port".
+function address(server: string): [string, u16] throws IoError {
+	const colon = lastIndexOf(server, ":")
+	if (colon > 0) {
+		let host = server.slice(0, colon)
+		if (startsWith(host, "[")) {
+			host = host.slice(1, host.length - 1)
+		}
+		try {
+			const port = parseInt[u16](server.slice(colon + 1, server.length))
+			if (isIp(host)) {
+				return [host, port]
+			}
+		} catch (e: ParseError) {}
+	}
+	throw new IoError("InvalidInput", "resolve", server)
+}
+
+/// The words of line before any #.
+function fields(line: string): string[] {
+	const out: string[] = []
+	let word = ""
+	for (const c of line) {
+		if (c == hash) {
+			break
+		}
+		if (!isSpace(c)) {
+			word += chr(c)
+		} else if (word != "") {
+			out.push(word)
+			word = ""
+		}
+	}
+	if (word != "") {
+		out.push(word)
+	}
+	return out
+}
+
+/// What path holds, or nothing if it cannot be read.
+function contents(path: string): string {
+	try {
+		return readFile(path)
+	} catch (e: IoError) {
+		return ""
+	}
+}

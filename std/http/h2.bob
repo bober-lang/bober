@@ -1,0 +1,1056 @@
+//! HTTP/2 (RFC 9113) on a TLS connection, for std/http: a Conn carries many requests at once, each a stream.
+
+import { startsWith } from "../algo"
+import { Signal } from "../../builtin/fiber"
+import { isDigit, zero } from "../ascii"
+import { HashMap } from "../collections/hashmap"
+import { ReadCloser, Reader } from "../io"
+import { max, min } from "../math"
+import { ParseError, lower, parseInt } from "../string"
+import { deadline, monotonic, second } from "../time"
+import * as tls from "../tls"
+import { Buffered, isTarget, isToken, isValue } from "./h1"
+import { Decoder, Encoder } from "./hpack"
+
+export type Head = [string, string][]
+/// What a server answers a request's head and body with, the body null if it ended with the head: the response's
+/// head and body, null for none, closed once sent or abandoned.
+export type Handle = (head: Head, body: Body | null) => [Head, ReadCloser | null] throws IoError
+
+const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+/// The initial window, and ours of a stream and of the connection.
+const initial: i64 = 65535
+const streamWindow: i64 = 4 << 20
+const connWindow: i64 = 16 << 20
+// Frame types, flags, error codes and settings.
+const data: u8 = 0
+const headers: u8 = 1
+const priority: u8 = 2
+const rst: u8 = 3
+const settings: u8 = 4
+const pushPromise: u8 = 5
+const ping: u8 = 6
+const goaway: u8 = 7
+const update: u8 = 8
+const continuation: u8 = 9
+const endStream: u8 = 1
+const ack: u8 = 1
+const endHeaders: u8 = 4
+const padded: u8 = 8
+const prioritized: u8 = 32
+const protocolError: i64 = 1
+const internalError: i64 = 2
+const flowError: i64 = 3
+const streamClosed: i64 = 5
+const sizeError: i64 = 6
+const refused: i64 = 7
+const cancel: i64 = 8
+const compressionError: i64 = 9
+const calm: i64 = 11
+const headerTableSize: i64 = 1
+const enablePush: i64 = 2
+const maxConcurrentStreams: i64 = 3
+const initialWindowSize: i64 = 4
+const maxFrameSize: i64 = 5
+const maxHeaderListSize: i64 = 6
+/// Headers of the connection, which HTTP/2 forbids (RFC 9113 §8.2.2).
+const hop = ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"]
+const pseudos = [":method", ":scheme", ":authority", ":path", ":status"]
+
+/// One request and its response.
+class Stream {
+	readonly id: i64
+	/// The peer's head, once it has come.
+	head: Head | null = null
+	/// Whether the peer's half has ended, and the fault that ended the stream, if one did.
+	ended = false
+	failed: IoError | null = null
+	/// Whether our half has ended; when we last sent on it, opened a window for it or began to read it, the turn the
+	/// peer's, and our writes on it waiting or going, which keep the turn ours: only a timeout counting from before
+	/// since, with none, is the peer's; the Content-Length of our head, which our body must match.
+	sent = false
+	since: i64 = 0
+	writes = 0
+	promised: i64 | null = null
+	/// Whether our writer waits for a window.
+	parked = false
+	/// Bytes received and unread, the Content-Length expected, the bytes had, and whether a reader waits for more.
+	buf = ""
+	length: i64 | null = null
+	got: i64 = 0
+	reading = false
+	/// Whether a HEAD's response is expected, which has no body whatever its Content-Length says.
+	bare = false
+	/// The send window; what the receive window has left, and what was read but not yet credited.
+	window: i64
+	left = streamWindow
+	used: i64 = 0
+	/// Whether the peer waits for 100 Continue before the body, which the first read asks for.
+	expect = false
+	/// When a client's final head is due, once our half has ended; 0 for never.
+	by: i64 = 0
+	/// Woken on any of these changing.
+	changed = new Signal()
+
+	constructor(id: i64, window: i64) {
+		this.id = id
+		this.window = window
+	}
+}
+
+export class Conn {
+	/// For each write, for the peer's preface, for a head's block from its first frame to its last, and while a stream
+	/// is open, or a client is let open none, for the peer to move one on with DATA, a head, or a window a write waits
+	/// for, whatever else it sends: past it, once no stream has moved, the streams waiting on the peer are reset, the
+	/// connection failing if all are. Handlers and readers slower are waited for. The socket's at first, as a client's
+	/// reads begin at once.
+	timeout: i64
+	/// From the last stream's end, or the start, to the next stream, whatever else the peer sends meanwhile.
+	idleTimeout: i64 = 60 * second
+	/// For a client's final head from its request's end, checked as frames come, past which its stream alone is reset
+	/// and the request TimedOut; 0 for none.
+	headTimeout: i64 = 0
+	/// Of a head's names and values together, and of its encoded block.
+	maxHeaders: i64
+	/// Streams the peer may have open, or being answered, at once on a server, past which it refuses them; a client
+	/// waits for the server's.
+	maxStreams = 100
+	/// Once GOAWAY was sent or received, or the connection failed: no stream can be opened.
+	closed = false
+	/// Once the peer's settings came: till then its limit on streams is unknown.
+	settled = false
+	private s: tls.Conn
+	private server: bool
+	private b: Buffered
+	private streams = new HashMap[i64, Stream]()
+	/// The next id to open, and the highest the peer opened.
+	private next: i64 = 1
+	private last: i64 = 0
+	/// The send window, and what the receive window has left.
+	private window = initial
+	private left = connWindow
+	/// The peer's settings.
+	private peerWindow = initial
+	private peerFrame: i64 = 16384
+	private peerStreams: i64 = 1 << 30
+	/// Whether the peer refused a stream since it last ended one, as at a limit of its own it does not tell.
+	private refusing = false
+	private enc = new Encoder()
+	private dec = new Decoder()
+	/// One write at a time, and the fibers waiting for it.
+	private writing = false
+	private queued = 0
+	private wrote = new Signal()
+	/// Woken as a window opens, a stream closes or a fiber ends.
+	private flow = new Signal()
+	/// Fibers answering or uploading.
+	private busy = 0
+	/// A head's block across CONTINUATION frames.
+	private block = ""
+	private blockId: i64 = 0
+	private blockEnd = false
+	private failed: IoError | null = null
+	/// When the connection last went busy, a stream ended, or, while one was open, a HEADERS, CONTINUATION, or DATA
+	/// with bytes or END_STREAM came; at first, the start.
+	private quiet = monotonic()
+
+	/// Over s, closed as the connection ends; a client's SETTINGS, maxHeaders among them, go at once and its reads on a
+	/// fiber of its own from here on; a server's reads in serve.
+	constructor(s: tls.Conn, server: bool, maxHeaders: i64 = 1 << 16) throws IoError {
+		this.s = s
+		this.timeout = s.timeout
+		this.server = server
+		this.maxHeaders = maxHeaders
+		this.b = new Buffered(s)
+		if (!server) {
+			this.send(preface + this.ours())
+			const job = async this.run(null)
+		}
+	}
+
+	/// A request's response: its head and body. Waits for a stream while the peer has as many open as it allows.
+	request(head: Head, body: Reader | null): [Head, Body] throws IoError {
+		// The id is taken with the lock: a HEADERS must follow those of lower ids.
+		while (!this.closed && (this.writing || this.streams.size >= this.peerStreams)) {
+			if (this.writing) {
+				this.wrote.wait()
+			} else {
+				this.flow.wait()
+			}
+		}
+		if (this.closed) {
+			// Nothing sent: the request may go again elsewhere, unless the peer let none go for the timeout.
+			const e = this.failed
+			throw if (e != null && e.kind == "TimedOut" && this.peerStreams == 0) e
+				else new IoError("ConnectionReset", "write", "goaway")
+		}
+		this.writing = true
+		const st = new Stream(this.next, this.peerWindow)
+		st.writes++ // Its head's, the lock taken above as take would.
+		this.next += 2
+		const idle = this.streams.size == 0
+		this.streams.set(st.id, st)
+		st.bare = head.some(p => p[0] == ":method" && p[1] == "HEAD")
+		this.head(st, head, body == null)
+		if (idle) {
+			this.quiet = monotonic() // After the head, which may end the request: the peer has a whole timeout after.
+		}
+		if (this.next > 0x7fffffff) {
+			this.close() // Ids run out: requests go on a new connection (RFC 9113 §5.1.1).
+		}
+		if (body != null) {
+			const job = async this.upload(st, body)
+		}
+		while (st.failed == null && (st.head == null || interim(st.head!))) {
+			st.changed.wait()
+		}
+		if (st.head == null || interim(st.head!)) {
+			throw st.failed!
+		}
+		return [st.head!, new Body(this, st)]
+	}
+
+	/// Serves the peer's requests through handle, each on a fiber of its own, until the connection ends and s is
+	/// closed.
+	serve(handle: Handle) { this.run(handle) }
+
+	/// Whether a request would have a stream at once: the connection open, its peer's limit known and not reached,
+	/// nor one of its own.
+	free(): bool { return this.settled && !this.refusing && !this.closed && this.streams.size < this.peerStreams }
+
+	/// Tells the peer no more streams will be taken; the connection ends once those open have.
+	close() {
+		if (!this.closed) {
+			this.maxStreams = 0 // None taken from here on, though the GOAWAY may wait on a write.
+			this.bye(0)
+			this.idle()
+		}
+	}
+
+	/// Resets st with code, unless it has ended, failing it with e.
+	reset(st: Stream, code: i64, e: IoError = new IoError("ConnectionReset", "read", "reset")) {
+		if (st.failed != null || st.ended && st.sent) {
+			return
+		}
+		try {
+			this.send(frame(rst, 0, st.id, big(code, 4)))
+		} catch (e: IoError) {}
+		this.kill(st, e)
+	}
+
+	/// Credits n bytes read of st's body to its window, once half of it is used, and to the connection's.
+	credit(st: Stream, n: i32) {
+		st.used += n
+		if (st.used >= streamWindow / 2 && !st.ended) {
+			// Counted before the write, which another credit may wait for: no byte is announced twice.
+			const k = st.used
+			st.left += k
+			st.used = 0
+			try {
+				this.send(frame(update, 0, st.id, big(k, 4)), st)
+			} catch (e: IoError) {}
+		}
+		this.grant()
+	}
+
+	/// Writes 100 Continue on st, once, if the peer waits for it: nothing of the body came, and no head went.
+	proceed(st: Stream) throws IoError {
+		if (st.expect && st.got == 0) {
+			this.take(st)
+			if (st.expect) {
+				this.head(st, [[":status", "100"]], false)
+			} else {
+				st.writes-- // The response's head went first.
+				this.writing = false
+				this.wrote.wake()
+			}
+		}
+	}
+
+	/// Reads frames until the connection ends, then fails what is open, and closes the socket once no fiber writes.
+	private run(handle: Handle | null) {
+		let e: IoError | null = null
+		try {
+			if (handle != null) {
+				this.send(this.ours())
+			}
+			this.loop(handle)
+		} catch (err: IoError) {
+			e = err
+			if (err.kind == "TimedOut") {
+				this.bye(0) // Idle, or a stream stuck: the peer learns which were never taken.
+			}
+		}
+		this.fail(e ?? new IoError("ConnectionReset", "read", "closed"))
+		while (this.busy > 0) {
+			this.flow.wait()
+		}
+		try {
+			this.s.close()
+		} catch (e: IoError) {}
+	}
+
+	/// Reads frames until the peer ends the connection; a fault of the peer's is thrown, GOAWAY sent.
+	private loop(handle: Handle | null) throws IoError {
+		let first = true
+		let began: i64 = 0 // When the last HEADERS came, which a block in progress began with.
+		while (true) {
+			// A head overdue resets its stream alone, though frames for others keep the connection going.
+			const t0 = monotonic()
+			for (const st of if (this.headTimeout == 0) [] else this.streams.values()) {
+				if (st.by != 0 && st.by <= t0 && (st.head == null || interim(st.head!))) {
+					this.reset(st, cancel, new IoError("TimedOut", "read", "head"))
+				}
+			}
+			const idle = this.streams.size == 0
+			const block = this.blockId != 0
+			// The peer's preface is waited on, as for a stream, and so is the peer by a client it lets open no stream.
+			const lazy = idle && !block && !first && (this.server || this.peerStreams > 0)
+			const t = if (lazy) this.idleTimeout else this.timeout
+			const since = if (block) began else this.quiet
+			const end = deadline(t, since)
+			// A client idling parks a timeout at most, so that a stream it opens meanwhile soon has its own.
+			const each = if (lazy && !this.server) deadline(this.timeout) else 0
+			this.s.timeout = t
+			this.b.deadline = if (end == 0 || each != 0 && each < end) each else end
+			let more = false
+			try {
+				more = this.b.pending() || this.b.fill() // Only the wait for a frame is retried, so nothing read is lost.
+				if (more && this.b.deadline != 0 && monotonic() >= this.b.deadline) {
+					// Frames that keep coming do not put the deadline off; only those that refresh quiet move it.
+					throw new IoError("TimedOut", "read", "frames")
+				}
+			} catch (e: IoError) {
+				// Retried, unless a head's block is half come, if streams opened meanwhile or a client's idle time is
+				// not up. Else those waiting on the peer since before the wait began, as fibers may move quiet
+				// meanwhile, for bytes a read waits on (none unread, our window open) or a client's final head once
+				// its request went whole (a server's stream opens with its head), or with a write parked on a window
+				// still shut, are reset alone, as a late head is; if every stream waits, the peer is gone and the
+				// connection fails. The timeout then counts from the oldest wait left, or afresh if none is.
+				const waiting = this.streams.values().filter(st => st.writes == 0
+					&& (st.parked && (st.window <= 0 || this.window <= 0)
+					|| !st.ended && st.buf.length == 0 && this.left > 0
+						&& (st.reading || st.sent && (st.head == null || interim(st.head!)))))
+				const stuck = waiting.filter(st => st.since <= since)
+				const up = if (idle) this.streams.size == 0 && this.b.deadline == end
+					else stuck.length > 0 && stuck.length == this.streams.size
+				if (e.kind != "TimedOut" || block || up) {
+					throw e
+				}
+				if (!idle) {
+					let next = monotonic()
+					for (const st of waiting) {
+						if (st.since > since) {
+							next = min(next, st.since)
+						}
+					}
+					const quiet = max(this.quiet, next) // Set after the resets, which stamp it.
+					for (const st of stuck) {
+						this.reset(st, cancel, new IoError("TimedOut", "read", "stream"))
+					}
+					this.quiet = quiet
+				}
+				continue
+			}
+			if (!more) {
+				return
+			}
+			// A frame begun has a whole timeout to come whole, or none.
+			this.s.timeout = this.timeout
+			this.b.deadline = deadline(this.timeout)
+			if (first && handle != null && this.exact(preface.length) != preface) {
+				throw this.fault(protocolError, "preface")
+			}
+			const h = this.exact(9)
+			const n = num(h, 0, 3)
+			const kind = h[3]
+			const flags = h[4]
+			const id = num(h, 5, 4) & 0x7fffffff
+			if (n > 16384) {
+				throw this.fault(sizeError, "frame")
+			}
+			const p = this.exact(n as i32)
+			const cont = kind == continuation
+			if (first && kind != settings || cont != (this.blockId != 0) || cont && id != this.blockId) {
+				throw this.fault(protocolError, "frame")
+			}
+			// DATA, HEADERS, PRIORITY and RST_STREAM are a stream's, SETTINGS, PING and GOAWAY the connection's; DATA,
+			// RST_STREAM and WINDOW_UPDATE are a fault on a stream not yet opened, as is HEADERS a client gets (RFC
+			// 9113 §5.1): ours from next on, any of a server's, push being off, a client's past last unless past a
+			// GOAWAY, which leaves those refused uncounted.
+			const unopened = if ((id % 2 == 0) == this.server) id >= this.next
+				else if (this.server) !this.closed && id > this.last else id != 0
+			if (kind <= rst && id == 0 || (kind == settings || kind == ping || kind == goaway) && id != 0
+				|| (kind == data || kind == rst || kind == update || kind == headers && !this.server) && unopened) {
+				throw this.fault(protocolError, "stream")
+			}
+			first = false
+			const st = this.streams.get(id)
+			// Whether the frame moves a stream on: a head's block, which began bounds, or DATA with bytes or
+			// END_STREAM; others leave quiet be. A writer a WINDOW_UPDATE lets send is not waiting, though yet to run,
+			// and its write sets its since past quiet.
+			let progress = kind == headers || cont
+			switch (kind) {
+				case data:
+					this.left -= n
+					if (this.left < 0) {
+						throw this.fault(flowError, "window")
+					}
+					if (st != null && st.failed == null) {
+						const d = this.unpad(p, flags)
+						progress = d.length > 0 || (flags & endStream) != 0
+						this.received(st, d, n, (flags & endStream) != 0)
+					}
+					this.grant() // Bytes not held, as of a stream gone, are free at once.
+				case headers:
+					began = monotonic()
+					let f = this.unpad(p, flags)
+					if ((flags & prioritized) != 0) {
+						this.depends(id, f)
+						f = f.slice(5, f.length)
+					}
+					this.fragment(id, f, flags, (flags & endStream) != 0, handle)
+				case priority:
+					this.depends(id, if (n == 5) p else "") // One of any other size is short.
+				case continuation:
+					this.fragment(id, p, flags, this.blockEnd, handle)
+				case rst:
+					if (n != 4) {
+						throw this.fault(sizeError, "reset")
+					}
+					if (st != null) {
+						const code = num(p, 0, 4)
+						this.refusing = !this.server && code == refused
+						this.kill(st, new IoError("ConnectionReset", "read", `reset ${code}`))
+					}
+				case settings:
+					// Its ACK empty.
+					if (n % 6 != 0 || (flags & ack) != 0 && n != 0) {
+						throw this.fault(sizeError, "settings")
+					}
+					if ((flags & ack) == 0) {
+						this.apply(p)
+						this.send(frame(settings, ack, 0, ""))
+					}
+				case pushPromise: throw this.fault(protocolError, "push")
+				case ping:
+					if (n != 8) {
+						throw this.fault(sizeError, "ping")
+					}
+					if ((flags & ack) == 0) {
+						this.send(frame(ping, ack, 0, p))
+					}
+				case goaway:
+					if (n < 8) {
+						throw this.fault(sizeError, "goaway")
+					}
+					this.closed = true
+					const kept = num(p, 0, 4) & 0x7fffffff
+					for (const st of this.streams.values()) {
+						if (st.id > kept && !this.server) {
+							this.kill(st, new IoError("ConnectionReset", "write", "goaway"))
+						}
+					}
+					this.flow.wake()
+					this.idle()
+				case update:
+					// An increment of 0 is a protocol error, a window past 2^31-1 a flow control error.
+					if (n != 4) {
+						throw this.fault(sizeError, "window")
+					}
+					const inc = num(p, 0, 4) & 0x7fffffff
+					const code = if (inc == 0) protocolError else flowError
+					if (id == 0) {
+						this.window += inc
+						if (inc == 0 || this.window > 0x7fffffff) {
+							throw this.fault(code, "window")
+						}
+					} else if (st != null) {
+						st.window += inc
+						if (inc == 0 || st.window > 0x7fffffff) {
+							this.reset(st, code)
+						}
+					}
+					this.flow.wake()
+			} // Types unknown pass.
+			if (this.streams.size > 0 && progress) {
+				this.quiet = monotonic()
+			}
+		}
+	}
+
+	/// Checks a priority p starts with, ignored but for its size and a stream depending on itself (RFC 9113 §6.3,
+	/// §5.3.1): faults the connection, as a stream's error may (§5.4.1), the stream maybe idle, where no RST_STREAM may
+	/// go (§6.4).
+	private depends(id: i64, p: string) throws IoError {
+		if (p.length < 5) {
+			throw this.fault(sizeError, "priority")
+		}
+		if ((num(p, 0, 4) & 0x7fffffff) == id) {
+			throw this.fault(protocolError, "priority")
+		}
+	}
+
+	/// The peer's settings in p.
+	private apply(p: string) throws IoError {
+		let i = 0
+		while (i < p.length) {
+			const v = num(p, i + 2, 4)
+			switch (num(p, i, 2)) {
+				case headerTableSize: this.enc.limit(v)
+				case maxConcurrentStreams: this.peerStreams = v
+				case enablePush:
+					// Push enabled by a server, too (RFC 9113 §6.5.2).
+					if (v > 1 || v == 1 && !this.server) {
+						throw this.fault(protocolError, "settings")
+					}
+				case initialWindowSize:
+					if (v > 0x7fffffff) {
+						throw this.fault(flowError, "settings")
+					}
+					// As is a stream window it takes past 2^31-1 (RFC 9113 §6.9.2).
+					for (const st of this.streams.values()) {
+						st.window += v - this.peerWindow
+						if (st.window > 0x7fffffff) {
+							throw this.fault(flowError, "settings")
+						}
+					}
+					this.peerWindow = v
+				case maxFrameSize:
+					if (v < 16384 || v > 16777215) {
+						throw this.fault(protocolError, "settings")
+					}
+					this.peerFrame = v
+			}
+			i += 6
+		}
+		this.settled = true
+		this.flow.wake()
+	}
+
+	/// Our settings: no push, maxStreams, a stream's window, and maxHeaders as the advised bound on a head; then the
+	/// connection's window opened to ours.
+	private ours(): string {
+		const set = (id: i64, v: i64) => big(id, 2) + big(v, 4)
+		return frame(settings, 0, 0, set(enablePush, 0) + set(maxConcurrentStreams, this.maxStreams)
+			+ set(initialWindowSize, streamWindow) + set(maxHeaderListSize, this.maxHeaders))
+			+ frame(update, 0, 0, big(connWindow - initial, 4))
+	}
+
+	/// Opens the connection's window again once half its room is free, not left to the peer: the room is connWindow
+	/// less, on a server, what open streams hold unread, so that stays within it.
+	private grant() {
+		if (this.failed != null) {
+			return // Else fail() could wait on a stuck write to announce a window no one will use.
+		}
+		let held: i64 = 0
+		for (const st of this.streams.values()) {
+			held += st.buf.length
+		}
+		const room = connWindow - (if (this.server) held else 0)
+		const k = room - this.left
+		if (k > 0 && k >= room / 2) {
+			this.left += k // Counted before the write, as credit does.
+			try {
+				this.send(frame(update, 0, 0, big(k, 4)))
+				const now = monotonic()
+				for (const st of this.streams.values()) {
+					st.since = now
+				}
+			} catch (e: IoError) {}
+		}
+	}
+
+	/// A DATA frame's payload p for st, of n bytes with its padding; one before a final head resets st (RFC 9113
+	/// §8.1.1).
+	private received(st: Stream, p: string, n: i64, end: bool) throws IoError {
+		const head = st.head
+		st.left -= n
+		st.got += p.length
+		const length = st.length
+		if (head == null || st.ended || interim(head) || st.left < 0
+			|| length != null && (st.got > length || end && st.got != length)) {
+			this.reset(st, if (st.ended) streamClosed else if (st.left < 0) flowError else protocolError)
+			return
+		}
+		st.buf += p
+		this.ended(st, end)
+		if (n > p.length) {
+			this.credit(st, (n - p.length) as i32) // The padding, as if read: a frame of padding alone has no reader.
+		}
+	}
+
+	/// A HEADERS or CONTINUATION frame's fragment f of the block of stream id.
+	private fragment(id: i64, f: string, flags: u8, end: bool, handle: Handle | null) throws IoError {
+		if (this.block.length + f.length > this.maxHeaders) {
+			throw this.fault(calm, "headers")
+		}
+		this.block += f
+		if ((flags & endHeaders) == 0) {
+			this.blockId = id
+			this.blockEnd = end
+			return
+		}
+		const block = this.block
+		this.block = ""
+		this.blockId = 0
+		let head: Head = []
+		try {
+			head = this.dec.decode(block, this.maxHeaders)
+		} catch (e: ParseError) {
+			throw this.fault(if (e.kind == "range") calm else compressionError, "headers")
+		}
+		const st = this.streams.get(id)
+		const had = if (st == null) null else st.head
+		if (st != null && had != null) {
+			// A client's interim response, which the final one follows; else trailers, dropped, which must end the
+			// stream as DATA would and hold no pseudo-header, or past its end are refused as DATA is.
+			if (!this.server && interim(had)) {
+				this.accept(st, head, end)
+			} else if (st.ended || end && !head.some(p => startsWith(p[0], ":"))) {
+				this.received(st, "", 0, true)
+			} else {
+				this.reset(st, protocolError)
+			}
+		} else if (!this.server) {
+			if (st != null) {
+				this.accept(st, head, end)
+			}
+		} else if (id % 2 == 0) {
+			throw this.fault(protocolError, "stream")
+		} else if (id <= this.last) {
+			// Trailers of a stream reset since, dropped; a request's head, which has pseudo-headers, is a fault.
+			if (head.some(p => startsWith(p[0], ":"))) {
+				throw this.fault(protocolError, "stream")
+			}
+		} else if (this.closed || this.streams.size >= this.maxStreams || this.busy >= this.maxStreams) {
+			// Closed by the reset, so trailers sent meanwhile are dropped; not past a GOAWAY's, which a second keeps.
+			if (!this.closed) {
+				this.last = id
+			}
+			this.send(frame(rst, 0, id, big(refused, 4)))
+		} else {
+			this.last = id
+			const opened = new Stream(id, this.peerWindow)
+			this.streams.set(id, opened)
+			if (this.accept(opened, head, end)) {
+				const job = async this.answer(opened, handle!)
+			}
+		}
+	}
+
+	/// Takes head as st's, ended if end; whether it is well formed, st reset if not.
+	private accept(st: Stream, head: Head, end: bool): bool {
+		st.length = null // The final head's length is its own, not an interim one's.
+		let pseudo = true
+		for (const [name, value] of head) {
+			const colon = startsWith(name, ":")
+			pseudo = pseudo && colon
+			// :status is a response's alone, the rest a request's.
+			if (colon && (!pseudo || !pseudos.includes(name) || this.server == (name == ":status")
+				|| head.filter(h => h[0] == name).length > 1)
+				|| !colon && !isToken(name) || !isValue(value) || lower(name) != name || hop.includes(name)
+				|| name == "te" && value != "trailers"
+				|| name == "content-length" && (st.length != null || startsWith(value, "-"))
+				|| name == ":method" && !isToken(value)
+				// HTTP/2 has no upgrade, so no 101 (RFC 9113 §8.6), nor a 0xx.
+				|| name == ":status" && !(value.length == 3 && value != "101" && value[0] != zero && isDigit(value[0])
+					&& isDigit(value[1]) && isDigit(value[2]))
+				|| name == ":path" && !(isTarget(value) && (startsWith(value, "/") || value == "*"))) {
+				this.reset(st, protocolError)
+				return false
+			}
+			if (name == "content-length") {
+				try {
+					st.length = parseInt[i64](value)
+				} catch (e: ParseError) {
+					this.reset(st, protocolError)
+					return false
+				}
+			}
+		}
+		if (st.bare || ["204", "304"].includes(status(head))) {
+			st.length = 0
+		}
+		// A request needs :method, :scheme and :path, which the late trailers of a refused stream lack; CONNECT, which
+		// may go without the last two, is not served.
+		const lacking = this.server && [":method", ":scheme", ":path"].some(n => !head.some(p => p[0] == n))
+		if (lacking || end && ((st.length ?? 0) != 0 || interim(head))) {
+			this.reset(st, protocolError)
+			return false
+		}
+		st.head = head
+		st.expect = this.server && head.some(p => p[0] == "expect" && lower(p[1]) == "100-continue")
+		this.ended(st, end)
+		return true
+	}
+
+	/// Marks the peer's half of st ended if end, and wakes its readers.
+	private ended(st: Stream, end: bool) {
+		if (end) {
+			st.ended = true
+			this.finish(st)
+		}
+		st.changed.wake()
+	}
+
+	/// A server's stream: handle's response, written as it comes.
+	private answer(st: Stream, handle: Handle) {
+		this.busy++
+		let out: ReadCloser | null = null
+		try {
+			const [head, body] = handle(st.head!, if (st.ended) null else new Body(this, st))
+			out = body
+			this.take(st)
+			this.head(st, head, body == null)
+			if (body != null) {
+				this.stream(st, body)
+			}
+			if (!st.ended) {
+				this.reset(st, 0)
+			}
+		} catch (e: IoError) {
+			this.reset(st, internalError)
+		} finally {
+			try {
+				out?.close()
+			} catch (e: IoError) {}
+			this.busy--
+			this.flow.wake()
+		}
+	}
+
+	/// Writes body as st's on a fiber of its own, so that the response can be read meanwhile; its error fails the
+	/// stream.
+	private upload(st: Stream, body: Reader) {
+		this.busy++
+		try {
+			this.stream(st, body)
+		} catch (e: IoError) {
+			this.reset(st, cancel, e)
+		} finally {
+			this.busy--
+			this.flow.wake()
+		}
+	}
+
+	/// Writes head as st's, in one HEADERS frame and CONTINUATIONs, ending our half if end; the lock taken, as the
+	/// decoder's table must follow the encoder's in the order written. No 100 Continue is owed after.
+	private head(st: Stream, head: Head, end: bool) throws IoError {
+		st.expect = false
+		const length = head.find(p => p[0] == "content-length")
+		try {
+			st.promised = if (length == null) null else parseInt[i64](length[1])
+		} catch (e: ParseError) {
+			st.promised = -1 // Matched by no body.
+		}
+		const block = this.enc.encode(head)
+		const max = this.peerFrame as i32
+		let out = ""
+		let at = 0
+		while (true) {
+			const to = if (at + max < block.length) at + max else block.length
+			let flags: u8 = if (to == block.length) endHeaders else 0
+			if (at == 0 && end) {
+				flags = flags | endStream
+			}
+			out += frame(if (at == 0) headers else continuation, flags, st.id, block.slice(at, to))
+			at = to
+			if (at == block.length) {
+				break
+			}
+		}
+		this.write(out, st)
+		if (end) {
+			this.sent(st)
+			this.finish(st)
+		}
+	}
+
+	/// Writes body as st's in DATA frames, each piece as it comes, our half ended by the one that completes its
+	/// Content-Length, else by an empty one after; a body short of it throws before the end, one longer before the
+	/// excess goes, as the message would be malformed.
+	private stream(st: Stream, body: Reader) throws IoError {
+		let n: i64 = 0
+		const length = st.promised
+		while (true) {
+			const piece = body.read(1 << 16)
+			if (piece != null) {
+				n += piece.length
+			}
+			if (length != null && (n > length || piece == null && n != length)) {
+				throw new IoError("Protocol", "write", "content-length")
+			}
+			const end = piece == null || n == length
+			this.data(st, piece ?? "", end)
+			if (end) {
+				break
+			}
+		}
+		this.sent(st)
+		this.finish(st)
+	}
+
+	/// Writes s as DATA of st, as the windows allow.
+	private data(st: Stream, s: string, end: bool) throws IoError {
+		let at = 0
+		while (true) {
+			const left = (s.length - at) as i64
+			while (left > 0 && (st.window <= 0 || this.window <= 0)) {
+				if (st.failed != null) {
+					throw st.failed
+				}
+				if (this.failed != null) {
+					throw this.failed
+				}
+				st.parked = true
+				this.flow.wait()
+				st.parked = false
+			}
+			let n = left
+			if (left > 0) {
+				n = if (st.window < this.window) st.window else this.window
+				n = if (n < this.peerFrame) n else this.peerFrame
+				n = if (n < left) n else left
+			}
+			// Taken from the windows before the write, which other fibers may wait for.
+			st.window -= n
+			this.window -= n
+			const k = n as i32
+			let flags: u8 = 0
+			if (end && n == left) {
+				flags = endStream
+			}
+			try {
+				this.send(frame(data, flags, st.id, s.slice(at, at + k)), st)
+			} catch (e: IoError) {
+				this.window += n // Never written: given back.
+				this.flow.wake()
+				throw e
+			}
+			at += k
+			if (at == s.length) {
+				return
+			}
+		}
+	}
+
+	/// Writes bytes, of st if given, one fiber at a time; a failure ends the connection.
+	private send(bytes: string, st: Stream | null = null) throws IoError {
+		this.take(st)
+		this.write(bytes, st)
+	}
+
+	/// Takes the write lock, unless st, if given, or the connection has failed.
+	private take(st: Stream | null) throws IoError {
+		if (st != null) {
+			st.writes++
+		}
+		// Behind those already waiting, which a writer taking it back at once would starve, as the reading loop.
+		let behind = this.queued > 0
+		this.queued++
+		while (this.writing || behind) {
+			behind = false
+			this.wrote.wait()
+		}
+		this.queued--
+		const e = if (st != null && st.failed != null) st.failed else this.failed
+		if (e != null) {
+			this.wrote.wake() // The turn passed on.
+			throw e
+		}
+		this.writing = true
+	}
+
+	/// Writes bytes, of st if given, and gives the lock back, the turn then the peer's; a failure ends the connection.
+	private write(bytes: string, st: Stream | null = null) throws IoError {
+		try {
+			this.s.timeout = this.timeout
+			this.s.write(bytes)
+		} catch (e: IoError) {
+			this.closed = true
+			this.failed = e
+			this.s.end()
+			throw e
+		} finally {
+			this.writing = false
+			this.wrote.wake()
+		}
+		if (st != null) {
+			st.writes--
+			st.since = monotonic()
+		}
+	}
+
+	/// Exactly n bytes; ConnectionReset if the connection ends first.
+	private exact(n: i32): string throws IoError {
+		let s = ""
+		while (s.length < n) {
+			const p = this.b.read(n - s.length)
+			if (p == null) {
+				throw new IoError("ConnectionReset", "read", "frame")
+			}
+			s += p
+		}
+		return s
+	}
+
+	/// p without its padding, if flags say it is padded; a Protocol error if the padding exceeds it.
+	private unpad(p: string, flags: u8): string throws IoError {
+		if ((flags & padded) == 0) {
+			return p
+		}
+		if (p.length == 0 || p[0] >= p.length) {
+			throw this.fault(protocolError, "padding")
+		}
+		return p.slice(1, p.length - p[0])
+	}
+
+	/// Sends GOAWAY with code: the error to throw for a fault of the peer's.
+	private fault(code: i64, what: string): IoError {
+		this.bye(code)
+		return new IoError("Protocol", "read", what)
+	}
+
+	/// Sends GOAWAY with code, as far as it goes; no stream opens after. Closed only with the lock, else idle could end
+	/// the socket while the GOAWAY waits for another write.
+	private bye(code: i64) {
+		try {
+			this.take(null)
+			this.closed = true
+			this.write(frame(goaway, 0, 0, big(this.last, 4) + big(code, 4)))
+		} catch (e: IoError) {}
+		this.closed = true
+	}
+
+	/// Ends every stream with e, and the connection.
+	private fail(e: IoError) {
+		this.closed = true
+		this.failed = e
+		for (const st of this.streams.values()) {
+			this.kill(st, e)
+		}
+		this.flow.wake()
+	}
+
+	private kill(st: Stream, e: IoError) {
+		st.failed = e
+		// What it holds unread, past the window once forgotten, goes, and reads fail; a client's whole response is kept.
+		if (st.buf.length > 0 && (this.server || !st.ended)) {
+			st.buf = ""
+			st.ended = false
+		}
+		st.changed.wake()
+		this.finish(st)
+	}
+
+	/// Ends our half of st, from which a client's final head is due within its wait.
+	private sent(st: Stream) {
+		st.sent = true
+		st.by = deadline(this.headTimeout)
+	}
+
+	/// Forgets st once both halves have ended, what it holds unread no longer counted against a server's window.
+	private finish(st: Stream) {
+		if (st.sent && st.ended || st.failed != null) {
+			this.streams.delete(st.id)
+			if (st.failed == null) {
+				this.refusing = false
+			} else if (this.refusing && this.streams.size == 0) {
+				this.close() // None left for the peer to end: it would never be free again.
+			}
+			this.quiet = monotonic()
+			this.grant()
+			this.flow.wake()
+			this.idle()
+		}
+	}
+
+	/// Ends the socket once closed with no stream open, which ends the reading fiber; close_notify first, so that the
+	/// peer reads an end, not a cut.
+	private idle() {
+		if (this.closed && this.streams.size == 0) {
+			// close_notify, unless a write is parked, which it would wait on: then the end is cut, waking it. A second
+			// at most, as a peer that reads nothing could hold it.
+			if (!this.writing) {
+				try {
+					this.s.timeout = if (this.timeout == 0 || this.timeout > second) second else this.timeout
+					this.s.shutdown()
+				} catch (e: IoError) {}
+			}
+			this.s.end()
+		}
+	}
+}
+
+/// A stream's incoming body.
+export class Body implements ReadCloser {
+	private c: Conn
+	private st: Stream
+
+	constructor(c: Conn, st: Stream) {
+		this.c = c
+		this.st = st
+	}
+
+	read(n: i32): string | null throws IoError {
+		const st = this.st
+		this.c.proceed(st)
+		// The turn the peer's from here: a read has a whole timeout, however long the reader took to begin it, but
+		// not one more for each empty frame that wakes it.
+		st.since = monotonic()
+		while (st.buf.length == 0) {
+			if (st.ended) {
+				return null
+			}
+			if (st.failed != null) {
+				throw st.failed
+			}
+			st.reading = true
+			st.changed.wait()
+			st.reading = false
+		}
+		const k = if (n < st.buf.length) n else st.buf.length
+		const s = st.buf.slice(0, k)
+		st.buf = st.buf.slice(k, st.buf.length)
+		this.c.credit(st, k)
+		return s
+	}
+
+	/// Sends 100 Continue if the peer waits for it, as a response that streams may read the body after its head.
+	proceed() throws IoError { this.c.proceed(this.st) }
+
+	/// Ends it unread, cancelling the stream.
+	close() { this.c.reset(this.st, cancel) }
+}
+
+/// A response head's status; "" if it is not one.
+function status(head: Head): string {
+	return if (head.length > 0 && head[0][0] == ":status") head[0][1] else ""
+}
+
+/// Whether head is an interim response, a 1xx.
+function interim(head: Head): bool { return startsWith(status(head), "1") }
+
+/// A frame of type and flags on stream id with payload p.
+function frame(kind: u8, flags: u8, id: i64, p: string): string {
+	return big(p.length, 3) + fromBytes([kind, flags]) + big(id, 4) + p
+}
+
+/// v as n big-endian bytes.
+function big(v: i64, n: i32): string {
+	let s = ""
+	for (const i of 0 ... n - 1) {
+		s += chr(((v >> (8 * (n - 1 - i))) & 255) as u8)
+	}
+	return s
+}
+
+/// The n big-endian bytes of s at i.
+function num(s: string, i: i32, n: i32): i64 {
+	let v: i64 = 0
+	for (const k of 0 ... n - 1) {
+		v = (v << 8) | (s[i + k] as i64)
+	}
+	return v
+}

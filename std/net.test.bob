@@ -1,0 +1,254 @@
+import { readAll } from "./io"
+import { Conn, dial, listen, listenUdp, Listener, UdpConn } from "./net"
+import { Set } from "./collections/set"
+import { makeTempDir, remove } from "./fs"
+import { ParseError } from "./string"
+import { millisecond, monotonic } from "./time"
+import { Handle } from "../builtin/sys"
+
+/// Writes back what it reads, then closes.
+function echo(c: Conn) throws IoError {
+	while (true) {
+		const s = c.read(1024)
+		if (s == null) {
+			break
+		}
+		c.write(s)
+	}
+	c.close()
+}
+
+/// Echoes n connections, each on its own fiber.
+function serve(l: Listener, n: i32) throws IoError {
+	for (const _ of 1 ... n) {
+		const job = async echo(l.accept())
+	}
+}
+
+/// What the echo at addr gives back for s.
+function roundTrip(addr: string, s: string): string throws IoError | ParseError {
+	const c = dial(addr)
+	c.write(s)
+	c.shutdown()
+	const got = readAll(c)
+	c.close()
+	return got
+}
+
+test "connections interleave on fibers" {
+	const l = listen("127.0.0.1:0")
+	assert l.addr.host == "127.0.0.1" && l.addr.port != 0
+	const server = async serve(l, 3)
+	const addr = `${l.addr}`
+	const jobs = [async roundTrip(addr, "a"), async roundTrip(addr, "bb"), async roundTrip(addr, "ccc")]
+	assert await jobs[0] == "a" && await jobs[1] == "bb" && await jobs[2] == "ccc"
+	await server
+	l.close()
+}
+
+test "a quiet peer times out" {
+	const l = listen("[::1]:0")
+	const accepted = async l.accept()
+	const c = dial(`${l.addr}`)
+	const s = await accepted
+	assert c.remote.port == l.addr.port && s.remote.host == "::1"
+	c.timeout = 50 * millisecond
+	let kind = ""
+	try {
+		c.read(1)
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	assert kind == "TimedOut"
+	s.close()
+	c.close()
+	l.close()
+}
+
+test "a write's timeout is for each 64 KiB, so a long write goes on while the peer reads" {
+	const l = listen("127.0.0.1:0")
+	const accepted = async l.accept()
+	const c = dial(`${l.addr}`)
+	const s = await accepted
+	const quiet = dial(`${l.addr}`) // never accepted: a read of it pauses for its timeout
+	quiet.timeout = 20 * millisecond
+	const reading = async (() => {
+		let n = 0
+		let got = s.read(1 << 16)
+		while (got != null) {
+			if ((n >> 20) != ((n + got.length) >> 20)) {
+				try {
+					quiet.read(1)
+				} catch (e: IoError) {}
+			}
+			n += got.length
+			got = s.read(1 << 16)
+		}
+		return n
+	})()
+	c.timeout = 50 * millisecond
+	let big = "x"
+	while (big.length < 1 << 23) {
+		big += big
+	}
+	c.write(big)
+	c.close()
+	assert await reading == big.length
+	s.close()
+	quiet.close()
+	l.close()
+}
+
+test "a closed port refuses" {
+	const l = listen("127.0.0.1:0")
+	const addr = `${l.addr}`
+	l.close()
+	assert dial(addr) throws new IoError("ConnectionRefused", "dial", addr)
+}
+
+test "unix sockets" {
+	const dir = makeTempDir("bober-net-")
+	const path = `${dir}/s`
+	const l = listen(`unix:${path}`)
+	assert l.addr.host == path && `${l.addr}` == `unix:${path}`
+	const server = async serve(l, 1)
+	assert roundTrip(`unix:${path}`, "hello") == "hello"
+	await server
+	l.close()
+	listen(`unix:${path}`).close() // Its file gone with it.
+	remove(dir)
+}
+
+test "a unix sender with no name has an empty Addr" {
+	const dir = makeTempDir("bober-net-")
+	const path = `${dir}/s`
+	const u = listenUdp(`unix:${path}`)
+	const h = Handle.dial("udp", path, 0)
+	h.write("b")
+	const [data, from] = u.receive()
+	assert data == "b" && from.host == ""
+	h.close()
+	u.close()
+	remove(path)
+	remove(dir)
+}
+
+test "a bad address is a ParseError" {
+	assert listen("nowhere") throws new ParseError("syntax", 7)
+	assert dial("127.0.0.1:x") throws new ParseError("syntax", 0)
+	assert dial("unix:x") throws new ParseError("syntax", 0) // The host unix, as an http URL's: a path is absolute.
+}
+
+test "close ends what waits, the peer reading an end, and again does nothing" {
+	const l = listen("127.0.0.1:0")
+	const accepted = async l.accept()
+	const c = dial(`${l.addr}`)
+	const s = await accepted
+	const reading = async c.read(1)
+	c.close()
+	c.close()
+	assert await reading == null
+	assert s.read(1) == null
+	s.close()
+	const accepting = async l.accept()
+	l.close()
+	let kind = ""
+	try {
+		await accepting
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	assert kind != ""
+}
+
+test "a closed socket is BadResource, whoever has its descriptor now" {
+	const l = listen("127.0.0.1:0")
+	const c = dial(`${l.addr}`)
+	c.close()
+	const d = dial(`${l.addr}`)  // on c's descriptor
+	assert c.shutdown() throws new IoError("BadResource", "shutdown", `${c.handle.raw()}`)
+	l.close()
+	const m = listen("127.0.0.1:0")  // on l's
+	const e = dial(`${m.addr}`)
+	assert l.accept() throws new IoError("BadResource", "accept", `${l.handle.raw()}`)
+	const u = listenUdp("127.0.0.1:0")
+	u.close()
+	const v = listenUdp("127.0.0.1:0")  // on u's
+	assert u.send("x", `${v.addr}`) throws new IoError("BadResource", "send", `${u.handle.raw()}`)
+	assert u.receive() throws new IoError("BadResource", "receive", `${u.handle.raw()}`)
+	d.close()
+	e.close()
+	m.close()
+	v.close()
+}
+
+test "a v4 peer of every address is a v4 one" {
+	const l = listen(":0")
+	const accepted = async l.accept()
+	const c = dial(`127.0.0.1:${l.addr.port}`)
+	const s = await accepted
+	assert s.remote.host == "127.0.0.1"
+	s.close()
+	c.close()
+	l.close()
+}
+
+test "a datagram goes to the first of a name's addresses it can be sent to, a v4 one from a v6 socket too" {
+	const u = listenUdp("127.0.0.1:0")
+	const v = listenUdp("0.0.0.0:0")
+	v.send("hi", `localhost:${u.addr.port}`)
+	assert u.receive()[0] == "hi"
+	v.send("past ::", `:${u.addr.port}`)  // "::", Unsupported on v, then "0.0.0.0"
+	assert u.receive()[0] == "past ::"
+	const w = listenUdp(":0")
+	w.send("from v6", `${u.addr}`)
+	assert u.receive()[0] == "from v6"
+	u.close()
+	v.close()
+	w.close()
+}
+
+test "sockets bound to port 0 get ports of their own" {
+	const all: UdpConn[] = []
+	for (const _ of 1 ... 500) {
+		all.push(listenUdp("127.0.0.1:0"))
+	}
+	assert new Set(all.map(u => `${u.addr.port}`)).items.length == all.length
+	for (const u of all) {
+		u.close()
+	}
+}
+
+test "an idle connection is one the peer has neither ended nor written to" {
+	const l = listen("127.0.0.1:0")
+	const accepted = async l.accept()
+	const c = dial(`${l.addr}`)
+	const s = await accepted
+	assert c.idle()
+	s.write("x")
+	assert !c.idle() && c.read(1) == "x" && c.idle()
+	s.close()
+	assert !c.idle()
+	c.close()
+	assert !c.idle()
+	l.close()
+}
+
+test "a reply of two small writes is not held back by Nagle and the delayed ack" {
+	const l = listen("127.0.0.1:0")
+	const accepted = async l.accept()
+	const c = dial(`${l.addr}`)
+	const s = await accepted
+	const from = monotonic()
+	for (const _ of 1 ... 20) {
+		c.write("q")
+		assert s.read(1) == "q"
+		s.write("a")
+		s.write("b")
+		assert c.read(1) == "a" && c.read(1) == "b"
+	}
+	assert monotonic() - from < 400 * millisecond // Held back, each round would take 40 ms.
+	s.close()
+	c.close()
+	l.close()
+}

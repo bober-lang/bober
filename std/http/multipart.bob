@@ -1,0 +1,313 @@
+//! multipart/form-data (RFC 7578): parts streams a body's parts, form reads them all, encode makes a body.
+
+import { indexOf, startsWith } from "../algo"
+import { bytes } from "../crypto/random"
+import { encode as hex } from "../encoding/hex"
+import { Headers, Request } from "../http"
+import { head } from "./h1"
+import { Reader } from "../io"
+import { backslash, cr, minus, quote as dq, semicolon, space, tab } from "../ascii"
+import { ParseError, lower, replace, split, trim } from "../string"
+import { Query } from "../url"
+
+/// A part of a multipart body.
+export class Part {
+	/// Its Content-Disposition's name.
+	name = ""
+	/// Its Content-Disposition's filename: null for a plain field, "" for a file input with no file chosen.
+	filename: string | null = null
+	headers = new Headers()
+	/// Its bytes up to the next boundary.
+	body: Reader
+
+	constructor(body: Reader) { this.body = body }
+}
+
+/// The parts of body, whose Content-Type, multipart with a boundary, is contentType; a syntax error if it is not.
+export function parts(body: Reader, contentType: string): Parts throws ParseError {
+	const boundary = param(contentType, "boundary")
+	if (!startsWith(lower(contentType), "multipart/") || boundary == null || boundary == "") {
+		throw new ParseError("syntax", 0)
+	}
+	return new Parts(body, boundary)
+}
+
+export class Parts {
+	private src: Reader
+	/// What src gave and no one took yet, after the CRLF the first boundary line need not have.
+	private buf = "\r\n"
+	private delim: string
+	private ended = false
+	/// Which part's body is current; an earlier one reads as ended.
+	private serial = 0
+
+	constructor(src: Reader, boundary: string) {
+		this.src = src
+		this.delim = `\r\n--${boundary}`
+	}
+
+	/// The next part, skipping what is left of the last; null after the closing boundary.
+	next(): Part | null throws IoError | ParseError {
+		if (this.ended) {
+			return null
+		}
+		while (this.piece(this.serial, 1 << 16) != null) {}
+		this.buf = this.buf.slice(this.delim.length, this.buf.length)
+		this.serial++
+		// After the closing boundary's -- is the epilogue, read no further.
+		if (startsWith(this.buf, "--")) {
+			this.ended = true
+			return null
+		}
+		this.line()
+		const p = new Part(new Bytes(this, this.serial))
+		let head = 0
+		while (true) {
+			const l = this.line()
+			if (l == "") {
+				break
+			}
+			head += l.length + 2
+			if (head > 8192) {
+				throw new IoError("TooLarge", "read", "multipart head")
+			}
+			const colon = indexOf(l, ":")
+			if (colon <= 0) {
+				throw protocol()
+			}
+			// The value of its own bytes, as a slice would keep what was read with it alive; append lowers the name.
+			p.headers.append(l.slice(0, colon), trim(l.slice(colon + 1, l.length)).copy())
+		}
+		const cd = p.headers.get("content-disposition") ?? ""
+		p.name = param(cd, "name") ?? ""
+		p.filename = param(cd, "filename")
+		return p
+	}
+
+	/// Up to n bytes of part serial's body, or null at its end; for Bytes.
+	piece(serial: i32, n: i32): string | null throws IoError {
+		if (serial != this.serial) {
+			return null
+		}
+		while (true) {
+			const i = this.delimAt()
+			// What cannot start a delimiter can be given out.
+			const safe = if (i >= 0) i else this.buf.length - this.delim.length
+			if (safe > 0) {
+				const k = if (safe < n) safe else n
+				const s = this.buf.slice(0, k)
+				this.buf = this.buf.slice(k, this.buf.length)
+				return s
+			}
+			if (i == 0 && this.ends(0) == true) {
+				return null
+			}
+			if (!this.fill()) {
+				throw protocol()
+			}
+		}
+	}
+
+	/// Where a delimiter line may start in buf: the delimiter, then what ends one or too few bytes yet to tell; -1 if
+	/// none, as a boundary may prefix a part's text.
+	private delimAt(): i32 {
+		let i = indexOf(this.buf, this.delim)
+		while (i >= 0 && this.ends(i) == false) {
+			i = indexOf(this.buf, this.delim, i + 1)
+		}
+		return i
+	}
+
+	/// Whether the delimiter at i ends a delimiter line: `--` or padding, of at most 8 KiB, and then a CR follow it;
+	/// null while the bytes that would tell are not in buf yet.
+	private ends(i: i32): bool | null {
+		let j = i + this.delim.length
+		if (j < this.buf.length && this.buf[j] == minus) {
+			return if (j + 1 < this.buf.length) this.buf[j + 1] == minus else null
+		}
+		while (j < this.buf.length && (this.buf[j] == space || this.buf[j] == tab)) {
+			j++
+		}
+		return if (j < this.buf.length) this.buf[j] == cr else if (j - i > 8192) false else null
+	}
+
+	/// The line next in buf, without its CRLF, with any transport padding trimmed, or what is left at src's end;
+	/// TooLarge past 8 KiB.
+	private line(): string throws IoError {
+		while (true) {
+			const i = indexOf(this.buf, "\r\n")
+			if (i >= 0) {
+				const l = this.buf.slice(0, i)
+				this.buf = this.buf.slice(i + 2, this.buf.length)
+				return trim(l)
+			}
+			if (this.buf.length > 8192) {
+				throw new IoError("TooLarge", "read", "multipart head")
+			}
+			if (!this.fill()) {
+				if (this.buf.length == 0) {
+					throw protocol()
+				}
+				const l = this.buf
+				this.buf = ""
+				return trim(l)
+			}
+		}
+	}
+
+	/// Adds what src gives next to buf; false at its end.
+	private fill(): bool throws IoError {
+		const c = this.src.read(1 << 16)
+		if (c == null) {
+			return false
+		}
+		this.buf += c
+		return true
+	}
+}
+
+/// A part's body: its bytes up to the next boundary.
+class Bytes implements Reader {
+	private parts: Parts
+	private serial: i32
+
+	constructor(parts: Parts, serial: i32) {
+		this.parts = parts
+		this.serial = serial
+	}
+
+	read(n: i32): string | null throws IoError { return this.parts.piece(this.serial, n) }
+}
+
+function protocol(): IoError { return new IoError("Protocol", "read", "multipart") }
+
+/// The value of parameter key, as `; key=value` or `; key="value"`, in a header like Content-Type; null if none, or
+/// if its quoted string is not closed at its end.
+function param(header: string, key: string): string | null {
+	for (const p of pieces(header)) {
+		const eq = indexOf(p, "=")
+		if (eq > 0 && lower(trim(p.slice(0, eq))) == key) {
+			const v = trim(p.slice(eq + 1, p.length))
+			return if (v.length > 0 && v[0] == dq) unquote(v) else v
+		}
+	}
+	return null
+}
+
+/// header at each `;` outside a quoted string.
+function pieces(header: string): string[] {
+	const out: string[] = []
+	let from = 0
+	let quoted = false
+	let i = 0
+	while (i < header.length) {
+		const c = header[i]
+		if (c == dq) {
+			quoted = !quoted
+		} else if (c == backslash && quoted) {
+			i++
+		} else if (c == semicolon && !quoted) {
+			out.push(header.slice(from, i))
+			from = i + 1
+		}
+		i++
+	}
+	out.push(header.slice(from, header.length))
+	return out
+}
+
+/// What the quoted-string q holds, each \" or \\ its second byte; any other \ is kept, as browsers send it unescaped,
+/// as is one before the closing quote. Null if a quote closes it before its end, or none does.
+function unquote(q: string): string | null {
+	let s = ""
+	let i = 1
+	while (i < q.length) {
+		if (q[i] == dq) {
+			return if (i == q.length - 1) s else null
+		}
+		if (q[i] == backslash && i + 2 < q.length && (q[i + 1] == dq || q[i + 1] == backslash)) {
+			i++
+		}
+		s += chr(q[i])
+		i++
+	}
+	return null
+}
+
+/// A file a form holds, named as its field is.
+export class File {
+	name = ""
+	filename = ""
+	contentType = "application/octet-stream"
+	data = ""
+}
+
+export class Form {
+	fields = new Query()
+	files: File[] = []
+}
+
+/// The form req carries, as multipart/form-data or application/x-www-form-urlencoded, whole in memory: more than
+/// maxMemory bytes of fields and files together is TooLarge, as no file is spooled to disk.
+export function form(req: Request, maxMemory: i64 = 10 << 20): Form throws IoError | ParseError {
+	const ct = req.headers.get("content-type") ?? ""
+	const f = new Form()
+	if (startsWith(lower(ct), "application/x-www-form-urlencoded")) {
+		f.fields = Query.parse(req.body.text(maxMemory))
+		return f
+	}
+	const ps = parts(req.body, ct)
+	let left = maxMemory
+	while (true) {
+		const p = ps.next()
+		if (p == null) {
+			return f
+		}
+		// Its names, type and a part's own keep count too, so empty parts are not free.
+		left -= 32 + p.name.length + (p.filename ?? "").length + (p.headers.get("content-type") ?? "").length
+		let data = ""
+		while (true) {
+			if (data.length > left) {
+				throw new IoError("TooLarge", "read", "form")
+			}
+			const c = p.body.read(1 << 16)
+			if (c == null) {
+				break
+			}
+			data += c
+		}
+		left -= data.length
+		const filename = p.filename
+		if (filename == null) {
+			f.fields.append(p.name, data)
+		} else {
+			const file = new File()
+			file.name = p.name
+			file.filename = filename
+			file.contentType = p.headers.get("content-type") ?? file.contentType
+			file.data = data
+			f.files.push(file)
+		}
+	}
+}
+
+/// A multipart/form-data body of the fields and files, and its Content-Type, with a random boundary, so no value
+/// can be made to hold it; a file's header that is not a field value, as a type with a line break, is a Protocol error.
+export function encode(fields: [string, string][], files: File[] = []): [string, string] throws IoError {
+	const boundary = `bober${hex(bytes(16))}`
+	let body = ""
+	for (const [name, value] of fields) {
+		body += `--${boundary}\r\nContent-Disposition: form-data; name="${quote(name)}"\r\n\r\n${value}\r\n`
+	}
+	for (const f of files) {
+		const disposition = `form-data; name="${quote(f.name)}"; filename="${quote(f.filename)}"`
+		body += head(`--${boundary}`, [["Content-Disposition", disposition], ["Content-Type", f.contentType]])
+			+ `${f.data}\r\n`
+	}
+	return [`${body}--${boundary}--\r\n`, `multipart/form-data; boundary=${boundary}`]
+}
+
+/// s as a quoted parameter's inside: `\` escaped for param, quotes and line breaks percent-encoded as browsers do.
+function quote(s: string): string {
+	return replace(replace(replace(replace(s, "\\", "\\\\"), "\"", "%22"), "\r", "%0D"), "\n", "%0A")
+}

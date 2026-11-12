@@ -1,0 +1,1185 @@
+//! HTTP, shaped as fetch is: a Handler turns a Request into a Response; a Server runs one, a Client is one. HTTP/1.1,
+//! and HTTP/2 over TLS. A status is never an error; a message that is not HTTP, or past a limit, is an IoError.
+
+import { indexOf, startsWith } from "./algo"
+import { HashMap } from "./collections/hashmap"
+import { EncodeError, decode, encode } from "./encoding/json"
+import { Signal } from "../builtin/fiber"
+import { ReadCloser, Reader, Stream, copy, readAll, stderr } from "./io"
+import { Buffered, Framed, Upgraded, chunk, head, isTarget, isToken, readHead } from "./http/h1"
+import * as h2 from "./http/h2"
+import { Conn, Listener, dial, listen } from "./net"
+import { isAlphanumeric, isDigit, toUpper } from "./ascii"
+import { ParseError, lower, parseInt, split, trim } from "./string"
+import { deadline, httpDate, monotonic, second } from "./time"
+import * as tls from "./tls"
+import { Decodable } from "./types"
+import { Url } from "./url"
+
+export class Headers {
+	/// Names lowercased, in order.
+	entries: [string, string][] = []
+
+	/// The first value of name.
+	get(name: string): string | null {
+		const n = lower(name)
+		const e = this.entries.find(e => e[0] == n)
+		return if (e == null) null else e[1]
+	}
+
+	all(name: string): string[] {
+		const n = lower(name)
+		return this.entries.filter(e => e[0] == n).map(e => e[1])
+	}
+
+	has(name: string): bool {
+		const n = lower(name)
+		return this.entries.some(e => e[0] == n)
+	}
+
+	set(name: string, value: string) {
+		this.delete(name)
+		this.append(name, value)
+	}
+
+	append(name: string, value: string) { this.entries.push([lower(name), value]) }
+
+	delete(name: string) {
+		const n = lower(name)
+		this.entries = this.entries.filter(e => e[0] != n)
+	}
+}
+
+/// What a message carries: bytes, a stream, or nothing.
+export type BodyInit = string | Reader | null
+
+export class Body implements ReadCloser {
+	/// Known for a string or a Content-Length; else null, framed by chunks or the connection's end.
+	length: i64 | null
+	/// All of a string body, which can be sent again; null for a stream.
+	readonly whole: string | null
+	private src: Reader | null = null
+	private at = 0
+	/// What close calls, set by whoever framed a stream on a connection, or a Body's it streams.
+	private closer: (() => void) | null
+
+	constructor(init: BodyInit = null, length: i64 | null = null, closer: (() => void) | null = null) {
+		this.closer = closer ?? (if (init instanceof Body) init.close else null)
+		if (init == null) {
+			this.whole = ""
+			this.length = 0
+		} else if (init instanceof string) {
+			this.whole = init
+			this.length = init.length
+		} else {
+			this.whole = null
+			this.src = init
+			this.length = length
+		}
+	}
+
+	read(n: i32): string | null throws IoError {
+		const whole = this.whole
+		if (whole == null) {
+			return this.src!.read(n)
+		}
+		if (this.at >= whole.length) {
+			return null
+		}
+		const s = whole.slice(this.at, if (this.at + n < whole.length) this.at + n else whole.length)
+		this.at += s.length
+		return s
+	}
+
+	/// All of it; more than limit bytes is TooLarge, and an error ends its connection.
+	text(limit: i64 = 10 << 20): string throws IoError {
+		const whole = this.whole
+		if (whole != null && whole.length <= limit) {
+			return whole
+		}
+		let s = ""
+		try {
+			if (this.length == null || this.length <= limit) {
+				while (true) {
+					const c = this.read(1 << 16)
+					if (c == null) {
+						return s
+					}
+					s += c
+					if (s.length > limit) {
+						break
+					}
+				}
+			}
+			throw new IoError("TooLarge", "read", "body")
+		} catch (e: IoError) {
+			this.close()
+			throw e
+		}
+	}
+
+	json[T extends Decodable](limit: i64 = 10 << 20): T throws IoError | ParseError {
+		return decode[T](this.text(limit))
+	}
+
+	/// Ends a streaming body without reading the rest, freeing the connection a client's holds.
+	close() {
+		const f = this.closer
+		if (f != null) {
+			f()
+		}
+	}
+}
+
+/// The HTTP versions; any other HTTP/1.x is taken as 1.1 (RFC 9110 §2.5).
+export type Version = "HTTP/1.0" | "HTTP/1.1" | "HTTP/2"
+
+export class Request {
+	/// Uppercased by the constructor; on a server, as sent, since methods are case-sensitive.
+	method: string
+	/// Absolute, on a server too: the scheme served, and the host of Host, or the connection's for HTTP/1.0 without.
+	url: Url
+	/// As received, on a server.
+	version: Version = "HTTP/1.1"
+	headers = new Headers()
+	body: Body
+
+	constructor(method: string, url: string | Url, body: BodyInit = null) throws ParseError {
+		this.method = upper(method)
+		this.url = if (url instanceof Url) url else Url.parse(url)
+		this.body = new Body(body)
+	}
+}
+
+export class Response {
+	status: i32
+	headers = new Headers()
+	body: Body
+	/// On a server, what a 101 hands the connection to, as a WebSocket does: called once the head is written, owning
+	/// it until it returns, when it is closed.
+	upgrade: ((c: Stream) => void) | null = null
+	/// On a client, the connection a 101 handed over, with what the server sent after the head; else null.
+	stream: Stream | null = null
+
+	constructor(status: i32 = 200, body: BodyInit = null) {
+		this.status = status
+		this.body = new Body(body)
+	}
+
+	/// Frees the connection a streaming response holds, without reading the rest.
+	close() { this.body.close() }
+}
+
+/// s as text/plain.
+export function text(s: string, status: i32 = 200): Response {
+	const res = new Response(status, s)
+	res.headers.set("content-type", "text/plain; charset=utf-8")
+	return res
+}
+
+/// v as application/json; a 500 naming the value if JSON cannot hold it, a NaN or infinite float.
+export function json[T](v: T, status: i32 = 200): Response {
+	try {
+		const res = new Response(status, encode(v))
+		res.headers.set("content-type", "application/json")
+		return res
+	} catch (e: EncodeError) {
+		return text(`json: ${e.value}`, 500)
+	}
+}
+
+export function redirect(to: string, status: i32 = 303): Response {
+	const res = new Response(status)
+	res.headers.set("location", to)
+	return res
+}
+
+export type Handler = (req: Request) => Response throws IoError | ParseError
+/// Wraps a handler: a cookie jar, decompression or logging, on a Client or a Router.
+export type Middleware = (req: Request, next: Handler) => Response throws IoError | ParseError
+
+/// h inside mws, the first outermost.
+export function wrap(mws: Middleware[], h: Handler): Handler {
+	let next = h
+	for (const i of 0 ... mws.length - 1) {
+		const mw = mws[mws.length - 1 - i]
+		const inner = next
+		next = req => mw(req, inner)
+	}
+	return next
+}
+
+/// How many bytes of a response a client takes whole, with its head.
+const whole: i64 = 1 << 16
+/// Methods whose requests may go again.
+const idempotent = ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"]
+
+export class Client {
+	/// For connecting, and then for the TLS handshake; 0 for none.
+	connectTimeout: i64 = 10 * second
+	/// For a response's status and headers as a whole, from the request's end; 0 for none. Over HTTP/2 it is checked
+	/// as frames come, timeout bounding a connection that sends none.
+	headerTimeout: i64 = 30 * second
+	/// For each read and write of a body: a slow download is not a stuck one.
+	timeout: i64 = 30 * second
+	/// Past it, the last 3xx is the response.
+	maxRedirects = 10
+	maxHeaders: i64 = 1 << 16
+	/// Idle HTTP/1.1 connections kept, of all origins together; past it the oldest is closed. An HTTP/2 one closes
+	/// itself once idle for idleTimeout.
+	poolSize = 32
+	/// How long a connection is kept idle, 0 for ever; an HTTP/1.1 one is closed at the next send past it.
+	idleTimeout: i64 = 90 * second
+	/// For https, offering h2 and http/1.1.
+	tls = negotiating(new tls.Config())
+	/// Idle connections, their origins and since when, oldest first.
+	private idle: [string, Stream, Conn, i64][] = []
+	/// HTTP/2 connections and their origins.
+	private h2: [string, h2.Conn][] = []
+	private mws: Middleware[] = []
+	/// once inside mws, built as each is added rather than per send.
+	private chain: Handler = req => this.once(req)
+
+	/// Wraps every send, inside those added before it.
+	use(mw: Middleware) {
+		this.mws.push(mw)
+		this.chain = wrap(this.mws, req => this.once(req))
+	}
+
+	/// The response to req: its status and headers, and a body of known length up to 64 KiB with them, else one that
+	/// streams and holds its connection until read to its end or closed. Redirects are followed, a 303, or a 301 or
+	/// 302 of a POST, by a GET without the body, the rest with the method and body unless it streams; each with the
+	/// headers req had before the middleware, which it goes through again, but Authorization and Cookie across
+	/// origins.
+	send(req: Request): Response throws IoError | ParseError {
+		let r = req
+		let left = this.maxRedirects
+		while (true) {
+			const given = [...r.headers.entries]
+			const res = this.chain(r)
+			const to = res.headers.get("location")
+			const s = res.status
+			const get = s == 303 && r.method != "HEAD" || (s == 301 || s == 302) && r.method == "POST"
+			if (!(s == 301 || s == 302 || s == 303 || s == 307 || s == 308) || to == null || left == 0
+				|| !get && r.body.whole == null) {
+				return res
+			}
+			res.close()
+			left--
+			const url = r.url.resolve(to)
+			const next = new Request(if (get) "GET" else r.method, url, if (get) null else r.body.whole)
+			for (const [name, value] of given) {
+				if (!(name == "host" || (name == "authorization" || name == "cookie") && url.origin() != r.url.origin()
+					|| get && name == "content-type")) {
+					next.headers.append(name, value)
+				}
+			}
+			r = next
+		}
+	}
+
+	/// One exchange; on a pooled connection found dead before any byte of the response, once more on another if the
+	/// method is idempotent; over HTTP/2 up to 3 times more, as over allows. One the peer has ended or written to
+	/// meanwhile is not taken.
+	private once(req: Request): Response throws IoError | ParseError {
+		const u = req.url
+		const secure = u.scheme == "https"
+		if (!secure && u.scheme != "http") {
+			throw new IoError("Unsupported", "send", u.scheme)
+		}
+		if (u.host == "") {
+			throw new IoError("Protocol", "send", "host")
+		}
+		const origin = u.origin()
+		const authority = `${u.host}${if (u.port == null) "" else `:${u.port}`}`
+		const query = `${u.query}`
+		const target = `${if (u.path == "") "/" else u.path}${if (query == "") "" else `?${query}`}`
+		if (!isToken(req.method) || !isTarget(target)) {
+			throw new IoError("Protocol", "send", `${req.method} ${target}`)
+		}
+		const body = req.body.whole
+		const start = head(`${req.method} ${target} HTTP/1.1`, outgoing(req, [["host", authority]], false))
+		// HTTP/2 has no upgrade.
+		const upgrade = req.headers.has("upgrade")
+		let retries = 3
+		while (true) {
+			const found = if (upgrade) null else this.h2.find(p => p[0] == origin && p[1].free())
+			const pooled = if (found != null) null else this.pooled(origin)
+			const reused = pooled != null
+			const fresh = if (found != null) found[1]
+				else pooled ?? this.connect(u.host, u.port ?? (if (secure) 443 else 80), secure, origin, upgrade)
+			// One just connected is sent on though it may have ended already, so that its end counts as a try.
+			if (fresh instanceof h2.Conn) {
+				let res: Response | null = null
+				try {
+					res = this.over(fresh, req, authority, target, retries > 0)
+				} finally {
+					if (!this.h2.some(p => p[1] == fresh)) {
+						fresh.close() // Its stream goes on.
+					}
+				}
+				if (res != null) {
+					return res
+				}
+				retries--
+				continue
+			}
+			const [s, c] = fresh
+			if (reused && !c.idle()) {
+				drop(s) // Ended by the peer, or with bytes no request asked for.
+				continue
+			}
+			const b = new Buffered(s)
+			// The final head, once read.
+			let got: [string[], [string, string][]] | null = null
+			// The request goes on a fiber of its own, so that a response that comes before its end, as an echo's, is
+			// read meanwhile, not left to fill the buffers both ways; ended is when it ended, cut what failed it, and
+			// fault why that fiber ended the reads, if it did.
+			let ended: i64 = 0
+			let cut: IoError | null = null
+			let fault: IoError | null = null
+			s.timeout = this.timeout
+			const write = () => {
+				try {
+					s.write(start + (body ?? ""))
+					if (body == null) {
+						copyChunked(req.body, s)
+					}
+				} catch (e: IoError) {
+					cut = e
+					// The peer may have answered before the whole body, as a 413 does, and ended: its answer is read.
+					// Else, before the head, the read waiting for it ends.
+					if (got == null && (e.op != "write" || !(e.kind == "BrokenPipe" || e.kind == "ConnectionReset"))) {
+						fault = e
+						drop(s)
+					}
+				}
+				ended = monotonic()
+				if (got == null) {
+					b.deadline = deadline(this.headerTimeout, ended) // For the head's reads from here on,
+					if (s instanceof tls.Conn) {
+						s.hasten(b.deadline) // and a TLS read's next wait.
+					}
+				}
+			}
+			// A read for the head begun while the request went has the timeout alone: if nothing comes by headerTimeout
+			// after its end, the stream is dropped, which wakes it; a wait after has the deadline.
+			const upload = () => {
+				write()
+				const by = deadline(this.headerTimeout, ended)
+				if (by != 0 && got == null && !c.handle.ready(by) && got == null) {
+					fault = new IoError("TimedOut", "read", "head")
+					drop(s)
+				}
+			}
+			// One without a body goes at once: no response comes before it.
+			if (body == "") {
+				write()
+			} else {
+				const job = async upload()
+			}
+			// Ends the request if it still goes, leaving it to fail at its next write: whether it was all sent.
+			const sent = (): bool => {
+				if (ended == 0) {
+					drop(s)
+					return false
+				}
+				return cut == null
+			}
+			try {
+				while (got == null) {
+					// A head is waited for from the request's end: a read before it that times out is tried again.
+					while (ended == 0 && !b.pending()) {
+						try {
+							if (!b.fill()) {
+								break
+							}
+						} catch (e: IoError) {
+							if (e.kind != "TimedOut") {
+								throw e
+							}
+						}
+					}
+					const h = readHead(b, this.maxHeaders)
+					if (h == null) {
+						throw cut ?? new IoError("ConnectionReset", "send", origin)
+					}
+					if (statusOf(h[0]) >= 200 || h[0][1] == "101") {
+						got = h
+					}
+				}
+				b.deadline = 0
+				s.timeout = this.timeout
+				return this.response(req, got!, b, origin, fresh, sent)
+			} catch (e: IoError) {
+				const err = fault ?? e
+				drop(s)
+				if (reused && got == null && (err.kind == "ConnectionReset" || err.kind == "BrokenPipe") && body != null
+					&& idempotent.includes(req.method)) {
+					continue
+				}
+				throw err
+			}
+		}
+	}
+
+	/// A new connection to host:port, through TLS if secure, offering http/1.1 alone for an upgrade, and its socket;
+	/// once it agreed on HTTP/2, the h2.Conn instead, kept in this.h2 unless another of origin is yet unsettled.
+	private connect(host: string, port: u16, secure: bool, origin: string,
+		upgrade: bool): [Stream, Conn] | h2.Conn throws IoError | ParseError {
+		const c = dial(`${host}:${port}`, this.connectTimeout)
+		if (!secure) {
+			return [c, c]
+		}
+		let s: Stream = c
+		try {
+			c.timeout = this.connectTimeout
+			const name = if (startsWith(host, "[")) host.slice(1, host.length - 1) else host
+			const t = tls.client(c, name, if (upgrade) upgrading(this.tls) else this.tls)
+			s = t
+			if (t.alpn != "h2") {
+				return [t, c]
+			}
+			t.timeout = this.timeout
+			const h = new h2.Conn(t, false, this.maxHeaders)
+			h.idleTimeout = this.idleTimeout
+			const other = this.h2.find(p => p[0] == origin && p[1].free())
+			if (other != null) {
+				h.close() // Another send connected meanwhile.
+				return other[1]
+			}
+			// One of a burst to a new origin, dialled before a connection knew the server's limit, is not kept, as a
+			// client keeps one per origin (RFC 9113 §9.1).
+			if (!this.h2.some(p => p[0] == origin && !p[1].closed && !p[1].settled)) {
+				this.h2 = [...this.h2.filter(p => !p[1].closed), [origin, h]] // Those ended go.
+			}
+			return h
+		} catch (e: IoError) {
+			drop(s)
+			throw e
+		}
+	}
+
+	/// req as a stream of h, the HTTP/2 connection to its origin, authority its host and port and target its path; null
+	/// when again and its stream ended before the response's head so that req, its body whole, may go again: never
+	/// processed, as a GOAWAY or REFUSED_STREAM says, or idempotent as h ended.
+	private over(h: h2.Conn, req: Request, authority: string, target: string,
+		again: bool): Response | null throws IoError {
+		const pairs = outgoing(req, [], true)
+		head("", pairs) // A header that would split the message fails as over HTTP/1.1.
+		// A whole body is read anew, so it can be sent again.
+		const sent = req.body.whole
+		let answer: [h2.Head, h2.Body] | null = null
+		try {
+			h.headTimeout = this.headerTimeout // As at each request over HTTP/1.1.
+			answer = h.request([[":method", req.method], [":scheme", req.url.scheme], [":authority", authority],
+				[":path", target], ...pairs], if (sent == "") null else if (sent != null) new Body(sent) else req.body)
+		} catch (e: IoError) {
+			if (again && sent != null && (e.op == "write" && e.what == "goaway" || e.what == "reset 7" || h.closed
+				&& idempotent.includes(req.method) && (e.kind == "ConnectionReset" || e.kind == "BrokenPipe"))) {
+				return null
+			}
+			throw e
+		}
+		const [got, body] = answer!
+		const status = got.find(p => p[0] == ":status")
+		const res = new Response()
+		res.headers.entries = got.filter(p => !startsWith(p[0], ":"))
+		const length = res.headers.get("content-length")
+		let known: i64 | null = null
+		try {
+			if (status == null) {
+				throw new IoError("Protocol", "read", "status")
+			}
+			res.status = number(status[1]) as i32
+			known = if (length == null) null else number(length)
+		} catch (e: IoError) {
+			body.close()
+			throw e
+		}
+		if (req.method == "HEAD" || res.status == 204 || res.status == 304) {
+			body.close() // Ends its stream, which the server may leave open.
+			return res
+		}
+		if (known != null && known <= whole) {
+			res.body = new Body(readAll(body))
+		} else {
+			res.body = new Body(body, known, () => body.close())
+		}
+		return res
+	}
+
+	/// The response whose head was read from b, its body framed on it, on conn, as connect gives it; the last on it
+	/// unless sent, which ends the request if it still goes and waits for it, says all of it went.
+	private response(req: Request, got: [string[], [string, string][]], b: Buffered, origin: string,
+		conn: [Stream, Conn], sent: () => bool): Response throws IoError {
+		const [parts, pairs] = got
+		const res = new Response()
+		res.status = statusOf(parts) as i32
+		res.headers.entries = pairs
+		const version = versionOf(parts[0])!
+		const [length, chunked] = framing(res.headers, version)
+		const s = b.stream
+		const bare = req.method == "HEAD" || res.status == 204 || res.status == 304
+		const last = closes(req.headers) || closes(res.headers) || version == "HTTP/1.0"
+			|| !bare && length == null && !chunked
+		const onEnd = (clean: bool) => {
+			if (sent() && clean && !last && !b.pending()) {
+				this.release(origin, conn)
+			} else {
+				drop(s)
+			}
+		}
+		if (res.status == 101) {
+			if (!req.headers.has("upgrade") || !sent()) {
+				throw new IoError("Protocol", "read", "101")
+			}
+			res.stream = new Upgraded(b)
+		} else if (bare) {
+			onEnd(true)
+		} else if (length != null && length <= whole) {
+			res.body = new Body(readAll(new Framed(b, length, false, onEnd)))
+		} else {
+			const f = new Framed(b, length, chunked, onEnd)
+			res.body = new Body(f, length, () => f.abort())
+		}
+		return res
+	}
+
+	/// The newest idle connection to origin, taken out of the pool.
+	private pooled(origin: string): [Stream, Conn] | null {
+		this.trim()
+		let i = this.idle.length - 1
+		while (i >= 0 && this.idle[i][0] != origin) {
+			i--
+		}
+		if (i < 0) {
+			return null
+		}
+		const p = this.idle[i]
+		this.idle = [...this.idle.slice(0, i), ...this.idle.slice(i + 1, this.idle.length)]
+		return [p[1], p[2]]
+	}
+
+	private release(origin: string, conn: [Stream, Conn]) {
+		this.idle.push([origin, conn[0], conn[1], monotonic()])
+		this.trim()
+	}
+
+	/// Closes the oldest idle connections while there are more than poolSize, or they are idle past idleTimeout.
+	private trim() {
+		while (this.idle.length > this.poolSize
+			|| this.idle.length > 0 && this.idleTimeout != 0 && monotonic() - this.idle[0][3] >= this.idleTimeout) {
+			const old = this.idle[0][1]
+			this.idle = this.idle.slice(1, this.idle.length) // Before the drop, which may park.
+			drop(old)
+		}
+	}
+}
+
+/// The default Client, the isolate's own.
+let client = new Client()
+
+export function send(req: Request): Response throws IoError | ParseError { return client.send(req) }
+export function get(url: string): Response throws IoError | ParseError { return client.send(new Request("GET", url)) }
+
+export function post(url: string, body: BodyInit, contentType: string): Response throws IoError | ParseError {
+	const req = new Request("POST", url, body)
+	req.headers.set("content-type", contentType)
+	return client.send(req)
+}
+
+export class Server {
+	/// Where to listen, as net.listen takes it; port 0 is any free one, which addr then holds once serving.
+	addr = ":8080"
+	/// Serves https with it, if given.
+	tls: tls.Config | null = null
+	/// For a request's head as a whole, so a byte every few seconds does not hold a fiber forever; 0 for none.
+	headerTimeout: i64 = 30 * second
+	/// For each read and write of a body.
+	timeout: i64 = 30 * second
+	/// Between requests on a kept connection.
+	idleTimeout: i64 = 60 * second
+	maxHeaders: i64 = 1 << 16
+	/// Connections at once; accept waits past it.
+	maxConns = 10000
+	/// Connections open now.
+	conns = 0
+	private active = 0
+	private closing = false
+	private listener: Listener | null = null
+	/// Those between requests, or upgraded, each by itself.
+	private idle = new HashMap[Conn, Conn]()
+	/// Those on HTTP/2, by their connection.
+	private h2s = new HashMap[Conn, h2.Conn]()
+	/// Woken as a connection or a request ends.
+	private ended = new Signal()
+
+	/// Serves until close: each connection on a fiber of its own, each request through handler. One that throws is
+	/// logged to stderr and answered 500, or ends the connection if the response had begun or more than maxHeaders of
+	/// its body was left unread.
+	serve(handler: Handler) throws IoError | ParseError {
+		if (this.closing) {
+			return
+		}
+		const l = listen(this.addr)
+		this.listener = l
+		this.addr = `${l.addr}`
+		if (this.tls != null) {
+			this.tls = negotiating(this.tls!)
+		}
+		try {
+			while (true) {
+				while (this.conns >= this.maxConns && !this.closing) {
+					this.ended.wait()
+				}
+				const c = this.accept(l)
+				if (c == null) {
+					break
+				}
+				this.conns++
+				const job = async this.connection(c, handler)
+			}
+			// An h2 connection writes its responses after their handlers return, and ends once they are written.
+			while (this.active > 0 || this.h2s.size > 0) {
+				this.ended.wait()
+			}
+		} finally {
+			// Closed however serve ends, as a serve again would share its port.
+			this.listener = null
+			l.close()
+		}
+	}
+
+	/// Stops accepting and ends idle and upgraded connections; serve returns once the requests in flight are answered,
+	/// each of whose reads and writes is bounded by timeout.
+	close() {
+		this.closing = true
+		this.ended.wake() // For serve waiting at maxConns.
+		try {
+			this.listener?.close()
+		} catch (e: IoError) {}
+		for (const c of this.idle.values()) {
+			c.end() // Not by fd: an upgrade may have closed it, and the number gone to another.
+		}
+		for (const h of this.h2s.values()) {
+			const job = async h.close() // Each on a fiber of its own, as its GOAWAY may wait on a write.
+		}
+	}
+
+	/// A connection, or null once closing. Out of descriptors or memory, it waits for a connection to end and tries
+	/// again.
+	private accept(l: Listener): Conn | null throws IoError {
+		while (true) {
+			try {
+				return l.accept()
+			} catch (e: IoError) {
+				if (this.closing) {
+					return null
+				} else if (e.kind != "OutOfResources" || this.conns == 0) {
+					throw e
+				}
+				this.ended.wait()
+			}
+		}
+	}
+
+	/// Serves c until it ends: its requests in order, or as streams if it agreed on HTTP/2.
+	private connection(c: Conn, handler: Handler) {
+		let s: Stream = c
+		let h: h2.Conn | null = null
+		try {
+			if (this.tls != null) {
+				c.timeout = this.headerTimeout
+				s = tls.server(c, this.tls!)
+			}
+			if (s instanceof tls.Conn && s.alpn == "h2" && !this.closing) {
+				h = new h2.Conn(s, true, this.maxHeaders)
+				h.timeout = this.timeout
+				h.idleTimeout = this.idleTimeout
+				this.h2s.set(c, h)
+				const handle: h2.Handle = (head, body) => this.stream(head, body, handler)
+				h.serve(handle)
+			} else {
+				this.requests(c, s, handler)
+			}
+		} catch (e: IoError) {
+			// The connection is gone, past a timeout, or not TLS.
+		}
+		if (h == null) {
+			this.idle.delete(c) // Left there by an upgrade, or an idle read that threw.
+			drop(s) // h2 closes its own.
+		} else {
+			this.h2s.delete(c)
+		}
+		this.conns--
+		this.ended.wake()
+	}
+
+	/// Serves the requests on s in order until it ends, the handler fails, or a message asks to close.
+	private requests(c: Conn, s: Stream, handler: Handler) throws IoError {
+		const b = new Buffered(s)
+		while (!this.closing) {
+			s.timeout = this.idleTimeout
+			this.idle.set(c, c)
+			const more = b.pending() || b.fill()
+			this.idle.delete(c)
+			if (!more || this.closing) {
+				break
+			}
+			this.active++
+			try {
+				if (!this.exchange(c, b, handler)) {
+					break
+				}
+			} finally {
+				this.active--
+				this.ended.wake()
+			}
+		}
+	}
+
+	/// handler's response to req; a 500 if it throws, logged to stderr. OPTIONS *, which asks of the server and of no
+	/// resource (RFC 9112 §3.2.4), is a 200 the handler is not asked for, as Go answers it.
+	private run(req: Request, handler: Handler): Response {
+		if (req.url.path == "*") {
+			return new Response(200)
+		}
+		try {
+			return handler(req)
+		} catch (e: IoError | ParseError) {
+			stderr.write(`http: ${req.method} ${req.url.path}: ${if (e instanceof IoError) e.message() else `ParseError ${e.kind} at ${e.at}`}\n`)
+			return new Response(500)
+		}
+	}
+
+	/// One HTTP/2 stream: its head and body as a Request through handler; a 400 if the head is not a request's, a 500
+	/// if a header of the response is malformed. h2 closes the body it is given to send.
+	private stream(pairs: [string, string][], body: h2.Body | null,
+		handler: Handler): [[string, string][], ReadCloser | null] {
+		this.active++
+		let req: Request | null = null
+		try {
+			req = this.request(pairs, body)
+		} catch (e: IoError | ParseError) {}
+		const got = if (req == null) new Response(400) else this.run(req, handler)
+		this.active--
+		this.ended.wake()
+		const [res, pairs, bare] = this.prepare(got, if (req == null) "" else req.method, "HTTP/2")
+		const out = if (bare || res.body.length == 0) null else res.body
+		if (out == null) {
+			got.body.close() // One not sent, as a HEAD's, frees what it holds.
+		} else if (body != null && res.body.whole == null) {
+			try {
+				body.proceed() // As over HTTP/1.1: a response that streams may stream the body.
+			} catch (e: IoError) {}
+		}
+		return [[[":status", `${res.status}`], ...pairs], out]
+	}
+
+	/// res, or a 500 if its status is not 3 digits, or is interim, as no final one follows, or a header of res would
+	/// split the message, with its head's pairs for a request of version: Date added, and in place of any framing of
+	/// theirs Content-Length for a known length, Transfer-Encoding chunked for one unknown over HTTP/1.1, and neither
+	/// for a 204, 304 or 1xx; and whether no body follows: theirs or a HEAD's. Over h2, what is the connection's is
+	/// dropped.
+	private prepare(res: Response, method: string, version: Version): [Response, [string, string][], bool] {
+		let r = res
+		try {
+			head("", r.headers.entries)
+		} catch (e: IoError) {
+			r = new Response(500)
+		}
+		if (r.status < 200 && !(r.status == 101 && r.upgrade != null && version == "HTTP/1.1") || r.status > 999) {
+			r = new Response(500)
+		}
+		const h2 = version == "HTTP/2"
+		const pairs = r.headers.entries.filter(p => !isFraming(p[0]) && !(h2 && isConnection(p[0], p[1])))
+		if (!r.headers.has("date")) {
+			pairs.push(["date", httpDate(now())])
+		}
+		const bare = r.status == 204 || r.status == 304 || r.status / 100 == 1
+		// A HEAD's empty body keeps the handler's Content-Length, which may be a GET's (RFC 9110 §9.3.2).
+		const given = if (method == "HEAD" && r.body.length == 0) r.headers.get("content-length") else null
+		if (!bare && r.body.length != null) {
+			pairs.push(["content-length", given ?? `${r.body.length}`])
+		} else if (!bare && version == "HTTP/1.1") {
+			pairs.push(["transfer-encoding", "chunked"])
+		}
+		return [r, pairs, bare || method == "HEAD"]
+	}
+
+	/// The request an HTTP/2 head and body make, with one Host, from :authority or else Host, and its cookie fields
+	/// joined in one, as HTTP/1.1 has them (RFC 9113 §8.3.1, §8.2.3); null if the head is not a request's for a path
+	/// or OPTIONS *, or its Host and :authority differ.
+	private request(head: [string, string][], body: Reader | null): Request | null throws IoError | ParseError {
+		let method = ""
+		let path = ""
+		let authority = ""
+		const headers = new Headers()
+		const cookies: string[] = []
+		for (const [name, value] of head) {
+			if (name == ":method") {
+				method = value
+			} else if (name == ":path") {
+				path = value
+			} else if (name == ":authority" || name == "host") {
+				if (authority == "") {
+					authority = value
+				} else if (lower(value) != lower(authority)) {
+					return null
+				}
+			} else if (name == "cookie") {
+				cookies.push(value)
+			} else if (!startsWith(name, ":")) {
+				headers.append(name, value)
+			}
+		}
+		const star = method == "OPTIONS" && path == "*"
+		if (method == "" || !star && !startsWith(path, "/") || authority == "" || !isHost(authority)) {
+			return null
+		}
+		if (cookies.length > 0) {
+			headers.append("cookie", cookies.join("; "))
+		}
+		headers.entries = [["host", authority], ...headers.entries]
+		const req = new Request(method, `https://${authority}${if (star) "" else path}`)
+		if (star) {
+			req.url.path = "*"
+		}
+		req.method = method
+		req.version = "HTTP/2"
+		req.headers = headers
+		const length = headers.get("content-length")
+		if (body != null) {
+			req.body = new Body(body, if (length == null) null else number(length))
+		}
+		return req
+	}
+
+	/// Reads a request from b, on conn, and writes its response; whether the connection can carry another.
+	private exchange(conn: Conn, b: Buffered, handler: Handler): bool throws IoError {
+		const c = b.stream
+		b.deadline = deadline(this.headerTimeout)
+		let got: [Request, Framed | null, Version] | null = null
+		try {
+			got = this.receive(b, `${conn.local}`)
+		} catch (e: IoError | ParseError) {
+			if (e instanceof IoError && (e.kind == "TimedOut" || e.kind == "ConnectionReset")) {
+				return false
+			}
+			this.respond(c, "GET", new Response(400), true, "HTTP/1.1")
+			linger(c)
+			return false
+		}
+		if (got == null) {
+			return false
+		}
+		const [req, framed, version] = got!
+		b.deadline = 0
+		c.timeout = this.timeout
+		const res = this.run(req, handler)
+		const up = res.upgrade
+		if (res.status == 101 && up != null) {
+			// For close to end, as an upgrade has no request to finish.
+			this.idle.set(conn, conn)
+			// The new protocol begins after the body, asked for first if held back for 100 Continue (RFC 9110 §7.8);
+			// past maxHeaders of it there is none, nor a response: it lingers.
+			if (!drained(framed, this.maxHeaders)) {
+				linger(c)
+			} else if (!this.closing && this.respond(c, req.method, res, false, version).status == 101) {
+				up(new Upgraded(b)) // None once closing, as close has passed it by.
+			}
+			return false
+		}
+		// A body the handler left unread is drained after the response, up to maxHeaders; a response to one that may
+		// pass it closes, its head going before the body is read, even by an echo. One the client holds back for 100
+		// Continue is asked for only if the response streams, as it may stream the body; else it closes.
+		if (framed != null && res.body.whole == null) {
+			try {
+				framed.proceed()
+			} catch (e: IoError) {
+				res.close()
+				throw e
+			}
+		}
+		const last = this.closing || closes(req.headers) || closes(res.headers) || version == "HTTP/1.0"
+			|| framed != null && (framed.expect || framed.exceeds(this.maxHeaders))
+		this.respond(c, req.method, res, last, version)
+		if (!drained(framed, if (last) 0 else this.maxHeaders)) {
+			linger(c)
+			return false
+		}
+		return !last
+	}
+
+	/// The request whose head is next on b, with its body's framing and its version; null if b has ended.
+	private receive(b: Buffered, local: string): [Request, Framed | null, Version] | null throws IoError | ParseError {
+		const got = readHead(b, this.maxHeaders)
+		if (got == null) {
+			return null
+		}
+		const [parts, pairs] = got
+		const headers = new Headers()
+		headers.entries = pairs
+		const hosts = headers.all("host")
+		const version = versionOf(parts[2])
+		// An HTTP/1.0 request may have none, its host then the connection's (RFC 9112 §3.3).
+		const host = if (hosts.length == 0 && version == "HTTP/1.0") local
+			else if (hosts.length == 1) hosts[0] else null
+		if (!isToken(parts[0]) || !isTarget(parts[1]) || host == null || !isHost(host) || version == null) {
+			throw new IoError("Protocol", "read", parts.join(" "))
+		}
+		const [given, chunked] = framing(headers, version)
+		// A request with neither header has no body, where a response's would run to the end.
+		const length = if (chunked) null else given ?? 0
+		const scheme = if (this.tls == null) "http" else "https"
+		const star = parts[0] == "OPTIONS" && parts[1] == "*"
+		const origin = star || startsWith(parts[1], "/")
+		const req = new Request(parts[0],
+			if (origin) `${scheme}://${host}${if (star) "" else parts[1]}` else parts[1].copy())
+		// An absolute target, of the scheme served, overrides Host (RFC 9112 §3.2.2).
+		if (req.url.host == ""
+			|| !origin && (req.url.scheme != scheme || req.url.user != null || !isHost(req.url.host))) {
+			throw new IoError("Protocol", "read", parts.join(" "))
+		}
+		if (!origin) {
+			headers.set("host", split(req.url.origin(), "//")[1])
+		}
+		if (req.url.path == "") {
+			req.url.path = if (star) "*" else "/" // An absolute URL's empty path (RFC 9110 §4.2.3).
+		}
+		req.method = parts[0].copy()
+		req.version = version
+		req.headers = headers
+		let framed: Framed | null = null
+		if (length != 0 || chunked) {
+			framed = new Framed(b, length, chunked, (clean: bool) => {})
+			framed.expect = version == "HTTP/1.1" && lower(headers.get("expect") ?? "") == "100-continue"
+			req.body = new Body(framed, length)
+		}
+		return [req, framed, version]
+	}
+
+	/// Writes and returns res, or a 500 if a header of res would split the message: framed by its body's length, with
+	/// Date, and without a body for a HEAD or a status without one. If last, Connection is close alone. got's body is
+	/// closed after, written or not, to free what it holds.
+	private respond(c: Stream, method: string, got: Response, last: bool, version: Version): Response throws IoError {
+		try {
+			const [res, prepared, bare] = this.prepare(got, method, version)
+			const pairs = if (last) [...prepared.filter(p => p[0] != "connection"), ["connection", "close"]] else prepared
+			const start = head(`HTTP/1.1 ${res.status} `, pairs)
+			const body = res.body
+			if (bare) {
+				c.write(start)
+			} else if (body.whole != null) {
+				c.write(start + body.whole)
+			} else {
+				c.write(start)
+				const length = body.length
+				if (length != null) {
+					copyLength(body, c, length)
+				} else if (version == "HTTP/1.1") {
+					copyChunked(body, c)
+				} else {
+					copy(body, c)
+				}
+			}
+			return res
+		} finally {
+			got.body.close()
+		}
+	}
+}
+
+export function serve(handler: Handler, addr: string = ":8080") throws IoError | ParseError {
+	const s = new Server()
+	s.addr = addr
+	s.serve(handler)
+}
+
+/// How a body is framed by the headers of a message of version: its Content-Length, and whether it is chunked;
+/// Content-Length beside Transfer-Encoding, two of them, or a Transfer-Encoding other than chunked or in HTTP/1.0
+/// (RFC 9112 §6.1) are Protocol errors.
+function framing(headers: Headers, version: Version): [i64 | null, bool] throws IoError {
+	const te = headers.all("transfer-encoding")
+	const cl = headers.all("content-length")
+	if (te.length > 1 || te.length == 1 && (lower(te[0]) != "chunked" || cl.length > 0 || version == "HTTP/1.0")
+		|| cl.length > 1) {
+		throw new IoError("Protocol", "read", "framing")
+	}
+	if (te.length == 1) {
+		return [null, true]
+	}
+	if (cl.length == 0) {
+		return [null, false]
+	}
+	return [number(cl[0]), false]
+}
+
+/// req's headers to send after first, with Content-Length for a whole body unless empty and not a POST, PUT or
+/// PATCH's, and Transfer-Encoding chunked for a stream over HTTP/1.1, in place of any framing of theirs; without
+/// Host, and over h2 without what is the connection's.
+function outgoing(req: Request, first: [string, string][], h2: bool): [string, string][] {
+	const body = req.body.whole
+	if (body == null) {
+		if (!h2) {
+			first.push(["transfer-encoding", "chunked"])
+		}
+	} else if (body.length > 0 || req.method == "POST" || req.method == "PUT" || req.method == "PATCH") {
+		first.push(["content-length", `${body.length}`])
+	}
+	for (const [name, value] of req.headers.entries) {
+		if (!(name == "host" || isFraming(name) || h2 && isConnection(name, value))) {
+			first.push([name, value])
+		}
+	}
+	return first
+}
+
+/// Whether name is a framing header, which a message's body sets, not its sender.
+function isFraming(name: string): bool { return name == "content-length" || name == "transfer-encoding" }
+
+/// Whether a header is the connection's, which HTTP/2 forbids: TE is allowed as trailers alone.
+function isConnection(name: string, value: string): bool {
+	return name == "connection" || name == "keep-alive" || name == "upgrade" || name == "proxy-connection"
+		|| name == "te" && lower(trim(value)) != "trailers"
+}
+
+/// Whether headers' Connection lists close, in any case among other tokens.
+function closes(headers: Headers): bool {
+	return headers.all("connection").some(v => split(v, ",").some(t => lower(trim(t)) == "close"))
+}
+
+/// Whether s can be the authority of a URL: a host and port, without what would end them or begin a user or a path.
+function isHost(s: string): bool {
+	for (const ch of s) {
+		if (!(isAlphanumeric(ch) || indexOf("!$%&'()*+,-.:;=[]_~", chr(ch)) >= 0)) {
+			return false
+		}
+	}
+	return true
+}
+
+/// Writes r's bytes to s in chunks, then the last.
+function copyChunked(r: Reader, s: Stream) throws IoError {
+	while (true) {
+		const piece = r.read(1 << 16)
+		if (piece == null) {
+			break
+		}
+		if (piece.length > 0) {
+			s.write(chunk(piece))
+		}
+	}
+	s.write(chunk(""))
+}
+
+/// Writes r's length bytes to s; a reader of more or fewer is a Protocol error, as the bytes after would be read as
+/// the next message.
+function copyLength(r: Reader, s: Stream, length: i64) throws IoError {
+	let left = length
+	let piece = r.read(1 << 16)
+	while (piece != null && piece.length <= left) {
+		s.write(piece)
+		left -= piece.length
+		piece = r.read(1 << 16)
+	}
+	if (piece != null || left != 0) {
+		throw new IoError("Protocol", "write", "body")
+	}
+}
+
+/// A response's status from its start line's parts: Protocol unless of HTTP/1.x and 3 digits from 100.
+function statusOf(parts: string[]): i64 throws IoError {
+	const n = if (parts[1].length == 3) number(parts[1]) else 0
+	if (n < 100 || versionOf(parts[0]) == null) {
+		throw new IoError("Protocol", "read", parts.join(" "))
+	}
+	return n
+}
+
+/// The version s names on an HTTP/1 connection; null if not HTTP/1.x.
+function versionOf(s: string): Version | null {
+	if (s.length != 8 || !startsWith(s, "HTTP/1.") || !isDigit(s[7])) {
+		return null
+	}
+	return if (s == "HTTP/1.0") "HTTP/1.0" else "HTTP/1.1"
+}
+
+/// The number s spells in digits alone, as a status or a length; else a Protocol error.
+function number(s: string): i64 throws IoError {
+	try {
+		for (const ch of s) {
+			if (!isDigit(ch)) {
+				throw new ParseError("syntax", 0)
+			}
+		}
+		return parseInt[i64](s)
+	} catch (e: ParseError) {
+		throw new IoError("Protocol", "read", s)
+	}
+}
+
+/// Whether framed, if any, is at its end, read on while fewer than max bytes of it are.
+function drained(framed: Framed | null, max: i64): bool throws IoError {
+	let n: i64 = 0
+	while (framed != null && !framed.done && n < max) {
+		n += (framed.read(1 << 16) ?? "").length
+	}
+	return framed == null || framed.done
+}
+
+/// Ends s's writes, then reads what the peer still sends for up to half a second, so that closing on a request left
+/// unread does not reset the response before the peer reads it (RFC 9112 §9.6).
+function linger(s: Stream) {
+	try {
+		if (s instanceof Conn) {
+			s.shutdown()
+		} else if (s instanceof tls.Conn) {
+			s.shutdown()
+		}
+		const until = monotonic() + second / 2
+		let left = second / 2
+		while (left > 0) {
+			s.timeout = left // Never 0, which is none.
+			if (s.read(1 << 16) == null) {
+				break
+			}
+			left = until - monotonic()
+		}
+	} catch (e: IoError) {}
+}
+
+/// cfg, offering h2 and http/1.1 if it offers nothing.
+function negotiating(cfg: tls.Config): tls.Config {
+	if (cfg.alpn.length == 0) {
+		cfg.alpn = ["h2", "http/1.1"]
+	}
+	return cfg
+}
+
+/// A copy of cfg offering http/1.1 alone.
+function upgrading(cfg: tls.Config): tls.Config {
+	const c = new tls.Config()
+	c.roots = cfg.roots
+	c.cert = cfg.cert
+	c.key = cfg.key
+	c.insecure = cfg.insecure
+	c.alpn = ["http/1.1"]
+	return c
+}
+
+/// Closes s, whatever comes of it.
+function drop(s: Stream) {
+	try {
+		s.close()
+	} catch (e: IoError) {}
+}
+
+function upper(s: string): string {
+	let out = ""
+	for (const ch of s) {
+		out += chr(toUpper(ch))
+	}
+	return out
+}

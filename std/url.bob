@@ -1,0 +1,271 @@
+//! URLs as RFC 3986 parses them, not normalized, with the query as decoded pairs.
+
+import { indexOf, lastIndexOf, startsWith } from "./algo"
+import { ampersand, digit, dot, equal, isAlphabetic, isAlphanumeric, isHexDigit, minus, percent, plus, question, slash,
+	space, tilde, underscore } from "./ascii"
+
+import { ParseError, lower, parseInt } from "./string"
+
+export class Url {
+	scheme = ""
+	/// Before an @, even an empty one; null with none.
+	user: string | null = null
+	host = ""
+	port: u16 | null = null
+	path = ""
+	query = new Query()
+	fragment: string | null = null
+
+	/// s as a URI or a relative reference: [scheme:][//authority]path[?query][#fragment], the scheme lowercased. A syntax
+	/// error is at a space or a control or the bad byte of a port; a range error at a port past 65535.
+	static parse(s: string): Url throws ParseError {
+		const u = new Url()
+		for (const i of 0 ... s.length - 1) {
+			if (s[i] <= space) {
+				throw new ParseError("syntax", i)
+			}
+		}
+		let i = 0
+		const colonAt = indexOf(s, ":")
+		if (colonAt > 0 && isScheme(s.slice(0, colonAt))) {
+			u.scheme = lower(s.slice(0, colonAt))
+			i = colonAt + 1
+		}
+		const hashAt = indexOf(s, "#", i)
+		const end = if (hashAt < 0) s.length else hashAt
+		if (startsWith(s.slice(i, end), "//")) {
+			i += 2
+			let authEnd = i
+			while (authEnd < end && s[authEnd] != slash && s[authEnd] != question) {
+				authEnd++
+			}
+			const userEnd = lastIndexOf(s.slice(i, authEnd), "@")
+			if (userEnd >= 0) {
+				u.user = s.slice(i, i + userEnd)
+				i += userEnd + 1
+			}
+			const close = indexOf(s, "]", i)
+			const portAt = indexOf(s, ":", if (close >= 0 && close < authEnd) close else i)
+			const hostEnd = if (portAt >= 0 && portAt < authEnd) portAt else authEnd
+			u.host = s.slice(i, hostEnd)
+			if (hostEnd + 1 < authEnd) {
+				u.port = port(s, hostEnd + 1, authEnd)
+			}
+			i = authEnd
+		}
+		const questionAt = indexOf(s, "?", i)
+		const pathEnd = if (questionAt >= 0 && questionAt < end) questionAt else end
+		u.path = s.slice(i, pathEnd)
+		if (pathEnd < end) {
+			u.query = Query.parse(s.slice(pathEnd + 1, end))
+		}
+		if (hashAt >= 0) {
+			u.fragment = s.slice(hashAt + 1, s.length)
+		}
+		return u
+	}
+
+	/// scheme://host:port, no default port.
+	origin(): string { return `${this.scheme}://${this.host}${if (this.port == null) "" else `:${this.port}`}` }
+
+	/// The authority, user@host:port, is written when any of it is set, so file:///p comes back as file:/p, or as an
+	/// empty // when the path starts with //, which would be taken for one; a path a:b with neither, as ./a:b.
+	toString(): string {
+		let s = if (this.scheme == "") "" else `${this.scheme}:`
+		if (this.user != null || this.host != "" || this.port != null || startsWith(this.path, "//")) {
+			const user = if (this.user == null) "" else `${this.user}@`
+			s += `//${user}${this.host}${if (this.port == null) "" else `:${this.port}`}`
+		}
+		// A first segment parse would take for a scheme comes after ./ (RFC 3986 §4.2).
+		const colon = indexOf(this.path, ":")
+		if (s == "" && colon > 0 && isScheme(this.path.slice(0, colon))) {
+			s = "./"
+		}
+		s += this.path
+		const q = this.query.toString()
+		if (q != "" || this.query.raw != null) {
+			s += `?${q}`
+		}
+		return if (this.fragment == null) s else `${s}#${this.fragment}`
+	}
+
+	/// ref against this, as RFC 3986 §5.2 resolves it; what a redirect's Location means.
+	resolve(ref: string): Url throws ParseError {
+		const r = Url.parse(ref)
+		if (r.scheme != "") {
+			r.path = removeDots(r.path)
+			return r
+		}
+		r.scheme = this.scheme
+		if (startsWith(ref, "//")) { // An authority, though maybe empty.
+			r.path = removeDots(r.path)
+			return r
+		}
+		r.user = this.user
+		r.host = this.host
+		r.port = this.port
+		if (r.path == "") {
+			r.path = this.path
+			if (r.query.raw == null) {
+				// A copy, so that editing one leaves the other, its raw too, null if this had no ?.
+				r.query = Query.parse(this.query.toString())
+				r.query.raw = this.query.raw
+			}
+		} else if (startsWith(r.path, "/")) {
+			r.path = removeDots(r.path)
+		} else if (this.host != "" && this.path == "") {
+			r.path = removeDots(`/${r.path}`)
+		} else {
+			let cut = this.path.length
+			while (cut > 0 && this.path[cut - 1] != slash) {
+				cut--
+			}
+			r.path = removeDots(this.path.slice(0, cut) + r.path)
+		}
+		return r
+	}
+}
+
+/// Pairs in order, decoded, with names kept as written.
+export class Query {
+	entries: [string, string][] = []
+	/// What the pairs were parsed from, even an empty ?, until set, append or delete edits them.
+	raw: string | null = null
+
+	/// s as a query string, what a form posts too: name=value pairs between &s, decoded.
+	static parse(s: string): Query {
+		const q = new Query()
+		let start = 0
+		while (start <= s.length) {
+			let end = start
+			let eq = -1
+			while (end < s.length && s[end] != ampersand) {
+				if (eq < 0 && s[end] == equal) {
+					eq = end
+				}
+				end++
+			}
+			if (end > start) {
+				const value = if (eq < 0) "" else s.slice(eq + 1, end)
+				q.entries.push([unescape(s.slice(start, if (eq < 0) end else eq)), unescape(value)])
+			}
+			start = end + 1
+		}
+		q.raw = s
+		return q
+	}
+
+	/// The first value of name.
+	get(name: string): string | null {
+		const e = this.entries.find(e => e[0] == name)
+		return if (e == null) null else e[1]
+	}
+
+	/// Every value of name.
+	all(name: string): string[] { return this.entries.filter(e => e[0] == name).map(e => e[1]) }
+	has(name: string): bool { return this.entries.some(e => e[0] == name) }
+
+	set(name: string, value: string) {
+		this.delete(name)
+		this.append(name, value)
+	}
+
+	append(name: string, value: string) {
+		this.entries.push([name, value])
+		this.raw = null
+	}
+
+	delete(name: string) {
+		this.entries = this.entries.filter(e => e[0] != name)
+		this.raw = null
+	}
+
+	/// raw, or the pairs encoded, name=value between &s; a pair with an empty value is its name alone.
+	toString(): string {
+		return this.raw
+			?? this.entries.map(e => if (e[1] == "") escape(e[0]) else `${escape(e[0])}=${escape(e[1])}`).join("&")
+	}
+}
+
+/// s with + a space, unless in a path, and each %XX its byte; a % not followed by two hex digits is kept, as WHATWG.
+export function unescape(s: string, path = false): string {
+	let out = ""
+	let i = 0
+	while (i < s.length) {
+		const ch = s[i]
+		if (ch == percent && i + 2 < s.length && isHexDigit(s[i + 1]) && isHexDigit(s[i + 2])) {
+			out += chr(digit(s[i + 1])! << 4 | digit(s[i + 2])!)
+			i += 3
+		} else {
+			out += if (ch == plus && !path) " " else chr(ch)
+			i++
+		}
+	}
+	return out
+}
+
+const hex = "0123456789ABCDEF"
+
+/// s with a space as + and each byte but the unreserved, letters, digits and -._~, as %XX.
+function escape(s: string): string {
+	let out = ""
+	for (const ch of s) {
+		if (ch == space) {
+			out += "+"
+		} else if (isAlphanumeric(ch) || ch == minus || ch == dot || ch == underscore || ch == tilde) {
+			out += chr(ch)
+		} else {
+			out += `%${chr(hex[ch >> 4])}${chr(hex[ch & 15])}`
+		}
+	}
+	return out
+}
+
+/// Whether s is a scheme: a letter, then letters, digits, +, - and .s.
+function isScheme(s: string): bool {
+	for (const ch of s) {
+		if (!(isAlphanumeric(ch) || ch == plus || ch == minus || ch == dot)) {
+			return false
+		}
+	}
+	return isAlphabetic(s[0])
+}
+
+/// The port at s[from] up to to, with errors placed in s.
+function port(s: string, from: i32, to: i32): u16 throws ParseError {
+	try {
+		return parseInt[u16](s.slice(from, to))
+	} catch (e: ParseError) {
+		throw new ParseError(e.kind, from + e.at)
+	}
+}
+
+/// p without its . and .. segments, as RFC 3986 §5.2.4 removes them.
+function removeDots(p: string): string {
+	let input = p
+	const out: string[] = []
+	while (input.length > 0) {
+		if (startsWith(input, "../")) {
+			input = input.slice(3, input.length)
+		} else if (startsWith(input, "./") || startsWith(input, "/./")) {
+			input = input.slice(2, input.length)
+		} else if (input == "/.") {
+			input = "/"
+		} else if (startsWith(input, "/../") || input == "/..") {
+			input = if (input.length == 3) "/" else input.slice(3, input.length)
+			if (out.length > 0) {
+				out.pop()
+			}
+		} else if (input == "." || input == "..") {
+			input = ""
+		} else {
+			let next = 1
+			while (next < input.length && input[next] != slash) {
+				next++
+			}
+			out.push(input.slice(0, next))
+			input = input.slice(next, input.length)
+		}
+	}
+	return out.join("")
+}

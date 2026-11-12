@@ -1,0 +1,214 @@
+//! TCP, UDP and Unix sockets: a Conn reads and writes bytes, a Listener accepts Conns, a UdpConn sends and receives
+//! datagrams. A failure throws an IoError.
+
+import { endsWith, indexOf, lastIndexOf, startsWith } from "./algo"
+import { remove } from "./fs"
+import { Stream } from "./io"
+import { Handle } from "../builtin/sys"
+import { max, min } from "./math"
+import { resolve } from "./net/dns"
+import { ParseError, parseInt } from "./string"
+import { deadline, monotonic, second } from "./time"
+
+/// An IP and port, or a Unix socket's path and port 0.
+export class Addr {
+	host: string
+	port: u16
+
+	constructor(host: string, port: u16) {
+		this.host = host
+		this.port = port
+	}
+
+	/// "host:port", a v6 host in brackets, or a unix socket's "unix:/path", as dial takes it.
+	toString(): string {
+		if (this.port != 0) {
+			return `${bracketed(this.host)}:${this.port}`
+		}
+		return if (startsWith(this.host, "/")) `unix:${this.host}` else this.host
+	}
+}
+
+export class Conn implements Stream {
+	readonly local: Addr
+	readonly remote: Addr
+	/// For each read, and each 64 KiB of a write, in ns; 0 for none.
+	timeout: i64 = 30 * second
+	readonly handle: Handle
+
+	constructor(h: Handle) throws IoError {
+		this.handle = h
+		this.local = addrOf(h.local())
+		this.remote = addrOf(h.peer())
+	}
+
+	/// Up to n > 0 bytes, or null once the peer has ended or close interrupts the read.
+	read(n: i32): string | null throws IoError { return this.handle.read(n, deadline(this.timeout)) }
+
+	write(s: string) throws IoError {
+		// A deadline per piece: a slow peer that keeps reading does not time out.
+		let at = 0
+		while (at < s.length) {
+			const to = min(at + (1 << 16), s.length)
+			this.handle.write(s.slice(at, to), deadline(this.timeout))
+			at = to
+		}
+	}
+
+	/// Whether it is open, with nothing unread and the peer not ended; never waits.
+	idle(): bool { return this.handle.idle() }
+
+	/// Ends reads and writes, waking those in flight, as close does but keeping the descriptor; nothing once closed.
+	end() {
+		try {
+			this.handle.shutdown(true)
+		} catch (e: IoError) {}
+	}
+
+	/// Ends writes; the peer reads an end.
+	shutdown() throws IoError { this.handle.shutdown() }
+	close() throws IoError { this.handle.close() }
+	/// Closes it with a reset: the peer's reads and writes fail with ConnectionReset rather than end.
+	reset() throws IoError { this.handle.reset() }
+}
+
+/// A connection to addr, "host:port", "[v6]:port" or "unix:/path", within timeout ns, its name's lookup too; each
+/// address of a name is tried in turn, each for an even share of the time left, at least 2 s of it, as Go's; the last
+/// failure thrown.
+export function dial(addr: string, timeout: i64 = 10 * second): Conn throws IoError | ParseError {
+	const end = deadline(timeout)
+	const h = opened(addr, "dial", (host, port, left) => {
+		const rest = max(end - monotonic(), 1)
+		return Handle.dial("tcp", host, port, if (end == 0) 0 else deadline(max(rest / left, min(rest, 2 * second))))
+	}, end)
+	return closing(h, h => new Conn(h))
+}
+
+export class Listener {
+	readonly addr: Addr
+	readonly handle: Handle
+	private open = true
+
+	constructor(h: Handle) throws IoError {
+		this.handle = h
+		this.addr = addrOf(h.local())
+	}
+
+	/// The next connection; one whose peer has gone before it was taken is dropped.
+	accept(): Conn throws IoError {
+		while (true) {
+			const h = this.handle.accept()
+			try {
+				return new Conn(h)
+			} catch (e: IoError) {
+				h.close()
+			}
+		}
+	}
+
+	/// Closes the socket, and removes a unix one's file, as Go's does, so that its path can be listened on again.
+	close() throws IoError {
+		if (this.open) {
+			this.open = false
+			this.handle.close()
+			if (startsWith(this.addr.host, "/")) {
+				try {
+					remove(this.addr.host)
+				} catch (e: IoError) {}
+			}
+		}
+	}
+}
+
+/// A socket listening on addr, as dial takes it; ":port" is every address, and port 0 any free one, which addr then
+/// holds. A port other than 0 may be listened on by several at once, as each isolate does.
+export function listen(addr: string, backlog: i32 = 1024): Listener throws IoError | ParseError {
+	const h = opened(addr, "listen", (host, port, _) => Handle.listen("tcp", host, port, backlog))
+	return closing(h, h => new Listener(h))
+}
+
+/// A datagram socket bound to addr, as listen takes it.
+export class UdpConn {
+	readonly addr: Addr
+	/// For each receive and send, in ns; 0 for none.
+	timeout: i64 = 30 * second
+	readonly handle: Handle
+
+	constructor(h: Handle) throws IoError {
+		this.handle = h
+		this.addr = addrOf(h.local())
+	}
+
+	/// The next datagram, cut to n bytes, and its sender.
+	receive(n: i32 = 65535): [string, Addr] throws IoError {
+		const [data, host, port] = this.handle.receive(n, deadline(this.timeout))
+		return [data, new Addr(host, port)]
+	}
+
+	/// Sends data as one datagram to addr, as dial takes it: to the first of a name's addresses it can be sent to, a v6
+	/// one being Unsupported from a v4 socket, within timeout in all; else the last failure.
+	send(data: string, addr: string) throws IoError | ParseError {
+		const end = deadline(this.timeout)
+		opened(addr, "send", (host, port, _) => {
+			this.handle.send(data, host, port, end)
+			return true
+		}, end)
+	}
+
+	close() throws IoError { this.handle.close() }
+}
+
+export function listenUdp(addr: string): UdpConn throws IoError | ParseError {
+	const h = opened(addr, "listen", (host, port, _) => Handle.listen("udp", host, port))
+	return closing(h, h => new UdpConn(h))
+}
+
+/// What f gives for the first of addr's hosts, as addresses has them, it succeeds on, given how many are left with it;
+/// else the last failure, of op.
+function opened[T](addr: string, op: string, f: (host: string, port: i32, left: i64) => T throws IoError,
+	by: i64 = 0): T throws IoError | ParseError {
+	const [all, port] = addresses(addr, by)
+	let err = new IoError("NotFound", op, addr)
+	let left = all.length as i64
+	for (const host of all) {
+		try {
+			return f(host, port as i32, left)
+		} catch (e: IoError) {
+			err = e
+		}
+		left -= 1
+	}
+	throw err
+}
+
+/// The hosts and port addr means: a Unix socket's path, an IP, or each of a name's, its lookup bounded by by, as
+/// resolve's; ":port" is v6's any address, which takes v4 too, then v4's, for where there is no v6.
+function addresses(addr: string, by: i64 = 0): [string[], u16] throws IoError | ParseError {
+	if (startsWith(addr, "unix:/")) {
+		return [[addr.slice(5, addr.length)], 0]
+	}
+	const colon = lastIndexOf(addr, ":")
+	if (colon < 0) {
+		throw new ParseError("syntax", addr.length)
+	}
+	let host = addr.slice(0, colon)
+	if (startsWith(host, "[") && endsWith(host, "]")) {
+		host = host.slice(1, host.length - 1)
+	}
+	const port = parseInt[u16](addr.slice(colon + 1, addr.length))
+	return [if (host == "") ["::", "0.0.0.0"] else resolve(host, by), port]
+}
+
+/// What make gives of h, which its failure closes.
+function closing[T](h: Handle, make: (h: Handle) => T throws IoError): T throws IoError {
+	try {
+		return make(h)
+	} catch (e: IoError) {
+		h.close()
+		throw e
+	}
+}
+
+function addrOf(a: [string, u16]): Addr { return new Addr(a[0], a[1]) }
+
+function bracketed(host: string): string { return if (indexOf(host, ":") >= 0) `[${host}]` else host }

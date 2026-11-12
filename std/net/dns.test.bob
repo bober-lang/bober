@@ -1,0 +1,225 @@
+import { ipBytes } from "../../builtin/sys"
+import { Listener, UdpConn, listen, listenUdp } from "../net"
+import { ParseError, parseInt, split, trim } from "../string"
+import { millisecond, monotonic, second } from "../time"
+import { A, AAAA, CNAME, Resolver, decode, encode, labels, parseHosts, parseResolv } from "./dns"
+
+/// a.test's addresses.
+const a = "a.test 60 A 1.2.3.4\na.test 60 AAAA 2001:db8::1"
+
+/// big.test's 40 addresses, more than a UDP answer holds.
+function big(): string {
+	let zone = ""
+	for (const i of 1 ... 40) {
+		zone += `big.test 60 A 10.0.0.${i}\n`
+	}
+	return zone
+}
+
+/// A record on the wire, its owner a pointer to the question's name if empty.
+function rr(owner: string, kind: u16, ttl: u8, data: string): string {
+	return (if (owner == "") fromBytes([0xc0, 0x0c]) else labels(owner))
+		+ fromBytes([0, kind as u8, 0, 1, 0, 0, 0, ttl, 0, data.length as u8]) + data
+}
+
+/// The reply to q from zone, truncated to the UDP size if over is set. zone's lines are `owner ttl kind data`, data
+/// an IP or, for a CNAME, a name; the answer is the records of q's name and of those its CNAMEs name, of q's kind or
+/// CNAME, in zone's order.
+function reply(zone: string, q: string, over: bool): string throws ParseError {
+	const m = decode(q)
+	const lines = split(zone, "\n").map(l => split(trim(l), " ")).filter(l => l.length == 4)
+	const owners = [m.name, ...lines.filter(l => l[0] == m.name && l[2] == "CNAME" && l[3] != m.name).map(l => l[3])]
+	const want = if (m.qtype == A) "A" else "AAAA"
+	const rrs: string[] = []
+	for (const [owner, ttl, kind, data] of lines) {
+		if (owners.includes(owner) && (kind == want || kind == "CNAME")) {
+			const cname = kind == "CNAME"
+			rrs.push(rr(if (owner == m.name) "" else owner, if (cname) CNAME else m.qtype, parseInt[u8](ttl),
+				if (cname) labels(data) else ipBytes(data)!))
+		}
+	}
+	const known = lines.some(l => l[0] == m.name)
+	const r = fromBytes([q[0], q[1], 0x81, if (known) 0x80 else 0x83, 0, 1, 0, rrs.length as u8, 0, 0, 0, 0])
+		+ q.slice(12, q.length) + rrs.join("")
+	return if (over && r.length > 512) fromBytes([r[0], r[1], 0x83]) + r.slice(3, 512) else r
+}
+
+let queries = 0
+/// Whether A queries are lost.
+let lose = false
+
+function serveUdp(u: UdpConn, zone: string) throws IoError | ParseError {
+	while (true) {
+		const [q, from] = u.receive()
+		queries += 1
+		if (lose && decode(q).qtype == A) {
+			continue
+		}
+		u.send("", `${from}`)
+		u.send("junk", `${from}`)
+		u.send(q, `${from}`) // The query echoed, not a response.
+		u.send(reply(zone, q.slice(0, 12) + labels("stray.test") + q.slice(q.length - 4, q.length), true), `${from}`)
+		u.send(reply(zone, q, true), `${from}`)
+	}
+}
+
+function serveTcp(l: Listener, zone: string) throws IoError | ParseError {
+	while (true) {
+		const c = l.accept()
+		try {
+			const got = c.read(4096)!
+			const r = reply(zone, got.slice(2, got.length), false)
+			c.write(fromBytes([(r.length >> 8) as u8, (r.length & 0xff) as u8]) + r)
+		} finally {
+			c.close()
+		}
+	}
+}
+
+/// A resolver asking only a fake server of zone, as reply takes it, which serves on fibers of its own, on a port free
+/// for both udp and tcp.
+function fake(zone: string): Resolver throws IoError | ParseError {
+	let u = listenUdp("127.0.0.1:0")
+	let t: Listener | null = null
+	while (t == null) {
+		try {
+			t = listen(`${u.addr}`)
+		} catch (e: IoError) {
+			u.close()
+			u = listenUdp("127.0.0.1:0")
+		}
+	}
+	const udp = async serveUdp(u, zone)
+	const tcp = async serveTcp(t!, zone)
+	const r = new Resolver()
+	r.servers = [`${u.addr}`]
+	return r
+}
+
+test "a, aaaa and cname answers" {
+	// d.test's CNAME after the addresses it leads to.
+	const r = fake(`c.test 60 CNAME a.test\n${a}\nd.test 60 CNAME a.test\nloop.test 60 CNAME loop.test`)
+	assert r.resolve("A.test").join(",") == "2001:db8::1,1.2.3.4"
+	assert r.resolve("c.test").join(",") == "2001:db8::1,1.2.3.4"
+	assert r.resolve("d.test").join(",") == "2001:db8::1,1.2.3.4" // The address before the CNAME to it.
+	assert r.resolve("a.test.").join(",") == "2001:db8::1,1.2.3.4"
+	assert r.resolve("::1").join(",") == "::1" && r.resolve("localhost").join(",") == "::1,127.0.0.1"
+	assert r.resolve("APP.localhost.").join(",") == "::1,127.0.0.1"
+	assert r.resolve("none.test") throws new IoError("NotFound", "resolve", "none.test")
+	assert r.resolve("loop.test") throws new IoError("NotFound", "resolve", "loop.test")
+}
+
+test "a truncated answer is asked again over tcp" {
+	const ips = fake(big()).resolve("big.test")
+	assert ips.length == 40 && ips[0] == "10.0.0.1" && ips[39] == "10.0.0.40"
+}
+
+test "answers are cached for their ttl" {
+	const r = fake(`${a}\nzero.test 0 A 1.2.3.4`)
+	queries = 0
+	r.resolve("a.test")
+	r.resolve("a.test")
+	assert queries == 2
+	r.resolve("zero.test")
+	r.resolve("zero.test")
+	assert queries == 6
+}
+
+test "an answer to one query alone, the other lost, is not cached" {
+	const r = fake(a)
+	r.timeout = 50 * millisecond
+	r.attempts = 1
+	lose = true
+	assert r.resolve("a.test").join(",") == "2001:db8::1"
+	lose = false
+	assert r.resolve("a.test").join(",") == "2001:db8::1,1.2.3.4"
+}
+
+test "a timeout of 0 is none" {
+	const r = fake(`${a}\n${big()}`)
+	r.timeout = 0
+	assert r.resolve("a.test").join(",") == "2001:db8::1,1.2.3.4" && r.resolve("big.test").length == 40
+}
+
+test "a silent server times out" {
+	const u = listenUdp("127.0.0.1:0")
+	const r = new Resolver()
+	r.servers = [`${u.addr}`]
+	r.timeout = 50 * millisecond
+	r.attempts = 1
+	assert r.resolve("a.test") throws new IoError("TimedOut", "resolve", `${u.addr}`)
+	// by cuts every try short: two of 2 s are done in 100 ms.
+	r.timeout = 2 * second
+	r.attempts = 2
+	const from = monotonic()
+	assert r.resolve("a.test", from + 100 * millisecond) throws new IoError("TimedOut", "resolve", `${u.addr}`)
+	assert monotonic() - from < second
+	r.servers = []
+	assert r.resolve("a.test") throws new IoError("NotFound", "resolve", "a.test")
+}
+
+test "resolv.conf and hosts" {
+	const r = parseResolv("# mine\nnameserver 10.0.0.1\nnameserver ::1\nsearch Svc.local. local\noptions ndots:2\n")
+	assert r.servers.join(",") == "10.0.0.1:53,[::1]:53"
+	assert r.search.join(",") == "svc.local,local" && r.ndots == 2
+	assert parseResolv("").servers.join(",") == "127.0.0.1:53,[::1]:53" && parseResolv("search .\n").search.length == 0
+	r.hosts = parseHosts("127.0.0.1 localhost Box # me\n::1 localhost\nfe80::1%lo zoned\n10.0.0.1/24 masked\n\n")
+	assert r.hosts.get("localhost")!.join(",") == "127.0.0.1,::1" && r.resolve("localhost").join(",") == "::1,127.0.0.1"
+	assert r.resolve("BOX").join(",") == "127.0.0.1"
+	assert r.hosts.get("zoned") == null && r.hosts.get("masked") == null
+}
+
+test "search domains" {
+	const r = fake(a)
+	r.search = ["test"]
+	assert r.resolve("a").join(",") == "2001:db8::1,1.2.3.4"
+	assert r.resolve("a.") throws new IoError("NotFound", "resolve", "a")
+	r.search = ["none"]
+	r.ndots = 2
+	assert r.resolve("a.test").join(",") == "2001:db8::1,1.2.3.4"
+	assert r.resolve("b.test") throws new IoError("NotFound", "resolve", "b.test")
+}
+
+test "a name the wire cannot carry is rejected" {
+	const r = new Resolver()
+	let label = "x"
+	while (label.length < 63) {
+		label += "x"
+	}
+	const name = `${label}.${label}.${label}.${label}`  // 255 bytes
+	assert r.resolve(name) throws new IoError("InvalidInput", "resolve", name)
+	assert r.resolve(`x${label}.test`) throws new IoError("InvalidInput", "resolve", `x${label}.test`)
+	assert r.resolve("a..b") throws new IoError("InvalidInput", "resolve", "a..b")
+}
+
+test "messages encode and decode" {
+	const q = encode(0x1234, "www.Example.test", AAAA)
+	const m = decode(q)
+	assert m.id == 0x1234 && m.name == "www.Example.test" && m.qtype == AAAA && m.answers.length == 0
+	const r = reply(`c.test 60 CNAME a.test\n${a}`, encode(1, "c.test", A), false)
+	const a = decode(r).answers
+	assert a.length == 2 && a[0].name == "c.test" && a[0].kind == CNAME && a[0].data == "a.test"
+	assert a[1].name == "a.test" && a[1].data == "1.2.3.4" && a[1].ttl == 60
+	const top = r.length - 10 // The last record's TTL, its top bit set.
+	assert decode(r.slice(0, top) + fromBytes([0x80]) + r.slice(top + 1, r.length)).answers[1].ttl == 0
+	assert decode("short") throws new ParseError("syntax", 4)
+	assert decode(q.slice(0, 12) + fromBytes([0xc0, 0x0c, 0, 1, 0, 1])) throws new ParseError("syntax", 12)
+	assert decode(q.slice(0, 12) + fromBytes([1, 97, 0xc0, 0x0c, 0, 1, 0, 1])) throws new ParseError("syntax", 14)
+	let l = "x"
+	while (l.length < 61) {
+		l += "x"
+	}
+	assert decode(q.slice(0, 12) + fromBytes([0x40]) + l + "xxx\0" + fromBytes([0, 1, 0, 1])) throws new ParseError("syntax", 12)
+	assert decode(encode(1, `${l}xx.${l}xx.${l}xx.${l}`, A)).name.length == 253  // 255 bytes on the wire
+	assert decode(encode(1, `${l}xx.${l}xx.${l}xx.${l}x`, A)) throws new ParseError("syntax", 204)
+	const b = encode(1, "a.test", A)
+	const empty = fromBytes([0, 1, 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0]) + b.slice(12, b.length) + rr("", A, 60, "")
+		+ rr("", A, 60, ipBytes("1.2.3.4")!)
+	assert decode(empty) throws new ParseError("syntax", 34)
+	let chain = fromBytes([0, 1, 0, 0, 0, 129, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0xc0, 12, 0, 1, 0, 1])
+	for (const _ of 1 ... 127) {
+		const to: i32 = chain.length - 6
+		chain += fromBytes([(0xc0 | to >> 8) as u8, (to & 0xff) as u8, 0, 1, 0, 1])  // the question before
+	}
+	assert decode(chain) throws new ParseError("syntax", 17)
+}
