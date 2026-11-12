@@ -25,7 +25,8 @@ export class Tree {
 	kind: Syntax
 	t: ...Tok
 	parts: Part[]
-	/// Where its parts end, before its closing token, for a block, switch or one of items in brackets.
+	/// Where its parts end, before its closing token, for a block, switch, parenthesized expression or one of items in
+	/// brackets.
 	end: i32 = 0
 
 	constructor(kind: Syntax, t: Tok, parts: Part[] = []) {
@@ -648,12 +649,14 @@ export class Parser {
 			this.list(n, ")", () => this.param(true))
 			return this.arrow(n)
 		}
-		this.expect(")")
+		const close = this.expect(")")
 		if (bare && this.peek().kind == "=>") {
 			return this.arrow(new Tree("params", t, [this.paramAt(first, x)]))
 		}
 		this.shape = "("
-		return new Tree("paren", t, [x])
+		const n = new Tree("paren", t, [x])
+		n.end = close.loc.pos
+		return n
 	}
 
 	private arrow(params: Tree): Tree {

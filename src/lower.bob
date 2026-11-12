@@ -32,11 +32,12 @@ import { Opcode } from "./bc/op"
 import { Code, Program, TypeParam, sourceHash } from "./bc/program"
 import {
 	Checked, Node, after, arrowBody, bodyOf, check, child, compared, element, has, isLink, isTok, isTypeValue, operands,
-	optional, selfOf, show as showType, standsFor, substitute, supers,
+	optional, selfOf, show as showType, sourceOf, standsFor, substitute, supers,
 } from "./check"
 import { CompileError } from "./error"
 import { Tok } from "./lex"
 import { Lift } from "./lift"
+import { holdsType } from "./resolve"
 import { builtinPath } from "./root"
 import { Bool, Field, Null, String, Type, basics, members } from "./type"
 import { strtod } from "stdlib.h"
@@ -142,7 +143,7 @@ export class Lower implements Checked {
 		const file = switch (name) {
 			case "zero", "subtest", "mark": "mem"
 			case "equal", "literal": "equal"
-			case "show": "show"
+			case "show", "item", "diff": "show"
 			case "newArray": "array"
 			case "pow": "math"
 			default: "fiber" // start, wait, race and Future
@@ -623,6 +624,9 @@ class Gen {
 	private loops: Loop[] = []
 	/// Whether an assert's expression is being lowered, where == and != compare by value; its closures inherit it.
 	private asserting = false
+	/// The subexpressions of the assert being lowered whose values its failure shows, and the locals expr keeps them in.
+	private shown: Node[] = []
+	private kept: i32[] = []
 	/// Whether the code is a test's, or a closure's in one, each statement of which marks where the test is.
 	private testing: bool
 
@@ -783,6 +787,12 @@ class Gen {
 	expr(p: Node) {
 		const pos = this.at(p)
 		this.cast(this.raw(p), this.ty(p.type!))
+		const i = this.shown.indexOf(p)
+		if (i >= 0) {
+			this.kept[i] = if (this.kept[i] < 0) this.temp(this.ty(p.type!)) else this.kept[i]
+			this.op(op.SetLocal, this.kept[i])
+			this.op(op.Local, this.kept[i])
+		}
 		this.code.at = pos
 	}
 
@@ -1122,47 +1132,68 @@ class Gen {
 		this.op(op.End)
 	}
 
-	/// Asserts p, a conjunct at a time, and of a || the right if the left is false; a comparison's failure shows its
-	/// operands, as `${}` does.
+	/// Asserts p, a conjunct at a time; a failure shows p's source, and on a line each, the source and value of each
+	/// subexpression of it that was evaluated, but of strings == compares, how their lines differ.
 	private assert(p: Node) {
-		const how = p.t.kind
-		if (p.kind == "binary" && how == "&&") {
+		if (p.kind == "binary" && p.t.kind == "&&") {
 			this.assert(p.parts[0])
 			return this.assert(p.parts[1])
 		}
-		if (p.kind == "binary" && how == "||") {
-			this.value(p.parts[0], Bool)
-			this.open(op.If, kind.None)
-			this.op(op.Else)
-			this.assert(p.parts[1])
-			return this.op(op.End)
-		}
-		if (p.kind != "binary" || !["==", "!=", "<", ">", "<=", ">="].includes(how) || p.parts.some(q => isTok(q, "null"))) {
-			this.value(p, Bool)
-			return this.op(op.Assert)
-		}
-		const [a, b] = p.parts
-		const jt = compared(a.type!, b.type!) ?? b.type!
-		const t = this.ty(jt)
-		const [l, r] = [this.temp(t), this.temp(t)]
-		this.to(a, t)
-		this.op(op.SetLocal, l)
-		this.to(b, t)
-		this.op(op.SetLocal, r)
-		this.op(op.Local, l)
-		this.op(op.Local, r)
-		this.compare(how, jt)
+		const texts = p.kind == "binary" && p.t.kind == "==" && p.parts.every(q => textual(q.type!))
+		this.shown = if (texts) [...p.parts] else []
+		this.watch(p, true)
+		this.kept = this.shown.map(q => -1)
+		this.value(p, Bool)
 		this.open(op.If, kind.None)
 		this.op(op.Else)
-		this.op(op.Local, l)
-		this.toString(jt)
-		this.op(op.Str, this.prog.intern(` ${how} `))
-		this.op(op.Add)
-		this.op(op.Local, r)
-		this.toString(jt)
-		this.op(op.Add)
+		this.op(op.Str, this.prog.intern(this.brief(p)))
+		for (const i of (if (texts) 2 else 0) ... this.shown.length - 1) { // the strings compared show as their diff
+			const q = this.shown[i]
+			if (this.kept[i] >= 0) {
+				this.op(op.Str, this.prog.intern(`\n  ${this.brief(q)}: `))
+				this.op(op.Add)
+				this.op(op.Local, this.kept[i])
+				this.callBuiltin("item", this.u.list([q.type!], false, this))
+				this.op(op.Add)
+			}
+		}
+		if (texts) {
+			for (const i of 0 ... 1) {
+				this.op(op.Local, this.kept[i])
+				this.cast(this.ty(p.parts[i].type!), kind.String)
+			}
+			this.callBuiltin("diff", 0)
+			this.op(op.Add)
+		}
 		this.op(op.Fail)
 		this.op(op.End)
+		this.shown = []
+	}
+
+	/// The source of p, of its first line only, then …, if it has more.
+	private brief(p: Node): string {
+		const s = sourceOf(this.u.src, p)
+		const nl = indexOf(s, "\n")
+		return if (nl < 0) s else `${s.slice(0, nl)} …`
+	}
+
+	/// Adds to shown p's subexpressions, and p unless it is false when its assert fails, top: those evaluated whatever
+	/// their values, and of an || in top, its sides; those that name something, once each, but not functions nor what
+	/// holds a Type, known only when compiling, nor links after a ?., parentheses, or array, object and template
+	/// literals, which show what is in them.
+	private watch(p: Node, top: bool) {
+		const link = isLink(p) && optional(p)
+		if (!top && names(p) && !link && !["paren", "array", "object", "template"].includes(p.kind) && p.type != null
+			&& p.type!.kind != "function" && !holdsType(this.prog, this.ty(p.type!))
+			&& !this.shown.some(q => this.brief(q) == this.brief(p))) {
+			this.shown.push(p)
+		}
+		const or = p.kind == "binary" && p.t.kind == "||"
+		const branches = p.kind == "binary" && ["&&", "||", "??"].includes(p.t.kind) && !(top && or) || link
+			|| ["ifExpr", "switchExpr", "chain"].includes(p.kind)
+		for (const q of if (p.kind == "arrow") [] else if (branches) [p.parts[0]] else p.parts) {
+			this.watch(q, top && (or || p.kind == "paren"))
+		}
 	}
 
 	/// Asserts that x throws a value equal to e, trapping if it returns; a value of another type propagates.
@@ -2178,6 +2209,10 @@ function eached(t: Type): bool {
 }
 
 function holdsTypes(t: Type): bool { return isTypeValue(t) || t.kind == "array" && holdsTypes(t.params[0]) }
+
+/// Whether p names something, so that its value may be other than what its source spells; this, often large, alone is
+/// not shown.
+function names(p: Node): bool { return if (p.kind == "token") p.t.kind == "ident" else p.parts.some(names) }
 
 /// Whether a value of type t is text as is in a template: a string or a string literal.
 function textual(t: Type): bool { return t.kind == "string" || t.kind == "literal" && t.base!.kind == "string" }

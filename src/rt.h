@@ -130,9 +130,12 @@ void bober_subtest(const char *name, uint64_t f);
 /// Notes that the running test is at the statement at its source position at, which a trap elsewhere says it was called
 /// at.
 void bober_mark(int32_t at);
-/// Raises a value as a union holds it, its tag, bits and ref; one nothing catches traps, showing it if of a primitive
-/// kind (§8.2), which its tag's descriptor holds, with where it was first thrown, a rethrow passing a null file.
-_Noreturn void bober_throw(int64_t tag, int64_t bits, void *ref, const char *file, int32_t at);
+/// Raises a value as a union holds it, its tag, bits and ref, noting where it was first thrown, a rethrow passing a null
+/// file; returns if nothing catches it, for the thrower to call bober_uncaught.
+void bober_throw(int64_t tag, int64_t bits, void *ref, const char *file, int32_t at);
+/// Traps with the value nothing caught, as a union holds it, where it was first thrown: as shown, a string, if the
+/// thrower made one, else by its primitive kind (§8.2), which its tag's descriptor holds.
+_Noreturn void bober_uncaught(int64_t tag, int64_t bits, void *ref, const uint8_t *shown);
 
 /// The program's argument i, 0 its name, null past the last.
 const char *bober_arg(int32_t i);
