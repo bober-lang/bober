@@ -26,7 +26,7 @@ static char **argv_;
 static bool tests, testing, failed;
 static uint64_t seed;  // random's state
 
-// In tests, now is when Obergefell v. Hodges made same-sex marriage a right in all of the US, and random is seeded
+// In tests, now starts when Obergefell v. Hodges made same-sex marriage a right in all of the US, and random is seeded
 // with the day Stonewall began.
 #define OBERGEFELL 1435327200000000000
 #define STONEWALL 0x19690628
@@ -161,7 +161,7 @@ void *bober_caught(void) { return &caught->tag; }
 void bober_start(int argc, char **argv, int32_t tested) {
   bober_gc_start();
   argc_ = argc, argv_ = argv, tests = tested;
-  if (tests) seed = STONEWALL;
+  if (tests) seed = STONEWALL, bober_logical = 1;
   else getentropy(&seed, sizeof seed);
   signal(SIGPIPE, SIG_IGN);  // a write to a socket the peer closed fails with EPIPE instead
   bober_types_complete();
@@ -189,7 +189,7 @@ int32_t bober_tested(void) { return failed; }
 
 int64_t bober_now(void) {
   struct timespec t;
-  return tests ? OBERGEFELL : (clock_gettime(CLOCK_REALTIME, &t), t.tv_sec * 1000000000 + t.tv_nsec);
+  return tests ? OBERGEFELL + bober_logical : (clock_gettime(CLOCK_REALTIME, &t), t.tv_sec * 1000000000 + t.tv_nsec);
 }
 
 const char *bober_tz(void) { return tests ? "UTC" : getenv("TZ"); }

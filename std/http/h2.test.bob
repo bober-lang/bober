@@ -314,7 +314,7 @@ test "a response's body goes as it comes, not held back till more of it is read"
 	t.write(frame(1, 4, 1, new Encoder().encode(post)) + frame(0, 0, 1, "a"))
 	assert until(t, 0, 0, 1) && found == "a"
 	t.close()
-	shutdown(l.fd, SHUT_RDWR)
+	l.close()
 	await job
 }
 
@@ -434,7 +434,7 @@ test "a frame on the wrong stream, or a SETTINGS or PING of the wrong size, is a
 	t.write(frame(0, 0, 1, "x") + frame(8, 0, 1, inc) + frame(3, 0, 1, code) + frame(6, 0, 0, "12345678"))
 	assert until(t, 6)
 	t.close()
-	shutdown(l.fd, SHUT_RDWR)
+	l.close()
 	await job
 }
 
@@ -468,11 +468,12 @@ test "a head with a connection header, a pseudo-header twice or missing, a respo
 	await job
 }
 
-/// Writes frames to t until the peer is gone.
+/// Writes frames to t each ms until the peer is gone.
 function flood(t: tls.Conn, frames: string) {
 	try {
 		while (true) {
 			t.write(frames)
+			sleep(millisecond)
 		}
 	} catch (e: IoError) {}
 }
