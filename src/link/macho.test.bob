@@ -6,7 +6,7 @@ import { arm64 } from "./arm64"
 import { le, pad, u, zeros } from "./bytes"
 import { Linker } from "./link"
 import { macho } from "./macho"
-import { Code, Data, Global, Object, Section, Symbol, Unwind } from "./object"
+import { Code, Data, Desc, Fixup, Global, Object, Section, Symbol, Thread, Unwind } from "./object"
 
 /// A section named name of kind, of bytes.
 function section(name: string, kind: u8, bytes = zeros(8)): Section {
@@ -69,4 +69,22 @@ test "a kept dylib is continued, and where an object's Unwind section was is a C
 	const header = indexOf(d, pad("__eh_frame", 16) + "__TEXT")
 	const frames = u(d, header + 48, 4) as i32
 	assert u(d, header + 40, 8) == 48 && d.slice(frames, frames + 48) == cie + le(12, 4) + zeros(12) + cie
+}
+
+test "a thread-local's descriptor has its offset in a thread's copy, and dyld knows its section and the copy's" {
+	const vars = section("__thread_vars", Data, zeros(48))
+	vars.fixups = [new Fixup(16, Desc, 1, 0), new Fixup(40, Desc, 1, 8)]
+	const o = object("a.o", [vars, section("__thread_data", Thread, zeros(16))])
+	o.symbols = [new Symbol("a", Global, 0), new Symbol("a$tlv$init", Global, 1)]
+	const l = new Linker(arm64, macho)
+	l.add(o)
+	l.export("a")
+	const d = macho.write(l.link())
+	assert (u(d, 24, 4) & 0x800000) != 0 // MH_HAS_TLV_DESCRIPTORS
+	// Each section's header, of 80 bytes, past the 64 from its segment's name on, has its size at 40, its offset in
+	// the file at 48 and its type at 64.
+	const data = indexOf(d, pad("__DATA", 16)) + 64
+	assert u(d, data + 64, 4) == 0x13 && u(d, data + 40, 8) == 48 && u(d, data + 80 + 64, 4) == 0x11
+	const at = u(d, data + 48, 4) as i32
+	assert u(d, at + 16, 8) == 0 && u(d, at + 40, 8) == 8
 }

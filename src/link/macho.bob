@@ -4,18 +4,20 @@
 //! Names are C's, which the files have after a `_`, and a library is named by its install name. Code unwinds
 //! by the DWARF call frame information of `__eh_frame` alone, which objects compiled with
 //! `-femit-dwarf-unwind=dwarf-only` have of every function; their compact unwind is dropped, as are debug sections.
+//! A thread-local is reached through its descriptor, of `__thread_vars`: a function dyld sets, which finds the
+//! thread's copy, a key of dyld's, and the offset in the copy, which the writer sets.
 
 import { HashMap } from "../../std/collections/hashmap"
 import { indexOf, partitionPoint, sort, sortBy, startsWith } from "../../std/algo"
 import { ParseError, lower, replace, split, trim } from "../../std/string"
 import { Reader, Writer, get, put } from "../../std/encoding/binary"
-import { alignUp, min } from "../../std/math"
+import { alignUp, max, min } from "../../std/math"
 import { CompileError } from "../error"
 import { be, le, pad, str, u, zeros } from "./bytes"
 import { Format, Image } from "./link"
 import { sha256 } from "./sha256"
-import { Abs64, Call, Code, Const, Data, Fixup, Global, Init, Local, Object, Page, PageOff, Rel32, Rel64, Section,
-	SlotPage, SlotPageOff, SlotRel32, Symbol, Unwind, Weak, Zero } from "./object"
+import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Init, Local, Object, Page, PageOff, Rel32, Rel64, Section,
+	SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Unwind, Weak, Zero } from "./object"
 
 /// The room the writer needs before the first linked address, for the Mach-O header and its load commands; write
 /// throws if they need more, as for very many libraries.
@@ -25,8 +27,10 @@ const headers: u64 = 0x1000
 const MH_MAGIC_64: u64 = 0xfeedfacf
 const MH_OBJECT: u64 = 1
 const MH_DYLIB: u64 = 6
-/// flags: no undefined names but those bound, for dyld to load, names bound in their library, no library re-exported.
+/// flags: no undefined names but those bound, for dyld to load, names bound in their library, no library re-exported;
+/// and that of a file with descriptors of thread-locals.
 const MH_FLAGS: u64 = 0x1 | 0x4 | 0x80 | 0x100000
+const MH_HAS_TLV_DESCRIPTORS: u64 = 0x800000
 /// cputype of arm64 and of x86-64, whose cpusubtype of all models is 0 and 3.
 const CPU_TYPE_ARM64: u64 = 0x0100000c
 const CPU_TYPE_X86_64: u64 = 0x01000007
@@ -47,7 +51,8 @@ const LC_BUILD_VERSION: u64 = 0x32
 const LC_DYLD_EXPORTS_TRIE: u64 = 0x80000033
 
 /// A section's type, the low byte of its flags: bytes no file holds, of either kind; pointers dyld or a stub sets;
-/// pointers to the functions run on load and on unload; and the first and last of thread-local storage's.
+/// pointers to the functions run on load and on unload; and of thread-local storage, a thread's copy's bytes, those
+/// of it no file holds, the descriptors, and the last of its types.
 const S_ZEROFILL: u64 = 0x1
 const S_GB_ZEROFILL: u64 = 0xc
 const S_NON_LAZY_SYMBOL_POINTERS: u64 = 0x6
@@ -55,6 +60,8 @@ const S_SYMBOL_STUBS: u64 = 0x8
 const S_MOD_INIT_FUNC_POINTERS: u64 = 0x9
 const S_MOD_TERM_FUNC_POINTERS: u64 = 0xa
 const S_THREAD_LOCAL_REGULAR: u64 = 0x11
+const S_THREAD_LOCAL_ZEROFILL: u64 = 0x12
+const S_THREAD_LOCAL_VARIABLES: u64 = 0x13
 const S_THREAD_LOCAL_INIT_FUNCTION_POINTERS: u64 = 0x15
 /// A section's attributes: of instructions only, or some; of debug information.
 const S_ATTR_PURE_INSTRUCTIONS: u64 = 0x80000000
@@ -84,6 +91,8 @@ const ARM64_RELOC_PAGEOFF12: u64 = 4
 const ARM64_RELOC_GOT_LOAD_PAGE21: u64 = 5
 const ARM64_RELOC_GOT_LOAD_PAGEOFF12: u64 = 6
 const ARM64_RELOC_POINTER_TO_GOT: u64 = 7
+const ARM64_RELOC_TLVP_LOAD_PAGE21: u64 = 8
+const ARM64_RELOC_TLVP_LOAD_PAGEOFF12: u64 = 9
 const ARM64_RELOC_ADDEND: u64 = 10
 /// r_type of x86-64's: SIGNED_1 to SIGNED_4 are SIGNED followed by 1, 2 or 4 bytes of the instruction.
 const X86_64_RELOC_UNSIGNED: u64 = 0
@@ -94,6 +103,7 @@ const X86_64_RELOC_GOT: u64 = 4
 const X86_64_RELOC_SUBTRACTOR: u64 = 5
 const X86_64_RELOC_SIGNED_1: u64 = 6
 const X86_64_RELOC_SIGNED_4: u64 = 8
+const X86_64_RELOC_TLV: u64 = 9
 
 /// dyld's opcodes: of rebases, to set their type, to set the segment and offset, and to rebase there; of binds, to set
 /// the library, the name and its flags, the type, the addend, the segment and offset, and to bind there. 0 ends both.
@@ -145,16 +155,18 @@ function read(name: string, bytes: string): Object throws CompileError {
 			index.push(-1)
 			continue
 		}
-		const zero = st == S_ZEROFILL || st == S_GB_ZEROFILL
+		const zero = st == S_ZEROFILL || st == S_GB_ZEROFILL || st == S_THREAD_LOCAL_ZEROFILL
 		const sect = name16(bytes, shdrs[i])
 		const s = new Section(sect, kindOf(seg, sect, st, flags))
-		// Pointers and stubs only ld64 makes, functions run on unload and thread-local storage are not linked.
+		// Pointers and stubs only ld64 makes, and functions run on unload or to initialize a thread-local, are not linked.
 		const unlinked = st >= S_NON_LAZY_SYMBOL_POINTERS && st <= S_SYMBOL_STUBS || st == S_MOD_TERM_FUNC_POINTERS ||
-			st >= S_THREAD_LOCAL_REGULAR && st <= S_THREAD_LOCAL_INIT_FUNCTION_POINTERS
+			st > S_THREAD_LOCAL_VARIABLES && st <= S_THREAD_LOCAL_INIT_FUNCTION_POINTERS
 		if (unlinked || !zero && sh(i, 48, 4) + sh(i, 40, 8) > (bytes.length as u64)) {
 			throw new CompileError(`${name}: section ${seg},${s.name} cannot be linked`)
 		}
-		s.align = 1 << sh(i, 52, 4)
+		// A thread's copy is malloc's, aligned to 16 and no more, so each of its sections is; and a descriptor is of
+		// pointers, though clang aligns it to 1.
+		s.align = max(1 << sh(i, 52, 4), if (s.kind == Thread) 16 else if (st == S_THREAD_LOCAL_VARIABLES) 8 else 1)
 		s.size = sh(i, 40, 8)
 		s.bytes = if (zero) "" else bytes.slice(sh(i, 48, 4) as i32, (sh(i, 48, 4) + s.size) as i32)
 		index.push(o.sections.length)
@@ -244,6 +256,9 @@ function read(name: string, bytes: string): Object throws CompileError {
 				a -= 4
 			}
 			let kind = fixup(x64, r.rt, r.pcrel, r.size)
+			if (sec.name == "__thread_vars" && r.at % 24 == 16 && kind == Abs64) {
+				kind = Desc // a descriptor's last word, which the object has as a pointer to the bytes
+			}
 			if (r.minus[0] >= 0) {
 				// A - B + a, B in this section, is S + a' - P, B - P being known: of an UNSIGNED of 4 or 8 bytes.
 				const b = o.symbols[r.minus[0]]
@@ -303,7 +318,8 @@ function fdes(o: Object, bytes: string, shdrs: i32[], index: i32[], base: i32, i
 
 /// The kind of a section of segment seg, named sect, of type and flags.
 function kindOf(seg: string, sect: string, st: u64, flags: u64): u8 {
-	return if (st == S_ZEROFILL || st == S_GB_ZEROFILL) Zero else if (st == S_MOD_INIT_FUNC_POINTERS) Init
+	return if (st == S_THREAD_LOCAL_REGULAR || st == S_THREAD_LOCAL_ZEROFILL) Thread
+		else if (st == S_ZEROFILL || st == S_GB_ZEROFILL) Zero else if (st == S_MOD_INIT_FUNC_POINTERS) Init
 		else if (sect == "__eh_frame") Unwind
 		else if ((flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)) != 0) Code
 		else if (seg == "__TEXT") Const else Data
@@ -314,7 +330,7 @@ function fixup(x64: bool, rt: u64, pcrel: bool, size: u64): i32 {
 	if (x64) {
 		return if (rt == X86_64_RELOC_UNSIGNED && !pcrel && size == 8) Abs64 else if (!pcrel || size != 4) -1
 			else if (rt == X86_64_RELOC_BRANCH) Call
-			else if (rt == X86_64_RELOC_GOT_LOAD || rt == X86_64_RELOC_GOT) SlotRel32
+			else if (rt == X86_64_RELOC_GOT_LOAD || rt == X86_64_RELOC_GOT || rt == X86_64_RELOC_TLV) SlotRel32
 			else if (rt == X86_64_RELOC_SIGNED || rt >= X86_64_RELOC_SIGNED_1 && rt <= X86_64_RELOC_SIGNED_4) Rel32
 			else -1
 	}
@@ -323,8 +339,8 @@ function fixup(x64: bool, rt: u64, pcrel: bool, size: u64): i32 {
 		case ARM64_RELOC_BRANCH26: Call
 		case ARM64_RELOC_PAGE21: Page
 		case ARM64_RELOC_PAGEOFF12: PageOff
-		case ARM64_RELOC_GOT_LOAD_PAGE21: SlotPage
-		case ARM64_RELOC_GOT_LOAD_PAGEOFF12: SlotPageOff
+		case ARM64_RELOC_GOT_LOAD_PAGE21, ARM64_RELOC_TLVP_LOAD_PAGE21: SlotPage
+		case ARM64_RELOC_GOT_LOAD_PAGEOFF12, ARM64_RELOC_TLVP_LOAD_PAGEOFF12: SlotPageOff
 		case ARM64_RELOC_POINTER_TO_GOT: if (pcrel && size == 4) SlotRel32 else -1
 		default: -1
 	}
@@ -431,11 +447,16 @@ function write(image: Image): string throws CompileError {
 			if (s.exec) 5 else if (s.write) 3 else 1])
 	}
 	const where = (at: u64) => (partitionPoint(mapped, m => m[1] > at) as i32) - 1
-	// A section per stretch of a segment, named as it is, between where its bytes end and the Init sections are; but
-	// the Unwind ones, `__eh_frame`, as the unwinder finds them by that name. It reads them entry by entry up to one of
-	// length 0, so each run of zeros there, the hole a kept image has where an object was, is made a CIE of no FDE:
-	// one of 8 bytes at least, as an object's entries are padded to that.
-	const cuts = [from, to, image.inits[0], image.inits[1]]
+	// A section per stretch of a segment, named as it is, between where its bytes end and what dyld knows by its
+	// section's type is: the Init sections, the Thread ones, and the descriptors of thread-locals. But the Unwind ones
+	// are `__eh_frame`, as the unwinder finds them by that name. It reads them entry by entry up to one of length 0, so
+	// each run of zeros there, the hole a kept image has where an object was, is made a CIE of no FDE: one of 8 bytes
+	// at least, as an object's entries are padded to that.
+	const vars = image.sections.filter(s => s[0] == "__thread_vars")
+	const cuts = [from, to, image.inits[0], image.inits[1], image.thread[0], image.thread[1]]
+	for (const [_, at, size] of vars) {
+		cuts.push(...[at, at + size])
+	}
 	for (const s of segs) {
 		cuts.push(...[s.address, s.address + s.size, s.address + s.size + s.zero])
 	}
@@ -458,6 +479,10 @@ function write(image: Image): string throws CompileError {
 			put(image.bytes, image.at(p), q - p - 4, 4)
 		}
 		p = if (q > p) q else p + 4 + get(image.bytes, image.at(p), 4)
+	}
+	// A descriptor's last word is the offset of its bytes in a thread's copy.
+	for (const [at, offset] of image.descs) {
+		put(image.bytes, image.at(at), offset, 8)
 	}
 
 	// __LINKEDIT, at offset file in the file.
@@ -542,8 +567,10 @@ function write(image: Image): string throws CompileError {
 	for (const [name, at, size] of sections) {
 		const seg = image.segment(at)
 		const zero = at >= seg.address + seg.size
+		// dyld takes the Thread sections, from the first to the last, as a thread's copy's template.
 		const st = if (zero) S_ZEROFILL else if (at >= image.inits[0] && at < image.inits[1]) S_MOD_INIT_FUNC_POINTERS
-			else 0
+			else if (vars.some(v => at >= v[1] && at < v[1] + v[2])) S_THREAD_LOCAL_VARIABLES
+			else if (at >= image.thread[0] && at < image.thread[1]) S_THREAD_LOCAL_REGULAR else 0
 		const flags = st | (if (seg.exec) S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS else 0)
 		// The image knows no alignment; the address's own, up to 2^16, accounts for the gap before the section.
 		let align: u64 = 0
@@ -590,7 +617,8 @@ function write(image: Image): string throws CompileError {
 	}
 	const x64 = image.arch == "x86_64"
 	const head = le(MH_MAGIC_64, 4) + le(if (x64) CPU_TYPE_X86_64 else CPU_TYPE_ARM64, 4) + le(if (x64) 3 else 0, 4) +
-		le(MH_DYLIB, 4) + le(ncmds, 4) + le(cmds.length as u64, 4) + le(MH_FLAGS, 4) + le(0, 4) + cmds
+		le(MH_DYLIB, 4) + le(ncmds, 4) + le(cmds.length as u64, 4) +
+		le(MH_FLAGS | (if (vars.length > 0) MH_HAS_TLV_DESCRIPTORS else 0), 4) + le(0, 4) + cmds
 	for (const i of 0 ... head.length - 1) {
 		image.bytes[i] = head[i]
 	}
