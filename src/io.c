@@ -32,10 +32,11 @@ void __attribute__((weak)) bober_wake(uint64_t f) {}
 void __attribute__((weak)) bober_park(void) { bober_io_wait(); }
 
 int64_t bober_logical = -1;
+struct bober_net __attribute__((weak)) bober_net;
 /// Whether tests' TCP and UDP go through their network (src/net.h), not the kernel: where they link it.
-#define NETWORK (bober_logical >= 0 && net_poll)
+#define NETWORK (bober_logical >= 0 && bober_net.poll)
 /// Whether fd is a socket of that network.
-#define NET(fd) (NETWORK && net_ready(fd, 0) >= 0)
+#define NET(fd) (NETWORK && bober_net.ready(fd, 0) >= 0)
 
 int64_t bober_mono(void) {
   struct timespec t;
@@ -157,7 +158,7 @@ static long park(Wait *w, long timeout) {
 long bober_io_ready(int fd, int write, long timeout) {
   if (fd < 0) return 0;
   Fd *f = (fds = fit(fds, &nfds, fd, sizeof *fds)) + fd;
-  int net = NETWORK ? net_ready(fd, write) : -1;
+  int net = NETWORK ? bober_net.ready(fd, write) : -1;
   if (net > 0) return 0;
   // One the kernel cannot watch, as a file or one closed, is always ready: the call on it tells.
   if (net < 0 && (!f->watched || f->ready[write])) {
@@ -184,7 +185,7 @@ int bober_io_wait(void) {
   // Logical time waits for nothing: once no socket is ready, it is the soonest deadline or timer of the network, and
   // with neither, never one.
   if (bober_logical >= 0) {
-    long timer = NETWORK ? net_poll() : 0;
+    long timer = NETWORK ? bober_net.poll() : 0;
     if (waiting == before) {
       if (timer && (!soonest || timer < soonest)) soonest = timer;
       if (!soonest || soonest == LONG_MAX) return 0;
@@ -240,16 +241,16 @@ static void ended(int fd) {
 
 long bober_io_close(int fd) {
   ended(fd);
-  if (NET(fd)) return net_close(fd, 0);
+  if (NET(fd)) return bober_net.close(fd, 0);
   // The kernel forgets fd, which it would not for a dup's sake.
   if ((unsigned)fd < nfds && fds[fd].watched) watch(fd, DEL), fds[fd] = (Fd){0};
   return result(close(fd));
 }
 long bober_io_read(int fd, void *buf, unsigned long n) {
-  return NET(fd) ? net_read(fd, buf, n) : result_on(fd, 0, read(fd, buf, n));
+  return NET(fd) ? bober_net.read(fd, buf, n) : result_on(fd, 0, read(fd, buf, n));
 }
 long bober_io_write(int fd, const void *buf, unsigned long n) {
-  return NET(fd) ? net_write(fd, buf, n) : result_on(fd, 1, write(fd, buf, n));
+  return NET(fd) ? bober_net.write(fd, buf, n) : result_on(fd, 1, write(fd, buf, n));
 }
 long bober_io_sync(int fd) { return result(fsync(fd)); }
 long bober_io_mkdir(const char *path) { return result(mkdir(path, 0777)); }
@@ -366,7 +367,7 @@ long bober_io_dial(const char *net, const char *host, int port) {
   struct sockaddr_storage sa;
   socklen_t n = address(host, port, &sa);
   if (!n) return -EINVAL;
-  if (NETWORK && sa.ss_family != AF_UNIX) return net_dial(net, host, port);
+  if (NETWORK && sa.ss_family != AF_UNIX) return bober_net.dial(net, host, port);
   long fd = unblocked(socket(sa.ss_family, strcmp(net, "udp") ? SOCK_STREAM : SOCK_DGRAM, 0));
   return fd >= 0 && connect(fd, (void *)&sa, n) && errno != EINPROGRESS ? failed(fd) : fd;
 }
@@ -374,7 +375,7 @@ long bober_io_dial(const char *net, const char *host, int port) {
 long bober_io_connected(int fd) {
   int err = 0;
   socklen_t n = sizeof err;
-  if (NET(fd)) return net_connected(fd);
+  if (NET(fd)) return bober_net.connected(fd);
   return getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &n) ? -errno : -err;
 }
 
@@ -383,7 +384,7 @@ long bober_io_listen(const char *net, const char *host, int port, int backlog) {
   socklen_t n = address(host, port, &sa);
   if (!n) return -EINVAL;
   int stream = strcmp(net, "udp"), ip = sa.ss_family != AF_UNIX, on = 1, off = 0;
-  if (NETWORK && ip) return net_listen(net, host, port);
+  if (NETWORK && ip) return bober_net.listen(net, host, port);
   long fd = unblocked(socket(sa.ss_family, stream ? SOCK_STREAM : SOCK_DGRAM, 0));
   // A v6 socket takes v4 too, whatever net.ipv6.bindv6only says. SO_REUSEADDR on UDP would let any user share the
   // port, so only a stream listener has it. SO_REUSEPORT lets the user's sockets share a port, so it is only for one
@@ -397,12 +398,15 @@ long bober_io_listen(const char *net, const char *host, int port, int backlog) {
 }
 
 long bober_io_accept(int fd) {
-  if (NET(fd)) return net_accept(fd);
+  if (NET(fd)) return bober_net.accept(fd);
   long c = accept(fd, 0, 0);
   if (c >= 0) return unblocked(c);
   // An abort or network error is the taken connection's, not the listener's, so accept(2) retries it as EAGAIN.
   switch (errno) {
-  case ECONNABORTED: case ENETDOWN: case EPROTO: case ENOPROTOOPT: case EHOSTDOWN: case ENONET: case EHOSTUNREACH:
+  case ECONNABORTED: case ENETDOWN: case EPROTO: case ENOPROTOOPT: case EHOSTDOWN: case EHOSTUNREACH:
+#ifdef ENONET  // Linux's
+  case ENONET:
+#endif
   case EOPNOTSUPP: case ENETUNREACH: return BOBER_IO_AGAIN;
   }
   return result_on(fd, 0, c);
@@ -411,7 +415,7 @@ long bober_io_accept(int fd) {
 long bober_io_recvfrom(int fd, void *buf, unsigned long n, char *host, int *port) {
   struct sockaddr_storage sa = {0};
   socklen_t len = sizeof sa;
-  if (NET(fd)) return net_recvfrom(fd, buf, n, host, port);
+  if (NET(fd)) return bober_net.recvfrom(fd, buf, n, host, port);
   long r = recvfrom(fd, buf, n, 0, (void *)&sa, &len);
   if (r >= 0) *port = text(&sa, host);
   return result_on(fd, 0, r);
@@ -420,12 +424,12 @@ long bober_io_recvfrom(int fd, void *buf, unsigned long n, char *host, int *port
 long bober_io_sendto(int fd, const void *buf, unsigned long n, const char *host, int port) {
   struct sockaddr_storage sa;
   socklen_t len = address(host, port, &sa);
-  if (NET(fd)) return len ? net_sendto(fd, buf, n, host, port) : -EINVAL;
+  if (NET(fd)) return len ? bober_net.sendto(fd, buf, n, host, port) : -EINVAL;
   return len ? result_on(fd, 1, sendto(fd, buf, n, 0, (void *)&sa, len)) : -EINVAL;
 }
 
 long bober_io_shutdown(int fd, int both) {
-  long r = NET(fd) ? net_shutdown(fd, both) : result(shutdown(fd, both ? SHUT_RDWR : SHUT_WR));
+  long r = NET(fd) ? bober_net.shutdown(fd, both) : result(shutdown(fd, both ? SHUT_RDWR : SHUT_WR));
   if (both) ended(fd);
   return r;
 }
@@ -434,19 +438,19 @@ long bober_io_reset(int fd) {
   struct linger l = {1, 0};  // a close resets
   if (!NET(fd)) return setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof l) ? -errno : bober_io_close(fd);
   ended(fd);
-  return net_close(fd, 1);
+  return bober_net.close(fd, 1);
 }
 
 int bober_io_idle(int fd) {
   char c;
-  if (NET(fd)) return net_idle(fd);
+  if (NET(fd)) return bober_net.idle(fd);
   return recv(fd, &c, 1, MSG_PEEK) < 0 && errno == EWOULDBLOCK;
 }
 
 long bober_io_name(int fd, int peer, char *host) {
   struct sockaddr_storage sa = {0};
   socklen_t n = sizeof sa;
-  if (NET(fd)) return net_name(fd, peer, host);
+  if (NET(fd)) return bober_net.name(fd, peer, host);
   return (peer ? getpeername : getsockname)(fd, (void *)&sa, &n) ? -errno : text(&sa, host);
 }
 
