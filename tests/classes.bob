@@ -150,3 +150,35 @@ test "embedded fields copy, never alias" {
 	p.x = 6
 	assert s.a.x == 5
 }
+
+class Trio {
+	a: string
+	b: string
+	c: string
+
+	constructor(a: string) {
+		this.a = a
+		this.b = a + a
+		this.c = this.b + a
+	}
+}
+
+class Kept {
+	trio = trio(1)
+}
+
+let finals = 0
+
+function trio(n: i32): Trio {
+	try {
+		return if (n == 0) new Trio("x") else trio(n - 1)
+	} finally {
+		finals += 1
+	}
+}
+
+test "a class instance wider than the registers that return: a function value's, a finally's and an initializer's" {
+	const fs = [() => new Trio("a"), () => trio(2)]
+	assert fs.map(f => f().c) == ["aaa", "xxx"]
+	assert new Kept().trio.b == "xx" && finals == 5
+}

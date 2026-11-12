@@ -934,7 +934,8 @@ class Emitter {
 		if (this.val) {
 			this.ir().store(this.unboxed(this.stack.pop()), this.out, false)
 		}
-		const v = if (this.val || this.result(this.ret) == this.void) 0 else this.retval(this.popOrNull(), this.ret)
+		const v = if (this.val || this.result(this.ret) == this.void) 0
+			else this.returning(this.retval(this.popOrNull(), this.ret), this.ret)
 		this.leave(0)
 		if (v == 0) {
 			this.ir().retVoid()
@@ -1392,7 +1393,7 @@ class Emitter {
 		const res = this.p.b(f.t)
 		const ft = this.fnType(res, [this.ref], ps)
 		const code = if (via < 0) this.captured(f.v, 0, this.ptr) else this.function(via, ft)
-		this.pushResult(this.call(ft, code, [f.v, ...this.args(xs, ps)]), res)
+		this.pushResult(this.returned(this.call(ft, code, [f.v, ...this.args(xs, ps)]), res), res)
 	}
 
 	/// What copied has of closure d, else of another instance of its source and owner.
@@ -1624,7 +1625,7 @@ class Emitter {
 	/// statepoints relocate no ref in memory.
 	private callByValue(f: Callee, args: Value[], unwinds: bool = true): Value {
 		if (!f.val) {
-			return this.call(f.type, f.fn, args, unwinds)
+			return this.returned(this.call(f.type, f.fn, args, unwinds), f.ret)
 		}
 		const n = this.norm(f.ret)
 		const out = this.slot(this.struct(n))
@@ -1646,8 +1647,14 @@ class Emitter {
 		return this.ir().call(t, f, args)
 	}
 
-	/// The value r of a call returning a t: false if t is null, of which the function returns none.
-	private returned(r: Value, t: i32): Value { return if (this.result(t) == this.void) this.bool(false) else r }
+	/// The value r of a call returning a t, as result has it: false if t is null, of which the function returns none,
+	/// and a class held by value out of its box.
+	private returned(r: Value, t: i32): Value {
+		return if (this.result(t) == this.void) this.bool(false) else if (this.inlined(t)) this.unbox(r, this.norm(t)) else r
+	}
+
+	/// v as a function returns a t, as result has it: a tuple, object or class instance held by value boxed.
+	private returning(v: Value, t: i32): Value { return this.heap({ v: v, t: this.norm(t) }, true).v }
 
 	/// A call of the runtime's function name.
 	private rt(name: string, args: Value[], unwinds: bool = true): Value {
@@ -1774,7 +1781,7 @@ class Emitter {
 				k++
 			}
 		}
-		const r = this.heap({ v: this.callByValue(f, args, false), t: this.norm(f.ret) }).v
+		const r = this.returning(this.callByValue(f, args, false), f.ret)
 		if (rt == this.void) {
 			b.retVoid()
 		} else {
@@ -1830,7 +1837,7 @@ class Emitter {
 		if (this.result(tr) == this.void) {
 			this.ir().retVoid()
 		} else {
-			this.ir().ret(this.cast({ v: if (this.result(fr) == this.void) this.bool(false) else r, t: this.norm(fr) }, tr))
+			this.ir().ret(this.returning(this.cast({ v: this.returned(r, fr), t: this.norm(fr) }, tr), tr))
 		}
 		b.at(this.entry)
 		b.br(start)
@@ -2826,9 +2833,9 @@ class Emitter {
 	private isHeld(v: V): bool { return this.facts.phase == "learned" && this.b.typeOf(v.v) != this.ref && this.holdable(v.t) }
 
 	/// v by ref: a tuple or object held by value boxed on the heap, field by field, which LLVM forwards, unlike a
-	/// struct's; a class instance stays held by value.
-	private heap(v: V): V {
-		if (!this.isHeld(v) || this.inlined(v.t)) {
+	/// struct's; a class instance stays held by value, unless a function's result (see result).
+	private heap(v: V, result = false): V {
+		if (!this.isHeld(v) || this.inlined(v.t) && !result) {
 			return v
 		}
 		const q = this.alloc(this.struct(v.t))
@@ -3626,10 +3633,11 @@ class Emitter {
 		return this.b.struct(words)
 	}
 
-	/// The type of a function's result: void for null.
+	/// The type of a function's result, unless through a slot: void for null, and a ref to a class held by value, boxed,
+	/// as LLVM's statepoints take no struct returned of more scalars than the target has registers for.
 	private result(t: i32): IrType {
 		const k = this.kindOf(t)
-		return if (k == kind.Null || k == kind.None) this.void else this.ll(t)
+		return if (k == kind.Null || k == kind.None) this.void else if (this.inlined(t)) this.ref else this.ll(t)
 	}
 
 	/// The fields of a class instance, object or tuple, in order, their types as declared; while learning, the class
