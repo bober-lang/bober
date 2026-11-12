@@ -1,0 +1,67 @@
+# Bootstraps bober from boot/ to its fixpoint, a bober that builds itself byte for byte, uploads it, and runs the tests.
+name: ci
+on: push
+concurrency: { group: "${{ github.ref }}", cancel-in-progress: true }
+
+jobs:
+  bober:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - run: git -C vendor/tpde submodule update --init --depth 1 deps/fadec deps/disarm
+      - if: runner.os == 'Linux'
+        run: |
+          c=$(lsb_release -cs)
+          curl -fsS https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb https://apt.llvm.org/$c/ llvm-toolchain-$c main" | sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-24 lld-24 libclang-rt-24-dev llvm-24-dev bison flex libffi-dev libgc-dev ninja-build
+          echo /usr/lib/llvm-24/bin >> $GITHUB_PATH
+      - if: runner.os == 'macOS'
+        run: |
+          brew install llvm lld bison flex bdw-gc libffi
+          for p in llvm lld bison flex; do echo "$(brew --prefix $p)/bin" >> $GITHUB_PATH; done
+          echo "CPATH=$(brew --prefix)/include:$(brew --prefix libffi)/include" >> $GITHUB_ENV
+          echo "LIBRARY_PATH=$(brew --prefix)/lib:$(brew --prefix libffi)/lib" >> $GITHUB_ENV
+      # The sysroot and the C libraries of bober.pkg, LLVM's an hour to build, without their sources; saved even if a
+      # step fails, so that the next run goes on from there.
+      - uses: actions/cache/restore@v6
+        with:
+          path: |
+            build/musl
+            build/@bober
+            !build/@bober/*/*/src
+            !build/@bober/*/*/src.tar
+          key: c-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: c-${{ runner.os }}-${{ runner.arch }}-
+      - run: make -C boot
+      - if: runner.os == 'Linux'
+        run: make -C src/backend/llvm
+      - name: bootstrap
+        run: |
+          build/boot run src/bober.bob build -release -I "$(llvm-config --includedir)" src/bober.bob
+          mv build/bober build/bober.stage1
+          build/bober.stage1 build -release src/bober.bob
+          cp build/bober build/bober.stage2
+          build/bober.stage2 build -release src/bober.bob
+          cmp build/bober build/bober.stage2
+      - if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            build/musl
+            build/@bober
+            !build/@bober/*/*/src
+            !build/@bober/*/*/src.tar
+          key: c-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bober-${{ runner.os }}-${{ runner.arch }}
+          path: build/bober
+      - run: build/bober test
