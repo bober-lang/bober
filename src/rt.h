@@ -203,6 +203,8 @@ long bober_io_remove(const char *path);
 long bober_io_rename(const char *from, const char *to);
 /// What the symlink at path points to, n bytes of it at most, in buf; its length.
 long bober_io_readlink(const char *path, void *buf, unsigned long n);
+/// The path of the running program's file, symlinks resolved, as a C string in buf, of PATH_MAX bytes; its length.
+long bober_io_exe(char *buf);
 /// What stat finds: err is 0 or a failure; times are in ns since the epoch, born 0 if unknown; kind is "file",
 /// "directory", "symlink" or "other"; perm the permission bits.
 typedef struct {
