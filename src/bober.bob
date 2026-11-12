@@ -201,9 +201,11 @@ export function build(main: string, tests: bool, args: string[] = [], includes: 
 			objects.push(`${exe}.o`)
 		}
 	}
-	// The run time, and in the package the C of the bundle's modules too, compiled in lib/ (pack), with the launcher.
+	// The run time, and in the package the C of the bundle's modules too, compiled in lib/ (pack), with the launcher;
+	// with tests, their network.
 	const packaged = exists(join(root, "lib/std.bobc"))
-	const rt = if (packaged) glob(join(root, "lib/*.[ao]")) else runtime(dir)
+	const rt = [...(if (packaged) glob(join(root, "lib/*.[ao]")) else runtime(dir)),
+		...(if (!tests) [] else if (packaged) glob(join(root, "lib/net/*.o")) else network(dir))]
 	const [cs, cxx] = cObjects(p, includes)
 	const path = p.modules[o.main].path
 	if (!imaged(release, args)) {
@@ -361,6 +363,7 @@ function pack(lib: string) {
 	const p = lower([...glob("std/**/*.bob"), ...glob("builtin/*.bob")].filter(f => !endsWith(f, ".test.bob")))
 	mkdirAll(lib)
 	runtime(lib)
+	network(lib)
 	launcher(lib)
 	const cs = cObjects(p, [])[0]
 	run(["ar", "rcs", join(lib, "std.a"), ...cs.filter(c => endsWith(c, ".o"))])
@@ -383,6 +386,21 @@ export function runtime(out: string): string[] {
 		objects.push(o)
 	}
 	return objects
+}
+
+/// The network of tests, src/net.c of bober's root on vendor/lwip, compiled by bobcc into out/net where older than their
+/// source or headers of src/.
+function network(out: string): string[] {
+	const lwip = join(root, "vendor/lwip/src")
+	const headers = ["src/rt.h", "src/net.h", "src/net/lwipopts.h", "src/net/arch/cc.h"].map(h => join(root, h))
+	mkdirAll(`${out}/net`)
+	return [join(root, "src/net.c"), ...glob(`${lwip}/core/**/*.c`)].map(src => {
+		const o = `${out}/net/${base(src)}.o`
+		if (!newer(o, [src, ...headers])) {
+			object(sysroot, src, o, [join(root, "src"), join(root, "src/net"), `${lwip}/include`])
+		}
+		return o
+	})
 }
 
 /// The launcher of images, src/launch.c of bober's root, compiled by bobcc into out/launch.c.exe where older than its

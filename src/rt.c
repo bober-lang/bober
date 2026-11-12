@@ -161,7 +161,7 @@ void *bober_caught(void) { return &caught->tag; }
 void bober_start(int argc, char **argv, int32_t tested) {
   bober_gc_start();
   argc_ = argc, argv_ = argv, tests = tested;
-  if (tests) seed = STONEWALL;
+  if (tests) seed = STONEWALL, bober_logical = 1;
   else getentropy(&seed, sizeof seed);
   signal(SIGPIPE, SIG_IGN);  // a write to a socket the peer closed fails with EPIPE instead
   bober_types_complete();

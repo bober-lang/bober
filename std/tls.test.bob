@@ -4,8 +4,6 @@ import * as net from "./net"
 import { Config, client, server } from "./tls"
 import { monotonic, second } from "./time"
 import { Signal } from "../builtin/fiber"
-import { MSG_DONTWAIT, send } from "sys/socket.h"
-import { usleep } from "unistd.h"
 
 const own = owning()
 
@@ -262,17 +260,10 @@ test "close tells a peer that reads nothing for a second at most, then ends a re
 	const raw = net.dial(`${l.addr}`)
 	const c = client(raw, "localhost", trusting())
 	c.write("x")
-	// Bytes past the TLS, never read, until the socket's buffers and the peer's stay full.
-	const junk = flood().slice(0, 4096)
-	let idle = 0
-	while (idle < 20) {
-		if (send(raw.fd, junk, 4096, MSG_DONTWAIT) > 0) {
-			idle = 0
-		} else {
-			idle++
-			usleep(10_000)
-		}
-	}
+	// Bytes past the TLS, never read, until the socket's buffers and the peer's are full.
+	raw.timeout = second
+	assert raw.write(flood()) throws new IoError("TimedOut", "write", `${raw.fd}`)
+	raw.timeout = 0
 	const read = async c.read(1024)
 	const start = monotonic()
 	c.close()

@@ -150,8 +150,12 @@ int64_t bober_now(void);
 const char *bober_tz(void);
 /// 64 random bits, not for keys; in tests the same ones in each test.
 uint64_t bober_random(void);
-/// The time in ns since a fixed point, which nothing sets back or forward: for deadlines, which must pass in tests too.
+/// The time in ns since a fixed point, which nothing sets back or forward: for deadlines. In tests, bober_logical: it
+/// starts at 1, as 0 is none to deadlines, and only a wait moves it, once no socket is ready, to the soonest deadline
+/// or timer of their network (src/net.h); what another process sends is not waited for.
 int64_t bober_mono(void);
+/// The logical time in tests, -1 elsewhere.
+extern int64_t bober_logical;
 
 // I/O, through which std makes every system call, so that it needs no header of the system's: src/io.c translates
 // each for where it runs, through its libc. A call gives a result >= 0 or a failure < 0, which only bober_io_kind
@@ -169,6 +173,8 @@ const char *bober_io_kind(long r);
 /// Parks until the socket fd is ready to read or, if write, to write, or is shut down or closed: 0, or a failure once
 /// timeout passes. The kernel watches fd from its first wait until bober_io_close.
 long bober_io_ready(int fd, int write, long timeout);
+/// Parks for ns.
+void bober_io_sleep(long ns);
 /// Waits for the kernel to find a socket fibers wait on ready, or for their soonest deadline, and wakes those fibers;
 /// what bober_park does once no fiber is ready. 0, at once, if none waits: every fiber is parked, which bober_park then
 /// traps on.
@@ -220,6 +226,8 @@ long bober_io_recvfrom(int fd, void *buf, unsigned long n, char *host, int *port
 long bober_io_sendto(int fd, const void *buf, unsigned long n, const char *host, int port);
 /// Ends fd's writes, or, if both, its reads too, waking what waits on fd; the peer reads an end.
 long bober_io_shutdown(int fd, int both);
+/// Closes the connected fd with a reset: the peer's calls fail with ConnectionReset.
+long bober_io_reset(int fd);
 /// 1 if the connected fd has nothing to read and its peer has not ended, else 0.
 int bober_io_idle(int fd);
 /// The host of fd, or of its peer, into host: its port.

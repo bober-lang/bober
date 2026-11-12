@@ -8,6 +8,7 @@
 
 #define _GNU_SOURCE  // statx
 #include "rt.h"
+#include "net.h"
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
@@ -30,9 +31,15 @@ uint64_t __attribute__((weak)) bober_self(void) { return 0; }
 void __attribute__((weak)) bober_wake(uint64_t f) {}
 void __attribute__((weak)) bober_park(void) { bober_io_wait(); }
 
+int64_t bober_logical = -1;
+/// Whether tests' TCP and UDP go through their network (src/net.h), not the kernel: where they link it.
+#define NETWORK (bober_logical >= 0 && net_poll)
+/// Whether fd is a socket of that network.
+#define NET(fd) (NETWORK && net_ready(fd, 0) >= 0)
+
 int64_t bober_mono(void) {
   struct timespec t;
-  return clock_gettime(CLOCK_MONOTONIC, &t), t.tv_sec * 1000000000 + t.tv_nsec;
+  return bober_logical >= 0 ? bober_logical : (clock_gettime(CLOCK_MONOTONIC, &t), t.tv_sec * 1000000000 + t.tv_nsec);
 }
 
 /// A fiber parked until fd is ready, on its stack: done once it is, -1 if its deadline passed first; at its index in
@@ -108,9 +115,11 @@ static void sift(Wait *w, long i) {
 
 /// Wakes w, done, taking it from its descriptor's waits and the heap.
 static void wake(Wait *w, int done) {
-  Wait **p = &fds[w->fd].waits[w->write];
-  while (*p != w) p = &(*p)->next;
-  *p = w->next;
+  if (w->fd >= 0) {
+    Wait **p = &fds[w->fd].waits[w->write];
+    while (*p != w) p = &(*p)->next;
+    *p = w->next;
+  }
   if (w->deadline && w->at < --deadlines) sift(heap[deadlines], w->at);
   w->done = done, waiting--, bober_wake(w->fiber);
 }
@@ -119,6 +128,10 @@ static void wake(Wait *w, int done) {
 static void edge(int fd, int write) {
   Fd *f = &fds[fd];
   for (f->ready[write] = 1; f->waits[write];) wake(f->waits[write], 1);
+}
+
+void net_edge(int fd, int write) {
+  if ((unsigned)fd < nfds) edge(fd, write);
 }
 
 /// What a call that gave r gives: r, or the failure errno is, BOBER_IO_AGAIN for one that would block.
@@ -132,30 +145,52 @@ static long result_on(int fd, int write, long r) {
   return result(r);
 }
 
+/// Parks until w, waiting, is done or timeout passes: 0, or -ETIMEDOUT.
+static long park(Wait *w, long timeout) {
+  long t = bober_mono();  // a deadline past the largest long saturates to it, which never comes
+  w->deadline = !timeout ? 0 : timeout > LONG_MAX - t ? LONG_MAX : t + timeout, waiting++;
+  if (w->deadline) heap = fit(heap, &room, deadlines, sizeof *heap), sift(w, deadlines++);
+  while (!w->done) bober_park();
+  return w->done < 0 ? -ETIMEDOUT : 0;
+}
+
 long bober_io_ready(int fd, int write, long timeout) {
   if (fd < 0) return 0;
   Fd *f = (fds = fit(fds, &nfds, fd, sizeof *fds)) + fd;
+  int net = NETWORK ? net_ready(fd, write) : -1;
+  if (net > 0) return 0;
   // One the kernel cannot watch, as a file or one closed, is always ready: the call on it tells.
-  if (!f->watched || f->ready[write]) {
+  if (net < 0 && (!f->watched || f->ready[write])) {
     if (q < 0 && (q = queue()) < 0) return -errno;
     if (watch(fd, f->watched ? MOD : ADD)) return errno == EPERM || errno == EBADF ? 0 : -errno;
     f->watched = 1, f->ready[write] = 0;
   }
-  long t = bober_mono();  // a deadline past the largest long saturates to it, which never comes
-  Wait w = {bober_self(), fd, write, 0, !timeout ? 0 : timeout > LONG_MAX - t ? LONG_MAX : t + timeout}, **p;
-  for (p = &f->waits[write]; *p;) p = &(*p)->next;
-  *p = &w, waiting++;
-  if (w.deadline) heap = fit(heap, &room, deadlines, sizeof *heap), sift(&w, deadlines++);
-  while (!w.done) bober_park();
-  return w.done < 0 ? -ETIMEDOUT : 0;
+  Wait **p = &f->waits[write];
+  while (*p) p = &(*p)->next;
+  return park(*p = &(Wait){bober_self(), fd, write}, timeout);
+}
+
+void bober_io_sleep(long ns) {
+  if (ns > 0) park(&(Wait){bober_self(), -1}, ns);
 }
 
 int bober_io_wait(void) {
   if (!waiting) return 0;
-  long t = bober_mono(), soonest = deadlines ? heap[0]->deadline : 0;
+  if (q < 0) q = queue();  // which no wait made if none was on a kernel socket
+  long t = bober_mono(), soonest = deadlines ? heap[0]->deadline : 0, before = waiting;
   // In ms rounded up, at most an int's; a later deadline is waited for again.
   long ms = !soonest ? -1 : soonest <= t ? 0 : (soonest - t - 1) / 1000000 + 1;
-  events(ms > INT_MAX ? INT_MAX : ms);
+  events(bober_logical >= 0 ? 0 : ms > INT_MAX ? INT_MAX : ms);
+  // Logical time waits for nothing: once no socket is ready, it is the soonest deadline or timer of the network, and
+  // with neither, never one.
+  if (bober_logical >= 0) {
+    long timer = NETWORK ? net_poll() : 0;
+    if (waiting == before) {
+      if (timer && (!soonest || timer < soonest)) soonest = timer;
+      if (!soonest || soonest == LONG_MAX) return 0;
+      bober_logical = soonest;
+    }
+  }
   for (t = bober_mono(); deadlines && heap[0]->deadline <= t;) wake(heap[0], -1);
   return 1;
 }
@@ -205,12 +240,17 @@ static void ended(int fd) {
 
 long bober_io_close(int fd) {
   ended(fd);
+  if (NET(fd)) return net_close(fd, 0);
   // The kernel forgets fd, which it would not for a dup's sake.
   if ((unsigned)fd < nfds && fds[fd].watched) watch(fd, DEL), fds[fd] = (Fd){0};
   return result(close(fd));
 }
-long bober_io_read(int fd, void *buf, unsigned long n) { return result_on(fd, 0, read(fd, buf, n)); }
-long bober_io_write(int fd, const void *buf, unsigned long n) { return result_on(fd, 1, write(fd, buf, n)); }
+long bober_io_read(int fd, void *buf, unsigned long n) {
+  return NET(fd) ? net_read(fd, buf, n) : result_on(fd, 0, read(fd, buf, n));
+}
+long bober_io_write(int fd, const void *buf, unsigned long n) {
+  return NET(fd) ? net_write(fd, buf, n) : result_on(fd, 1, write(fd, buf, n));
+}
 long bober_io_sync(int fd) { return result(fsync(fd)); }
 long bober_io_mkdir(const char *path) { return result(mkdir(path, 0777)); }
 long bober_io_rename(const char *from, const char *to) { return result(rename(from, to)); }
@@ -314,6 +354,7 @@ long bober_io_dial(const char *net, const char *host, int port) {
   struct sockaddr_storage sa;
   socklen_t n = address(host, port, &sa);
   if (!n) return -EINVAL;
+  if (NETWORK && sa.ss_family != AF_UNIX) return net_dial(net, host, port);
   long fd = unblocked(socket(sa.ss_family, strcmp(net, "udp") ? SOCK_STREAM : SOCK_DGRAM, 0));
   return fd >= 0 && connect(fd, (void *)&sa, n) && errno != EINPROGRESS ? failed(fd) : fd;
 }
@@ -321,6 +362,7 @@ long bober_io_dial(const char *net, const char *host, int port) {
 long bober_io_connected(int fd) {
   int err = 0;
   socklen_t n = sizeof err;
+  if (NET(fd)) return net_connected(fd);
   return getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &n) ? -errno : -err;
 }
 
@@ -329,6 +371,7 @@ long bober_io_listen(const char *net, const char *host, int port, int backlog) {
   socklen_t n = address(host, port, &sa);
   if (!n) return -EINVAL;
   int stream = strcmp(net, "udp"), ip = sa.ss_family != AF_UNIX, on = 1, off = 0;
+  if (NETWORK && ip) return net_listen(net, host, port);
   long fd = unblocked(socket(sa.ss_family, stream ? SOCK_STREAM : SOCK_DGRAM, 0));
   // A v6 socket takes v4 too, whatever net.ipv6.bindv6only says. SO_REUSEADDR on UDP would let any user share the
   // port, so only a stream listener has it. SO_REUSEPORT lets the user's sockets share a port, so it is only for one
@@ -342,6 +385,7 @@ long bober_io_listen(const char *net, const char *host, int port, int backlog) {
 }
 
 long bober_io_accept(int fd) {
+  if (NET(fd)) return net_accept(fd);
   long c = accept(fd, 0, 0);
   if (c >= 0) return unblocked(c);
   // An abort or network error is the taken connection's, not the listener's, so accept(2) retries it as EAGAIN.
@@ -355,6 +399,7 @@ long bober_io_accept(int fd) {
 long bober_io_recvfrom(int fd, void *buf, unsigned long n, char *host, int *port) {
   struct sockaddr_storage sa = {0};
   socklen_t len = sizeof sa;
+  if (NET(fd)) return net_recvfrom(fd, buf, n, host, port);
   long r = recvfrom(fd, buf, n, 0, (void *)&sa, &len);
   if (r >= 0) *port = text(&sa, host);
   return result_on(fd, 0, r);
@@ -363,23 +408,33 @@ long bober_io_recvfrom(int fd, void *buf, unsigned long n, char *host, int *port
 long bober_io_sendto(int fd, const void *buf, unsigned long n, const char *host, int port) {
   struct sockaddr_storage sa;
   socklen_t len = address(host, port, &sa);
+  if (NET(fd)) return len ? net_sendto(fd, buf, n, host, port) : -EINVAL;
   return len ? result_on(fd, 1, sendto(fd, buf, n, 0, (void *)&sa, len)) : -EINVAL;
 }
 
 long bober_io_shutdown(int fd, int both) {
-  long r = result(shutdown(fd, both ? SHUT_RDWR : SHUT_WR));
+  long r = NET(fd) ? net_shutdown(fd, both) : result(shutdown(fd, both ? SHUT_RDWR : SHUT_WR));
   if (both) ended(fd);
   return r;
 }
 
+long bober_io_reset(int fd) {
+  struct linger l = {1, 0};  // a close resets
+  if (!NET(fd)) return setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof l) ? -errno : bober_io_close(fd);
+  ended(fd);
+  return net_close(fd, 1);
+}
+
 int bober_io_idle(int fd) {
   char c;
+  if (NET(fd)) return net_idle(fd);
   return recv(fd, &c, 1, MSG_PEEK) < 0 && errno == EWOULDBLOCK;
 }
 
 long bober_io_name(int fd, int peer, char *host) {
   struct sockaddr_storage sa = {0};
   socklen_t n = sizeof sa;
+  if (NET(fd)) return net_name(fd, peer, host);
   return (peer ? getpeername : getsockname)(fd, (void *)&sa, &n) ? -errno : text(&sa, host);
 }
 
