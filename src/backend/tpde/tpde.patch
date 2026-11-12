@@ -80,10 +80,10 @@ index fe9d002..2d1b61c 100644
          if (dst.has_assignment()) {
            dst.lock(this);
 diff --git a/tpde/include/tpde/arm64/CompilerA64.hpp b/tpde/include/tpde/arm64/CompilerA64.hpp
-index 4de1bc9..6a06c3e 100644
+index 4de1bc9..aad0f3b 100644
 --- a/tpde/include/tpde/arm64/CompilerA64.hpp
 +++ b/tpde/include/tpde/arm64/CompilerA64.hpp
-@@ -161,10 +161,10 @@ constexpr static u64 create_bitmask(const std::array<AsmReg, N> regs) {
+@@ -161,10 +161,10 @@
  /// AArch64 AAPCS calling convention.
  class CCAssignerAAPCS : public CCAssigner {
    static constexpr CCInfo Info{
@@ -96,6 +96,41 @@ index 4de1bc9..6a06c3e 100644
        // callee-saved registers
        .callee_saved_regs = create_bitmask({
            AsmReg::R19,
+@@ -212,6 +212,12 @@
+   // NSAA = Next Stack Argument Address
+   u32 ngrn = 0, nsrn = 0, nsaa = 0;
+   u32 ret_ngrn = 0, ret_nsrn = 0;
++  // What an argument's size on the stack is a multiple of: Apple packs them.
++#ifdef __APPLE__
++  static constexpr u32 slot = 1;
++#else
++  static constexpr u32 slot = 8;
++#endif
+ 
+ public:
+   CCAssignerAAPCS() : CCAssigner(Info) {}
+@@ -240,9 +246,10 @@
+         ngrn += 1;
+       } else {
+         ngrn = 8;
+-        nsaa = util::align_up(nsaa, arg.align < 8 ? 8 : arg.align);
++        u32 size = util::align_up(arg.size, slot);
++        nsaa = util::align_up(nsaa, arg.align < size ? size : arg.align);
+         arg.stack_off = nsaa;
+-        nsaa += 8;
++        nsaa += size;
+       }
+     } else {
+       if (nsrn + arg.consecutive < 8) {
+@@ -250,7 +257,7 @@
+         nsrn += 1;
+       } else {
+         nsrn = 8;
+-        u32 size = util::align_up(arg.size, 8);
++        u32 size = util::align_up(arg.size, slot);
+         nsaa = util::align_up(nsaa, size);
+         arg.stack_off = nsaa;
+         nsaa += size;
 diff --git a/tpde/include/tpde/util/SmallVector.hpp b/tpde/include/tpde/util/SmallVector.hpp
 index 6976ba9..3d620d7 100644
 --- a/tpde/include/tpde/util/SmallVector.hpp
