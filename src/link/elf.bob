@@ -13,9 +13,10 @@ import { Format, Image, Segment } from "./link"
 import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Init, Local, Object, Page, PageOff, Rel32, Rel64,
 	Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Unwind, Weak, Zero } from "./object"
 
-/// The room the writer needs before the first linked address: the ELF header and 9 program headers, a PT_LOAD per
-/// segment, of at most 4, and one for the loader's tables, PT_DYNAMIC, PT_TLS, PT_GNU_EH_FRAME and PT_GNU_STACK.
-const headers: u64 = 64 + 9 * 56
+/// The room the writer needs before the first linked address: the ELF header and 10 program headers, a PT_LOAD per
+/// segment, of at most 5 (link.bob's keptRegions), and one for the loader's tables, PT_DYNAMIC, PT_TLS, PT_GNU_EH_FRAME
+/// and PT_GNU_STACK.
+const headers: u64 = 64 + 10 * 56
 
 /// e_ident: the magic, 64-bit, little-endian, version 1.
 const ident = "\x7fELF\x02\x01\x01"
@@ -464,6 +465,9 @@ function write(image: Image): string throws CompileError {
 		phdrs += program(PT_GNU_EH_FRAME, PF_R, t(hdrAt), hdrAt, hdrSize, hdrSize, 4)
 	}
 	phdrs += program(PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 16)
+	if (64 + (phdrs.length as u64) > headers) {
+		throw new CompileError(`the ELF headers need ${64 + phdrs.length} bytes, more than ${headers}`)
+	}
 	const head = ident + le(0, 9) + le(ET_DYN, 2) + le(if (x64) EM_X86_64 else EM_AARCH64, 2) + le(1, 4) + le(0, 8) +
 		le(64, 8) + le(shoff, 8) + le(0, 4) + le(64, 2) + le(56, 2) + le((phdrs.length / 56) as u64, 2) + le(64, 2) +
 		le(n + 1, 2) + le(n, 2) + phdrs
