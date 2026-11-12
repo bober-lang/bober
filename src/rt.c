@@ -23,7 +23,7 @@ static Thrown *caught;
 
 static int argc_;
 static char **argv_;
-static bool tests, testing, failed;
+static bool tests;
 static uint64_t seed;  // random's state
 
 // In tests, now is when Obergefell v. Hodges made same-sex marriage a right in all of the US, and random is seeded
@@ -31,11 +31,10 @@ static uint64_t seed;  // random's state
 #define OBERGEFELL 1435327200000000000
 #define STONEWALL 0x19690628
 
-static jmp_buf *test;    // where a trap in the running test or subtest goes
-static char path[1024];  // the running test's name, then its running subtests', each after " / "
-static int subfailed;    // the running test's failed subtests
+static jmp_buf *test;          // where a trap in the running test or subtest goes, null outside one
 static const char *testFile;  // the running test's source
 static int32_t testAt;        // where in it the statement running is, -1 before the first
+static int cap = -1, saved[2] = {1, 2};  // in tests, the file the output and errors go to, and where they went
 /// Reserves the heap (src/gc.c), before any code runs that may store to it.
 void bober_gc_start(void);
 /// Drops every fiber but the first (src/fiber.c), as once a trap jumped back to it.
@@ -79,13 +78,13 @@ _Noreturn void bober_trap(const char *what, const char *file, int32_t at) {
   else if (file) snprintf(msg, sizeof msg, "%s: trap: %s", file, what);
   else snprintf(msg, sizeof msg, "trap: %s", what);
   int testLine, testCol;  // of the test's statement running, noted if the trap is not on its line
-  position(testFile, testing ? testAt : -1, &testLine, &testCol);
+  position(testFile, test ? testAt : -1, &testLine, &testCol);
   if (testLine && (!file || strcmp(file, testFile) || line != testLine)) {
     size_t n = strlen(msg);
     snprintf(msg + n, sizeof msg - n, " (called at %s:%d)", testFile, testLine);
   }
-  if (testing) longjmp(*test, 1);
-  put(2, msg, strlen(msg)), put(2, "\n", 1);
+  if (test) longjmp(*test, 1);
+  put(saved[1], msg, strlen(msg)), put(saved[1], "\n", 1);
   exit(1);
 }
 
@@ -177,8 +176,11 @@ void *bober_caught(void) { return &caught->tag; }
 void bober_start(int argc, char **argv, int32_t tested) {
   bober_gc_start();
   argc_ = argc, argv_ = argv, tests = tested;
-  if (tests) seed = STONEWALL, bober_logical = 1;
-  else getentropy(&seed, sizeof seed);
+  if (tests) {
+    FILE *f = tmpfile();
+    seed = STONEWALL, bober_logical = 1, cap = f ? fileno(f) : -1, saved[0] = dup(1), saved[1] = dup(2);
+    dup2(cap, 1), dup2(cap, 2);
+  } else getentropy(&seed, sizeof seed);
   signal(SIGPIPE, SIG_IGN);  // a write to a socket the peer closed fails with EPIPE instead
   bober_types_complete();
 }
@@ -187,41 +189,84 @@ const char *bober_arg(int32_t i) { return i < argc_ ? argv_[i] : 0; }
 
 const char *bober_env(const char *name) { return getenv(name); }
 
-/// Prints that the test or subtest at path failed with msg.
-static void fail(void) {
-  bober_fibers_reset();
-  char line[sizeof msg + sizeof path + 16];
-  put(1, line, snprintf(line, sizeof line, "FAIL %s: %s\n", path, msg));
-  failed = true;
-}
+/// A test or subtest running, or the tests: its children's entries in the report so far, members of a JSON object,
+/// whether one failed, and where its output starts in cap.
+typedef struct Level { struct Level *up; char *kids; size_t n; bool failed; long from; } Level;
+static Level all, *level = &all;
+static size_t sent;  // of all's entries, printed
 
-/// Runs a test, printing whether it passed; a trap fails it, as a failed subtest does once it returns.
-void bober_test(const char *name, const char *file, void (*f)(void)) {
-  testing = true, seed = STONEWALL, subfailed = 0, testFile = file, testAt = -1;
-  snprintf(path, sizeof path, "%s", name);
-  jmp_buf here;
-  if (setjmp(*(test = &here))) {
-    fail();
-    return;
+/// Appends the n bytes at s to l's entries, escaped as in a JSON string if esc.
+static void add(Level *l, const char *s, size_t n, bool esc) {
+  char *p = (l->kids = bober_realloc(l->kids, l->n + 6 * n + 1)) + l->n;
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = s[i];
+    if (esc && (c == '"' || c == '\\')) *p++ = '\\';
+    if (esc && c < 0x20) p += sprintf(p, c == '\n' ? "\\n" : c == '\t' ? "\\t" : "\\u%04x", c);
+    else *p++ = c;
   }
-  f();
-  if (subfailed) snprintf(msg, sizeof msg, "failed subtests: %d", subfailed), fail();
-  else put(1, "ok ", 3), put(1, name, strlen(name)), put(1, "\n", 1);
+  l->n = p - l->kids;
 }
 
-void bober_subtest(const char *name, uint64_t f) {
-  size_t n = strlen(path);
-  snprintf(path + n, sizeof path - n, " / %s", name);
-  jmp_buf here, *up = test;
-  if (setjmp(*(test = &here))) fail(), subfailed++;
-  else (*(void (**)(void *))f)((void *)(uintptr_t)f);
-  test = up;
-  path[n] = 0;
+static void raw(Level *l, const char *s) { add(l, s, strlen(s), false); }
+
+/// Appends the key name to l's entries.
+static void key(Level *l, const char *name) {
+  raw(l, l->n ? ",\"" : "\""), add(l, name, strlen(name), true), raw(l, "\":");
 }
+
+/// Prints the entries of the tests not yet printed, so that a crash leaves those before it and the key of its test.
+static void flush(void) { put(saved[0], all.kids + sent, all.n - sent), sent = all.n; }
+
+/// Ends l, which trapped with msg if trapped: adds its value to its parent's entries, "ok" if it and its subtests
+/// passed, else what it printed, at most the last 4 KiB and with its subtests' output, and msg, or if subtests failed
+/// their entries, and that as "trap", which a subtest may also be named.
+static void end(Level *l, bool trapped) {
+  Level *up = l->up;
+  if (trapped) {
+    Level *to = l->failed ? (key(l, "trap"), l) : up;
+    char buf[4096], *b = buf;
+    long at = lseek(cap, 0, SEEK_CUR);
+    bool cut = at - l->from > (long)sizeof buf;
+    long n = pread(cap, buf, sizeof buf, cut ? at - (long)sizeof buf : l->from);
+    while (cut && n > 0 && (*b & 0xC0) == 0x80) b++, n--;  // a character cut off
+    raw(to, "\""), add(to, b, n > 0 ? n : 0, true);
+    if (n > 0 && b[n - 1] != '\n') raw(to, "\\n");
+    add(to, msg, strlen(msg), true), raw(to, "\"");
+  }
+  if (l->failed) raw(up, "{"), add(up, l->kids, l->n, false), raw(up, "}");
+  else if (!trapped) raw(up, "\"ok\"");
+  up->failed |= l->failed || trapped;
+  free(l->kids);
+}
+
+/// Runs f(env) as the test or subtest name, in the running one if any; a trap fails it.
+static void run(const char *name, void (*f)(void *), void *env) {
+  key(level, name), flush();
+  Level l = {level, 0, 0, false, lseek(cap, 0, SEEK_CUR)};
+  jmp_buf here, *up = test;
+  level = &l, test = &here;
+  if (setjmp(here)) bober_fibers_reset(), end(&l, true);
+  else f(env), end(&l, false);
+  test = up, level = l.up;
+  flush();
+}
+
+void bober_test(const char *name, const char *file, void (*f)(void)) {
+  seed = STONEWALL, testFile = file, testAt = -1;
+  if (!all.n) put(saved[0], "{", 1);  // not before, as a trap in initializing prints instead
+  run(name, (void (*)(void *))f, 0);
+  ftruncate(cap, 0), lseek(cap, 0, SEEK_SET);
+}
+
+void bober_subtest(const char *name, uint64_t f) { run(name, *(void (**)(void *))f, (void *)(uintptr_t)f); }
 
 void bober_mark(int32_t at) { testAt = at; }
 
-int32_t bober_tested(void) { return failed; }
+/// Ends the report of the tests, a JSON object of their entries; whether one failed.
+int32_t bober_tested(void) {
+  put(saved[0], all.n ? "}\n" : "{}\n", all.n ? 2 : 3);
+  return all.failed;
+}
 
 int64_t bober_now(void) {
   struct timespec t;

@@ -152,6 +152,41 @@ export function quoted(s: string): string {
 	return `"${q}"`
 }
 
+/// The valid JSON s with each member and element on a line of its own, indented by a tab for each array and object it
+/// is in, and a space after each colon; an empty array or object stays on its line.
+export function indent(s: string): string {
+	let out = ""
+	let tabs = ""
+	let opened = false // whether an array or object just opened, its first line not yet begun
+	let i = 0
+	while (i < s.length) {
+		const c = s[i]
+		const at = i
+		i++
+		if (ascii.isSpace(c)) {
+			continue
+		}
+		if (c == rbrace || c == rbracket) {
+			tabs = tabs.slice(1, tabs.length)
+			out += if (opened) "" else `\n${tabs}`
+		} else if (opened) {
+			out += `\n${tabs}`
+		}
+		opened = c == lbrace || c == lbracket
+		if (opened) {
+			tabs += "\t"
+		}
+		if (c == quote) {
+			while (i < s.length && s[i] != quote) {
+				i += if (s[i] == backslash) 2 else 1
+			}
+			i++
+		}
+		out += if (c == comma) `,\n${tabs}` else if (c == colon) ": " else s.slice(at, i)
+	}
+	return out
+}
+
 /// An object of any keys, each with its value's text for decode to read.
 export class Keys {
 	all: Unknown[] @Rest = []
