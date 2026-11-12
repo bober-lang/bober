@@ -1,9 +1,10 @@
 //! C11, with the GNU extensions system headers.
 
-import { endsWith, startsWith } from "../../std/algo"
+import { endsWith, indexOf, startsWith } from "../../std/algo"
 import { max, min } from "../../std/math"
 import { HashMap } from "../../std/collections/hashmap"
 import { ScopedMap } from "../../std/collections/scopedmap"
+import { isAlphabetic, lbracket, percent } from "../../std/ascii"
 import { split, strip } from "../../std/string"
 import { Backend, Block, Unary, Value } from "../backend/backend"
 import { attrs, signature, vaList } from "../backend/abi"
@@ -1874,11 +1875,12 @@ export class Parser {
 	}
 }
 
-/// The initializer of one object (C11 6.7.9), read from the parser p. A static's becomes the bytes of
-/// data; a local's is stored into dest, which is zero already where it is an aggregate.
+/// The initializer of one object (C11 6.7.9), read from the parser p.
 class Init {
 	private p: Parser
+	/// Where a local's is stored, zero already where it is an aggregate.
 	private dest: Val
+	/// What a static's becomes the bytes of.
 	private data: Data | null
 	/// The expression a struct's initializer read, which is not of its type, for the first scalar in it.
 	private pending: Val | null = null
@@ -2376,7 +2378,7 @@ function numbered(at: Tok, text: string, names: string[]): string {
 		}
 		if (j < text.length && text[j] == lbracket) {
 			const end = indexOf(text, "]", j)
-			const n = if (end < 0) -1 else position(names, text.slice(j + 1, end))
+			const n = if (end < 0) -1 else names.indexOf(text.slice(j + 1, end))
 			if (n < 0) {
 				throw CError.at(at, "no asm operand of that name")
 			}

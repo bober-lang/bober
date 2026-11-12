@@ -17,7 +17,7 @@ Results on 2026-11-03, arm64, go1.26, ms (lower is better). Bober runs on one co
 | hanoi-stacks | 43 | 41 | 42 | push and pop |
 | sort-quick-i32 | 253 | 260 | 261 | int array indexing |
 | sort-merge-objects | 512 | 511 | 319 | 324 once Item is held as a ref (sortref.bob); Go with Item by value (go/sortval): 953 / 622 |
-| sort-std-objects | 472 | 238 | 240 | std/sort vs slices.SortStableFunc |
+| sort-std-objects | 472 | 238 | 240 | std/algo stableSort vs slices.SortStableFunc |
 | binarytrees | 494 | 1280 | 834 | allocation and collection |
 | nbody | 344 | 513 | 513 | floats through objects |
 | fannkuch | 1552 | 1501 | 1514 | array indexing |

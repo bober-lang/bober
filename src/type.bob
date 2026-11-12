@@ -31,7 +31,7 @@
 //! assignment and passing copy the reference, so all holders see one object, and `==` compares identity, except that
 //! strings compare by code units, functions do not compare, and an assert compares by value (§5.5).
 
-import { contains, lowerBound, merge, position, unique } from "../std/algo"
+import { merge, partitionPoint, unique } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
 import { combine, fnv } from "../std/hash"
 import { maxOf } from "../std/limits"
@@ -351,7 +351,7 @@ export class Type {
 	in(g: Type, args: Type[]): Type {
 		switch (this.kind) {
 			case "param":
-				const i = position(g.params, this)
+				const i = g.params.indexOf(this)
 				return if (i < 0 || i >= args.length) this else args[i]
 			case "class", "interface": return (this.generic ?? this).instantiate(this.params.map(p => p.in(g, args)))
 		}
@@ -359,7 +359,7 @@ export class Type {
 	}
 
 	/// Whether it has one of params in it.
-	mentions(params: Type[]): bool { return contains(params, this) || this.parts().some(p => p.mentions(params)) }
+	mentions(params: Type[]): bool { return params.includes(this) || this.parts().some(p => p.mentions(params)) }
 
 	/// Sets in found the args of params that a value of v fitting this gives them: v where none is found yet or the one
 	/// found has untyped constants and fits v widened but not the reverse, else what the two join to (`join`), or the
@@ -367,11 +367,16 @@ export class Type {
 	unify(v: Type, params: Type[], found: (Type | null)[]) {
 		switch (this.kind) {
 			case "param":
-				const i = position(params, this)
+				const i = params.indexOf(this)
 				const f = if (i < 0) null else found[i]
 				if (i >= 0) {
 					found[i] = if (f == null || f.isLoose() && f.fits(v.widen(true)) && !v.fits(f)) v
 						else f!.join(v) ?? f
+				}
+				const r = readonlyOf(this)
+				const e = if (r == null) null else elementOf(v)
+				if (e != null) {
+					r!.unify(e, params, found)
 				}
 			case "object": for (const f of this.fields) {
 				const m = v.member(f.name)
@@ -382,7 +387,7 @@ export class Type {
 			case "union":
 				const bare = this.types.filter(m => m.kind == "param")
 				const open = if (bare.length > 0) bare else this.types.filter(m => m.mentions(params))
-				const closed = Type.union(this.types.filter(m => !contains(open, m)))
+				const closed = Type.union(this.types.filter(m => !open.includes(m)))
 				const rest = v.alternatives().filter(m => !m.fits(closed))
 				if (open.length == 1 && rest.length > 0) {
 					open[0].unify(Type.union(rest), params, found)
@@ -481,6 +486,10 @@ export class Type {
 	/// elements until stored. Destructuring an array shorter than the pattern traps. Element types are invariant:
 	/// `Square[]` does not fit `Shape[]`. `T[n]` and tuples have no `push` or `pop`.
 	///
+	/// `T[readonly]`, only a declared function's parameter type, takes a `T[]`, a `T[n]` or, where `T` is `u8`, a
+	/// `string`. It has `length`, subscripting and `for`, but no element is assignable, and it may be passed on as a
+	/// `T[readonly]`.
+	///
 	/// ```
 	/// const xs = [1, 2, 3]            // i32[]
 	/// const ys: u8[] = [1, 2]
@@ -497,6 +506,8 @@ export class Type {
 	/// ps[1] = {...ps[0]}               // copies ps[0] into ps[1]
 	/// ps[1] = new P()                  // error: write {...new P()}
 	/// const mixed = [1, "s"]           // error: no common type
+	/// function count(xs: u8[readonly], c: u8): i32 { … }
+	/// count("abc", 98)  count([1, 2], 1)  count(buf, 0)
 	/// ```
 	static array(t: Type): Type { return Array.instantiate([t]) }
 	static async(t: Type): Type { return intern({ ...new Type("async"), base: t }) }
@@ -686,6 +697,24 @@ export function memberOf(s: Type, t: Type): bool {
 	return o.kind == "param" && o.text == "members" && origin(o.params[0]) == origin(t)
 }
 
+/// The T of p, a `T[readonly]` param: a function's type param of its own, constrained by `T[] | string`, which no
+/// constraint written is, as it is a union (4.9); else null.
+export function readonlyOf(p: Type): Type | null {
+	return if (p.kind == "param" && p.base?.kind == "union") p.base!.types.find(m => m.kind == "array")?.params[0] ?? null else null
+}
+
+/// The element type of t as a `T[readonly]` argument: an array's or fixed array's, a string's u8, or a `T[readonly]`'s
+/// T; else null.
+export function elementOf(t: Type): Type | null {
+	return switch (t.kind) {
+		case "array": t.params[0]
+		case "fixed": t.base
+		case "string": if (t == String) U8 else null
+		case "literal": elementOf(t.base!)
+		default: readonlyOf(t)
+	}
+}
+
 /// Whether t is a member of ts, in order.
 function among(t: Type, ts: Type[]): bool {
 	const i = partitionPoint(ts, s => s.id >= t.id) as i32
@@ -773,7 +802,7 @@ function hasMembers(s: Type, t: Type): bool {
 /// a tuple of types fitting the rest of a tuple in t.
 function inInterface(s: Type, t: Type): bool {
 	const ts = t.base!.alternatives()
-	if (contains(ts, s) || s.kind == "literal" && s.base!.fits(t)) {
+	if (ts.includes(s) || s.kind == "literal" && s.base!.fits(t)) {
 		return true
 	}
 	for (const m of ts) {

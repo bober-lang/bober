@@ -1,10 +1,10 @@
-//! YAML 1.2 as a tree of nodes, composed as eemeli/yaml (ISC, github.com/eemeli/yaml) composes it, from the tokens
-//! of ./yaml/cst: scalars keep their text, and kindOf reads a scalar by the core schema. Strict: whatever eemeli/yaml
-//! reports as an error throws a ParseError at its offset, as do a %YAML directive twice, directives without a
-//! document, an alias to no anchor before it, and, in documents, a key twice in a mapping or a node its core tag does
-//! not fit, as !!int x or !!map [a]. Comments are dropped. An anchor is an alias's target once its node is complete,
-//! so the tree has no cycles; to bound the work of expanding them, aliases in a document may stand for at most
-//! maxExpansion (2^20) nodes in all, and collections nest maxDepth (128) deep.
+//! YAML 1.2 as a tree of nodes, composed as eemeli/yaml composes it, from the tokens of ./yaml/cst: scalars keep their
+//! text, and kindOf reads a scalar by the core schema. Strict: whatever eemeli/yaml reports as an error throws a
+//! ParseError at its offset, as do a %YAML directive twice, directives without a document, an alias to no anchor before
+//! it, and, in documents, a key twice in a mapping or a node its core tag does not fit, as !!int x or !!map [a].
+//! Comments are dropped. An anchor is an alias's target once its node is complete, so the tree has no cycles; to bound
+//! the work of expanding them, aliases in a document may stand for at most maxExpansion (2^20) nodes in all, and
+//! collections nest maxDepth (128) deep.
 //!
 //! decode and encode map values as ./json does, with field tags of the same names; fields take ../encoding's tags
 //! too. A document is read by the core schema, strictly, so a string is only a scalar of kind "str" and a class takes
@@ -13,15 +13,17 @@
 //! on its size that alias bombs hit as a "range" error. encode writes block YAML through emit: plain scalars where
 //! they read back as they are, else quoted, and text with line breaks as a literal block scalar.
 
+// Ported from eemeli/yaml (ISC, github.com/eemeli/yaml).
+
 import * as ascii from "../ascii"
+import { endsWith, indexOf, startsWith } from "../algo"
 import { ampersand, apostrophe, backslash, backtick, colon, comma, cr, digit, dot, exclamation, greater, hash, isDigit,
 	isHexDigit, lbrace, lbracket, less, lf, minus, nine, percent, pipe, plus, question, quote, rbrace, rbracket, seven,
 	slash, space, star, tab, tilde, underscore, zero } from "../ascii"
 import { HashMap } from "../collections/hashmap"
 import { formatFloat, parseFloat } from "../float"
 import { inf, isFinite, isNaN, max, nan } from "../math"
-import { ParseError, parseInt } from "../parse"
-import { codePoint, endsWith, indexOf, replace, split, startsWith, utf8 } from "../string"
+import { ParseError, codePoint, parseInt, replace, split, utf8 } from "../string"
 import * as encoding from "../encoding"
 import { Decodable, Float, has, Integral } from "../types"
 import { quoted, Unknown } from "./json"

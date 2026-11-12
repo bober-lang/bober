@@ -3,22 +3,22 @@
 
 import * as abi from "../backend/abi"
 import { Backend, Binary, Block, Cast, Cmp, FCmp, Type as Held, Operand, Unary, Value } from "../backend/backend"
-import { contains } from "../../std/algo"
 import { isDigit, plus, zero } from "../../std/ascii"
 import { max } from "../../std/math"
 import { trim } from "../../std/string"
 import { Numeric } from "../../std/types"
 import * from "./type"
 
-/// An expression's value. An lvalue's v is the base of its address, and off is added to it; so is an
-/// address constant's, a global. A constant also knows its value: known is "int", "float" or "addr".
+/// An expression's value.
 export class Val {
 	ty: Type
 	/// The back end's value: an rvalue's, or the address an lvalue or address constant is at; 0 for a
 	/// constant number, which is made where it is used.
 	v: Value
 	lv = false
+	/// Added to v's address, of an lvalue or address constant.
 	off: i64 = 0
+	/// "int", "float" or "addr" for a constant that knows its value.
 	known = ""
 	n: i64 = 0
 	x: f64 = 0.0
@@ -65,12 +65,13 @@ export function global(t: Type, v: Value, sym: string = ""): Val {
 	return o
 }
 
-/// The function being defined: its value and type, the entry block its allocas gather in, and the block
-/// its code starts in.
+/// The function being defined: its value and type.
 export class Func {
 	v: Value
 	ty: Fn
+	/// The block its allocas gather in.
 	entry: Block
+	/// The block its code starts in.
 	body: Block
 
 	constructor(v: Value, ty: Fn, entry: Block, body: Block) {
@@ -460,7 +461,7 @@ export class Gen implements abi.Frame {
 			types.push(x.ty)
 			xs.push(if (x.ty instanceof Record) this.addr(x) else this.op(x))
 		}
-		if (contains(["setjmp", "_setjmp", "sigsetjmp"], p.sym)) {
+		if (["setjmp", "_setjmp", "sigsetjmp"].includes(p.sym)) {
 			this.b.attr(p.v, -1, "returns_twice", 0)
 		}
 		const r = ft.result

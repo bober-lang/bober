@@ -120,6 +120,13 @@ uint64_t bober_convert(const bober_type *to, const bober_type *from, uint64_t bi
 
 /// Prints what and, given a file, where, and exits, or in a test fails just that test.
 _Noreturn void bober_trap(const char *what, const char *file, int32_t at);
+/// Traps as an assert that failed, with how, a string, saying how.
+_Noreturn void bober_fail(const uint8_t *how, const char *file, int32_t at);
+/// Runs the function value f as the subtest name of the running test; a trap in it fails it and the test, which goes on.
+void bober_subtest(const char *name, uint64_t f);
+/// Notes that the running test is at the statement at its source position at, which a trap elsewhere says it was called
+/// at.
+void bober_mark(int32_t at);
 /// Raises a value as a union holds it, its tag, bits and ref; one nothing catches traps, showing it if of a primitive
 /// kind (§8.2), which its tag's descriptor holds, with where it was first thrown, a rethrow passing a null file.
 _Noreturn void bober_throw(int64_t tag, int64_t bits, void *ref, const char *file, int32_t at);
@@ -139,7 +146,7 @@ void bober_fiber(uint64_t f);
 uint64_t bober_self(void);
 /// Parks the fiber running until bober_wake readies it, running those ready meanwhile; traps if none is.
 void bober_park(void);
-/// Readies fiber f, which parked, to run after those readied before it.
+/// Readies fiber f, which parked, to run after those readied before it, unless it is ready already.
 void bober_wake(uint64_t f);
 
 // What differs between runs is fixed in tests, so that a test's result depends on its code alone and can be cached.

@@ -23,6 +23,19 @@ export class String {
 		return if (i >= 0 && i < this.length) this[i] else null
 	}
 
+	/// Whether f holds for a code unit.
+	some(f: (x: u8) => bool): bool {
+		for (const x of this) {
+			if (f(x)) {
+				return true
+			}
+		}
+		return false
+	}
+
+	/// Whether f holds for each code unit.
+	every(f: (x: u8) => bool): bool { return !this.some(x => !f(x)) }
+
 	/// It in bytes of its own, as a long slice shares those of the string it is of, keeping it alive.
 	copy(): string {
 		const p = addr(this)
@@ -163,10 +176,16 @@ export function chr(c: u8): string {
 	return copy(addr(b), 1)
 }
 
-/// The string of the bytes, copied.
-export function fromBytes(bytes: u8[]): string {
-	const n = bytes.length as i64
-	const buf = full(n)
-	memcpy(deref(buf) + 16, elements(addr(bytes)), n as u64)
-	return shared(buf, 16, n)
+/// The string of the bytes, copied, or of the n bytes at address bytes, which traps if 0 and n is not.
+export function fromBytes(bytes: u8[] | u64, n: u64 = 0): string {
+	if (bytes instanceof u64) {
+		if (bytes == 0 && n != 0) {
+			trap("null bytes")
+		}
+		return copy(bytes, n as i64)
+	}
+	const len = bytes.length as i64
+	const buf = full(len)
+	memcpy(deref(buf) + 16, elements(addr(bytes)), len as u64)
+	return shared(buf, 16, len)
 }

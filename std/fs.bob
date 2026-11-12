@@ -1,22 +1,19 @@
-//! Files and directories, as Deno's runtime has them. Every call goes through the run time's I/O (src/rt.h) and throws
-//! an IoError if it fails.
+//! Files and directories, as Deno's runtime has them. A call that fails throws an IoError.
 
+import { sort } from "./algo"
 import { backslash, lbracket, question, star } from "./ascii"
 import { Set } from "./collections/set"
-import { fromCString } from "./c"
-import { File, IoError, checked, readAll } from "./io"
+import { File, readAll } from "./io"
 import { dir, isAbs, join, matchName, patternNames } from "./fs/path"
-import { sort } from "./sort"
-import { indexOf } from "./string"
-import { bober_io_list, bober_io_mkdir, bober_io_open, bober_io_readlink, bober_io_remove, bober_io_rename,
-	bober_io_stat } from "../src/rt.h"
+import { formatInt } from "./string"
+import * as sys from "../builtin/sys"
 
 /// How open opens a file, as C's fopen does: r reads, w truncates or creates, a appends or creates, x creates one that
 /// must not exist; + both reads and writes.
 export type Mode = "r" | "r+" | "w" | "w+" | "a" | "a+" | "x" | "x+"
 
 export function open(path: string, mode: Mode = "r"): File throws IoError {
-	return new File(on("open", path, p => bober_io_open(p, mode)) as i32)
+	return new File(sys.Handle.open(path, mode))
 }
 
 export function readFile(path: string): string throws IoError {
@@ -43,47 +40,16 @@ function put(path: string, mode: Mode, data: string) throws IoError {
 	}
 }
 
-/// What stat finds of a file; times are in ns since the epoch, born null where the file system does not keep it.
-export class FileInfo {
-	isFile: bool
-	isDirectory: bool
-	isSymlink: bool
-	size: i64
-	/// The permission bits.
-	mode: u32
-	modified: i64
-	accessed: i64
-	born: i64 | null
-}
+export type FileInfo = sys.FileInfo
 
 /// Of the file at path, following symlinks.
-export function stat(path: string): FileInfo throws IoError { return info("stat", path, true) }
+export function stat(path: string): FileInfo throws IoError { return sys.stat(path, true) }
 
 /// Of the file at path, a symlink itself.
-export function lstat(path: string): FileInfo throws IoError { return info("lstat", path, false) }
-
-function info(op: string, path: string, follow: bool): FileInfo throws IoError {
-	const s = bober_io_stat(cPath(op, path), if (follow) 1 else 0)
-	checked(s.err, op, path)
-	const i = new FileInfo()
-	const kind = fromCString(s.kind)
-	i.isFile = kind == "file"
-	i.isDirectory = kind == "directory"
-	i.isSymlink = kind == "symlink"
-	i.size = s.size
-	i.mode = s.perm
-	i.modified = s.modified
-	i.accessed = s.accessed
-	i.born = if (s.born == 0) null else s.born
-	return i
-}
+export function lstat(path: string): FileInfo throws IoError { return sys.stat(path, false) }
 
 /// What the symlink at path points to.
-export function readLink(path: string): string throws IoError {
-	const buf = new u8[](4096)
-	const n = checked(bober_io_readlink(cPath("readlink", path), buf, 4096), "readlink", path)
-	return fromBytes(buf.slice(0, n as i32))
-}
+export function readLink(path: string): string throws IoError { return sys.readlink(path) }
 
 /// Whether there is a file at path.
 export function exists(path: string): bool throws IoError {
@@ -98,7 +64,22 @@ export function exists(path: string): bool throws IoError {
 	}
 }
 
-export function mkdir(path: string) throws IoError { on("mkdir", path, p => bober_io_mkdir(p)) }
+export function mkdir(path: string) throws IoError { sys.mkdir(path) }
+
+/// A new directory in the system's directory for temporary files, its name prefix and then random characters.
+export function makeTempDir(prefix = ""): string throws IoError {
+	while (true) {
+		const path = join(sys.env("TMPDIR") ?? "/tmp", prefix + formatInt(random(), 36))
+		try {
+			mkdir(path)
+			return path
+		} catch (e: IoError) {
+			if (e.kind != "AlreadyExists") {
+				throw e
+			}
+		}
+	}
+}
 
 /// Makes a directory and its missing parents, or none if it is one already.
 export function mkdirAll(path: string): void throws IoError {
@@ -115,7 +96,7 @@ export function mkdirAll(path: string): void throws IoError {
 }
 
 /// Removes a file or an empty directory.
-export function remove(path: string) throws IoError { on("remove", path, p => bober_io_remove(p)) }
+export function remove(path: string) throws IoError { sys.remove(path) }
 
 /// Removes a file or a directory and all in it.
 export function removeAll(path: string): void throws IoError {
@@ -127,44 +108,13 @@ export function removeAll(path: string): void throws IoError {
 	remove(path)
 }
 
-export function rename(from: string, to: string) throws IoError {
-	const p = cPath("rename", to)
-	on("rename", from, q => bober_io_rename(q, p))
-}
+export function rename(from: string, to: string) throws IoError { sys.rename(from, to) }
 
-export class DirEntry {
-	name: string
-	isFile: bool
-	isDirectory: bool
-	isSymlink: bool
-}
+export type DirEntry = sys.DirEntry
 
 /// The entries of the directory, in no order, without . and ..; on a file system that keeps no types, all three
 /// flags are false.
-export function readDir(path: string): DirEntry[] throws IoError {
-	let buf = new u8[](1 << 16)
-	let n = on("readDir", path, p => bober_io_list(p, buf, buf.length as u64)) as i32
-	while (n > buf.length) {
-		buf = new u8[](2 * n)  // with room for what is added meanwhile
-		n = on("readDir", path, p => bober_io_list(p, buf, buf.length as u64)) as i32
-	}
-	const s = fromBytes(buf.slice(0, n))
-	const entries: DirEntry[] = []
-	let i = 0
-	while (i < s.length) {
-		const name = indexOf(s, "\0", i)
-		const end = indexOf(s, "\0", name + 1)
-		const kind = s.slice(name + 1, end)
-		const e = new DirEntry()
-		e.name = s.slice(i, name)
-		e.isFile = kind == "file"
-		e.isDirectory = kind == "directory"
-		e.isSymlink = kind == "symlink"
-		entries.push(e)
-		i = end + 1
-	}
-	return entries
-}
+export function readDir(path: string): DirEntry[] throws IoError { return sys.readDir(path) }
 
 /// The paths that match pattern, as path.match takes it, sorted and cleaned; * matches dot files too. A name without *,
 /// ?, [ or \ is looked up rather than matched against its directory's, and ** does not follow symlinks to directories.
@@ -222,16 +172,3 @@ function isLiteral(name: string): bool {
 
 /// Whether path is a directory, following symlinks; false if there is nothing there.
 function isDir(path: string): bool throws IoError { return exists(path) && stat(path).isDirectory }
-
-/// What f, a call of the run time's I/O on path, gives, unless an error, which it throws as op's.
-function on(op: string, path: string, f: (p: string) => i64): i64 throws IoError {
-	return checked(f(cPath(op, path)), op, path)
-}
-
-/// path, unless it holds a NUL, which C would take as its end: then an IoError, as op's.
-function cPath(op: string, path: string): string throws IoError {
-	if (indexOf(path, "\0") >= 0) {
-		throw new IoError("InvalidInput", op, path)
-	}
-	return path
-}

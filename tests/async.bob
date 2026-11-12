@@ -1,0 +1,105 @@
+//! Deferred computation (§6.10): futures and races.
+
+import { Signal } from "../builtin/fiber"
+
+class Oops {}
+
+function now(v: i32): i32 { return v }
+
+/// v, once go wakes.
+function later(go: Signal, v: i32): i32 {
+	go.wait()
+	return v
+}
+
+/// v, once go wakes, waking then.
+function relay(go: Signal, then: Signal, v: i32): i32 {
+	go.wait()
+	then.wake()
+	return v
+}
+
+function failing(go: Signal): i32 {
+	go.wait()
+	throw new Oops()
+}
+
+test "a race takes futures in the order they finish" {
+	const go = [new Signal(), new Signal(), new Signal()]
+	const jobs = [async later(go[0], 10), async later(go[1], 11), async later(go[2], 12)]
+	go[2].wake()
+	assert await ...jobs == [2, 12]
+	go[0].wake()
+	assert await ...jobs == [0, 10]
+	go[1].wake()
+	assert await ...jobs == [1, 11]
+}
+
+test "of several finished, a race takes the lowest index" {
+	const go = [new Signal(), new Signal()]
+	const jobs = [async later(go[0], 10), async later(go[1], 11), async later(go[1], 12)]
+	go[1].wake()
+	assert await ...jobs == [1, 11]
+	assert await ...jobs == [2, 12]
+	go[0].wake()
+	assert await ...jobs == [0, 10]
+	assert await ...[async now(1), async now(2)] == [0, 1]
+}
+
+test "a race rethrows what the future it takes threw" {
+	const go = new Signal()
+	const jobs = [async later(go, 1), async failing(go)]
+	go.wake()
+	assert await ...jobs == [0, 1]
+	let threw = false
+	try {
+		const r = await ...jobs
+	} catch (e: Oops) {
+		threw = true
+	}
+	assert threw
+}
+
+test "a plain await of a taken future yields its result again, and takes nothing" {
+	const jobs = [async now(4), async now(5)]
+	assert await jobs[1] == 5
+	const [i, v] = await ...jobs
+	assert i == 0 && await jobs[i] == v
+	assert await ...jobs == [1, 5]
+}
+
+test "a race in a loop gives each future once" {
+	const go = new Signal()
+	const jobs = [async later(go, 0), async later(go, 1), async later(go, 2)]
+	go.wake()
+	let seen = 0
+	for (const _ of jobs) {
+		const [i, v] = await ...jobs
+		assert v == i && (seen & 1 << i) == 0
+		seen |= 1 << i
+	}
+	assert seen == 7
+}
+
+test "a race woken by two futures loses no other fiber" {
+	const go = new Signal()
+	const then = new Signal()
+	const jobs = [async later(go, 0), async relay(go, then, 1)]
+	const other = async later(then, 2)
+	go.wake()
+	assert await ...jobs == [0, 0]
+	assert await other == 2
+}
+
+function racing(fs: (async i32)[]): [i32, i32] { return await ...fs }
+
+test "fibers racing one array each take a different future" {
+	const go = [new Signal(), new Signal()]
+	const jobs = [async later(go[0], 10), async later(go[1], 11)]
+	const x = async racing(jobs)
+	const y = async racing(jobs)
+	go[1].wake()
+	assert await x == [1, 11]
+	go[0].wake()
+	assert await y == [0, 10]
+}

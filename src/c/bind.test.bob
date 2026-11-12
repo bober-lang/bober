@@ -69,15 +69,15 @@ test "a pointer to a struct that is a class is the class, as a parameter" {
 		== "export class point { x: f64; y: f64 }\nexport function nearest(a0: point, a1: u64, a2: u64): u64\n"
 }
 
-test "a pointer to a scalar takes an array of it, one to a byte or void a string too" {
-	assert b("fill") == "export function fill(a0: i32[] | u64, a1: u64[] | u64, a2: u64)\n"
+test "a pointer to a scalar takes an array of it, to a byte or void a string too, to a pointer to one a string[]" {
+	assert b("fill") == "export function fill(a0: i32[] | u64, a1: string[] | u64[] | u64, a2: u64)\n"
 }
 
 test "a static function is declared as an alias, which glue defines" {
 	assert b("half") == "export function bober_inline_half(a0: i32): i32\nexport const half = bober_inline_half\n"
 	assert glue("dir/t.h", ["bober_inline_half", "div"])
 		== "#include \"dir/t.h\"\nextern __typeof__(half) bober_inline_half __attribute__((weak, alias(\"half\")));\n"
-	assert glue("dir/t.h", ["div"]) == ""
+	assert glue("dir/t.h", ["div"]) == "" && glue("dir/t.c", ["div"]) == "#include \"dir/t.c\"\n"
 }
 
 test "include directories come from the importer's bober.pkg" {
@@ -92,9 +92,22 @@ test "constants come from enums and macros" {
 		== "export const RED: i32 = 0\nexport const GREEN: i32 = 5\nexport const VERSION = \"3.1\\x0A\"\nexport const FLAG: u32 = 2147483648\nexport const NEG: i32 = -2\nexport const HALF: f32 = 0.5\nexport const NONE: u64 = 0\n"
 }
 
-test "objects are consts, arrays of structs included" {
-	assert b("counter", "corners")
-		== "export const counter: i32\nexport class C1 { x: f64; y: f64 }\nexport const corners: C1[2]\n"
+test "objects are consts of copies, arrays of structs included, which glue reads" {
+	assert b("counter") == "export function bober_object_counter(): i32\nexport const counter = bober_object_counter()\n"
+	assert b("corners") == `export class C1 { x: f64; y: f64 }
+export function bober_element_corners(i: i32): C1
+export const corners = (() => {
+	const xs: C1[] = []
+	for (const i of 0 ... 1) {
+		xs.push(bober_element_corners(i))
+	}
+	return xs
+})()
+`
+	assert glue("dir/t.h", ["bober_object_counter", "bober_element_corners"]) == `#include "dir/t.h"
+__attribute__((weak)) __typeof__(counter) bober_object_counter(void) { return counter; }
+__attribute__((weak)) __typeof__(corners[0]) bober_element_corners(int i) { return corners[i]; }
+`
 }
 
 test "a macro naming a function aliases it" {

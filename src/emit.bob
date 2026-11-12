@@ -22,12 +22,11 @@
 //! Types are the Program's ids, compared by id once norm has made them as their values are held; what emit computes
 //! of a type, its key, members, layout and struct, it computes once per id.
 
-import { contains, lowerBound, position } from "../std/algo"
+import { endsWith, lowerBound, startsWith } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
 import { encode as hex } from "../std/encoding/hex"
 import { fromBits } from "../std/float"
 import { max, min } from "../std/math"
-import { endsWith, startsWith } from "../std/string"
 import { Frame as AbiFrame, attrs, call as cCall, held as heldAs, signature } from "./backend/abi"
 import { Backend, Binary, Block, Cmp, FCmp, Type as IrType, Value, mark } from "./backend/backend"
 import * as decl from "./bc/decl"
@@ -68,16 +67,19 @@ export function learn(p: Program, o: Options, backend: (m: i32) => Backend): Fac
 }
 
 /// What emitting a program finds, for each of its modules: what emit computes of a type or decl, and in a release build
-/// the classes, by type, laid out, and those an instance of which is touched, written after its constructor, by
-/// identity or bound to a method, a write through its owner (see newAt) only if what was made at its New also escapes
-/// that, as sites has them by function and op. Once learned, the functions, by decl, that return a tuple, object or
-/// class instance by value, and the classes held by value.
+/// what it learns of its classes and functions.
 export class Facts {
 	phase: "none" | "learning" | "learned" = "none"
+	/// The classes, by type, laid out.
 	classes = new HashMap[i32, i32]()
+	/// Those an instance of which is touched: written after its constructor, by identity or bound to a method; a write
+	/// through its owner (see newAt) only if what was made at its New also escapes that, as sites has them by function
+	/// and op.
 	touched = new HashMap[i32, bool]()
 	sites = new HashMap[i64, i32]()
+	/// Once learned, the functions, by decl, that return a tuple, object or class instance by value.
 	byValue = new HashMap[i32, bool]()
+	/// Once learned, the classes held by value.
 	inline = new HashMap[i32, bool]()
 	/// By type id, what Emitter's functions of their names make of it, and by decl its symbol.
 	norms = new HashMap[i32, i32]()
@@ -94,14 +96,17 @@ type V = { v: Value, t: i32 }
 /// object's or tuple's, are for reflection.
 type Slot = { name: i32, t: i32, embed: bool, mods: i32, decl: i32 }
 
-/// An open block. Br to it jumps to head if it is a Loop or Each, else to exit, storing its result, if any, in slot.
+/// An open block.
 class Frame {
 	op: Opcode
 	t: i32
 	at: i32
 	height: i32
+	/// Where br to it jumps, but for a Loop or Each.
 	exit: Block
+	/// Where br to it stores its result, if any.
 	slot: Value = 0
+	/// Where br to a Loop or Each jumps.
 	head: Block = 0
 	/// An If's else, until its Else.
 	other: Block = 0
@@ -279,17 +284,18 @@ class Emitter {
 		const declare = (name: string, ret: IrType, params: IrType[]) => {
 			const f = b.function(`bober_${name}`, b.fn(ret, params), false)
 			this.rts.set(name, f)
-			if (!contains(["alloc", "test", "zero"], name)) {
+			if (!["alloc", "test", "zero"].includes(name)) {
 				b.attr(f, -1, "gc-leaf-function", 0)
 			}
 			return f
 		}
 		b.allocator(declare("alloc", this.ref, [i64, ptr]))
 		b.attr(declare("trap", v, [ptr, ptr, i32]), -1, "noreturn", 0)
+		b.attr(declare("fail", v, [this.ref, ptr, i32]), -1, "noreturn", 0)
 		declare("throw", v, [i64, i64, this.ref, ptr, i32])
 		declare("caught", ptr, [])
 		declare("start", v, [i32, ptr, i32])
-		declare("test", v, [ptr, ptr])
+		declare("test", v, [ptr, ptr, ptr])
 		declare("tested", i32, [])
 		declare("personality", i32, [])
 		// C's, which builtin/mem's intrinsics of the names call.
@@ -457,7 +463,7 @@ class Emitter {
 		const deps = p.modules[this.m].deps.map(m => p.modules[m].path)
 		if (!builtin(this.path)) {
 			for (const m of p.modules) {
-				if (builtin(m.path) && !contains(deps, m.path)) {
+				if (builtin(m.path) && !deps.includes(m.path)) {
 					deps.push(m.path)
 				}
 			}
@@ -494,7 +500,7 @@ class Emitter {
 		for (const d of p.modules[this.m].decls) {
 			const x = p.decls[d]
 			if (tests && x.kind == decl.Test) {
-				this.rt("test", [this.cstr(this.name(d)), b.function(this.symbol(d), b.fn(this.void, []), true)])
+				this.rt("test", [this.cstr(this.name(d)), this.cstr(this.path), b.function(this.symbol(d), b.fn(this.void, []), true)])
 			} else if (!tests && x.kind == decl.Function && this.name(d) == "main") {
 				const c = this.callee(d)
 				const v = this.call(c.type, c.fn, [])
@@ -664,11 +670,7 @@ class Emitter {
 		switch (o) {
 			case op.End: this.end()
 			case op.Unreachable: this.trap("unreachable")
-			case op.Block, op.Test:
-				if (o == op.Test) {
-					this.pop()
-				}
-				this.open(o, n, i)
+			case op.Block: this.open(o, n, i)
 			case op.Loop:
 				const f = this.open(o, kind.None, i)
 				f.head = this.label()
@@ -829,7 +831,7 @@ class Emitter {
 			case op.Closure:
 				const list = c.items(c.c(i))
 				const d = n
-				if (this.ctor && contains(list, 0)) {
+				if (this.ctor && list.includes(0)) {
 					this.touch(c.locals[0].type) // its this, which the closure may keep
 				}
 				const descs = this.envDescs(c.b(i))
@@ -849,6 +851,7 @@ class Emitter {
 				}
 			case op.Is: this.push(this.isa(this.pop(), n), kind.Bool)
 			case op.Assert: this.check(this.cond(), "assert failed")
+			case op.Fail: this.stop("fail", this.refOf(this.cast(this.pop(), this.any)))
 			case op.Not: this.push(this.not(this.cond()), kind.Bool)
 			case op.Eq, op.Ne, op.Lt, op.Gt, op.Le, op.Ge: this.compare(o)
 			case op.Same:
@@ -1245,13 +1248,15 @@ class Emitter {
 	}
 
 	/// What builtin/'s cPtr takes for the member of u, a pointer param's string | T[] | u64, that tag says: 1 for
-	/// the string, 2 for the array, 0 for the u64.
+	/// the string, 3 for a string[], 2 for another array, 0 for the u64.
 	private pointee(u: i32, tag: Value): Value {
 		let r = this.b.constInt(this.i32, 0)
 		for (const m of this.p.members(u)) {
 			const k = this.p.kind(m)
-			if (k == kind.String || k == kind.Array) {
-				r = this.b.select(this.b.icmp("eq", tag, this.tag(m)), this.b.constInt(this.i32, if (k == kind.String) 1 else 2), r)
+			const n = if (k == kind.String) 1 else if (k != kind.Array) 0
+				else if (this.p.kind(this.norm(this.p.a(m))) == kind.String) 3 else 2
+			if (n > 0) {
+				r = this.b.select(this.b.icmp("eq", tag, this.tag(m)), this.b.constInt(this.i32, n), r)
 			}
 		}
 		return r
@@ -1783,12 +1788,13 @@ class Emitter {
 		return v
 	}
 
-	/// The code of a closure { code, g } calling a function g of type from as one of type to (4.6): its args cast to
-	/// from's params but the optional ones, which g's thunk leaves out, its result to to's.
+	/// The code of a closure { code, g, ...the descriptors of the scope's type params } calling a function g of type from
+	/// as one of type to (4.6): its args cast to from's params but the optional ones, which g's thunk leaves out, its
+	/// result to to's.
 	private adapter(from: i32, to: i32): Value {
 		const b = this.b
 		const p = this.p
-		const sym = `adapt.${this.key(from)}.${this.key(to)}`
+		const sym = `adapt.${this.key(from)}.${this.key(to)}${this.scope.map(x => `.${this.key(x)}`).join("")}`
 		const have = this.thunks.get(sym)
 		if (have != null) {
 			return have
@@ -1801,14 +1807,21 @@ class Emitter {
 		const entry = this.entry
 		const unwind = this.unwind
 		const dead = this.dead
+		const scope = this.scope
+		const descs = this.descs
+		const formed = this.formed
 		const here = b.here()
 		const code = b.function(sym, this.fnType(tr, [this.ref], tps), true)
 		this.thunks.set(sym, code)
 		this.fn = code
-		this.entry = b.block(code)
 		this.unwind = 0
-		this.start(this.entry)
+		this.enter(scope, [])
 		const g = this.captured(b.param(code, 0), 1, this.ref)
+		for (const k of 0 ... scope.length - 1) {
+			this.descs.push(this.captured(b.param(code, 0), k + 2, this.i64))
+		}
+		const start = this.label()
+		this.start(start)
 		const args = [g]
 		for (const i of 0 ... fps.length - 1) {
 			args.push(this.cast({ v: b.param(code, (i + 1) as u32), t: this.norm(tps[i]) }, fps[i]))
@@ -1819,8 +1832,13 @@ class Emitter {
 		} else {
 			this.ir().ret(this.cast({ v: if (this.result(fr) == this.void) this.bool(false) else r, t: this.norm(fr) }, tr))
 		}
+		b.at(this.entry)
+		b.br(start)
 		this.fn = fn
 		this.entry = entry
+		this.scope = scope
+		this.descs = descs
+		this.formed = formed
 		this.unwind = unwind
 		this.dead = dead
 		b.at(here)
@@ -2050,7 +2068,7 @@ class Emitter {
 				this.ir().store(this.ir().binary("add", j, this.i64Const(1)), i, false)
 			}
 			for (const j of 0 ... vs.length - 1) {
-				if (contains(spreads, j)) {
+				if (spreads.includes(j)) {
 					this.forEach(vs[j], set)
 				} else {
 					set(vs[j])
@@ -2069,7 +2087,7 @@ class Emitter {
 		const r = if (!fixed) this.instance(n) else if (!this.b.holdsRef(st)) this.gc(this.spill(this.zero(n), st)) else this.alloc(st)
 		let f = 0
 		for (const j of 0 ... vs.length - 1) {
-			if (contains(spreads, j)) {
+			if (spreads.includes(j)) {
 				this.copy(vs[j], { v: r, t: n })
 			} else {
 				const q = if (fixed) this.ir().gep(st, r, [this.i64Const(0), this.i64Const(f)]) else this.gep(r, n, f)
@@ -2201,7 +2219,7 @@ class Emitter {
 			return this.unbits(v.v, t)
 		}
 		if (fk == kind.Func && tk == kind.Func) {
-			return this.closure(this.adapter(f, t), [v.v])
+			return this.closure(this.adapter(f, t), [v.v], this.descs)
 		}
 		if (fk == kind.Named && tk == kind.Named && (this.inlined(f) || this.inlined(t))) {
 			return this.b.constZero(this.ll(t)) // where a test of a class it is not narrows to it, never reached
@@ -2276,7 +2294,7 @@ class Emitter {
 	}
 
 	/// Whether union u holds a value of type t: has it as a member, or is the union of any type.
-	private holds(u: i32, t: i32): bool { return u == this.any || contains(this.p.members(u), this.norm(t)) }
+	private holds(u: i32, t: i32): bool { return u == this.any || this.p.members(u).includes(this.norm(t)) }
 
 	/// The value of type t union u holds.
 	private unbits(u: Value, t: i32): Value {
@@ -2308,7 +2326,7 @@ class Emitter {
 			return this.ir().icmp("ne", is, this.i64Const(0))
 		}
 		if (this.p.kind(v.t) != kind.Union && !this.boxed(v.t)) {
-			return this.bool(contains(ts, v.t))
+			return this.bool(ts.includes(v.t))
 		}
 		return this.tagIn(this.tagOf(v.v), ts)
 	}
@@ -2353,7 +2371,7 @@ class Emitter {
 		// The byte the widest spares, if no other member reaches it but to spare it too.
 		const k = this.spare(widest)
 		const shared = k >= 0 && ms.every(m => (this.b.bytes(this.inUnion(m)) as i32) <= k || this.spare(m) == k)
-		const r: [i32, i32, i32] = if (ms.length == 2 && contains(ms, kind.Null) && k == 7) [size, align, -1]
+		const r: [i32, i32, i32] = if (ms.length == 2 && ms.includes(kind.Null) && k == 7) [size, align, -1]
 			else if (shared) [size, align, k] else [(size + align) / align * align, align, size]
 		return r
 	}
@@ -2410,7 +2428,7 @@ class Emitter {
 				this.ir().store(this.b.constInt(this.b.int(8), this.tagByte(n, i)), this.ir().gep(this.b.int(8), q, [this.i64Const(at)]), false)
 			}
 		}
-		const i = if (this.p.kind(v.t) == kind.Union) -1 else position(ms, v.t)
+		const i = if (this.p.kind(v.t) == kind.Union) -1 else ms.indexOf(v.t)
 		if (i >= 0) {
 			store(i, v) // as is, not boxed in a union first
 			return
@@ -2429,7 +2447,7 @@ class Emitter {
 	/// its zero.
 	private tagByte(n: i32, i: i32): i64 {
 		const ms = this.p.members(n)
-		const z = max(0, position(ms, kind.Null as i32))
+		const z = max(0, ms.indexOf(kind.Null as i32))
 		return ((i - z + ms.length) % ms.length) as i64
 	}
 
@@ -2571,7 +2589,7 @@ class Emitter {
 			r = this.langCall("concat", [x, y])
 		} else if (kind.isFloat(k)) {
 			r = this.ir().binary(`f${name}` as Binary, x, y)
-		} else if (contains([op.Add, op.Sub, op.Mul, op.And, op.Or, op.Xor], o)) {
+		} else if ([op.Add, op.Sub, op.Mul, op.And, op.Or, op.Xor].includes(o)) {
 			r = this.ir().binary(name as Binary, x, y)
 		} else if (o == op.Shl || o == op.Shr) {
 			const c = this.ir().binary("and", y, this.b.constInt(ty, kind.width(k) - 1))
@@ -2663,7 +2681,7 @@ class Emitter {
 		seen.push(t)
 		return this.layout(t).some(s => {
 			const n = this.norm(s.t)
-			return r.has(n) && (n == of || !contains(seen, n) && this.nests(n, of, r, seen))
+			return r.has(n) && (n == of || !seen.includes(n) && this.nests(n, of, r, seen))
 		})
 	}
 
@@ -2711,7 +2729,7 @@ class Emitter {
 					}
 				}
 				// A finally may collect after a return has stored its value where the caller's slot is, no root.
-				if (x.kind == decl.Function && (x.mods & Extern) == 0 && this.holdable(p.b(x.type)) && !contains(c.ops, op.Finally)) {
+				if (x.kind == decl.Function && (x.mods & Extern) == 0 && this.holdable(p.b(x.type)) && !c.ops.includes(op.Finally)) {
 					fns.push(d)
 				}
 			}
@@ -2878,7 +2896,7 @@ class Emitter {
 		const other = c.locals.map(_ => false)
 		for (const k of 1 ... c.ops.length - 1) {
 			const l = this.assigned(c, k)
-			if (c.ops[k] == op.SetLocal && l >= np && !contains(c.captures, l) && c.ops[k - 1] == op.New && r[l] < 0) {
+			if (c.ops[k] == op.SetLocal && l >= np && !c.captures.includes(l) && c.ops[k - 1] == op.New && r[l] < 0) {
 				r[l] = k - 1
 			} else if (l >= 0) {
 				other[l] = true
@@ -2916,7 +2934,7 @@ class Emitter {
 			if (l >= 0) {
 				sets[l]++
 				at[l] = k
-				looped[l] = contains(open, op.Loop) || contains(open, op.Each) || o == op.Each
+				looped[l] = open.includes(op.Loop) || open.includes(op.Each) || o == op.Each
 			}
 			if (o == op.Fresh) {
 				fresh[c.a(k)] = true
@@ -3096,8 +3114,11 @@ class Emitter {
 		this.start(ok)
 	}
 
-	private trap(what: string) {
-		this.rt("trap", [this.cstr(what), ...this.site()], false)
+	private trap(what: string) { this.stop("trap", this.cstr(what)) }
+
+	/// Calls rt.c's function name, which traps with what at the site.
+	private stop(name: string, what: Value) {
+		this.rt(name, [what, ...this.site()], false)
 		this.ir().unreachable()
 		this.dead = true
 	}
@@ -3235,7 +3256,7 @@ class Emitter {
 		const p = this.p
 		const k = p.kind(n)
 		if (k == kind.Param) {
-			const at = position(this.scope, n)
+			const at = this.scope.indexOf(n)
 			if (at < 0) {
 				throw new CompileError(`emit: ${showType(p, n)} is not bound here`)
 			}
@@ -3250,7 +3271,7 @@ class Emitter {
 			const [q, d] = this.dynPlace(l, this.str(p.strings[p.b(n)]))
 			return this.bitsOf(this.load(d, q))
 		} else if (k == kind.Member) {
-			const at = position(["elem", "base"], p.strings[p.b(n)])
+			const at = ["elem", "base"].indexOf(p.strings[p.b(n)])
 			if (at < 0) {
 				throw new CompileError(`emit: ${showType(p, n)}`)
 			}
@@ -3285,7 +3306,7 @@ class Emitter {
 	private holes(t: i32, out: i32[]): i32[] {
 		const k = this.p.kind(t)
 		if (k == kind.Of || k == kind.Member) {
-			if (!contains(out, t)) {
+			if (!out.includes(t)) {
 				out.push(t)
 			}
 			return out
@@ -3348,6 +3369,8 @@ class Emitter {
 			|| k == kind.Embed) {
 			elem = addr(this.describe(a))
 			length = w(if (k == kind.FixedArray) y else 0)
+		} else if (n == kind.String) {
+			elem = addr(this.describe(kind.U8)) // its code units', as a `u8[readonly]` reads them (src/type.c, element)
 		} else if (k == kind.Param || k == kind.Func) {
 			length = w(if (k == kind.Func) p.lists[a].length else y)  // a function's params, its last part its result
 		} else if (k == kind.Named) {
@@ -3554,20 +3577,20 @@ class Emitter {
 	/// Whether a field of a value of n, normalized, is found at run time, by its tag: if boxed, or a union.
 	private byTag(n: i32): bool { return this.boxed(n) || this.dyn && this.p.kind(n) == kind.Union }
 
-	/// The names of the members of interface decl c, but statics, with those of the interfaces it extends.
+	/// The names of the members of interface decl c, but statics, with those of the interfaces it embeds or extends.
 	private memberNames(c: i32): string[] {
 		const p = this.p
 		const names: string[] = []
 		for (const f of p.decls[c].members) {
-			if ((p.decls[f].mods & Static) == 0) {
+			if ((p.decls[f].mods & Embed) != 0) {
+				names.push(...this.memberNames(p.a(p.decls[f].type)))
+			} else if ((p.decls[f].mods & Static) == 0) {
 				names.push(this.name(f))
 			}
 		}
 		for (const x of p.lists[p.decls[c].supers]) {
 			if (p.kind(x) == kind.Named) {
-				for (const name of this.memberNames(p.a(x))) {
-					names.push(name)
-				}
+				names.push(...this.memberNames(p.a(x)))
 			}
 		}
 		return names

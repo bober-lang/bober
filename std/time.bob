@@ -11,18 +11,17 @@
 //! wall clock nor with NTP. Leap seconds do not exist here, as in Unix time; nor do calendars but the proleptic
 //! Gregorian, locales or strftime's patterns, whose text depends on them, or zone abbreviations, which are ambiguous.
 
+import { indexOf, occurs, startsWith } from "./algo"
 import { J, M, T, Z, colon, comma, dot, greater, isAlphabetic, isAlphanumeric, isDigit, less, lf, minus, plus, slash,
 	space, t as lowerT, z as lowerZ, zero } from "./ascii"
 import { addr, store } from "../builtin/mem"
+import { env, monotonic as mono, tz as localTz } from "../builtin/sys"
 import { copy } from "../builtin/string"
-import { fromCString } from "./c"
 import { open, readLink } from "./fs"
-import { IoError } from "./io"
 import { maxOf, minOf } from "./limits"
 import { abs, clamp, min } from "./math"
-import { ParseError } from "./parse"
-import { indexOf, occurs, startsWith } from "./string"
-import { bober_env, bober_io_sleep, bober_mono, bober_tz } from "../src/rt.h"
+import { ParseError } from "./string"
+import { bober_io_sleep } from "../src/rt.h"
 
 export const nanosecond: i64 = 1
 export const microsecond: i64 = 1_000
@@ -30,6 +29,9 @@ export const millisecond: i64 = 1_000_000
 export const second: i64 = 1_000_000_000
 export const minute: i64 = 60 * second
 export const hour: i64 = 60 * minute
+/// 24 hours; a calendar day across a DST change is not one.
+export const day: i64 = 24 * hour
+export const week: i64 = 7 * day
 
 /// d as Go writes a duration: 1h2m3.5s, 1.5ms or 0s, in the largest unit under a second, else in hours, minutes and
 /// seconds, with as many digits after the point as are not trailing zeros.
@@ -59,7 +61,7 @@ function decimal(n: u64, size: u64): string {
 }
 
 /// ns since a fixed point in the past, which nothing sets back or forward: for deadlines and elapsed times, not dates.
-export function monotonic(): i64 { return bober_mono() }
+export function monotonic(): i64 { return mono() }
 
 /// Parks the fiber for ns of monotonic().
 export function sleep(ns: i64) { bober_io_sleep(ns) }
@@ -327,8 +329,7 @@ export function load(name: string): Zone throws IoError | ParseError {
 	if (startsWith(name, "/") || up >= 0) {
 		throw new ParseError("syntax", if (up >= 0) up else 0)
 	}
-	const p = bober_env("TZDIR")
-	const dir = if (p == 0) "" else fromCString(p)
+	const dir = env("TZDIR") ?? ""
 	return tzif(name, head(`${if (dir == "") "/usr/share/zoneinfo" else dir}/${name}`))
 }
 
@@ -338,8 +339,7 @@ let localZone: Zone | null = null
 /// else /etc/localtime's, named by the database's name for it where its path tells; UTC if neither loads, and in tests.
 export function local(): Zone {
 	if (localZone == null) {
-		const p = bober_tz()
-		const tz = if (p == 0) ":/etc/localtime" else fromCString(p)
+		const tz = localTz() ?? ":/etc/localtime"
 		const path = if (startsWith(tz, ":")) tz.slice(1, tz.length) else tz
 		try {
 			localZone = if (startsWith(path, "/")) tzif(zoneName(path), head(path)) else if (tz == "") utc else load(path)

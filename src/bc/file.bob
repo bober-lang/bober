@@ -46,13 +46,13 @@
 //! class, also of one two modules away, but not with a function's body. Modules whose signatures name each other have
 //! one hash, of all of theirs.
 
-import { contains } from "../../std/algo"
+import { sort } from "../../std/algo"
 import { HashMap } from "../../std/collections/hashmap"
 import { Reader, Writer } from "../../std/encoding/binary"
 import { isAbs, join } from "../../std/fs/path"
 import { combine, fnv } from "../../std/hash"
 import { min } from "../../std/math"
-import { ParseError } from "../../std/parse"
+import { ParseError } from "../../std/string"
 import * as decl from "./decl"
 import * as kind from "./kind"
 import * as op from "./op"
@@ -167,8 +167,9 @@ export function abi(p: Program, m: i32): u64 {
 }
 
 /// The ids a file gives the entries of a table of the Program it uses, and their section, each entry after those it
-/// is made of. Those below fixed are the Program's own, the same in every Program, and not written.
+/// is made of.
 class Table {
+	/// The ids below it are the Program's own, the same in every Program, and not written.
 	private fixed: i32
 	private ids = new HashMap[i32, i32]()
 	private out = new Writer()
@@ -616,7 +617,7 @@ class Abis {
 		}
 		if (low == i) {
 			const c: i32[] = []
-			while (!contains(c, m)) {
+			while (!c.includes(m)) {
 				c.push(this.stack.pop())
 			}
 			let own: u64 = 0
@@ -624,7 +625,7 @@ class Abis {
 			for (const x of c) {
 				own += this.made.get(x)!.h
 				for (const u of this.made.get(x)!.uses) {
-					others += if (contains(c, u)) 0 else this.p.modules[u].abi
+					others += if (c.includes(u)) 0 else this.p.modules[u].abi
 				}
 			}
 			const h = combine(own, others)
@@ -742,7 +743,7 @@ class Abi {
 		const m = this.p.decls[d].module
 		if (m == this.m) {
 			this.decl(d)
-		} else if (!contains(this.uses, m)) {
+		} else if (!this.uses.includes(m)) {
 			this.uses.push(m)
 		}
 	}

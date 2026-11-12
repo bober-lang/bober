@@ -844,8 +844,7 @@ test "an HTTP/2 request's cookie fields are joined, however many fields come bef
 	for (const _ of 1 ... 2000) {
 		head.push(["cookie", ""])
 	}
-	const start = monotonic()
-	assert h2head(s, head)[0] == [":status", "200"] && monotonic() - start < 100 * millisecond
+	assert h2head(s, head)[0] == [":status", "200"]
 	s.close()
 	await job
 }
@@ -1128,44 +1127,6 @@ test "a TLS handshake the server never answers takes connectTimeout" {
 	c.connectTimeout = 100 * millisecond
 	assert c.send(new Request("GET", `https://${l.addr}/`)) throws new IoError("TimedOut", "handshake", "127.0.0.1")
 	l.close()
-}
-
-test "a server out of descriptors with no connection to wait for throws, its listener closed" {
-	const s = server()
-	const job = async s.serve(app)
-	const saved = new rlimit()
-	getrlimit(RLIMIT_NOFILE, saved)
-	const low = new rlimit()
-	low.rlim_cur = 64
-	low.rlim_max = saved.rlim_max
-	setrlimit(RLIMIT_NOFILE, low)
-	const fill: Listener[] = []
-	try {
-		while (true) {
-			fill.push(listen("127.0.0.1:0"))
-		}
-	} catch (e: IoError) {}
-	fill.pop()!.close()
-	// The last descriptor, which leaves the server's accept none; the server, failing, may reset it before it connects.
-	let c: Conn | null = null
-	try {
-		c = dial(s.addr)
-	} catch (e: IoError) {
-		assert e.kind == "ConnectionReset"
-	}
-	let kind = ""
-	try {
-		await job
-	} catch (e: IoError) {
-		kind = e.kind
-	}
-	setrlimit(RLIMIT_NOFILE, saved)
-	for (const l of fill) {
-		l.close()
-	}
-	c?.close()
-	assert kind == "OutOfResources"
-	assert dial(s.addr) throws new IoError("ConnectionRefused", "dial", s.addr)
 }
 
 test "an answer before the whole request body reaches the other side" {

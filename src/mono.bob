@@ -9,9 +9,8 @@
 //! it and `.f()[T]` for calling method f. An intrinsic, a function of builtin/ without a body, is called as itself with
 //! its type args, for emit.
 
-import { contains } from "../std/algo"
+import { stableSort } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
-import { sortBy } from "../std/sort"
 import * as decl from "./bc/decl"
 import * as kind from "./bc/kind"
 import * as op from "./bc/op"
@@ -19,7 +18,7 @@ import { Imm } from "./bc/op"
 import { Code, Program, pair } from "./bc/program"
 import { qualified, showType } from "./bc/show"
 import { CompileError } from "./error"
-import { Instances, runtime } from "./resolve"
+import { Instances, embedded, runtime } from "./resolve"
 import { builtin, builtinPath } from "./root"
 
 /// Monomorphizes p, whose module main holds the main function and tests: those, every module's typed vars and
@@ -103,11 +102,13 @@ class Mono {
 				}
 				if (o == op.Cast || o == op.Is) {
 					this.convert(i.info[j], c!.a(j))
+				} else if (o == op.Array && i.info[j] >= 0 && p.kind(c!.a(j)) == kind.Array) {
+					this.convert(i.info[j], p.a(c!.a(j)))
 				} else if (o == op.Object) {
 					this.source(c!.a(j), c!.a(j))
-				} else if (o == op.Throw && !contains(thrown, i.info[j])) {
+				} else if (o == op.Throw && !thrown.includes(i.info[j])) {
 					thrown.push(i.info[j])
-				} else if (o == op.Catch && c!.a(j) != kind.None && !contains(caught, c!.a(j))) {
+				} else if (o == op.Catch && c!.a(j) != kind.None && !caught.includes(c!.a(j))) {
 					caught.push(c!.a(j))
 				}
 			}
@@ -149,7 +150,7 @@ class Mono {
 		const targets = p.members(to)
 		for (const x of targets.filter(x => ins.abstract(x))) {
 			for (const s of p.members(src)) {
-				if ((ins.abstract(s) || ins.nominal(s) == decl.Class) && !contains(targets, s) && covers(p, s, x)) {
+				if ((ins.abstract(s) || ins.nominal(s) == decl.Class) && !targets.includes(s) && covers(p, s, x)) {
 					this.source(x, s)
 				}
 			}
@@ -161,7 +162,7 @@ class Mono {
 		if (ss == null) {
 			this.abstracts.push(x)
 			this.sources.set(x, [s])
-		} else if (!contains(ss, s)) {
+		} else if (!ss.includes(s)) {
 			ss.push(s)
 		}
 	}
@@ -196,7 +197,7 @@ class Mono {
 			ins.where = qualified(p, k)
 			x.supers = 0
 			x.members = owned.get(k) ?? []
-			sortBy(x.members, (a, b) => source(a) < source(b))
+			stableSort(x.members, (a, b) => source(a) < source(b))
 			if (x.kind != decl.Class) {
 				x.type = this.low(if (x.kind == decl.Function) runtime(p, x.type) else x.type)
 				x.code = if (i.code == null) null else this.lower(x.module, i.code!, i.info)
@@ -373,11 +374,12 @@ function add(m: HashMap[i32, i32[]], k: i32, v: i32) {
 	}
 }
 
-/// Whether class, interface or object type s has a field or method of each name interface or object type x has.
+/// Whether class, interface or object type s has a field or method of each name interface or object type x has, an
+/// interface's embedded ones counted as its own.
 function covers(p: Program, s: i32, x: i32): bool {
-	const has = (name: i32) => if (p.kind(s) == kind.Named) p.member(p.a(s), name) >= 0 else p.field(s, name) >= 0
+	const has = (name: i32) => if (p.kind(s) == kind.Named) hasMember(p, p.a(s), name) else p.field(s, name) >= 0
 	if (p.kind(x) == kind.Named) {
-		return p.decls[p.a(x)].members.every(m => has(p.decls[m].name))
+		return p.decls[p.a(x)].members.every(m => if (embedded(p, m)) covers(p, s, p.decls[m].type) else has(p.decls[m].name))
 	}
 	for (const i of 0 ... p.items(x).length - 1) {
 		if (!has(p.names[p.b(x)][2 * i])) {
@@ -385,6 +387,12 @@ function covers(p: Program, s: i32, x: i32): bool {
 		}
 	}
 	return true
+}
+
+/// Whether class or interface decl d has member name, a Str, or an interface d embeds has.
+function hasMember(p: Program, d: i32, name: i32): bool {
+	return p.member(d, name) >= 0 || p.decls[d].kind == decl.Interface
+		&& p.decls[d].members.some(m => embedded(p, m) && hasMember(p, p.a(p.decls[m].type), name))
 }
 
 /// What a dispatch function's access how of a member of type ft takes after the receiver, and gives: nothing and the

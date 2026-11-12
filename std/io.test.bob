@@ -1,10 +1,9 @@
-import { open, remove } from "./fs"
-import { IoError, copy, readAll } from "./io"
-import { getpid } from "unistd.h"
-
-const path = `/tmp/bober-io-${getpid()}`
+import { makeTempDir, open, removeAll } from "./fs"
+import { copy, readAll } from "./io"
 
 test "a file reads back what was written" {
+	const dir = makeTempDir("bober-io-")
+	const path = `${dir}/f`
 	const w = open(path, "w")
 	w.write("abc")
 	w.write("")
@@ -28,12 +27,11 @@ test "a file reads back what was written" {
 	const c = open(`${path}.copy`)
 	assert readAll(c) == "> abcdef\n"
 	c.close()
-	remove(path)
-	remove(`${path}.copy`)
+	removeAll(dir)
 }
 
 test "errors name the call and their kind" {
-	assert open("/tmp/bober-io-none/x") throws new IoError("NotFound", "open", "/tmp/bober-io-none/x")
+	assert open("none/x") throws new IoError("NotFound", "open", "none/x")
 	const e = new IoError("NotFound", "open", "/x")
 	assert e.kind == "NotFound" && e.message() == "open /x: NotFound"
 }

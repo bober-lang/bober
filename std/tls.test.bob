@@ -1,8 +1,7 @@
 import { readFile } from "./fs"
-import { IoError } from "./io"
 import * as net from "./net"
 import { Config, client, server } from "./tls"
-import { monotonic, second } from "./time"
+import { millisecond, monotonic, second } from "./time"
 import { Signal } from "../builtin/fiber"
 
 const own = owning()
@@ -10,8 +9,8 @@ const own = owning()
 /// The test certificate, speaking http/1.1.
 function owning(): Config {
 	const cfg = new Config()
-	cfg.cert = readFile("std/tls/testdata/cert.pem")
-	cfg.key = readFile("std/tls/testdata/key.pem")
+	cfg.cert = readFile("tests/tls/cert.pem")
+	cfg.key = readFile("tests/tls/key.pem")
 	cfg.alpn = ["http/1.1"]
 	return cfg
 }
@@ -164,7 +163,7 @@ test "a write that timed out fails the ones after it" {
 	const go = new Signal()
 	const job = async draining(l, go)
 	const c = client(net.dial(`${l.addr}`), "localhost", trusting())
-	c.timeout = 100_000_000
+	c.timeout = 100 * millisecond
 	const kinds: string[] = []
 	try {
 		c.write(flood())
@@ -262,7 +261,7 @@ test "close tells a peer that reads nothing for a second at most, then ends a re
 	c.write("x")
 	// Bytes past the TLS, never read, until the socket's buffers and the peer's are full.
 	raw.timeout = second
-	assert raw.write(flood()) throws new IoError("TimedOut", "write", `${raw.fd}`)
+	assert raw.write(flood()) throws new IoError("TimedOut", "write", `${raw.handle.raw()}`)
 	raw.timeout = 0
 	const read = async c.read(1024)
 	const start = monotonic()
@@ -281,7 +280,7 @@ test "a read and a write in flight at once each keep their timeout" {
 		try {
 			s.read(1024)
 			c.write("\x17\x03\x03\x00\x20")  // a record's head: the read waits again, after the write, for the rest
-			c.timeout = 200_000_000
+			c.timeout = 200 * millisecond
 			try {
 				c.read(1)  // a pause past the write's timeout
 			} catch (e: IoError) {}
@@ -292,7 +291,7 @@ test "a read and a write in flight at once each keep their timeout" {
 	})()
 	const c = client(net.dial(`${l.addr}`), "localhost", trusting())
 	const read = async c.read(1024)
-	c.timeout = 50_000_000
+	c.timeout = 50 * millisecond
 	c.write("x")
 	let kind = ""
 	try {
@@ -310,7 +309,7 @@ test "a read and a write in flight at once each keep their timeout" {
 function trickling(l: net.Listener) throws IoError {
 	const c = l.accept()
 	const s = server(c, own)
-	c.timeout = 50_000_000
+	c.timeout = 50 * millisecond
 	const record = "\x17\x03\x03\x00\x20" + flood().slice(0, 32)
 	try {
 		for (const i of 0 ... record.length - 1) {
@@ -327,7 +326,7 @@ test "a read's timeout is for the whole read, though its record comes a byte at 
 	const l = net.listen("127.0.0.1:0")
 	const job = async trickling(l)
 	const c = client(net.dial(`${l.addr}`), "localhost", trusting())
-	c.timeout = 200_000_000
+	c.timeout = 200 * millisecond
 	let kind = ""
 	try {
 		c.read(1024)
@@ -345,7 +344,7 @@ function sipping(l: net.Listener): i32 throws IoError {
 	const s = server(l.accept(), own)
 	const idle = net.listen("127.0.0.1:0")
 	const pause = net.dial(`${idle.addr}`)  // a read of a connection never accepted times out
-	pause.timeout = 10_000_000
+	pause.timeout = 10 * millisecond
 	try {
 		let n = 0
 		let got = s.read(1 << 16)
@@ -370,7 +369,7 @@ test "a write's timeout is for each record, so a long write goes on while the pe
 	const l = net.listen("127.0.0.1:0")
 	const job = async sipping(l)
 	const c = client(net.dial(`${l.addr}`), "localhost", trusting())
-	c.timeout = 100_000_000
+	c.timeout = 100 * millisecond
 	const big = flood()
 	c.write(big)
 	c.close()

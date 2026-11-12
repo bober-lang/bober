@@ -9,14 +9,13 @@
 //! says; - is standard input. -ftpde compiles through TPDE instead of LLVM. Other flags cc takes are ignored.
 
 import * as c from "../../std/c"
+import { indexOf, startsWith } from "../../std/algo"
 import { remove } from "../../std/fs"
-import { IoError } from "../../std/io"
 import { Cc, decode, Name, Optional, Rest } from "../../std/encoding/optarg"
 import { ext, stem } from "../../std/fs/path"
 import { min } from "../../std/math"
 import { arch, os } from "../../std/os"
-import { ParseError } from "../../std/parse"
-import { indexOf, split, startsWith } from "../../std/string"
+import { ParseError, split } from "../../std/string"
 import { Backend } from "../backend/backend"
 import { LLVM, options } from "../backend/llvm"
 import { Tpde } from "../backend/tpde"
@@ -26,7 +25,6 @@ import { CError, File, Lexer } from "./lex"
 import { Parser, Tokens } from "./parse"
 import { Preprocessor, render } from "./pp"
 import { bober_lld } from "../backend/llvm/lld.h"
-import { free, malloc } from "stdlib.h"
 import { ctime } from "time.h"
 import { getpid } from "unistd.h"
 
@@ -257,8 +255,7 @@ export function link(sysroot: string, args: string[], out: string, kind: "static
 		`${lib}/crti.o`, ...args, `-L${lib}`, "--start-group", "-lc", "-lunwind", `${lib}/libclang_rt.builtins.a`,
 		"--end-group", `${lib}/crtn.o`,
 	]
-	const strings = argv.map(a => c.toCString(a))
-	return c.withArray(strings, p => bober_lld(strings.length, p) as u64) as i32
+	return bober_lld(argv.length, argv)
 }
 
 /// The preprocessor of src, with the macros defined, and __ASSEMBLER__ if it is assembly.
@@ -284,9 +281,5 @@ function preprocessor(o: Options, macros: [string, string | null][], src: string
 
 /// The time, as ctime has it.
 function date(): string {
-	const p = malloc(8)
-	poke(p, (now() / 1000000000) as u64)
-	const s = c.fromCString(ctime(p))
-	free(p)
-	return s
+	return c.fromCString(ctime([now() / 1000000000]))
 }

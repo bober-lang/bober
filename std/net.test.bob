@@ -3,7 +3,7 @@ import { Conn, dial, listen, listenUdp, Listener, UdpConn } from "./net"
 import { Set } from "./collections/set"
 import { makeTempDir, remove } from "./fs"
 import { ParseError } from "./string"
-import { millisecond, monotonic } from "./time"
+import { deadline, millisecond, monotonic } from "./time"
 import { Handle } from "../builtin/sys"
 
 /// Writes back what it reads, then closes.
@@ -25,9 +25,9 @@ function serve(l: Listener, n: i32) throws IoError {
 	}
 }
 
-/// Waits up to ms, 0 for no limit, for fd to read, adding ms to late if it timed out.
-function wait(fd: i32, ms: i64, late: i64[]) {
-	if (bober_io_ready(fd, 0, ms * millisecond) != 0) {
+/// Waits up to ms, 0 for no limit, for h to read, adding ms to late if it timed out.
+function wait(h: Handle, ms: i64, late: i64[]) {
+	if (!h.ready(deadline(ms * millisecond))) {
 		late.push(ms)
 	}
 }
@@ -174,8 +174,8 @@ test "waits on one socket each end at their own deadline, in its order, or once 
 	const c = dial(`${l.addr}`)
 	const s = await accepted
 	const late: i64[] = []
-	const jobs = [async wait(c.fd, 30, late), async wait(c.fd, 10, late), async wait(c.fd, 0, late),
-		async wait(c.fd, 20, late)]
+	const jobs = [async wait(c.handle, 30, late), async wait(c.handle, 10, late), async wait(c.handle, 0, late),
+		async wait(c.handle, 20, late)]
 	await jobs[0]
 	assert late == [10, 20, 30]
 	s.write("x")
@@ -192,8 +192,8 @@ test "a wait on a socket made ready while none waited ends at once" {
 	const c = dial(`${l.addr}`)
 	const s = await accepted
 	s.write("x")
-	bober_io_ready(l.fd, 0, 20 * millisecond) // A round of the kernel's events, with none waiting on c.
-	assert bober_io_ready(c.fd, 0, 50 * millisecond) == 0
+	l.handle.ready(deadline(20 * millisecond)) // A round of the kernel's events, with none waiting on c.
+	assert c.handle.ready(deadline(50 * millisecond))
 	s.close()
 	c.close()
 	l.close()

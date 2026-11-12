@@ -2,15 +2,14 @@
 //! they import. It declares a file's top-level names, then checks each declaration, those it uses first, and hands it
 //! to the next stage with the type of each construct and token in it.
 
-import { contains } from "../std/algo"
+import { endsWith, indexOf, stableSort, startsWith } from "../std/algo"
 import { digit, isAlphabetic, minus, o, x } from "../std/ascii"
 import { HashMap } from "../std/collections/hashmap"
 import { ScopedMap } from "../std/collections/scopedmap"
 import { Set } from "../std/collections/set"
 import { Cc, Rest } from "../std/encoding/optarg"
 import { join } from "../std/fs/path"
-import { sortBy } from "../std/sort"
-import { endsWith, indexOf, quoted, startsWith } from "../std/string"
+import { quoted } from "../std/string"
 import * as decl from "./bc/decl"
 import * as kind from "./bc/kind"
 import * as op from "./bc/op"
@@ -23,16 +22,16 @@ import { Parser, Syntax, Tree } from "./parse"
 import { builtin, builtinPath, root } from "./root"
 import {
 	Array as Arrays, Bool, Empty, Field, I32, Kind as TypeKind, Null, String, String16, String32, Type, U8, UntypedFloat,
-	UntypedInt, bases, basics, fillWith, memberOf, members, setOf,
+	UntypedInt, bases, basics, elementOf, fillWith, memberOf, members, readonlyOf, setOf,
 } from "./type"
 
 /// The modules of builtin/ every module outside builtin/ and C's loads first: those declaring the classes of a string's
 /// and an array's methods, then those exporting the prelude's names. A module one of them imports sees only the exports
 /// of those before it, so io.bob, which imports show.bob, comes last.
-let first = ["array", "string", "type", "c", "tag", "io"].map(builtinPath)
+let first = ["array", "string", "type", "c", "tag", "error", "io"].map(builtinPath)
 /// The exports of first that every module sees without importing them.
-const prelude = ["print", "readFile", "writeFile", "args", "targetOs", "targetArch", "now", "random", "idOf", "chr", "fromBytes",
-	"toC", "toCN", "fromC", "fromCN", "peek", "poke", "Deprecated", "Experimental", "Type"]
+const prelude = ["print", "readFile", "writeFile", "args", "targetOs", "targetArch", "now", "random", "idOf", "chr",
+	"fromBytes", "fromC", "Deprecated", "Experimental", "Type", "IoError"]
 /// The constructs a doc comment documents.
 const documented: Syntax[] = ["test", "var", "function", "class", "type", "method", "prop", "param", "typeParam"]
 /// What the compiler lowers the builtin types and the prelude to, which every program holds.
@@ -173,12 +172,14 @@ class Errors {
 	}
 }
 
-/// A throw or call in the function of errors in, which may throw the types of from, but those a catch around it takes,
-/// null for any.
+/// A throw or call.
 class Site {
 	at: Loc
+	/// The types it may throw.
 	from: Errors
+	/// The errors of the function it is in.
 	in: Errors
+	/// The types a catch around it takes, null for any.
 	caught: (Type | null)[] = []
 
 	constructor(at: Loc, from: Errors, in: Errors) {
@@ -232,11 +233,12 @@ class Warning {
 	}
 }
 
-/// What a command line gives the checker, spelled as a C compiler's and anywhere on it: the directories of its -I
-/// flags, whether a build is -release, and the other arguments.
+/// What a command line gives the checker, spelled as a C compiler's and anywhere on it.
 export class Flags @Cc {
+	/// The directories of its -I flags.
 	I: string[] = []
 	release: bool = false
+	/// The other arguments.
 	args: string[] @Rest = []
 }
 
@@ -258,12 +260,12 @@ class Ignore implements Checked {
 	done(path: string) {}
 }
 
-/// A construct, or a token where kind is "token", with the type of its value once checked, or of a type expression,
-/// declaration or pattern the type it stands for.
+/// A construct, or a token where kind is "token".
 export class Node {
 	kind: Syntax | "token"
 	t: Tok
 	parts: Node[] = []
+	/// Its value's type once checked; of a type expression, declaration or pattern, the type it stands for.
 	type: Type | null = null
 	/// A declaration's or member's tags (5.3), once typed.
 	tags: Type[] | null = null
@@ -458,7 +460,7 @@ class Modules {
 		if (!this.failed) {
 			this.next.done(path)
 		}
-		sortBy(c.errors, (a, b) => a.loc.pos < b.loc.pos)
+		stableSort(c.errors, (a, b) => a.loc.pos < b.loc.pos)
 		for (const e of c.errors) {
 			const [line, col] = p.lineCol(e.loc.pos)
 			e.line = line
@@ -719,8 +721,9 @@ class Linked {
 /// a type fails each statement that uses it, without an error of its own.
 class Failed {}
 
-/// A top-level declaration or test, checked in order or when first needed. Its node is dropped once handed on.
+/// A top-level declaration or test, checked in order or when first needed.
 class Decl {
+	/// Dropped once handed on.
 	node: Node | null
 	/// Whether it was declared to the next stage ahead of being handed on.
 	ahead = false
@@ -1053,7 +1056,7 @@ class Checker {
 		for (const p of t.parts) {
 			n.parts.push(if (p instanceof Tree) this.node(p) else new Node("token", p))
 		}
-		if (contains(documented, t.kind)) {
+		if (documented.includes(t.kind)) {
 			n.doc = this.p.doc(start(n).pos)
 		}
 		if (n.kind == "binary" || n.kind == "chain") {
@@ -1124,7 +1127,7 @@ class Checker {
 			texts.push(this.text(names[names.length - 1]))
 		}
 		let m: Module | string = ""
-		if (!endsWith(spec, ".h")) {
+		if (!endsWith(spec, ".h") && !endsWith(spec, ".c")) {
 			m = this.modules.load(resolve(this.m.path, if (endsWith(spec, ".bob")) spec else spec + ".bob"))
 		} else if (listed) {
 			m = this.modules.header(this.m.path, spec, texts)
@@ -1363,15 +1366,17 @@ class Checker {
 	/// Assert = "assert" Expr ["throws" Expr]
 	/// ```
 	///
-	/// A top-level test is named by a string literal; inside a test's block, outside nested functions, a *subtest* may
-	/// also be named by a template. Running a subtest runs its enclosing tests but skips their other subtests. `assert`
-	/// traps if its `bool` operand is false. Within the operand, nested functions included, `==` and `!=` compare by
-	/// value: arrays and tuples element by element, objects and class instances field by field, a union's members by tag
-	/// and then value, the rest as elsewhere. A value holding itself compares without end, a field of a `T[n]` is an
-	/// error, and `switch` cases match as elsewhere. `assert x throws e` traps unless `x` throws a value of `e`'s type
-	/// that equals `e`, which is evaluated after; a value of another type propagates. Tests and assertions exist only in
-	/// test and debug builds; in other builds they are not compiled, so they shall have no side effects a program relies
-	/// on.
+	/// A top-level test is named by a string literal; inside a test's block, outside nested functions and `try`, a
+	/// *subtest* may also be named by a template. Running a subtest runs its enclosing tests but skips their other
+	/// subtests. A trap in a subtest, as a throw leaving it, fails it, reported by its name after its enclosing tests'
+	/// (`patterns / sub 1`), and its test goes on and fails at its end. A subtest's block is a function of its own:
+	/// `return` ends the subtest, and `break` and `continue` cannot leave it. `assert` traps if its `bool` operand is
+	/// false. Within the operand, nested functions included, `==` and `!=` compare by value: arrays and tuples element
+	/// by element, objects and class instances field by field, a union's members by tag and then value, the rest as
+	/// elsewhere. A value holding itself compares without end, a field of a `T[n]` is an error, and `switch` cases
+	/// match as elsewhere. `assert x throws e` traps unless `x` throws a value of `e`'s type that equals `e`, which is
+	/// evaluated after; a value of another type propagates. Tests and assertions exist only in test and debug builds;
+	/// in other builds they are not compiled, so they shall have no side effects a program relies on.
 	///
 	/// ```
 	/// test "patterns" {
@@ -1553,7 +1558,7 @@ class Checker {
 			this.vars.push(d)
 			if (fns.length > 0) {
 				d.value = new Decl(d.node!, d.at)
-				d.uses.push(d.value!)
+				d.uses.push(d.value)
 			}
 		}
 		const init = this.init
@@ -1666,7 +1671,7 @@ class Checker {
 			errors.listed = true
 		}
 		const params = child(n, "params")!
-		const sig = this.params(params, null, bodies)
+		const sig = this.params(params, null, bodies, ps)
 		const ann = after(n, ":")
 		const body = bodyOf(n)
 		const result = if (ann != null) this.annotation(ann) else if (n.kind == "method" || body == null) Null else null
@@ -1681,7 +1686,7 @@ class Checker {
 		}
 		const t = returning(sig, if (bodies && body != null) this.body(body, f) else result, ps)
 		this.close(paths, mark)
-		if (contains(t.types, Empty)) {
+		if (t.types.includes(Empty)) {
 			throw new Failed()
 		}
 		params.type = t
@@ -1692,7 +1697,8 @@ class Checker {
 	/// Binds params n, typed by their annotations, else by want's params, else by their defaults, and returns
 	/// the function type they make, without its result. A param that fails is Empty, and fails where used. An
 	/// annotated one's default is checked only where defaults is, with the body, as it may name what is not declared yet.
-	private params(n: Node, want: Type | null, defaults = true): Type {
+	/// Those of a declared function have its type params ps.
+	private params(n: Node, want: Type | null, defaults = true, ps: Type[] | null = null): Type {
 		const types: Type[] = []
 		let required = 0
 		let rest = false
@@ -1704,7 +1710,7 @@ class Checker {
 				required = i + 1
 			}
 			let pt = Empty
-			const typed = this.apart(() => { pt = this.param(p, i, want, defaults) })
+			const typed = this.apart(() => { pt = this.param(p, i, want, defaults, ps) })
 			p.type = pt
 			types.push(pt)
 			if (typed) {
@@ -1718,11 +1724,12 @@ class Checker {
 		return t
 	}
 
-	private param(p: Node, i: i32, want: Type | null, defaults: bool): Type {
+	private param(p: Node, i: i32, want: Type | null, defaults: bool, ps: Type[] | null): Type {
 		const ann = after(p, ":")
 		const init = after(p, "=")
 		const rest = p.parts[0].kind == "unary"
-		let pt = if (ann != null) this.annotation(ann) else if (want == null) null
+		let pt = if (ann != null && ps != null && this.isReadonly(ann)) this.readonly(ann, ps)
+			else if (ann != null) this.annotation(ann) else if (want == null) null
 			else if (rest && want.rest) want.types[want.types.length - 1] else element(want, i)
 		if (init != null && (pt == null || defaults)) {
 			const v = this.expr(init, pt)
@@ -1740,6 +1747,21 @@ class Checker {
 		}
 		return pt
 	}
+
+	/// The type of a param annotated `T[readonly]` n: a type param of its own, added to ps, constrained by `T[] | string`
+	/// (readonlyOf).
+	private readonly(n: Node, ps: Type[]): Type {
+		const e = this.annotation(n.parts[0])
+		const t = new Type("param")
+		t.base = Type.union([Type.array(e), String])
+		names.set(t, `${show(e)}[readonly]`)
+		ps.push(t)
+		n.type = t
+		return t
+	}
+
+	/// Whether type expression n is `T[readonly]`.
+	private isReadonly(n: Node): bool { return n.kind == "index" && n.parts.length == 2 && isTok(n.parts[1], "ident") && this.text(n.parts[1].t) == "readonly" }
 
 	/// The type params n declares, without their constraints and defaults yet.
 	private paramsOf(n: Node): Type[] {
@@ -1765,9 +1787,10 @@ class Checker {
 			const d = after(p, "=")
 			if (bounds && c != null) {
 				const ct = this.typeExpr(c)
-				t.base = ct
 				if (ct.kind == "union") {
 					this.report(start(c), "a constraint is not a union; name a type set")
+				} else {
+					t.base = ct // a union base is a `T[readonly]`'s
 				}
 			}
 			if (bounds && d != null) {
@@ -1954,7 +1977,7 @@ class Checker {
 			a.state = state
 			if (t.kind == "class" && this.wall < 0 && (f.static || m.kind == "method") && f.name != "constructor") {
 				a.decl = new Decl(m, m.t)
-				a.decl!.mutable = m.kind != "method" && !has(m, "readonly")
+				a.decl.mutable = m.kind != "method" && !has(m, "readonly")
 			}
 			if (t.fields.some(e => e.name == f.name && e.static == f.static)) {
 				this.report(m.t.loc, `${f.name} is declared twice`)
@@ -2274,14 +2297,17 @@ class Checker {
 			case "try": return this.tryStmt(p)
 			case "jump": return this.jump(p)
 			case "test":
-				const f = this.fn
-				if (f == null || !f.tests) {
-					this.report(p.t.loc, "a test is only at the top level or in a test")
+				const f = this.fn!
+				if (!f.tests) {
+					this.report(p.t.loc, "a test is only at the top level or in a test, outside try")
 				}
 				this.expr(p.parts[0], null)
 				this.forget(p.parts[1])
 				const mark = this.undo.length
+				const inLoop = f.inLoop
+				f.inLoop = false // its block is a function of its own (src/lower.bob)
 				this.block(p.parts[1])
+				f.inLoop = inLoop
 				this.restore(mark)
 			default: this.value(p)
 		}
@@ -2415,6 +2441,10 @@ class Checker {
 			return t
 		}
 		const t = this.value(p)
+		const e = readonlyOf(t)
+		if (e != null) {
+			return e
+		}
 		const es: Type[] = []
 		for (const m of bases(opened(t)).alternatives()) {
 			switch (m.kind) {
@@ -2480,7 +2510,7 @@ class Checker {
 			body(c.parts[c.parts.length - 1], c.t)
 			this.restore(mark)
 		}
-		return all || subject != null && subject!.alternatives().every(m => contains(named, m))
+		return all || subject != null && subject!.alternatives().every(m => named.includes(m))
 	}
 
 	/// Whether p is static and its value depends on a type param (4.11).
@@ -2546,7 +2576,7 @@ class Checker {
 				throw this.error(start(p), `expected ${show(subject)}, got ${show(v)}`)
 			}
 			this.representable(p, bases(subject))
-			if ((v.kind == "literal" || v == Null) && contains(subject.alternatives(), v)) {
+			if ((v.kind == "literal" || v == Null) && subject.alternatives().includes(v)) {
 				types.push(v)
 			}
 		}
@@ -2585,6 +2615,11 @@ class Checker {
 	/// export function bad() { parse("") }      // warning: ParseError is neither caught nor listed
 	/// ```
 	private tryStmt(n: Node): bool {
+		const f = this.fn
+		const tests = f?.tests ?? false
+		if (f != null) {
+			f.tests = false // a throw leaving a subtest leaves through C (src/rt.c), which a catch past it would skip
+		}
 		const mark = this.undo.length
 		const all = this.fn?.errors?.sites ?? []
 		const from = all.length
@@ -2620,6 +2655,9 @@ class Checker {
 			this.locals.leave()
 		}
 		this.restore(caught)
+		if (f != null) {
+			f.tests = tests
+		}
 		return open
 	}
 
@@ -2821,14 +2859,14 @@ class Checker {
 
 	/// What the param of k, known to be one of some scalars, is narrowed to where its kind is not label l's (4.11).
 	private otherKind(k: Binding, l: Node): Narrowing[] {
-		const n = k.narrowed
+		const n = k.narrowed ?? k.type!
 		const ts = if (isTok(l, "string")) scalars(this.key(l.t)) else null
-		const c = n?.base
-		if (n?.kind != "param" || c == null || !isSet(c) || ts == null) {
+		const c = n.base
+		if (n.kind != "param" || c == null || !isSet(c) || ts == null) {
 			return []
 		}
-		const rest = c.base!.alternatives().filter(t => !contains(ts!, t))
-		return [new Narrowing(k, Type.derived(n!.params[0], "", typeSet(rest)))]
+		const rest = c.base!.alternatives().filter(t => !ts!.includes(t))
+		return [new Narrowing(k, Type.derived(k.type!, "", typeSet(rest)))]
 	}
 
 	/// What param p is known to be where its kind is one of the labels' (4.11): what the kind of one makes it, else a
@@ -3054,7 +3092,7 @@ class Checker {
 	/// - `async c`, of a call: starts `c` on a new fiber; `async T` (§6.10)
 	/// - `spawn c`, of a call: starts `c` in a new isolate; `async T` (§6.10)
 	/// - `await f`, of an `async T`: waits for `f`; `T`
-	/// - `await ...fs`, of an `(async T)[]`: waits for the first of `fs` to finish; `[i32, T]` (§6.10)
+	/// - `await ...fs`, of an `(async T)[]`: waits for the first of `fs` not taken to finish; `[i32, T]` (§6.10)
 	private unary(n: Node, want: Type | null): Type {
 		const x = n.parts[0]
 		const op = n.t.kind
@@ -3070,16 +3108,17 @@ class Checker {
 				return this.single(t, n.t)
 			case "typeof": return meta(this.expr(x, null))
 			case "await":
+				this.suspend(true)
 				if (x.kind == "unary" && x.t.kind == "...") {
 					const fs = x.parts[0]
 					const ts: Type[] = []
-					for (const f of if (fs.kind == "array") fs.parts else [fs]) {
+					// Of an array literal, each future; else x, the array spread.
+					for (const f of if (fs.kind == "array") fs.parts else [x]) {
 						const t = this.expr(f, null)
-						ts.push(if (fs.kind == "array") this.awaited(t, f) else this.awaited(element(t, 0) ?? t, f))
+						ts.push(this.awaited(if (f == x) t.params[0] else t, f))
 					}
 					return Type.tuple([I32, Type.union(ts)], false)
 				}
-				this.suspend(true)
 				return this.awaited(this.expr(x, null), x)
 			case "async", "spawn":
 				if (x.kind != "call") {
@@ -3589,6 +3628,9 @@ class Checker {
 
 	private member(o: Type, name: Tok, assigned = false, own = false): Type {
 		const k = this.key(name)
+		if (assigned && readonlyOf(o) != null) {
+			throw this.error(name.loc, `${k} of ${show(o)} is not assignable`)
+		}
 		const s = standsFor(o)
 		const r = if (s?.kind == "param") this.refine(s!) else s
 		const t = (if (r == null) null else r.member(k, true) ?? reflected(r, k)) ?? o.member(k)
@@ -3625,6 +3667,9 @@ class Checker {
 		if (assigned && o.isString()) {
 			throw this.error(n.t.loc, "strings are immutable")
 		}
+		if (assigned && readonlyOf(o) != null) {
+			throw this.error(n.t.loc, `the elements of ${show(o)} are not assignable`)
+		}
 		if (isTypeValue(o)) {
 			return meta(this.typeExpr(n))
 		}
@@ -3655,6 +3700,10 @@ class Checker {
 		}
 		if (o.isString()) {
 			return U8
+		}
+		const e = readonlyOf(o)
+		if (e != null) {
+			return e
 		}
 		const u = opened(o)
 		switch (u.kind) {
@@ -3925,7 +3974,7 @@ class Checker {
 		const outer = this.fn
 		const init = this.init
 		const user = this.user
-		const unrun = init != null && contains(init.fns, n)
+		const unrun = init != null && init.fns.includes(n)
 		if (unrun) {
 			this.init = null
 			this.user = init!.user
@@ -3946,7 +3995,7 @@ class Checker {
 			}
 		}
 		this.close(paths, mark)
-		if (contains(t.types, Empty)) {
+		if (t.types.includes(Empty)) {
 			throw new Failed()
 		}
 		n.parts[0].type = t
@@ -4002,6 +4051,9 @@ class Checker {
 					return Type.union([this.typeExpr(a), this.typeExpr(p.parts[1])])
 				}
 			case "index":
+				if (this.isReadonly(p)) {
+					throw this.error(start(p), "T[readonly] is only a declared function's param type")
+				}
 				const [base, ps] = if (isTok(a, "ident") || a.kind == "member") this.named(a) else [this.typeExpr(a), []]
 				a.type = base
 				if (p.parts.length == 1) {
@@ -4039,7 +4091,7 @@ class Checker {
 			case "arrow":
 				this.locals.enter()
 				const sig = this.params(a, null)
-				if (contains(sig.types, Empty)) {
+				if (sig.types.includes(Empty)) {
 					throw new Failed()
 				}
 				const t = returning(sig, this.typeExpr(p.parts[1]))
@@ -4087,8 +4139,9 @@ class Checker {
 	/// Generic g of params ps, named by at, with type args, the ones left out by their defaults, or g if it has no params
 	/// (4.9).
 	private applied(g: Type, ps: Type[], args: Type[], at: Node): Type {
-		if (args.length > ps.length) {
-			throw this.error(start(at), `${this.source(at)} takes ${ps.length} type arguments, got ${args.length}`)
+		const declared = ps.filter(p => readonlyOf(p) == null).length
+		if (args.length > declared) {
+			throw this.error(start(at), `${this.source(at)} takes ${declared} type arguments, got ${args.length}`)
 		}
 		if (ps.length == 0) {
 			return g
@@ -4099,10 +4152,12 @@ class Checker {
 		const targs: Type[] = []
 		for (const i of 0 ... ps.length - 1) {
 			const a = if (i < args.length) args[i] else this.byDefault(ps, i, targs, start(at))
-			if (a == null) {
+			if (a == null && readonlyOf(ps[i]) != null) {
+				throw this.error(start(at), `${this.source(at)} takes a T[readonly], whose type is only inferred`)
+			} else if (a == null) {
 				throw this.error(start(at), `${this.source(at)} needs a type argument for ${show(ps[i])}`)
 			}
-			targs.push(this.satisfying(a, ps, targs, start(at)))
+			targs.push(this.satisfying(a!, ps, targs, start(at)))
 		}
 		return if (g.params != ps) substitute(g, ps, targs) else g.instantiate(targs)
 	}
@@ -4158,7 +4213,7 @@ class Checker {
 
 	/// p with the type args found so far, but where open, not those found with untyped constants, so the arg may widen
 	/// them; a function's result is left to the arg where it mentions a type arg not yet found or found so, which the
-	/// result may widen.
+	/// result may widen. A `T[readonly]` is wanted as a T[].
 	private partly(p: Type, ps: Type[], found: (Type | null)[], open: bool): Type {
 		const partial: Type[] = []
 		const loose: Type[] = []
@@ -4169,7 +4224,8 @@ class Checker {
 			}
 			partial.push(if (f == null || open && f.isLoose()) ps[i] else f.widen(true))
 		}
-		const want = substitute(p, ps, partial)
+		const e = readonlyOf(p)
+		const want = substitute(if (e == null) p else Type.array(e), ps, partial)
 		return if (p.kind == "function" && p.base!.mentions(loose)) returning(want, null, want.params) else want
 	}
 
@@ -4198,14 +4254,18 @@ class Checker {
 		if (c == null || this.defaulting) {
 			return a
 		}
-		const msg = `${show(a)} does not fit ${show(p)}'s constraint ${show(c)}`
+		// A `T[readonly]`'s arg has exactly T as its elements, a string only for u8.
+		const e = readonlyOf(p)
+		const t = if (e == null) null else substitute(e!, ps.slice(0, args.length), args)
+		const fits = () => if (t == null) a.fits(c!) else elementOf(a) == t
+		const msg = if (t == null) `${show(a)} does not fit ${show(p)}'s constraint ${show(c)}` else `expected ${show(t)}[readonly], got ${show(a)}`
 		if (filling > 0 && !inferred) {
 			deferred.push(() => {
-				if (!a.fits(c!)) {
+				if (!fits()) {
 					this.report(at, msg)
 				}
 			})
-		} else if (!a.fits(c)) {
+		} else if (!fits()) {
 			throw this.error(at, msg)
 		}
 		return a
@@ -4724,7 +4784,7 @@ function aim(want: Type | null, kinds: TypeKind[]): Type | null {
 	}
 	const found: Type[] = []
 	for (const m of want.alternatives()) {
-		if (contains(kinds, m.kind)) {
+		if (kinds.includes(m.kind)) {
 			found.push(m)
 		}
 	}
@@ -4760,7 +4820,7 @@ function strong(d: Decl): void {
 		for (const j of i ... pending.length - 1) {
 			lets = lets || pending[j].uses.some(e => e.mutable || e.lets)
 		}
-		const loops = pending.length - i > 1 || contains(d.uses, d)
+		const loops = pending.length - i > 1 || d.uses.includes(d)
 		while (pending.length > i) {
 			const e = pending.pop()!
 			e.index = -e.index

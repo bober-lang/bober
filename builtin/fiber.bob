@@ -1,7 +1,7 @@
 //! Futures, which `async c` makes (src/lower.bob): each of a call run on a fiber of its own (src/fiber.c).
 
 import { bober_fiber, bober_park, bober_self, bober_wake } from "../src/rt.h"
-import { Ref, addr } from "./mem"
+import { Ref, addr, trap } from "./mem"
 
 /// What a call threw, laid out as the union it is held as (src/emit.bob), for each await of its future to throw again.
 class Thrown {
@@ -20,6 +20,8 @@ export class Future[T] {
 	done = false
 	result: T[] = []
 	thrown: Thrown | null = null
+	/// Whether a race took it.
+	taken = false
 	/// The fibers parked awaiting it.
 	waiters: u64[] = []
 }
@@ -41,15 +43,17 @@ export function start[T](f: () => T): Future[T] {
 	return fut
 }
 
-/// What fibers wait on for a change: wait parks the caller until the next wake, which readies all waiting.
+/// What fibers wait on for a change.
 export class Signal {
 	private waiters: u64[] = []
 
+	/// Parks the caller until the next wake.
 	wait() {
 		this.waiters.push(bober_self())
 		bober_park()
 	}
 
+	/// Readies all waiting.
 	wake() {
 		const w = this.waiters
 		this.waiters = []
@@ -69,4 +73,35 @@ export function wait[T](fut: Future[T]): T {
 		rethrow(fut.thrown!)
 	}
 	return fut.result[0]
+}
+
+/// Parks until a future of fs no race took is done, and takes the lowest such: its index and result, or throws what its
+/// call threw.
+export function race[T](fs: Future[T][]): [i32, T] {
+	const self = bober_self()
+	while (true) {
+		for (const i of 0 ... fs.length - 1) {
+			if (fs[i].done && !fs[i].taken) {
+				fs[i].taken = true
+				return [i, wait(fs[i])]
+			}
+		}
+		// Each done is taken by now.
+		if (fs.every(f => f.done)) {
+			trap("a race of only taken futures")
+		}
+		for (const f of fs) {
+			if (!f.done) {
+				f.waiters.push(self)
+			}
+		}
+		bober_park()
+		// So that the others, once done, do not wake this fiber parked for something else.
+		for (const f of fs) {
+			const i = f.waiters.indexOf(self)
+			if (i >= 0) {
+				f.waiters.remove(i)
+			}
+		}
+	}
 }

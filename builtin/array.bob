@@ -44,6 +44,44 @@ export class Array[T] {
 		return load[T](elements(a) + ((n * sizeOf[T]()) as u64))
 	}
 
+	/// v stored at i, the elements from i on moved up one.
+	insert(i: i32, v: T) {
+		if (i < 0 || i > this.length) {
+			trap("insert out of range")
+		}
+		this.push(v)
+		let j = this.length - 1
+		while (j > i) {
+			this[j] = this[j - 1]
+			j--
+		}
+		this[i] = v
+	}
+
+	/// The element at i, removed, the elements after it moved down one.
+	remove(i: i32): T {
+		const v = this[i]
+		for (const j of i + 1 ... this.length - 1) {
+			this[j - 1] = this[j]
+		}
+		this.pop()
+		return v
+	}
+
+	/// This, its elements reversed in place.
+	reverse(): T[] {
+		let i = 0
+		let j = this.length - 1
+		while (i < j) {
+			const x = this[i]
+			this[i] = this[j]
+			this[j] = x
+			i++
+			j--
+		}
+		return this
+	}
+
 	/// The element at i, or null outside the array.
 	at(i: i32): T | null { return if (i >= 0 && i < this.length) this[i] else null }
 
@@ -110,8 +148,18 @@ export class Array[T] {
 	/// Whether f holds for each element.
 	every(f: (x: T) => bool): bool { return !this.some(x => !f(x)) }
 
+	/// The index of the first element == v, or -1.
+	indexOf(v: T): i32 {
+		for (const i of 0 ... this.length - 1) {
+			if (this[i] == v) {
+				return i
+			}
+		}
+		return -1
+	}
+
 	/// Whether v is an element.
-	includes(v: T): bool { return this.some(x => x == v) }
+	includes(v: T): bool { return this.indexOf(v) >= 0 }
 
 	/// Whether o has as many elements, each == the one here.
 	equals(o: T[]): bool {

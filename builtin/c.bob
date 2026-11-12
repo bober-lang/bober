@@ -2,11 +2,17 @@
 
 import { bober_free, bober_malloc } from "../src/rt.h"
 import { elements } from "./array"
-import { Ref, addr, deref, load, memcpy, store, trap } from "./mem"
+import { Ref, addr, deref, load, memcpy, sizeOf, store, trap } from "./mem"
 import { bytesAt, copy, lenAt } from "./string"
 
-/// s and a NUL, in memory from C's malloc, for the caller to free. toC traps if s holds a NUL.
-export function toCN(s: string): u64 {
+/// n bytes of C's memory, which the collector neither moves nor frees; exits if out of memory.
+export function malloc(n: u64): u64 { return bober_malloc(n) }
+
+/// Frees p, from malloc; nothing if 0.
+export function free(p: u64) { bober_free(p) }
+
+/// s and a NUL, in memory from C's malloc, for the caller to free.
+function toCN(s: string): u64 {
 	const p = addr(s)
 	const n = lenAt(p) as u64
 	const q = bober_malloc(n + 1)
@@ -15,62 +21,48 @@ export function toCN(s: string): u64 {
 	return q
 }
 
-export function toC(s: string): u64 {
-	const p = addr(s)
-	const n = lenAt(p) as u64
-	if (nul(bytesAt(p), n) != n) {
-		trap("not a C string")
-	}
-	return toCN(s)
-}
-
-/// The n bytes at p; fromC up to its NUL. Traps if p is 0 and n is not.
-export function fromCN(p: u64, n: u64): string {
-	if (p == 0 && n != 0) {
-		trap("null C string")
-	}
-	return copy(p, n as i64)
-}
-
+/// The bytes at p up to its NUL. Traps if p is 0.
 export function fromC(p: u64): string {
 	if (p == 0) {
 		trap("null C string")
 	}
-	return copy(p, nul(p, 0xffff_ffff_ffff_ffff) as i64)
-}
-
-/// Where the first NUL of the n bytes at p is, n if they hold none.
-function nul(p: u64, n: u64): u64 {
-	let i: u64 = 0
-	while (i < n && load[u8](p + i) != 0) {
-		i += 1
+	let n: u64 = 0
+	while (load[u8](p + n) != 0) {
+		n += 1
 	}
-	return i
-}
-
-/// The 8 bytes at p. Traps if p is 0.
-export function peek(p: u64): u64 {
-	if (p == 0) {
-		trap("load from null")
-	}
-	return load[u64](p)
-}
-
-export function poke(p: u64, v: u64) {
-	if (p == 0) {
-		trap("store to null")
-	}
-	store[u64](p, v)
+	return copy(p, n as i64)
 }
 
 /// What C is given for the argument of a pointer param, a union's bits and ref: of kind 1, a string boxed in ref, a
-/// copy of its bytes and a NUL, which cDone frees; of kind 2, an array: its elements; else bits.
+/// copy of its bytes and a NUL; of kind 2, an array: its elements; of kind 3, a string[]: its strings' addresses and
+/// a 0, then the strings as kind 1's, in one block, which C may change; else bits. cDone frees the copies.
 export function cPtr(kind: i32, bits: u64, ref: Ref): u64 {
+	if (kind == 3) {
+		const a = deref(ref)
+		const n = load[i64](a)
+		const size = sizeOf[string]()
+		let bytes = (8 * n + 8) as u64
+		for (const i of 0 ... n - 1) {
+			bytes += (lenAt(elements(a) + ((size * i) as u64)) as u64) + 1
+		}
+		const p = bober_malloc(bytes)
+		let q = p + ((8 * n + 8) as u64)
+		for (const i of 0 ... n - 1) {
+			const s = elements(a) + ((size * i) as u64)
+			const len = lenAt(s) as u64
+			memcpy(q, bytesAt(s), len)
+			store[u8](q + len, 0)
+			store[u64](p + ((8 * i) as u64), q)
+			q += len + 1
+		}
+		store[u64](p + ((8 * n) as u64), 0)
+		return p
+	}
 	return if (kind == 1) toCN(load[string](deref(ref))) else if (kind == 2) elements(deref(ref)) else bits
 }
 
 export function cDone(kind: i32, p: u64) {
-	if (kind == 1) {
+	if (kind == 1 || kind == 3) {
 		bober_free(p)
 	}
 }
