@@ -3,23 +3,30 @@
 import { indexOf, sort } from "../../std/algo"
 import { CompileError } from "../error"
 import { arm64 } from "./arm64"
+import { le, pad, u, zeros } from "./bytes"
 import { Linker } from "./link"
 import { macho } from "./macho"
-import { Code, Global, Object, Section, Symbol, Unwind } from "./object"
+import { Code, Data, Global, Object, Section, Symbol, Unwind } from "./object"
 
-/// A section named name of kind, of 8 zero bytes.
-function section(name: string, kind: u8): Section {
+/// A section named name of kind, of bytes.
+function section(name: string, kind: u8, bytes = zeros(8)): Section {
 	const s = new Section(name, kind)
 	s.align = 4
-	s.bytes = "\x00\x00\x00\x00\x00\x00\x00\x00"
-	s.size = 8
+	s.bytes = bytes
+	s.size = bytes.length as u64
 	return s
 }
 
-/// The dylib of an arm64 object of sections, its first exported as each of names.
-function dylib(sections: Section[], names: string[]): string throws CompileError {
-	const o = new Object("a.o", "arm64")
+/// An arm64 object named name, of sections.
+function object(name: string, sections: Section[]): Object {
+	const o = new Object(name, "arm64")
 	o.sections = sections
+	return o
+}
+
+/// The dylib of an object of sections, its first exported as each of names.
+function dylib(sections: Section[], names: string[]): string throws CompileError {
+	const o = object("a.o", sections)
 	o.symbols = names.map(n => new Symbol(n, Global, 0))
 	const l = new Linker(arm64, macho)
 	l.add(o)
@@ -31,7 +38,7 @@ function dylib(sections: Section[], names: string[]): string throws CompileError
 
 test "a written dylib's export trie holds the names the image exports, of shared prefixes too" {
 	const names = ["a", "ab", "abc", "b", "ba"]
-	const got = macho.exports("a.dylib", dylib([section("__text", Code)], names))
+	const got = macho.exports("a.dylib", dylib([section("text", Code)], names))
 	sort(got)
 	assert got.join(" ") == names.join(" ")
 }
@@ -42,9 +49,24 @@ test "a text stub's exports are those of each of its lists of symbols" {
 	assert names.join(" ") == "a b c"
 }
 
-test "the Unwind sections are __eh_frame however named, and a long name is cut to 16 bytes" {
-	const d = dylib([section("__text", Code), section(".eh_frame", Unwind), section("bober_type_descriptors", Code)],
-		["a"])
-	assert indexOf(d, "__eh_frame\x00\x00\x00\x00\x00\x00__TEXT") > 0 && indexOf(d, ".eh_frame") < 0
-	assert indexOf(d, "bober_type_descr__TEXT") > 0
+test "the Unwind sections are __eh_frame of __TEXT, and the others are named as their segment" {
+	const d = dylib([section("text", Code), section(".eh_frame", Unwind), section("data", Data)], ["a"])
+	assert indexOf(d, pad("__eh_frame", 16) + "__TEXT") > 0 && indexOf(d, ".eh_frame") < 0
+	assert indexOf(d, pad("__text", 16) + "__TEXT") > 0 && indexOf(d, pad("__data", 16) + "__DATA") > 0
+}
+
+test "a kept dylib is continued, and where an object's Unwind section was is a CIE, which the unwinder skips" {
+	const cie = le(12, 4) + zeros(4) + "12345678"
+	const l = new Linker(arm64, macho, "")
+	for (const name of ["a", "b", "c"]) {
+		l.add(object(name, [section(".eh_frame", Unwind, cie)]))
+	}
+	const again = new Linker(arm64, macho, macho.write(l.link()))
+	assert again.objects().join(" ") == "a b c"
+	again.remove("b")
+	const d = macho.write(again.link())
+	// The section's header: its name and its segment's, of 16 bytes each, its address, size and offset in the file.
+	const header = indexOf(d, pad("__eh_frame", 16) + "__TEXT")
+	const frames = u(d, header + 48, 4) as i32
+	assert u(d, header + 40, 8) == 48 && d.slice(frames, frames + 48) == cie + le(12, 4) + zeros(12) + cie
 }
