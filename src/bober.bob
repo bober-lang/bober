@@ -13,7 +13,6 @@
 //! can catch. *implementation-defined* behavior is chosen by the implementation; a program shall not depend on
 //! implementation-defined behavior.
 
-import { Handle } from "../builtin/sys"
 import { endsWith, indexOf, lastIndexOf, sortBy, startsWith } from "../std/algo"
 import { fromCString } from "../std/c"
 import { Keys, Rest, Unknown, decode as decodeJson, encode, quoted } from "../std/encoding/json"
@@ -42,6 +41,9 @@ import { bundle, compilerId } from "./lift"
 import { members } from "./link/ar"
 import { arm64 } from "./link/arm64"
 import { elf } from "./link/elf"
+import { macho, named } from "./link/macho"
+import { pe } from "./link/pe"
+import { x64 } from "./link/x64"
 import { Linker, Stale } from "./link/link"
 import { Const, Global, Object, Section, Symbol } from "./link/object"
 import { SyntaxError } from "./lex"
@@ -52,7 +54,7 @@ import { Parser } from "./parse"
 import { builtin, root } from "./root"
 import { CLib, Package, load, nearest, out } from "./pkg"
 import * as process from "../std/process"
-import { dup, getcwd, getpid, isatty } from "unistd.h"
+import { getcwd, getpid, isatty, link as hardLink } from "unistd.h"
 
 const usage = `usage: bober <command> [-I dir]... args
   build <main.bob> [linker args]  compile a program into build/<name>, and print the command that runs it
@@ -67,12 +69,17 @@ const usage = `usage: bober <command> [-I dir]... args
 Its options are taken anywhere on the line, as a C compiler's, up to a --; the arguments after go to the program.
 -I adds a directory C headers are found in, as a C compiler takes it, before those of the nearest bober.pkg's C libraries.
 -release builds with LLVM, the whole program at -O2, for build, run and test; else each module with TPDE, to debug, once
-as lowered: a generic's code takes its type args' descriptors; on Linux arm64 into one shared library of all that is
-built there, build/image.so, which run and test load, and which a build links only what changed into.
+as lowered: a generic's code takes its type args' descriptors; into one shared library of all that is built there,
+build/image.so, which run and test load, and which a build links only what changed into.
 test prints a YAML mapping of the tests, or of the files and directories with tests: each ok if all in it passed, else
 what failed in it, a test's trap after what it printed.`
 
 const dir = "build"
+
+/// The machine and the format of the images src/link writes here; TPDE's objects are ELF everywhere.
+const machine = if (arch == "arm64") arm64 else x64
+const mac = os == "macos"
+const format = if (mac) macho else if (os == "windows") pe else elf
 
 /// Links the objects and linker options args into the executable out by bobcc's link, with libc++ for C++ libraries:
 /// folding identical code, with a build ID on ELF (compilerId); throws a CompileError if it fails.
@@ -269,9 +276,9 @@ function hasTests(path: string): bool {
 
 /// Compiles the program of main, linked with the linker options args, into the executable build/<name>, or with tests
 /// build/<name>.test, or if imaged into the image: each module once by TPDE, fast to compile, or if release all as one,
-/// monomorphized, by LLVM at -O2. Returns the command that runs it, or its tests: the executable, or the C library's
-/// loader running the launcher on the image's entry, the image as image has it if pin. Throws the errors, or what
-/// failed, as a CompileError or IoError.
+/// monomorphized, by LLVM at -O2. Returns the command that runs it, or its tests: the executable, or the launcher on
+/// the image's entry, run by the C library's loader where it is the sysroot's, the image as image has it if pin.
+/// Throws the errors, or what failed, as a CompileError or IoError.
 export function build(main: string, tests: bool, args: string[] = [], includes: string[] = [],
 	release = false, pin = false): string[] {
 	const out = `${dir}/${name(main)}`
@@ -319,32 +326,31 @@ export function build(main: string, tests: bool, args: string[] = [], includes: 
 		ld([...objects, ...cs, ...rt, ...args, ...(if (release) [] else [`--defsym=main="${entry(path, tests)}"`])], exe)
 		return [exe]
 	}
-	// libc++, which the C++ of CMake's libraries needs, as ld links it.
-	const cxxs: string[] = if (cxx) [`${sysroot}/usr/lib/libc++.a`, `${sysroot}/usr/lib/libc++abi.a`] else []
-	return [`${sysroot}/usr/lib/libc.so`, if (packaged) join(root, "lib/launch.c.exe") else launcher(dir),
-		image(p, o, [...cs, ...rt, ...cxxs], pin), entry(path, tests)]
+	// libc++, which the C++ of CMake's libraries needs, as ld links it; macOS has it and the loader in the system.
+	const cxxs: string[] = if (cxx && !mac) [`${sysroot}/usr/lib/libc++.a`, `${sysroot}/usr/lib/libc++abi.a`] else []
+	return [...(if (mac) [] else [`${sysroot}/usr/lib/libc.so`]),
+		if (packaged) join(root, "lib/launch.c.exe") else launcher(dir), image(p, o, [...cs, ...rt, ...cxxs], pin),
+		entry(path, tests)]
 }
 
 /// Whether a build is linked into an image, a shared library that run and test load through the launcher
-/// (src/launch.c), and not into an executable: a debug one on Linux arm64, until src/link writes other formats and
-/// machines; and with no linker args, until it takes them.
-function imaged(release: bool, args: string[]): bool {
-	return !release && os == "linux" && arch == "arm64" && args.length == 0
-}
+/// (src/launch.c), and not into an executable: a debug one with no linker args, until src/link takes them.
+function imaged(release: bool, args: string[]): bool { return !release && args.length == 0 }
 
 /// Links p's modules, each compiled by TPDE as o says, the objects and archives files, and the C library's libunwind
-/// and compiler builtins into build/image.so, the one image of all that is built there, which loads the C library and
-/// exports the entries of p's main module. The image is kept (src/link/link.bob), and a build links only what it does
-/// not hold: each object is named by what it is made of, `<what>@<version>`, a module by its bytecode, which has the
-/// ABIs of the modules it imports; a file by its bytes; an archive, which is linked for good, by its size and when it
-/// was written. Where the image cannot take the link, or an archive it holds changed, all is linked anew, fresh. The
-/// image is written under a name of its own, then renamed, as a running program may have the old one mapped, or
-/// another build be writing it. Returns its path, or if pin that of this process's open file of it, by which what the
-/// process runs loads this build's image though another build replaces it.
+/// and compiler builtins into build/image.so, the one image of all that is built there, which loads the C library, on
+/// macOS the system's with those and libc++ in it, and exports the entries of p's main module. The image is kept
+/// (src/link/link.bob), and a build links only what it does not hold: each object is named by what it is made of,
+/// `<what>@<version>`, a module by its bytecode, which has the ABIs of the modules it imports; a file by its bytes; an
+/// archive, which is linked for good, by its size and when it was written. Where the image cannot take the link, or
+/// an archive it holds changed, all is linked anew, fresh. The image is written under a name of its own, then renamed,
+/// as a running program may have the old one mapped, or another build be writing it. Returns its path, or if pin that
+/// of a link to it of this process's, which the launcher removes, by which what the process runs loads this build's
+/// image though another build replaces it.
 function image(p: Program, o: Options, files: string[], pin: bool, fresh = false): string {
 	const out = `${dir}/image.so`
 	const lib = `${sysroot}/usr/lib`
-	const l = new Linker(arm64, elf, if (fresh || !exists(out)) "" else readFile(out))
+	const l = new Linker(machine, format, if (fresh || !exists(out)) "" else readFile(out))
 	const held = l.objects()
 	// Whether the image lacks the object name; another version of it is unlinked.
 	const lacks = (name: string) => {
@@ -361,12 +367,12 @@ function image(p: Program, o: Options, files: string[], pin: bool, fresh = false
 			l.add(unit(p, m, o, name))
 		}
 	}
-	for (const f of [...files, `${lib}/libunwind.a`, `${lib}/libclang_rt.builtins.a`]) {
+	for (const f of [...files, ...(if (mac) [] else [`${lib}/libunwind.a`, `${lib}/libclang_rt.builtins.a`])]) {
 		if (!endsWith(f, ".a")) {
 			const bytes = readFile(f)
 			const name = `${f}@${fnv(bytes)}`
 			if (lacks(name)) {
-				l.add(elf.read(name, bytes))
+				l.add(format.read(name, bytes))
 			}
 			continue
 		}
@@ -377,30 +383,39 @@ function image(p: Program, o: Options, files: string[], pin: bool, fresh = false
 			return image(p, o, files, pin, true)
 		}
 		if (!held.includes(name)) {
-			l.add(new Object(name, arm64.arch))
+			l.add(new Object(name, machine.arch))
 		}
 		const bytes = readFile(f)
 		for (const [member, b, names] of members(f, bytes)) {
-			l.lazy(names, () => elf.read(member, b))
+			l.lazy(if (mac) names.map(named) else names, () => format.read(member, b))
 		}
 	}
-	l.library("libc.so", elf.exports(`${lib}/libc.so`, readFile(`${lib}/libc.so`)))
+	// Each library as the loader finds it, and the file that has its exports: on macOS a text stub of the SDK's.
+	const system = ["libSystem.B", "libc++.1", "libc++abi"]
+	const libraries = if (mac) system.map(n => [`/usr/lib/${n}.dylib`, `${lib}/${n}.tbd`])
+		else [["libc.so", `${lib}/libc.so`]]
+	for (const [name, file] of libraries) {
+		l.library(name, format.exports(file, readFile(file)))
+	}
 	l.export(entry(p.modules[o.main].path, false))
 	l.export(entry(p.modules[o.main].path, true))
 	const tmp = `${out}.${getpid()}`
 	try {
-		save(tmp, elf.write(l.link()))
+		save(tmp, format.write(l.link()))
 	} catch (e: Stale) {
 		return image(p, o, files, pin, true)
 	}
-	let fd = 0
+	const own = `${tmp}.run`
 	if (pin) {
-		const h = Handle.open(tmp, "r")
-		fd = dup(h.raw()) // which, unlike h's, what the process runs has too
-		h.close()
+		if (exists(own)) {
+			remove(own) // which a process of this ID left, whose launcher never ran
+		}
+		if (hardLink(tmp, own) != 0) {
+			throw new CompileError(`cannot link ${own}`)
+		}
 	}
 	rename(tmp, out)
-	return if (pin) `/proc/self/fd/${fd}` else out
+	return if (pin) own else out
 }
 
 /// Module m of p, compiled by TPDE as o says, as the object name. It defines a symbol named by its ABI, and names
