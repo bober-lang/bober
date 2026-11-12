@@ -21,8 +21,9 @@ import { decode } from "../std/encoding/optarg"
 import { exists, glob, mkdirAll, readFile, remove, removeAll, rename, stat } from "../std/fs"
 import { base, dir as parent, isAbs, join, rel } from "../std/fs/path"
 import { fnv } from "../std/hash"
+import { stdin, stdout } from "../std/io"
 import { arch, os } from "../std/os"
-import { ParseError, split } from "../std/string"
+import { ParseError, split, trim } from "../std/string"
 import { abi, write } from "./bc/file"
 import { Program } from "./bc/program"
 import { show } from "./bc/show"
@@ -48,7 +49,7 @@ import { mono } from "./mono"
 import { builtin, root } from "./root"
 import { CLib, Package, load, nearest, out } from "./pkg"
 import * as process from "../std/process"
-import { dup, getcwd, getpid } from "unistd.h"
+import { dup, getcwd, getpid, isatty } from "unistd.h"
 
 const usage = `usage: bober <command> [-I dir]... args
   build <main.bob> [linker args]  compile a program into build/<name>, and print the command that runs it
@@ -58,6 +59,7 @@ const usage = `usage: bober <command> [-I dir]... args
   format <file>...               rewrite each file in place in the one layout of its syntax tree
   lower <file>...                print the bytecode of each file
   doc <file>...                  print the spec in the files' doc comments as Markdown
+  init [@namespace/name]         write a bober.pkg here, asking for its name on a terminal
   lsp                            serve the language server protocol on stdin and stdout
 Its options are taken anywhere on the line, as a C compiler's, up to a --; the arguments after go to the program.
 -I adds a directory C headers are found in, as a C compiler takes it, before those of the nearest bober.pkg's C libraries.
@@ -98,7 +100,7 @@ function main(): i32 {
 		print(`bad option ${argv[e.at + 1]}`)
 		return 2
 	}
-	if (f.args.length == 0 && argv[0] != "lsp") {
+	if (f.args.length == 0 && argv[0] != "lsp" && argv[0] != "init") {
 		print(usage)
 		return 2
 	}
@@ -147,6 +149,9 @@ function command(cmd: string, f: Flags): i32 {
 		case "lsp":
 			serve(dirs)
 			return 0
+		case "init":
+			init(if (argv.length == 0) "" else argv[0])
+			return 0
 		case "bundle":
 			pack(argv[0])
 			return 0
@@ -159,6 +164,35 @@ function command(cmd: string, f: Flags): i32 {
 	}
 	print(usage)
 	return 2
+}
+
+/// Writes bober.pkg in the directory it runs in, of the package name, else the one asked for on a terminal, else
+/// @local/<the directory's name>.
+function init(name: string) {
+	if (exists("bober.pkg")) {
+		throw new CompileError("bober.pkg exists")
+	}
+	let n = name
+	if (n == "") {
+		n = `@local/${base(fromCString(getcwd(0, 0)))}`
+		if (isatty(0) != 0) {
+			stdout.write(`name (${n}): `)
+			let line = ""
+			let c = stdin.read(1)
+			while (c != null && c != "\n") {
+				line += c
+				c = stdin.read(1)
+			}
+			if (trim(line) != "") {
+				n = trim(line)
+			}
+		}
+	}
+	const parts = split(n, "/")
+	if (parts.length != 2 || parts[0].length < 2 || parts[1] == "" || !startsWith(n, "@")) {
+		throw new CompileError(`${n} is not @namespace/name`)
+	}
+	save("bober.pkg", `{\n\t"name": ${quoted(n)}\n}\n`)
 }
 
 /// Compiles the program of main, linked with the linker options args, into the executable build/<name>, or with tests
