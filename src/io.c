@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -248,6 +249,9 @@ long bober_io_close(int fd) {
 }
 long bober_io_read(int fd, void *buf, unsigned long n) {
   return NET(fd) ? bober_net.read(fd, buf, n) : result_on(fd, 0, read(fd, buf, n));
+}
+long bober_io_map(int fd, void *at, unsigned long n) {
+  return result(mmap(at, n, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED ? -1 : 0);
 }
 long bober_io_write(int fd, const void *buf, unsigned long n) {
   return NET(fd) ? bober_net.write(fd, buf, n) : result_on(fd, 1, write(fd, buf, n));

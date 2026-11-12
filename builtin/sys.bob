@@ -7,7 +7,7 @@ import { BOBER_IO_AGAIN, BOBER_IO_HOST, bober_env, bober_io_accept, bober_io_clo
 	bober_tz } from "../src/rt.h"
 import { fromC } from "./c"
 import { IoError, Kind } from "./error"
-import { fromBytes } from "./string"
+import { fromBytes, mapped } from "./string"
 
 /// The IoError of r < 0, a failure of the run time's I/O or of C glue such as std/tls's, as op's on what.
 export function failure(r: i64, op: string, what: string): IoError {
@@ -258,6 +258,17 @@ export function readDir(path: string): DirEntry[] throws IoError {
 		i = end + 1
 	}
 	return entries
+}
+
+/// The n > 0 bytes of the file at path, mapped.
+export function map(path: string, n: i64): string throws IoError {
+	const fd = checked(bober_io_open(cPath("map", path), "r"), "map", path) as i32
+	const s = mapped(fd, n)
+	bober_io_close(fd)
+	if (s instanceof i64) {
+		throw failure(s, "map", path)
+	}
+	return s
 }
 
 export function mkdir(path: string) throws IoError { checked(bober_io_mkdir(cPath("mkdir", path)), "mkdir", path) }

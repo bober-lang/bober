@@ -24,7 +24,7 @@
 #include <string.h>
 #include <sys/mman.h>
 
-#define PAGE (1 << 16)
+#define PAGE BOBER_PAGE
 #define PAGES (1 << 20)  // of address space, 64 GiB
 #define CARD 9           // the bits of a card's size, as the write barrier has it
 #define SMALL 8192       // the size, its header in, of the largest object of a size class
@@ -119,7 +119,7 @@ static uint32_t take(int n, int kind) {
   return p;
 }
 
-/// Frees n pages from p, zeroing them.
+/// Frees n pages from p, zeroing them: several by mapping them anew (src/rt.h).
 static void release(uint32_t p, int n) {
   if (n > 1) mmap(at(p), (int64_t)n * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED, -1, 0);
   else memset(at(p), 0, PAGE);

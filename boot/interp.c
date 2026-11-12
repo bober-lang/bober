@@ -1436,6 +1436,13 @@ static Val bi_chr(Val self, Val *a, int n, Node *site) {
   return S(mkstr(&c, 1));
 }
 
+/// builtin/string's mapped: the n bytes of fd, read, as boot has no pages to map them in.
+static Val bi_mapped(Val self, Val *a, int n, Node *site) {
+  Str *s = mkstr("", 0);
+  s->p = alloc(s->len = a[1].i);
+  return pread(a[0].i, s->p, s->len, 0) == s->len ? S(s) : I(K_I64, -1);
+}
+
 static Val bi_fromBytes(Val self, Val *a, int n, Node *site) {
   if (n && a[0].k != K_ARR) {  // the n bytes at an address
     char *p = (char *)(intptr_t)a[0].i;
@@ -1625,6 +1632,7 @@ static void init(void) {
   builtin(prelude, "idOf", bi_idOf);
   builtin(prelude, "chr", bi_chr);
   builtin(prelude, "fromBytes", bi_fromBytes);
+  builtin(prelude, "mapped", bi_mapped);
   builtin(prelude, "fromC", bi_fromC);
   mem = alloc(sizeof(Mod));
   builtin(mem, "addr", bi_addr);
