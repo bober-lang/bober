@@ -19,7 +19,8 @@ import { Arch } from "../../std/os"
 import { CompileError } from "../error"
 import { Region, State, read, write } from "./keep"
 import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Image32, Init, Local, Machine, Object, Page, PageOff,
-	Rel32, Rel64, Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Unwind, Weak, Zero } from "./object"
+	Rel32, Rel64, Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Thread32, Unwind, Weak,
+	Zero } from "./object"
 
 /// What a format's writer makes a file of. Its addresses are from where it is loaded; the file has each segment's
 /// bytes at its offset, which is its address but in a kept image, whose segments have room after them no file holds.
@@ -867,7 +868,8 @@ export class Linker {
 							this.state.rebases.push(p)
 						}
 					}
-					if (!this.apply(image.bytes, image.at(p), f.kind, s + (f.addend as u64), p)) {
+					const v = s + (f.addend as u64) - (if (f.kind == Thread32) image.thread[0] else 0)
+					if (!this.apply(image.bytes, image.at(p), f.kind, v, p)) {
 						throw new CompileError(`${place(o, i, f)} cannot reach its symbol`)
 					}
 				}
@@ -1024,7 +1026,7 @@ export class Linker {
 		switch (kind) {
 			case Abs64: put(b, at, v, 8)
 			case Rel64: put(b, at, d as u64, 8)
-			case Image32:
+			case Image32, Thread32:
 				if (v >= 1 << 32) {
 					return false
 				}

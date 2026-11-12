@@ -4,7 +4,7 @@ import { CompileError } from "../error"
 import { addend, arm64 } from "./arm64"
 import { Image, Linker, Stale } from "./link"
 import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Init, Local, Machine, Object, Page, PageOff, Rel32, Section,
-	SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Unwind, Weak, Zero } from "./object"
+	SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Thread32, Unwind, Weak, Zero } from "./object"
 import { x64 } from "./x64"
 
 /// An object named name of one section of kind, of the bytes of words, and of symbols.
@@ -299,7 +299,7 @@ test "sections of one name are laid out by their order, then as linked" {
 	assert at(image, "b") < at(image, "c") && at(image, "c") < at(image, "a")
 }
 
-test "the Thread sections are laid out together after the data, and a Desc is noted with S + A's offset there" {
+test "the Thread sections are laid out together after the data; a Desc and a Thread32 have S + A's offset there" {
 	const t = obj("t", Thread, [1, 2], [new Symbol("x", Global, 0, 4), new Symbol("y", Local, 1, 4),
 		new Symbol("p", Global, 2)])
 	const tbss = new Section("tbss", Thread)
@@ -308,7 +308,7 @@ test "the Thread sections are laid out together after the data, and a Desc is no
 	const descs = new Section("data", Data)
 	descs.size = 32
 	descs.bytes = fromBytes(new u8[](32))
-	descs.fixups = [new Fixup(0, Desc, 0, 2), new Fixup(16, Desc, 1, 0)]
+	descs.fixups = [new Fixup(0, Desc, 0, 2), new Fixup(8, Thread32, 0, 2), new Fixup(16, Desc, 1, 0)]
 	t.sections = [t.sections[0], tbss, descs]
 	t.sections[0].name = "tdata"
 	const image = link([t], ["p"])
@@ -317,6 +317,7 @@ test "the Thread sections are laid out together after the data, and a Desc is no
 	assert from > p && image.segment(from).write && from == section(image, "tdata") && get(image, from) == 1
 	assert to == section(image, "tbss") + 8 && align == 16
 	assert image.descs.map(e => `${e[0] - p}:${e[1]}`).join(" ") == `0:6 16:${section(image, "tbss") - from + 4}`
+	assert get(image, p + 8) == 6
 }
 
 test "a Desc reaches only a thread's own bytes" {
