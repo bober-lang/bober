@@ -1,5 +1,5 @@
 import * as encoding from "../encoding"
-import { Cc, decode, encode, EncodeError, Name, OmitEmpty, Optional, Rest, Short, Skip } from "./optarg"
+import { Cc, decode, encode, EncodeError, help, Name, OmitEmpty, Optional, Rest, Short, Skip, Verbose } from "./optarg"
 import { ParseError } from "../string"
 
 class Flags {
@@ -26,7 +26,12 @@ class Plain {
 }
 
 class Nested {
-	plain = new Plain()
+	...Plain
+	n: i32 = 0
+}
+
+class Pair {
+	p: [i32, i32] = [0, 0]
 }
 
 test "decode" {
@@ -104,5 +109,64 @@ test "encode" {
 	const args = encode(f)
 	assert args == ["-v", "-I", "a", "-I", "b c", "--jobs", "1", "--mode", "fast", "--out", "o", "--color=never", "x"]
 	assert encode(decode[Flags](args)) == args
-	assert encode(new Nested()) throws new EncodeError("--plain")
+}
+
+test "groups" {
+	const n = decode[Nested](["-v", "-n", "2"])
+	assert n.v && n.n == 2
+	assert encode(n) == ["-v", "-n", "2"]
+	assert encode(new Pair()) throws new EncodeError("-p")
+}
+
+/// use the tool
+class Tool {
+	/// be loud
+	v: bool = false
+	/// how many at once
+	jobs: i32 @Short["j"] = 1
+	/// where to write,
+	/// if anywhere
+	out: string @Verbose = ""
+	/// colored
+	color: string @Optional @Verbose = "never"
+	/// headers
+	include: string[] @Short["I"] @Verbose = []
+	rest: string[] @Rest = []
+}
+
+/// the debugger
+class Debug @Verbose @Name["dbg"] @Cc {
+	O: u8 = 0
+	args: string[] @Rest = []
+}
+
+class Main @Cc {
+	v: bool = false
+	command: Tool | Debug | null @Rest = null
+}
+
+test "help" {
+	assert help[Tool]() == `  -v              be loud
+  -j, --jobs i32  how many at once`
+	assert help[Tool](true) == `  -v                    be loud
+  -j, --jobs i32        how many at once
+  --out string          where to write,
+                        if anywhere
+  --color=[string]      colored
+  -I, --include string  headers`
+	assert help[Tool | Debug]() == "  tool  use the tool"
+	assert help[Tool | Debug](true) == "  dbg   the debugger\n  tool  use the tool"
+}
+
+test "commands" {
+	const m = decode[Main](["tool", "-j", "2", "x", "-v"])
+	assert m.v
+	assert m.command instanceof Tool && m.command.jobs == 2 && m.command.rest == ["x"]
+	const d = decode[Main](["-v", "dbg", "a", "-O1"])
+	assert d.command instanceof Debug && d.command.O == 1 && d.command.args == ["a"]
+	assert decode[Main](["-v"]).command == null
+	const r = decode[Main](["dbg", "a", "--", "-O1"])
+	assert r.command instanceof Debug && r.command.O == 0 && r.command.args == ["a", "-O1"]
+	assert decode[Main](["nope"]) throws new ParseError("syntax", 0)
+	assert decode[Main](["tool", "-v", "--jobs"]) throws new ParseError("syntax", 2)
 }
