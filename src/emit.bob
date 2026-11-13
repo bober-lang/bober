@@ -14,10 +14,10 @@
 //! ref into it; a T[n] is held in place and handled by a ref to it, its place, which is copied where stored. A union
 //! value is { i64 tag, i64 bits, ref }, the tag the address of the member's type's descriptor, which is one per type in
 //! the program, so that a tag means the same in every union; a ref member, or a boxed string or T[n], is in ref and any
-//! other in bits, so that a word is a ref by its type alone. In a field or element it is packed (§4.4, stored), a word
-//! a ref if any member's is, which the collector may thus find a number in. A function value is a ref to { ptr code, captures... },
-//! its code taking it first. A thrown value is held as a union of any type: the union without members, which as a
-//! type no value has, so that the two meanings never meet.
+//! other in bits, so that a word is a ref by its type alone. In a field or element it is packed (§4.4, stored), its
+//! members' refs sharing a word, where the collector may find a number, but below 2^32, so no ref. A function value
+//! is a ref to { ptr code, captures... }, its code taking it first. A thrown value is held as a union of any type: the
+//! union without members, which as a type no value has, so that the two meanings never meet.
 //!
 //! Types are the Program's ids, compared by id once norm has made them as their values are held; what emit computes
 //! of a type, its key, members, layout and struct, it computes once per id.
@@ -166,7 +166,7 @@ class Emitter {
 	private rts = new HashMap[string, Value]()
 	/// By type id, what the functions of their names make of it in this module's backend, as learned or not.
 	private structs = new HashMap[i32, IrType]()
-	private shapes = new HashMap[i32, [i32, i32, i32]]()
+	private shapes = new HashMap[i32, [i32, i32, i32, i32]]()
 	/// The module's string constants, by text and whether a C string, and the function values made.
 	private strs = new HashMap[string, Value]()
 	private cstrs = new HashMap[string, Value]()
@@ -2347,40 +2347,34 @@ class Emitter {
 		return r
 	}
 
-	/// Whether a value of t is a union packed in memory (§4.4): not boxed, nor in a program as lowered of a member whose
-	/// layout a type param decides.
+	/// Whether a value of t is a union packed in memory (§4.4): not boxed, nor with a T[n] member, nor in a program as
+	/// lowered of a member whose layout a type param decides.
 	private packed(t: i32): bool {
 		const n = this.norm(t)
 		return this.p.kind(n) == kind.Union && n != this.any && !this.boxed(n) && !this.unbound(n)
-			&& !this.p.members(n).some(m => this.boxed(m))
+			&& !this.p.members(n).some(m => this.boxed(m) || this.p.kind(m) == kind.FixedArray)
 	}
 
-	/// The size and alignment of packed union n, and the byte its tag is in, -1 if its members are null and a ref,
-	/// which null is the zero of; as src/type.c lays it out (§4.4).
-	private shape(n: i32): [i32, i32, i32] { return this.shapes.get(n) ?? put(this.shapes, n, this.measure(n)) }
+	/// The byte packed union n's tag is in, -1 if its members are null and a ref, which null is the zero of; the word its
+	/// members' refs share, -1 if none; and its size and alignment; as src/type.c lays it out (§4.4).
+	private shape(n: i32): [i32, i32, i32, i32] { return this.shapes.get(n) ?? put(this.shapes, n, this.measure(n)) }
 
 	/// shape's, made.
-	private measure(n: i32): [i32, i32, i32] {
-		// Its widest member's size and alignment; a struct of a byte and a value is padded to the value's alignment.
+	private measure(n: i32): [i32, i32, i32, i32] {
 		const ms = this.p.members(n)
-		let size = 0
+		const r = if (ms.some(m => this.spare(m) == 23)) 16 else if (ms.some(m => this.spare(m) == 7)) 0 else -1
+		// Its members' end and alignment; a struct of a byte and a value is padded to the value's alignment.
+		let end = 0
 		let align = 1
-		let widest = ms[0]
 		for (const m of ms) {
 			const l = this.inUnion(m)
 			const bytes = this.b.bytes(l) as i32
 			align = max(align, (this.b.bytes(this.b.struct([this.b.int(8), l])) as i32) - bytes)
-			if (bytes > size) {
-				size = bytes
-				widest = m
-			}
+			end = max(end, this.placed(r, m) + bytes)
 		}
-		// The byte the widest spares, if no other member reaches it but to spare it too.
-		const k = this.spare(widest)
-		const shared = k >= 0 && ms.every(m => (this.b.bytes(this.inUnion(m)) as i32) <= k || this.spare(m) == k)
-		const r: [i32, i32, i32] = if (ms.length == 2 && ms.includes(kind.Null) && k == 7) [size, align, -1]
-			else if (shared) [size, align, k] else [(size + align) / align * align, align, size]
-		return r
+		// The tag in the top byte of the refs' word, else after the members.
+		const at = if (ms.length == 2 && ms.includes(kind.Null) && r == 0) -1 else if (r >= 0) r + 7 else end
+		return [at, r, (max(end, at + 1) + align - 1) / align * align, align]
 	}
 
 	/// The type of member t of a packed union: a class's a ref, as a union boxes one held by value (§4.4).
@@ -2392,27 +2386,36 @@ class Emitter {
 		return if (l == this.ref) 7 else if (l == this.stringTy) 23 else -1
 	}
 
+	/// The offset of member m of a packed union whose refs share the word at r: a ref's r, a number's of more than 4 bytes
+	/// after it if at 0, else 0, so that the word holds a ref or less than 2^32 (§4.4).
+	private placed(r: i32, m: i32): i32 {
+		const l = this.inUnion(m)
+		return if (l == this.ref) r else if (r == 0 && this.b.bytes(l) > 4) 8 else 0
+	}
+
 	/// The value of packed union t at place q, as a union holds it.
 	private unpack(q: Value, t: i32): Value {
 		const n = this.norm(t)
 		const ms = this.p.members(n)
-		const at = this.shape(n)[2]
+		const [at, r] = this.shape(n)
 		if (at < 0) {
-			const r = this.ir().load(this.ref, q, false)
-			const none = this.ir().icmp("eq", this.ir().cast("ptrtoint", r, this.i64), this.i64Const(0))
+			const x = this.ir().load(this.ref, q, false)
+			const none = this.ir().icmp("eq", this.ir().cast("ptrtoint", x, this.i64), this.i64Const(0))
 			const m = if (ms[0] == kind.Null) ms[1] else ms[0]
-			return this.union(this.ir().select(none, this.tag(kind.Null), this.tag(m)), this.i64Const(0), r)
+			return this.union(this.ir().select(none, this.tag(kind.Null), this.tag(m)), this.i64Const(0), x)
 		}
 		const tag = this.ir().cast("zext", this.ir().load(this.b.int(8), this.ir().gep(this.b.int(8), q, [this.i64Const(at)]), false), this.i64)
 		const u = this.slot(this.unionTy)
 		this.cases(ms.length, i => this.ir().icmp("eq", tag, this.i64Const(this.tagByte(n, i))), i => {
 			const boxed = this.inlined(ms[i])
-			let x = if (boxed) this.ir().load(this.ref, q, false) else this.fetch(q, ms[i])
-			if (this.spare(ms[i]) == at) {
+			const p = this.ir().gep(this.b.int(8), q, [this.i64Const(this.placed(r, ms[i]))])
+			let x = if (boxed) this.ir().load(this.ref, p, false) else this.fetch(p, ms[i])
+			const k = this.spare(ms[i])
+			if (k >= 0) {
 				// Without the tag, in the top byte of its ref: a pointer derived from it, which statepoints move with it.
-				const ref = if (at == 7) x else this.ir().extract(x, 2)
+				const ref = if (k == 7) x else this.ir().extract(x, 2)
 				const bare = this.ir().gep(this.b.int(8), ref, [this.i64Const(-(this.tagByte(n, i) << 56))])
-				x = if (at == 7) bare else this.ir().insert(x, bare, 2)
+				x = if (k == 7) bare else this.ir().insert(x, bare, 2)
 			}
 			this.ir().store(if (boxed) this.union(this.tag(ms[i]), this.i64Const(0), x) else this.unionOf(this.tag(ms[i]), x, ms[i]), u, false)
 		})
@@ -2423,13 +2426,14 @@ class Emitter {
 	private pack(q: Value, v: V, t: i32) {
 		const n = this.norm(t)
 		const ms = this.p.members(n)
-		const at = this.shape(n)[2]
+		const [at, r] = this.shape(n)
 		this.ir().store(this.b.constZero(this.stored(n)), q, false)
 		const store = (i: i32, x: V) => {
+			const p = this.ir().gep(this.b.int(8), q, [this.i64Const(this.placed(r, ms[i]))])
 			if (this.inlined(ms[i])) {
-				this.ir().store(this.refOf(this.cast(x, n)), q, false) // its box
+				this.ir().store(this.refOf(this.cast(x, n)), p, false) // its box
 			} else {
-				this.put(q, x, ms[i])
+				this.put(p, x, ms[i])
 			}
 			if (at >= 0) {
 				this.ir().store(this.b.constInt(this.b.int(8), this.tagByte(n, i)), this.ir().gep(this.b.int(8), q, [this.i64Const(at)]), false)
@@ -3611,24 +3615,19 @@ class Emitter {
 		return if (this.p.kind(n) == kind.FixedArray) this.b.array(this.stored(this.p.a(n)), this.p.b(n) as u64) else this.ll(n)
 	}
 
-	/// The type of t as a field or element: a union packed (§4.4), each word a ref if any member's is there, as a
-	/// ref's, a string's third or any of a T[n]'s holding refs; so the collector may take a member's number for a ref.
+	/// The type of t as a field or element: a union packed (§4.4), the word its members' refs share a ref.
 	private stored(t: i32): IrType {
 		const n = this.norm(t)
 		if (!this.packed(n)) {
 			return this.mem(n)
 		}
-		const [size, align, _] = this.shape(n)
+		const [_, r, size, align] = this.shape(n)
 		if (align < 8) {
 			return this.b.array(this.b.int((8 * align) as u32), (size / align) as u64)
 		}
 		const words: IrType[] = []
 		for (const w of 0 ... size / 8 - 1) {
-			const ref = this.p.members(n).some(m => {
-				const l = this.inUnion(m)
-				return if (l == this.ref) w == 0 else if (l == this.stringTy) w == 2 else this.b.holdsRef(l)
-			})
-			words.push(if (ref) this.ref else this.i64)
+			words.push(if (8 * w == r) this.ref else this.i64)
 		}
 		return this.b.struct(words)
 	}
