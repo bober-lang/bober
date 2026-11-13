@@ -18,14 +18,14 @@ import { Imm } from "./bc/op"
 import { Code, Program, pair } from "./bc/program"
 import { qualified, showType } from "./bc/show"
 import { CompileError } from "./error"
-import { Instances, embedded, runtime } from "./resolve"
+import { Instances, embedded, runtime, takesType } from "./resolve"
 import { builtin, builtinPath } from "./root"
 
-/// Monomorphizes p, whose module main holds the main function and tests: those, every module's typed vars and
-/// builtin/'s plain exported functions are the roots, and only decls they reach are kept. Each module's decls and inits
-/// become their instances, its dispatch functions after its decls, and each instance's members those of its members'
-/// instances it owns.
-export function mono(p: Program, main: i32) throws CompileError { new Mono(p).run(main) }
+/// Monomorphizes p, whose module main holds the main function and tests: those, or if whole all of main's functions
+/// and classes that are neither generic nor take a Type, every module's typed vars and builtin/'s plain exported
+/// functions are the roots, and only decls they reach are kept. Each module's decls and inits become their instances,
+/// its dispatch functions after its decls, and each instance's members those of its members' instances it owns.
+export function mono(p: Program, main: i32, whole = false) throws CompileError { new Mono(p).run(main, whole) }
 
 class Mono {
 	p: Program
@@ -50,10 +50,12 @@ class Mono {
 		this.ins = new Instances(p)
 	}
 
-	run(main: i32) throws CompileError {
+	run(main: i32, whole: bool) throws CompileError {
 		const p = this.p
 		for (const d of p.modules[main].decls) {
-			if (p.decls[d].kind == decl.Test || p.decls[d].kind == decl.Function && p.strings[p.decls[d].name] == "main") {
+			const x = p.decls[d]
+			const plain = x.params.length == 0 && (x.kind == decl.Class || x.kind == decl.Function && !takesType(p, d))
+			if (x.kind == decl.Test || x.kind == decl.Function && p.strings[x.name] == "main" || whole && plain) {
 				this.ins.instance(d, 0)
 			}
 		}

@@ -2,7 +2,7 @@
 
 Each program exists twice, as `<name>.bob` and `go/<name>/main.go`, doing the same work and printing the same checksum.
 
-    build/bober build -release bench/<name>.bob && build/<name>
+    build/bober run -release bench/<name>.bob
     (cd bench/go && go build -o ../../build/go-<name> ./<name>) && build/go-<name>
 
 `httpd` is a server; load it with `build/go-load -addr http://127.0.0.1:<port> -mode ping|orders -c 32 -d 3s`.

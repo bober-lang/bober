@@ -3,7 +3,7 @@
 # and std/ it writes, with the C they link compiled (src/root.bob) and the launcher of images; and the C sysroot,
 # build/musl, but C++'s headers, with libc.so, which loads images; macOS's is the system's. Runs in the repo.
 set -e
-build/bober build -release src/bober.bob
+build/bober run -release src/bober.bob help > /dev/null
 rm -rf build/dist
 mkdir -p build/dist/bober/bin
 cp build/bober build/dist/bober/bin/
