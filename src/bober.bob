@@ -93,12 +93,19 @@ export function ld(args: string[], out: string) {
 }
 
 /// The CMake toolchain file of C library c, built in cwd: bober's defaults for the target, its triple, the sysroot and on
-/// ELF static executables, with the compilers CMake finds, then c's toolchain file, which may override them.
+/// ELF static executables, with the compilers CMake finds, run by ccache if found with paths under cwd made relative,
+/// so that checkouts share hits, and so without precompiled headers, then c's toolchain file, which may override them.
 const toolchain = (c: CLib, cwd: string) => `set(CMAKE_C_COMPILER_TARGET ${triple})
 set(CMAKE_CXX_COMPILER_TARGET ${triple})
 set(CMAKE_ASM_COMPILER_TARGET ${triple})
 ${if (os == "macos") `set(CMAKE_OSX_SYSROOT "${sysroot}")` else `set(CMAKE_SYSROOT "${if (isAbs(sysroot)) "" else cwd + "/"}${sysroot}")
 set(CMAKE_EXE_LINKER_FLAGS_INIT "-static")`}
+find_program(CCACHE ccache)
+if(CCACHE)
+	set(CMAKE_C_COMPILER_LAUNCHER \${CCACHE} "base_dir=${cwd}")
+	set(CMAKE_CXX_COMPILER_LAUNCHER \${CCACHE} "base_dir=${cwd}")
+	set(CMAKE_DISABLE_PRECOMPILE_HEADERS ON)
+endif()
 ${if (c.toolchain == "") "" else `include("${cwd}/${c.toolchain}")\n`}`
 
 function main(): i32 {
