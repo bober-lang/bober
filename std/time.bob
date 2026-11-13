@@ -14,9 +14,7 @@
 import { indexOf, occurs, startsWith } from "./algo"
 import { J, M, T, Z, colon, comma, dot, greater, isAlphabetic, isAlphanumeric, isDigit, less, lf, minus, plus, slash,
 	space, t as lowerT, z as lowerZ, zero } from "./ascii"
-import { addr, store } from "../builtin/mem"
 import { env, monotonic as mono, tz as localTz } from "../builtin/sys"
-import { copy } from "../builtin/string"
 import { open, readLink } from "./fs"
 import { maxOf, minOf } from "./limits"
 import { abs, clamp, min } from "./math"
@@ -124,9 +122,9 @@ export class Date {
 
 	/// As ISO 8601 writes it, 2006-01-02, and Temporal a year past 0 to 9999, -000044-03-15.
 	toString(): string {
-		let w: u8[13]
-		const b = addr(w)
-		return copy(b, putDate(b, 0, this) as i64)
+		const y = abs(this.year)
+		const year = if (this.year < 0) `-${pad(y, 6)}` else if (this.year > 9999) `+${pad(y, 6)}` else pad(y, 4)
+		return `${year}-${pad(this.month, 2)}-${pad(this.day, 2)}`
 	}
 }
 
@@ -158,26 +156,17 @@ export class DateTime {
 	/// As RFC 3339 writes a local time, 2006-01-02T15:04:05, with the digits of a fraction of a second there are, up to
 	/// the last that is not 0: 2006-01-02T15:04:05.5.
 	toString(): string {
-		let w: u8[32]
-		const b = addr(w)
-		return copy(b, text(this, b) as i64)
+		const s = `${this.date}T${hms(secondOfDay(this), true)}`
+		if (this.nanosecond == 0) {
+			return s
+		}
+		const f = pad(this.nanosecond, 9)
+		let n = 9
+		while (f[n - 1] == zero) {
+			n--
+		}
+		return `${s}.${f.slice(0, n)}`
 	}
-}
-
-/// Writes dt as toString does to b, and up to 8 bytes more past it; the index after.
-function text(dt: DateTime, b: u64): i32 {
-	const at = putDate(b, 0, dt.date)
-	set(b, at, T)
-	const i = putHms(b, at + 1, secondOfDay(dt), true)
-	const f = dt.nanosecond
-	if (f == 0) {
-		return i
-	}
-	set(b, i, dot)
-	set(b, i + 1, zero + ((f / 100_000_000) as u8))
-	const d = digits8(f % 100_000_000)
-	set8(b, i + 2, d + 0x3030303030303030)
-	return i + 10 - clz(d) / 8 // less the trailing 0s, which are d's top bytes that are 0
 }
 
 /// dt's seconds since 1970-01-01T00:00 on a wall clock.
@@ -313,10 +302,7 @@ export function fixed(offset: i32): Zone {
 /// offset as RFC 3339 writes it, +01:00, with seconds if it has them: +00:01:15.
 function offsetName(offset: i32): string {
 	const a = abs(offset)
-	let w: u8[9]
-	const b = addr(w)
-	set(b, 0, if (offset < 0) minus else plus)
-	return copy(b, putHms(b, 1, a, a % 60 != 0) as i64)
+	return `${if (offset < 0) "-" else "+"}${hms(a, a % 60 != 0)}`
 }
 
 /// The zone of the tz database named name, as "Europe/Vienna", from TZDIR, else /usr/share/zoneinfo; "UTC" without it.
@@ -457,11 +443,7 @@ export function posix(rule: string): Zone throws ParseError {
 /// minutes, one of a day or more cut to 23:59, and the reading taken at that.
 export function rfc3339(t: i64, zone: Zone = utc): string {
 	const o = clamp((zone.offset(t) + 30 + 86400) / 60 * 60 - 86400, -86340, 86340)
-	let w: u8[41]
-	const b = addr(w)
-	const at = text(civilAt(t, o), b)
-	set(b, at, if (o == 0) Z else if (o < 0) minus else plus)
-	return copy(b, (if (o == 0) at + 1 else putHms(b, at + 1, abs(o), false)) as i64)
+	return `${civilAt(t, o)}${if (o == 0) "Z" else offsetName(o)}`
 }
 
 /// The instant an RFC 3339 timestamp names: 2006-01-02T15:04:05Z, with a fraction of up to 9 digits after the seconds,
@@ -514,19 +496,10 @@ export function parseRfc3339(s: string): i64 throws ParseError {
 export function httpDate(t: i64): string {
 	const dt = utc.civil(t)
 	const d = dt.date
-	let w: u8[29]
-	const b = addr(w)
-	copyTo(b, 0, weekdays, 3 * d.weekday() - 3, 3)
-	copyTo(b, 3, ", ", 0, 2)
-	put(b, 5, d.day, 2)
-	set(b, 7, space)
-	copyTo(b, 8, months, 3 * d.month - 3, 3)
-	set(b, 11, space)
-	put(b, 12, d.year, 4)
-	set(b, 16, space)
-	putHms(b, 17, secondOfDay(dt), true)
-	copyTo(b, 25, " GMT", 0, 4)
-	return copy(b, 29)
+	const w = 3 * d.weekday()
+	const m = 3 * d.month
+	return `${weekdays.slice(w - 3, w)}, ${pad(d.day, 2)} ${months.slice(m - 3, m)} ${pad(d.year, 4)} `
+		+ `${hms(secondOfDay(dt), true)} GMT`
 }
 
 /// The instant an HTTP-date names, in any of the forms RFC 9110 has a recipient take: an IMF-fixdate, as httpDate
@@ -712,80 +685,18 @@ function civilAt(t: i64, offset: i32): DateTime {
 
 function sign(n: i64): i32 { return ((n > 0) as i32) - ((n < 0) as i32) }
 
-// The text of dates and times, written to a buffer on the stack of the most it takes, and copied to a string once.
-// Digits are put a word at a time, its low byte first, as on the little-endian targets there are.
+// The text of dates and times.
 
-/// Writes c to b at i.
-function set(b: u64, i: i32, c: u8) { store[u8](b + (i as u64), c) }
-
-/// Writes w's 8 bytes to b from i on, low byte first.
-function set8(b: u64, i: i32, w: u64) { store[u64](b + (i as u64), w) }
-
-/// Writes v's last n digits to b from at on; the index after them.
-function put(b: u64, at: i32, v: i32, n: i32): i32 {
-	let x = v
-	for (const i of 1 ... n) {
-		set(b, at + n - i, zero + ((x % 10) as u8))
-		x /= 10
-	}
-	return at + n
+/// v, at least 0 and of at most n digits, in n digits, 0s before it.
+function pad(v: i32, n: i32): string {
+	const s = `${v}`
+	return "000000000".slice(0, n - s.length) + s
 }
 
-/// Writes d to b from at on; the index after.
-function putDate(b: u64, at: i32, d: Date): i32 {
-	const y = abs(d.year)
-	let i = at
-	if (d.year < 0 || d.year > 9999) {
-		set(b, i, if (d.year < 0) minus else plus)
-		i = put(b, i + 1, y / 100, 4)
-	} else {
-		i = put(b, i, y / 100, 2)
-	}
-	return put3(b, i, y % 100, d.month, d.day, minus)
-}
-
-/// Writes a, c and e, each under 100, as 2 digits with sep between, aa-cc-ee, to b from at on in one store; the index
-/// after. They are split into tens and ones at once, as bytes of a word.
-function put3(b: u64, at: i32, a: i32, c: i32, e: i32, sep: u8): i32 {
-	const x = (a as u64) | ((c as u64) << 24) | ((e as u64) << 48)
-	const t = (x * 103 >> 10) & 0x000f00000f00000f
-	const s = sep as u64
-	set8(b, at, t | ((x - t * 10) << 8) | 0x3030003030003030 | (s << 16) | (s << 40))
-	return at + 8
-}
-
-/// v's 8 digits, v < 10⁸, a byte each in the order they are written, split into halves, pairs and digits a word at once.
-function digits8(v: i32): u64 {
-	const x = ((v / 10000) as u64) | (((v % 10000) as u64) << 32)
-	const h = (x * 10486 >> 20) & 0x0000007f0000007f
-	const y = h | ((x - h * 100) << 16)
-	const t = (y * 103 >> 10) & 0x000f000f000f000f
-	return t | ((y - t * 10) << 8)
-}
-
-/// The leading zero bits of x.
-function clz(x: u64): i32 {
-	let n = 64
-	let v = x
-	while (v != 0) {
-		v >>= 1
-		n--
-	}
-	return n
-}
-
-/// Writes s seconds as hh:mm, and :ss after if seconds, to b from at on, and 3 bytes more past them if not; the index
-/// after.
-function putHms(b: u64, at: i32, s: i32, seconds: bool): i32 {
-	put3(b, at, s / 3600, s / 60 % 60, s % 60, colon)
-	return if (seconds) at + 8 else at + 5
-}
-
-/// Writes the n bytes of s from from on to b from at on.
-function copyTo(b: u64, at: i32, s: string, from: i32, n: i32) {
-	for (const i of 0 ... n - 1) {
-		set(b, at + i, s[from + i])
-	}
+/// s seconds as hh:mm, and :ss after if seconds.
+function hms(s: i32, seconds: bool): string {
+	const hm = `${pad(s / 3600, 2)}:${pad(s / 60 % 60, 2)}`
+	return if (seconds) `${hm}:${pad(s % 60, 2)}` else hm
 }
 
 // RFC 8536's TZif files and POSIX's TZ rules.
