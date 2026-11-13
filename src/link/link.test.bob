@@ -361,6 +361,16 @@ test "an object replaced in a kept image leaves the others' bytes where they are
 	assert kept(file(image)).objects().join(" ") == "a c b"
 }
 
+test "a pointer a kept image's frozen unit has set for good is rebased once" {
+	const v = named("set", obj("v", Data, [1, 0], [new Symbol("lz", Global)], [new Fixup(0, Abs64, 0, 0)]))
+	const z = named("set", obj("z", Data, [0, 0], [new Symbol("__start_set", Global), new Symbol("lz", Global, 0)],
+		[new Fixup(0, Abs64, 0, 0)]))
+	const l = kept()
+	l.lazy(["lz"], () => z)
+	const second = file(keep(kept(file(keep(l, [v]))), []))
+	assert keep(kept(second), []).rebases.length == 2
+}
+
 test "an object a kept image holds that names what is no longer defined is unlinked, and one added is stale" {
 	const a = obj("a", Code, [0x94000000], [new Symbol("g", Global), new Symbol("f", Global, 0)],
 		[new Fixup(0, Call, 0, 0)])

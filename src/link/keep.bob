@@ -7,7 +7,7 @@ import { ParseError } from "../../std/string"
 import { Fixup, Object, Section, Symbol } from "./object"
 
 /// What the state starts with, and the version of its encoding.
-const magic = "bober image 2"
+const magic = "bober image 3"
 
 /// Where the sections of one of regions are: from start to top, of which holes, in order, are free; cap, which top
 /// stays below, where the next region starts; and file, where the image's file has its bytes.
@@ -27,8 +27,9 @@ export class Region {
 /// What a link continues a kept image from, beside its bytes.
 export class State {
 	regions: Region[] = []
-	/// The objects of the frozen unit, then those given, stripped, and where their sections are.
-	units: [Object, u64[]][] = []
+	/// The objects of the frozen unit, then those given, stripped; where their sections are; and the bytes an object
+	/// was read from, which it is written as, so that it must be as read: "" if it is not.
+	units: [Object, u64[], string][] = []
 	/// Per name with a slot, its address and that of its stub, 0 if none.
 	slots: [string, u64, u64][] = []
 	/// Of the frozen units: per name and kind, from and to where their sections are; the pointers the loader adds the
@@ -65,6 +66,11 @@ export function write(s: State, arch: Arch): string {
 		})
 	})
 	list(w, s.units, u => {
+		list(w, u[1], at => w.uleb(at))
+		if (u[2] != "") {
+			w.raw(u[2])
+			return
+		}
 		str(u[0].name)
 		list(w, u[0].sections, sec => {
 			str(sec.name)
@@ -80,7 +86,6 @@ export function write(s: State, arch: Arch): string {
 				w.sleb(f.addend)
 			})
 		})
-		list(w, u[1], at => w.uleb(at))
 		list(w, u[0].symbols, sym => {
 			str(sym.name)
 			w.u8(sym.binding)
@@ -139,6 +144,8 @@ export function read(file: string, headers: u64, arch: Arch): State | null {
 			return region
 		})
 		s.units = many(r, () => {
+			const at = many(r, () => r.uleb())
+			const from = r.pos
 			const o = new Object(str(), arch)
 			o.sections = many(r, () => {
 				const sec = new Section(str(), r.u8())
@@ -149,9 +156,8 @@ export function read(file: string, headers: u64, arch: Arch): State | null {
 				sec.fixups = many(r, () => new Fixup(r.uleb(), r.u8(), r.uleb() as i32, r.sleb()))
 				return sec
 			})
-			const at = many(r, () => r.uleb())
 			o.symbols = many(r, () => new Symbol(str(), r.u8(), r.sleb() as i32, r.uleb(), r.uleb()))
-			return [o, at]
+			return [o, at, file.slice(from, r.pos)]
 		})
 		s.slots = many(r, () => [str(), r.uleb(), r.uleb()])
 		s.sections = many(r, () => [str(), r.u8(), r.uleb(), r.uleb()])

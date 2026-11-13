@@ -136,12 +136,14 @@ class Name {
 }
 
 /// An object as linked: per symbol, the index of its Name, -1 if it is local; per section, its address, 0 while it is
-/// to be laid out, or dropped; and whether it is frozen.
+/// to be laid out, or dropped; whether it is frozen; and the bytes the continued image has its object as, "" once it is
+/// not as there.
 class Unit {
 	object: Object
 	names: i32[] = []
 	at: u64[]
 	frozen: bool
+	encoded = ""
 
 	constructor(o: Object, frozen = false) {
 		this.object = o
@@ -196,6 +198,7 @@ export class Linker {
 		this.units = s.units.map(e => {
 			const u = new Unit(e[0])
 			u.at = e[1]
+			u.encoded = e[2]
 			return u
 		})
 		this.units[0].frozen = true
@@ -824,6 +827,9 @@ export class Linker {
 				for (const f of o.sections[i].fixups) {
 					const p = u.at[i] + f.at
 					const stays = u.frozen && this.stable(u, f, p)
+					if (stays) {
+						u.encoded = "" // the image no longer keeps the fixup
+					}
 					const g = u.names[f.symbol]
 					let s: u64 = 0
 					let inside = true
@@ -906,7 +912,8 @@ export class Linker {
 			}
 		}
 		s.floating = this.bounded.filter(x => !s.pinned.includes(x))
-		s.units = [this.freeze(), ...this.units.filter(u => !u.frozen).map(u => this.strip(u))].map(u => [u.object, u.at])
+		const units = [this.freeze(), ...this.units.filter(u => !u.frozen).map(u => this.strip(u))]
+		s.units = units.map(u => [u.object, u.at, u.encoded])
 		s.slots = []
 		for (const g of 0 ... this.names.length - 1) {
 			const n = this.names[g]
@@ -924,8 +931,13 @@ export class Linker {
 
 	/// The frozen units as one, of a section per region from its start, of no bytes, that their symbols are in: those
 	/// with a name, but the weak definitions another unit's took over, which are references; and their fixups not set
-	/// for good. Notes where their sections are.
+	/// for good. Notes where their sections are. The continued image's is as it is where no lazy object, slot or stub
+	/// adds to it.
 	private freeze(): Unit {
+		const units = this.units.filter(u => u.frozen)
+		if (units.length == 2 && units[0].encoded != "" && units[1].object.symbols.length == 0) {
+			return units[0]
+		}
 		const regions = this.state.regions
 		const o = new Object("the image", this.machine.arch)
 		o.sections = this.regions.map(r => new Section("", r[0]))
@@ -949,7 +961,7 @@ export class Linker {
 			return j
 		}
 		const laid: [string, u8, u64, u64][] = []
-		for (const u of this.units.filter(u => u.frozen)) {
+		for (const u of units) {
 			for (const i of 0 ... u.object.symbols.length - 1) {
 				const s = u.object.symbols[i]
 				if (s.binding != Local) {
@@ -1004,7 +1016,11 @@ export class Linker {
 
 	/// u without the bytes of its sections, and but the fixups a later link sets again: of a shared name, or a pointer
 	/// or Desc, which the image's lists are made anew of, or in or to a section of a bound name, which is laid out anew.
+	/// One the continued image holds is that.
 	private strip(u: Unit): Unit {
+		if (u.encoded != "") {
+			return u
+		}
 		const o = new Object(u.object.name, u.object.arch)
 		o.symbols = u.object.symbols
 		const floats = (i: i32) => i >= 0 && this.state.floating.includes(u.object.sections[i].name)
