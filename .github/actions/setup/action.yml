@@ -1,0 +1,43 @@
+# Of TPDE's submodules those it builds with; the C toolchain, with ccache, checking the compiler by its version, as each
+# run installs it anew, a nightly on Linux, kept small, as GitHub's caches of a repo are; the sysroot and the C
+# libraries of bober.pkg, LLVM's an hour to build, the latest saved, without their sources and builds, with ccache's
+# objects, from which those whose stamp is stale rebuild, and which the workflow saves anew if their stamps differ from
+# those restored, its key in CACHE_KEY; and on Linux, the sysroot built if missing.
+name: setup
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: git -C vendor/tpde submodule update --init --depth 1 deps/fadec deps/disarm
+    - if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        c=$(lsb_release -cs)
+        curl -fsS https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+        echo "deb https://apt.llvm.org/$c/ llvm-toolchain-$c main" | sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends clang-24 lld-24 libclang-rt-24-dev ninja-build ccache
+        echo /usr/lib/llvm-24/bin >> $GITHUB_PATH
+    - if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        brew install llvm lld ccache
+        for p in llvm lld; do echo "$(brew --prefix $p)/bin" >> $GITHUB_PATH; done
+    - shell: bash
+      run: printf '%s\n' CCACHE_DIR=$PWD/build/ccache "CCACHE_COMPILERCHECK=%compiler% -dumpversion" CCACHE_MAXSIZE=2G >> $GITHUB_ENV
+    - id: cache
+      uses: actions/cache/restore@v6
+      with:
+        path: |
+          build/musl
+          build/@bober
+          build/ccache
+          !build/@bober/*/*/src
+          !build/@bober/*/*/src.tar
+          !build/@bober/*/*/build
+        key: c-${{ runner.os }}-${{ runner.arch }}-
+    - shell: bash
+      run: echo CACHE_KEY=${{ steps.cache.outputs.cache-matched-key }} >> $GITHUB_ENV
+    - if: runner.os == 'Linux'
+      shell: bash
+      run: make -C src/backend/llvm

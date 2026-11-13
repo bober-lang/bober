@@ -1,0 +1,58 @@
+# Run by hand, when the edge cannot build bober: bootstraps it from boot/ to its fixpoint, a bober that builds itself
+# byte for byte; then as ci.yml, runs the tests, packages it and, on dev, publishes the packages as the new edge.
+name: bootstrap
+on: workflow_dispatch
+
+jobs:
+  bober:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - uses: ./.github/actions/setup
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y llvm-24-dev bison flex libffi-dev libgc-dev
+      - if: runner.os == 'macOS'
+        run: |
+          brew install bison flex bdw-gc libffi
+          for p in bison flex; do echo "$(brew --prefix $p)/bin" >> $GITHUB_PATH; done
+          echo "CPATH=$(brew --prefix)/include:$(brew --prefix libffi)/include" >> $GITHUB_ENV
+          echo "LIBRARY_PATH=$(brew --prefix)/lib:$(brew --prefix libffi)/lib" >> $GITHUB_ENV
+      - run: |
+          make -C boot
+          build/boot run src/bober.bob run -release -I "$(llvm-config --includedir)" src/bober.bob help
+          mv build/bober build/bober.stage1
+          build/bober.stage1 run -release src/bober.bob help
+          cp build/bober build/bober.stage2
+          build/bober.stage2 run -release src/bober.bob help
+          cmp build/bober build/bober.stage2
+      - if: always()
+        run: echo KEY=c-$RUNNER_OS-$RUNNER_ARCH-${{ hashFiles('build/@bober/*/*/stamp') }}- >> $GITHUB_ENV
+      - if: always() && !startsWith(env.CACHE_KEY, env.KEY)
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            build/musl
+            build/@bober
+            build/ccache
+            !build/@bober/*/*/src
+            !build/@bober/*/*/src.tar
+            !build/@bober/*/*/build
+          key: ${{ env.KEY }}${{ github.run_id }}
+      - run: build/bober test
+      - run: ./dist.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bober-${{ runner.os }}-${{ runner.arch }}
+          path: build/dist/bober.tar.gz
+
+  publish:
+    needs: bober
+    if: github.ref == 'refs/heads/dev'
+    uses: ./.github/workflows/publish.yml
+    secrets: inherit

@@ -1,0 +1,48 @@
+# Publishes the packages a run of ci.yml or bootstrap.yml built as the new edge, in the environment that alone has the
+# secrets, running no code of the repo's: signs macOS's package by the Developer ID, hardened, letting the launcher still
+# load the images bober links, signed ad hoc; has Apple notarize its executables, by their hashes, so that Gatekeeper
+# lets a download of them run (notarytool exits 0 on a rejection too); and uploads the packages to Backblaze's bucket
+# that dl.bober-lang.dev serves. Not cancelled by a newer run, which waits.
+name: publish
+on: workflow_call
+
+jobs:
+  publish:
+    runs-on: macos-latest
+    environment: release
+    concurrency: publish
+    steps:
+      - uses: actions/download-artifact@v8
+      - env:
+          CERT: ${{ secrets.MACOS_CERT }}
+          PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          KEY: ${{ secrets.NOTARY_KEY }}
+        run: |
+          echo "$CERT" | base64 -d > $RUNNER_TEMP/cert.p12
+          security create-keychain -p "" sign.keychain
+          security set-keychain-settings sign.keychain
+          security unlock-keychain -p "" sign.keychain
+          security import $RUNNER_TEMP/cert.p12 -k sign.keychain -P "$PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "" sign.keychain > /dev/null
+          security list-keychains -s sign.keychain
+          tar -xzf bober-macOS-ARM64/bober.tar.gz
+          sign() { codesign -f -o runtime --timestamp -s "Developer ID Application" "$@"; }
+          sign bober/bin/bober
+          sign --entitlements /dev/stdin bober/lib/launch.c.exe <<E
+          <plist><dict><key>com.apple.security.cs.disable-library-validation</key><true/></dict></plist>
+          E
+          echo "$KEY" > $RUNNER_TEMP/key.p8
+          ditto -c -k bober $RUNNER_TEMP/bober.zip
+          xcrun notarytool submit $RUNNER_TEMP/bober.zip --wait --timeout 15m -k $RUNNER_TEMP/key.p8 \
+            -d ${{ secrets.NOTARY_KEY_ID }} -i ${{ secrets.NOTARY_ISSUER }} | tee /dev/stderr | grep "status: Accepted"
+          tar -czf bober-macOS-ARM64/bober.tar.gz bober
+      - env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_KEY }}
+          AWS_ENDPOINT_URL: https://s3.eu-central-003.backblazeb2.com
+          AWS_DEFAULT_REGION: eu-central-003
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+        run: |
+          for p in bober-*; do
+            aws s3 cp --cache-control no-cache $p/bober.tar.gz s3://bober-releases/edge/$p.tar.gz
+          done
