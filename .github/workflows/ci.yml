@@ -11,6 +11,12 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.os }}
+    # ccache, which bober's CMake toolchain uses if found, checking the compiler by its version, as each run installs it
+    # anew, a nightly on Linux; kept small, as GitHub's caches of a repo are.
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/build/ccache
+      CCACHE_COMPILERCHECK: "%compiler% -dumpversion"
+      CCACHE_MAXSIZE: 2G
     steps:
       - uses: actions/checkout@v7
         with:
@@ -22,21 +28,22 @@ jobs:
           curl -fsS https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
           echo "deb https://apt.llvm.org/$c/ llvm-toolchain-$c main" | sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang-24 lld-24 libclang-rt-24-dev llvm-24-dev bison flex libffi-dev libgc-dev ninja-build
+          sudo apt-get install -y --no-install-recommends clang-24 lld-24 libclang-rt-24-dev llvm-24-dev bison flex libffi-dev libgc-dev ninja-build ccache
           echo /usr/lib/llvm-24/bin >> $GITHUB_PATH
       - if: runner.os == 'macOS'
         run: |
-          brew install llvm lld bison flex bdw-gc libffi
+          brew install llvm lld bison flex bdw-gc libffi ccache
           for p in llvm lld bison flex; do echo "$(brew --prefix $p)/bin" >> $GITHUB_PATH; done
           echo "CPATH=$(brew --prefix)/include:$(brew --prefix libffi)/include" >> $GITHUB_ENV
           echo "LIBRARY_PATH=$(brew --prefix)/lib:$(brew --prefix libffi)/lib" >> $GITHUB_ENV
-      # The sysroot and the C libraries of bober.pkg, LLVM's an hour to build, without their sources; saved even if a
-      # step fails, so that the next run goes on from there.
+      # The sysroot and the C libraries of bober.pkg, LLVM's an hour to build, without their sources, with ccache's
+      # objects, from which those whose stamp is stale rebuild; saved even if a step fails, so the next run goes on.
       - uses: actions/cache/restore@v6
         with:
           path: |
             build/musl
             build/@bober
+            build/ccache
             !build/@bober/*/*/src
             !build/@bober/*/*/src.tar
           key: c-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
@@ -58,6 +65,7 @@ jobs:
           path: |
             build/musl
             build/@bober
+            build/ccache
             !build/@bober/*/*/src
             !build/@bober/*/*/src.tar
           key: c-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
@@ -78,7 +86,7 @@ jobs:
     runs-on: macos-latest
     environment: release
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: bober-macOS-ARM64
       - env:
@@ -104,7 +112,7 @@ jobs:
           xcrun notarytool submit $RUNNER_TEMP/bober.zip --wait --timeout 15m -k $RUNNER_TEMP/key.p8 \
             -d ${{ secrets.NOTARY_KEY_ID }} -i ${{ secrets.NOTARY_ISSUER }} | tee /dev/stderr | grep "status: Accepted"
           tar -czf bober.tar.gz bober
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bober-macOS-ARM64
           path: bober.tar.gz
