@@ -5,6 +5,13 @@ class Node[K] {
 	constructor(k: K) { this.k = k }
 }
 
+class Holder[T] {
+	f: (x: T) => T
+
+	constructor(f: (x: T) => T) { this.f = f }
+	run(x: T): T { return this.f(x) }
+}
+
 function sum(...xs: i32[]): i32 {
 	let s = 0
 	for (const x of xs) {
@@ -16,7 +23,9 @@ function sum(...xs: i32[]): i32 {
 function add(a: i32, b: i32 = 5): i32 { return a + b }
 function orFive(x: i32 | null = 5): i32 | null { return x }
 function fact(n: i64): i64 { return if (n == 0) 1 else n * fact(n - 1) }
+
 const factorial: (n: i64) => i64 = n => if (n == 0) 1 else n * factorial(n - 1)
+
 function isEven(n: i32): bool { return n == 0 || isOdd(n - 1) }
 function isOdd(n: i32): bool { return n != 0 && isEven(n - 1) }
 function id[T](x: T): T { return x }
@@ -148,6 +157,13 @@ test "generic functions take type arguments, else infer them" {
 	n!.next = new Node(2)
 	assert depth(n) == 2 && depth(n!.next) == 1 && depth[i32](null) == 0
 	assert pair("a")[0][1] == "a"
+}
+
+test "a generic class's function field is called as its instance types it" {
+	const h = new Holder[i32](x => x + 1)
+	const f = h.f
+	h.f = x => x * f(x)
+	assert f(1) == 2 && h.f(2) == 6 && h.run(3) == 12
 }
 
 test "nested functions are visible from their declaration on" {
