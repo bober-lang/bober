@@ -1457,9 +1457,10 @@ static Val bi_fromBytes(Val self, Val *a, int n, Node *site) {
   return S(s);
 }
 
-/// The run time's C memory, which rt.c gives and boot does not link.
+/// The run time's C memory and environment, which rt.c gives and boot does not link.
 void *bober_malloc(uint64_t n) { return malloc(n ? n : 1); }
 void bober_free(void *p) { free(p); }
+const char *bober_env(const char *name) { return getenv(name); }
 
 static Val bi_fromC(Val self, Val *a, int n, Node *site) {
   char *p = n ? (char *)(intptr_t)a[0].i : 0;

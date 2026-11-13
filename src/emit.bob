@@ -40,11 +40,12 @@ import * as c from "./c/type"
 import { CompileError } from "./error"
 import { builtin } from "./root"
 
-/// How a program is emitted: whether it is as lowered, a debug build's, each module of which gets two entries; else the
-/// module that gets C's main, which runs the program's main or, with tests, each of the module's tests.
+/// How a program is emitted: whether it is as lowered, a debug build's; and the module that gets C's main, which runs
+/// the program's main or, with tests, each of the module's tests, or if -1 each module gets two entries like it, an
+/// image's.
 export type Options = { main: i32, tests: bool, dyn: bool }
 
-/// The name of the entry of a debug build's module at path, which runs its main as C's main would, or else its tests.
+/// The name of the entry of the image's module at path, which runs its main as C's main would, or else its tests.
 export function entry(path: string, tests: bool): string { return `bober.${if (tests) "tests" else "main"}.${path}` }
 
 /// Emits module m of program p into b; a release build's as facts says.
@@ -346,7 +347,7 @@ class Emitter {
 			this.decl(d)
 		}
 		this.init()
-		if (this.dyn) {
+		if (this.o.main < 0) {
 			this.cMain(entry(this.path, false), false)
 			this.cMain(entry(this.path, true), true)
 		} else if (this.m == this.o.main) {
