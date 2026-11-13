@@ -1,8 +1,7 @@
-# Bootstraps bober from boot/ to its fixpoint, a bober that builds itself byte for byte, packages and uploads it,
-# and runs the tests.
+# Builds bober by the latest edge, the package dev last published (bootstrap.yml makes one anew), runs the tests and
+# packages it; on dev, once the tests pass everywhere, publishes the packages as the new edge.
 name: ci
 on: push
-concurrency: { group: "${{ github.ref }}", cancel-in-progress: true }
 
 jobs:
   bober:
@@ -11,55 +10,18 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.os }}
-    # ccache, which bober's CMake toolchain uses if found, checking the compiler by its version, as each run installs it
-    # anew, a nightly on Linux; kept small, as GitHub's caches of a repo are.
-    env:
-      CCACHE_DIR: ${{ github.workspace }}/build/ccache
-      CCACHE_COMPILERCHECK: "%compiler% -dumpversion"
-      CCACHE_MAXSIZE: 2G
+    concurrency: { group: "${{ github.ref }}-${{ matrix.os }}", cancel-in-progress: true }
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: true
-      - run: git -C vendor/tpde submodule update --init --depth 1 deps/fadec deps/disarm
-      - if: runner.os == 'Linux'
-        run: |
-          c=$(lsb_release -cs)
-          curl -fsS https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
-          echo "deb https://apt.llvm.org/$c/ llvm-toolchain-$c main" | sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang-24 lld-24 libclang-rt-24-dev llvm-24-dev bison flex libffi-dev libgc-dev ninja-build ccache
-          echo /usr/lib/llvm-24/bin >> $GITHUB_PATH
-      - if: runner.os == 'macOS'
-        run: |
-          brew install llvm lld bison flex bdw-gc libffi ccache
-          for p in llvm lld bison flex; do echo "$(brew --prefix $p)/bin" >> $GITHUB_PATH; done
-          echo "CPATH=$(brew --prefix)/include:$(brew --prefix libffi)/include" >> $GITHUB_ENV
-          echo "LIBRARY_PATH=$(brew --prefix)/lib:$(brew --prefix libffi)/lib" >> $GITHUB_ENV
-      # The sysroot and the C libraries of bober.pkg, LLVM's an hour to build, without their sources, with ccache's
-      # objects, from which those whose stamp is stale rebuild; saved even if a step fails, so the next run goes on.
-      - uses: actions/cache/restore@v6
-        with:
-          path: |
-            build/musl
-            build/@bober
-            build/ccache
-            !build/@bober/*/*/src
-            !build/@bober/*/*/src.tar
-          key: c-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
-          restore-keys: c-${{ runner.os }}-${{ runner.arch }}-
-      - run: make -C boot
-      - if: runner.os == 'Linux'
-        run: make -C src/backend/llvm
-      - name: bootstrap
-        run: |
-          build/boot run src/bober.bob run -release -I "$(llvm-config --includedir)" src/bober.bob help
-          mv build/bober build/bober.stage1
-          build/bober.stage1 run -release src/bober.bob help
-          cp build/bober build/bober.stage2
-          build/bober.stage2 run -release src/bober.bob help
-          cmp build/bober build/bober.stage2
+      - uses: ./.github/actions/setup
+      - run: |
+          curl -fsS https://dl.bober-lang.dev/edge/bober-$RUNNER_OS-$RUNNER_ARCH.tar.gz | tar -xz -C $RUNNER_TEMP
+          $RUNNER_TEMP/bober/bin/bober run -release src/bober.bob help > /dev/null
       - if: always()
+        run: echo KEY=c-$RUNNER_OS-$RUNNER_ARCH-${{ hashFiles('build/@bober/*/*/stamp') }}- >> $GITHUB_ENV
+      - if: always() && !startsWith(env.CACHE_KEY, env.KEY)
         uses: actions/cache/save@v6
         with:
           path: |
@@ -68,52 +30,17 @@ jobs:
             build/ccache
             !build/@bober/*/*/src
             !build/@bober/*/*/src.tar
-          key: c-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+            !build/@bober/*/*/build
+          key: ${{ env.KEY }}${{ github.run_id }}
+      - run: build/bober test
       - run: ./dist.sh
       - uses: actions/upload-artifact@v7
         with:
           name: bober-${{ runner.os }}-${{ runner.arch }}
           path: build/dist/bober.tar.gz
-      - run: build/bober test
 
-  # Apart from the builds, in the environment that alone has the secrets, it runs no code of the repo's: signs macOS's
-  # package by the Developer ID, hardened, letting the launcher still load the images bober links, signed ad hoc; and has
-  # Apple notarize its executables, by their hashes, so that Gatekeeper lets a download of them run (notarytool exits 0
-  # on a rejection too).
-  sign:
+  publish:
     needs: bober
-    if: ${{ !cancelled() && github.ref == 'refs/heads/dev' }}
-    runs-on: macos-latest
-    environment: release
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: bober-macOS-ARM64
-      - env:
-          CERT: ${{ secrets.MACOS_CERT }}
-          PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
-          KEY: ${{ secrets.NOTARY_KEY }}
-        run: |
-          echo "$CERT" | base64 -d > $RUNNER_TEMP/cert.p12
-          security create-keychain -p "" sign.keychain
-          security set-keychain-settings sign.keychain
-          security unlock-keychain -p "" sign.keychain
-          security import $RUNNER_TEMP/cert.p12 -k sign.keychain -P "$PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -k "" sign.keychain > /dev/null
-          security list-keychains -s sign.keychain
-          tar -xzf bober.tar.gz
-          sign() { codesign -f -o runtime --timestamp -s "Developer ID Application" "$@"; }
-          sign bober/bin/bober
-          sign --entitlements /dev/stdin bober/lib/launch.c.exe <<E
-          <plist><dict><key>com.apple.security.cs.disable-library-validation</key><true/></dict></plist>
-          E
-          echo "$KEY" > $RUNNER_TEMP/key.p8
-          ditto -c -k bober $RUNNER_TEMP/bober.zip
-          xcrun notarytool submit $RUNNER_TEMP/bober.zip --wait --timeout 15m -k $RUNNER_TEMP/key.p8 \
-            -d ${{ secrets.NOTARY_KEY_ID }} -i ${{ secrets.NOTARY_ISSUER }} | tee /dev/stderr | grep "status: Accepted"
-          tar -czf bober.tar.gz bober
-      - uses: actions/upload-artifact@v7
-        with:
-          name: bober-macOS-ARM64
-          path: bober.tar.gz
-          overwrite: true
+    if: github.ref == 'refs/heads/dev'
+    uses: ./.github/workflows/publish.yml
+    secrets: inherit
