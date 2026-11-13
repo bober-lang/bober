@@ -5,6 +5,7 @@
 //! can trap takes the module's source path and the byte offset in it last, and reports them as path:line:col.
 
 #include "rt.h"
+#include <errno.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -285,4 +286,10 @@ uint64_t bober_random(void) {
   z = (z ^ z >> 30) * 0xbf58476d1ce4e5b9;
   z = (z ^ z >> 27) * 0x94d049bb133111eb;
   return z ^ z >> 31;
+}
+
+long bober_entropy(unsigned char *p, long n) {
+  if (tests) for (long i = 0; i < n; i++) p[i] = bober_random();
+  else for (long i = 0; i < n; i += 256) if (getentropy(p + i, n - i < 256 ? n - i : 256)) return -errno;
+  return 0;
 }
