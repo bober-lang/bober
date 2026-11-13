@@ -17,11 +17,11 @@ import { endsWith, indexOf, lastIndexOf, sortBy, startsWith } from "../std/algo"
 import { fromCString } from "../std/c"
 import { Keys, Rest, Unknown, decode as decodeJson, encode, quoted } from "../std/encoding/json"
 import * as yaml from "../std/encoding/yaml"
-import { decode } from "../std/encoding/optarg"
+import * as optarg from "../std/encoding/optarg"
 import { exists, glob, mapFile, mkdirAll, readDir, readFile, remove, removeAll, rename, stat } from "../std/fs"
 import { base, dir as parent, isAbs, join, rel } from "../std/fs/path"
 import { fnv } from "../std/hash"
-import { stdin, stdout } from "../std/io"
+import { stderr, stdin, stdout } from "../std/io"
 import { arch, os } from "../std/os"
 import { ParseError, codePoint, split, trim, utf8 } from "../std/string"
 import { abi, write } from "./bc/file"
@@ -31,7 +31,7 @@ import { glue, includesOf, sysroot } from "./c/bind"
 import { link, object } from "./c/bobcc"
 import { doc } from "./doc"
 import { Options, emit, entry, learn } from "./emit"
-import { Flags, check, normal } from "./check"
+import { check, normal } from "./check"
 import { CompileError } from "./error"
 import { formatFile } from "./format"
 import { LLVM, triple } from "./backend/llvm"
@@ -55,31 +55,105 @@ import { CLib, Package, load, nearest, out } from "./pkg"
 import * as process from "../std/process"
 import { chdir, getcwd, getpid, isatty, link as hardLink } from "unistd.h"
 
-const usage = `usage: bober <command> [-I dir]... args
-  build                          link the modules of the nearest bober.pkg's directory and below into build/image.so
-  build <file.bob> -o <out>      compile the file's module alone into the object out, to inspect
-  run <main.bob> [args]          build the program and run it with args
-  test [<main.bob> [args]]       build it and run its main module's tests, or each file's here and below
-  check <file>...                report the type errors of the files and the modules they import; also lint
-  format <file>...               rewrite each file in place in the one layout of its syntax tree
-  lower <file>...                print the bytecode of each file
-  doc <file>...                  print the spec in the files' doc comments as Markdown
-  init [@namespace/name]         write a bober.pkg here, asking for its name on a terminal
-  lsp                            serve the language server protocol on stdin and stdout
-  help                           print this
-Its options are taken anywhere on the line, as a C compiler's, up to a --; the arguments after go to the program.
--I adds a directory C headers are found in, as a C compiler takes it, before those of the nearest bober.pkg's C libraries.
--release builds with LLVM, the whole program at -O2 into build/<name>; a module alone keeps its generics as bytecode, in
-section bober_bc. Else each module is built with TPDE, to debug, once as lowered: a generic's code takes its type args'
-descriptors; into one shared library of all that is built there, build/image.so, which run and test load, and which a
-build links only what changed into. -mono has run and test monomorphize the program first, as -release does, so that
-it runs fast, into build/image.mono.so; by default where the environment sets CI, as CI runners do.
-test prints a YAML mapping of the tests: each ok if it passed, else what failed in it, a test's trap after what it
-printed. Without main.bob, it prints the mapping of the files that failed, under their directories, each as it fails,
-then how many passed; on a terminal, its last line shows the file it is at.`
+/// What a command line gives bober, spelled as a C compiler's: these options anywhere on it, a command's after the
+/// command; their docs are bober's help.
+class Flags @optarg.Cc {
+	/// print help
+	h: bool = false
+	/// with help or -h, print all of it
+	v: bool = false
+	/// The command and its arguments.
+	command: Command | null @optarg.Rest = null
+}
+
+type Command = Run | Test | Check | Format | Init | Help | Build | Bundle | Lower | Doc | Lsp
+
+/// The options of the commands that read C headers.
+class Headers @optarg.Cc {
+	/// add a directory of C headers
+	I: string[] @optarg.Verbose = []
+}
+
+/// The options of the commands that build a program.
+class Compile @optarg.Cc {
+	headers: ...Headers
+	/// optimize with LLVM
+	release: bool = false
+	/// monomorphize first, so that it runs fast; by default where CI is set
+	mono: bool @optarg.Verbose = process.env("CI") != null
+}
+
+/// build a program and run it
+class Run @optarg.Cc {
+	compile: ...Compile
+	args: string[] @optarg.Rest = []
+}
+
+/// run a file's tests, or each file's here and below
+class Test @optarg.Cc {
+	compile: ...Compile
+	args: string[] @optarg.Rest = []
+}
+
+/// report type errors and lint
+class Check @optarg.Cc {
+	headers: ...Headers
+	args: string[] @optarg.Rest = []
+}
+
+/// rewrite files in their one layout
+class Format @optarg.Cc {
+	args: string[] @optarg.Rest = []
+}
+
+/// write a bober.pkg here
+class Init @optarg.Cc {
+	args: string[] @optarg.Rest = []
+}
+
+/// print help
+class Help {}
+
+/// link the package's image, or with -o one module's object; for CI
+class Build @optarg.Cc @optarg.Verbose {
+	compile: ...Compile
+	/// the object to write
+	o: string = ""
+	args: string[] @optarg.Rest = []
+}
+
+/// write builtin/ and std/ as the lib/ of bober's package
+class Bundle @optarg.Cc @optarg.Verbose {
+	args: string[] @optarg.Rest = []
+}
+
+/// print the bytecode of files
+class Lower @optarg.Cc @optarg.Verbose {
+	headers: ...Headers
+	args: string[] @optarg.Rest = []
+}
+
+/// print the spec in files' doc comments as Markdown
+class Doc @optarg.Cc @optarg.Verbose {
+	args: string[] @optarg.Rest = []
+}
+
+/// serve the language server protocol on stdin and stdout
+class Lsp @optarg.Cc @optarg.Verbose {
+	headers: ...Headers
+}
+
+/// The help of command c, else of all, all of it if verbose.
+function usage(c: Command | null, verbose: bool): string {
+	for (const M of Command.members) {
+		if (c instanceof M) {
+			return [M.doc, optarg.help[M](verbose)].filter(l => l != "").join("\n")
+		}
+	}
+	return `usage: bober <command> [args]\n${optarg.help[Command](verbose)}\noptions:\n${optarg.help[Flags](verbose)}`
+}
 
 const dir = "build"
-
 /// The machine and the format of the images src/link writes here; TPDE's objects are ELF everywhere.
 const machine = if (arch == "arm64") arm64 else x64
 const mac = os == "macos"
@@ -112,62 +186,66 @@ ${if (c.toolchain == "") "" else `include("${cwd}/${c.toolchain}")\n`}`
 
 function main(): i32 {
 	const argv = args()
-	if (argv.length == 0) {
-		print(usage)
-		return 2
-	}
 	let f = new Flags()
 	try {
-		f = decode[Flags](argv.slice(1, argv.length))
+		f = optarg.decode[Flags](argv)
 	} catch (e: ParseError) {
-		print(`bad option ${argv[e.at + 1]}`)
+		print(`bad argument ${argv[e.at]}`)
 		return 2
 	}
-	if (f.args.length == 0 && !["lsp", "init", "test", "build", "help"].includes(argv[0])) {
-		print(usage)
+	const c = f.command
+	if (f.h || c instanceof Help) {
+		print(usage(if (c instanceof Help) null else c, f.v))
+		return 0
+	}
+	if (c == null) {
+		print(usage(null, false))
 		return 2
 	}
 	try {
-		return command(argv[0], f)
+		return command(c)
 	} catch (e: CompileError | IoError) {
 		print(if (e instanceof IoError) e.message() else e.msg)
 		return 1
 	}
 }
 
-/// Runs the command cmd with the options and arguments f; returns the exit status or throws a CompileError or IoError.
-function command(cmd: string, f: Flags): i32 {
-	const argv = f.args
-	const dirs = f.I
-	switch (cmd) {
-		case "test":
-			if (argv.length == 0) {
-				return testAll(f)
+/// Runs command c; returns the exit status or throws a CompileError or IoError.
+function command(c: Command): i32 {
+	switch (c) {
+		case Test:
+			if (c.args.length == 0) {
+				return testAll(c.compile)
 			}
-			const [status, report] = runTests(argv[0], argv.slice(1, argv.length), f)
+			const [status, report] = runTests(c.args[0], c.args.slice(1, c.args.length), c.compile)
 			stdout.write(yamlOf(report))
 			return status
-		case "build":
-			if (argv.length == 0) {
-				buildPackage(dirs)
-			} else if (f.o == "") {
+		case Build:
+			if (process.env("CI") == null) {
+				stderr.write("warning: build is for CI; run and test build what they need\n")
+			}
+			if (c.args.length == 0) {
+				buildPackage(c.compile.headers.I)
+			} else if (c.o == "") {
 				throw new CompileError("build <file.bob> takes -o <out>")
 			} else {
-				inspect(argv[0], f.o, dirs, f.release)
+				inspect(c.args[0], c.o, c.compile.headers.I, c.compile.release)
 			}
 			return 0
-		case "run":
-			return process.run([...build(argv[0], false, f, true), ...argv.slice(1, argv.length)])
-		case "check", "lint":
+		case Run: if (c.args.length > 0) {
+			return process.run([...build(c.args[0], false, c.compile, true), ...c.args.slice(1, c.args.length)])
+		}
+		case Check: if (c.args.length > 0) {
 			let status = 0
-			for (const e of check(argv, dirs)) {
+			for (const e of check(c.args, c.headers.I)) {
 				print(`${e.path}:${e.line}:${e.col}: ${if (e.warning) "warning: " else ""}${e.msg}`)
 				status = if (e.warning) status else 1
 			}
 			return status
-		case "format":
+		}
+		case Format: if (c.args.length > 0) {
 			let status = 0
-			for (const path of argv) {
+			for (const path of c.args) {
 				try {
 					formatFile(path)
 				} catch (e: CompileError) {
@@ -176,29 +254,30 @@ function command(cmd: string, f: Flags): i32 {
 				}
 			}
 			return status
-		case "doc":
-			print(doc(argv))
+		}
+		case Doc: if (c.args.length > 0) {
+			print(doc(c.args))
 			return 0
-		case "lsp":
-			serve(dirs)
+		}
+		case Lsp:
+			serve(c.headers.I)
 			return 0
-		case "init":
-			init(if (argv.length == 0) "" else argv[0])
+		case Init:
+			init(if (c.args.length == 0) "" else c.args[0])
 			return 0
-		case "bundle":
-			pack(argv[0])
+		case Bundle: if (c.args.length > 0) {
+			pack(c.args[0])
 			return 0
-		case "help":
-			print(usage)
-			return 0
-		case "lower":
-			const p = lower(argv, dirs)
-			for (const path of argv) {
+		}
+		case Lower: if (c.args.length > 0) {
+			const p = lower(c.args, c.headers.I)
+			for (const path of c.args) {
 				print(show(p, p.module(normal(path))))
 			}
 			return 0
+		}
 	}
-	print(usage)
+	print(usage(c, false))
 	return 2
 }
 
@@ -233,7 +312,7 @@ function init(name: string) {
 
 /// Runs the tests of testFiles(".") as test without main.bob prints them; 0 if all passed. A failed file's YAML starts
 /// with a line for each of its directories, of which those the last failed file printed are left out.
-function testAll(f: Flags): i32 {
+function testAll(f: Compile): i32 {
 	const files = testFiles(".")
 	const clear = if (isatty(1) != 0) "\r\x1b[K" else ""
 	let dirs: string[] = [] // of the last failed file
@@ -288,13 +367,13 @@ function yamlOf(report: string): string {
 	try {
 		return yaml.emit(yaml.documents(s))
 	} catch (e: ParseError | yaml.EncodeError) {
-		return s + "\n"  // not a report
+		return s + "\n" // not a report
 	}
 }
 
 /// Builds the program of main with its tests and runs them with args: its exit status, and its report, the JSON object
 /// src/rt.c prints, ended by the exit status if a crash cut it off, or else what failed as a JSON string.
-function runTests(main: string, args: string[], f: Flags): [i32, string] {
+function runTests(main: string, args: string[], f: Compile): [i32, string] {
 	try {
 		const out = `${dir}/${name(main)}.test.log`
 		const status = process.run([...build(main, true, f, true), ...args], out)
@@ -331,10 +410,10 @@ function hasTests(path: string): bool {
 /// if mono monomorphized for the program. Returns the command that runs it, or its tests: the executable, or the
 /// launcher on the image's entry, run by the C library's loader where it is the sysroot's, the image as image has it if
 /// pin. Throws the errors, or what failed, as a CompileError or IoError.
-function build(main: string, tests: bool, f: Flags, pin: bool): string[] {
-	const p = lowered([main], f.I)
+function build(main: string, tests: bool, f: Compile, pin: bool): string[] {
+	const p = lowered([main], f.headers.I)
 	const m = p.module(normal(main))
-	const [files, cxx] = linked(p, tests, f.I)
+	const [files, cxx] = linked(p, tests, f.headers.I)
 	if (!f.release) {
 		if (f.mono) {
 			mono(p, m)
@@ -470,7 +549,8 @@ function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, 
 		}
 	}
 	const cxxs: string[] = if (cxx) [`${lib}/libc++.a`, `${lib}/libc++abi.a`] else []
-	for (const f of [...files, ...(if (mac) [] else [...cxxs, `${lib}/libunwind.a`, `${lib}/libclang_rt.builtins.a`])]) {
+	for (const f of [...files,
+		...(if (mac) [] else [...cxxs, `${lib}/libunwind.a`, `${lib}/libclang_rt.builtins.a`])]) {
 		if (!endsWith(f, ".a")) {
 			const bytes = readFile(f)
 			const name = `${f}@${fnv(bytes)}`
@@ -715,7 +795,8 @@ function cmake(p: Package) {
 		} else {
 			// Its one directory as out/src, the same for any URL.
 			const url = split(src[0], "#")
-			save(`${o}/fetch.cmake`, `file(DOWNLOAD "${url[0]}" "${o}/src.tar" EXPECTED_HASH SHA256=${src[1]})
+			save(`${o}/fetch.cmake`,
+				`file(DOWNLOAD "${url[0]}" "${o}/src.tar" EXPECTED_HASH SHA256=${src[1]})
 file(ARCHIVE_EXTRACT INPUT "${o}/src.tar" DESTINATION "${o}/fetch")`)
 			run(["cmake", "-P", `${o}/fetch.cmake`])
 			rename(glob(`${o}/fetch/*`)[0], root)
