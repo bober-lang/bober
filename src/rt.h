@@ -81,7 +81,7 @@ typedef struct bober_type {
   bober_field *fields;
   int64_t nmethods;
   const bober_method *methods;
-  int64_t held;  // the TypeId of the primitive it is held as, or -1 a ref, -2 a union of any type, -3 in place (a fixed array), -4 a packed union (§4.4)
+  int64_t held;  // the TypeId of the primitive it is held as, or -1 a ref, -2 a union of any type, -3 in place (a fixed array), -4 a packed union (§4.4), -5 a class in place (an embedded field)
   int64_t size, align, ssize;
   const bober_layout *layout, *slayout;
   int64_t ntags;  // a class's or interface's (§5.3)

@@ -14,7 +14,7 @@ BOBER_SECTION(const bober_type *const, bober_types);
 // Primitive type ids (src/bc/kind.bob) and Type.kind's indices (builtin/type.bob).
 enum { NUL = 1, BOOL, I8, I16, I32, I64, U8, U16, U32, U64, F32, F64, STRING, TYPE = 16, INT, FLOAT };
 enum { KLITERAL = 5, KARRAY, KFIXED, KTUPLE, KOBJECT, KCLASS, KINTERFACE, KFUNCTION, KASYNC, KUNION, KTYPE, KPARAM };
-enum { REF = -1, ANY = -2, PLACE = -3, PACKED = -4 };
+enum { REF = -1, ANY = -2, PLACE = -3, PACKED = -4, EMBED = -5 };
 static const char *const ops[] = {"Eq", "Ne", "Lt", "Gt", "Le", "Ge", "Add", "Sub", "Mul", "Div", "Rem", "Pow", "And", "Or", "Xor", "Shl", "Shr", "Neg"};
 
 static void *alloc(size_t n) {
@@ -364,14 +364,31 @@ static const bober_type *form(const bober_type *t, int64_t n, const bober_type *
   return r;
 }
 
+/// The descriptor of the place of class c that a field embedding it is (§5.3), its elem c: loaded, a ref to the place,
+/// which keeps the instance alive; stored, copied into it.
+static const bober_type *embedded(const bober_type *c) {
+  int64_t n = len(c->key) + 1;
+  char *key = alloc(n);
+  key[0] = '&', memcpy(key + 1, c->key.bytes, n - 1);
+  const bober_type *have = find(key, n);
+  if (have) return free(key), have;
+  bober_type *r = alloc(sizeof *r);
+  *r = *c;
+  r->key = (bober_string){(uint64_t)n << 8 | 0xff, key, 0};
+  r->held = EMBED, r->elem = c, r->canon = r;
+  add(r);
+  return r;
+}
+
 int64_t bober_field_of(const bober_type *t, const char *name, int64_t n, const bober_type **type) {
   for (int64_t i = 0; i < t->nfields; i++) {
     const bober_field *f = &t->fields[i];
-    if (len(f->name) == n && !memcmp(f->name.bytes, name, n)) return *type = f->type, f->offset;
+    if (len(f->name) == n && !memcmp(f->name.bytes, name, n))
+      return *type = inPlace(f) ? embedded(f->type->canon) : f->type, f->offset;
   }
   for (int64_t i = 0; i < t->nfields; i++) {
     const bober_field *f = &t->fields[i];
-    int64_t at = f->mods & 16 && f->type->kind == KCLASS ? bober_field_of(f->type, name, n, type) : -1;
+    int64_t at = inPlace(f) ? bober_field_of(f->type, name, n, type) : -1;
     if (at >= 0) return f->offset + at;
   }
   return -1;
@@ -388,6 +405,7 @@ void *bober_method_of(const bober_type *t, const char *name, int64_t n) {
 int64_t bober_load(const bober_type *t, const void *p, bober_union *u) {
   t = t->canon;  // packed, if a union, as emit packs it, its literals their base
   if (t->held == ANY) return *u = *(const bober_union *)p, 0;
+  if (t->held == EMBED) return *u = (bober_union){t->elem, 0, (void *)p}, 0;
   if (t->held == PACKED) {
     int64_t i = member(t, p), n = bober_load(t->parts[i], (const char *)p + placed(t, i), u);
     u->ref = (void *)((uintptr_t)u->ref << 8 >> 8);  // without the tag in its top byte; a string's emit's load clears
@@ -411,6 +429,7 @@ void bober_store(const bober_type *t, void *p, const bober_union *u) {
     if (t->length >= 0) ((uint8_t *)p)[t->length] = (i - zeroOf(t) + t->nparts) % t->nparts;
   } else if (t->held == ANY) *(bober_union *)p = *u;
   else if (t->held == STRING || t->held == PLACE) memcpy(p, u->ref, t->size);
+  else if (t->held == EMBED) memcpy(p, u->ref, t->elem->ssize);
   else if (t->held == REF) *(void **)p = u->ref;
   else memcpy(p, &u->bits, t->size);
 }
