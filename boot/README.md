@@ -5,7 +5,7 @@ A tree-walking interpreter for the Bober subset needed to self-host the compiler
 `parse.y` (bison, LALR, no conflicts) builds the AST and resolves locals to frame slots while parsing, a frame per call and per loop iteration. `interp.c` evaluates it.
 
 Build: `make` (needs bison 3.8, flex 2.6, Boehm's libgc and the system's LLVM, which it links) produces `../build/boot`, which bootstraps the native bober from the repo's
-root, after `make -C src/backend/llvm` builds its sysroot, with `build/boot run src/bober.bob build -release -I "$(llvm-config --includedir)" src/bober.bob`, into
+root, after `make -C src/backend/llvm` builds its sysroot, with `build/boot run src/bober.bob run -release -I "$(llvm-config --includedir)" src/bober.bob help`, into
 `build/bober`, building the C libraries of `bober.pkg` with CMake (`-release`: boot has LLVM but not TPDE; `-I`: boot binds the
 system's LLVM, as those are not built yet).
 
