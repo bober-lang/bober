@@ -30,10 +30,15 @@ export function held(b: Backend, t: Type): Held {
 		case "void": b.void()
 		case "bool": b.int(8)
 		case "int": b.int((t.size * 8) as u32)
-		case "float": if (t.size == 4) b.f32() else b.f64()
+		case "float": float(b, t.size)
 		case "ptr", "func": b.ptr()
 		default: b.array(b.int(8), t.size as u64)
 	}
+}
+
+/// The float of size bytes, a long double's 16 being x86's 80-bit extended float on x86-64, IEEE's quad on arm64.
+function float(b: Backend, size: i32): Held {
+	return if (size == 4) b.f32() else if (size == 8) b.f64() else if (arch == "x86_64") b.f80() else b.f128()
 }
 
 /// The type an aggregate crosses a call as, in registers, or 0 when it goes through memory. On x86-64, as
@@ -52,7 +57,7 @@ function coerce(b: Backend, t: Type): Held {
 	}
 	const [size, n] = floats(t)
 	if (size > 0 && n <= 4) {
-		return b.array(if (size == 4) b.f32() else b.f64(), n as u64)
+		return b.array(float(b, size), n as u64)
 	}
 	return if (t.size > 16) 0 else if (t.align == 16) b.int(128) else if (t.size > 8) b.array(b.int(64), 2) else b.int(64)
 }
@@ -106,9 +111,10 @@ function eightbytes(t: Type): bool[] {
 }
 
 /// Marks the eightbytes of sse that t, at off in them, holds anything but floats in; false if it is not
-/// aligned there.
+/// aligned there, or is a long double, which goes in memory: System V returns a struct of one in x87's st0,
+/// which bobcc does not, returning it through sret.
 function classify(t: Type, off: i32, sse: bool[]): bool {
-	if (off % t.align != 0) {
+	if (off % t.align != 0 || t.kind == "float" && t.size == 16) {
 		return false
 	}
 	if (t instanceof Arr) {
@@ -260,8 +266,8 @@ export function ret(b: Backend, f: Frame, fn: Value, ft: Fn, v: Value) {
 export const vaList: Type = if (arch == "x86_64") new Arr(ULong, 3) else if (aapcs) new Arr(ULong, 4) else new Ptr(Char)
 
 /// The address of the next variadic argument, a t, from the va_list at list, which is taken the way a call
-/// passes it. On x86-64 a scalar comes from the registers saved at reg_save_area while there are any, else
-/// from the stack, and an aggregate as vaAggregate says; on other arm64 as vaRegisters says; on Apple arm64
+/// passes it. On x86-64 a scalar of up to 8 bytes comes from the registers saved at reg_save_area while there
+/// are any, else from the stack, and another value as vaAggregate says; on other arm64 as vaRegisters says; on Apple arm64
 /// the list is a char * through 8-byte slots. On arm64 an aggregate that goes in memory comes as a pointer.
 export function vaArg(b: Backend, f: Frame, list: Value, t: Type): Value {
 	if (arch == "x86_64") {
@@ -277,7 +283,7 @@ export function vaArg(b: Backend, f: Frame, list: Value, t: Type): Value {
 	return if (indirect) b.load(b.ptr(), p, false) else p
 }
 
-/// An aggregate or __int128 from the x86-64 va_list at list: its eightbytes from the general and float
+/// An aggregate, __int128 or long double from the x86-64 va_list at list: its eightbytes from the general and float
 /// registers saved at reg_save_area if enough of each are left, else all of it from the stack, aligned.
 function vaAggregate(b: Backend, f: Frame, list: Value, t: Type): Value {
 	const byte = b.int(8)
@@ -400,7 +406,7 @@ function vaRegisters(b: Backend, f: Frame, list: Value, t: Type): Value {
 }
 
 /// The default argument promotions (C11 6.5.2.2).
-export function promoteArg(t: Type): Type { return if (t.kind == "float") Double else promote(t) }
+export function promoteArg(t: Type): Type { return if (t.kind == "float" && t.size == 4) Double else promote(t) }
 
 /// The size of t's float members and their count, if all are floats of one size; else size 0.
 function floats(t: Type): [i32, i32] {

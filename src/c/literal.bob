@@ -6,7 +6,7 @@ import * as ascii from "../../std/ascii"
 import { compose, parseFloat } from "../../std/float"
 import { max, min } from "../../std/math"
 import { ParseError, codePoint, parseInt, scanInt, utf8 } from "../../std/string"
-import { Char, Double, Float, Int, Long, Type, UInt, ULong, UShort, isUnsigned, wrap } from "./type"
+import { Char, Double, Float, Int, Long, LongDouble, Type, UInt, ULong, UShort, isUnsigned, wrap } from "./type"
 
 /// The type and value of a pp-number, or null if it is no constant: an integer, n, typed by its suffix
 /// and magnitude, or a float, x.
@@ -53,16 +53,16 @@ function isFloating(s: string, radix: i32): bool {
 	return false
 }
 
-/// A floating constant, double unless suffixed f, for float, or l, for long double, which is double;
-/// null if more follows it, as in 1..2.
+/// A floating constant, double unless suffixed f, for float, or l, for long double, which x holds only as
+/// a double, or infinity past one's range; null if more follows it, as in 1..2.
 function floating(s: string, radix: i32): [Type, i64, f64] | null {
 	const last = toLower(s[s.length - 1])
 	const body = if (last == ascii.f || last == ascii.l) s.slice(0, s.length - 1) else s
+	const t = if (last == ascii.f) Float else if (last == ascii.l) LongDouble else Double
 	try {
-		const x = if (radix == 16) hexFloat(body) else parseFloat(decimal(body))
-		return [if (last == ascii.f) Float else Double, 0, x]
+		return [t, 0, if (radix == 16) hexFloat(body) else parseFloat(decimal(body))]
 	} catch (e: ParseError) {
-		return null
+		return if (e.kind == "range" && t.size > 8) [t, 0, 1.0 / 0.0] else null
 	}
 }
 

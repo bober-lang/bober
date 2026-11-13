@@ -33,7 +33,7 @@ struct Part {
 };
 
 struct Type {
-	enum Kind : u8 { Void, Int, F32, F64, Ptr, Fn, Struct, Array } kind;
+	enum Kind : u8 { Void, Int, F32, F64, LongDouble, Ptr, Fn, Struct, Array } kind;
 	/// The int's bits, the array's length, or 1 for a ref, a variadic function or a packed struct.
 	u64 n = 0;
 	u64 size = 0;

@@ -392,7 +392,7 @@ export class Parser {
 				const ty = decay(declared)
 				for (const i of 0 ... ft.params.length - 1) {
 					if (ft.params[i][1] == name?.text) {
-						ft.params[i] = [if (ty.kind == "float") Double else ty, ft.params[i][1]]
+						ft.params[i] = [if (ty.kind == "float" && ty.size == 4) Double else ty, ft.params[i][1]]
 					}
 				}
 			}
@@ -1650,6 +1650,10 @@ export class Parser {
 					throw CError.at(t, `bad number ${t.text}`)
 				}
 				const [ty, n, x] = c
+				if (ty.kind == "float" && ty.size > 8) {
+					// More exact than x: the back end reads the digits, less the l.
+					return new Val(ty, this.g.b.constFloatOf(this.g.ty(ty), t.text.slice(0, t.text.length - 1)))
+				}
 				return if (ty.kind == "float") float(x, ty) else int(n, ty)
 			case "char":
 				const [ty, n] = character(t.text)
@@ -1829,10 +1833,10 @@ export class Parser {
 			case "constant_p": return int(if (a[0].known == "int" || a[0].known == "float") 1 else 0, Int)
 			// The size is unknown: -1 for types 0 and 1, which ask for a maximum, else 0.
 			case "object_size": return int(if (g.rv(a[1]).n < 2) -1 else 0, ULong)
-			case "inf", "inff", "infl", "huge_val", "huge_valf",
-				"huge_vall": return float(1.0 / 0.0, if (b[b.length - 1] == ("f" as u8)) Float else Double)
-			case "fabs", "fabsf", "fabsl": return g.intrinsic("fabs", if (b == "fabsf") Float else Double, g.rv(a[0]))
-			case "nan", "nanf", "nanl": return float(0.0 / 0.0, if (b == "nanf") Float else Double)
+			case "inf", "inff", "infl": return g.cast(float(1.0 / 0.0, Double), suffixed(b, "inf"))
+			case "huge_val", "huge_valf", "huge_vall": return g.cast(float(1.0 / 0.0, Double), suffixed(b, "huge_val"))
+			case "fabs", "fabsf", "fabsl": return g.intrinsic("fabs", suffixed(b, "fabs"), g.rv(a[0]))
+			case "nan", "nanf", "nanl": return g.cast(float(0.0 / 0.0, Double), suffixed(b, "nan"))
 			case "bswap16", "bswap32", "bswap64", "clz", "clzl", "clzll", "ctz", "ctzl", "ctzll", "popcount",
 				"popcountl", "popcountll":
 				const op: Unary = if (startsWith(b, "bswap")) "bswap"
@@ -2261,6 +2265,11 @@ function unchecked(lib: string, a: Val[]): Val[] {
 	return out
 }
 
+/// The float type of math.h's function base suffixed by name: f for float, l for long double.
+function suffixed(name: string, base: string): Type {
+	return if (name == base + "f") Float else if (name == base + "l") LongDouble else Double
+}
+
 /// The basic type its words name.
 function basic(words: Word[]): Type {
 	let longs = 0
@@ -2284,7 +2293,7 @@ function basic(words: Word[]): Type {
 		case "char": if (unsigned) UChar else if (signed) SChar else Char
 		case "short": if (unsigned) UShort else Short
 		case "float": Float
-		case "double": Double
+		case "double": if (longs > 0) LongDouble else Double
 		case "__int128": if (unsigned) UInt128 else Int128
 		default: if (longs > 0) (if (unsigned) ULong else Long) else if (unsigned) UInt else Int
 	}

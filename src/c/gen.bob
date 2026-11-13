@@ -281,7 +281,7 @@ export class Gen implements abi.Frame {
 		if (v.known == "int" && exact(v, t)) {
 			return if (t.kind == "float") float(if (isUnsigned(s)) (v.n as u64) as f64 else v.n as f64, t) else int(v.n, t)
 		}
-		if (v.known == "float") {
+		if (v.known == "float" && exact(v, t)) {
 			return if (t.kind == "float") float(v.x, t) else int(if (isUnsigned(t)) (v.x as u64) as i64 else v.x as i64, t)
 		}
 		if (isInt(s) && t.kind == "int" && s.size == t.size || v.known == "addr" && t.size == 8) {
@@ -687,10 +687,10 @@ function floatPredicate(op: string): FCmp {
 	}
 }
 
-/// Whether folding v's value, kept in 64 bits, as a t is exact: not where an unsigned value past 2^63
-/// is or becomes 128 bits wide.
+/// Whether folding v's value, kept in 64 bits, as a t is exact: not as a long double, which the back end
+/// folds, nor where an unsigned value past 2^63 is or becomes 128 bits wide.
 function exact(v: Val, t: Type): bool {
-	return !(isUnsigned(v.ty) && v.n < 0 && (t.size == 16 || v.ty.size == 16 && t.kind == "float"))
+	return !(t.kind == "float" && t.size == 16 || isUnsigned(v.ty) && v.n < 0 && (t.size == 16 || v.ty.size == 16 && t.kind == "float"))
 }
 
 function foldInt(op: string, a: i64, b: i64, unsigned: bool): i64 {
