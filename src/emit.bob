@@ -92,7 +92,6 @@ export class Facts {
 
 /// An operand: a value and its type, as norm makes it.
 type V = { v: Value, t: i32 }
-
 /// A field of a class instance, object or tuple; an embedded one is held in place. Its mods and decl, -1 for an
 /// object's or tuple's, are for reflection.
 type Slot = { name: i32, t: i32, embed: bool, mods: i32, decl: i32 }
@@ -147,7 +146,9 @@ class CFrame implements AbiFrame {
 		this.fn = fn
 	}
 
-	alloca(t: c.Type, held: IrType): Value { return this.b.alloca(if (held == 0) heldAs(this.b, t) else held, max(t.align, 8) as u32) }
+	alloca(t: c.Type, held: IrType): Value {
+		return this.b.alloca(if (held == 0) heldAs(this.b, t) else held, max(t.align, 8) as u32)
+	}
 
 	label(): Block { return this.b.block(this.fn) }
 }
@@ -198,7 +199,6 @@ class Emitter {
 	/// rt.h's bober_type and bober_field.
 	private descTy: IrType
 	private fieldTy: IrType
-
 	// The function being emitted.
 	private fn: Value = 0
 	private code = new Code()
@@ -262,7 +262,8 @@ class Emitter {
 		this.stringTy = this.unionTy
 		this.arrayTy = this.unionTy
 		const [w, str] = [this.i64, this.stringTy]
-		this.descTy = b.struct([w, w, str, str, str, str, w, w, w, str, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w])
+		this.descTy = b.struct([w, w, str, str, str, str, w, w, w, str, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w,
+			w])
 		this.fieldTy = b.struct([str, str, w, w, w, w, w])
 		b.collected()
 		this.runtime()
@@ -366,7 +367,6 @@ class Emitter {
 	}
 
 	// Decls.
-
 	private decl(d: i32) {
 		const p = this.p
 		const x = p.decls[d]
@@ -399,7 +399,8 @@ class Emitter {
 		} else if (x.kind == decl.Var) {
 			this.variable(d)
 			if (code != null) {
-				this.define(this.b.function(this.symbol(d) + ".init", this.b.fn(this.result(x.type), []), true), x.type, [], false, code)
+				this.define(this.b.function(this.symbol(d) + ".init", this.b.fn(this.result(x.type), []), true), x.type,
+					[], false, code)
 			}
 		}
 	}
@@ -478,7 +479,8 @@ class Emitter {
 			const x = p.decls[d]
 			if (x.code != null) {
 				const init = b.function(this.symbol(d) + ".init", b.fn(this.result(x.type), []), true)
-				this.put(this.variable(d), { v: this.returned(this.call(b.valueType(init), init, []), x.type), t: this.norm(x.type) }, x.type)
+				this.put(this.variable(d),
+					{ v: this.returned(this.call(b.valueType(init), init, []), x.type), t: this.norm(x.type) }, x.type)
 			}
 		}
 		b.retVoid()
@@ -502,7 +504,9 @@ class Emitter {
 		for (const d of p.modules[this.m].decls) {
 			const x = p.decls[d]
 			if (tests && x.kind == decl.Test) {
-				this.rt("test", [this.cstr(this.name(d)), this.cstr(this.path), b.function(this.symbol(d), b.fn(this.void, []), true)])
+				this.rt("test",
+					[this.cstr(this.name(d)), this.cstr(this.path),
+					b.function(this.symbol(d), b.fn(this.void, []), true)])
 			} else if (!tests && x.kind == decl.Function && this.name(d) == "main") {
 				const c = this.callee(d)
 				const v = this.call(c.type, c.fn, [])
@@ -518,7 +522,6 @@ class Emitter {
 	}
 
 	// Functions.
-
 	/// Defines the function f of params (backend types), its code's first locals being the params after an env, which
 	/// holds its captures.
 	private define(f: Value, ret: i32, params: IrType[], env: bool, c: Code, scope: i32[] = [], val = false) {
@@ -731,7 +734,8 @@ class Emitter {
 				const t = c.locals[n].type
 				const at = this.local(n)
 				const v = if (this.held[n]) this.unbox(at, this.norm(t))
-					else if (n == 0 && this.self != 0) this.self else this.fetch(at, t)
+					else if (n == 0 && this.self != 0) this.self
+					else this.fetch(at, t)
 				const w = this.words.get(at)
 				if (w != null) {
 					this.homes.set(v, w)
@@ -752,7 +756,8 @@ class Emitter {
 					const f = this.callee(d)
 					const env = c.b(i)
 					const to = p.subst(t, env)
-					const g = if (env == 0) this.value(f, false) else this.closure(this.value(f, false), [], this.envDescs(env))
+					const g = if (env == 0) this.value(f, false)
+						else this.closure(this.value(f, false), [], this.envDescs(env))
 					this.push(this.cast({ v: g, t: this.norm(t) }, to), to)
 				} else if (o == op.Global) {
 					this.push(this.fetch(this.variable(d), t), t)
@@ -769,7 +774,8 @@ class Emitter {
 				} else if (o == op.Float) {
 					this.push(b.constFloat(this.ll(n), fromBits[f64](v as u64)), n)
 				} else {
-					this.push(if (kind.isFloat(this.kindOf(n))) b.constFloat(this.ll(n), v as f64) else b.constInt(this.ll(n), v), n)
+					this.push(if (kind.isFloat(this.kindOf(n))) b.constFloat(this.ll(n), v as f64)
+						else b.constInt(this.ll(n), v), n)
 				}
 			case op.Str: this.push(this.str(p.strings[n]), kind.String)
 			case op.Type:
@@ -800,7 +806,7 @@ class Emitter {
 				} else if (s.embed) {
 					this.copy(this.heap(v), { v: q, t: this.norm(s.t) })
 				} else {
-					this.write(q, this.heap(v), s.t)
+					this.write(q, this.heap(v), this.declared(s))
 				}
 			case op.Subscript:
 				const k = this.pop()
@@ -826,7 +832,8 @@ class Emitter {
 			case op.Unpack:
 				const arr = this.stack[this.stack.length - 1]
 				if (p.kind(arr.t) == kind.Array) {
-					this.check(this.ir().icmp("sge", this.arrLen(arr.v), this.i64Const(n)), "array pattern longer than array")
+					this.check(this.ir().icmp("sge", this.arrLen(arr.v), this.i64Const(n)),
+						"array pattern longer than array")
 				}
 			case op.Array, op.Object: this.array(n, this.popN(c.b(i)), c.items(c.c(i)))
 			case op.New: this.make(n)
@@ -896,7 +903,6 @@ class Emitter {
 	}
 
 	// Control flow.
-
 	private open(o: Opcode, t: i32, at: i32): Frame {
 		const f = new Frame(o, t, at, this.stack.length, this.label())
 		if (t != kind.None) {
@@ -1049,7 +1055,8 @@ class Emitter {
 		// The length read anew each time, as the body may change it; so the element is in range.
 		const x = this.ir().load(this.i64, at, false)
 		const n = if (boxed) this.rt("length", [this.spill(xs.v, this.unionTy)], false)
-			else if (k == kind.Array) this.arrLen(xs.v) else this.i64Const(this.p.b(xs.t))
+			else if (k == kind.Array) this.arrLen(xs.v)
+			else this.i64Const(this.p.b(xs.t))
 		this.condBr(this.ir().icmp("slt", x, n), body, f.exit)
 		this.start(body)
 		this.renew(l)
@@ -1059,7 +1066,8 @@ class Emitter {
 			this.setLocal(l, { v: this.cast({ v: this.load(d, q), t: this.any }, lt), t: this.norm(lt) })
 		} else {
 			const e = this.p.a(xs.t)
-			const q = if (k == kind.Array) this.at(this.elements(xs.v), e, x) else this.ir().gep(this.mem(xs.t), xs.v, [this.i64Const(0), x])
+			const q = if (k == kind.Array) this.at(this.elements(xs.v), e, x)
+				else this.ir().gep(this.mem(xs.t), xs.v, [this.i64Const(0), x])
 			this.setLocal(l, { v: this.read(q, e), t: this.norm(e) })
 		}
 		return i
@@ -1137,7 +1145,8 @@ class Emitter {
 		let shown = this.b.constZero(this.ref)
 		if (this.dyn) {
 			const item = this.lang("item")
-			shown = this.refOf(this.cast({ v: this.call(item.type, item.fn, [this.tagOf(u), u]), t: kind.String }, this.any))
+			shown = this.refOf(this.cast({ v: this.call(item.type, item.fn, [this.tagOf(u), u]), t: kind.String },
+				this.any))
 		}
 		this.rt("uncaught", [this.tagOf(u), this.bitsOf(u), this.refOf(u), shown], false)
 		this.ir().unreachable()
@@ -1145,9 +1154,7 @@ class Emitter {
 	}
 
 	private rethrow(u: Value) { this.raise(u, this.b.constZero(this.ptr), 0) }
-
 	// Calls.
-
 	/// The callee of Function decl d, declared if of another module.
 	private callee(d: i32): Callee { return this.callees.get(d) ?? put(this.callees, d, this.calleeOf(d)) }
 
@@ -1186,8 +1193,8 @@ class Emitter {
 	/// Decl d as a function of type t, in this module or declared; one nested in a function local.
 	private function(d: i32, t: IrType): Value {
 		const x = this.p.decls[d]
-		return this.b.function(this.symbol(d), t, x.module == this.m && x.owner >= 0 && this.p.classOf(d) < 0
-			&& (x.mods & decl.Export) == 0)
+		return this.b.function(this.symbol(d), t,
+			x.module == this.m && x.owner >= 0 && this.p.classOf(d) < 0 && (x.mods & decl.Export) == 0)
 	}
 
 	/// C's function name, called through a local function of type ft, bober's convention, which makes the call as C's ABI
@@ -1221,7 +1228,9 @@ class Emitter {
 				args.push(b.call(cPtr.type, cPtr.fn, [k, b.extract(p, 1), b.extract(p, 2)]))
 				done.push([k, args[args.length - 1]])
 			} else {
-				args.push(if (t.kind == "bool") b.cast("zext", p, b.int(8)) else if (b.typeOf(p) == this.ref) this.raw(p) else p)
+				args.push(if (t.kind == "bool") b.cast("zext", p, b.int(8))
+					else if (b.typeOf(p) == this.ref) this.raw(p)
+					else p)
 			}
 			types.push(t)
 		}
@@ -1263,8 +1272,10 @@ class Emitter {
 		let r = this.b.constInt(this.i32, 0)
 		for (const m of this.p.members(u)) {
 			const k = this.p.kind(m)
-			const n = if (k == kind.String) 1 else if (k != kind.Array) 0
-				else if (this.p.kind(this.norm(this.p.a(m))) == kind.String) 3 else 2
+			const n = if (k == kind.String) 1
+				else if (k != kind.Array) 0
+				else if (this.p.kind(this.norm(this.p.a(m))) == kind.String) 3
+				else 2
 			if (n > 0) {
 				r = this.b.select(this.b.icmp("eq", tag, this.tag(m)), this.b.constInt(this.i32, n), r)
 			}
@@ -1351,7 +1362,8 @@ class Emitter {
 			let ok = this.bool(false)
 			for (const m of this.p.members(this.kept(t))) {
 				if (this.p.kind(m) == kind.Literal && this.p.a(m) == kind.String) {
-					ok = this.ir().binary("or", ok, this.langCall("strEq", [s.v, this.str(this.p.strings[this.p.b(m)])]))
+					ok = this.ir().binary("or", ok,
+						this.langCall("strEq", [s.v, this.str(this.p.strings[this.p.b(m)])]))
 				}
 			}
 			this.check(ok, "not a literal of the type")
@@ -1365,7 +1377,8 @@ class Emitter {
 		const xs = this.popN(n)
 		const args = xs.map(a => this.cast(a, this.any))
 		const recv = this.pop()
-		const self = if (this.p.kind(recv.t) == kind.Type) this.union(recv.v, this.i64Const(0), this.b.constZero(this.ref))
+		const self = if (this.p.kind(recv.t)
+			== kind.Type) this.union(recv.v, this.i64Const(0), this.b.constZero(this.ref))
 			else this.cast(recv, this.any)
 		const fn = this.rt("method_of", [this.tagOf(self), this.cstr(name), this.i64Const(name.length)], false)
 		const r = this.slot(this.unionTy)
@@ -1374,7 +1387,8 @@ class Emitter {
 		const done = this.label()
 		this.condBr(this.ir().icmp("ne", this.ir().cast("ptrtoint", fn, this.i64), this.i64Const(0)), yes, no)
 		this.start(yes)
-		this.ir().store(this.call(this.b.fn(this.unionTy, [self, ...args].map(_ => this.unionTy)), fn, [self, ...args]), r, false)
+		this.ir().store(this.call(this.b.fn(this.unionTy, [self, ...args].map(_ => this.unionTy)), fn, [self, ...args]),
+			r, false)
 		this.jump(done)
 		this.start(no)
 		const i = if (this.p.kind(recv.t) == kind.Object) this.p.field(recv.t, this.p.intern(name)) else -1
@@ -1389,7 +1403,8 @@ class Emitter {
 			this.trap(`no method ${name}`)
 		} else {
 			const show = this.lang("show")
-			this.ir().store(this.cast({ v: this.call(show.type, show.fn, [this.tagOf(self), self]), t: kind.String }, this.any), r, false)
+			this.ir().store(this.cast({ v: this.call(show.type, show.fn, [this.tagOf(self), self]), t: kind.String },
+				this.any), r, false)
 			this.jump(done)
 		}
 		this.start(done)
@@ -1426,7 +1441,8 @@ class Emitter {
 	/// are the parts of the tag's.
 	private thunk(d: i32): Value {
 		const f = this.callee(d)
-		const fn = this.b.function(`${f.sym}.thunk`, this.b.fn(this.unionTy, [this.unionTy, ...f.params.map(_ => this.unionTy)]), false)
+		const fn = this.b.function(`${f.sym}.thunk`,
+			this.b.fn(this.unionTy, [this.unionTy, ...f.params.map(_ => this.unionTy)]), false)
 		if (this.p.decls[d].module != this.m) {
 			return fn
 		}
@@ -1440,7 +1456,8 @@ class Emitter {
 		}
 		const r = this.call(f.type, f.fn, args)
 		const void = this.result(f.ret) == this.void
-		this.ir().ret(this.cast({ v: if (void) this.bool(false) else r, t: if (void) kind.Null else this.norm(f.ret) }, this.any))
+		this.ir().ret(this.cast({ v: if (void) this.bool(false) else r, t: if (void) kind.Null else this.norm(f.ret) },
+			this.any))
 		this.b.at(this.entry)
 		this.b.br(start)
 		return fn
@@ -1488,10 +1505,12 @@ class Emitter {
 		this.dead = true
 		this.start(array)
 		const e = this.word(d, elemAt)
-		this.ir().store(this.union(d, this.i64Const(0), this.cell(this.word(e, sizeAt), this.i64Const(0), this.layoutOf(e))), r, false)
+		this.ir().store(this.union(d, this.i64Const(0),
+			this.cell(this.word(e, sizeAt), this.i64Const(0), this.layoutOf(e))), r, false)
 		this.jump(done)
 		this.start(tuple)
-		this.ir().store(this.union(d, this.i64Const(0), this.rt("alloc", [this.word(d, ssizeAt), this.layoutOf(d, true)], false)), r, false)
+		this.ir().store(this.union(d, this.i64Const(0),
+			this.rt("alloc", [this.word(d, ssizeAt), this.layoutOf(d, true)], false)), r, false)
 		this.jump(done)
 		this.start(instance)
 		const fn = this.rt("method_of", [d, this.cstr("new"), this.i64Const(3)], false)
@@ -1565,7 +1584,8 @@ class Emitter {
 			const d = this.desc(t)
 			switch (name) {
 				case "sizeOf": this.push(this.word(d, sizeAt), ret)
-				case "alloc": this.push(this.rt("alloc", [this.ir().binary("mul", this.pop().v, this.word(d, sizeAt)), this.layoutOf(d)], false), ret)
+				case "alloc": this.push(this.rt("alloc",
+					[this.ir().binary("mul", this.pop().v, this.word(d, sizeAt)), this.layoutOf(d)], false), ret)
 				case "array": this.push(this.cellOf(t, this.pop().v), ret)
 				case "zero": this.push(this.zero(t), ret)
 				case "addr":
@@ -1587,15 +1607,14 @@ class Emitter {
 			case "sizeOf": this.push(this.sizeOf(t), ret)
 			case "alloc": this.push(this.alloc(this.stored(t), this.pop().v), ret)
 			case "array": this.push(this.cellOf(t, this.pop().v), ret)
-			case "zero":
-				if (this.kindOf(t) == kind.FixedArray) {
-					// Held by address, as array makes one.
-					const q = this.alloc(this.mem(t))
-					this.ir().store(this.zero(t), q, false)
-					this.push(q, t)
-				} else {
-					this.push(this.zero(t), t)
-				}
+			case "zero": if (this.kindOf(t) == kind.FixedArray) {
+				// Held by address, as array makes one.
+				const q = this.alloc(this.mem(t))
+				this.ir().store(this.zero(t), q, false)
+				this.push(q, t)
+			} else {
+				this.push(this.zero(t), t)
+			}
 			case "load": this.push(this.read(this.ir().cast("inttoptr", this.pop().v, this.ptr), t), t)
 			case "store":
 				const v = this.pop()
@@ -1624,7 +1643,8 @@ class Emitter {
 		const r: Value[] = []
 		for (const k of 0 ... vs.length - 1) {
 			// Once learned, a T[n] by its place, which the callee copies on entry.
-			r.push(if (this.facts.phase == "learned" && this.kindOf(ps[k]) == kind.FixedArray) vs[k].v else this.retval(vs[k], ps[k]))
+			r.push(if (this.facts.phase == "learned" && this.kindOf(ps[k]) == kind.FixedArray) vs[k].v
+				else this.retval(vs[k], ps[k]))
 		}
 		return r
 	}
@@ -1659,7 +1679,9 @@ class Emitter {
 	/// The value r of a call returning a t, as result has it: false if t is null, of which the function returns none,
 	/// and a class held by value out of its box.
 	private returned(r: Value, t: i32): Value {
-		return if (this.result(t) == this.void) this.bool(false) else if (this.inlined(t)) this.unbox(r, this.norm(t)) else r
+		return if (this.result(t) == this.void) this.bool(false)
+			else if (this.inlined(t)) this.unbox(r, this.norm(t))
+			else r
 	}
 
 	/// v as a function returns a t, as result has it: a tuple, object or class instance held by value boxed.
@@ -1799,7 +1821,9 @@ class Emitter {
 		b.at(here)
 		this.dead = dead
 		this.entry = entry
-		const v = if (bound || f.scope.length > 0) thunk else b.constCast("inttoptr", b.constCast("ptrtoint", b.constant(b.constStruct([thunk])), this.i64), this.ref)
+		const v = if (bound || f.scope.length > 0) thunk
+			else b.constCast("inttoptr", b.constCast("ptrtoint", b.constant(b.constStruct([thunk])), this.i64),
+			this.ref)
 		this.thunks.set(sym, v)
 		return v
 	}
@@ -1862,7 +1886,6 @@ class Emitter {
 	}
 
 	// Values.
-
 	/// Pushes the field of held of the name, a Str, as its layout or, at run time, its tag says.
 	private field(held: V, name: i32) {
 		const p = this.p
@@ -1895,7 +1918,9 @@ class Emitter {
 				return
 			}
 			const of = this.p.members(t)[0]
-			const s = if (p.kind(of) == kind.Object || p.kind(of) == kind.Named) this.layout(of).find(s => s.name == name) else null
+			const s = if (p.kind(of) == kind.Object
+				|| p.kind(of) == kind.Named) this.layout(of).find(s => s.name == name)
+				else null
 			const [q, d] = this.dynPlace({ v: u, t: this.any }, this.str(text))
 			const v = this.load(d, q)
 			if (s == null) {
@@ -1917,8 +1942,15 @@ class Emitter {
 			this.push(this.cast({ v: f, t: this.norm(u) }, p.subst(u, env)), p.subst(u, env))
 		} else {
 			const [q, s] = this.place(obj, name)
-			this.push(if (s.embed) q else this.read(q, s.t), s.t)
+			const h = this.declared(s)
+			this.push(if (s.embed) q else this.cast({ v: this.read(q, h), t: this.norm(h) }, s.t), s.t)
 		}
+	}
+
+	/// The type the field of slot s is held as: a function's as declared, as its class's generic code calls it, which no
+	/// descriptor of a type param could adapt.
+	private declared(s: Slot): i32 {
+		return if (this.dyn && s.decl >= 0 && this.kindOf(s.t) == kind.Func) this.p.decls[s.decl].type else s.t
 	}
 
 	/// The place and slot of the field of a class instance, object or tuple of the name, a Str, also of one an embedded
@@ -1993,7 +2025,8 @@ class Emitter {
 		const u = src.t
 		if (this.p.kind(u) == kind.Union) {
 			const ms = this.p.members(u)
-			this.cases(ms.length, i => this.ir().icmp("eq", this.tagOf(src.v), this.tag(ms[i])), i => this.copy({ v: this.unbits(src.v, ms[i]), t: ms[i] }, dst))
+			this.cases(ms.length, i => this.ir().icmp("eq", this.tagOf(src.v), this.tag(ms[i])),
+				i => this.copy({ v: this.unbits(src.v, ms[i]), t: ms[i] }, dst))
 			return
 		}
 		for (const s of this.layout(dst.t)) {
@@ -2100,7 +2133,9 @@ class Emitter {
 		const st = if (fixed) this.mem(n) else 0
 		const slots = if (fixed) [] else this.layout(n)
 		// A T[n] is copied where stored, so one holding no refs, which would have the collector find it, is in the frame.
-		const r = if (!fixed) this.instance(n) else if (!this.b.holdsRef(st)) this.gc(this.spill(this.zero(n), st)) else this.alloc(st)
+		const r = if (!fixed) this.instance(n)
+			else if (!this.b.holdsRef(st)) this.gc(this.spill(this.zero(n), st))
+			else this.alloc(st)
 		let f = 0
 		for (const j of 0 ... vs.length - 1) {
 			if (spreads.includes(j)) {
@@ -2143,7 +2178,8 @@ class Emitter {
 	/// The function initializing an instance of class decl c in place, defined in its module.
 	private initializer(c: i32): Value {
 		const ps = [...this.scopeOf(c).map(_ => this.i64), this.ref]
-		return this.b.function(this.symbol(c) + ":init", this.b.fn(this.void, ps), this.p.decls[c].module == this.m && this.p.decls[c].owner >= 0)
+		return this.b.function(this.symbol(c) + ":init", this.b.fn(this.void, ps),
+			this.p.decls[c].module == this.m && this.p.decls[c].owner >= 0)
 	}
 
 	/// Runs the initializers of class n on the instance at refers to, then its constructor, if it has one, with args.
@@ -2203,7 +2239,8 @@ class Emitter {
 				const bits = this.rt("convert", [this.desc(t), this.tagOf(v.v), this.bitsOf(v.v)], false)
 				return this.unbits(this.union(this.desc(t), bits, this.b.constZero(this.ref)), t)
 			} else if (!this.unbound(t)) {
-				this.check(this.ir().icmp("eq", this.tagOf(v.v), this.desc(t)), "cast to a type that is not the value's")
+				this.check(this.ir().icmp("eq", this.tagOf(v.v), this.desc(t)),
+					"cast to a type that is not the value's")
 			}
 			return this.unbits(v.v, t)
 		}
@@ -2328,7 +2365,8 @@ class Emitter {
 		} else if (isNumber(k) || k == kind.Type) {
 			return if (this.ll(n) == this.i64) b else this.ir().cast("trunc", b, this.ll(n))
 		}
-		return if (k == kind.String || this.inlined(n)) this.ir().load(this.ll(n), this.refOf(u), false) else this.refOf(u)
+		return if (k == kind.String || this.inlined(n)) this.ir().load(this.ll(n), this.refOf(u), false)
+			else this.refOf(u)
 	}
 
 	/// Whether v's type, the type of its tag if a union, fits t.
@@ -2413,7 +2451,8 @@ class Emitter {
 			const m = if (ms[0] == kind.Null) ms[1] else ms[0]
 			return this.union(this.ir().select(none, this.tag(kind.Null), this.tag(m)), this.i64Const(0), x)
 		}
-		const tag = this.ir().cast("zext", this.ir().load(this.b.int(8), this.ir().gep(this.b.int(8), q, [this.i64Const(at)]), false), this.i64)
+		const tag = this.ir().cast("zext",
+			this.ir().load(this.b.int(8), this.ir().gep(this.b.int(8), q, [this.i64Const(at)]), false), this.i64)
 		const u = this.slot(this.unionTy)
 		this.cases(ms.length, i => this.ir().icmp("eq", tag, this.i64Const(this.tagByte(n, i))), i => {
 			const boxed = this.inlined(ms[i])
@@ -2426,7 +2465,8 @@ class Emitter {
 				const bare = this.ir().gep(this.b.int(8), ref, [this.i64Const(-(this.tagByte(n, i) << 56))])
 				x = if (k == 7) bare else this.ir().insert(x, bare, 2)
 			}
-			this.ir().store(if (boxed) this.union(this.tag(ms[i]), this.i64Const(0), x) else this.unionOf(this.tag(ms[i]), x, ms[i]), u, false)
+			this.ir().store(if (boxed) this.union(this.tag(ms[i]), this.i64Const(0), x)
+				else this.unionOf(this.tag(ms[i]), x, ms[i]), u, false)
 		})
 		return this.ir().load(this.unionTy, u, false)
 	}
@@ -2445,7 +2485,8 @@ class Emitter {
 				this.put(p, x, ms[i])
 			}
 			if (at >= 0) {
-				this.ir().store(this.b.constInt(this.b.int(8), this.tagByte(n, i)), this.ir().gep(this.b.int(8), q, [this.i64Const(at)]), false)
+				this.ir().store(this.b.constInt(this.b.int(8), this.tagByte(n, i)),
+					this.ir().gep(this.b.int(8), q, [this.i64Const(at)]), false)
 			}
 		}
 		const i = if (this.p.kind(v.t) == kind.Union) -1 else ms.indexOf(v.t)
@@ -2492,13 +2533,10 @@ class Emitter {
 
 	/// The tag, the bits, and the ref of union value u.
 	private tagOf(u: Value): Value { return this.ir().extract(u, 0) }
-
 	private bitsOf(u: Value): Value { return this.ir().extract(u, 1) }
-
 	private refOf(u: Value): Value { return this.ir().extract(u, 2) }
 
 	// Operators.
-
 	private compare(o: Opcode) {
 		const b = this.pop()
 		const a = this.pop()
@@ -2507,7 +2545,9 @@ class Emitter {
 			this.touch(b.t)
 		}
 		// Of the type of the operand not held as a union, if one is.
-		const t = if (this.p.kind(b.t) == kind.Union && this.p.kind(a.t) != kind.Union || this.boxed(a.t) && !this.boxed(b.t)) b.t else a.t
+		const t = if (this.p.kind(b.t) == kind.Union && this.p.kind(a.t) != kind.Union
+			|| this.boxed(a.t) && !this.boxed(b.t)) b.t
+			else a.t
 		const x = this.cast(a, t)
 		const y = this.cast(b, t)
 		const k = this.p.kind(t)
@@ -2542,7 +2582,8 @@ class Emitter {
 		const ta = this.tagOf(x)
 		const same = this.ir().icmp("eq", ta, this.tagOf(y))
 		const eq = (a: Value, b: Value) => this.ir().icmp("eq", a, b)
-		let plain = this.ir().binary("and", same, this.ir().binary("and", eq(this.bitsOf(x), this.bitsOf(y)), eq(this.refOf(x), this.refOf(y))))
+		let plain = this.ir().binary("and", same,
+			this.ir().binary("and", eq(this.bitsOf(x), this.bitsOf(y)), eq(this.refOf(x), this.refOf(y))))
 		for (const f of [kind.F32, kind.F64]) {
 			if (this.holds(t, f)) {
 				const v = this.ir().fcmp("oeq", this.unbits(x, f), this.unbits(y, f))
@@ -2575,7 +2616,8 @@ class Emitter {
 		this.condBr(this.ir().binary("and", eq(tx, this.desc(kind.String)), eq(ty, this.desc(kind.String))), str, other)
 		this.start(str)
 		const c = this.langCall("strCompare", [this.unbits(x, kind.String), this.unbits(y, kind.String)])
-		this.ir().store(this.ir().icmp((if (eqs) mnemonic(o) else `s${mnemonic(o)}`) as Cmp, c, this.b.constInt(this.i32, 0)), r, false)
+		this.ir().store(this.ir().icmp((if (eqs) mnemonic(o) else `s${mnemonic(o)}`) as Cmp, c,
+			this.b.constInt(this.i32, 0)), r, false)
 		this.jump(join)
 		this.start(other)
 		let v = this.ir().cast("trunc", this.number(if (eqs) op.Eq else o, x, y), this.i1)
@@ -2621,7 +2663,8 @@ class Emitter {
 				const minus = this.ir().icmp("eq", y, this.b.constInt(ty, -1))
 				const d = this.ir().select(minus, this.b.constInt(ty, 1), y)
 				const q = this.ir().binary(`s${name}` as Binary, x, d)
-				const neg = if (o == op.Div) this.ir().binary("sub", this.b.constInt(ty, 0), x) else this.b.constInt(ty, 0)
+				const neg = if (o == op.Div) this.ir().binary("sub", this.b.constInt(ty, 0), x)
+					else this.b.constInt(ty, 0)
 				r = this.ir().select(minus, neg, q)
 			} else {
 				r = this.ir().binary(`u${name}` as Binary, x, y)
@@ -2648,12 +2691,12 @@ class Emitter {
 	/// The bits of o on the numbers boxed x and y of one type, as src/type.c computes them, which takes Eq to Neg in
 	/// order; Neg ignores y.
 	private number(o: Opcode, x: Value, y: Value): Value {
-		return this.rt("number", [this.i64Const((o - op.Eq) as i64), this.tagOf(x), this.bitsOf(x), this.bitsOf(y), ...this.site()], false)
+		return this.rt("number",
+			[this.i64Const((o - op.Eq) as i64), this.tagOf(x), this.bitsOf(x), this.bitsOf(y), ...this.site()], false)
 	}
 
 	// Values held in place, once a release build's emission has learned where it can: tuples and objects that functions
 	// return or locals hold, and class instances.
-
 	/// Settles what the program's emission learned: the classes held by value, then the functions that return by value.
 	settle() {
 		this.facts.inline = this.inlines()
@@ -2749,7 +2792,8 @@ class Emitter {
 					}
 				}
 				// A finally may collect after a return has stored its value where the caller's slot is, no root.
-				if (x.kind == decl.Function && (x.mods & Extern) == 0 && this.holdable(p.b(x.type)) && !c.ops.includes(op.Finally)) {
+				if (x.kind == decl.Function && (x.mods & Extern) == 0 && this.holdable(p.b(x.type))
+					&& !c.ops.includes(op.Finally)) {
 					fns.push(d)
 				}
 			}
@@ -2761,7 +2805,8 @@ class Emitter {
 				const x = p.decls[d]
 				const np = p.items(x.type).length + (if (p.method(d)) 1 else 0)
 				const ret = p.b(x.type)
-				if (!vals.has(d) && !closures.has(d) && (this.inlined(ret) || this.returnsFresh(x.code!, np, ret, vals))) {
+				if (!vals.has(d) && !closures.has(d)
+					&& (this.inlined(ret) || this.returnsFresh(x.code!, np, ret, vals))) {
 					vals.set(d, true)
 					more = true
 				}
@@ -2776,7 +2821,8 @@ class Emitter {
 		let any = false
 		for (const k of 1 ... c.ops.length - 1) {
 			if (c.ops[k] == op.Return) {
-				const t = if (c.ops[k - 1] == op.Local && held[c.a(k - 1)]) c.locals[c.a(k - 1)].type else this.made(c, k - 1, vals)
+				const t = if (c.ops[k - 1] == op.Local && held[c.a(k - 1)]) c.locals[c.a(k - 1)].type
+					else this.made(c, k - 1, vals)
 				if (t < 0 || !this.same(t, ret)) {
 					return false
 				}
@@ -2811,7 +2857,8 @@ class Emitter {
 				set[a] = true
 			} else if (o == op.Local && held[l]) {
 				const next = if (k + 1 < c.ops.length) k + 1 else k
-				held[l] = val && c.ops[next] == op.Return || c.ops[next] == op.Field
+				held[l] = val && c.ops[next] == op.Return
+					|| c.ops[next] == op.Field
 					&& this.layout(this.norm(c.locals[l].type)).some(s => s.name == c.a(next))
 			}
 		}
@@ -2838,12 +2885,15 @@ class Emitter {
 	private holdable(t: i32): bool {
 		const n = this.norm(t)
 		const k = this.p.kind(n)
-		return this.inlined(n) || (k == kind.Tuple || k == kind.Object)
+		return this.inlined(n)
+			|| (k == kind.Tuple || k == kind.Object)
 			&& !this.layout(n).some(s => s.embed || this.kindOf(s.t) == kind.FixedArray)
 	}
 
 	/// Whether v is held by value, not by a ref.
-	private isHeld(v: V): bool { return this.facts.phase == "learned" && this.b.typeOf(v.v) != this.ref && this.holdable(v.t) }
+	private isHeld(v: V): bool {
+		return this.facts.phase == "learned" && this.b.typeOf(v.v) != this.ref && this.holdable(v.t)
+	}
 
 	/// v by ref: a tuple or object held by value boxed on the heap, field by field, which LLVM forwards, unlike a
 	/// struct's; a class instance stays held by value, unless a function's result (see result).
@@ -2972,7 +3022,8 @@ class Emitter {
 			}
 		}
 		for (const l of 0 ... c.locals.length - 1) {
-			ok[l] = ok[l] && first[l] < c.ops.length && (sets[l] == 0 || sets[l] == 1 && at[l] < first[l] && (fresh[l] || !looped[l]))
+			ok[l] = ok[l] && first[l] < c.ops.length
+				&& (sets[l] == 0 || sets[l] == 1 && at[l] < first[l] && (fresh[l] || !looped[l]))
 		}
 		return ok
 	}
@@ -3005,7 +3056,6 @@ class Emitter {
 	}
 
 	// Places.
-
 	/// Where local n is: of one a Fresh boxes, the box it holds.
 	private local(n: i32): Value {
 		return if (this.fresh[n]) this.ir().load(this.ref, this.locals[n], false) else this.locals[n]
@@ -3031,7 +3081,9 @@ class Emitter {
 	}
 
 	/// Where the elements of the array at a are.
-	private elements(a: Value): Value { return this.header(this.ir().load(this.ref, this.ir().field(this.arrayTy, a, 2), false)) }
+	private elements(a: Value): Value {
+		return this.header(this.ir().load(this.ref, this.ir().field(this.arrayTy, a, 2), false))
+	}
 
 	/// The value at place q of type t; a fixed array is its place.
 	private fetch(q: Value, t: i32): Value {
@@ -3104,11 +3156,14 @@ class Emitter {
 
 	/// Place q as a ref: one into the frame or a constant is no ref of the collector's, which leaves it as it is.
 	private gc(q: Value): Value {
-		return if (this.b.typeOf(q) == this.ref) q else this.ir().cast("inttoptr", this.ir().cast("ptrtoint", q, this.i64), this.ref)
+		return if (this.b.typeOf(q) == this.ref) q
+			else this.ir().cast("inttoptr", this.ir().cast("ptrtoint", q, this.i64), this.ref)
 	}
 
 	/// Ref r as a plain pointer, which C takes: what it refers to stays where it is while no bober runs.
-	private raw(r: Value): Value { return this.ir().cast("inttoptr", this.ir().cast("ptrtoint", r, this.i64), this.ptr) }
+	private raw(r: Value): Value {
+		return this.ir().cast("inttoptr", this.ir().cast("ptrtoint", r, this.i64), this.ptr)
+	}
 
 	/// An alloca in the entry block.
 	private slot(t: IrType): Value {
@@ -3121,7 +3176,8 @@ class Emitter {
 
 	/// The integer, bool or Type v extended to an i64.
 	private ext(v: V): Value {
-		return if (this.b.typeOf(v.v) == this.i64) v.v else this.ir().cast(if (kind.isSigned(v.t)) "sext" else "zext", v.v, this.i64)
+		return if (this.b.typeOf(v.v) == this.i64) v.v
+			else this.ir().cast(if (kind.isSigned(v.t)) "sext" else "zext", v.v, this.i64)
 	}
 
 	/// Traps with what unless cond.
@@ -3145,13 +3201,9 @@ class Emitter {
 
 	/// The source path and position of the op being emitted, as rt.c's functions that trap take them.
 	private site(): Value[] { return [this.cstr(this.path), this.b.constInt(this.i32, this.pos)] }
-
 	// The stack and the blocks.
-
 	private push(v: Value, t: i32) { this.stack.push({ v: v, t: this.norm(t) }) }
-
 	private pop(): V { return this.heap(this.taken(this.stack.pop())) }
-
 	/// The bool popped, as which a CallMethod's result, of any type, is cast.
 	private cond(): Value { return this.cast(this.pop(), kind.Bool) }
 
@@ -3194,11 +3246,8 @@ class Emitter {
 	}
 
 	private label(): Block { return this.b.block(this.fn) }
-
 	private bool(v: bool): Value { return this.b.constInt(this.i1, if (v) 1 else 0) }
-
 	private i64Const(n: i64): Value { return this.b.constInt(this.i64, n) }
-
 	private not(v: Value): Value { return this.ir().binary("xor", v, this.bool(true)) }
 
 	/// The string literal s, made once, a constant: a long string of the program's one copy of its bytes, named by them,
@@ -3220,13 +3269,14 @@ class Emitter {
 	}
 
 	/// The C string of s, made once.
-	private cstr(s: string): Value { return this.cstrs.get(s) ?? put(this.cstrs, s, this.b.constant(this.b.constBytes(s + "\0"))) }
+	private cstr(s: string): Value {
+		return this.cstrs.get(s) ?? put(this.cstrs, s, this.b.constant(this.b.constBytes(s + "\0")))
+	}
 
 	// Generics, in a program as lowered: a generic's code is emitted once, taking the descriptors of its type args
 	// first, a closure's in its env. A value of a type param not bound there is held as a union of any type, tagged
 	// with its type's descriptor; in memory, as a field or element, it is held as its type's values are, which the
 	// descriptor says how.
-
 	/// Starts the function this.fn: its entry block, and the type params it takes the descriptors of.
 	private enter(scope: i32[], descs: Value[]) {
 		this.scope = scope
@@ -3268,7 +3318,8 @@ class Emitter {
 	private desc(t: i32, kept = false): Value {
 		const n = if (kept) this.kept(t) else this.norm(t)
 		return if (!this.unbound(n)) this.b.constCast("ptrtoint", this.describe(n), this.i64)
-			else if (kept) this.formedDesc(n) else this.word(this.formedDesc(n), canonAt)
+			else if (kept) this.formedDesc(n)
+			else this.word(this.formedDesc(n), canonAt)
 	}
 
 	/// The address of the descriptor of n, which has params, formed when the function starts from theirs.
@@ -3312,8 +3363,10 @@ class Emitter {
 		for (const k of 0 ... holes.length - 1) {
 			this.ir().store(this.desc(holes[k], true), this.ir().gep(this.i64, args, [this.i64Const(k)]), false)
 		}
-		const ps = this.b.constant(this.b.constArray(this.i64, holes.map(h => this.b.constCast("ptrtoint", this.describe(h), this.i64))))
-		const d = this.rt("type_of", [this.b.constCast("ptrtoint", this.describe(n), this.i64), this.i64Const(holes.length), ps, args], false)
+		const ps = this.b.constant(this.b.constArray(this.i64,
+			holes.map(h => this.b.constCast("ptrtoint", this.describe(h), this.i64))))
+		const d = this.rt("type_of",
+			[this.b.constCast("ptrtoint", this.describe(n), this.i64), this.i64Const(holes.length), ps, args], false)
 		if (statics.length == 0) {
 			this.formed.set(n, d)
 			this.b.at(here)
@@ -3339,11 +3392,14 @@ class Emitter {
 
 	/// Word k of the descriptor at d.
 	private word(d: Value, k: i32): Value {
-		return this.ir().load(this.i64, this.ir().gep(this.i64, this.ir().cast("inttoptr", d, this.ptr), [this.i64Const(k)]), false)
+		return this.ir().load(this.i64,
+			this.ir().gep(this.i64, this.ir().cast("inttoptr", d, this.ptr), [this.i64Const(k)]), false)
 	}
 
 	/// The layout of a value of the type of descriptor d, or with ssize, of the struct one refers to.
-	private layoutOf(d: Value, ssize: bool = false): Value { return this.ir().cast("inttoptr", this.word(d, if (ssize) slayoutAt else layoutAt), this.ptr) }
+	private layoutOf(d: Value, ssize: bool = false): Value {
+		return this.ir().cast("inttoptr", this.word(d, if (ssize) slayoutAt else layoutAt), this.ptr)
+	}
 
 	/// The descriptor of n, as given: a weak global, defined once it has named those of the types it refers to, in run.
 	private describe(n: i32): Value {
@@ -3367,10 +3423,12 @@ class Emitter {
 		const w = (v: i64) => this.i64Const(v)
 		const addr = (g: Value) => b.constCast("ptrtoint", g, this.i64)
 		const list = (t: IrType, vs: Value[], local: bool) => if (vs.length == 0) w(0)
-			else addr(if (local) b.global(`bober.fields.${this.key(n)}`, b.constArray(t, vs), true, 0) else b.constant(b.constArray(t, vs)))
+			else addr(if (local) b.global(`bober.fields.${this.key(n)}`, b.constArray(t, vs), true, 0)
+			else b.constant(b.constArray(t, vs)))
 		// The count and list of the descriptors of decl d's tags, if any, which are Type values, keeping their literals.
 		const tags = (d: i32) => {
-			const ts = if (d < 0 || p.decls[d].tags == 0) [] as Value[] else p.lists[p.decls[d].tags].map(t => addr(this.describe(this.kept(t))))
+			const ts = if (d < 0 || p.decls[d].tags == 0) [] as Value[]
+				else p.lists[p.decls[d].tags].map(t => addr(this.describe(this.kept(t))))
 			return [w(ts.length), list(this.i64, ts, false)]
 		}
 		let doc = ""
@@ -3385,14 +3443,13 @@ class Emitter {
 			} else {
 				length = w(if (kind.isInt(a)) p.ints[y] else y)
 			}
-		} else if (k == kind.Array || k == kind.FixedArray || k == kind.Optional || k == kind.Rest
-			|| k == kind.Embed) {
+		} else if (k == kind.Array || k == kind.FixedArray || k == kind.Optional || k == kind.Rest || k == kind.Embed) {
 			elem = addr(this.describe(a))
 			length = w(if (k == kind.FixedArray) y else 0)
 		} else if (n == kind.String) {
 			elem = addr(this.describe(kind.U8)) // its code units', as a `u8[readonly]` reads them (src/type.c, element)
 		} else if (k == kind.Param || k == kind.Func) {
-			length = w(if (k == kind.Func) p.lists[a].length else y)  // a function's params, its last part its result
+			length = w(if (k == kind.Func) p.lists[a].length else y) // a function's params, its last part its result
 		} else if (k == kind.Named) {
 			doc = p.strings[p.decls[a].doc]
 			ki = if (this.isInterface(n)) 11 else 10
@@ -3405,7 +3462,8 @@ class Emitter {
 		if (k == kind.Named || k == kind.Object || k == kind.Tuple) {
 			for (const s of this.layout(n)) {
 				const doc = if (s.decl < 0) "" else p.strings[p.decls[s.decl].doc]
-				fields.push(b.constStruct([this.str(p.strings[s.name]), this.str(doc), addr(this.describe(this.kept(s.t))), w(s.mods), w(0), ...tags(s.decl)]))
+				fields.push(b.constStruct([this.str(p.strings[s.name]), this.str(doc),
+					addr(this.describe(this.kept(s.t))), w(s.mods), w(0), ...tags(s.decl)]))
 			}
 		}
 		const methods: Value[] = []
@@ -3422,8 +3480,10 @@ class Emitter {
 				methods.push(b.constStruct([this.str(name), b.constZero(this.ptr)]))
 			}
 		}
-		const ps = (if (k == kind.Named || k == kind.Union || k == kind.Func) p.parts(n) else []).map(t => addr(this.describe(t)))
-		const head = [w(if (kind.isPrimitive(n)) n else 0), w(ki), this.str(this.key(n)), this.str(showType(p, n)), this.str(doc)]
+		const ps = (if (k == kind.Named || k == kind.Union || k == kind.Func) p.parts(n)
+			else []).map(t => addr(this.describe(t)))
+		const head = [w(if (kind.isPrimitive(n)) n else 0), w(ki), this.str(this.key(n)), this.str(showType(p, n)),
+			this.str(doc)]
 		return b.constStruct([...head, this.str(typeKinds[ki]), elem, base, length, value, w(ps.length),
 			list(this.i64, ps, false), w(fields.length), list(this.fieldTy, fields, true), w(methods.length),
 			list(b.struct([this.stringTy, this.ptr]), methods, false), w(0), w(0), w(0), w(0), w(0), w(0), ...tagged,
@@ -3440,7 +3500,9 @@ class Emitter {
 
 	/// The value of type t at place q.
 	private read(q: Value, t: i32): Value {
-		return if (this.dynamic(t)) this.load(this.desc(t), q) else if (this.packed(this.norm(t))) this.unpack(q, t) else this.fetch(q, t)
+		return if (this.dynamic(t)) this.load(this.desc(t), q)
+			else if (this.packed(this.norm(t))) this.unpack(q, t)
+			else this.fetch(q, t)
 	}
 
 	/// Stores v at place q, a field or an element, which elem says it is, of type t.
@@ -3479,8 +3541,10 @@ class Emitter {
 		this.rt("memcpy", [this.raw(r), this.raw(q), size], false)
 		// Without the tag of a packed union a string holds in its spare byte.
 		const spare = this.ir().gep(this.b.int(8), r, [this.i64Const(23)])
-		const string = this.ir().icmp("eq", this.word(this.ir().load(this.i64, u, false), heldAt), this.i64Const(kind.String))
-		this.ir().store(this.ir().select(string, this.b.constInt(this.b.int(8), 0), this.ir().load(this.b.int(8), spare, false)), spare, false)
+		const string = this.ir().icmp("eq", this.word(this.ir().load(this.i64, u, false), heldAt),
+			this.i64Const(kind.String))
+		this.ir().store(this.ir().select(string, this.b.constInt(this.b.int(8), 0),
+			this.ir().load(this.b.int(8), spare, false)), spare, false)
 		this.ir().store(r, this.ir().field(this.unionTy, u, 2), false)
 		this.jump(done)
 		this.start(done)
@@ -3507,22 +3571,27 @@ class Emitter {
 	/// The place of element k of the array or fixed array that arr holds as a union, and its type's descriptor.
 	private dynElement(arr: V, k: V): [Value, Value] {
 		const t = this.slot(this.i64)
-		const q = this.rt("element", [this.spill(this.cast(arr, this.any), this.unionTy), this.ext(k), t, ...this.site()], false)
+		const q = this.rt("element",
+			[this.spill(this.cast(arr, this.any), this.unionTy), this.ext(k), t, ...this.site()], false)
 		return [this.gc(q), this.ir().load(this.i64, t, false)]
 	}
 
 	/// Whether a subscript of arr by k names a field, by a static string.
-	private byName(arr: V, k: V): bool { return this.dyn && this.kindOf(k.t) == kind.String && this.kindOf(arr.t) != kind.String }
+	private byName(arr: V, k: V): bool {
+		return this.dyn && this.kindOf(k.t) == kind.String && this.kindOf(arr.t) != kind.String
+	}
 
 	// Types, each computed once per id.
-
 	/// t as its values are held: a literal type as its base, a rest or embed as what it holds, a union re-made of its
 	/// members so, which may collapse, but a class or interface with its args kept, each set of which is an instance of
 	/// its own (§4.9); equal types have equal ids.
 	private norm(t: i32): i32 {
 		const k = this.p.kind(t)
-		return this.facts.norms.get(t) ?? put(this.facts.norms, t, if (k == kind.Literal || k == kind.Rest || k == kind.Embed)
-			this.norm(this.p.a(t)) else if (k == kind.Named) this.kept(t) else this.p.map(t, x => this.norm(x)))
+		return this.facts.norms.get(t)
+			?? put(this.facts.norms, t,
+			if (k == kind.Literal || k == kind.Rest || k == kind.Embed) this.norm(this.p.a(t))
+			else if (k == kind.Named) this.kept(t)
+			else this.p.map(t, x => this.norm(x)))
 	}
 
 	/// t as reflection sees it, as a field's type or type arg, its literal types kept, though a value of one is held, and
@@ -3530,7 +3599,8 @@ class Emitter {
 	private kept(t: i32): i32 {
 		const k = this.p.kind(t)
 		return this.facts.keeps.get(t)
-			?? put(this.facts.keeps, t, if (k == kind.Rest || k == kind.Embed) this.kept(this.p.a(t)) else this.p.map(t, x => this.kept(x)))
+			?? put(this.facts.keeps, t,
+			if (k == kind.Rest || k == kind.Embed) this.kept(this.p.a(t)) else this.p.map(t, x => this.kept(x)))
 	}
 
 	private kindOf(t: i32): kind.Kind { return this.p.kind(this.norm(t)) }
@@ -3590,7 +3660,8 @@ class Emitter {
 	/// lowered, of a type param not bound, a type a Type value holds, an interface or an object type, or of any type.
 	private boxed(n: i32): bool {
 		const k = this.p.kind(n)
-		return this.dyn && (k == kind.Param || k == kind.Of || k == kind.Member || k == kind.Object
+		return this.dyn
+			&& (k == kind.Param || k == kind.Of || k == kind.Member || k == kind.Object
 			|| k == kind.Named && this.isInterface(n) || n == this.any)
 	}
 
@@ -3621,7 +3692,8 @@ class Emitter {
 	/// The type of t in a frame or global, a fixed array's elements in place.
 	private mem(t: i32): IrType {
 		const n = this.norm(t)
-		return if (this.p.kind(n) == kind.FixedArray) this.b.array(this.stored(this.p.a(n)), this.p.b(n) as u64) else this.ll(n)
+		return if (this.p.kind(n) == kind.FixedArray) this.b.array(this.stored(this.p.a(n)), this.p.b(n) as u64)
+			else this.ll(n)
 	}
 
 	/// The type of t as a field or element: a union packed (§4.4), the word its members' refs share a ref.
@@ -3666,7 +3738,8 @@ class Emitter {
 			for (const f of p.decls[a].members) {
 				const d = p.decls[f]
 				if (d.kind == decl.Var && (d.mods & Static) == 0) {
-					slots.push({ name: d.name, t: p.subst(d.type, b), embed: (d.mods & Embed) != 0, mods: d.mods, decl: f })
+					slots.push({ name: d.name, t: p.subst(d.type, b), embed: (d.mods & Embed) != 0, mods: d.mods,
+						decl: f })
 				}
 			}
 		} else {
@@ -3683,12 +3756,13 @@ class Emitter {
 	/// The struct a class instance, object or tuple refers to, an embedded one's in place.
 	private struct(t: i32): IrType {
 		const n = this.norm(t)
-		return this.structs.get(n) ?? put(this.structs, n, this.b.struct(this.layout(n).map(s => if (s.embed) this.struct(s.t) else this.stored(s.t))))
+		return this.structs.get(n)
+			?? put(this.structs, n,
+			this.b.struct(this.layout(n).map(s => if (s.embed) this.struct(s.t) else this.stored(s.t))))
 	}
 
 	/// The size of an element of array type t, an i64 constant.
 	private sizeOf(t: i32): Value { return this.b.sizeOf(this.stored(t)) }
-
 	private elem(t: i32): i32 { return this.p.a(this.norm(t)) }
 
 	/// The zero value of t (spec 5.1) as a constant; a fixed array's is its elements'.
@@ -3706,7 +3780,8 @@ class Emitter {
 			return this.b.constStruct([this.tag(z), this.i64Const(0), this.b.constZero(this.ref)])
 		}
 		const e = if (k == kind.FixedArray) this.elem(n) else -1
-		if (e >= 0 && (this.kindOf(e) == kind.Union && !this.packed(this.norm(e)) || this.kindOf(e) == kind.FixedArray)) {
+		if (e >= 0
+			&& (this.kindOf(e) == kind.Union && !this.packed(this.norm(e)) || this.kindOf(e) == kind.FixedArray)) {
 			// A boxed union's zero is not all zero bits.
 			const zs: Value[] = []
 			for (const _ of 1 ... this.p.b(n)) {
@@ -3718,7 +3793,6 @@ class Emitter {
 	}
 
 	// Decls.
-
 	/// The symbol of decl d, the same in each build of its module: <path>:<name>, a test's <path>:test <name>, so that it
 	/// does not clash with a declaration's; an owned one's its owner's .<name>, with #n after it of the nth of its
 	/// owner's of its name; an instance's then with the keys of its own args.
@@ -3731,7 +3805,8 @@ class Emitter {
 		const x = p.decls[d]
 		const path = p.modules[x.module].path
 		const name = p.strings[x.name]
-		let r = if (x.kind == decl.Test) `${path}:test ${name}` else if (x.owner < 0) `${path}:${name}`
+		let r = if (x.kind == decl.Test) `${path}:test ${name}`
+			else if (x.owner < 0) `${path}:${name}`
 			else `${this.symbol(x.owner)}.${name}${if (x.nth == 0) "" else `#${x.nth}`}`
 		const n = if (x.generic < 0) 0 else p.decls[x.generic].params.length
 		if (n > 0) {
@@ -3745,7 +3820,9 @@ class Emitter {
 	private name(d: i32): string { return this.p.strings[this.p.decls[d].name] }
 
 	/// The name, a Str, of the field of a Field's or of a Member's decl.
-	private fieldName(o: Opcode, n: i32): i32 { return if (o == op.Field || o == op.SetField) n else this.p.decls[n].name }
+	private fieldName(o: Opcode, n: i32): i32 {
+		return if (o == op.Field || o == op.SetField) n else this.p.decls[n].name
+	}
 }
 
 /// The decls of module m of p: its top-level decls and those they own, in a release build those mono keeps.
@@ -3804,7 +3881,6 @@ function kindIndex(k: kind.Kind): i32 {
 
 /// What LLVM calls an op, an instruction or a comparison predicate, give or take a prefix: its name in lower case.
 function mnemonic(o: Opcode): string { return chr(op.names[o][0] + 0x20) + op.names[o].slice(1, op.names[o].length) }
-
 function isNumber(k: i32): bool { return kind.isInt(k) || kind.isFloat(k) || k == kind.Bool }
 
 /// v, kept as what m has for k: a memo's the first time, as `m.get(k) ?? put(m, k, ...)`.
