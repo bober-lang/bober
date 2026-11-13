@@ -214,6 +214,15 @@ test "an x86-64 aggregate goes on the stack whole when the registers left cannot
 	assert has(ir, "define i64 @f(i64 %0, i64 %1, i64 %2, i64 %3, i64 %4, ptr byval([16 x i8]) %5)")
 }
 
+test "a long double is x86's extended float, in memory within an aggregate, or IEEE's quad on arm64 but Apple's" {
+	const ir = compile("struct Q { long double a, b; }; long double f(long double x, struct Q q) { return x + q.b; }")
+	if (arch == "x86_64") {
+		assert has(ir, "define x86_fp80 @f(x86_fp80 %0, ptr byval([32 x i8]) %1)")
+	} else if (aapcs) {
+		assert has(ir, "define fp128 @f(fp128 %0, [2 x fp128] %1)")
+	}
+}
+
 test "__builtin_frame_address(0) is the frame pointer" {
 	const ir = compile("void *f(void) { return __builtin_frame_address(0); }")
 	assert has(ir, "%2 = call ptr @llvm.frameaddress.p0(i32 0)")

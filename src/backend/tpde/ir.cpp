@@ -73,6 +73,7 @@ u32 type(Module &m, Type::Kind kind, u64 n = 0, Run elems = {}) {
 	case Type::Int: scalar(n <= 8 ? 1 : n <= 16 ? 2 : n <= 32 ? 4 : 8, false); break;
 	case Type::F32: scalar(4, true); break;
 	case Type::F64: scalar(8, true); break;
+	case Type::LongDouble: scalar(16, true); break;
 	case Type::Ptr: scalar(8, false); break;
 	case Type::Struct:
 		for (u32 k = elems.at; k < elems.at + elems.n; k++) {
@@ -124,6 +125,11 @@ u32 address(Module &m, u32 base, i64 off, u32 t) {
 		return m.fail("a constant address does not fit in a type smaller than a pointer");
 	}
 	return add(m, {.op = Op::Addr, .type = t, .imm = u64(off), .ops = push(m.opList, {base})});
+}
+
+/// Whether t holds a long double, which TPDE cannot compute with.
+bool longDouble(const Module &m, u32 t) {
+	return std::ranges::any_of(m.parts(m.types[t]), [](const Part &p) { return p.fp && p.size > 8; });
 }
 
 /// Appends an instruction to the current block, which jumps to succs if it is the terminator.
@@ -211,6 +217,7 @@ TpdeTypeRef TpdeVoidType(TpdeModuleRef m) { return type(*m, Type::Void); }
 TpdeTypeRef TpdeIntType(TpdeModuleRef m, unsigned bits) { return type(*m, Type::Int, bits); }
 TpdeTypeRef TpdeFloatType(TpdeModuleRef m) { return type(*m, Type::F32); }
 TpdeTypeRef TpdeDoubleType(TpdeModuleRef m) { return type(*m, Type::F64); }
+TpdeTypeRef TpdeLongDoubleType(TpdeModuleRef m) { return type(*m, Type::LongDouble); }
 TpdeTypeRef TpdePointerType(TpdeModuleRef m) { return type(*m, Type::Ptr); }
 TpdeTypeRef TpdeRefType(TpdeModuleRef m) { return type(*m, Type::Ptr, 1); }
 TpdeTypeRef TpdeFunctionType(TpdeModuleRef m, TpdeTypeRef result, TpdeTypeRef *params, unsigned n, int variadic) {
@@ -225,6 +232,9 @@ TpdeTypeRef TpdeArrayType(TpdeModuleRef m, TpdeTypeRef elem, uint64_t n) {
 
 TpdeValueRef TpdeConstInt(TpdeModuleRef m, TpdeTypeRef t, uint64_t n) { return constant(*m, t, n); }
 TpdeValueRef TpdeConstReal(TpdeModuleRef m, TpdeTypeRef t, double x) {
+	if (longDouble(*m, t)) {
+		return m->fail("long double is not supported by TPDE");
+	}
 	float f = x;
 	u64 bits = 0;
 	m->types[t].kind == Type::F32 ? std::memcpy(&bits, &f, 4) : std::memcpy(&bits, &x, 8);
@@ -481,8 +491,23 @@ TpdeValueRef TpdeBuildLandingPad(TpdeModuleRef m, TpdeValueRef typeinfo) {
 const char *TpdeVerifyModule(TpdeModuleRef m) {
 	group(*m);
 	m->msg = m->error;
+	// What the code kept and the constants use, as global initializers do.
+	std::vector<bool> used(m->vals.size());
+	for (u32 i = 1; i < m->vals.size(); i++) {
+		if (m->vals[i].block == 0 || !m->sym(m->blocks[m->vals[i].block].fn).removed) {
+			for (u32 o : m->ops(i)) {
+				used[o] = true;
+			}
+		}
+	}
 	for (const Sym &s : m->syms) {
+		used[s.init] = true;
+	}
+	for (Sym &s : m->syms) {
 		auto fail = [&](const std::string &what) { m->msg = m->msg.empty() ? what + " in " + s.name : m->msg; };
+		// Whether the function computes with a long double: takes, returns or makes one.
+		bool wide = m->vals[s.val].op == Op::Function
+			&& std::ranges::any_of(m->elems(m->types[s.type]), [&](u32 t) { return longDouble(*m, t); });
 		for (u32 b : s.removed ? std::span<const u32>{} : m->blocksOf(s)) {
 			std::span<const u32> insts = m->insts(b);
 			if (insts.empty() || !terminates(m->vals[insts.back()].op)) {
@@ -490,6 +515,7 @@ const char *TpdeVerifyModule(TpdeModuleRef m) {
 			}
 			for (size_t i = 0; i < insts.size(); i++) {
 				const Value &v = m->vals[insts[i]];
+				wide |= longDouble(*m, v.type);
 				if (i + 1 < insts.size() && terminates(v.op)) {
 					fail("a terminator is not at the end of its block");
 				}
@@ -502,6 +528,13 @@ const char *TpdeVerifyModule(TpdeModuleRef m) {
 						fail("an invoke does not unwind to a landing pad");
 					}
 				}
+			}
+		}
+		// Unless local and unused, as a header's inline one may be, when it is dropped.
+		if (wide && !s.removed) {
+			s.removed = s.local && !used[s.val];
+			if (!s.removed) {
+				fail("long double is not supported by TPDE");
 			}
 		}
 	}

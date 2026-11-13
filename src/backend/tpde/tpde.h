@@ -40,6 +40,8 @@ TpdeTypeRef TpdeVoidType(TpdeModuleRef m);
 TpdeTypeRef TpdeIntType(TpdeModuleRef m, unsigned bits);
 TpdeTypeRef TpdeFloatType(TpdeModuleRef m);
 TpdeTypeRef TpdeDoubleType(TpdeModuleRef m);
+/// C's long double, which values may be declared of but no instruction or constant may use.
+TpdeTypeRef TpdeLongDoubleType(TpdeModuleRef m);
 TpdeTypeRef TpdePointerType(TpdeModuleRef m);
 /// A pointer the collector knows (src/rt.c), which a collected module keeps where its stack maps say across calls.
 TpdeTypeRef TpdeRefType(TpdeModuleRef m);
