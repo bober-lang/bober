@@ -23,7 +23,7 @@ import { base, dir as parent, isAbs, join, rel } from "../std/fs/path"
 import { fnv } from "../std/hash"
 import { stdin, stdout } from "../std/io"
 import { arch, os } from "../std/os"
-import { ParseError, split, trim } from "../std/string"
+import { ParseError, codePoint, split, trim, utf8 } from "../std/string"
 import { abi, write } from "./bc/file"
 import { Program } from "./bc/program"
 import { show } from "./bc/show"
@@ -74,8 +74,9 @@ section bober_bc. Else each module is built with TPDE, to debug, once as lowered
 descriptors; into one shared library of all that is built there, build/image.so, which run and test load, and which a
 build links only what changed into. -mono has run and test monomorphize the program first, as -release does, so that
 it runs fast, into build/image.mono.so; by default where the environment sets CI, as CI runners do.
-test prints a YAML mapping of the tests, or of the files and directories with tests: each ok if all in it passed, else
-what failed in it, a test's trap after what it printed.`
+test prints a YAML mapping of the tests: each ok if it passed, else what failed in it, a test's trap after what it
+printed. Without main.bob, it prints the mapping of the files that failed, under their directories, each as it fails,
+then how many passed; on a terminal, its last line shows the file it is at.`
 
 const dir = "build"
 
@@ -140,13 +141,11 @@ function command(cmd: string, f: Flags): i32 {
 	const dirs = f.I
 	switch (cmd) {
 		case "test":
-			const [status, report] = if (argv.length == 0) testAll(".", f)
-				else runTests(argv[0], argv.slice(1, argv.length), f)
-			try {
-				stdout.write(yaml.emit(yaml.documents(report)))
-			} catch (e: ParseError | yaml.EncodeError) {
-				print(report)  // not UTF-8
+			if (argv.length == 0) {
+				return testAll(f)
 			}
+			const [status, report] = runTests(argv[0], argv.slice(1, argv.length), f)
+			stdout.write(yamlOf(report))
 			return status
 		case "build":
 			if (argv.length == 0) {
@@ -232,28 +231,65 @@ function init(name: string) {
 	save("bober.pkg", `{\n\t"name": ${quoted(n)}\n}\n`)
 }
 
-/// The tests of each file that has some in d and below, but in build/, hidden directories and builtin/, which no
-/// program tests: 0 if all passed, and their report, a JSON object of d's files and directories with tests, each "ok"
-/// if all of its passed, else a file's report as runTests gives it, or a directory's as this.
-function testAll(d: string, f: Flags): [i32, string] {
-	let status = 0
-	const entries: string[] = []
+/// Runs the tests of testFiles(".") as test without main.bob prints them; 0 if all passed. A failed file's YAML starts
+/// with a line for each of its directories, of which those the last failed file printed are left out.
+function testAll(f: Flags): i32 {
+	const files = testFiles(".")
+	const clear = if (isatty(1) != 0) "\r\x1b[K" else ""
+	let dirs: string[] = [] // of the last failed file
+	let failed = 0
+	for (const i of 0 ... files.length - 1) {
+		if (clear != "") {
+			stdout.write(`${clear}[${i + 1}/${files.length}] ${files[i]}`)
+		}
+		const [s, report] = runTests(files[i], [], f)
+		if (s != 0) {
+			const parts = split(files[i], "/")
+			const lines = split(yamlOf(parts.map(p => `{${quoted(p)}:`).join("") + report
+				+ parts.map(p => "}").join("")), "\n")
+			let k = 0
+			while (k < dirs.length && k < parts.length - 1 && dirs[k] == parts[k]) {
+				k++
+			}
+			stdout.write(clear + lines.slice(k, lines.length).join("\n"))
+			dirs = parts.slice(0, parts.length - 1)
+			failed++
+		}
+	}
+	stdout.write(`${clear}# ${files.length - failed} of ${files.length} files passed\n`)
+	return if (failed == 0) 0 else 1
+}
+
+/// The files that have tests in d and below, but in build/, hidden directories and builtin/, which no program tests.
+function testFiles(d: string): string[] {
+	const files: string[] = []
 	const es = readDir(d)
 	sortBy(es, (a, b) => a.name < b.name)
 	for (const e of es) {
 		const p = join(d, e.name)
-		const sub = e.isDirectory && e.name != "build" && !startsWith(e.name, ".")
-		if (sub || endsWith(e.name, ".bob") && !builtin(p) && hasTests(p)) {
-			const [s, report] = if (sub) testAll(p, f) else runTests(p, [], f)
-			if (report != "{}") {
-				entries.push(`${quoted(e.name)}:${if (s == 0) `"ok"` else report}`)
-				if (s != 0) {
-					status = 1
-				}
-			}
+		if (e.isDirectory && e.name != "build" && !startsWith(e.name, ".")) {
+			files.push(...testFiles(p))
+		} else if (endsWith(e.name, ".bob") && !builtin(p) && hasTests(p)) {
+			files.push(p)
 		}
 	}
-	return [status, `{${entries.join(",")}}`]
+	return files
+}
+
+/// The report, JSON, as YAML, each byte of it not UTF-8, which YAML cannot hold, as U+FFFD.
+function yamlOf(report: string): string {
+	let s = ""
+	let i = 0
+	while (i < report.length) {
+		const [c, end] = codePoint(report, i)
+		s += if (c == 0xfffd) utf8(c) else report.slice(i, end)
+		i = end
+	}
+	try {
+		return yaml.emit(yaml.documents(s))
+	} catch (e: ParseError | yaml.EncodeError) {
+		return s + "\n"  // not a report
+	}
 }
 
 /// Builds the program of main with its tests and runs them with args: its exit status, and its report, the JSON object
