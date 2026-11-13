@@ -4,11 +4,14 @@
 //! on macOS, whose loader is the system's. An image named `*.run` is a run's own link to it, removed once loaded.
 
 #include <dlfcn.h>
+#include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 int main(int argc, char **argv) {
-	void *image = argc < 3 ? 0 : dlopen(argv[1], RTLD_NOW);
+	char path[PATH_MAX]; // absolute: the package's launcher, hardened on macOS (ci.yml), loads no relative path
+	void *image = argc < 3 ? 0 : dlopen(realpath(argv[1], path) ? path : argv[1], RTLD_NOW);
 	int (*entry)(int, char **) = image ? (int (*)(int, char **))dlsym(image, argv[2]) : 0;
 	const char *run = argc < 3 ? 0 : strrchr(argv[1], '.');
 	if (run && !strcmp(run, ".run")) {

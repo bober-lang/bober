@@ -113,10 +113,23 @@ export function unbundle(s: string): HashMap[string, string] throws ParseError {
 	return files
 }
 
-/// The hash of the compiler's first page, which has a hash of its content: ELF's build ID, or Mach-O's UUID.
+/// The hash of the compiler's ID: Mach-O's UUID, which signing it keeps, else its first page, with ELF's build ID.
 export function compilerId(): u64 throws IoError {
 	const f = open(executable())
 	const page = f.read(4096) ?? ""
 	f.close()
+	const r = new Reader(page)
+	try {
+		if (r.fixed(4) == 0xfeedfacf) {
+			r.pos = 32 // the load commands, after the header
+			while (true) {
+				const at = r.pos
+				if (r.fixed(4) == 0x1b) { // LC_UUID
+					return fnv(page.slice(at + 8, at + 24))
+				}
+				r.pos = at + (r.fixed(4) as i32)
+			}
+		}
+	} catch (e: ParseError) {}
 	return fnv(page)
 }
