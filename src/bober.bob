@@ -636,10 +636,10 @@ function archive(c: CLib, out: string, pkg: string, includes: string[]): string 
 }
 
 /// Builds and installs each CMake project of p into its out, listing the static libraries it installs in out/libs,
-/// unless its entry in p, its patches and toolchain files are what they were last, and it was built after those of p
-/// before it and the files of its src if a directory: its src, copied or fetched with its hash checked to out/src,
-/// patched, and configured afresh with its preset "bober" and toolchain file, finding those of p before it, in
-/// out/build, which is kept, as the archive fetched.
+/// unless its stamp is what it was last: its entry in p, its patches and toolchain files, the stamps of those of p
+/// before it and the files of its src if a directory, by their contents, not times, which a checkout or a cache resets.
+/// Its src, copied or fetched with its hash checked to out/src, patched, and configured afresh with its preset "bober"
+/// and toolchain file, finding those of p before it, in out/build, which is kept, as the archive fetched.
 function cmake(p: Package) {
 	const cwd = fromCString(getcwd(0, 0))
 	const before: string[] = []
@@ -649,14 +649,20 @@ function cmake(p: Package) {
 		}
 		const o = out(p.name, name)
 		const tools = toolchain(c, cwd)
-		const entry = encode(c.src) + encode(c.cmake) + c.patches.map(x => readFile(x)).join("")
-			+ (if (c.toolchain == "") "" else readFile(c.toolchain)) + tools
 		const src = c.src
-		const inputs = [...before.map(b => `${b}/stamp`), ...(if (src instanceof string) glob(`${src}/**/*`) else [])]
+		const files = if (src instanceof string) glob(`${src}/**/*`).filter(f => !stat(f).isDirectory) else []
+		const entry = encode(src) + encode(c.cmake) + c.patches.map(x => readFile(x)).join("")
+			+ (if (c.toolchain == "") "" else readFile(c.toolchain)) + tools
+			+ before.map(b => `${b} ${fnv(readFile(`${b}/stamp`))}\n`).join("")
+			+ files.map(f => `${f} ${fnv(mapFile(f))}\n`).join("")
 		const prefixes = before.map(b => `${cwd}/${b}`).join(";")
 		before.push(o)
-		if (newer(`${o}/stamp`, inputs) && readFile(`${o}/stamp`) == entry) {
+		if (exists(`${o}/stamp`) && readFile(`${o}/stamp`) == entry) {
 			continue
+		}
+		// Gone while it builds, so that the stamps of a build cut short tell, as CI keys its cache by them.
+		if (exists(`${o}/stamp`)) {
+			remove(`${o}/stamp`)
 		}
 		let root = `${o}/src`
 		if (exists(root)) {
@@ -689,7 +695,7 @@ file(ARCHIVE_EXTRACT INPUT "${o}/src.tar" DESTINATION "${o}/fetch")`)
 			`${cwd}/${o}/toolchain.cmake`, `-DCMAKE_PREFIX_PATH=${prefixes}`])
 		run(["cmake", "--build", `${o}/build`])
 		run(["cmake", "--install", `${o}/build`, "--prefix", o])
-		save(`${o}/libs`, installed(`${o}/build`).join("\n"))
+		save(`${o}/libs`, installed(o).join("\n"))
 		save(`${o}/stamp`, entry)
 	}
 }
@@ -698,26 +704,32 @@ file(ARCHIVE_EXTRACT INPUT "${o}/src.tar" DESTINATION "${o}/fetch")`)
 class Target {
 	type: string = ""
 	artifacts: Artifact[] = []
-	install: Keys = new Keys()
+	install: Install = new Install()
+	rest: Unknown[] @Rest = []
+}
+
+class Install {
+	destinations: Artifact[] = []
 	rest: Unknown[] @Rest = []
 }
 
 class Artifact {
 	path: string = ""
+	rest: Unknown[] @Rest = []
 }
 
-/// The static libraries the CMake project built in build installs, as its file API tells.
-function installed(build: string): string[] {
+/// The static libraries the CMake project built in o/build installs into o, as its file API tells.
+function installed(o: string): string[] {
 	const libs: string[] = []
-	for (const f of glob(`${build}/.cmake/api/v1/reply/target-*.json`)) {
+	for (const f of glob(`${o}/build/.cmake/api/v1/reply/target-*.json`)) {
 		let t = new Target()
 		try {
 			t = decodeJson[Target](readFile(f))
 		} catch (e: ParseError) {
 			throw new CompileError(`${f}: ${e.kind} error at byte ${e.at}`)
 		}
-		if (t.type == "STATIC_LIBRARY" && t.install.all.length > 0) {
-			libs.push(...t.artifacts.map(a => join(build, a.path)))
+		if (t.type == "STATIC_LIBRARY") {
+			libs.push(...t.install.destinations.map(d => join(o, d.path, base(t.artifacts[0].path))))
 		}
 	}
 	return libs
