@@ -1478,6 +1478,9 @@ static Val bi_addr(Val self, Val *a, int n, Node *site) {
   return I(K_U64, (intptr_t)p);
 }
 
+/// builtin/mem's trap, which builtin/math, src's way to the bits of floats, imports.
+static Val bi_trap(Val self, Val *a, int n, Node *site) { trap(site, "%s", n ? cstr(a[0], site) : ""); }
+
 /// builtin/mem's load[T]: the T at address a[0], as C holds it.
 static Val bi_load(Val self, Val *a, int n, Node *site) {
   if (self.k != K_TYPE || !n || !a[0].i) trap(site, "load from null");
@@ -1638,6 +1641,7 @@ static void init(void) {
   mem = alloc(sizeof(Mod));
   builtin(mem, "addr", bi_addr);
   builtin(mem, "load", bi_load);
+  builtin(mem, "trap", bi_trap);
   builtin(strmethods, "slice", bi_slice);
   builtin(strmethods, "at", bi_at);
   builtin(strmethods, "copy", bi_copy);

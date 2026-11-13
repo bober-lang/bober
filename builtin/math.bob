@@ -1,7 +1,7 @@
-//! What ** of integers is lowered to.
+//! What ** of integers is lowered to, and the bits of floats.
 
-import { Integral } from "../std/types"
-import { trap } from "./mem"
+import { Float, Integral } from "../std/types"
+import { addr, load, trap } from "./mem"
 
 /// a ** b, wrapped; traps on a negative b.
 export function pow[T extends Integral](a: T, b: T): T {
@@ -19,4 +19,17 @@ export function pow[T extends Integral](a: T, b: T): T {
 		e >>= 1
 	}
 	return r
+}
+
+/// x's IEEE 754 bits, a NaN's payload too; an f32's the low 32.
+export function bits[T extends Float](x: T): u64 {
+	return if (T == f32) load[u32](addr(x)) as u64 else load[u64](addr(x))
+}
+
+/// The T whose IEEE 754 bits are b, an f32's the low 32 of them.
+export function fromBits[T extends Float](b: u64): T {
+	if (T == f32) {
+		return load[T](addr(b as u32))
+	}
+	return load[T](addr(b))
 }
