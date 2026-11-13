@@ -163,6 +163,8 @@ int64_t bober_now(void);
 const char *bober_tz(void);
 /// 64 random bits, not for keys; in tests the same ones in each test.
 uint64_t bober_random(void);
+/// n bytes at p for keys, from the system's CSPRNG; in tests random's. 0, or -errno if that failed.
+long bober_entropy(unsigned char *p, long n);
 /// The time in ns since a fixed point, which nothing sets back or forward: for deadlines. In tests, bober_logical: it
 /// starts at 1, as 0 is none to deadlines, and only a wait moves it, once no socket is ready, to the soonest deadline
 /// or timer of their network (src/net.h); what another process sends is not waited for.

@@ -1,10 +1,10 @@
 //! The system as std reaches it: files, sockets, paths, processes and the environment. A failure throws an IoError.
 
-import { BOBER_IO_AGAIN, BOBER_IO_HOST, bober_env, bober_io_accept, bober_io_close, bober_io_connected, bober_io_dial, bober_io_exe,
-	bober_io_idle, bober_io_ip, bober_io_ip_text, bober_io_kind, bober_io_list, bober_io_listen, bober_io_mkdir, bober_io_name,
-	bober_io_open, bober_io_read, bober_io_readlink, bober_io_ready, bober_io_recvfrom, bober_io_remove, bober_io_rename,
-	bober_io_reset, bober_io_run, bober_io_sendto, bober_io_shutdown, bober_io_stat, bober_io_sync, bober_io_write, bober_mono,
-	bober_tz } from "../src/rt.h"
+import { BOBER_IO_AGAIN, BOBER_IO_HOST, bober_entropy, bober_env, bober_io_accept, bober_io_close, bober_io_connected,
+	bober_io_dial, bober_io_exe, bober_io_idle, bober_io_ip, bober_io_ip_text, bober_io_kind, bober_io_list,
+	bober_io_listen, bober_io_mkdir, bober_io_name, bober_io_open, bober_io_read, bober_io_readlink, bober_io_ready,
+	bober_io_recvfrom, bober_io_remove, bober_io_rename, bober_io_reset, bober_io_run, bober_io_sendto,
+	bober_io_shutdown, bober_io_stat, bober_io_sync, bober_io_write, bober_mono, bober_tz } from "../src/rt.h"
 import { fromC } from "./c"
 import { IoError, Kind } from "./error"
 import { fromBytes, mapped } from "./string"
@@ -314,6 +314,13 @@ export function env(name: string): string | null {
 export function tz(): string | null {
 	const p = bober_tz()
 	return if (p == 0) null else fromC(p)
+}
+
+/// n bytes for keys, from the system's CSPRNG; in tests the same ones in each test.
+export function entropy(n: i32): string throws IoError {
+	const buf = new u8[](n)
+	checked(bober_entropy(buf, n), "entropy", "")
+	return fromBytes(buf)
 }
 
 /// The time in ns since a fixed point, which nothing sets back or forward.
