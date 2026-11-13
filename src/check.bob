@@ -23,7 +23,7 @@ import { Parser, Syntax, Tree } from "./parse"
 import { builtin, builtinPath, root } from "./root"
 import {
 	Array as Arrays, Bool, Empty, Field, I32, Kind as TypeKind, Null, String, String16, String32, Type, U8, UntypedFloat,
-	UntypedInt, bases, basics, elementOf, fillWith, memberOf, members, readonlyOf, setOf,
+	UntypedInt, bases, basics, elementOf, fillWith, members, membersOf, readonlyOf, setOf,
 } from "./type"
 
 /// The modules of builtin/ every module outside builtin/ and C's loads first: those declaring the classes of a string's
@@ -2544,21 +2544,22 @@ class Checker {
 	}
 
 	/// Marks the names pattern binds as depending on a type param where the value of p does. A type such a name holds
-	/// that is known only per instantiation stands for a param of its own: each of `T.members` for one of T's, and the
-	/// type of each of `T.fields` for one of T's fields' (4.11).
+	/// that is known only per instantiation stands for a param of its own: each of `T.members` for one of T's, as each of
+	/// a known union's does, and the type of each of `T.fields` for one of T's fields' (4.11).
 	private generic(pattern: Node, p: Node) {
-		if (pattern.kind == "token" && this.dependent(p)) {
+		const of = if (p.kind == "member") standsFor(p.parts[0].type!) else null
+		const member = if (of == null) "" else this.text(p.parts[1].t)
+		const one = of != null && of!.kind != "param" && member == "members"
+		if (pattern.kind == "token" && (one || this.dependent(p))) {
 			const b = this.locals.get(this.text(pattern.t))!
-			b.generic = true
-			const of = if (p.kind == "member") standsFor(p.parts[0].type!) else null
+			b.generic = this.dependent(p)
 			const t = b.type!
 			const f = t.member("type")
-			if (of?.kind == "param" && (t == Meta || f == Meta)) {
+			if (one && isTypeValue(t) || of?.kind == "param" && (t == Meta || f == Meta)) {
 				// Its own, not made once, as each binding's stands for another type.
-				const member = this.text(p.parts[1].t)
-				const d: Type = { ...new Type("param"), text: member, params: [of!], base: partOf(of!, member) }
+				const d: Type = { ...new Type("param"), text: member, params: [of!], base: if (one) of else partOf(of!, member) }
 				names.set(d, this.text(pattern.t))
-				b.type = if (t == Meta) meta(d) else Type.object(t.fields.map(x => new Field(x.name, if (x.name == "type") meta(d) else x.type)))
+				b.type = if (isTypeValue(t)) meta(d) else Type.object(t.fields.map(x => new Field(x.name, if (x.name == "type") meta(d) else x.type)))
 				pattern.type = b.type
 			}
 		}
@@ -3456,8 +3457,11 @@ class Checker {
 
 	/// Whether a value of type l, a type set's param any type in it, may be a t (6.5).
 	private narrows(l: Type, t: Type): bool {
+		if (membersOf(t)?.alternatives().some(m => m.fits(l)) ?? false) {
+			return true
+		}
 		for (const m of opened(l).alternatives()) {
-			if (m.fits(t) || (m.kind == "object" || m.kind == "interface" || memberOf(t, m)) && t.fits(m)) {
+			if (m.fits(t) || (m.kind == "object" || m.kind == "interface") && t.fits(m)) {
 				return true
 			}
 		}

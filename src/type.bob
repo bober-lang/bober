@@ -688,10 +688,16 @@ export let basics: Type[] = [Bool, I8, I16, I32, I64, U8, U16, U32, U64, F32, F6
 /// The param that param t narrows, through those narrowing it, else t (4.11).
 function origin(t: Type): Type { return if (t.kind == "param" && t.params.length > 0 && t.text == "") origin(t.params[0]) else t }
 
+/// The union s stands for one of the members of, as each of its `members` does (4.11), else null.
+export function membersOf(s: Type): Type | null {
+	const o = origin(s)
+	return if (o.kind == "param" && o.text == "members") o.params[0] else null
+}
+
 /// Whether s stands for one of the members of union t, as each of `t.members` does (4.11).
 export function memberOf(s: Type, t: Type): bool {
-	const o = origin(s)
-	return o.kind == "param" && o.text == "members" && origin(o.params[0]) == origin(t)
+	const u = membersOf(s)
+	return u != null && origin(u!) == origin(t)
 }
 
 /// The T of p, a `T[readonly]` param: a function's type param of its own, constrained by `T[] | string`, which no
