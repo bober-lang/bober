@@ -112,33 +112,42 @@ static const bober_type *form(const bober_type *t, int64_t n, const bober_type *
 
 static bool inPlace(const bober_field *f) { return f->mods & 16 && f->type->kind == KCLASS; }
 
-/// The byte of a value of t that it does not use, else -1: a ref's last, a string's ref's (§4.1).
-static int64_t spare(const bober_type *t) { return t->held == REF ? 7 : t->held == STRING ? 23 : -1; }
+/// The offset of the word the refs of union t's members share (§4.4): a string's third, else a ref's, -1 if none.
+static int64_t refs(const bober_type *t) {
+  int64_t r = -1;
+  for (int64_t i = 0; i < t->nparts; i++)
+    if (t->parts[i]->held == STRING) return 16;
+    else if (t->parts[i]->held == REF) r = 0;
+  return r;
+}
 
-/// Lays out union t, its members completed, as src/emit.bob's shape does (§4.4): packed, each member at offset 0, its
-/// tag's byte in length, -1 if its members are null and a ref, which null is the zero of. False if a member is held
-/// as any, as t is then.
+/// The offset of member i of packed union t, as src/emit.bob's placed.
+static int64_t placed(const bober_type *t, int64_t i) {
+  int64_t r = refs(t);
+  return t->parts[i]->held == REF ? r : r == 0 && t->parts[i]->size > 4 ? 8 : 0;
+}
+
+/// Lays out union t, its members completed, as src/emit.bob's shape does (§4.4): packed, each member at its offset,
+/// its tag's byte in length, -1 if its members are null and a ref, which null is the zero of. False if a member is
+/// held as any or in place, as t is then.
 static bool pack(bober_type *t) {
-  const bober_type *widest = t->parts[0];
-  int64_t size = 0, align = 1;  // set last, as complete stops at a type with its align set
+  int64_t end = 0, align = 1;  // set last, as complete stops at a type with its align set
   for (int64_t i = 0; i < t->nparts; i++) {
     bober_type *m = (bober_type *)t->parts[i];
     complete(m);
-    if (m->held == ANY) return false;
-    if (m->size > size) size = m->size, widest = m;
+    if (m->held == ANY || m->held == PLACE) return false;
     if (m->align > align) align = m->align;
   }
-  int64_t k = spare(widest);
-  bool shared = k >= 0;
-  for (int64_t i = 0; i < t->nparts; i++) shared = shared && (t->parts[i]->size <= k || spare(t->parts[i]) == k);
-  if (t->nparts == 2 && (t->parts[0]->id == NUL || t->parts[1]->id == NUL) && k == 7) t->length = -1;
-  else if (shared) t->length = k;
-  else t->length = size, size = up(size + 1, align);
-  // Each word a ref if any member's is, as the collector may take a member's number for a ref.
-  uint64_t *words = alloc((size / 512 + 1) * 8);
-  for (int64_t i = 0; i < t->nparts; i++) mark(words, t->parts[i]->layout, 0, 1, 0);
-  t->held = PACKED, t->size = size, t->align = align, t->layout = layout(size, words);
-  free(words);
+  for (int64_t i = 0; i < t->nparts; i++) {
+    int64_t e = placed(t, i) + t->parts[i]->size;
+    if (e > end) end = e;
+  }
+  int64_t r = refs(t);
+  if (t->nparts == 2 && (t->parts[0]->id == NUL || t->parts[1]->id == NUL) && r == 0) t->length = -1;
+  else t->length = r >= 0 ? r + 7 : end;
+  uint64_t word = r < 0 ? 0 : 1 << r / 8;
+  t->held = PACKED, t->size = up(end > t->length ? end : t->length + 1, align), t->align = align;
+  t->layout = layout(t->size, &word);
   return true;
 }
 
@@ -380,7 +389,7 @@ int64_t bober_load(const bober_type *t, const void *p, bober_union *u) {
   t = t->canon;  // packed, if a union, as emit packs it, its literals their base
   if (t->held == ANY) return *u = *(const bober_union *)p, 0;
   if (t->held == PACKED) {
-    int64_t n = bober_load(t->parts[member(t, p)], p, u);
+    int64_t i = member(t, p), n = bober_load(t->parts[i], (const char *)p + placed(t, i), u);
     u->ref = (void *)((uintptr_t)u->ref << 8 >> 8);  // without the tag in its top byte; a string's emit's load clears
     return n;
   }
@@ -398,7 +407,7 @@ void bober_store(const bober_type *t, void *p, const bober_union *u) {
     int64_t i = 0;
     while (i < t->nparts - 1 && !bober_is(t->parts[i], u)) i++;
     memset(p, 0, t->size);
-    bober_store(t->parts[i], p, u);
+    bober_store(t->parts[i], (char *)p + placed(t, i), u);
     if (t->length >= 0) ((uint8_t *)p)[t->length] = (i - zeroOf(t) + t->nparts) % t->nparts;
   } else if (t->held == ANY) *(bober_union *)p = *u;
   else if (t->held == STRING || t->held == PLACE) memcpy(p, u->ref, t->size);

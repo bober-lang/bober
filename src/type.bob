@@ -581,16 +581,12 @@ export class Type {
 	/// union with the tag of the type it was converted from, and keeps it; `instanceof` (§6.5), `switch` and `== null` test
 	/// the tag.
 	///
-	/// Layout: the payload is the size and alignment of the widest member, each member at offset 0. The tag is found, in
-	/// order of preference:
-	///
-	/// 1. in the payload itself, when the members are told apart by their values: one reference member with `null`, where
-	///    `null` is the zero reference, which no value of a reference type is; or members of one base type that is
-	///    otherwise a union of literals (§4.2);
-	/// 2. in a field: object and class members that all declare a field of the same name whose types are disjoint literals
-	///    (a *discriminated* union, like `{ kind: "a", … } | { kind: "b", … }`);
-	/// 3. in a byte unused by every member, if the payload has one;
-	/// 4. appended as a `u8`, the whole padded to the payload's alignment.
+	/// Layout: a union whose members are `null` and one reference type is one reference, `null` being the zero
+	/// reference. Otherwise the members overlay, their references sharing one word, a string member's last if there is
+	/// one, else the first, so that the word holds a reference or a number below 2^32, which no reference is: a string,
+	/// `null`, a number or `bool` is at offset 0, but a number of more than 4 bytes after the word if that is the first.
+	/// The tag is a `u8` in the word's last byte, which no reference uses (§4.1), else right after the members, the
+	/// whole padded to their greatest alignment. A union with a `T[n]` member is held as a union of any type.
 	///
 	/// ```
 	/// let v: i32 | string = 1
@@ -600,6 +596,7 @@ export class Type {
 	/// let m: "a" | "b" | null        // a string's size: null is 0
 	/// let n: i32 | null = 3          // 8 bytes: i32, tag, pad
 	/// let u: Square | Circle         // 8 bytes: the tag is in the last byte of the reference
+	/// let w: i64 | Square            // 16 bytes: the reference, then i64
 	/// let s: Shape | null = null     // 8 bytes if Shape is held as Square | Circle (§4.7), null is 0
 	/// n + 1                          // error: n may be null
 	/// (n as i32) + 1                 // ok, traps if null

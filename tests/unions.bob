@@ -1,4 +1,4 @@
-import { sizeOf } from "../builtin/mem"
+import { addr, sizeOf } from "../builtin/mem"
 
 class Square {
 	side: f64
@@ -180,15 +180,31 @@ test "a field of a literal type reflects as that literal" {
 	assert f.type.kind == "literal" && f.type.value == "add" && new Add().kind == "add"
 }
 
-test "a union is packed: its widest member, its tag in a byte none uses, else appended" {
+test "a union is packed: its refs in one word, its tag in that word's top byte, else appended" {
 	assert sizeOf[i32[] | null]() == 8 // null is the zero ref
+	assert sizeOf[Square | Circle]() == 8
 	assert sizeOf[i32 | i32[]]() == 8 // the tag in the top byte of the ref
 	assert sizeOf[string | null]() == 24 // in that of a string's ref
 	assert sizeOf[f64 | string | null]() == 24
+	assert sizeOf[string | Square]() == 24 // Square in the string's ref
 	assert sizeOf[i32 | null]() == 8
 	assert sizeOf[i64 | i32[]]() == 16
 	assert sizeOf[bool | null]() == 2
 	assert sizeOf[i8 | i16]() == 4
+	assert sizeOf[i32 | i32[2]]() == 24 // as a union of any type
+}
+
+/// Its v held where a type param decides its layout, as src/type.c packs it then.
+class Held[T] {
+	v: T
+
+	constructor(v: T) { this.v = v }
+
+	swap(v: T): T {
+		const w = this.v
+		this.v = v
+		return w
+	}
 }
 
 test "packed unions hold their members in fields and elements" {
@@ -198,6 +214,16 @@ test "packed unions hold their members in fields and elements" {
 	o.s = "a string longer than fifteen bytes"
 	o.w = "short"
 	assert (o.a as i32[])[1] == 4 && o.s == "a string longer than fifteen bytes" && o.w == "short"
+	const p: { c: string | Square, f: i64 | Square } = { c: new Square(3.0), f: 4 }
+	assert (p.c as Square).side == 3.0 && p.f == 4
+	p.c = "a string longer than fifteen bytes"
+	p.f = new Square(5.0)
+	assert p.c == "a string longer than fifteen bytes" && (p.f as Square).side == 5.0
+	const h = new Held[string | Square](new Square(3.0))
+	assert (h.swap("a string longer than fifteen bytes") as Square).side == 3.0
+	assert h.v == "a string longer than fifteen bytes"
+	const k = new Held[i64 | Square](4)
+	assert k.swap(new Square(5.0)) == 4 && (k.v as Square).side == 5.0
 	const xs: (string | i32[] | null)[] = []
 	for (const i of 0 ... 9999) {
 		xs.push(if (i % 3 == 0) null else if (i % 3 == 1) `string ${i} that is long` else [i])
@@ -205,5 +231,22 @@ test "packed unions hold their members in fields and elements" {
 	for (const i of 0 ... 9999) {
 		const x = xs[i]
 		assert if (i % 3 == 0) x == null else if (i % 3 == 1) x == `string ${i} that is long` else (x as i32[])[0] == i
+	}
+}
+
+test "a packed union's number is not taken for a ref" {
+	const squares: Square[] = []
+	const xs: (i64 | Square)[] = []
+	const was: i64[] = []
+	for (const i of 0 ... 99) {
+		squares.push(new Square(1.0))
+		was.push(addr(squares[i]) as i64)
+		xs.push(was[i])
+	}
+	for (const i of 0 ... 1999999) {
+		squares[i % 100] = new Square(2.0) // until a collection moves them
+	}
+	for (const i of 0 ... 99) {
+		assert xs[i] == was[i]
 	}
 }

@@ -91,6 +91,8 @@ void bober_gc_start(void) {
   }
   heap = mmap(0, ((int64_t)PAGES * PAGE >> CARD) + ((int64_t)PAGES * PAGE) + 1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
   if (heap == MAP_FAILED) fputs("out of memory\n", stderr), exit(1);
+  // Above 4 GiB, so that a number below 2^32 a packed union holds in its refs' word is no ref (§4.4).
+  if ((uintptr_t)heap >> 32 == 0) fputs("gc: the heap below 4 GiB\n", stderr), abort();
   cards = (uint8_t *)heap + (int64_t)PAGES * PAGE;
   const char *e = getenv("BOBER_GC_EVERY");
   if (e) every = atoll(e);
@@ -157,7 +159,6 @@ static Header *object(void *p, Page **page) {
   uint32_t i = a / PAGE;
   if (pages[i].kind == REST) i -= pages[i].pages;
   Page *g = *page = &pages[i];
-  if (g->kind == FREE) return 0;  // no ref, but a number a packed union holds where another member holds one (§4.4)
   return (Header *)(g->kind == BIG ? at(i) : at(i) + a % PAGE / sizes[g->class] * sizes[g->class]);
 }
 
