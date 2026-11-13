@@ -1058,7 +1058,13 @@ class Copy {
 		} else if (f < 0) {
 			throw new CompileError(`no method ${p.strings[name]} to call (${this.ins.where})`)
 		} else if (this.ins.nominal(slot.t) == decl.Class) {
-			this.call(this.ins.member(slot.t, name), p.b(slot.t))
+			const d = this.ins.member(slot.t, name)
+			// Each param the call leaves out, defaulted, as Missing, as lower passes it to a callee it knows.
+			const ps = p.items(p.subst(p.decls[d].type, p.b(slot.t)))
+			for (const t of ps.slice(n, ps.length)) {
+				this.plain(op.Missing, 0, t, t)
+			}
+			this.call(d, p.b(slot.t))
 		} else {
 			this.drop(n + 1)
 			this.info[this.emit(op.CallMethod, name, n)] = slot.t
