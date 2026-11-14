@@ -9,7 +9,7 @@ import { Bytes, u } from "./bytes"
 import { Fixup, Object, Section, Symbol } from "./object"
 
 /// What the head starts with, and the version of the encoding.
-const magic = "bober image 7"
+const magic = "bober image 8"
 
 /// Where the sections of one of regions are: from start to top, of which holes, in order, are free; cap, which top
 /// stays below, where the next region starts.
@@ -39,7 +39,7 @@ export class State {
 	/// Per name with a slot, its index in the table of names, its address and that of its stub, 0 if none.
 	slots: [u64, u64, u64][] = []
 	/// Of the frozen units: per name and kind, from and to where their sections are; the pointers the loader adds the
-	/// image's address to, and the descs, as Image has them.
+	/// image's address to, ascending, and the descs, as Image has them.
 	sections: [string, u8, u64, u64][] = []
 	rebases: u64[] = []
 	descs: [u64, u64][] = []
@@ -88,7 +88,12 @@ export function write(s: State, arch: Arch): string {
 		w.uleb(e[2])
 		w.uleb(e[3])
 	})
-	list(w, s.rebases, at => w.uleb(at))
+	// The rebases, each as how far it is past the one before.
+	let last: u64 = 0
+	list(w, s.rebases, at => {
+		w.uleb(at - last)
+		last = at
+	})
 	list(w, s.descs, d => {
 		w.uleb(d[0])
 		w.uleb(d[1])
@@ -174,7 +179,11 @@ export function read(file: Bytes, headers: u64, arch: Arch): State | null {
 		})
 		s.slots = many(r, () => [r.uleb(), r.uleb(), r.uleb()])
 		s.sections = many(r, () => [str(), r.u8(), r.uleb(), r.uleb()])
-		s.rebases = many(r, () => r.uleb())
+		let last: u64 = 0
+		s.rebases = many(r, () => {
+			last += r.uleb()
+			return last
+		})
 		s.descs = many(r, () => [r.uleb(), r.uleb()])
 		s.inits = [r.uleb(), r.uleb()]
 		s.thread = [r.uleb(), r.uleb(), r.uleb()]
