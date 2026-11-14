@@ -4,8 +4,8 @@ import { CompileError } from "../error"
 import { Bytes, mapped } from "./bytes"
 import { addend, arm64 } from "./arm64"
 import { Image, Linker, Stale } from "./link"
-import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Init, Kept, Local, Machine, Object, Page, PageOff, Rel32,
-	Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Thread32, Unwind, Weak, Zero } from "./object"
+import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Init, Kept, Local, Machine, Object, Over, Page, PageOff,
+	Rel32, Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Thread32, Unwind, Weak, Zero } from "./object"
 import { x64 } from "./x64"
 
 /// An object named name of one section of kind, of the bytes of words, and of symbols.
@@ -117,6 +117,15 @@ test "a name defined twice, or wanted and not defined, is an error naming the ob
 	assert link([a, b], []) throws new CompileError(
 		"x is defined in a and b\nu is not defined, but a names it\nv is not defined, but b names it")
 	assert link([obj("c", Data, [0], [])], ["w"]) throws new CompileError("w is exported but not defined")
+}
+
+test "an Over definition is taken over a Global and a Weak one, linked before or after, and two are an error" {
+	const a = obj("a", Data, [1, 0], [new Symbol("x", Global, 0), new Symbol("y", Weak, 0)])
+	const b = obj("b", Data, [2, 0], [new Symbol("x", Over, 0), new Symbol("y", Over, 0), new Symbol("z", Over, 0)])
+	const c = obj("c", Data, [3, 0], [new Symbol("z", Global, 0)])
+	const image = link([a, b, c], ["x", "y", "z"])
+	assert get(image, at(image, "x")) == 2 && get(image, at(image, "y")) == 2 && get(image, at(image, "z")) == 2
+	assert link([b, obj("d", Data, [0], [new Symbol("x", Over, 0)])], []) throws new CompileError("x is defined in b and d")
 }
 
 test "a weak name no one defines is 0" {
@@ -378,6 +387,20 @@ test "an object replaced in a kept image leaves the others' bytes where they are
 	assert get(image, f + 4) == 0xd65f03c0 && get(image, g + 8) == 0xd65f03c0
 	assert addend(get(image, f), Call) == (g as i64) - (f as i64)
 	assert kept(file(image)).objects().join(" ") == "a c b"
+}
+
+test "an Over object unlinked from a kept image gives the name back to the one it was over, which calls then reach" {
+	const a = obj("a", Code, [0x94000000], [new Symbol("g", Global), new Symbol("f", Global, 0)],
+		[new Fixup(0, Call, 0, 0)])
+	const b = obj("b", Code, [0xd65f03c0], [new Symbol("g", Global, 0)])
+	const first = keep(kept(), [a, b, obj("o", Code, [0xd503201f, 0xd65f03c0], [new Symbol("g", Over, 0)])], ["f", "g"])
+	const f = at(first, "f")
+	assert addend(get(first, f), Call) == (at(first, "g") as i64) - (f as i64) && get(first, at(first, "g")) == 0xd503201f
+	const l = kept(file(first))
+	l.remove("o")
+	const image = l.link()
+	const g = at(image, "g")
+	assert get(image, g) == 0xd65f03c0 && at(image, "f") == f && addend(get(image, f), Call) == (g as i64) - (f as i64)
 }
 
 test "a pointer a kept image's frozen unit has set for good is rebased once" {
