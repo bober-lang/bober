@@ -2220,11 +2220,13 @@ class Checker {
 		}
 	}
 
-	/// Binds pattern p to the type f gives, or where f fails, as failing where used.
-	private bindBy(p: Node, f: () => Type, mutable: bool) {
-		if (!this.apart(() => this.bind(p, f(), mutable))) {
+	/// Binds pattern p to the type f gives, or where f fails, as failing where used; whether f gave one.
+	private bindBy(p: Node, f: () => Type, mutable: bool): bool {
+		const ok = this.apart(() => this.bind(p, f(), mutable))
+		if (!ok) {
 			this.failNames(p)
 		}
+		return ok
 	}
 
 	/// What condition p narrows, or nothing where it fails.
@@ -2276,9 +2278,10 @@ class Checker {
 				return broke || !isTok(p.parts[0], "true")
 			case "for":
 				this.locals.enter()
-				this.bindBy(p.parts[1], () => this.iterated(p.parts[2]), isTok(p.parts[0], "let"))
+				if (this.bindBy(p.parts[1], () => this.iterated(p.parts[2]), isTok(p.parts[0], "let"))) {
+					this.generic(p.parts[1], p.parts[2])
+				}
 				this.forget(p.parts[3])
-				this.generic(p.parts[1], p.parts[2])
 				this.loop(p.parts[3], [])
 				this.locals.leave()
 			case "switch":
