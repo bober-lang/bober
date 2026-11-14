@@ -915,6 +915,8 @@ class Checker {
 	private modules: Modules
 	private prelude = new HashMap[string, Binding]()
 	private top = new HashMap[string, Binding]()
+	/// The names of the top-level tests.
+	private tests = new Set()
 	private vars: Decl[] = []
 	/// Whether a type param's default is being read, whose constraints are checked where it is used.
 	private defaulting = false
@@ -1087,6 +1089,11 @@ class Checker {
 
 	private declare(n: Node): Decl {
 		if (n.kind == "test") {
+			const name = this.text(n.parts[0].t)
+			if (this.tests.has(name)) {
+				this.report(n.parts[0].t.loc, `test ${name} is declared twice`)
+			}
+			this.tests.add(name)
 			return new Decl(n, n.t)
 		}
 		const names = patternNames(operands(n)[0])
@@ -1377,7 +1384,8 @@ class Checker {
 	/// elsewhere. A value holding itself compares without end, a field of a `T[n]` is an error, and `switch` cases
 	/// match as elsewhere. `assert x throws e` traps unless `x` throws a value of `e`'s type that equals `e`, which is
 	/// evaluated after; a value of another type propagates. Tests and assertions exist only in test and debug builds;
-	/// in other builds they are not compiled, so they shall have no side effects a program relies on.
+	/// in other builds they are not compiled, so they shall have no side effects a program relies on. No two top-level
+	/// tests of a module share a name.
 	///
 	/// ```
 	/// test "patterns" {
