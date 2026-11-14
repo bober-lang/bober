@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -247,6 +248,7 @@ long bober_io_close(int fd) {
   if (NET(fd)) return bober_net.close(fd, 0);
   // The kernel forgets fd, which it would not for a dup's sake.
   if ((unsigned)fd < nfds && fds[fd].watched) watch(fd, DEL), fds[fd] = (Fd){0};
+  flock(fd, LOCK_UN);  // which a mapping of it would keep
   return result(close(fd));
 }
 long bober_io_read(int fd, void *buf, unsigned long n) {
@@ -307,6 +309,10 @@ long bober_io_copy(int fd, const char *path, unsigned long n) {
 }
 
 long bober_io_sync(int fd) { return result(fsync(fd)); }
+long bober_io_lock(int fd, int shared, int wait) {
+  if (flock(fd, (shared ? LOCK_SH : LOCK_EX) | (wait ? 0 : LOCK_NB)) == 0) return 1;
+  return errno == EWOULDBLOCK ? 0 : result(-1);
+}
 long bober_io_mkdir(const char *path) { return result(mkdir(path, 0777)); }
 long bober_io_rename(const char *from, const char *to) { return result(rename(from, to)); }
 

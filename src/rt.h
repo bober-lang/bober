@@ -217,6 +217,8 @@ long bober_io_size(int fd);
 /// kernel, which shares their blocks where the file system can, else copies its data only, its holes kept.
 long bober_io_copy(int fd, const char *path, unsigned long n);
 long bober_io_sync(int fd);
+/// Locks the file, shared or for fd alone, as flock does, waiting if wait for others' locks to go: 1; else 0.
+long bober_io_lock(int fd, int shared, int wait);
 long bober_io_mkdir(const char *path);
 /// Removes a file or an empty directory.
 long bober_io_remove(const char *path);

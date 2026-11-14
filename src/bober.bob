@@ -21,7 +21,7 @@ import * as optarg from "../std/encoding/optarg"
 import { exists, glob, mapFile, mkdirAll, open, readDir, readFile, remove, removeAll, rename, stat } from "../std/fs"
 import { base, dir as parent, isAbs, join, rel } from "../std/fs/path"
 import { fnv } from "../std/hash"
-import { stderr, stdin, stdout } from "../std/io"
+import { File, stderr, stdin, stdout } from "../std/io"
 import { arch, os } from "../std/os"
 import { ParseError, codePoint, split, trim, utf8 } from "../std/string"
 import { abi, write } from "./bc/file"
@@ -507,10 +507,13 @@ function lowered(mains: string[], includes: string[]): Program {
 		cmake(load(home))
 	}
 	const image = `${dir}/image.so`
-	const f = if (exists(image)) open(image) else null // mapped of one descriptor, lest another build replace it
+	// Mapped of one descriptor, lest another build replace it, and read shared, lest one write it in place, which it may
+	// once this is done: what is taken of it, copied.
+	const f = if (exists(image)) open(image) else null
+	f?.lock(true, true)
 	const l = if (f == null) null else new Linker(machine, format, new Bytes(f.map()))
-	const cache = l?.sections("bober_bc") ?? []
-	Bound.keep(l?.sections("bober_bind") ?? [])
+	const cache = (l?.sections("bober_bc") ?? []).map(s => s.copy())
+	Bound.keep((l?.sections("bober_bind") ?? []).map(s => s.copy()))
 	f?.close()
 	const p = lower(mains, includes, cache)
 	mkdirAll(dir)
@@ -540,16 +543,32 @@ const debug = { main: -1, tests: false, dyn: true }
 /// `<what>@<version>`, a module by its bytecode, which has the ABIs of the modules it imports, and its Bound; a file by
 /// its bytes; an archive, which is linked for good, by its size and when it was written. An image that holds all and
 /// exports the entries is left as it is. Where the image cannot take the link, or an archive it holds changed, all is
-/// linked anew, fresh. The image is written under a name of its own, then renamed,
-/// as a running program may have the old one mapped, or another build be writing it. Returns its path, or if pin that
-/// of a link to it of this process's, which the launcher removes, by which what the process runs loads this build's
-/// image though another build replaces it.
+/// linked anew, fresh. The image is written in place where no other process has it, else under a name of its own, then
+/// renamed, as a running program may have the old one mapped, or another build be reading it. Returns its path, or if
+/// pin that of a link to it of this process's, which the launcher removes, by which what the process runs loads this
+/// build's image though another build replaces it.
 function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, o: Options, o1: i32[][][] | null = null,
 	fresh = false): string {
 	const out = `${dir}/image${if (o.dyn) "" else ".mono"}.so`
+	// The image continued, which is mapped and written of one descriptor, lest another build replace it in between:
+	// in place if this build has it alone, which no run maps or is about to, by a pin, nor another build reads, but on
+	// macOS, whose kernel kills who maps a signed file changed in place; else a copy, the image shared meanwhile.
+	const old = if (fresh || !exists(out)) null else open(out, "r+")
+	try {
+		const alone = !mac && old != null && old.lock(false, false) && glob(`${out}.*.run`).length == 0
+		if (old != null && !alone) {
+			old.lock(true, true)
+		}
+		return relink(p, mains, files, cxx, pin, o, o1, out, old, alone)
+	} finally {
+		old?.close()
+	}
+}
+
+/// The image out, which image links of old, the image continued if not null, written in place if alone.
+function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, o: Options, o1: i32[][][] | null,
+	out: string, old: File | null, alone: bool): string {
 	const lib = `${sysroot}/usr/lib`
-	// The image continued, which is mapped and copied of one descriptor, lest another build replace it in between.
-	const old = if (fresh || !exists(out)) null else open(out)
 	const kept = new Bytes(if (old != null) old.map() else "")
 	const l = new Linker(machine, format, kept)
 	const held = l.objects()
@@ -607,7 +626,6 @@ function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, 
 		const info = stat(f)
 		const name = `${f}@${info.modified}.${info.size}`
 		if (held.some(h => h != name && startsWith(h, `${f}@`))) {
-			old?.close()
 			return image(p, mains, files, cxx, pin, o, o1, true)
 		}
 		if (!held.includes(name)) {
@@ -628,6 +646,7 @@ function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, 
 	}
 	const changed = l.changed()
 	const tmp = `${out}.${getpid()}`
+	let at = out // where the image is written
 	if (changed) {
 		for (const f of archives) {
 			const bytes = mapFile(f)
@@ -638,23 +657,27 @@ function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, 
 		try {
 			const linked = l.link()
 			format.write(linked)
-			store(tmp, if (linked.bytes == kept) old else null, linked.bytes)
+			const continued = linked.bytes == kept
+			at = if (continued && alone) out else tmp
+			const f = if (at == out) old! else if (continued) old!.copy(tmp, linked.bytes.length) else open(tmp, "w")
+			store(f, linked.bytes)
+			if (f != old) {
+				f.close() // old once the pin is made, which a build sees
+			}
 		} catch (e: Stale) {
-			old?.close()
 			return image(p, mains, files, cxx, pin, o, o1, true)
 		}
 	}
-	old?.close()
 	const own = `${tmp}.run`
 	if (pin) {
 		if (exists(own)) {
 			remove(own) // which a process of this ID left, whose launcher never ran
 		}
-		if (hardLink(if (changed) tmp else out, own) != 0) {
+		if (hardLink(at, own) != 0) {
 			throw new CompileError(`cannot link ${own}`)
 		}
 	}
-	if (changed) {
+	if (at != out) {
 		rename(tmp, out)
 	}
 	return if (pin) own else out
