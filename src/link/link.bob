@@ -139,11 +139,11 @@ const room: u64 = 1 << 28
 class Name {
 	name: string
 	/// The unit, section and offset defining it, unit -1 while none does, and section -1 if it is the format's start,
-	/// address 0; and whether weakly.
+	/// address 0; and its binding there.
 	unit = -1
 	section = -1
 	value: u64 = 0
-	weak = false
+	binding = Weak
 	/// The first unit that names it without defining it, and not weakly, so that it must be defined; -1 if none does.
 	namer = -1
 	/// The library it is imported from, -1 if none.
@@ -490,15 +490,15 @@ export class Linker {
 			u.names.push(g)
 			const n = this.names[g]
 			if (s.section >= 0 && u.at[s.section] != dropped) {
-				if (n.unit < 0 || n.weak && s.binding == Global) {
+				if (n.unit < 0 || rank(s.binding) > rank(n.binding)) {
 					if (n.unit == 0 && this.loaded > 0) {
 						this.errors.push(`${s.name} of ${o.name} is defined for good`)
 					}
 					n.unit = k
 					n.section = s.section
 					n.value = s.value
-					n.weak = s.binding == Weak
-				} else if (!n.weak && s.binding == Global) {
+					n.binding = s.binding
+				} else if (s.binding != Weak && s.binding == n.binding) {
 					this.errors.push(`${s.name} is defined in ${this.units[n.unit].object.name} and ${o.name}`)
 				}
 			} else if (s.binding == Global && n.namer < 0) {
@@ -1033,7 +1033,7 @@ export class Linker {
 				const bounds = (x: string) => n.name == `__start_${x}` || n.name == `__stop_${x}`
 				const s = new Symbol(n.name, Weak)
 				if (n.section >= 0 && (this.units[n.unit].frozen || this.state.pinned.some(bounds))) {
-					s.binding = if (n.weak) Weak else Global
+					s.binding = n.binding
 					s.section = region(n.address)
 					s.value = n.address - regions[s.section].start
 				}
@@ -1175,6 +1175,9 @@ function merged(entries: [string, u8, u64, u64][]): [string, u8, u64, u64][] {
 	}
 	return out
 }
+
+/// Of the definitions of a name, one of the highest binding by this is taken: Weak, Global, Over.
+function rank(binding: u8): u8 { return if (binding == Weak) 0 else binding }
 
 /// Where fixup f of section i of o is, for messages.
 function place(o: Object, i: i32, f: Fixup): string { return `${o.name}: ${o.sections[i].name}+${f.at}` }
