@@ -1473,8 +1473,9 @@ class Emitter {
 			this.intrinsic(this.name(d), env, p.subst(p.b(x.type), env))
 			return
 		}
-		if (this.dyn && builtin(p.modules[x.module].path) && d == p.lang("literal")) {
-			this.literal(p.lists[env][0])
+		if (this.dyn && builtin(p.modules[x.module].path) && d == p.lang("literal") && this.unbound(p.lists[env][0])) {
+			// Of a T not known here, which may turn out to be no literal type, as resolve's callOf has it: s cast.
+			this.push(this.cast(this.pop(), p.lists[env][0]), p.lists[env][0])
 			return
 		}
 		const e = if (this.dyn && instanced(p, d, env)) 0 else env
@@ -1492,23 +1493,6 @@ class Emitter {
 			args = [this.b.constZero(this.ref), ...args]
 		}
 		this.pushResult(this.callByValue(f, [...this.envDescs(e), ...args], (x.mods & Extern) == 0), f.ret, e)
-	}
-
-	/// literal[T](s), as a generic's code has it: s, checked to spell one of T's literals if T is known, else cast, as T
-	/// may turn out to be no literal type, as resolve's callOf does.
-	private literal(t: i32) {
-		const s = this.pop()
-		if (!this.unbound(t)) {
-			let ok = this.bool(false)
-			for (const m of this.p.members(this.kept(t))) {
-				if (this.p.kind(m) == kind.Literal && this.p.a(m) == kind.String) {
-					ok = this.ir().binary("or", ok,
-						this.langCall("strEq", [s.v, this.str(this.p.strings[this.p.b(m)])]))
-				}
-			}
-			this.check(ok, "not a literal of the type")
-		}
-		this.push(this.cast(s, t), t)
 	}
 
 	/// CallMethod: of the method of the name of its receiver's type, or of a Type's static, which its descriptor lists,
