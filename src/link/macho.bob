@@ -8,7 +8,7 @@
 //! thread's copy, a key of dyld's, and the offset in the copy, which the writer sets.
 
 import { HashMap } from "../../std/collections/hashmap"
-import { indexOf, partitionPoint, sort, sortBy, startsWith } from "../../std/algo"
+import { indexOf, partitionPoint, sortBy, startsWith } from "../../std/algo"
 import { ParseError, lower, replace, split, trim } from "../../std/string"
 import { Reader, Writer } from "../../std/encoding/binary"
 import { alignUp, max, min } from "../../std/math"
@@ -464,18 +464,7 @@ function write(image: Image) throws CompileError {
 	for (const [_, at, size] of vars) {
 		cuts.push(...[at, at + size])
 	}
-	for (const s of segs) {
-		cuts.push(...[s.address, s.address + s.size, s.address + s.size + s.zero])
-	}
-	sort(cuts)
-	const sections: [string, u64, u64][] = []
-	for (const i of 1 ... cuts.length - 1) {
-		const [at, end] = [cuts[i - 1], cuts[i]]
-		const s = image.segment(at)
-		if (end > at && at >= s.address && end <= s.address + s.size + s.zero) {
-			sections.push([if (at == from) "__eh_frame" else lower(mapped[where(at)][0]), at, end - at])
-		}
-	}
+	const sections = image.stretches(cuts, at => if (at == from) "__eh_frame" else lower(mapped[where(at)][0]))
 	let p = from
 	while (p < to) {
 		let q = p
