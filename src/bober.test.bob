@@ -15,16 +15,15 @@ function files(n: i32): [string, string][] {
 	return [["types.bob", types], ["own.bob", own], ["lib.bob", lib], ["main.bob", program(n)]]
 }
 
-/// What main.bob prints, built in home with the files written first, -O1 if o1, -O2 if o2; and the objects of lib.bob's
+/// What main.bob prints, built in home with the files written first, -O2 if o2; and the objects of lib.bob's
 /// instances and overlays its image holds.
-function built(files: [string, string][], o1: bool, o2 = false): [string, string[]] {
+function built(files: [string, string][], o2: bool): [string, string[]] {
 	mkdirAll(home)
 	for (const [name, src] of files) {
 		writeFile(`${home}/${name}`, src)
 	}
 	const f = new Compile()
-	f.mono = false
-	f.O1 = o1
+	f.O1 = false
 	f.O2 = o2
 	dir = `${home}/build`
 	try {
@@ -135,12 +134,8 @@ ${sizes}	const b = new Box[i32](2)
 /// What main.bob prints, size summed to k.
 function printed(k: i32): string { return `${k} 2 1 1 p1,p1 18 1\nbad true i32\n` }
 
-test "-O1 compiles the instances of generics a program calls into its image, which a build without keeps" {
-	const [out, held] = built(files(1), true)
-	assert out == printed(1) && held.length > 0
-	const [again, kept] = built([["main.bob", replace(program(1), "let k = 0", "let k = 1")]], false)
-	assert again == printed(2) && kept == held
-}
+/// Those of held, built's, of lib.bob's instances.
+function instances(held: string[]): string[] { return held.filter(o => indexOf(o, "lib.bob~") >= 0) }
 
 test "an edit of a generic's body unlinks its instances, the build running the new body" {
 	built(files(1), true)
@@ -152,19 +147,20 @@ test "a change of the layout of a type arg's class unlinks the instances of it, 
 	for (const [file, src, from] of [["types.bob", types, "x = 1"], ["own.bob", own, "v = 1"]]) {
 		built(files(1), true)
 		const [out, held] = built([[file, replace(src, from, `y = 5\n\t${from}`)]], false)
-		assert out == printed(1) && held.length == 0
+		assert out == printed(1) && instances(held).length == 0
 	}
 }
 
 test "a new instance compiles one bucket anew" {
-	const [_, before] = built(files(150), true)
-	const [out, after] = built([["main.bob", program(151)]], true)
+	const before = instances(built(files(150), true)[1])
+	const [out, held] = built([["main.bob", program(151)]], true)
+	const after = instances(held)
 	assert before.length == 4 && after.length == 4 && after.filter(o => !before.includes(o)).length == 1
 	assert out == printed(151)
 }
 
 test "-O2 compiles by LLVM the instances and each module's functions over their code, which a build without keeps" {
-	const [out, held] = built(files(1), false, true)
+	const [out, held] = built(files(1), true)
 	assert out == printed(1) && held.some(o => indexOf(o, "lib.bob^O2@") >= 0) && held.every(o => indexOf(o, "^O2@") >= 0)
 	const [again, kept] = built([["main.bob", replace(program(1), "let k = 0", "let k = 1")]], false)
 	assert again == printed(2) && kept == held
@@ -172,7 +168,7 @@ test "-O2 compiles by LLVM the instances and each module's functions over their 
 }
 
 test "an edit of a module unlinks its overlay, the build running the new code" {
-	built(files(1), false, true)
+	built(files(1), true)
 	const [out, held] = built([["lib.bob", replace(lib, "return f(i32)", "return f(i64)")]], false)
 	assert out == `1 2 1 1 p1,p1 18 1\nbad true i64\n` && held.length == 0
 }
@@ -180,14 +176,14 @@ test "an edit of a module unlinks its overlay, the build running the new code" {
 test "an edited module runs on its base code, the first -O2 build that finds it unchanged optimises it again" {
 	const overlays = (held: string[]) => held.filter(o => indexOf(o, "lib.bob^O2@") >= 0).length
 	anew()
-	const [_, held] = built(files(1), false, true)
-	const [out, kept] = built([["main.bob", replace(program(1), "let k = 0", "let k = 1")]], false, true)
+	const [_, held] = built(files(1), true)
+	const [out, kept] = built([["main.bob", replace(program(1), "let k = 0", "let k = 1")]], true)
 	assert overlays(held) == 1 && out == printed(2) && kept == held
 	for (const t of ["i64", "i16"]) {
-		const [edited, base] = built([["lib.bob", replace(lib, "return f(i32)", `return f(${t})`)]], false, true)
+		const [edited, base] = built([["lib.bob", replace(lib, "return f(i32)", `return f(${t})`)]], true)
 		assert edited == `2 2 1 1 p1,p1 18 1\nbad true ${t}\n` && overlays(base) == 0
 	}
-	const [again, back] = built([], false, true)
+	const [again, back] = built([], true)
 	assert again == `2 2 1 1 p1,p1 18 1\nbad true i16\n` && overlays(back) == 1
 }
 
@@ -195,9 +191,9 @@ test "a trap in -O2's code shows its line, after an edit above it" {
 	const lib = "export function at(xs: i32[]): i32 { return xs[1] }\n"
 	const main = `import { at } from "./lib"\nfunction main() { at([]) }\n`
 	anew()
-	const out = built([["lib.bob", lib], ["main.bob", main]], false, true)[0]
-	built([["lib.bob", `\n${lib}`]], false, true) // its base code
-	const again = built([], false, true)[0]
+	const out = built([["lib.bob", lib], ["main.bob", main]], true)[0]
+	built([["lib.bob", `\n${lib}`]], true) // its base code
+	const again = built([], true)[0]
 	assert indexOf(out, "lib.bob:1:47: trap") >= 0 && indexOf(again, "lib.bob:2:47: trap") >= 0
 }
 
@@ -206,9 +202,9 @@ test "an export added to a module keeps the code of one that imports it, a chang
 	const lib = `import { one } from "./dep"\nexport function two(): i32 { return one() + 1 }\n`
 	const main = `import { two } from "./lib"\nfunction main() { print(\`\${two()}\`) }\n`
 	anew()
-	const [out, held] = built([["dep.bob", dep], ["lib.bob", lib], ["main.bob", main]], false, true)
-	const [again, kept] = built([["dep.bob", `${dep}export function three(): i32 { return 3 }\n`]], false, true)
+	const [out, held] = built([["dep.bob", dep], ["lib.bob", lib], ["main.bob", main]], true)
+	const [again, kept] = built([["dep.bob", `${dep}export function three(): i32 { return 3 }\n`]], true)
 	assert out == "2\n" && again == out && held.length > 0 && kept == held
-	const [changed, anew] = built([["dep.bob", "export function one(x = 2): i32 { return x }\n"]], false, true)
+	const [changed, anew] = built([["dep.bob", "export function one(x = 2): i32 { return x }\n"]], true)
 	assert changed == "3\n" && anew.length > 0 && !anew.some(o => held.includes(o))
 }

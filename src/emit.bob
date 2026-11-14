@@ -49,8 +49,8 @@ export type Options = { main: i32, tests: bool, dyn: bool }
 /// The name of the entry of the image's module at path, which runs its main as C's main would, or else its tests.
 export function entry(path: string, tests: bool): string { return `bober.${if (tests) "tests" else "main"}.${path}` }
 
-/// Emits module m of program p into b; a release build's as facts says; with decls but those, instances -O1 makes
-/// (src/mono.bob's specialize), and nothing else the module's own object defines.
+/// Emits module m of program p into b; a release build's as facts says; with decls but those, -O2's instances
+/// (src/mono.bob's specialize) or group of functions, and nothing else the module's own object defines.
 export function emit(p: Program, m: i32, b: Backend, o: Options, facts: Facts = new Facts(),
 	decls: i32[] | null = null) throws CompileError { new Emitter(p, m, b, o, facts, decls).run() }
 
@@ -1233,7 +1233,7 @@ class Emitter {
 	}
 
 	/// The function of decl d's instance for env, which src/resolve.bob's instanced calls: d's, of the types env binds,
-	/// and no descriptors. -O1 defines it (src/mono.bob's specialize), else each unit calling it a weak trampoline.
+	/// and no descriptors. -O2 defines it (src/mono.bob's specialize), else each unit calling it a weak trampoline.
 	private instanceFn(d: i32, env: i32): Callee {
 		const have = this.instances.get(pair(d, env))
 		if (have != null) {
@@ -1451,7 +1451,7 @@ class Emitter {
 			return this.variable(d)
 		}
 		if (this.dyn && this.p.decls[d].generic >= 0) {
-			return this.global(this.p.decls[d].generic, this.p.decls[d].env) // an -O1 instance's code's, as its generic's
+			return this.global(this.p.decls[d].generic, this.p.decls[d].env) // an -O2 instance's code's, as its generic's
 		}
 		// Of the instance env names, or in its class's code, as its scope binds it.
 		const c = this.p.classOf(d)
@@ -1481,7 +1481,7 @@ class Emitter {
 		const p = this.p
 		const x = p.decls[d]
 		if (this.dyn && x.generic >= 0) {
-			this.invoke(x.generic, x.env) // an -O1 instance's code's call of an instance, as of its generic
+			this.invoke(x.generic, x.env) // an -O2 instance's code's call of an instance, as of its generic
 			return
 		}
 		if (x.code == null && (x.mods & Extern) == 0) {
