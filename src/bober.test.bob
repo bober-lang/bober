@@ -1,0 +1,155 @@
+//! Tests of src/bober.bob's builds into the image, which keeps what it holds across them.
+
+import { indexOf } from "../std/algo"
+import { mkdirAll, open } from "../std/fs"
+import * as process from "../std/process"
+import { replace } from "../std/string"
+import { Compile, build, dir, format, machine } from "./bober"
+import { Bytes } from "./link/bytes"
+import { Linker } from "./link/link"
+
+const home = "build/image-test"
+
+/// The files of the program, main.bob's calling size of n types.
+function files(n: i32): [string, string][] {
+	return [["types.bob", types], ["own.bob", own], ["lib.bob", lib], ["main.bob", program(n)]]
+}
+
+/// What main.bob prints, built in home with the files written first, -O1 if o1; and the objects of lib.bob's instances
+/// its image holds.
+function built(files: [string, string][], o1: bool): [string, string[]] {
+	mkdirAll(home)
+	for (const [name, src] of files) {
+		writeFile(`${home}/${name}`, src)
+	}
+	const f = new Compile()
+	f.mono = false
+	f.O1 = o1
+	dir = `${home}/build`
+	try {
+		process.run(build(`${home}/main.bob`, false, f, false), `${home}/out`)
+	} finally {
+		dir = "build"
+	}
+	const image = open(`${home}/build/image.so`)
+	const held = new Linker(machine, format, new Bytes(image.map())).objects().filter(o => indexOf(o, "lib.bob~") >= 0)
+	image.close()
+	return [readFile(`${home}/out`)!, held]
+}
+
+const types = `
+export class P {
+	x = 1
+
+	name(): string { return \`p\${this.x}\` }
+}
+
+export type Which = "a" | "b"
+export const which: Which = "a"
+`
+
+/// A module with a class of its own that it instances lib.bob's Box of.
+const own = `
+import { Box } from "./lib"
+
+class Q { v = 1 }
+
+export function boxed(): i32 { return new Box[Q](new Q()).get().v }
+`
+
+const lib = `
+export class Box[T] {
+	static made = 0
+	v: T
+
+	constructor(v: T) {
+		this.v = v
+		Box[T].made++
+	}
+
+	get(): T { return this.v }
+}
+
+export interface Named { name(): string }
+
+export function show[T extends Named](xs: T[]): string { return xs.map(x => x.name()).join(",") }
+export class Applied[T] {
+	v: T
+
+	constructor(f: (x: T) => T, x: T) { this.v = f(x) }
+}
+
+export function twice[T](f: (x: T) => T, x: T): T { return new Applied[T](y => f(f(y)), x).v }
+export function check[T](x: T, bad: T): T {
+	if (x == bad) {
+		throw "bad"
+	}
+	return x
+}
+interface AB extends "a" | "b" {}
+
+export function isA[T extends AB](v: T): bool { return v == "a" }
+export function described[T](): string { return named(t => \`\${t}\`) }
+export function size[T](): i32 { return 1 }
+
+function named(f: (t: Type) => string): string { return f(i32) }
+`
+
+/// main.bob, which calls size of n types and prints what the rest of lib.bob gives it.
+function program(n: i32): string {
+	let sizes = ""
+	let t = "i32"
+	for (const _ of 1 ... n) {
+		t += "[]"
+		sizes += `	k += size[${t}]()\n`
+	}
+	return `import { Box, check, described, isA, show, size, twice } from "./lib"
+import { P, Which, which } from "./types"
+import { boxed } from "./own"
+
+function main() {
+	let k = 0
+${sizes}	const b = new Box[i32](2)
+	new Box[string]("s").get()
+	let thrown = ""
+	try {
+		check("x", "x")
+	} catch (e: string) {
+		thrown = e
+	}
+	print(\`\${k} \${b.get()} \${Box[i32].made} \${Box[string].made} \${show([new P(), new P()])} \${twice(x => x * 3, 2)} \${boxed()}\`)
+	print(\`\${thrown} \${isA([which].join("") as Which)} \${described[f64]()}\`)
+}
+`
+}
+
+/// What main.bob prints, size summed to k.
+function printed(k: i32): string { return `${k} 2 1 1 p1,p1 18 1\nbad true i32\n` }
+
+test "-O1 compiles the instances of generics a program calls into its image, which a build without keeps" {
+	const [out, held] = built(files(1), true)
+	assert out == printed(1) && held.length > 0
+	const [again, kept] = built([["main.bob", replace(program(1), "let k = 0", "let k = 1")]], false)
+	assert again == printed(2) && kept == held
+}
+
+test "an edit of a generic's body unlinks its instances, the build running the new body" {
+	built(files(1), true)
+	const [out, held] = built([["lib.bob", replace(lib, "return 1", "return 2")]], false)
+	assert out == printed(2) && held.length == 0
+}
+
+test "a change of the layout of a type arg's class unlinks the instances of it, its module's export or not" {
+	for (const [file, src, from] of [["types.bob", types, "x = 1"], ["own.bob", own, "v = 1"]]) {
+		built(files(1), true)
+		const [out, held] = built([[file, replace(src, from, `y = 5\n\t${from}`)]], false)
+		assert out == printed(1) && held.length == 0
+	}
+}
+
+test "a new instance compiles one bucket anew" {
+	const [_, before] = built(files(150), true)
+	const [out, after] = built([["main.bob", program(151)]], true)
+	assert before.length == 4 && after.length == 4 && after.filter(o => !before.includes(o)).length == 1
+	assert out == printed(151)
+}

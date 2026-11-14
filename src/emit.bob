@@ -49,10 +49,10 @@ export type Options = { main: i32, tests: bool, dyn: bool }
 /// The name of the entry of the image's module at path, which runs its main as C's main would, or else its tests.
 export function entry(path: string, tests: bool): string { return `bober.${if (tests) "tests" else "main"}.${path}` }
 
-/// Emits module m of program p into b; a release build's as facts says.
-export function emit(p: Program, m: i32, b: Backend, o: Options, facts: Facts = new Facts()) throws CompileError {
-	new Emitter(p, m, b, o, facts).run()
-}
+/// Emits module m of program p into b; a release build's as facts says; with decls but those, instances -O1 makes
+/// (src/mono.bob's specialize), and nothing else the module's own object defines.
+export function emit(p: Program, m: i32, b: Backend, o: Options, facts: Facts = new Facts(),
+	decls: i32[] | null = null) throws CompileError { new Emitter(p, m, b, o, facts, decls).run() }
 
 /// What a release build learns of program p by emitting each module into a backend of its own, thrown away, so that it
 /// may hold values in place where it can: a release build's emission runs twice, to learn and as learned.
@@ -163,8 +163,9 @@ class Emitter {
 	/// Whether the program is as lowered, each generic's code once, taking its type args' descriptors.
 	dyn: bool
 	facts: Facts
-	/// The module's decls, members and nested ones included.
+	/// The module's decls, members and nested ones included, or but the instances given.
 	private decls: i32[] = []
+	private overlay: bool
 	/// The runtime's functions, and its heap's start, by name, without bober_.
 	private rts = new HashMap[string, Value]()
 	/// By type id, what the functions of their names make of it in this module's backend, as learned or not.
@@ -248,7 +249,7 @@ class Emitter {
 	private unwind: Block = 0
 	private pos = -1
 
-	constructor(p: Program, m: i32, b: Backend, o: Options, facts: Facts) {
+	constructor(p: Program, m: i32, b: Backend, o: Options, facts: Facts, decls: i32[] | null = null) {
 		this.p = p
 		this.m = m
 		this.path = p.modules[m].path
@@ -257,7 +258,8 @@ class Emitter {
 		this.dyn = o.dyn
 		this.facts = facts
 		this.any = p.type(kind.Union)
-		this.decls = listed(p, m)
+		this.decls = decls ?? listed(p, m)
+		this.overlay = decls != null
 		this.i1 = b.int(1)
 		this.i32 = b.int(32)
 		this.i64 = b.int(64)
@@ -354,12 +356,14 @@ class Emitter {
 		for (const d of this.decls) {
 			this.decl(d)
 		}
-		this.init()
-		if (this.o.main < 0) {
-			this.cMain(entry(this.path, false), false)
-			this.cMain(entry(this.path, true), true)
-		} else if (this.m == this.o.main) {
-			this.cMain("main", this.o.tests)
+		if (!this.overlay) {
+			this.init()
+			if (this.o.main < 0) {
+				this.cMain(entry(this.path, false), false)
+				this.cMain(entry(this.path, true), true)
+			} else if (this.m == this.o.main) {
+				this.cMain("main", this.o.tests)
+			}
 		}
 		for (const [d, env] of this.called) {
 			const f = this.instanceFn(d, env)
@@ -1313,11 +1317,14 @@ class Emitter {
 	/// Whether a function value's code takes an arg of type t as a union of any type (see codeType).
 	private anyOf(t: i32): bool { return this.dyn && this.kindOf(t) != kind.Optional }
 
+	/// Whether decl d is defined here: of this module, but where only its instances are emitted.
+	private here(d: i32): bool { return this.p.decls[d].module == this.m && !this.overlay }
+
 	/// Decl d as a function of type t, in this module or declared; one nested in a function local.
 	private function(d: i32, t: IrType): Value {
 		const x = this.p.decls[d]
 		return this.b.function(this.symbol(d), t,
-			x.module == this.m && x.owner >= 0 && this.p.classOf(d) < 0 && (x.mods & decl.Export) == 0)
+			this.here(d) && x.owner >= 0 && this.p.classOf(d) < 0 && (x.mods & decl.Export) == 0)
 	}
 
 	/// C's function name, called through a local function of type ft, bober's convention, which makes the call as C's ABI
@@ -1442,6 +1449,9 @@ class Emitter {
 		if (!this.lazy(d)) {
 			return this.variable(d)
 		}
+		if (this.dyn && this.p.decls[d].generic >= 0) {
+			return this.global(this.p.decls[d].generic, this.p.decls[d].env) // an -O1 instance's code's, as its generic's
+		}
 		// Of the instance env names, or in its class's code, as its scope binds it.
 		const c = this.p.classOf(d)
 		const n = if (env == 0) this.classType(c) else this.p.type(kind.Named, c, env)
@@ -1457,7 +1467,7 @@ class Emitter {
 			return have
 		}
 		const x = this.p.decls[d]
-		if (x.module != this.m) {
+		if (!this.here(d)) {
 			return this.b.extern(sym, this.mem(x.type))
 		}
 		const g = this.b.global(sym, this.zero(x.type), x.owner >= 0 && this.p.classOf(d) < 0, 0)
@@ -1469,6 +1479,10 @@ class Emitter {
 	private invoke(d: i32, env: i32) {
 		const p = this.p
 		const x = p.decls[d]
+		if (this.dyn && x.generic >= 0) {
+			this.invoke(x.generic, x.env) // an -O1 instance's code's call of an instance, as of its generic
+			return
+		}
 		if (x.code == null && (x.mods & Extern) == 0) {
 			this.intrinsic(this.name(d), env, p.subst(p.b(x.type), env))
 			return
@@ -1563,8 +1577,8 @@ class Emitter {
 	private dispatched(d: i32): bool {
 		const x = this.p.decls[d]
 		const c = this.p.classOf(d)
-		return this.dyn && c >= 0 && this.p.decls[c].kind == decl.Class && x.kind == decl.Function && x.code != null
-			&& x.params.length == 0 && this.name(d) != "constructor"
+		return this.dyn && x.generic < 0 && c >= 0 && this.p.decls[c].kind == decl.Class && x.kind == decl.Function
+			&& x.code != null && x.params.length == 0 && this.name(d) != "constructor"
 	}
 
 	/// The thunk of method d, defined if of this module: it takes this, or a static's class as a union tagged with its
@@ -1574,7 +1588,7 @@ class Emitter {
 		const f = this.callee(d)
 		const fn = this.b.function(`${f.sym}.thunk`,
 			this.b.fn(this.unionTy, [this.unionTy, ...f.params.map(_ => this.unionTy)]), false)
-		if (this.p.decls[d].module != this.m) {
+		if (!this.here(d)) {
 			return fn
 		}
 		const start = this.startThunk(fn, f.scope)
@@ -1598,7 +1612,7 @@ class Emitter {
 	/// instance as a union, its constructor called without args.
 	private construction(c: i32): Value {
 		const fn = this.b.function(`${this.symbol(c)}.new`, this.b.fn(this.unionTy, [this.unionTy]), false)
-		if (this.p.decls[c].module != this.m) {
+		if (!this.here(c)) {
 			return fn
 		}
 		const start = this.startThunk(fn, this.scopeOf(c))
@@ -2334,7 +2348,7 @@ class Emitter {
 	private initializer(c: i32): Value {
 		const ps = [...this.scopeOf(c).map(_ => this.i64), this.ref]
 		return this.b.function(this.symbol(c) + ":init", this.b.fn(this.void, ps),
-			this.p.decls[c].module == this.m && this.p.decls[c].owner >= 0)
+			this.here(c) && this.p.decls[c].owner >= 0)
 	}
 
 	/// Runs the initializers of class n on the instance at refers to, then its constructor, if it has one, with args.
