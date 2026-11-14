@@ -355,11 +355,19 @@ function exports(name: string, bytes: string): string[] throws CompileError {
 
 /// The image as an ELF shared library. A PT_LOAD maps each segment, the first also the headers before it, and one
 /// more, past them all, the loader's tables: the dynamic symbols, their hash table, the relocations, the
-/// eh_frame_hdr and the dynamic section, which glibc's loader writes. A section header per name of sections and a
-/// symbol table, which no loader reads, say what is where for debuggers and profilers.
+/// eh_frame_hdr and the dynamic section, which glibc's loader writes. Section headers and a symbol table, which no
+/// loader reads, say what is where for debuggers and profilers: a header per stretch of a segment, cut where the
+/// Unwind and Thread sections start and end.
 function write(image: Image) throws CompileError {
 	const segs = image.segments
 	const last = segs[segs.length - 1]
+	const spans = image.unwinds
+	const [from, to] = if (spans.length > 0) [spans[0][0], spans[spans.length - 1][1]] else [0, 0]
+	const stretches = image.stretches([from, to, image.thread[0], image.thread[1]], at => {
+		const s = image.segment(at)
+		return if (at == from) ".eh_frame" else if (threaded(image, at)) ".tdata" else if (s.exec) ".text"
+			else if (at >= s.address + s.size) ".bss" else if (s.write) ".data" else ".rodata"
+	})
 	// The loader's tables are at address base, and at offset file in the file, both multiples of a page.
 	const file = alignUp(image.bytes.length, image.page)
 	const base = alignUp(last.address + last.size + last.zero, image.page)
@@ -387,7 +395,7 @@ function write(image: Image) throws CompileError {
 		dynstr += l + "\x00"
 		return at
 	})
-	const [dynsym, strs, _] = symbols(image, dynamic, dynstr)
+	const [dynsym, strs, _] = symbols(image, stretches, dynamic, dynstr)
 	const symAt = place(fromBytes(dynsym))
 	const strAt = place(strs)
 	const hashAt = place(fromBytes(hash(dynamic)))
@@ -460,7 +468,7 @@ function write(image: Image) throws CompileError {
 	const loaded = tail.length as u64
 
 	// What is not loaded: the symbol table and the section headers.
-	const [symtab, strtab, locals] = symbols(image, image.symbols, "\x00")
+	const [symtab, strtab, locals] = symbols(image, stretches, image.symbols, "\x00")
 	const symtabAt = file + (place(fromBytes(symtab)) - base)
 	const strtabAt = file + (place(strtab) - base)
 	let shstrtab = "\x00"
@@ -474,12 +482,11 @@ function write(image: Image) throws CompileError {
 		n++
 		return n
 	}
-	for (const [name, at, size] of image.sections) {
+	for (const [name, at, size] of stretches) {
 		const seg = image.segment(at)
 		const sflags = SHF_ALLOC | (if (seg.write) SHF_WRITE else 0) | (if (seg.exec) SHF_EXECINSTR else 0) |
 			(if (threaded(image, at)) SHF_TLS else 0)
-		const sht = if (at >= seg.address + seg.size && size > 0) SHT_NOBITS else SHT_PROGBITS
-		section(name, sht, sflags, at, at, size, 0, 0, 0)
+		section(name, if (at >= seg.address + seg.size) SHT_NOBITS else SHT_PROGBITS, sflags, at, at, size, 0, 0, 0)
 	}
 	const t = (at: u64) => file + at - base
 	const dynsymIndex = section(".dynsym", SHT_DYNSYM, SHF_ALLOC, symAt, t(symAt), dynsym.length as u64, n + 2, 1, 24)
@@ -536,9 +543,9 @@ function flags(s: Segment): u64 { return PF_R | (if (s.write) PF_W else 0) | (if
 /// Whether the address at is in the template of a thread's copy, where a symbol's value is its offset.
 function threaded(image: Image, at: u64): bool { return at >= image.thread[0] && at < image.thread[1] }
 
-/// syms as an ELF symbol table, the locals first, with their string table, after strs; and the index of the first
-/// global.
-function symbols(image: Image, syms: Symbol[], strs: string): [u8[], string, u64] {
+/// syms as an ELF symbol table, the locals first, whose section headers after the first are stretches, with their
+/// string table, after strs; and the index of the first global.
+function symbols(image: Image, stretches: [string, u64, u64][], syms: Symbol[], strs: string): [u8[], string, u64] {
 	const b = new u8[](24 * (syms.length + 1))
 	let names = strs
 	let n = 1
@@ -555,7 +562,7 @@ function symbols(image: Image, syms: Symbol[], strs: string): [u8[], string, u64
 			put(b, e, names.length as u64, 4)
 			b[e + 4] = (bind << 4 | (if (s.section < 0) STT_NOTYPE else if (tls) STT_TLS else if (exec) STT_FUNC
 				else STT_OBJECT)) as u8
-			put(b, e + 6, if (s.section < 0) SHN_UNDEF else 1 + (partitionPoint(image.sections, r => r[1] + r[2] > s.value) as u64),
+			put(b, e + 6, if (s.section < 0) SHN_UNDEF else 1 + (partitionPoint(stretches, r => r[1] + r[2] > s.value) as u64),
 				2)
 			put(b, e + 8, if (tls) s.value - image.thread[0] else s.value, 8)
 			put(b, e + 16, s.size, 8)

@@ -11,7 +11,7 @@
 //! linked for good as one unit. Of the objects given, the image keeps the symbols and the fixups a link may set anew,
 //! not their bytes. A link the image cannot take is Stale, and who links then links all anew.
 
-import { partitionPoint, sortBy, stableSort, startsWith } from "../../std/algo"
+import { partitionPoint, sort, sortBy, stableSort, startsWith } from "../../std/algo"
 import { HashMap } from "../../std/collections/hashmap"
 import { get, put } from "../../std/encoding/binary"
 import { alignUp, max, min } from "../../std/math"
@@ -61,6 +61,23 @@ export class Image {
 	segment(at: u64): Segment {
 		const i = partitionPoint(this.segments, s => s.address + s.size + s.zero > at)
 		return this.segments[min(i, (this.segments.length - 1) as u32)]
+	}
+
+	/// The stretches of the segments the cuts and their bounds cut them into, as name calls each, in order.
+	stretches(cuts: u64[], name: (at: u64) => string): [string, u64, u64][] {
+		for (const s of this.segments) {
+			cuts.push(...[s.address, s.address + s.size, s.address + s.size + s.zero])
+		}
+		sort(cuts)
+		const all: [string, u64, u64][] = []
+		for (const i of 1 ... cuts.length - 1) {
+			const [at, end] = [cuts[i - 1], cuts[i]]
+			const s = this.segment(at)
+			if (end > at && at >= s.address && end <= s.address + s.size + s.zero) {
+				all.push([name(at), at, end - at])
+			}
+		}
+		return all
 	}
 }
 

@@ -1,0 +1,62 @@
+//! Tests of src/link/elf: a written shared library read back.
+
+import { CompileError } from "../error"
+import { arm64 } from "./arm64"
+import { Bytes, le, mapped, zeros } from "./bytes"
+import { elf } from "./elf"
+import { Linker } from "./link"
+import { Code, Global, Object, Section, Symbol, Unwind } from "./object"
+
+/// The file of the image l links.
+function file(l: Linker): Bytes throws CompileError {
+	const image = l.link()
+	elf.write(image)
+	return image.bytes
+}
+
+/// An object named name of 8 bytes of code, which defines name there.
+function text(name: string): Object {
+	const s = new Section("text", Code)
+	s.align = 4
+	s.bytes = zeros(8)
+	s.size = 8
+	const o = new Object(name, "arm64")
+	o.sections = [s]
+	o.symbols = [new Symbol(name, Global, 0)]
+	return o
+}
+
+/// The names of the entries of d's .symtab, each with its value if in the section its st_shndx says; and the entries.
+function symbols(d: Bytes): [string, string] {
+	const header = (i: u64) => d.get(40, 8) + 64 * i
+	let symtab: u64 = 1
+	while (d.get(header(symtab) + 4, 4) != 2) {
+		symtab++
+	}
+	const [entries, size] = [d.get(header(symtab) + 24, 8), d.get(header(symtab) + 32, 8)]
+	const strings = d.get(header(d.get(header(symtab) + 40, 4)) + 24, 8)
+	const names: string[] = []
+	for (const e of 0 ... ((size / 24) as i32) - 1) {
+		const at = entries + 24 * (e as u64)
+		const [name, value, shndx] = [strings + d.get(at, 4), d.get(at + 8, 8), d.get(at + 6, 2)]
+		const from = d.get(header(shndx) + 16, 8)
+		if (d.get(at, 4) != 0 && value >= from && value < from + d.get(header(shndx) + 32, 8)) {
+			names.push(d.slice(name, name + 1))
+		}
+	}
+	return [names.join(" "), d.slice(entries, entries + size)]
+}
+
+test "a symbol's entry is in the section its header says, of a kept image too, where an object cuts it anew" {
+	const l = new Linker(arm64, elf, new Bytes())
+	l.add(text("f"))
+	const again = new Linker(arm64, elf, new Bytes(mapped(file(l))))
+	const eh = new Section(".eh_frame", Unwind)
+	eh.bytes = le(12, 4) + zeros(12)
+	eh.size = 16
+	const u = new Object("u", "arm64")
+	u.sections = [eh]
+	again.add(u)
+	const [names, _] = symbols(file(again))
+	assert names == "f"
+}
