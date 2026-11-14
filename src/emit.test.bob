@@ -3,6 +3,7 @@
 import { indexOf } from "../std/algo"
 import { Facts, emit } from "./emit"
 import { LLVM } from "./backend/llvm"
+import { CompileError } from "./error"
 import { lower } from "./lower"
 import { mono, specialize } from "./mono"
 import { appendFile, mkdirAll } from "../std/fs"
@@ -480,4 +481,17 @@ test "-O2's unit of instances keeps their closures local, and a unit calling one
 	const lib = `${dir}/lib.bob`
 	assert indexOf(text(lib, o2[p.module(lib)][0]), `define internal { i64, i64, ptr addrspace(1) } @"${lib}:twice[i32].`) >= 0
 	assert indexOf(text(`${dir}/o2.bob`, null), `define weak i32 @"${lib}:twice[i32]"`) >= 0
+}
+
+test "a class whose fields nest its type args ever deeper is an error, not endless type descriptors" {
+	mkdirAll(dir)
+	const main = `${dir}/deep.bob`
+	writeFile(main, "class A[T] {\n\tb: B[T] | null = null\n}\nclass B[T] {\n\ta: A[T[]] | null = null\n}")
+	const p = lower([main])
+	let deep = "T"
+	for (const i of 1 ... 254) {
+		deep += "[]"
+	}
+	const o = { main: -1, tests: false, dyn: true }
+	assert emit(p, p.module(main), new LLVM(main, 0), o) throws new CompileError(`A[${deep}] | null nests type args ever deeper`)
 }
