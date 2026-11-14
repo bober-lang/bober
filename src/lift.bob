@@ -2,7 +2,6 @@
 //! types; and the modules of the bundle, linked into it from their files (src/bc/file.bob) rather than checked and
 //! lowered.
 
-import { indexOf } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
 import { Reader, Writer } from "../std/encoding/binary"
 import { open } from "../std/fs"
@@ -13,6 +12,7 @@ import { ParseError } from "../std/string"
 import * as decl from "./bc/decl"
 import { In, abi, head, read, write } from "./bc/file"
 import { Program, sourceHash } from "./bc/program"
+import { system } from "./c/bind"
 import { CompileError } from "./error"
 import { builtin, root } from "./root"
 import { Type } from "./type"
@@ -40,16 +40,20 @@ export class Lift {
 	/// The headers of the files linked from the cache.
 	private served: In[] = []
 
-	/// Adds those of files to the cache that are of their module's source as read gives it and made by this compiler,
-	/// but builtin/'s, which every program checks first (src/check.bob), and those of or using a C header's module,
-	/// which is bound anew.
-	cached(files: string[], read: (path: string) => string | null) throws IoError {
+	/// Adds those of files to the cache that are of their module's source as it is, made by this compiler, but
+	/// builtin/'s, which every program checks first (src/check.bob): as read gives it, or for a header's module as bind
+	/// made it; each while its Bound, if any, is current.
+	cached(files: string[], includes: string[], read: (path: string) => string | null) throws IoError {
 		const compiler = compilerId()
+		const joined = searched(includes)
 		for (const f of files) {
 			try {
 				const h = head(f)
-				const skip = builtin(h.path) || [h.path, ...h.paths].some(x => indexOf(x, ": ") >= 0)
-				const src = if (skip) null else read(h.path)
+				const b = bound.get(h.path)
+				if (builtin(h.path) || b != null && !b.current(joined, read)) {
+					continue
+				}
+				const src = if (b != null && b.src != "") b!.src else read(h.path)
 				if (src != null && h.source == sourceHash(h.path, src!) && h.compiler == compiler) {
 					this.cache.set(h.path, f)
 				}
@@ -140,6 +144,74 @@ export class Lift {
 		return ms[0]
 	}
 }
+
+/// What a module is of beyond its file: for a header's names, the source bind made of them, else ""; the includes
+/// searched (searched); and each file read meanwhile, by bind, or to locate the headers a module imports, by path, with
+/// the hash of its bytes, 0 if there are none.
+export class Bound {
+	src = ""
+	includes: string
+	reads: [string, u64][] = []
+
+	constructor(includes: string) { this.includes = includes }
+
+	/// Keeps each Bound of files, as bytes made them.
+	static keep(files: string[]) {
+		for (const f of files) {
+			try {
+				const r = new Reader(f)
+				const s = () => r.raw(r.uleb() as i32)
+				const path = s()
+				const b = new Bound(s())
+				b.src = s()
+				while (r.pos < f.length) {
+					b.reads.push([s(), r.fixed(8)])
+				}
+				bound.set(path, b)
+			} catch (e: ParseError) {}
+		}
+	}
+
+	/// Whether includes are those searched, and each file read is as read gives it.
+	current(includes: string, read: (path: string) => string | null): bool {
+		return includes == this.includes && this.reads.every(r => hash(read(r[0])) == r[1])
+	}
+
+	/// read, adding to reads each file it reads.
+	reader(read: (path: string) => string | null): (path: string) => string | null {
+		return p => {
+			const s = read(p)
+			if (!this.reads.some(r => r[0] == p)) {
+				this.reads.push([p, hash(s)])
+			}
+			return s
+		}
+	}
+
+	/// This, of the module at path, as a build's kept image holds it.
+	bytes(path: string): string {
+		const w = new Writer()
+		for (const s of [path, this.includes, this.src]) {
+			w.uleb(s.length as u64)
+			w.raw(s)
+		}
+		for (const [f, h] of this.reads) {
+			w.uleb(f.length as u64)
+			w.raw(f)
+			w.fixed(h, 8)
+		}
+		return w.bytes
+	}
+}
+
+/// The Bound of each module by path that is of a header or imports one, made by a check or kept in a build's kept image
+/// (Bound.keep), as binding is slow; current again on each use.
+export const bound = new HashMap[string, Bound]()
+
+/// includes, then the system's, joined by lines.
+export function searched(includes: string[]): string { return [...includes, system].join("\n") }
+
+function hash(s: string | null): u64 { return if (s == null) 0 else fnv(s!) }
 
 function stdBundle(): HashMap[string, string] {
 	if (std == null) {

@@ -1,11 +1,12 @@
 import { sort, startsWith } from "../std/algo"
 import { fnv } from "../std/hash"
 import { HashMap } from "../std/collections/hashmap"
+import { split } from "../std/string"
 import { write } from "./bc/file"
 import { show as shown } from "./bc/show"
 import { Checked, Node, TypeError, check, show } from "./check"
 import { CompileError } from "./error"
-import { Lift, bundle, compilerId, unbundle } from "./lift"
+import { Bound, Lift, bound, bundle, compilerId, unbundle } from "./lift"
 import { Lower, lower } from "./lower"
 
 /// The errors of main.bob of source src, as pos: msg separated by "; ", where it imports the modules of files, each
@@ -666,42 +667,49 @@ class Logged implements Checked {
 	}
 }
 
-/// The modules of main.bob of source src and of files that a build of them with the files of cache checks; the errors;
-/// and the file of each module, as a build's kept image holds it.
-function built(src: string, files: string[], cache: string[]): [string[], string[], string[]] {
-	const read = (path: string) => source(path, src, files)
+/// The modules of main.bob of source src and of files, with include directory inc/, that a build of them checks with
+/// the files and Bounds of image, as a build's kept image holds them; the errors; and the files and Bounds of each
+/// module, as this build's image holds them, each Bound kept in it alone.
+function built(src: string, files: string[], image: string[][] = [[], []]): [string[], string[], string[][]] {
+	const read = (path: string) => source(path, src, files) ?? readFile(path)
 	const l = new Lower()
 	const log = new Logged(l)
-	l.lift.cached(cache, read)
-	const errors = check(["main.bob"], [], read, log, l.lift).map(message)
+	Bound.keep(image[1])
+	l.lift.cached(image[0], ["inc"], read)
+	const errors = check(["main.bob"], ["inc"], read, log, l.lift).map(message)
 	if (errors.length > 0) {
-		return [[], errors, []]
+		return [[], errors, [[], []]]
 	}
 	const p = l.finish()
-	const checked = log.checked.filter(x => x == "main.bob" || files.includes(x))
+	const checked = log.checked.filter(x => x == "main.bob" || files.includes(split(x, ": ")[0]))
 	sort(checked)
-	const out: string[] = []
+	const out: string[][] = [[], []]
 	for (const m of 0 ... p.modules.length - 1) {
-		out.push(write(p, m, compilerId()))
+		const path = p.modules[m].path
+		out[0].push(write(p, m, compilerId()))
+		out[1].push(...(if (bound.get(path) == null) [] else [bound.get(path)!.bytes(path)]))
+		bound.delete(path)
 	}
 	return [checked, [], out]
+}
+
+/// The hashes of image's files and Bounds, in order.
+function units(image: string[][]): string {
+	const xs = [...image[0], ...image[1]].map(f => `${fnv(f)}`)
+	sort(xs)
+	return xs.join(" ")
 }
 
 test "a module whose file the cache holds is linked unless its source, or the ABI of one it imports, changed" {
 	const main = "import { f } from \"b\"\nexport function main(): i32 { return f() }"
 	const b = ["b.bob", "import { g } from \"a\"\nexport function f(): i32 { return g() }"]
-	const units = (fs: string[]): string => {
-		const xs = fs.map(f => `${fnv(f)}`)
-		sort(xs)
-		return xs.join(" ")
-	}
-	const same = (a: string, cache: string[], checked: string): string[] => {
-		const [c, errors, out] = built(main, [...b, "a.bob", a], cache)
+	const same = (a: string, image: string[][], checked: string): string[][] => {
+		const [c, errors, out] = built(main, [...b, "a.bob", a], image)
 		assert c.join(" ") == checked && errors.length == 0
-		assert units(out) == units(built(main, [...b, "a.bob", a], [])[2])
+		assert units(out) == units(built(main, [...b, "a.bob", a])[2])
 		return out
 	}
-	const all = same("export function g(): i32 { return 1 }", [], "a.bob b.bob main.bob")
+	const all = same("export function g(): i32 { return 1 }", [[], []], "a.bob b.bob main.bob")
 	same("export function g(): i32 { return 1 }", all, "")
 	same("export function g(): i32 { return 2 }", all, "a.bob")
 	same("export function g(x = 1): i32 { return x }", all, "a.bob b.bob")
@@ -714,7 +722,22 @@ test "a module whose file the cache holds is linked unless its source, or the AB
 		return ""
 	}
 	const cycle = "import { f } from \"b\"\nexport function g(): i32 { return 1 }"
-	assert errors(cycle, all) == errors(cycle, []) && errors(cycle, []) == "a.bob:1:19: import cycle through b.bob"
+	assert errors(cycle, all[0]) == errors(cycle, []) && errors(cycle, []) == "a.bob:1:19: import cycle through b.bob"
 	const i64 = "export function g(): i64 { return 1 }"
-	assert errors(i64, all) == errors(i64, []) && errors(i64, []) != ""
+	assert errors(i64, all[0]) == errors(i64, []) && errors(i64, []) != ""
+}
+
+test "a header's module and its users are linked from the cache while the files bind and located read are unchanged" {
+	const main = "import { N } from \"x.h\"\nimport { M } from \"d/b\"\nexport function main(): i32 { return N + M }"
+	const b = ["d/b.bob", "import { N } from \"x.h\"\nexport const M = N"]
+	const same = (files: string[], image: string[][], checked: string): string[][] => {
+		const [c, errors, out] = built(main, [...b, ...files], image)
+		assert c.join(" ") == checked && errors.length == 0
+		assert units(out) == units(built(main, [...b, ...files])[2])
+		return out
+	}
+	const all = same(["inc/x.h", "#define N 1\n"], [[], []], "d/b.bob inc/x.h: N main.bob")
+	same(["inc/x.h", "#define N 1\n"], all, "")
+	same(["inc/x.h", "#define N 2\n"], all, "d/b.bob inc/x.h: N main.bob")
+	same(["inc/x.h", "#define N 1\n", "d/x.h", "#define N 2\n"], all, "d/b.bob d/x.h: N main.bob")
 }

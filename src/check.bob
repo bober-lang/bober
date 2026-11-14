@@ -16,7 +16,7 @@ import { Program } from "./bc/program"
 import { bind, located } from "./c/bind"
 import { CompileError } from "./error"
 import { Kind, Loc, SyntaxError, Tok, prec } from "./lex"
-import { Lift } from "./lift"
+import { Bound, Lift, bound, searched } from "./lift"
 import { Parser, Syntax, Tree } from "./parse"
 import { builtin, builtinPath, root } from "./root"
 import {
@@ -293,10 +293,6 @@ export class TypeError {
 	}
 }
 
-/// The source bind makes of each header's names, by the key of their module and the includes, kept across checks,
-/// as each checks builtin/ and its headers again: binding is slow, and a header does not change while the compiler runs.
-const bound = new HashMap[string, string]()
-
 /// The modules of a program by path, each checked once, when first imported.
 ///
 /// Freezing (below) is meant to be free on the hot path: after const initialization, collect the heap once, move the
@@ -416,16 +412,21 @@ class Modules {
 
 	/// The module of names from C header spec, as importer includes it, or why there is none (3.1).
 	header(importer: string, spec: string, names: string[]): Module | string {
-		const key = `${located(importer, spec, this.includes, this.read)}: ${names.join(" ")}`
+		const includes = searched(this.includes)
+		const user = bound.get(importer) ?? new Bound(includes)
+		bound.set(importer, user)
+		const key = `${located(importer, spec, this.includes, user.reader(this.read))}: ${names.join(" ")}`
 		const m = this.loaded.get(key) ?? this.bundled(key)
 		if (m != null) {
 			return m
 		}
 		try {
-			const k = `${key} ${this.includes.join(" ")}`
-			const src = bound.get(k) ?? bind(importer, spec, names, this.includes, this.read)
-			bound.set(k, src)
-			return this.checked(key, src, true)
+			if (!(bound.get(key)?.current(includes, this.read) ?? false)) {
+				const b = new Bound(includes)
+				b.src = bind(importer, spec, names, this.includes, b.reader(this.read))
+				bound.set(key, b)
+			}
+			return this.checked(key, bound.get(key)!.src, true)
 		} catch (e: CompileError) {
 			return e.msg
 		}
@@ -446,6 +447,9 @@ class Modules {
 	}
 
 	private checked(path: string, src: string, header: bool): Module {
+		if (!header) {
+			bound.delete(path) // as header locates the headers it imports anew
+		}
 		const m = new Module(path)
 		this.loaded.set(path, m)
 		const p = new Parser(src, header || builtin(path)) // builtin/'s intrinsics have no body
