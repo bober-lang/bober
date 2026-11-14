@@ -4,6 +4,7 @@
 //! unwind, compiles it. A trap prints where it happened and exits, or in a test fails just that test. A function that
 //! can trap takes the module's source path and the byte offset in it last, and reports them as path:line:col.
 
+#define _GNU_SOURCE  // REG_RSP
 #include "rt.h"
 #include <errno.h>
 #include <setjmp.h>
@@ -15,6 +16,7 @@
 #include <string.h>
 #include <sys/random.h>
 #include <time.h>
+#include <sys/ucontext.h>  // <ucontext.h> is an #error on macOS without _XOPEN_SOURCE
 #include <unistd.h>
 #include <unwind.h>
 
@@ -86,6 +88,24 @@ _Noreturn void bober_trap(const char *what, const char *file, int32_t at) {
   if (test) longjmp(*test, 1);
   put(saved[1], msg, strlen(msg)), put(saved[1], "\n", 1);
   exit(1);
+}
+
+#if defined(__APPLE__) && defined(__aarch64__)
+#define SP(c) (c)->uc_mcontext->__ss.__sp
+#elif defined(__APPLE__)
+#define SP(c) (c)->uc_mcontext->__ss.__rsp
+#elif defined(__aarch64__)
+#define SP(c) (c)->uc_mcontext.sp
+#else
+#define SP(c) (c)->uc_mcontext.gregs[REG_RSP]
+#endif
+
+/// Ends the process as an uncaught trap on a fault by a frame stepping off the end of its stack, onto the guard below,
+/// which may be in the C library holding its state; any other fault ends it as it would have without.
+static void fault(int sig, siginfo_t *info, void *c) {
+  uintptr_t sp = SP((ucontext_t *)c), at = (uintptr_t)info->si_addr;
+  if (at - sp + (1 << 16) < 1 << 17) put(saved[1], "trap: stack overflow\n", 21), _exit(1);  // within a frame of sp
+  signal(sig, SIG_DFL), raise(sig);
 }
 
 /// A value of primitive kind (§8.2) held in bits as text, in buf; a string is boxed in ref, laid out as
@@ -187,6 +207,11 @@ void bober_start(int argc, char **argv, int32_t tested) {
     dup2(cap, 1), dup2(cap, 2);
   } else getentropy(&seed, sizeof seed);
   signal(SIGPIPE, SIG_IGN);  // a write to a socket the peer closed fails with EPIPE instead
+  // fault runs on a stack of its own, as the faulting one is full.
+  static char alt[1 << 16];
+  sigaltstack(&(stack_t){.ss_sp = alt, .ss_size = sizeof alt}, 0);
+  struct sigaction a = {.sa_sigaction = fault, .sa_flags = SA_SIGINFO | SA_ONSTACK};
+  sigaction(SIGSEGV, &a, 0), sigaction(SIGBUS, &a, 0);
   bober_types_complete();
 }
 
