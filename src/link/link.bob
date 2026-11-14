@@ -19,8 +19,8 @@ import { Arch } from "../../std/os"
 import { CompileError } from "../error"
 import { Bytes, zeros } from "./bytes"
 import { Region, State, read, write } from "./keep"
-import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Image32, Init, Local, Machine, Object, Page, PageOff,
-	Rel32, Rel64, Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Thread32, Unwind, Weak,
+import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Image32, Init, Kept, Local, Machine, Object, Page,
+	PageOff, Rel32, Rel64, Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Thread32, Unwind, Weak,
 	Zero } from "./object"
 
 /// What a format's writer makes a file of. Its addresses are from where it is loaded, and the file has each segment's
@@ -103,9 +103,10 @@ const slotted = (kind: u8) => kind == SlotPage || kind == SlotPageOff || kind ==
 /// The sections of each segment, by kind, in order; and of a kept image's, where the Zero ones are a segment of their
 /// own, as each before the last has room after it: addresses no file holds, for what later links add; and the Unwind
 /// ones the first, with the headers, where Mach-O's unwinder reads them one after another. An image with a full region
-/// is linked anew, as is one whose code no longer reaches what it calls, on arm64 128 MB away.
-const regions: u8[][] = [[Code], [Const, Unwind], [Data, Init, Thread, Zero]]
-const keptRegions: u8[][] = [[Unwind], [Code], [Const], [Data, Init, Thread], [Zero]]
+/// is linked anew, as is one whose code no longer reaches what it calls, on arm64 128 MB away. Last, the Kept ones,
+/// which no loader maps.
+const regions: u8[][] = [[Code], [Const, Unwind], [Data, Init, Thread, Zero], [Kept]]
+const keptRegions: u8[][] = [[Unwind], [Code], [Const], [Data, Init, Thread], [Zero], [Kept]]
 const room: u64 = 1 << 28
 
 /// A name the objects share: the definition taken for it, and its address once laid out.
@@ -709,13 +710,15 @@ export class Linker {
 				region.cap = alignUp(region.top, image.page) + (if (this.keep) room else 0)
 			}
 			if (region.top > region.start) {
-				image.segments.push({ address: region.start, size: end - region.start, zero: region.top - end,
-					write: regions[r][0] == Data || regions[r][0] == Zero, exec: regions[r][0] == Code })
+				if (regions[r][0] != Kept) {
+					image.segments.push({ address: region.start, size: end - region.start, zero: region.top - end,
+						write: regions[r][0] == Data || regions[r][0] == Zero, exec: regions[r][0] == Code })
+				}
 				file = max(file, end)
 			}
 		}
 		const all = merged(laid)
-		image.sections = all.map(e => [e[0], e[2], e[3] - e[2]])
+		image.sections = all.filter(e => e[1] != Kept).map(e => [e[0], e[2], e[3] - e[2]])
 		for (const i of 0 ... all.length - 1) {
 			const [_, kind, from, to] = all[i]
 			if (kind == Unwind && i > 0 && all[i - 1][1] == Unwind) {
@@ -904,7 +907,7 @@ export class Linker {
 
 	/// Keeps in the image what a later link continues it from, which the 16 bytes after its headers say where the file
 	/// has: its units, the frozen ones as one and the others stripped; the slots and stubs of names; and exports. It is
-	/// at the last region's start, which no segment's bytes grow over, as the loader takes none of the region's.
+	/// after the Kept sections, as the loader takes none of their region's.
 	private save(image: Image, exports: string[]) {
 		const s = this.state
 		for (const x of this.bounded) {
@@ -926,7 +929,7 @@ export class Linker {
 		s.inits = image.inits
 		s.thread = image.thread
 		const kept = write(s, this.machine.arch)
-		const at = s.regions[s.regions.length - 1].start
+		const at = alignUp(s.regions[s.regions.length - 1].top, 8)
 		image.bytes.set(at, kept)
 		image.bytes.length = at + (kept.length as u64)
 		image.bytes.put(this.format.headers, at, 8)
