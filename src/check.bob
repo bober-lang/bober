@@ -311,7 +311,8 @@ export class TypeError {
 ///
 /// A file is a module. Imports come first and name exported declarations of another module, whose path `p` is relative
 /// to the importing file if it starts with a dot, else to the implementation's, as `"std/fs"`. `import * from "p"` names
-/// every exported declaration of `p`. An imported name shall not also be imported otherwise or declared at the top
+/// every exported declaration of `p`, and `import * as n from "p"` names each `x` of them `n.x`, which is that
+/// declaration; `n` alone is not a value. An imported name shall not also be imported otherwise or declared at the top
 /// level. `import "p"` is `import * as n from "p"`, with `n` the last segment of `p` without `.bob`, which shall be an
 /// identifier. Only `export`ed declarations are visible to other modules, and an exported declaration's type shall name
 /// only exported or imported declarations; but a test file, one named `*.test.bob`, may import any top-level declaration
@@ -791,6 +792,8 @@ class Binding {
 	literal: Type | null = null
 	/// While its initializer is checked, whether that is in the body of a function literal it gives unrun (3).
 	initializing: "" | "function" | "value" = ""
+	/// A namespace import's module's exports by name.
+	exports: HashMap[string, Binding] | null = null
 
 	constructor(t: Type | null, mutable: bool, isType: bool) {
 		this.type = t
@@ -1163,27 +1166,11 @@ class Checker {
 				this.declareTop(name, what.t, m.exports.get(name)!)
 			}
 		} else {
-			const fs: Field[] = []
-			for (const name of m.names) {
-				const b = m.exports.get(name)!
-				const t = b.type
-				fs.push(new Field(name, if (t == null) Empty else if (b.isType) meta(t, b.params) else t))
-			}
-			const o = Type.object(fs)
-			for (const name of m.names) {
-				const b = m.exports.get(name)!
-				const f = about(o, name)
-				f.decl = b.decl
-				f.warning = b.decl?.warning ?? null
-				f.errors = b.decl?.errors ?? f.errors
-				if (b.type == null || b.failed) {
-					f.state = "failed"
-				}
-			}
 			const at = if (what.kind == "binary") what.parts[1].t else s
 			const name = if (what.kind == "binary") this.text(at) else segment(spec)
-			const b = new Binding(o, false, false)
+			const b = new Binding(Empty, false, false)
 			b.symbol = m.path + ":"
+			b.exports = m.exports
 			this.declareTop(name, at, b)
 		}
 	}
@@ -3063,18 +3050,21 @@ class Checker {
 	private name(p: Node): Type {
 		const n = p.t
 		const b = this.lookup(n)
+		if (b.exports != null) {
+			throw this.error(n.loc, `${this.text(n)} is a namespace, not a value`)
+		}
 		p.symbol = b.symbol
 		const t = this.typeOf(b, n)
 		return if (b.isType) meta(t) else this.place(p)?.narrowed ?? t
 	}
 
-	/// The binding of a name, recording a top-level one as a reference of the declaration being checked, and a use if
-	/// uses.
-	private lookup(t: Tok, uses = true): Binding {
+	/// The binding of a name, or of the export of a namespace import's exports, recording a top-level one as a
+	/// reference of the declaration being checked, and a use if uses.
+	private lookup(t: Tok, uses = true, exports: HashMap[string, Binding] | null = null): Binding {
 		const name = this.text(t)
-		const b = this.find(name)
+		const b = if (exports == null) this.find(name) else exports.get(name)
 		if (b == null) {
-			throw this.error(t.loc, `${name} is not declared`)
+			throw this.error(t.loc, `${name} is not ${if (exports == null) "declared" else "exported"}`)
 		}
 		const d = b.decl
 		if (d == null && !b.isType && b.depth <= this.wall && this.locals.get(name) == b) {
@@ -3665,6 +3655,10 @@ class Checker {
 	/// ```
 	private link(n: Node, assigned: bool, want: Type | null = null): Type {
 		const a = n.parts[0]
+		const space = this.namespace(n)
+		if (space != null) {
+			return this.exported(n, space, assigned)
+		}
 		const checked = if (isLink(a)) this.link(a, false) else this.linked(a, null)
 		let o = if (n.kind == "member") this.own(a, checked) else checked // a subscript's converts with its result
 		if (n.t.kind == "?." && o == Null) {
@@ -3685,6 +3679,27 @@ class Checker {
 		}
 		const b = if (n.kind == "member" && !assigned) this.place(n, t) else null
 		n.type = if (b == null) t else b.narrowed ?? t
+		return n.type!
+	}
+
+	/// The namespace import whose member member link n reads, if it is one.
+	private namespace(n: Node): Binding | null {
+		const b = if (n.kind == "member" && isTok(n.parts[0], "ident")) this.find(this.text(n.parts[0].t)) else null
+		return if (b?.exports == null) null else b
+	}
+
+	/// The type of n, the member of namespace import space that is an export of its module, as one imported by name.
+	private exported(n: Node, space: Binding, assigned: bool): Type {
+		const name = n.parts[1].t
+		n.parts[0].symbol = space.symbol
+		n.parts[0].type = space.type
+		const b = this.lookup(name, true, space.exports)
+		if (assigned && !b.mutable) {
+			throw this.error(name.loc, `${this.text(name)} is not assignable`)
+		}
+		const t = this.typeOf(b, name)
+		n.parts[1].type = t
+		n.type = if (b.isType) meta(t, b.params) else if (assigned) t else this.place(n, t)?.narrowed ?? t
 		return n.type!
 	}
 
@@ -3824,6 +3839,10 @@ class Checker {
 	/// The errors of callee where it names a top-level function or a method, else null: a function value's are unchecked.
 	private errorsOf(callee: Node): Errors | null {
 		const c = if (callee.kind == "index") callee.parts[0] else callee
+		const space = this.namespace(c)
+		if (space != null) {
+			return space.exports!.get(this.text(c.parts[1].t))?.decl?.errors ?? null
+		}
 		if (c.kind == "member") {
 			const o = c.parts[0].type!.nonNull()
 			const s = standsFor(o)
