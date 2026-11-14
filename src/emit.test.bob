@@ -1,9 +1,10 @@
 //! Tests of src/emit.bob: small programs compiled through the whole pipeline, with the run time, and run.
 
-import { emit } from "./emit"
+import { indexOf } from "../std/algo"
+import { Facts, emit } from "./emit"
 import { LLVM } from "./backend/llvm"
 import { lower } from "./lower"
-import { mono } from "./mono"
+import { mono, specialize } from "./mono"
 import { appendFile, mkdirAll } from "../std/fs"
 import * as process from "../std/process"
 import { ld, runtime } from "./bober"
@@ -454,4 +455,24 @@ no
 no again
 exit 0
 `
+}
+
+test "-O1's unit of instances keeps their closures local, and a unit calling one has a trampoline LLVM does not inline" {
+	mkdirAll(dir)
+	writeFile(`${dir}/o1.bob`, `import { twice } from "./lib"\n\nfunction main() { print(\`\${twice[i32](x => x * 3, 2)}\`) }\n`)
+	writeFile(`${dir}/lib.bob`, `export function twice[T](f: (x: T) => T, x: T): T {
+	const g = (y: T) => f(f(y))
+	return g(x)
+}
+`)
+	const p = lower([`${dir}/o1.bob`])
+	const o1 = specialize(p)
+	const text = (path: string, ds: i32[] | null) => {
+		const b = new LLVM(path, 0)
+		emit(p, p.module(path), b, { main: -1, tests: false, dyn: true }, new Facts(), ds)
+		return b.text()
+	}
+	const lib = `${dir}/lib.bob`
+	assert indexOf(text(lib, o1[p.module(lib)][0]), `define internal { i64, i64, ptr addrspace(1) } @"${lib}:twice[i32].`) >= 0
+	assert indexOf(text(`${dir}/o1.bob`, null), `define weak i32 @"${lib}:twice[i32]"`) >= 0
 }
