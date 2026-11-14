@@ -2851,6 +2851,15 @@ class Checker {
 	/// `&&`, `||`, `??`, `?.`, `if` and `switch` evaluate only what their rules state. A value has one static type, and
 	/// where it is used decides the conversion it undergoes (§4.10).
 	private expr(p: Node, want: Type | null): Type {
+		const t = this.linked(p, want)
+		if (t.kind == "function" && t.params.length > 0) {
+			throw this.error(start(p), `${this.source(p)} needs type arguments`)
+		}
+		return t
+	}
+
+	/// Checks expression p as expr does, but as the operand of `.`, `[` or `(`, which may be a generic function.
+	private linked(p: Node, want: Type | null): Type {
 		const t = this.refine(this.valueOf(p, want))
 		p.type = t
 		return t
@@ -3642,7 +3651,8 @@ class Checker {
 	/// string (§4.11); `a[T, …]` instantiates a generic `a` with types, and `T[]` or `T[n]` forms an array type when
 	/// `T` is a type. `f(args)` calls; `...xs` spreads an array into the arguments of a rest parameter or of
 	/// `push` (§4.5). The operand of `.`, `[` or `(` shall not be `null`; use `?.`, or `as` (§6.6) to trap instead;
-	/// `a!` is `a` cast from `T | null` to `T`.
+	/// `a!` is `a` cast from `T | null` to `T`. A generic function or method is called or instantiated, not otherwise
+	/// a value.
 	///
 	/// `a?.b`, `a?.[i]` and `a?.(args)` give `null` without evaluating the rest of the chain when `a` is `null`; the
 	/// chain's type is the result's type `| null`. `a` shall not be of type `null`, which has no members.
@@ -3655,7 +3665,7 @@ class Checker {
 	/// ```
 	private link(n: Node, assigned: bool, want: Type | null = null): Type {
 		const a = n.parts[0]
-		const checked = if (isLink(a)) this.link(a, false) else this.expr(a, null)
+		const checked = if (isLink(a)) this.link(a, false) else this.linked(a, null)
 		let o = if (n.kind == "member") this.own(a, checked) else checked // a subscript's converts with its result
 		if (n.t.kind == "?." && o == Null) {
 			throw this.error(n.t.loc, `${if (a.kind == "token") this.text(a.t) else "the value before ?."} is always null`)
