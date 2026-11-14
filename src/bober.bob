@@ -26,12 +26,14 @@ import { min } from "../std/math"
 import { arch, os } from "../std/os"
 import { ParseError, codePoint, split, trim, utf8 } from "../std/string"
 import { abi, write } from "./bc/file"
+import * as decl from "./bc/decl"
+import * as kind from "./bc/kind"
 import { Program } from "./bc/program"
 import { show } from "./bc/show"
 import { glue, includesOf, sysroot } from "./c/bind"
 import { link, object } from "./c/bobcc"
 import { doc } from "./doc"
-import { Options, emit, entry, learn } from "./emit"
+import { Facts, Options, emit, entry, learn } from "./emit"
 import { check, normal } from "./check"
 import { CompileError } from "./error"
 import { formatFile } from "./format"
@@ -50,7 +52,7 @@ import { Const, Global, Object, Section, Symbol } from "./link/object"
 import { SyntaxError } from "./lex"
 import { lower } from "./lower"
 import { serve } from "./lsp"
-import { mono } from "./mono"
+import { mono, specialize } from "./mono"
 import { Parser } from "./parse"
 import { builtin, root } from "./root"
 import { CLib, Package, load, nearest, out } from "./pkg"
@@ -77,12 +79,16 @@ class Headers @optarg.Cc {
 }
 
 /// The options of the commands that build a program.
-class Compile @optarg.Cc {
+export class Compile @optarg.Cc {
 	headers: ...Headers
 	/// optimize with LLVM
 	release: bool = false
 	/// monomorphize first, so that it runs fast; by default where CI is set
 	mono: bool @optarg.Verbose = process.env("CI") != null
+	/// compile also the instances of generics the program calls, into the image, which then keeps them
+	O1: bool @optarg.Verbose = false
+	/// compile no instances, but keep those the image has (the default)
+	O0: bool @optarg.Verbose = false
 }
 
 /// build a program and run it
@@ -155,11 +161,11 @@ function usage(c: Command | null, verbose: bool): string {
 	return `usage: bober <command> [args]\n${optarg.help[Command](verbose)}\noptions:\n${optarg.help[Flags](verbose)}`
 }
 
-const dir = "build"
+export let dir = "build"
 /// The machine and the format of the images src/link writes here; TPDE's objects are ELF everywhere.
-const machine = if (arch == "arm64") arm64 else x64
+export const machine = if (arch == "arm64") arm64 else x64
 const mac = os == "macos"
-const format = if (mac) macho else if (os == "windows") pe else elf
+export const format = if (mac) macho else if (os == "windows") pe else elf
 
 /// Links the objects and linker options args into the executable out by bobcc's link, with libc++ for C++ libraries:
 /// folding identical code, with a build ID on ELF (compilerId); throws a CompileError if it fails.
@@ -412,7 +418,7 @@ function hasTests(path: string): bool {
 /// if mono monomorphized for the program. Returns the command that runs it, or its tests: the executable, or the
 /// launcher on the image's entry, run by the C library's loader where it is the sysroot's, the image as image has it if
 /// pin. Throws the errors, or what failed, as a CompileError or IoError.
-function build(main: string, tests: bool, f: Compile, pin: bool): string[] {
+export function build(main: string, tests: bool, f: Compile, pin: bool): string[] {
 	const p = lowered([main], f.headers.I)
 	const m = p.module(normal(main))
 	const [files, cxx] = linked(p, tests, f.headers.I)
@@ -421,8 +427,9 @@ function build(main: string, tests: bool, f: Compile, pin: bool): string[] {
 			mono(p, m)
 		}
 		const o = { main: -1, tests: false, dyn: !f.mono }
+		const o1 = if (f.O1 && !f.mono) specialize(p) else null
 		return [...(if (mac) [] else [`${sysroot}/usr/lib/libc.so`]),
-			if (packaged()) join(root, "lib/launch.c.exe") else launcher(dir), image(p, [m], files, cxx, pin, o),
+			if (packaged()) join(root, "lib/launch.c.exe") else launcher(dir), image(p, [m], files, cxx, pin, o, o1),
 			entry(p.modules[m].path, tests)]
 	}
 	const exe = `${dir}/${name(main)}${if (tests) ".test" else ""}`
@@ -538,7 +545,8 @@ const debug = { main: -1, tests: false, dyn: true }
 /// as a running program may have the old one mapped, or another build be writing it. Returns its path, or if pin that
 /// of a link to it of this process's, which the launcher removes, by which what the process runs loads this build's
 /// image though another build replaces it.
-function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, o: Options, fresh = false): string {
+function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, o: Options, o1: i32[][][] | null = null,
+	fresh = false): string {
 	const out = `${dir}/image${if (o.dyn) "" else ".mono"}.so`
 	const lib = `${sysroot}/usr/lib`
 	// The image continued, which is mapped and copied of one descriptor, lest another build replace it in between.
@@ -555,12 +563,33 @@ function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, 
 		return !held.includes(name)
 	}
 	const compiler = compilerId()
+	const names: string[] = []
 	for (const m of 0 ... p.modules.length - 1) {
 		const bc = write(p, m, compiler)
 		const b = bound.get(p.modules[m].path)?.bytes(p.modules[m].path) ?? ""
-		const name = `${p.modules[m].path}@${fnv(bc + b)}`
-		if (lacks(name)) {
-			l.add(unit(p, m, name, o, bc, b))
+		names.push(`${p.modules[m].path}@${fnv(bc + b)}`)
+		if (lacks(names[m])) {
+			l.add(unit(p, m, names[m], o, bc, b))
+		}
+	}
+	// -O1's instances, an object per bucket of each module's (`<path>~<bucket>@<version>`), but those held; and of
+	// those held, but these. A build without keeps them, but those that name what no longer is (instances).
+	if (o1 != null) {
+		const wanted: string[] = []
+		for (const m of 0 ... p.modules.length - 1) {
+			for (const i of 0 ... o1[m].length - 1) {
+				const ds = o1[m][i]
+				const refs = [`bober.code.${names[m]}`, ...abis(p, m, ds, names)]
+				const version = fnv(`${refs.join(" ")} ${ds.map(d => p.decls[d].hash).join(" ")}`)
+				const name = `${p.modules[m].path}~${i}@${version}`
+				wanted.push(name)
+				if (ds.length > 0 && !held.includes(name)) {
+					l.add(instances(p, m, ds, name, refs))
+				}
+			}
+		}
+		for (const h of held.filter(h => p.modules.some(x => startsWith(h, `${x.path}~`)) && !wanted.includes(h))) {
+			l.remove(h)
 		}
 	}
 	const cxxs: string[] = if (cxx) [`${lib}/libc++.a`, `${lib}/libc++abi.a`] else []
@@ -580,7 +609,7 @@ function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, 
 		const name = `${f}@${info.modified}.${info.size}`
 		if (held.some(h => h != name && startsWith(h, `${f}@`))) {
 			old?.close()
-			return image(p, mains, files, cxx, pin, o, true)
+			return image(p, mains, files, cxx, pin, o, o1, true)
 		}
 		if (!held.includes(name)) {
 			l.add(new Object(name, machine.arch))
@@ -613,7 +642,7 @@ function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, 
 			store(tmp, if (linked.bytes == kept) old else null, linked.bytes)
 		} catch (e: Stale) {
 			old?.close()
-			return image(p, mains, files, cxx, pin, o, true)
+			return image(p, mains, files, cxx, pin, o, o1, true)
 		}
 	}
 	old?.close()
@@ -632,7 +661,8 @@ function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, 
 	return if (pin) own else out
 }
 
-/// Module m of p, compiled by TPDE as o says, as the object name. It defines a symbol named by its ABI, and names
+/// Module m of p, compiled by TPDE as o says, as the object name. It defines a symbol named by its ABI, one by name,
+/// bober.code.<name>, which the instances -O1 makes of its generics name (image), and names
 /// those of the modules it imports and of builtin/'s, whose functions the compiler calls unasked, so that a kept image
 /// unlinks it once one of them has another: an object another program left there, or after a change of builtin/, which
 /// no bytecode names. As lowered, it holds bc, its bytecode, in section bober_bc, which a build links rather than
@@ -642,7 +672,6 @@ function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: s
 	emit(p, m, b, o)
 	b.verify()
 	const x = elf.read(name, b.object())
-	const symbol = (m: i32, section: i32) => new Symbol(`bober.abi.${p.modules[m].path}.${abi(p, m)}`, Global, section)
 	for (const [n, bytes] of [["bober_bc", bc], ["bober_bind", bound]]) {
 		if (o.dyn && bytes != "") {
 			const s = new Section(n, Const)
@@ -652,13 +681,51 @@ function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: s
 		}
 	}
 	x.sections.push(new Section(".rodata", Const))
-	x.symbols.push(symbol(m, x.sections.length - 1))
+	x.symbols.append([new Symbol(abiSymbol(p, m), Global, x.sections.length - 1),
+		new Symbol(`bober.code.${name}`, Global, x.sections.length - 1)])
 	for (const d of 0 ... p.modules.length - 1) {
 		if (d != m && (builtin(p.modules[d].path) || p.modules[m].deps.includes(d))) {
-			x.symbols.push(symbol(d, -1))
+			x.symbols.push(new Symbol(abiSymbol(p, d), Global, -1))
 		}
 	}
 	return x
+}
+
+/// The symbol named by the ABI of p's module m.
+function abiSymbol(p: Program, m: i32): string { return `bober.abi.${p.modules[m].path}.${abi(p, m)}` }
+
+/// The instances ds of module m's generics (src/mono.bob's specialize), compiled by TPDE as the object name, which names
+/// refs, so that a kept image unlinks it once one of them is not: that of m's code (unit), and abis'.
+function instances(p: Program, m: i32, ds: i32[], name: string, refs: string[]): Object {
+	const b = new Tpde(p.modules[m].path)
+	emit(p, m, b, debug, new Facts(), ds)
+	b.verify()
+	const x = elf.read(name, b.object())
+	x.symbols.append(refs.map(r => new Symbol(r, Global, -1)))
+	return x
+}
+
+/// The ABI symbols of builtin/'s modules and of those of the types instances ds of module m's generics are of, but m's;
+/// of a type its module has not exported, which its ABI may not cover, the code's of its module, as names has its unit.
+function abis(p: Program, m: i32, ds: i32[], names: string[]): string[] {
+	const refs = p.modules.filter(x => builtin(x.path)
+		&& x.path != p.modules[m].path).map(x => abiSymbol(p, p.module(x.path)))
+	const ts: i32[] = []
+	for (const d of ds) {
+		ts.append(p.lists[p.decls[d].env])
+	}
+	while (ts.length > 0) {
+		const t = ts.pop()
+		const x = if (p.kind(t) == kind.Named) p.decls[p.a(t)] else null
+		const r = if (x == null || x.module == m) ""
+			else if (x.owner < 0 && (x.mods & decl.Export) != 0) abiSymbol(p, x.module)
+			else `bober.code.${names[x.module]}`
+		if (r != "" && !refs.includes(r)) {
+			refs.push(r)
+		}
+		ts.append(p.parts(t))
+	}
+	return refs
 }
 
 /// The objects of the glue of p's modules of C headers but the bundle's, of source hash 0, compiled with includes and
