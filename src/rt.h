@@ -43,6 +43,9 @@ void *bober_alloc(int64_t n, const bober_layout *l);
 #define BOBER_PAGE (1 << 16)
 /// Marks the card of place p, where a ref may have been stored, as the write barrier of compiled code does.
 void bober_written(void *p);
+/// The place of static field key of the generic class instance of descriptor t (src/emit.bob), a root of size bytes laid
+/// out as l, made zero on first use, as is the word before it, which the caller sets once it initializes it.
+void *bober_static(const void *key, const void *t, int64_t size, const bober_layout *l);
 /// A number, from 1, that is p's alone while what p points into lives, however it moves; 0 for null.
 uint64_t bober_id(void *p);
 /// n bytes from C's malloc, which the collector neither moves nor frees, for C to hold; exits if out of memory.

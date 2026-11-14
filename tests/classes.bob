@@ -88,6 +88,47 @@ test "statics" {
 	assert Counter.created == before + 1
 }
 
+let tallied = 0
+
+/// Statics of a generic class: one per instantiation, each initialized when first read or written.
+class Tally[T] {
+	static count = Tally.start()
+	static twice = Tally[T].count * 2
+	static seen: T[] = []
+
+	constructor(x: T) {
+		Tally[T].count += 1
+		Tally.seen.push(x)
+	}
+
+	static start(): i32 {
+		tallied += 1
+		return 10
+	}
+
+	static size(): i32 { return Tally.seen.length }
+}
+
+test "a generic class's statics are one per instantiation, each initialized on first use" {
+	assert tallied == 0
+	assert Tally[i32].twice == 20 && tallied == 1
+	new Tally[i32](1)
+	new Tally[i32](2)
+	new Tally[string]("a")
+	assert tallied == 2
+	assert Tally[i32].count == 12 && Tally[string].count == 11
+	assert Tally[i32].size() == 2 && Tally[string].seen[0] == "a"
+}
+
+test "a generic class's static keeps what it holds across collections" {
+	Tally[u8[]].seen.push([1, 2, 3])
+	let held: u8[][] = []
+	for (const i of 1 ... 64) {
+		held = [new u8[](1 << 20)]
+	}
+	assert Tally[u8[]].seen[0][2] == 3 && held.length == 1
+}
+
 test "methods are values bound to their object" {
 	const c = new Counter(3)
 	const f = c.inc

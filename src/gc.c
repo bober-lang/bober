@@ -246,6 +246,15 @@ BOBER_SECTION(const uint8_t *const, bober_stackmaps);
 void bober_parked(void (*visit)(unw_context_t *), int all);
 typedef struct { void *global; const bober_layout *layout; } Root;
 BOBER_SECTION(const Root, bober_roots);
+/// bober_static's places, each after its key, descriptor, size, layout and set word, chained by key and descriptor.
+typedef struct Static {
+  struct Static *next;
+  const void *key, *t;
+  int64_t size;
+  const bober_layout *layout;
+  int64_t set;
+} Static;
+static Static *statics[1024];
 
 static struct Call { uintptr_t ret; const Record *r; } *calls;  // by return address, open addressed, half full
 static uint64_t mask;
@@ -378,6 +387,8 @@ static void collect(void) {
   frames(&ctx);
   bober_parked(frames, !minor);
   for (const Root *g = bober_roots; g < bober_roots_end; g++) scan(g->global, g->layout->size, g->layout, WHOLE);
+  for (int i = 0; i < 1024; i++)
+    for (Static *s = statics[i]; s; s = s->next) scan((void **)(s + 1), s->size, s->layout, WHOLE);
   if (minor) dirty(false);
   while (grays) values(gray[--grays], WHOLE);
   if (minor && verify) verifying = true, bober_parked(frames, true), dirty(true), verifying = false;
@@ -415,6 +426,15 @@ static void collect(void) {
   else olds = live, major = 2 * live > 64 << 20 ? 2 * live : 64 << 20, majors++;
   allocated += young, collections++, young = 0;
   PROBE(gc_end, olds);
+}
+
+void *bober_static(const void *key, const void *t, int64_t size, const bober_layout *l) {
+  Static **at = &statics[((uintptr_t)key ^ (uintptr_t)t) * 0x9e3779b97f4a7c15 >> 54];
+  for (Static *s = *at; s; s = s->next)
+    if (s->key == key && s->t == t) return s + 1;
+  Static *s = bober_malloc(sizeof *s + size);
+  *s = (Static){*at, key, t, size, l, 0}, *at = s;
+  return memset(s + 1, 0, size);
 }
 
 /// What bober_alloc does but bump: collects, and takes a page or a big object's pages, new.

@@ -322,6 +322,7 @@ class Emitter {
 			declare("is", i64, [i64, ptr])
 			declare("length", i64, [ptr])
 			declare("element", ptr, [ptr, i64, ptr, ptr, i32])
+			declare("static", ptr, [ptr, i64, i64, ptr])
 		}
 	}
 
@@ -397,12 +398,60 @@ class Emitter {
 				this.define(this.fieldInit(d), x.type, [...scope.map(_ => this.i64), this.ref], false, code, scope)
 			}
 		} else if (x.kind == decl.Var) {
-			this.variable(d)
+			if (this.lazy(d)) {
+				this.defineAccessor(d)
+			} else {
+				this.variable(d)
+			}
 			if (code != null) {
-				this.define(this.b.function(this.symbol(d) + ".init", this.b.fn(this.result(x.type), []), true), x.type,
-					[], false, code)
+				const scope = this.scopeOf(d)
+				this.define(this.initOf(d), x.type, scope.map(_ => this.i64), false, code, scope)
 			}
 		}
+	}
+
+	/// The initializer of var decl d, which takes the descriptors of its scope.
+	private initOf(d: i32): Value {
+		const t = this.result(this.p.decls[d].type)
+		return this.b.function(this.symbol(d) + ".init", this.b.fn(t, this.scopeOf(d).map(_ => this.i64)), true)
+	}
+
+	/// Whether var decl d is a static field of a generic class, one per instance, initialized on first use (§3): as
+	/// lowered, of a generic's scope, or mono's instance.
+	private lazy(d: i32): bool { return this.p.decls[d].env != 0 || this.p.identity(d).length > 0 }
+
+	/// The accessor of lazy var decl d, which gives its place.
+	private accessor(d: i32): Value {
+		return this.b.function(this.symbol(d) + ".at", this.b.fn(this.ptr, if (this.dyn) [this.i64] else []), false)
+	}
+
+	/// Defines lazy var decl d's accessor: its place, src/gc.c's cell for the class instance if dyn, else its global;
+	/// zeroed, then initialized, on first use.
+	private defineAccessor(d: i32) {
+		const b = this.b
+		const x = this.p.decls[d]
+		const f = this.accessor(d)
+		const start = this.startThunk(f, this.scopeOf(d), false)
+		const t = this.mem(x.type)
+		const q = if (this.dyn) this.rt("static", [f, b.param(f, 0), b.sizeOf(t), b.layout(t)], false)
+			else this.variable(d)
+		const set = if (this.dyn) this.ir().gep(this.i64, q, [this.i64Const(-1)])
+			else b.global(this.symbol(d) + ".set", this.i64Const(0), true, 0)
+		const [init, done] = [this.label(), this.label()]
+		this.condBr(this.ir().icmp("eq", this.ir().load(this.i64, set, false), this.i64Const(0)), init, done)
+		this.start(init)
+		this.ir().store(this.i64Const(1), set, false) // first, as d's initializer may read d
+		this.put(q, { v: this.zero(x.type), t: this.norm(x.type) }, x.type)
+		if (x.code != null) {
+			const g = this.initOf(d)
+			const v = this.returned(this.call(b.valueType(g), g, this.descs), x.type)
+			this.put(q, { v: v, t: this.norm(x.type) }, x.type)
+		}
+		this.jump(done)
+		this.start(done)
+		this.ir().ret(q)
+		b.at(this.entry)
+		b.br(start)
 	}
 
 	/// The function of field d's initializer, which takes the descriptors of its scope and the instance.
@@ -477,8 +526,8 @@ class Emitter {
 		}
 		for (const d of p.modules[this.m].inits) {
 			const x = p.decls[d]
-			if (x.code != null) {
-				const init = b.function(this.symbol(d) + ".init", b.fn(this.result(x.type), []), true)
+			if (x.code != null && !this.lazy(d)) {
+				const init = this.initOf(d)
 				this.put(this.variable(d),
 					{ v: this.returned(this.call(b.valueType(init), init, []), x.type), t: this.norm(x.type) }, x.type)
 			}
@@ -751,18 +800,19 @@ class Emitter {
 			case op.Global, op.SetGlobal:
 				const d = n
 				const t = p.decls[d].type
+				const env = c.b(i)
+				const to = p.subst(t, env)
 				if (p.decls[d].kind == decl.Function) {
 					// A generic's, its type args' descriptors in the closure, adapted to its type as bound.
 					const f = this.callee(d)
-					const env = c.b(i)
-					const to = p.subst(t, env)
 					const g = if (env == 0) this.value(f, false)
 						else this.closure(this.value(f, false), [], this.envDescs(env))
 					this.push(this.cast({ v: g, t: this.norm(t) }, to), to)
 				} else if (o == op.Global) {
-					this.push(this.fetch(this.variable(d), t), t)
+					const v = this.fetch(this.global(d, env), t)
+					this.push(this.cast({ v: v, t: this.norm(t) }, to), to) // held as declared, T boxed
 				} else {
-					this.put(this.variable(d), this.pop(), t)
+					this.put(this.global(d, env), this.pop(), t)
 				}
 			case op.False, op.True: this.push(this.bool(o == op.True), kind.Bool)
 			case op.Null: this.push(this.bool(false), kind.Null)
@@ -1314,6 +1364,18 @@ class Emitter {
 		return s
 	}
 
+	/// The place of var decl d of env: its global, or if lazy, as its accessor gives it.
+	private global(d: i32, env: i32): Value {
+		if (!this.lazy(d)) {
+			return this.variable(d)
+		}
+		// Of the instance env names, or in its class's code, as its scope binds it.
+		const c = this.p.classOf(d)
+		const n = if (env == 0) this.classType(c) else this.p.type(kind.Named, c, env)
+		const f = this.accessor(d)
+		return this.call(this.b.valueType(f), f, if (this.dyn) [this.desc(n, true)] else [] as Value[])
+	}
+
 	/// Var decl d, in this module with its zero value or declared.
 	private variable(d: i32): Value {
 		const sym = this.symbol(d)
@@ -1480,15 +1542,18 @@ class Emitter {
 		return fn
 	}
 
-	/// Starts thunk fn, taking the descriptors of the type params of scope, its class's, from the parts of the tag of its
-	/// first param; the block after the entry, which the entry is to branch to.
-	private startThunk(fn: Value, scope: i32[]): Block {
+	/// Starts thunk fn, taking the descriptors of the type params of scope, its class's, from the parts of the descriptor
+	/// of its first param, its tag if tagged; the block after the entry, which the entry is to branch to.
+	private startThunk(fn: Value, scope: i32[], tagged = true): Block {
 		this.fn = fn
 		this.unwind = 0
 		this.enter(scope, [])
-		const parts = this.ir().cast("inttoptr", this.word(this.tagOf(this.b.param(fn, 0)), partsAt), this.ptr)
-		for (const k of 0 ... scope.length - 1) {
-			this.descs.push(this.ir().load(this.i64, this.ir().gep(this.i64, parts, [this.i64Const(k)]), false))
+		if (scope.length > 0) {
+			const d = this.b.param(fn, 0)
+			const parts = this.word(if (tagged) this.tagOf(d) else d, partsAt)
+			for (const k of 0 ... scope.length - 1) {
+				this.descs.push(this.word(parts, k))
+			}
 		}
 		const start = this.label()
 		this.start(start)
