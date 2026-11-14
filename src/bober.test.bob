@@ -15,9 +15,9 @@ function files(n: i32): [string, string][] {
 	return [["types.bob", types], ["own.bob", own], ["lib.bob", lib], ["main.bob", program(n)]]
 }
 
-/// What main.bob prints, built in home with the files written first, -O1 if o1; and the objects of lib.bob's instances
-/// its image holds.
-function built(files: [string, string][], o1: bool): [string, string[]] {
+/// What main.bob prints, built in home with the files written first, -O1 if o1, -O2 if o2; and the objects of lib.bob's
+/// instances and overlays its image holds.
+function built(files: [string, string][], o1: bool, o2 = false): [string, string[]] {
 	mkdirAll(home)
 	for (const [name, src] of files) {
 		writeFile(`${home}/${name}`, src)
@@ -25,6 +25,7 @@ function built(files: [string, string][], o1: bool): [string, string[]] {
 	const f = new Compile()
 	f.mono = false
 	f.O1 = o1
+	f.O2 = o2
 	dir = `${home}/build`
 	try {
 		process.run(build(`${home}/main.bob`, false, f, false), `${home}/out`)
@@ -32,7 +33,7 @@ function built(files: [string, string][], o1: bool): [string, string[]] {
 		dir = "build"
 	}
 	const image = open(`${home}/build/image.so`)
-	const held = new Linker(machine, format, new Bytes(image.map())).objects().filter(o => indexOf(o, "lib.bob~") >= 0)
+	const held = new Linker(machine, format, new Bytes(image.map())).objects().filter(o => indexOf(o, "lib.bob~") >= 0 || indexOf(o, "lib.bob^") >= 0)
 	image.close()
 	return [readFile(`${home}/out`)!, held]
 }
@@ -152,4 +153,18 @@ test "a new instance compiles one bucket anew" {
 	const [out, after] = built([["main.bob", program(151)]], true)
 	assert before.length == 4 && after.length == 4 && after.filter(o => !before.includes(o)).length == 1
 	assert out == printed(151)
+}
+
+test "-O2 compiles by LLVM the instances and each module's functions over their code, which a build without keeps" {
+	const [out, held] = built(files(1), false, true)
+	assert out == printed(1) && held.some(o => indexOf(o, "lib.bob^O2@") >= 0) && held.every(o => indexOf(o, "^O2@") >= 0)
+	const [again, kept] = built([["main.bob", replace(program(1), "let k = 0", "let k = 1")]], false)
+	assert again == printed(2) && kept == held
+	assert built([], true) == [printed(2), held]
+}
+
+test "an edit of a module unlinks its overlay, the build running the new code" {
+	built(files(1), false, true)
+	const [out, held] = built([["lib.bob", replace(lib, "return f(i32)", "return f(i64)")]], false)
+	assert out == `1 2 1 1 p1,p1 18 1\nbad true i64\n` && held.length == 0
 }
