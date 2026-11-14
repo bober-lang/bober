@@ -1867,7 +1867,7 @@ class Checker {
 	/// `const` if `readonly` and a `let` otherwise. `private` members are visible only inside the class body. Instance
 	/// `readonly` fields are assigned only by their initializer or on `this` in the class's `constructor`, not in its
 	/// closures. Methods see the instance as `this`; static methods have no `this`. Methods cannot capture locals of an
-	/// enclosing function.
+	/// enclosing function. A generic's static members are reached outside its body as `C[T].m`.
 	///
 	/// An interface may declare static methods. A type fits such an interface when it has each static method with a
 	/// fitting function type; a value never does. A type parameter constrained by it reaches those statics through its
@@ -3697,6 +3697,9 @@ class Checker {
 		const t = (if (r == null) null else r.member(k, true) ?? reflected(r, k)) ?? o.member(k)
 		if (t == null) {
 			throw this.error(name.loc, `${show(s ?? o)} has no member ${k}`)
+		}
+		if (s != null && s.generic == null && s.params.length > 0 && s != this.host && s.member(k, true) != null) {
+			throw this.error(name.loc, `${show(s)} needs type arguments for its static ${k}`)
 		}
 		const c = s ?? o.methods() ?? o
 		const w = declarer(c, k, s != null) ?? c
