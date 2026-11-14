@@ -9,7 +9,7 @@ import { Bytes, u } from "./bytes"
 import { Fixup, Object, Section, Symbol } from "./object"
 
 /// What the head starts with, and the version of the encoding.
-const magic = "bober image 8"
+const magic = "bober image 9"
 
 /// Where the sections of one of regions are: from start to top, of which holes, in order, are free; cap, which top
 /// stays below, where the next region starts.
@@ -28,11 +28,11 @@ export class Region {
 /// What a link continues a kept image from, beside its bytes.
 export class State {
 	regions: Region[] = []
-	/// The objects of the frozen unit, then those given, stripped; where their sections are; the bytes an object was
-	/// read from, its record, so that it must be as read: "" if it is not; the blocks of the file it has, from and
-	/// to where: its record's, then its symbols' entries in the symbol table and their names, if the format has one;
-	/// and per symbol, the index of its name in the table of names, -1 if it is local.
-	units: [Object, u64[], string, [u64, u64][], i32[]][] = []
+	/// The objects of the frozen unit, then those given, stripped, as read but their symbols and fixups (rest); where
+	/// their sections are; the bytes an object was read from, its record, so that it must be as read: "" if it is not; and
+	/// the blocks of the file it has, from and to where: its record's, then its symbols' entries in the symbol table
+	/// and their names, if the format has one.
+	units: [Object, u64[], string, [u64, u64][]][] = []
 	/// The table of names (Linker.slot): where, of how many slots, and how many names it has; and its hashes' seed.
 	names: [u64, u64, u64] = [0, 0, 0]
 	seed: u64 = 0
@@ -108,7 +108,8 @@ export function write(s: State, arch: Arch): string {
 	return w.bytes
 }
 
-/// The record of o, a unit's object as State has it, and of the indices of its symbols' names.
+/// The record of o, a unit's object as State has it, and of the indices of its symbols' names: its head, the sections
+/// but their fixups, first.
 export function record(o: Object, names: i32[]): string {
 	const w = new Writer()
 	const str = (x: string) => {
@@ -123,13 +124,15 @@ export function record(o: Object, names: i32[]): string {
 		w.uleb(sec.align)
 		w.uleb(sec.size)
 		str(sec.group)
+	})
+	for (const sec of o.sections) {
 		list(w, sec.fixups, f => {
 			w.uleb(f.at)
 			w.u8(f.kind)
 			w.uleb(f.symbol as u64)
 			w.sleb(f.addend)
 		})
-	})
+	}
 	list(w, o.symbols, sym => {
 		str(sym.name)
 		w.u8(sym.binding)
@@ -174,8 +177,7 @@ export function read(file: Bytes, headers: u64, arch: Arch): State | null {
 			const at = many(r, () => r.uleb())
 			const blocks: [u64, u64][] = many(r, () => [r.uleb(), r.uleb()])
 			const kept = block(blocks[0][0], blocks[0][1])
-			const o = new Reader(kept)
-			return [object(o, arch), at, kept, blocks, many(o, () => (o.uleb() as i32) - 1)]
+			return [object(new Reader(kept), arch), at, kept, blocks]
 		})
 		s.slots = many(r, () => [r.uleb(), r.uleb(), r.uleb()])
 		s.sections = many(r, () => [str(), r.u8(), r.uleb(), r.uleb()])
@@ -198,7 +200,7 @@ export function read(file: Bytes, headers: u64, arch: Arch): State | null {
 	}
 }
 
-/// The object whose record r reads, of arch.
+/// The object whose record r reads, of arch, but its symbols and fixups.
 function object(r: Reader, arch: Arch): Object throws ParseError {
 	const str = () => r.raw(r.uleb() as i32)
 	const o = new Object(str(), arch)
@@ -208,11 +210,27 @@ function object(r: Reader, arch: Arch): Object throws ParseError {
 		sec.align = r.uleb()
 		sec.size = r.uleb()
 		sec.group = str()
-		sec.fixups = many(r, () => new Fixup(r.uleb(), r.u8(), r.uleb() as i32, r.sleb()))
 		return sec
 	})
-	o.symbols = many(r, () => new Symbol(str(), r.u8(), r.sleb() as i32, r.uleb(), r.uleb()))
 	return o
+}
+
+/// Reads o's symbols and fixups from its record, of which read read the head; the indices of its symbols' names, of
+/// a table of count, null if the record is not as written.
+export function rest(o: Object, record: string, count: i32): i32[] | null {
+	const r = new Reader(record)
+	const str = () => r.raw(r.uleb() as i32)
+	try {
+		object(r, o.arch)
+		for (const sec of o.sections) {
+			sec.fixups = many(r, () => new Fixup(r.uleb(), r.u8(), r.uleb() as i32, r.sleb()))
+		}
+		o.symbols = many(r, () => new Symbol(str(), r.u8(), r.sleb() as i32, r.uleb(), r.uleb()))
+		const names = many(r, () => (r.uleb() as i32) - 1)
+		return if (names.length == o.symbols.length && names.every(g => g >= -1 && g < count)) names else null
+	} catch (e: ParseError) {
+		return null
+	}
 }
 
 /// Writes how many xs there are, then each by f.
