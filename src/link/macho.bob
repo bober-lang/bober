@@ -429,9 +429,10 @@ function exports(name: string, bytes: string): string[] throws CompileError {
 
 /// The image as a dynamic library: the segment `__TEXT` maps the headers and the image's first segments, those not
 /// written that the file has at their addresses, which have the Unwind sections, where the unwinder looks for them;
-/// each after it is one of its own, and `__LINKEDIT`, past them and a kept image's extra, has dyld's tables of
-/// rebases, binds and exports, the symbol table, and an ad hoc code signature, without which arm64's macOS runs no
-/// code.
+/// each after it is one of its own, and `__LINKEDIT`, past them and a kept image's extra, has the symbol table, as
+/// the image's, then dyld's tables of rebases, binds and exports, and an ad hoc code signature, without which arm64's
+/// macOS runs no code. The table has the symbols the units define, all local, as dyld finds names by the exports'
+/// trie and the binds; of a unit a kept image holds, as the link that added it wrote them.
 function write(image: Image) throws CompileError {
 	const page = image.page
 	const segs = image.segments
@@ -481,7 +482,26 @@ function write(image: Image) throws CompileError {
 		image.bytes.put(at, offset, 8)
 	}
 
-	// __LINKEDIT, at offset file in the file.
+	for (const [syms, at, names] of image.symbols) {
+		let entries = ""
+		let name = names - image.strtab[0]
+		for (const s of syms) {
+			entries += le(name, 4) + le(N_SECT | (if (s.binding == Local) 0 else N_PEXT), 1) + le(0, 3) + le(s.value, 8)
+			name += (s.name.length + 2) as u64
+		}
+		image.bytes.set(at, entries)
+	}
+	// Of each entry, held or new, the section it is in, which a new cut moves.
+	for (const i of 1 ... (((image.symtab[1] - image.symtab[0]) / 16) as i32) - 1) {
+		const e = image.symtab[0] + 16 * (i as u64)
+		if (image.bytes.get(e, 4) != 0) {
+			const value = image.bytes.get(e + 8, 8)
+			const sect = 1 + (partitionPoint(sections, r => r[1] + r[2] > value) as u64)
+			image.bytes.put(e + 5, min(sect, sections.length as u64), 1)
+		}
+	}
+
+	// __LINKEDIT, of the symbol table at the image's, and the rest at offset file in the file.
 	const file = alignUp(image.bytes.length, page)
 	let tail = ""
 	const place = (s: string) => {
@@ -517,38 +537,6 @@ function write(image: Image) throws CompileError {
 	const exported = padded(trie(image.exports.map(e => ["_" + e[0], e[1]])))
 	const info = [place(rebased), rebased.length as u64, place(bound), bound.length as u64, 0, 0, 0, 0, place(exported),
 		exported.length as u64]
-
-	// The symbol table: the symbols not exported, as local, then those exported, then those bound, as undefined.
-	let syms = ""
-	let strs = "\x00"
-	const nlist = (name: string, nt: u64, at: u64, desc: u64) => {
-		const sect = if ((nt & N_TYPE) == N_UNDF) 0
-			else min(1 + (partitionPoint(sections, r => r[1] + r[2] > at) as u64), sections.length as u64)
-		syms += le(strs.length as u64, 4) + le(nt, 1) + le(sect, 1) + le(desc, 2) + le(at, 8)
-		strs += "_" + name + "\x00"
-	}
-	const names = new HashMap[string, i32]()
-	for (const [name, _] of image.exports) {
-		names.set(name, 0)
-	}
-	for (const s of image.symbols) {
-		if (s.binding == Local || !names.has(s.name)) {
-			nlist(s.name, N_SECT | (if (s.binding == Local) 0 else N_PEXT), s.value, 0)
-		}
-	}
-	const locals = (syms.length / 16) as u64
-	for (const [name, at] of image.exports) {
-		nlist(name, N_SECT | N_EXT, at, 0)
-	}
-	const defined = (syms.length / 16) as u64
-	for (const b of image.binds) {
-		if (!names.has(b.name)) {
-			names.set(b.name, 0)
-			nlist(b.name, N_UNDF | N_EXT, 0, ((b.library + 1) as u64) << 8 | (if (b.weak) N_WEAK_REF else 0))
-		}
-	}
-	const n = (syms.length / 16) as u64
-	const symtab = [place(syms), n, place(strs), strs.length as u64]
 	tail += zeros(alignUp(tail.length, 16) - tail.length)
 
 	// The signature, of the file up to it, is last; it hashes each 4 KiB page of it. Its hashes are past its headers,
@@ -557,7 +545,7 @@ function write(image: Image) throws CompileError {
 	const pages = ((limit + 0xfff) >> 12) as i32
 	const headed = alignUp(24 + 88 + id.length + 1, 16)
 	const signed = (headed + 32 * pages) as u64
-	const linkedit = (tail.length as u64) + signed
+	const linkedit = limit + signed - image.strtab[0]
 
 	const sects = mapped.map(_ => "")
 	for (const [name, at, size] of sections) {
@@ -591,7 +579,7 @@ function write(image: Image) throws CompileError {
 	}
 	const last = segs[segs.length - 1]
 	const end = alignUp(last.address + last.size + last.zero, page)
-	segment64("__LINKEDIT", end, file, linkedit, alignUp(linkedit, page), 1, "")
+	segment64("__LINKEDIT", end, image.strtab[0], linkedit, alignUp(linkedit, page), 1, "")
 	const dylib = (cmd: u64, name: string) => command(cmd, le(24, 4) + le(0, 4) + le(0x10000, 4) + le(0x10000, 4) +
 		pad(name, alignUp(name.length + 1, 8)))
 	dylib(LC_ID_DYLIB, id)
@@ -599,9 +587,10 @@ function write(image: Image) throws CompileError {
 		dylib(LC_LOAD_DYLIB, l)
 	}
 	command(LC_DYLD_INFO_ONLY, info.map(v => le(v, 4)).join(""))
-	command(LC_SYMTAB, symtab.map(v => le(v, 4)).join(""))
-	command(LC_DYSYMTAB, [0, locals, locals, defined - locals, defined, n - defined].map(v => le(v, 4)).join("") +
-		zeros(48))
+	const [symtab, strtab] = [image.symtab, image.strtab]
+	const n = (symtab[1] - symtab[0]) / 16
+	command(LC_SYMTAB, [symtab[0], n, strtab[0], strtab[1] - strtab[0]].map(v => le(v, 4)).join(""))
+	command(LC_DYSYMTAB, [0, n, n, 0, n, 0].map(v => le(v, 4)).join("") + zeros(48))
 	// The UUID, 0 until the pages are hashed.
 	const uuid = 32 + cmds.length + 8
 	command(LC_UUID, zeros(16))
@@ -748,5 +737,5 @@ function trie(exports: [string, u64][]): string {
 /// The name in the 16 bytes at at, padded with NULs.
 function name16(s: string, at: i32): string { return str(s.slice(at, at + 16) + "\x00", 0) }
 
-export const macho: Format = { headers: headers, bindsAnywhere: true, start: "__dso_handle", read: read,
-	exports: exports, write: write }
+export const macho: Format = { headers: headers, symbol: 16, bindsAnywhere: true, start: "__dso_handle",
+	read: read, exports: exports, write: write }

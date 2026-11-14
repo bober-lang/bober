@@ -47,6 +47,17 @@ function symbols(d: Bytes): [string, string] {
 	return [names.join(" "), d.slice(entries, entries + size)]
 }
 
+test "a kept image's symbol table has each unit's symbols, in their sections, those of one it holds as it had them" {
+	const l = new Linker(arm64, elf, new Bytes())
+	l.add(text("f"))
+	const d = file(l)
+	const [first, entries] = symbols(d)
+	const again = new Linker(arm64, elf, new Bytes(mapped(d)))
+	again.add(text("g"))
+	const [second, more] = symbols(file(again))
+	assert first == "f" && second == "f g" && more.slice(0, entries.length) == entries
+}
+
 test "a symbol's entry is in the section its header says, of a kept image too, where an object cuts it anew" {
 	const l = new Linker(arm64, elf, new Bytes())
 	l.add(text("f"))

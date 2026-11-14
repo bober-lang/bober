@@ -5,7 +5,7 @@ import { partitionPoint, sort, sortBy, startsWith } from "../../std/algo"
 import { L, P, R, z } from "../../std/ascii"
 import { HashMap } from "../../std/collections/hashmap"
 import { get, put } from "../../std/encoding/binary"
-import { alignUp, max } from "../../std/math"
+import { alignUp, max, min } from "../../std/math"
 import { Arch } from "../../std/os"
 import { CompileError } from "../error"
 import { le, str, u, zeros } from "./bytes"
@@ -355,9 +355,10 @@ function exports(name: string, bytes: string): string[] throws CompileError {
 
 /// The image as an ELF shared library. A PT_LOAD maps each segment, the first also the headers before it, and one
 /// more, past them all, the loader's tables: the dynamic symbols, their hash table, the relocations, the
-/// eh_frame_hdr and the dynamic section, which glibc's loader writes. Section headers and a symbol table, which no
+/// eh_frame_hdr and the dynamic section, which glibc's loader writes. Section headers and the symbol table, which no
 /// loader reads, say what is where for debuggers and profilers: a header per stretch of a segment, cut where the
-/// Unwind and Thread sections start and end.
+/// Unwind and Thread sections start and end, and so the same for what a kept image holds, whose entries in the table,
+/// all local, are as the link that added it wrote them.
 function write(image: Image) throws CompileError {
 	const segs = image.segments
 	const last = segs[segs.length - 1]
@@ -368,6 +369,23 @@ function write(image: Image) throws CompileError {
 		return if (at == from) ".eh_frame" else if (threaded(image, at)) ".tdata" else if (s.exec) ".text"
 			else if (at >= s.address + s.size) ".bss" else if (s.write) ".data" else ".rodata"
 	})
+	for (const [syms, at, names] of image.symbols) {
+		const b = new u8[](24 * syms.length)
+		let name = names + 1 - image.strtab[0]
+		for (const i of 0 ... syms.length - 1) {
+			entry(b, 24 * i, image, stretches, syms[i], STB_LOCAL, name)
+			name += (syms[i].name.length + 2) as u64
+		}
+		image.bytes.set(at, fromBytes(b))
+	}
+	// Of each entry, held or new, the stretch it is in, which a new cut moves.
+	for (const i of 1 ... (((image.symtab[1] - image.symtab[0]) / 24) as i32) - 1) {
+		const e = image.symtab[0] + 24 * (i as u64)
+		if (image.bytes.get(e, 4) != 0) {
+			const value = image.bytes.get(e + 8, 8)
+			image.bytes.put(e + 6, stretch(stretches, value), 2)
+		}
+	}
 	// The loader's tables are at address base, and at offset file in the file, both multiples of a page.
 	const file = alignUp(image.bytes.length, image.page)
 	const base = alignUp(last.address + last.size + last.zero, image.page)
@@ -395,7 +413,14 @@ function write(image: Image) throws CompileError {
 		dynstr += l + "\x00"
 		return at
 	})
-	const [dynsym, strs, _] = symbols(image, stretches, dynamic, dynstr)
+	const dynsym = new u8[](24 * (dynamic.length + 1))
+	let strs = dynstr
+	for (const i of 0 ... dynamic.length - 1) {
+		const s = dynamic[i]
+		entry(dynsym, 24 * (i + 1), image, stretches, s, if (s.binding == Weak) STB_WEAK else STB_GLOBAL,
+			strs.length as u64)
+		strs += s.name + "\x00"
+	}
 	const symAt = place(fromBytes(dynsym))
 	const strAt = place(strs)
 	const hashAt = place(fromBytes(hash(dynamic)))
@@ -467,10 +492,7 @@ function write(image: Image) throws CompileError {
 	const dynAt = place(dyn)
 	const loaded = tail.length as u64
 
-	// What is not loaded: the symbol table and the section headers.
-	const [symtab, strtab, locals] = symbols(image, stretches, image.symbols, "\x00")
-	const symtabAt = file + (place(fromBytes(symtab)) - base)
-	const strtabAt = file + (place(strtab) - base)
+	// What is not loaded: the section headers.
 	let shstrtab = "\x00"
 	let shdrs = le(0, 64)
 	let n: u64 = 0
@@ -498,8 +520,9 @@ function write(image: Image) throws CompileError {
 		section(".eh_frame_hdr", SHT_PROGBITS, SHF_ALLOC, hdrAt, t(hdrAt), hdrSize, 0, 0, 0)
 	}
 	section(".dynamic", SHT_DYNAMIC, SHF_ALLOC | SHF_WRITE, dynAt, t(dynAt), dyn.length as u64, dynsymIndex + 1, 0, 16)
-	section(".symtab", SHT_SYMTAB, 0, 0, symtabAt, symtab.length as u64, n + 2, locals, 24)
-	section(".strtab", SHT_STRTAB, 0, 0, strtabAt, strtab.length as u64, 0, 0, 0)
+	const [symtab, strtab] = [image.symtab, image.strtab]
+	section(".symtab", SHT_SYMTAB, 0, 0, symtab[0], symtab[1] - symtab[0], n + 2, (symtab[1] - symtab[0]) / 24, 24)
+	section(".strtab", SHT_STRTAB, 0, 0, strtab[0], strtab[1] - strtab[0], 0, 0, 0)
 	const shstrtabAt = file + (place(shstrtab + ".shstrtab\x00") - base)
 	section(".shstrtab", SHT_STRTAB, 0, 0, shstrtabAt, (shstrtab.length + 10) as u64, 0, 0, 0)
 	const shoff = file + (place(shdrs) - base)
@@ -543,35 +566,22 @@ function flags(s: Segment): u64 { return PF_R | (if (s.write) PF_W else 0) | (if
 /// Whether the address at is in the template of a thread's copy, where a symbol's value is its offset.
 function threaded(image: Image, at: u64): bool { return at >= image.thread[0] && at < image.thread[1] }
 
-/// syms as an ELF symbol table, the locals first, whose section headers after the first are stretches, with their
-/// string table, after strs; and the index of the first global.
-function symbols(image: Image, stretches: [string, u64, u64][], syms: Symbol[], strs: string): [u8[], string, u64] {
-	const b = new u8[](24 * (syms.length + 1))
-	let names = strs
-	let n = 1
-	let locals = 1
-	for (const local of [true, false]) {
-		for (const s of syms) {
-			if ((s.binding == Local) != local) {
-				continue
-			}
-			const e = 24 * n
-			const exec = s.section >= 0 && image.segment(s.value).exec
-			const tls = s.section >= 0 && threaded(image, s.value)
-			const bind = if (s.binding == Local) STB_LOCAL else if (s.binding == Weak) STB_WEAK else STB_GLOBAL
-			put(b, e, names.length as u64, 4)
-			b[e + 4] = (bind << 4 | (if (s.section < 0) STT_NOTYPE else if (tls) STT_TLS else if (exec) STT_FUNC
-				else STT_OBJECT)) as u8
-			put(b, e + 6, if (s.section < 0) SHN_UNDEF else 1 + (partitionPoint(stretches, r => r[1] + r[2] > s.value) as u64),
-				2)
-			put(b, e + 8, if (tls) s.value - image.thread[0] else s.value, 8)
-			put(b, e + 16, s.size, 8)
-			names += s.name + "\x00"
-			n++
-		}
-		locals = if (local) n else locals
-	}
-	return [b, names, locals as u64]
+/// The index of the header of the stretch at is in, or of the last, of one at the end.
+function stretch(stretches: [string, u64, u64][], at: u64): u64 {
+	return 1 + min(partitionPoint(stretches, r => r[1] + r[2] > at) as u64, (stretches.length - 1) as u64)
+}
+
+/// Sets the entry at e of b, a symbol table whose section headers after the first are stretches, to that of s, of
+/// binding bind and whose name is at name of the string table.
+function entry(b: u8[], e: i32, image: Image, stretches: [string, u64, u64][], s: Symbol, bind: u64, name: u64) {
+	const exec = s.section >= 0 && image.segment(s.value).exec
+	const tls = s.section >= 0 && threaded(image, s.value)
+	put(b, e, name, 4)
+	const stt = if (s.section < 0) STT_NOTYPE else if (tls) STT_TLS else if (exec) STT_FUNC else STT_OBJECT
+	b[e + 4] = (bind << 4 | stt) as u8
+	put(b, e + 6, if (s.section < 0) SHN_UNDEF else stretch(stretches, s.value), 2)
+	put(b, e + 8, if (tls) s.value - image.thread[0] else s.value, 8)
+	put(b, e + 16, s.size, 8)
 }
 
 /// The SysV hash table of a dynamic symbol table of syms after the null one: a bucket per symbol, the index of the
@@ -683,5 +693,5 @@ function skip(b: string, p: i32): i32 {
 	return q + 1
 }
 
-export const elf: Format = { headers: headers, bindsAnywhere: true, start: "__dso_handle", read: read, exports: exports,
-	write: write }
+export const elf: Format = { headers: headers, symbol: 24, bindsAnywhere: true, start: "__dso_handle", read: read,
+	exports: exports, write: write }
