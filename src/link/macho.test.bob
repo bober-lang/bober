@@ -4,7 +4,7 @@ import { indexOf, sort } from "../../std/algo"
 import { min } from "../../std/math"
 import { CompileError } from "../error"
 import { arm64 } from "./arm64"
-import { Bytes, big, le, pad, u, zeros } from "./bytes"
+import { Bytes, big, le, mapped, pad, u, zeros } from "./bytes"
 import { Linker } from "./link"
 import { macho } from "./macho"
 import { Code, Data, Desc, Fixup, Global, Object, Section, Symbol, Thread, Unwind } from "./object"
@@ -33,9 +33,6 @@ function file(l: Linker): Bytes throws CompileError {
 	return image.bytes
 }
 
-/// The bytes of b.
-const all = (b: Bytes) => b.slice(0, b.length)
-
 /// The dylib of an object of sections, its first exported as each of names.
 function dylib(sections: Section[], names: string[]): string throws CompileError {
 	const o = object("a.o", sections)
@@ -45,7 +42,7 @@ function dylib(sections: Section[], names: string[]): string throws CompileError
 	for (const n of names) {
 		l.export(n)
 	}
-	return all(file(l))
+	return mapped(file(l))
 }
 
 test "a written dylib's export trie holds the names the image exports, of shared prefixes too" {
@@ -73,7 +70,7 @@ test "a kept dylib is continued, and where an object's Unwind section was is a C
 	for (const name of ["a", "b", "c"]) {
 		l.add(object(name, [section(".eh_frame", Unwind, cie)]))
 	}
-	const again = new Linker(arm64, macho, new Bytes(all(file(l))))
+	const again = new Linker(arm64, macho, new Bytes(mapped(file(l))))
 	assert again.objects().join(" ") == "a b c"
 	again.remove("b")
 	const d = file(again)
@@ -87,7 +84,7 @@ test "a kept dylib is continued, and where an object's Unwind section was is a C
 test "a kept dylib's signature hashes each page, of those a continued one has not written the old hashes" {
 	const l = new Linker(arm64, macho, new Bytes())
 	l.add(object("a", [section("text", Code), section("data", Data)]))
-	const again = new Linker(arm64, macho, new Bytes(all(file(l))))
+	const again = new Linker(arm64, macho, new Bytes(mapped(file(l))))
 	again.add(object("b", [section("text", Code, "\xc0\x03\x5f\xd6\x00\x00\x00\x00")]))
 	const d = file(again)
 	// LC_CODE_SIGNATURE, of 16 bytes, is the last command.
@@ -112,7 +109,7 @@ test "a thread-local's descriptor has its offset in a thread's copy, and dyld kn
 	const l = new Linker(arm64, macho)
 	l.add(o)
 	l.export("a")
-	const d = all(file(l))
+	const d = mapped(file(l))
 	assert (u(d, 24, 4) & 0x800000) != 0 // MH_HAS_TLV_DESCRIPTORS
 	// Each section's header, of 80 bytes, past the 64 from its segment's name on, has its size at 40, its offset in
 	// the file at 48 and its type at 64.
