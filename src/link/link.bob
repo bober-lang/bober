@@ -18,7 +18,7 @@ import { alignUp, max, min } from "../../std/math"
 import { Arch } from "../../std/os"
 import { CompileError } from "../error"
 import { Bytes, zeros } from "./bytes"
-import { Region, State, read, write } from "./keep"
+import { Region, State, read, record, write } from "./keep"
 import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Image32, Init, Kept, Local, Machine, Object, Page,
 	PageOff, Rel32, Rel64, Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Thread32, Unwind, Weak,
 	Zero } from "./object"
@@ -27,8 +27,8 @@ import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Image32, Init, Kep
 /// bytes at their address; a kept image's segments have room after them, which the file has as a hole.
 export class Image {
 	arch: Arch
-	/// The file, from offset 0, where the writer's headers go, to the end of the last segment's bytes, or of a kept
-	/// image's state; the writer puts the rest after.
+	/// The file, from offset 0, where the writer's headers go, to the end of the last region's bytes; the writer puts
+	/// the rest after.
 	bytes = new Bytes()
 	/// Ascending, each at a multiple of page but the first, which is after the headers.
 	segments: Segment[] = []
@@ -104,7 +104,7 @@ const slotted = (kind: u8) => kind == SlotPage || kind == SlotPageOff || kind ==
 /// own, as each before the last has room after it: addresses no file holds, for what later links add; and the Unwind
 /// ones the first, with the headers, where Mach-O's unwinder reads them one after another. An image with a full region
 /// is linked anew, as is one whose code no longer reaches what it calls, on arm64 128 MB away. Last, the Kept ones,
-/// which no loader maps.
+/// which no loader maps, and what a kept image keeps (save).
 const regions: u8[][] = [[Code], [Const, Unwind], [Data, Init, Thread, Zero], [Kept]]
 const keptRegions: u8[][] = [[Unwind], [Code], [Const], [Data, Init, Thread], [Zero], [Kept]]
 const room: u64 = 1 << 28
@@ -131,14 +131,15 @@ class Name {
 }
 
 /// An object as linked: per symbol, the index of its Name, -1 if it is local; per section, its address, 0 while it is
-/// to be laid out, or dropped; whether it is frozen; and the bytes the continued image has its object as, "" once it is
-/// not as there.
+/// to be laid out, or dropped; whether it is frozen; the bytes the continued image has its object as, "" once it is
+/// not as there; and its blocks of the file, as State has them, none until saved.
 class Unit {
 	object: Object
 	names: i32[] = []
 	at: u64[]
 	frozen: bool
 	encoded = ""
+	blocks: [u64, u64][] = []
 
 	constructor(o: Object, frozen = false) {
 		this.object = o
@@ -194,6 +195,7 @@ export class Linker {
 			const u = new Unit(e[0])
 			u.at = e[1]
 			u.encoded = e[2]
+			u.blocks = e[3]
 			return u
 		})
 		this.units[0].frozen = true
@@ -210,7 +212,7 @@ export class Linker {
 				const sec = u.object.sections[i]
 				if (s.floating.includes(sec.name) && u.at[i] != dropped) {
 					sec.bytes = if (sec.kind == Zero) "" else this.bytes.slice(u.at[i], u.at[i] + sec.size)
-					this.free(u.at[i], sec)
+					this.free(u.at[i], sec.size, sec.kind != Zero)
 					u.at[i] = 0
 				}
 			}
@@ -411,8 +413,11 @@ export class Linker {
 				this.errors.push(`${u.object.name} has ${sec.name}, which the image has for good`)
 			}
 			if (u.at[i] != 0 && u.at[i] != dropped) {
-				this.free(u.at[i], sec)
+				this.free(u.at[i], sec.size, sec.kind != Zero)
 			}
+		}
+		for (const [at, size] of u.blocks) {
+			this.free(at, size, true)
 		}
 		this.units = this.units.filter(x => x != u)
 		this.loaded--
@@ -706,7 +711,7 @@ export class Linker {
 					}
 				}
 			}
-			if (fresh && r < regions.length - 1) {
+			if (fresh) {
 				region.cap = alignUp(region.top, image.page) + (if (this.keep) room else 0)
 			}
 			if (region.top > region.start) {
@@ -739,9 +744,8 @@ export class Linker {
 		}
 	}
 
-	/// Lays the sections refs out one after another in region r: in the first of its holes they fit, else at its top,
-	/// which stays below its cap; the bytes between them zeros, where a hole may have others, as macho.bob's CIEs. From
-	/// and to where.
+	/// Lays the sections refs out one after another in region r, where room puts them; the bytes between them zeros,
+	/// where a hole may have others, as macho.bob's CIEs. From and to where.
 	private place(r: Region, refs: i64[]): [u64, u64] throws CompileError {
 		const sec = (ref: i64) => this.units[ref >> 32].object.sections[ref & 0xffffffff]
 		const end = (from: u64) => {
@@ -751,28 +755,8 @@ export class Linker {
 			}
 			return at
 		}
-		const align = sec(refs[0]).align
-		let from: u64 = 0
-		let at: u64 = 0
-		for (const i of 0 ... r.holes.length - 1) {
-			const [hole, last] = r.holes[i]
-			from = alignUp(hole, align)
-			const to = end(from)
-			if (to > from && to <= last) {
-				const rest: [u64, u64][] = [[hole, from], [to, last]]
-				r.holes = [...r.holes.slice(0, i), ...rest.filter(h => h[1] > h[0]), ...r.holes.slice(i + 1, r.holes.length)]
-				at = hole
-				break
-			}
-		}
-		if (at == 0) {
-			at = r.top
-			from = alignUp(r.top, align)
-			r.top = end(from)
-			if (r.top >= r.cap) {
-				throw new CompileError(`there is no room for ${sec(refs[0]).name}`)
-			}
-		}
+		let at = this.room(r, sec(refs[0]).align, end, sec(refs[0]).name)
+		const from = alignUp(at, sec(refs[0]).align)
 		for (const ref of refs) {
 			const to = alignUp(at, sec(ref).align)
 			if (sec(ref).kind != Zero) {
@@ -784,16 +768,43 @@ export class Linker {
 		return [from, at]
 	}
 
+	/// Where in region r what takes from from to end(from) goes, from aligned to align: the start of the first of its
+	/// holes it fits in, else its top, which stays below its cap; a CompileError naming what if neither.
+	private room(r: Region, align: u64, end: (from: u64) => u64, what: string): u64 throws CompileError {
+		for (const i of 0 ... r.holes.length - 1) {
+			const [hole, last] = r.holes[i]
+			const from = alignUp(hole, align)
+			const to = end(from)
+			if (to > from && to <= last) {
+				const rest: [u64, u64][] = [[hole, from], [to, last]]
+				r.holes = [...r.holes.slice(0, i), ...rest.filter(h => h[1] > h[0]), ...r.holes.slice(i + 1, r.holes.length)]
+				return hole
+			}
+		}
+		const at = r.top
+		r.top = end(alignUp(at, align))
+		if (r.top >= r.cap) {
+			throw new CompileError(`there is no room for ${what}`)
+		}
+		return at
+	}
+
+	/// A block of region r, where room puts it, of b, what's: from where, and its size.
+	private block(r: Region, b: string, what: string): [u64, u64] throws CompileError {
+		const at = this.room(r, 1, from => from + (b.length as u64), what)
+		this.bytes.set(at, b)
+		return [at, b.length as u64]
+	}
+
 	/// The region of the continued image the address at is in.
 	private region(at: u64): Region { return this.state.regions[partitionPoint(this.state.regions, r => r.cap > at)] }
 
-	/// Frees the bytes of sec at at for what is laid out later; the image has zeros there until then.
-	private free(at: u64, sec: Section) {
-		const size = sec.size
+	/// Frees the size bytes at at for what is laid out later; if bytes, the image has zeros there until then.
+	private free(at: u64, size: u64, bytes: bool) {
 		if (size == 0) {
 			return
 		}
-		if (sec.kind != Zero) {
+		if (bytes) {
 			this.bytes.set(at, zeros(size as i32))
 		}
 		const r = this.region(at)
@@ -905,10 +916,11 @@ export class Linker {
 			(this.index.get(n.name) ?? -1) != g
 	}
 
-	/// Keeps in the image what a later link continues it from, which the 16 bytes after its headers say where the file
-	/// has: its units, the frozen ones as one and the others stripped; the slots and stubs of names; and exports. It is
-	/// after the Kept sections, as the loader takes none of their region's.
-	private save(image: Image, exports: string[]) {
+	/// Keeps in the image what a later link continues it from: its units, the frozen ones as one and the others
+	/// stripped, each with a record in a block of the Kept region of its own, made once; the slots and stubs of names;
+	/// and exports. The head, of all but the records, is at the end of the region's room, where most of it is as the
+	/// file has it, and the 16 bytes after the headers say where.
+	private save(image: Image, exports: string[]) throws CompileError {
 		const s = this.state
 		for (const x of this.bounded) {
 			if (!s.pinned.includes(x) && this.units.some(u => u.frozen && u.object.sections.some(sec => sec.name == x))) {
@@ -917,7 +929,12 @@ export class Linker {
 		}
 		s.floating = this.bounded.filter(x => !s.pinned.includes(x))
 		const units = [this.freeze(), ...this.units.filter(u => !u.frozen).map(u => this.strip(u))]
-		s.units = units.map(u => [u.object, u.at, u.encoded])
+		const kept = s.regions[s.regions.length - 1]
+		for (const u of units.filter(u => u.blocks.length == 0)) {
+			u.encoded = record(u.object)
+			u.blocks = [this.block(kept, u.encoded, u.object.name)]
+		}
+		s.units = units.map(u => [u.object, u.at, u.encoded, u.blocks])
 		s.slots = []
 		for (const g of 0 ... this.names.length - 1) {
 			const n = this.names[g]
@@ -928,12 +945,15 @@ export class Linker {
 		s.exports = exports
 		s.inits = image.inits
 		s.thread = image.thread
-		const kept = write(s, this.machine.arch)
-		const at = alignUp(s.regions[s.regions.length - 1].top, 8)
-		image.bytes.set(at, kept)
-		image.bytes.length = at + (kept.length as u64)
+		const head = write(s, this.machine.arch)
+		const at = kept.cap - alignUp(head.length as u64, image.page)
+		if (at <= kept.top) {
+			throw new CompileError("there is no room for what the image keeps")
+		}
+		image.bytes.set(at, head)
+		image.bytes.length = at + (head.length as u64)
 		image.bytes.put(this.format.headers, at, 8)
-		image.bytes.put(this.format.headers + 8, kept.length as u64, 8)
+		image.bytes.put(this.format.headers + 8, head.length as u64, 8)
 	}
 
 	/// The frozen units as one, of a section per region from its start, of no bytes, that their symbols are in: those
@@ -944,6 +964,11 @@ export class Linker {
 		const units = this.units.filter(u => u.frozen)
 		if (units.length == 2 && units[0].encoded != "" && units[1].object.symbols.length == 0) {
 			return units[0]
+		}
+		for (const u of units) {
+			for (const [at, size] of u.blocks) {
+				this.free(at, size, true)
+			}
 		}
 		const regions = this.state.regions
 		const o = new Object("the image", this.machine.arch)
