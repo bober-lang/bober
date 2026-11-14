@@ -258,7 +258,7 @@ export class Linker {
 				const sec = u.object.sections[i]
 				if (s.floating.includes(sec.name) && u.at[i] != dropped) {
 					sec.bytes = if (sec.kind == Zero) "" else this.bytes.slice(u.at[i], u.at[i] + sec.size)
-					this.free(u.at[i], sec.size, sec.kind != Zero)
+					this.free(u.at[i], sec.size)
 					u.at[i] = 0
 				}
 			}
@@ -482,11 +482,11 @@ export class Linker {
 				this.errors.push(`${u.object.name} has ${sec.name}, which the image has for good`)
 			}
 			if (u.at[i] != 0 && u.at[i] != dropped) {
-				this.free(u.at[i], sec.size, sec.kind != Zero)
+				this.free(u.at[i], sec.size)
 			}
 		}
 		for (const [at, size] of u.blocks) {
-			this.free(at, size, true)
+			this.free(at, size)
 		}
 		this.units = this.units.filter(x => x != u)
 		this.loaded--
@@ -876,33 +876,28 @@ export class Linker {
 		return [at, b.length as u64]
 	}
 
-	/// The region of the continued image the address at is in.
-	private region(at: u64): Region { return this.state.regions[partitionPoint(this.state.regions, r => r.cap > at)] }
-
-	/// Frees the size bytes at at for what is laid out later; if bytes, the image has zeros there until then.
-	private free(at: u64, size: u64, bytes: bool) {
-		if (size == 0) {
-			return
-		}
-		if (bytes) {
+	/// Frees the size bytes at at for what is laid out later. They stay as they are but in the regions read entry by
+	/// entry, the unwinder's and the symbol table's, which have zeros there until then.
+	private free(at: u64, size: u64) {
+		const k = partitionPoint(this.state.regions, r => r.cap > at) as i32
+		const r = this.state.regions[k]
+		if (this.regions[k][0] == Unwind || this.regions[k][0] == Symbols) {
 			this.bytes.set(at, zeros(size as i32))
 		}
-		const r = this.region(at)
-		let a = partitionPoint(r.holes, h => h[0] > at) as i32
-		let b = a
-		let from = at
-		let to = at + size
-		if (a > 0 && r.holes[a - 1][1] == from) {
-			a--
-			from = r.holes[a][0]
+		let i = partitionPoint(r.holes, h => h[0] > at) as i32
+		let [from, to] = [at, at + size]
+		if (i < r.holes.length && r.holes[i][0] == to) {
+			to = r.holes.remove(i)[1]
 		}
-		if (b < r.holes.length && r.holes[b][0] == to) {
-			to = r.holes[b][1]
-			b++
+		if (i > 0 && r.holes[i - 1][1] == from) {
+			i--
+			from = r.holes.remove(i)[0]
 		}
-		const rest: [u64, u64][] = if (to == r.top) [] else [[from, to]]
-		r.top = if (to == r.top) from else r.top
-		r.holes = [...r.holes.slice(0, a), ...rest, ...r.holes.slice(b, r.holes.length)]
+		if (to == r.top) {
+			r.top = from
+		} else if (to > from) {
+			r.holes.insert(i, [from, to])
+		}
 	}
 
 	/// Sets the bytes each fixup is at, noting a pointer to an address in the image as a rebase, one to an import as a
@@ -1071,7 +1066,7 @@ export class Linker {
 		}
 		for (const u of units) {
 			for (const [at, size] of u.blocks) {
-				this.free(at, size, true)
+				this.free(at, size)
 			}
 		}
 		const regions = this.state.regions

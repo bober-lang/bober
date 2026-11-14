@@ -161,11 +161,14 @@ export function store(f: File, bytes: Bytes) {
 	f.writeAt(0, first)
 }
 
-/// The bytes, stored as a build stores them, their holes kept, and mapped: of an image's address space, only what is
-/// written takes memory.
-export function mapped(bytes: Bytes): string {
+/// The bytes, stored as a build stores them over the file it continues, which has theirs from and to each of kept,
+/// their holes kept; and mapped: of an image's address space, only what is written takes memory.
+export function mapped(bytes: Bytes, kept: [u64, u64][] = []): string {
 	const dir = makeTempDir("bober-")
 	const f = open(`${dir}/image`, "w")
+	for (const [from, to] of kept) {
+		f.writeAt(from, bytes.slice(from, to))
+	}
 	store(f, bytes)
 	f.close()
 	const s = mapFile(`${dir}/image`)
