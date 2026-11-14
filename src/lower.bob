@@ -275,7 +275,9 @@ class Unit {
 		const self = if (has(p, "static")) null else selfOf(t)
 		const pt = p.type!
 		const md = this.entry("", d, key, k, pm, pt, p.doc, if (k == decl.Var && self == null) this.vars else null)
-		this.depend(d, md)
+		if (self != null && (k == decl.Var || key == "constructor")) {
+			this.depend(d, md) // what new runs (spec 3)
+		}
 		this.later(() => { this.prog.decls[md].tags = this.tags(p) })
 		if (k == decl.Function) {
 			this.generic(pt.params, md)
@@ -1931,7 +1933,7 @@ class Gen {
 		const t = p.type!
 		const args = p.parts.slice(1, p.parts.length)
 		if (t.kind == "class") {
-			this.ref(this.u.l.nominal(t)) // so that a variable initialized by it comes after its static fields
+			this.ref(this.u.l.nominal(t)) // so that a variable initialized by it comes after what its new runs
 			const c = t.member("constructor")
 			if (c != null) {
 				this.args(c!, args)
