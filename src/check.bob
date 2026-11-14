@@ -2513,7 +2513,7 @@ class Checker {
 	private cases(n: Node, body: (p: Node, at: Tok) => void): bool {
 		const s = n.parts[0]
 		let subject: Type | null = null
-		this.apart(() => { subject = this.expr(s, null) })
+		this.apart(() => { subject = this.own(s, this.expr(s, null)) })
 		const b = this.place(s)
 		const k = this.kindOf(s)
 		let all = false
@@ -2920,6 +2920,16 @@ class Checker {
 		const t = this.expr(p, null).widen(false)
 		this.convert(p, t)
 		return t
+	}
+
+	/// The type of p, t as checked, where nothing converts its value but it is not one either, as the operand of `.`:
+	/// its untyped constants take their own types (4.1), and its other parts keep theirs.
+	private own(p: Node, t: Type): Type {
+		if (!t.isLoose()) {
+			return t
+		}
+		this.convert(p, t.widen(false))
+		return p.type!
 	}
 
 	private valueOf(p: Node, want: Type | null): Type {
@@ -3357,8 +3367,15 @@ class Checker {
 		const r = this.expr(b, l)
 		const op = n.t.kind
 		if (op == "==" || op == "!=") {
-			if (l.kind == "function" || r.kind == "function" || l.kind == "fixed" || r.kind == "fixed" || compared(l, r) == null) {
+			const j = compared(l, r)
+			if (l.kind == "function" || r.kind == "function" || l.kind == "fixed" || r.kind == "fixed" || j == null) {
 				throw this.error(n.t.loc, `cannot compare ${show(l)} and ${show(r)}`)
+			}
+			if (!l.isNumber() || !r.isNumber()) {
+				// as the type they join to, untyped constants in neither's context taking their own types (4.1)
+				const t = if (j!.isLoose()) j!.widen(false) else j!
+				this.convert(if (n.kind == "chain") a.parts[1] else a, t)
+				this.convert(b, t)
 			}
 		} else if (!l.isNumber() || !r.isNumber()) {
 			if ((!l.isString() || !r.isString()) && (l != r || !l.isOrdered())) {
@@ -3629,7 +3646,8 @@ class Checker {
 	/// ```
 	private link(n: Node, assigned: bool, want: Type | null = null): Type {
 		const a = n.parts[0]
-		let o = if (isLink(a)) this.link(a, false) else this.expr(a, null)
+		const checked = if (isLink(a)) this.link(a, false) else this.expr(a, null)
+		let o = if (n.kind == "member") this.own(a, checked) else checked // a subscript's converts with its result
 		if (n.t.kind == "?." && o == Null) {
 			throw this.error(n.t.loc, `${if (a.kind == "token") this.text(a.t) else "the value before ?."} is always null`)
 		} else if (n.t.kind == "?.") {
@@ -3930,7 +3948,7 @@ class Checker {
 		let cls: Type | null = null
 		for (const q of n.parts) {
 			if (q.kind == "unary") {
-				const t = this.expr(q.parts[0], null)
+				const t = this.own(q.parts[0], this.expr(q.parts[0], null))
 				if (t.kind == "class") {
 					if (cls != null && cls != t) {
 						throw this.error(start(q), `cannot spread ${show(t)} into ${show(cls)}`)

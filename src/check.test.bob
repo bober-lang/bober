@@ -750,3 +750,10 @@ test "a header's module and its users are linked from the cache while the files 
 	same(["inc/x.h", "#define N 2\n"], all, "d/b.bob inc/x.h: N main.bob")
 	same(["inc/x.h", "#define N 1\n", "d/x.h", "#define N 2\n"], all, "d/b.bob d/x.h: N main.bob")
 }
+
+test "untyped constants nothing converts take their own types: of an operand of . or ==, a switch's subject, a spread" {
+	assert typed("const n = [1, null].length\nconst e = [1] == [1]")
+		== "(var:i32 n:i32 (member:i32 (array:(i32 | null)[] 1:i32 null:null) length:i32)) (var:bool e:bool (binary:bool (array:i32[] 1:i32) (array:i32[] 1:i32)))"
+	assert typed("const o = { ...{ a: 1 } }\nconst s = switch ([1]) {\n\tdefault: 0\n}")
+		== "(var:{ a: i32 } o:{ a: i32 } (object:{ a: i32 } (unary (object:{ a: i32 } (prop:i32 1:i32))))) (var:i32 s:i32 (switchExpr:i32 (array:i32[] 1:i32) (case 0:i32)))"
+}
