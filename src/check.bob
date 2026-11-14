@@ -530,7 +530,7 @@ class Linked {
 		b.params = if (x.kind == decl.Alias) this.params(d) else if (isType) t.params else []
 		if (x.kind == decl.Var && readonly) {
 			const v = if (t == UntypedInt) this.value(d) else null
-			b.literal = if (v != null) Type.literal(decimal(v!), I32)
+			b.literal = if (v != null) Type.literal(v!, I32)
 				else if (t.kind == "literal" && (t.base!.kind == "int" || t.base!.kind == "string")) t else null
 		} else if (x.kind == decl.Class) {
 			about(t, "constructor").decl = b.decl
@@ -539,13 +539,13 @@ class Linked {
 	}
 
 	/// The value of untyped int const d: its code an Int, then each Neg; null for other code.
-	private value(d: i32): f64 | null {
+	private value(d: i32): string | null {
 		const c = this.p.decls[d].code
-		let v: f64 | null = null
+		let v: string | null = null
 		for (const i of 0 ... (c?.ops.length ?? 0) - 1) {
 			switch (c!.ops[i]) {
-				case op.Int: v = this.p.ints[c!.b(i)] as f64
-				case op.Neg: v = if (v == null) null else -v!
+				case op.Int: v = `${this.p.ints[c!.b(i)]}`
+				case op.Neg: v = if (v == null) null else negated(v!)
 				case op.End: return v
 				default: return null
 			}
@@ -1586,7 +1586,7 @@ class Checker {
 	/// string constant (4.2): of its value in t, else in v or its base, or `i32` for an untyped one; else null.
 	private literal(p: Node, v: Type, t: Type | null): Type | null {
 		const n = if (v.kind == "int") this.constant(p) else null
-		const text = if (n != null) decimal(n!) else if (v.kind == "literal") v.text else null
+		const text = if (n != null) n else if (v.kind == "literal") v.text else null
 		const base = t ?? (if (v.isUntyped()) I32 else if (n != null) v else v.base)
 		return if (text != null && (base?.kind == "int" || base?.kind == "string")) Type.literal(text!, base!) else null
 	}
@@ -3774,11 +3774,12 @@ class Checker {
 			case "array", "fixed": return element(u, 0)!
 			case "tuple":
 				const v = this.constant(i)
-				const e = if (v == null) null else element(u, v as i32)
+				const n = if (v == null) null else small(v!)
+				const e = if (n == null) null else element(u, n!)
 				if (e == null) {
 					throw this.error(start(i), `expected a static subscript within ${show(o)}`)
 				}
-				i.type = Type.literal(decimal(v!), I32) // the index, which lowering reads the element by
+				i.type = Type.literal(v!, I32) // the index, which lowering reads the element by
 				return e
 		}
 		throw this.error(n.t.loc, `cannot subscript ${show(o)}`)
@@ -4123,9 +4124,13 @@ class Checker {
 				if (p.parts.length == 1) {
 					return Type.array(this.applied(base, ps, [], a))
 				}
-				const len = this.constant(p.parts[1])
-				if (len != null && p.parts.length == 2) {
-					return Type.fixed(this.applied(base, ps, [], a), len as i32)
+				const n = this.constant(p.parts[1])
+				if (n != null && p.parts.length == 2) {
+					const len = small(n!)
+					if (len == null) {
+						throw this.error(start(p.parts[1]), `${n} is not a length`)
+					}
+					return Type.fixed(this.applied(base, ps, [], a), len!)
 				}
 				const args: Type[] = []
 				for (const q of p.parts.slice(1, p.parts.length)) {
@@ -4410,17 +4415,17 @@ class Checker {
 	private representable(p: Node, t: Type) {
 		const v = this.constant(p)
 		if (v != null && !holds(t, v)) {
-			throw this.error(start(p), `${decimal(v!)} is not representable as ${show(t)}`)
+			throw this.error(start(p), `${v!} is not representable as ${show(t)}`)
 		}
 	}
 
-	/// The value of p where it is an integer constant, possibly negated, or cast to an integer type that holds it: a
-	/// literal, or a const one initialized.
-	private constant(p: Node): f64 | null {
+	/// The value of p, in decimal, where it is an integer constant, possibly negated, or cast to an integer type that
+	/// holds it: a literal, or a const one initialized.
+	private constant(p: Node): string | null {
 		if (p.kind == "token") {
 			const l = if (p.t.kind == "ident") this.find(this.text(p.t))?.literal else null
 			const s = if (p.t.kind == "int") this.text(p.t) else if (l?.base?.kind == "int") l!.text else null
-			return if (s == null) null else integer(s!)
+			return if (s == null) null else decimal(s!)
 		}
 		if (p.kind == "paren") {
 			return this.constant(p.parts[0])
@@ -4430,7 +4435,7 @@ class Checker {
 			return if (v != null && p.type?.kind == "int" && holds(p.type!, v!)) v else null
 		}
 		const v = if (p.kind == "unary" && p.t.kind == "-") this.constant(p.parts[0]) else null
-		return if (v == null) null else -v
+		return if (v == null) null else negated(v!)
 	}
 
 	/// want if a and b both fit it, else their join.
@@ -4541,8 +4546,8 @@ export function compared(a: Type, b: Type): Type | null { return a.join(b) ?? op
 /// t with each of params in it replaced by the arg at its index.
 export function substitute(t: Type, params: Type[], args: Type[]): Type { return t.in({ ...new Type("class"), params: params }, args) }
 
-/// Whether t, or one of its int members, holds integer v; true of other types.
-function holds(t: Type, v: f64): bool {
+/// Whether t, or one of its int members, holds integer constant v; true of other types.
+function holds(t: Type, v: string): bool {
 	if (t.kind == "param") {
 		return t.each(m => holds(m, v))
 	}
@@ -4552,8 +4557,9 @@ function holds(t: Type, v: f64): bool {
 	if (t.kind != "int" || t.n == 0) {
 		return true
 	}
-	const max = 2.0 ** ((if (t.signed) t.n - 1 else t.n) as f64)
-	return (v < max || t.n == 64 && v == max) && v >= (if (t.signed) -max else 0.0)
+	const m = magnitude(v)
+	const w = if (t.signed) t.n - 1 else t.n
+	return m != null && (if (v[0] == minus) t.signed && m <= (1 as u64) << w else w == 64 || m < (1 as u64) << w)
 }
 
 /// Whether `new` makes a t without arguments: a class or tuple, or an interface with a constructor, that needs none,
@@ -4743,8 +4749,17 @@ function phaseOf(p: Node): i32 {
 	}
 }
 
-/// Integer constant v in decimal.
-function decimal(v: f64): string { return if (v < 0.0) `${v as i64}` else `${v as u64}` }
+/// Integer literal s, possibly negated, in decimal, or s past u64.
+function decimal(s: string): string {
+	const m = magnitude(s)
+	return if (m == null) s else if (s[0] == minus && m > 0) `-${m}` else `${m}`
+}
+
+/// Integer constant v negated.
+function negated(v: string): string { return if (v[0] == minus) v.slice(1, v.length) else decimal(`-${v}`) }
+
+/// Integer constant v as an index or a count: an i32 if it is one, not negative.
+function small(v: string): i32 | null { return if (v[0] != minus && holds(I32, v)) magnitude(v)! as i32 else null }
 
 /// Whether p is a constant, so that an untyped one initializes an untyped const (4.1).
 function isConstant(p: Node): bool {
@@ -4902,20 +4917,17 @@ function strong(d: Decl): void {
 	}
 }
 
-/// The value of an integer literal, possibly negated, or infinity past u64.
-function integer(s: string): f64 {
-	if (s[0] == minus) {
-		return -integer(s.slice(1, s.length))
-	}
+/// The magnitude of an integer literal, possibly negated, or null past u64.
+function magnitude(s: string): u64 | null {
+	let i = if (s[0] == minus) 1 else 0
 	let radix: u64 = 10
-	let i = 0
-	if (s.length > 2 && isAlphabetic(s[1])) {
-		radix = switch (s[1]) {
+	if (s.length > i + 2 && isAlphabetic(s[i + 1])) {
+		radix = switch (s[i + 1]) {
 			case x: 16
 			case o: 8
 			default: 2
 		}
-		i = 2
+		i += 2
 	}
 	let v: u64 = 0
 	for (const c of s.slice(i, s.length)) {
@@ -4923,10 +4935,10 @@ function integer(s: string): f64 {
 		if (d != null) {
 			const next = v * radix + d
 			if (next / radix != v) {
-				return 1.0 / 0.0
+				return null
 			}
 			v = next
 		}
 	}
-	return v as f64
+	return v
 }
