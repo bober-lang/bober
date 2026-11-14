@@ -21,11 +21,11 @@ import * as optarg from "../std/encoding/optarg"
 import { exists, glob, mapFile, mkdirAll, open, readDir, readFile, remove, removeAll, rename, stat } from "../std/fs"
 import { base, dir as parent, isAbs, join, rel } from "../std/fs/path"
 import { HashMap } from "../std/collections/hashmap"
-import { fnv } from "../std/hash"
+import { combine, fnv } from "../std/hash"
 import { File, stderr, stdin, stdout } from "../std/io"
 import { arch, os } from "../std/os"
 import { ParseError, codePoint, split, trim, utf8 } from "../std/string"
-import { abi, write } from "./bc/file"
+import { abi, version, write } from "./bc/file"
 import * as decl from "./bc/decl"
 import * as kind from "./bc/kind"
 import { Program } from "./bc/program"
@@ -599,12 +599,19 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	}
 	const compiler = compilerId()
 	const names: string[] = []
+	// Of each module, the symbol its unit defines of its version (src/bc/file.bob's), which -O2's overlay of its code
+	// names, and the other modules of the decls not exported it names; made when unit or -O2 wants them.
+	const versions: [string, i32[]][] = []
+	const signatures = new HashMap[i32, [u64, i32[]]]()
 	for (const m of 0 ... p.modules.length - 1) {
 		const bc = if (p.modules[m].bc != "") p.modules[m].bc else write(p, m, compiler)
 		const b = bound.get(p.modules[m].path)?.bytes(p.modules[m].path) ?? ""
 		names.push(`${p.modules[m].path}@${fnv(bc + b)}`)
-		if (lacks(names[m])) {
-			l.add(unit(p, m, names[m], o, bc, b))
+		const rebuilt = lacks(names[m])
+		const [v, others] = if (o2 || rebuilt) version(p, m, bc, signatures) else [0 as u64, []]
+		versions.push([`bober.o2.${p.modules[m].path}@${combine(v, fnv(b))}`, others])
+		if (rebuilt) {
+			l.add(unit(p, m, names[m], o, bc, b, versions[m][0]))
 		}
 	}
 	// -O1's instances, an object per bucket of each module's (`<path>~<bucket>@<version>`), and -O2's overlays of the
@@ -613,8 +620,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	// all, but those that name what no longer is (compiled).
 	if (o1 != null) {
 		const wanted: string[] = []
-		const part = (m: i32, ds: i32[], what: string, over: bool) => {
-			const refs = [`bober.code.${names[m]}`, ...abis(p, m, ds, names)]
+		const part = (m: i32, ds: i32[], what: string, refs: string[], over: bool) => {
 			const version = fnv(`${refs.join(" ")} ${ds.map(d => p.decls[d].hash).join(" ")}`)
 			const optimized = `${what}^O2@${version}`
 			const name = if (o2 || held.includes(optimized)) optimized else `${what}@${version}`
@@ -625,13 +631,16 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		}
 		for (const m of 0 ... p.modules.length - 1) {
 			for (const i of 0 ... o1[m].length - 1) {
-				part(m, o1[m][i], `${p.modules[m].path}~${i}`, false)
+				const ds = o1[m][i]
+				part(m, ds, `${p.modules[m].path}~${i}`, [`bober.code.${names[m]}`, ...abis(p, m, ds, names)], false)
 			}
 		}
 		if (o2) {
 			for (const ds of groups(p)) {
 				const m = p.decls[ds[0]].module
-				part(m, ds, p.modules[m].path, true)
+				const [symbol, others] = versions[m]
+				const refs = [symbol, ...abis(p, m, [], names), ...others.map(x => `bober.code.${names[x]}`)]
+				part(m, ds, p.modules[m].path, refs, true)
 			}
 		}
 		const ours = (h: string) => p.modules.some(x => startsWith(h, `${x.path}~`) || o2 && startsWith(h, `${x.path}^`))
@@ -725,12 +734,13 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 }
 
 /// Module m of p, compiled by TPDE as o says, as the object name. It defines a symbol named by its ABI, one by name,
-/// bober.code.<name>, which the instances -O1 makes of its generics name (image), and names
+/// bober.code.<name>, which the instances -O1 makes of its generics name (image), versioned, which -O2's overlay of
+/// its code names (relink), and names
 /// those of the modules it imports and of builtin/'s, whose functions the compiler calls unasked, so that a kept image
 /// unlinks it once one of them has another: an object another program left there, or after a change of builtin/, which
 /// no bytecode names. As lowered, it holds bc, its bytecode, in section bober_bc, which a build links rather than
 /// checks the module of (lowered), and its Bound, if any (src/lift.bob), in bober_bind.
-function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: string): Object {
+function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: string, versioned: string): Object {
 	const b = new Tpde(p.modules[m].path)
 	emit(p, m, b, o)
 	b.verify()
@@ -745,7 +755,8 @@ function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: s
 	}
 	x.sections.push(new Section(".rodata", Const))
 	x.symbols.append([new Symbol(abiSymbol(p, m), Global, x.sections.length - 1),
-		new Symbol(`bober.code.${name}`, Global, x.sections.length - 1)])
+		new Symbol(`bober.code.${name}`, Global, x.sections.length - 1),
+		new Symbol(versioned, Global, x.sections.length - 1)])
 	for (const d of 0 ... p.modules.length - 1) {
 		if (d != m && (builtin(p.modules[d].path) || p.modules[m].deps.includes(d))) {
 			x.symbols.push(new Symbol(abiSymbol(p, d), Global, -1))
@@ -758,9 +769,10 @@ function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: s
 function abiSymbol(p: Program, m: i32): string { return `bober.abi.${p.modules[m].path}.${abi(p, m)}` }
 
 /// Module m's decls ds, compiled as the object name, by LLVM if optimized, else TPDE, which names refs, so that a kept
-/// image unlinks it once one of them is not: that of m's code (unit), and abis'. ds are -O1's instances of m's generics
-/// (src/mono.bob's specialize), or if over, -O2's group of its functions, whose definitions of code are taken over the
-/// unit's; the group defines no other, which would be a second of what the unit defines.
+/// image unlinks it once one of them is not: that of m's code (unit), and abis'; or of m's version (relink's versions).
+/// ds are -O1's instances of m's generics (src/mono.bob's specialize), or if over, -O2's group of its functions, whose
+/// definitions of code are taken over the unit's; the group defines no other, which would be a second of what the unit
+/// defines.
 function compiled(p: Program, m: i32, ds: i32[], name: string, refs: string[], optimized: bool, over: bool): Object {
 	const b: Backend = if (optimized) new LLVM(p.modules[m].path) else new Tpde(p.modules[m].path)
 	emit(p, m, b, debug, new Facts(), ds)
