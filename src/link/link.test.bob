@@ -4,8 +4,8 @@ import { CompileError } from "../error"
 import { Bytes, mapped } from "./bytes"
 import { addend, arm64 } from "./arm64"
 import { Image, Linker, Stale } from "./link"
-import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Init, Local, Machine, Object, Page, PageOff, Rel32, Section,
-	SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Thread32, Unwind, Weak, Zero } from "./object"
+import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Init, Kept, Local, Machine, Object, Page, PageOff, Rel32,
+	Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Thread32, Unwind, Weak, Zero } from "./object"
 import { x64 } from "./x64"
 
 /// An object named name of one section of kind, of the bytes of words, and of symbols.
@@ -442,6 +442,12 @@ test "a group whose sections a kept object has dropped is taken by an object add
 	assert again.link() throws new Stale("b has k, which no object has now")
 }
 
+test "a Kept section is in no segment, and a continued image has its bytes" {
+	const first = keep(kept(), [obj("a", Code, [0xd65f03c0], []), obj("b", Kept, [7, 8], [])])
+	assert first.segments.length == 1 && first.sections.length == 1
+	assert kept(file(first)).sections("data").join("") == "\x07\x00\x00\x00\x08\x00\x00\x00"
+}
+
 test "the Zero sections of a kept image are a segment its file has no bytes of, and those it bounds one block" {
 	const zero = (name: string, size: u64) => {
 		const o = named("roots", obj(name, Zero, [], []))
@@ -453,7 +459,7 @@ test "the Zero sections of a kept image are a segment its file has no bytes of, 
 	const first = keep(kept(), [zero("a", 8), x, zero("b", 16)], ["__start_roots", "__stop_roots"])
 	const last = first.segments[first.segments.length - 1]
 	assert last.size == 0 && last.zero == 24 && last.address == at(first, "__start_roots")
-	assert get(first, 0x200, 8) == last.address // where the state is, which the loader takes none of
+	assert get(first, 0x200, 8) > last.address // where the state is, which the loader takes none of
 	const l = kept(file(first))
 	l.remove("a")
 	const image = keep(l, [zero("a", 32)])
