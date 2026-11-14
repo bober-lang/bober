@@ -118,3 +118,34 @@ test "a thread-local's descriptor has its offset in a thread's copy, and dyld kn
 	const at = u(d, data + 48, 4) as i32
 	assert u(d, at + 16, 8) == 0 && u(d, at + 40, 8) == 8
 }
+
+test "a kept dylib's symbol table has each unit's symbols, those of one it holds as it had them" {
+	const text = (name: string) => {
+		const o = object(name, [section("text", Code)])
+		o.symbols = [new Symbol(name, Global, 0)]
+		return o
+	}
+	// The names of the entries in LC_SYMTAB, and the table's entries.
+	const symbols = (d: Bytes) => {
+		const head = d.slice(0, 0x1000)
+		let at = 32
+		while (u(head, at, 4) != 0x2) {
+			at += u(head, at + 4, 4) as i32
+		}
+		const [entries, n, strings] = [u(head, at + 8, 4), u(head, at + 12, 4), u(head, at + 16, 4)]
+		const names: string[] = []
+		for (const i of 0 ... (n as i32) - 1) {
+			const name = strings + d.get(entries + 16 * (i as u64), 4)
+			names.push(d.slice(name, name + 2))
+		}
+		return [names.filter(x => x != "\x00\x00").join(" "), d.slice(entries, entries + 16 * n)]
+	}
+	const l = new Linker(arm64, macho, new Bytes())
+	l.add(text("f"))
+	const d = file(l)
+	const [first, entries] = symbols(d)
+	const again = new Linker(arm64, macho, new Bytes(mapped(d)))
+	again.add(text("g"))
+	const [second, more] = symbols(file(again))
+	assert first == "_f" && second == "_f _g" && more.slice(0, entries.length) == entries
+}

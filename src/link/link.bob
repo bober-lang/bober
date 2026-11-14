@@ -49,8 +49,12 @@ export class Image {
 	thread: [u64, u64, u64] = [0, 0, 1]
 	/// The address of each Desc fixup's bytes, and the offset of its S + A in the thread's copy.
 	descs: [u64, u64][] = []
-	/// Every symbol with a name the image defines, its value its address and its section 0, as defined.
-	symbols: Symbol[] = []
+	/// Of the units whose entries in the symbol table are new: the symbols with a name each defines, their value their
+	/// address and their section 0; where its entries go, of the format's size each; and where their names are, each
+	/// `_<name>` and a NUL. From and to where the table's entries are, the first zeros; and the names, the first a NUL.
+	symbols: [Symbol[], u64, u64][] = []
+	symtab: [u64, u64] = [0, 0]
+	strtab: [u64, u64] = [0, 0]
 
 	constructor(arch: Arch, page: u64) {
 		this.arch = arch
@@ -84,9 +88,11 @@ export class Image {
 /// A file format as who links needs it (elf.bob): the room at an image's start the file's headers take; whether who
 /// loads an image sets a pointer to an import wherever it is, or its slots only; the name code knows the image's first
 /// byte by, which the linker defines where no object does; read, the Object an object file's bytes are; exports, the
-/// names a shared library's file defines; and write, which makes the image's bytes its file.
+/// names a shared library's file defines; and write, which makes the image's bytes its file. Each entry of its symbol
+/// table takes symbol bytes, 0 if it has none.
 export type Format = {
 	headers: u64,
+	symbol: u64,
 	bindsAnywhere: bool,
 	start: string,
 	read: (name: string, bytes: string) => Object throws CompileError,
@@ -117,13 +123,16 @@ const planned: u64 = 1
 /// Whether a fixup of kind is of its symbol's slot.
 const slotted = (kind: u8) => kind == SlotPage || kind == SlotPageOff || kind == SlotRel32
 
+/// The kind of the symbol table's region, of no section.
+const Symbols: u8 = 8
+
 /// The sections of each segment, by kind, in order; and of a kept image's, where the Zero ones are a segment of their
 /// own, as each before the last has room after it: addresses no file holds, for what later links add; and the Unwind
 /// ones the first, with the headers, where Mach-O's unwinder reads them one after another. An image with a full region
-/// is linked anew, as is one whose code no longer reaches what it calls, on arm64 128 MB away. Last, the Kept ones,
-/// which no loader maps, and what a kept image keeps (save).
-const regions: u8[][] = [[Code], [Const, Unwind], [Data, Init, Thread, Zero], [Kept]]
-const keptRegions: u8[][] = [[Unwind], [Code], [Const], [Data, Init, Thread], [Zero], [Kept]]
+/// is linked anew, as is one whose code no longer reaches what it calls, on arm64 128 MB away. Last, two regions no
+/// loader maps: of the Kept sections and what a kept image keeps (save), and of the symbol table's entries.
+const regions: u8[][] = [[Code], [Const, Unwind], [Data, Init, Thread, Zero], [Kept], [Symbols]]
+const keptRegions: u8[][] = [[Unwind], [Code], [Const], [Data, Init, Thread], [Zero], [Kept], [Symbols]]
 const room: u64 = 1 << 28
 
 /// A name the objects share: the definition taken for it, and its address once laid out.
@@ -353,16 +362,15 @@ export class Linker {
 		for (const name of exports) {
 			image.exports.push([name, this.names[this.name(name)].address])
 		}
-		for (const u of this.units) {
-			for (const s of u.object.symbols) {
-				if (s.name != "" && s.section >= 0 && u.at[s.section] != dropped) {
-					image.symbols.push(new Symbol(s.name, s.binding, 0, u.at[s.section] + s.value, s.size))
-				}
-			}
-		}
 		if (this.keep) {
 			this.save(image, exports)
 		}
+		const [kept, table] = [this.state.regions[this.regions.length - 2], this.state.regions[this.regions.length - 1]]
+		image.symtab = [table.start, table.top]
+		// The names end at the top, where a head it moved up from may have left a byte.
+		image.bytes.set(kept.top, "\x00")
+		image.strtab = [kept.start, kept.top + 1]
+		image.bytes.length = max(image.bytes.length, table.top)
 		return image
 	}
 
@@ -689,6 +697,8 @@ export class Linker {
 			const fresh = this.state.regions.length == r
 			if (fresh) {
 				this.state.regions.push(new Region(if (r == 0) base else this.state.regions[r - 1].cap))
+				// One no loader maps starts with zeros, a symbol table's first entry and a string table's first byte.
+				this.state.regions[r].top += if (regions[r][0] >= Kept) this.format.symbol else 0
 			}
 			const region = this.state.regions[r]
 			let end = if (regions[r][0] == Zero) region.start else region.top
@@ -732,7 +742,7 @@ export class Linker {
 				region.cap = alignUp(region.top, image.page) + (if (this.keep) room else 0)
 			}
 			if (region.top > region.start) {
-				if (regions[r][0] != Kept) {
+				if (regions[r][0] < Kept) {
 					image.segments.push({ address: region.start, size: end - region.start, zero: region.top - end,
 						write: regions[r][0] == Data || regions[r][0] == Zero, exec: regions[r][0] == Code })
 				}
@@ -934,9 +944,10 @@ export class Linker {
 	}
 
 	/// Keeps in the image what a later link continues it from: its units, the frozen ones as one and the others
-	/// stripped, each with a record in a block of the Kept region of its own, made once; the slots and stubs of names;
-	/// and exports. The head, of all but the records, is at the end of the region's room, where most of it is as the
-	/// file has it, and the 16 bytes after the headers say where.
+	/// stripped, each with blocks of its own where no loader maps, made once: of its record and of its symbols'
+	/// names in the Kept sections' region, and of their entries in the symbol table's, which the format writes; the
+	/// slots and stubs of names; and exports. The head, of all but the records, is at the end of the Kept region's
+	/// room, where most of it is as the file has it, and the 16 bytes after the headers say where.
 	private save(image: Image, exports: string[]) throws CompileError {
 		const s = this.state
 		for (const x of this.bounded) {
@@ -946,10 +957,22 @@ export class Linker {
 		}
 		s.floating = this.bounded.filter(x => !s.pinned.includes(x))
 		const units = [this.freeze(), ...this.units.filter(u => !u.frozen).map(u => this.strip(u))]
-		const kept = s.regions[s.regions.length - 1]
+		const [kept, table] = [s.regions[s.regions.length - 2], s.regions[s.regions.length - 1]]
 		for (const u of units.filter(u => u.blocks.length == 0)) {
+			const what = u.object.name
 			u.encoded = record(u.object)
-			u.blocks = [this.block(kept, u.encoded, u.object.name)]
+			u.blocks = [this.block(kept, u.encoded, what)]
+			// Not those whose address a later link may change: of a floating section, or a thread's copy.
+			const syms = u.object.symbols.filter(x => {
+				const sec = if (x.section >= 0) u.object.sections[x.section] else null
+				return this.format.symbol > 0 && x.name != "" && sec != null && u.at[x.section] != dropped &&
+					sec.kind < Kept && sec.kind != Thread && !s.floating.includes(sec.name)
+			}).map(x => new Symbol(x.name, x.binding, 0, u.at[x.section] + x.value, x.size))
+			if (syms.length > 0) {
+				u.blocks.push(this.block(table, zeros((this.format.symbol as i32) * syms.length), what))
+				u.blocks.push(this.block(kept, syms.map(x => `_${x.name}\x00`).join(""), what))
+				image.symbols.push([syms, u.blocks[1][0], u.blocks[2][0]])
+			}
 		}
 		s.units = units.map(u => [u.object, u.at, u.encoded, u.blocks])
 		s.slots = []
@@ -968,7 +991,6 @@ export class Linker {
 			throw new CompileError("there is no room for what the image keeps")
 		}
 		image.bytes.set(at, head)
-		image.bytes.length = at + (head.length as u64)
 		image.bytes.put(this.format.headers, at, 8)
 		image.bytes.put(this.format.headers + 8, head.length as u64, 8)
 	}

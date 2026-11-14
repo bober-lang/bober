@@ -33,6 +33,7 @@ function obj(name: string, kind: u8, words: u64[], symbols: Symbol[], fixups: Fi
 function linker(bindsAnywhere = true, machine: Machine = arm64, kept: Bytes | null = null): Linker {
 	return new Linker(machine, {
 		headers: 0x200,
+		symbol: 24,
 		bindsAnywhere: bindsAnywhere,
 		start: "__image",
 		read: (name: string, bytes: string) => new Object(name, "arm64"),
@@ -130,8 +131,12 @@ test "a lazy object is linked when a linked one wants what it defines, and only 
 		[new Fixup(0, Call, 1, 0)])
 	const g = obj("g.o", Code, [0xd65f03c0], [new Symbol("g", Global, 0)])
 	const h = obj("h.o", Code, [0xd65f03c0], [new Symbol("h", Global, 0)])
-	const image = link([main], ["f", "g"], [h, g, f])
-	assert image.symbols.map(s => s.name).join(" ") == "f g"
+	const l = kept()
+	for (const o of [h, g, f]) {
+		l.lazy(o.symbols.filter(s => s.section >= 0).map(s => s.name), () => o)
+	}
+	const image = keep(l, [main], ["f", "g"])
+	assert image.symbols.map(s => s[0].map(s => s.name).join(" ")).join(" ") == "f g"
 	assert get(image, at(image, "f")) == 0x94000000 | (at(image, "g") - at(image, "f")) >> 2
 }
 
@@ -464,6 +469,17 @@ test "the Zero sections of a kept image are a segment its file has no bytes of, 
 	l.remove("a")
 	const image = keep(l, [zero("a", 32)])
 	assert at(image, "__stop_roots") == at(image, "__start_roots") + 48 && image.bytes.length == first.bytes.length
+}
+
+test "a kept image's units keep their records and symbols where they are, and only new ones' are written" {
+	const first = keep(kept(), [obj("a", Code, [0xd65f03c0], [new Symbol("f", Global, 0)])], ["f"])
+	const image = keep(kept(file(first)), [obj("b", Code, [0xd65f03c0], [new Symbol("g", Global, 0)])], ["f", "g"])
+	const [g, _, name] = image.symbols[0]
+	assert image.symbols.length == 1 && g.length == 1 && g[0].name == "g" && g[0].value == at(image, "g")
+	const [from, to] = [first.strtab[0], first.strtab[1] - 1] // but the last byte, the top a later link adds from
+	assert image.bytes.slice(from, to) == first.bytes.slice(from, to)
+	assert image.symtab[0] == first.symtab[0] && image.symtab[1] == first.symtab[1] + 24
+	assert image.bytes.slice(name, name + 3) == "_g\x00"
 }
 
 test "an object a continued image links, a lazy one too, with a section the image has for good is stale" {
