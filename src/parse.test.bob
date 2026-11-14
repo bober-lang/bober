@@ -148,6 +148,7 @@ test "statements" {
 	assert s("for (let i of 0 ... n - 1) { continue }")
 		== "(for let i (binary:... 0 (binary:- n 1)) (block (jump:continue)))"
 	assert s("while (i < 10) { break }") == "(while (binary:< i 10) (block (jump:break)))"
+	assert s("for (let i = 0; i < n; i++) {}") == "(while:for (var:let i = 0) (binary:< i n) (assign:++ i) (block))"
 	assert s("switch (c) {\n case 'a' ... 'z', (A | B):\n  g()\n  h()\n default: {}\n}")
 		== "(switch c (case (binary:... 'a' 'z') (paren (binary:| A B)) (block:: (call g) (call h))) (case:default (block:: (block))))"
 	assert s("try {} catch ({ message }: Error) {} finally {}")
@@ -204,8 +205,7 @@ test "what TypeScript has and bober leaves out is rejected" {
 	assert error("function f() { --a }") == "15: expected an expression, got --"
 	assert error("function f() { if (a) g() }") == "22: expected {, got ident"
 	assert error("function f() { if (a) {} else g() }") == "30: expected {, got ident"
-	assert error("function f() { for (let i = 0; i < 3; i++) {} }") == "26: expected of, got ="
-	assert error("function f() { for (i of xs) {} }") == "20: expected let or const, got ident"
+	assert error("function f() { for (i of xs) {} }") == "22: expected a call, await or new before it, got ident"
 }
 
 test "declarations" {

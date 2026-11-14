@@ -890,18 +890,41 @@ class Gen {
 		this.op(op.If, t)
 	}
 
+	/// A while, or `for (init; cond; step) body`, whose step a continue goes to, after a Fresh of each variable init
+	/// declares, so that each iteration has its own; a const's never changes.
 	private whileStmt(p: Node) {
+		const c = p.parts.length == 4
+		const cond = p.parts[if (c) 1 else 0]
+		this.scopes.enter()
+		const from = this.code.locals.length
+		if (c) {
+			this.stmt(p.parts[0])
+		}
+		const to = this.code.locals.length
 		const exit = this.open(op.Block, kind.None)
 		const loop = this.open(op.Loop)
-		if (!isTok(p.parts[0], "true")) {
-			this.value(p.parts[0], Bool)
+		if (!isTok(cond, "true")) {
+			this.value(cond, Bool)
 			this.op(op.Not)
 			this.br(op.BrIf, exit)
 		}
-		this.loop(p.parts[1], exit, loop)
+		this.loop(p.parts[p.parts.length - 1], exit, if (c) this.open(op.Block, kind.None) else loop)
+		if (c) {
+			this.op(op.End)
+			for (const l of from ... to - 1) {
+				if ((this.code.locals[l].mods & decl.Readonly) != 0) {
+					continue
+				}
+				this.op(op.Local, l)
+				this.op(op.Fresh, l)
+				this.op(op.SetLocal, l)
+			}
+			this.stmt(p.parts[2])
+		}
 		this.br(op.Br, loop)
 		this.op(op.End)
 		this.op(op.End)
+		this.scopes.leave()
 	}
 
 	/// for over a range, counting up to its last value; a `for (const x of …)` over a tuple or what eached says, an Each
