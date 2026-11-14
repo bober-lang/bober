@@ -17,7 +17,7 @@ import { Bytes, be, big, le, pad, str, u, zeros } from "./bytes"
 import { Format, Image } from "./link"
 import { sha256 } from "./sha256"
 import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Init, Local, Object, Page, PageOff, Rel32, Rel64, Section,
-	SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Unwind, Weak, Zero } from "./object"
+	SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Unwind, Weak, Zero, own } from "./object"
 
 /// The room the writer needs before the first linked address, for the Mach-O header and its load commands; write
 /// throws if they need more, as for very many libraries.
@@ -268,7 +268,7 @@ function read(name: string, bytes: string): Object throws CompileError {
 			if (kind < 0) {
 				throw new CompileError(`${name}: relocation ${r.rt} at ${sec.name}+${r.at} cannot be linked`)
 			}
-			sec.fixups.push(new Fixup(r.at, kind as u8, r.sym, a))
+			sec.fixups.push(new Fixup(r.at, kind as u8, if (sec.name == "__llvm_stackmaps") own(o, r.sym) else r.sym, a))
 		}
 		if (x64 && sec.kind == Unwind) {
 			fdes(o, bytes, shdrs, index, base, i)
