@@ -4,9 +4,10 @@ import { indexOf } from "../std/algo"
 import { exists, mkdirAll, open, remove } from "../std/fs"
 import * as process from "../std/process"
 import { replace } from "../std/string"
-import { Compile, build, dir, format, machine } from "./bober"
+import { Compile, build, dir, format, machine, toolchain } from "./bober"
 import { Bytes } from "./link/bytes"
 import { Linker } from "./link/link"
+import { CLib } from "./pkg"
 
 const home = "build/image-test"
 
@@ -207,4 +208,12 @@ test "an export added to a module keeps the code of one that imports it, a chang
 	assert out == "2\n" && again == out && held.length > 0 && kept == held
 	const [changed, anew] = built([["dep.bob", "export function one(x = 2): i32 { return x }\n"]], true)
 	assert changed == "3\n" && anew.length > 0 && !anew.some(o => held.includes(o))
+}
+
+test "a C library's toolchain file includes its own, of a package found by a rooted path or not" {
+	const c = new CLib()
+	c.toolchain = "/p/tc.cmake"
+	assert indexOf(toolchain(c, "/w"), `include("/p/tc.cmake")`) >= 0
+	c.toolchain = "tc.cmake"
+	assert indexOf(toolchain(c, "/w"), `include("/w/tc.cmake")`) >= 0
 }
