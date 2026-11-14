@@ -46,6 +46,7 @@ import { macho, named } from "./link/macho"
 import { pe } from "./link/pe"
 import { x64 } from "./link/x64"
 import { Bytes, store } from "./link/bytes"
+import { stamp, stamped } from "./link/keep"
 import { Linker, Stale } from "./link/link"
 import { Const, Global, Kept, Object, Section, Symbol } from "./link/object"
 import { SyntaxError } from "./lex"
@@ -500,7 +501,8 @@ function inspect(path: string, out: string, includes: string[], release: bool) {
 }
 
 /// Program p of mains, lowered after the CMake projects of main's package are built, but the modules linked from the
-/// bytecode build/image.so holds, of the Bound each holds if any (unit), with the build directory made.
+/// bytecode build/image.so holds, of the Bound each holds if any (unit), with the build directory made; its linker kept
+/// for relink.
 function lowered(mains: string[], includes: string[]): Program {
 	const home = nearest(mains[0])
 	if (home != null) {
@@ -508,12 +510,14 @@ function lowered(mains: string[], includes: string[]): Program {
 	}
 	const image = `${dir}/image.so`
 	// Mapped of one descriptor, lest another build replace it, and read shared, lest one write it in place, which it may
-	// once this is done: what is taken of it, copied.
+	// once this is done: what is taken of it, copied; the mapping, by relink only while the file has the same stamp.
 	const f = if (exists(image)) open(image) else null
 	f?.lock(true, true)
-	const l = if (f == null) null else new Linker(machine, format, new Bytes(f.map()))
-	const cache = (l?.sections("bober_bc") ?? []).map(s => s.copy())
-	Bound.keep((l?.sections("bober_bind") ?? []).map(s => s.copy()))
+	const kept = if (f == null) null else new Bytes(f.map())
+	const l = new Linker(machine, format, kept)
+	const cache = l.sections("bober_bc").map(s => s.copy())
+	Bound.keep(l.sections("bober_bind").map(s => s.copy()))
+	decoded = if (kept == null) null else [stamp(kept, format.headers), l, kept]
 	f?.close()
 	const p = lower(mains, includes, cache)
 	mkdirAll(dir)
@@ -534,6 +538,10 @@ function linked(p: Program, tests: bool, includes: string[]): [string[], bool] {
 
 /// How the image's modules are emitted: as lowered.
 const debug = { main: -1, tests: false, dyn: true }
+
+/// Of build/image.so as lowered read it, the stamp, its linker and bytes; each store of it has a new random stamp, so
+/// a file of the same stamp is the one decoded, which relink then continues.
+let decoded: [u64, Linker, Bytes] | null = null
 
 /// Links p's modules, each compiled by TPDE as o says, the objects and archives files, if cxx the sysroot's libc++,
 /// and the C library's libunwind and compiler builtins into build/image.so, the one image of all that is built there,
@@ -569,8 +577,12 @@ function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, 
 function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, o: Options, o1: i32[][][] | null,
 	out: string, old: File | null, alone: bool): string {
 	const lib = `${sysroot}/usr/lib`
-	const kept = new Bytes(if (old != null) old.map() else "")
-	const l = new Linker(machine, format, kept)
+	const d = decoded
+	decoded = null
+	const mapped = new Bytes(if (old != null) old.map() else "")
+	const unchanged = old != null && d != null && stamp(mapped, format.headers) == d[0]
+	const kept = if (unchanged) d![2] else mapped
+	const l = if (unchanged) d![1] else new Linker(machine, format, kept)
 	const held = l.objects()
 	// Whether the image lacks the object name; another version of it is unlinked.
 	const lacks = (name: string) => {
@@ -667,6 +679,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		}
 		try {
 			const linked = l.link()
+			stamped(linked.bytes, format.headers)
 			format.write(linked)
 			const continued = linked.bytes == kept
 			at = if (continued && alone) out else tmp
