@@ -159,6 +159,24 @@ test "generic functions take type arguments, else infer them" {
 	assert pair("a")[0][1] == "a"
 }
 
+function pick[T](a: T, b: T, first: bool): T { return if (first) a else b }
+
+class Cell[T] {
+	v: T
+
+	constructor(v: T) { this.v = v }
+
+	get(): T { return this.v }
+	with[U](u: U): [T, U] { return [this.v, u] }
+}
+
+test "a generic's instance takes and gives each kind of value as its type args have it" {
+	assert pick[i8](-2, 1, true) == -2 && pick[f32](1.5, 2.5, true) == 1.5 && pick("a", "b", false) == "b"
+	assert pick[i32 | null](null, 3, true) == null && pick([1], [2], false)[0] == 2
+	const c = new Cell[u16](7)
+	assert c.get() == 7 && c.with("x")[1] == "x" && c.with[i8](-1)[1] == -1
+}
+
 test "a generic class's function field is called as its instance types it" {
 	const h = new Holder[i32](x => x + 1)
 	const f = h.f

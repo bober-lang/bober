@@ -38,6 +38,7 @@ import { Code, Program, pair } from "./bc/program"
 import { showType } from "./bc/show"
 import * as c from "./c/type"
 import { CompileError } from "./error"
+import { instanced } from "./resolve"
 import { builtin } from "./root"
 
 /// How a program is emitted: whether it is as lowered, a debug build's; and the module that gets C's main, which runs
@@ -181,6 +182,9 @@ class Emitter {
 	/// The decls by source and owner: of a closure, its instances, sharing one env.
 	private kins = new HashMap[i64, i32[]]()
 	private callees = new HashMap[i32, Callee]()
+	/// The instances called, by pair(generic, env), as instanced has them, in the order first called.
+	private instances = new HashMap[i64, Callee]()
+	private called: [i32, i32][] = []
 	/// The descriptors named and not yet defined, by type, with their placeholders.
 	private pending: [i32, Value][] = []
 	/// The union of any type, the empty one (see above).
@@ -356,6 +360,12 @@ class Emitter {
 			this.cMain(entry(this.path, true), true)
 		} else if (this.m == this.o.main) {
 			this.cMain("main", this.o.tests)
+		}
+		for (const [d, env] of this.called) {
+			const f = this.instanceFn(d, env)
+			if (this.b.declared(f.fn)) {
+				this.trampoline(d, env, f)
+			}
 		}
 		// Each defined once all that named it are, as defining one may name more.
 		while (this.pending.length > 0) {
@@ -1212,7 +1222,53 @@ class Emitter {
 	private rethrow(u: Value) { this.raise(u, this.b.constZero(this.ptr), 0) }
 	// Calls.
 	/// The callee of Function decl d, declared if of another module.
-	private callee(d: i32): Callee { return this.callees.get(d) ?? put(this.callees, d, this.calleeOf(d)) }
+	private callee(d: i32): Callee {
+		const x = this.p.decls[d]
+		return if (this.dyn && x.generic >= 0 && instanced(this.p, x.generic, x.env)) this.instanceFn(x.generic, x.env)
+			else this.callees.get(d) ?? put(this.callees, d, this.calleeOf(d))
+	}
+
+	/// The function of decl d's instance for env, which src/resolve.bob's instanced calls: d's, of the types env binds,
+	/// and no descriptors. -O1 defines it (src/mono.bob's specialize), else each unit calling it a weak trampoline.
+	private instanceFn(d: i32, env: i32): Callee {
+		const have = this.instances.get(pair(d, env))
+		if (have != null) {
+			return have
+		}
+		const p = this.p
+		const g = this.callee(d)
+		const ret = p.subst(g.ret, env)
+		const params = g.params.map(t => p.subst(t, env))
+		const first = if (g.self) [this.ll(p.subst(p.decls[d].code!.locals[0].type, env))] else [] as IrType[]
+		const ft = this.fnType(ret, first, params)
+		const sym = this.symbol(d, env)
+		this.called.push([d, env])
+		return put(this.instances, pair(d, env),
+			{ sym: sym, fn: this.b.function(sym, ft, false), type: ft, ret: ret, params: params, self: g.self,
+			env: false, first: first, scope: [], val: false })
+	}
+
+	/// Defines f, decl d's instance for env, weakly, which a definition elsewhere overrides: a call of d with env's
+	/// descriptors.
+	private trampoline(d: i32, env: i32, f: Callee) {
+		const g = this.callee(d)
+		this.b.weak(f.fn)
+		const start = this.startThunk(f.fn, [])
+		const n = f.first.length
+		const xs: V[] = []
+		for (const t of f.params) {
+			xs.push({ v: this.b.param(f.fn, (n + xs.length) as u32), t: this.norm(t) })
+		}
+		const r = this.callByValue(g, [...this.envDescs(env), ...this.params(f.fn, 0, n), ...this.bound(xs, g, env)])
+		this.pushResult(r, g.ret, env)
+		if (this.result(f.ret) == this.void) {
+			this.ir().retVoid()
+		} else {
+			this.ir().ret(this.returning(this.retval(this.pop(), f.ret), f.ret))
+		}
+		this.b.at(this.entry)
+		this.b.br(start)
+	}
 
 	/// callee's, made.
 	private calleeOf(d: i32): Callee {
@@ -1421,12 +1477,13 @@ class Emitter {
 			this.literal(p.lists[env][0])
 			return
 		}
-		const f = this.callee(d)
+		const e = if (this.dyn && instanced(p, d, env)) 0 else env
+		const f = if (e != env) this.instanceFn(d, env) else this.callee(d)
 		if (f.env && this.dyn) {
 			this.callRef({ v: this.b.constZero(this.ref), t: p.subst(x.type, env) }, this.popN(f.params.length), d)
 			return // a closure's code, of no env here, as its value's is called
 		}
-		let args = this.bound(this.popN(f.params.length), f, env)
+		let args = this.bound(this.popN(f.params.length), f, e)
 		if (f.self) {
 			const obj = this.pop()
 			const q = this.upcast(obj, x.owner)
@@ -1434,7 +1491,7 @@ class Emitter {
 		} else if (f.env) {
 			args = [this.b.constZero(this.ref), ...args]
 		}
-		this.pushResult(this.callByValue(f, [...this.envDescs(env), ...args], (x.mods & Extern) == 0), f.ret, env)
+		this.pushResult(this.callByValue(f, [...this.envDescs(e), ...args], (x.mods & Extern) == 0), f.ret, e)
 	}
 
 	/// literal[T](s), as a generic's code has it: s, checked to spell one of T's literals if T is known, else cast, as T
@@ -3929,9 +3986,9 @@ class Emitter {
 	// Decls.
 	/// The symbol of decl d, the same in each build of its module: <path>:<name>, a test's <path>:test <name>, so that it
 	/// does not clash with a declaration's; an owned one's its owner's .<name>, with #n after it of the nth of its
-	/// owner's of its name; an instance's then with the keys of its own args.
-	private symbol(d: i32): string {
-		const have = this.facts.symbols.get(d)
+	/// owner's of its name; an instance's then with the keys of its own args, as is that of d's instance for env.
+	private symbol(d: i32, env = 0): string {
+		const have = if (env == 0) this.facts.symbols.get(d) else null
 		if (have != null) {
 			return have
 		}
@@ -3939,15 +3996,19 @@ class Emitter {
 		const x = p.decls[d]
 		const path = p.modules[x.module].path
 		const name = p.strings[x.name]
+		const args = p.lists[if (env == 0) x.env else env]
+		const n = if (env != 0) x.params.length else if (x.generic < 0) 0 else p.decls[x.generic].params.length
+		const owner = if (x.owner < 0) ""
+			else this.symbol(x.owner, if (env == 0) 0 else p.list(args.slice(0, args.length - n)))
 		let r = if (x.kind == decl.Test) `${path}:test ${name}`
 			else if (x.owner < 0) `${path}:${name}`
-			else `${this.symbol(x.owner)}.${name}${if (x.nth == 0) "" else `#${x.nth}`}`
-		const n = if (x.generic < 0) 0 else p.decls[x.generic].params.length
+			else `${owner}.${name}${if (x.nth == 0) "" else `#${x.nth}`}`
 		if (n > 0) {
-			const args = p.lists[x.env]
 			r += `[${args.slice(args.length - n, args.length).map(t => this.key(t)).join(",")}]`
 		}
-		this.facts.symbols.set(d, r)
+		if (env == 0) {
+			this.facts.symbols.set(d, r)
+		}
 		return r
 	}
 

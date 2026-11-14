@@ -464,6 +464,16 @@ export function takesType(p: Program, d: i32, env = 0): bool {
 	return p.decls[d].kind == decl.Function && p.items(p.subst(p.decls[d].type, env)).some(t => holdsType(p, t) || coded(p, t))
 }
 
+/// Whether a call of decl d with env, closed, as lowered calls d's instance for env by its symbol (src/emit.bob): of a
+/// function of code, a class's or not nested, but a constructor or one taking or giving a Type.
+export function instanced(p: Program, d: i32, env: i32): bool {
+	const x = p.decls[d]
+	const c = p.classOf(d)
+	return env != 0 && p.lists[env].every(t => p.closed(t)) && x.kind == decl.Function && x.code != null
+		&& (if (c < 0) x.owner < 0 else p.decls[c].kind == decl.Class) && p.strings[x.name] != "constructor"
+		&& !takesType(p, d, env) && !holdsType(p, p.b(p.subst(x.type, env)))
+}
+
 /// Whether a value of t holds a Type, and so is never at run time in a release build.
 export function holdsType(p: Program, t: i32): bool {
 	return t == kind.Type || p.kind(t) != kind.Named && p.kind(t) != kind.Func && p.parts(t).some(x => holdsType(p, x))
