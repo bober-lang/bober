@@ -1,6 +1,14 @@
 import { indexOf } from "../../std/algo"
+import { remove } from "../../std/fs"
+import { os } from "../../std/os"
+import { run } from "../../std/process"
+import { split } from "../../std/string"
+import { Backend, Type } from "./backend"
+import { LLVM } from "./llvm"
 import { Tpde } from "./tpde"
 import { CompileError } from "../error"
+import { ld } from "../bober"
+import { getpid } from "unistd.h"
 
 test "a broken module does not verify" {
 	const m = new Tpde("m", 0)
@@ -28,4 +36,104 @@ test "a function computing with a long double is an error, unless local and unus
 		m.ret(m.param(f, 0))
 	}
 	assert m.verify() throws new CompileError("long double is not supported by TPDE in kept")
+}
+
+/// The letters of p: i an i64, w an i32, b an i1, f an f64 and p a pointer.
+function letters(p: string): string[] {
+	const cs: string[] = []
+	for (const i of 0 ... p.length - 1) {
+		cs.push(p.slice(i, i + 1))
+	}
+	return cs
+}
+
+function leaf(b: Backend, c: string): Type {
+	return switch (c) {
+		case "i": b.int(64)
+		case "w": b.int(32)
+		case "b": b.int(1)
+		case "f": b.f64()
+		default: b.ptr()
+	}
+}
+
+/// The module of b: if callee, callee(params of s): {i64, i64, ptr}, of a leaf for each letter of s, a struct of them
+/// for each word of several, which returns the sum of each leaf of the args
+/// by its place from 1, its negation and it as a pointer; else main, which calls it with leaf n 100 + n, or for a bool
+/// its last bit, and returns whether it got sum.
+function shaped(b: Backend, s: string, callee: bool, sum: i64) {
+	const [i64, ptr] = [b.int(64), b.ptr()]
+	const ret = b.struct([i64, i64, ptr])
+	const ps = split(s, " ")
+	const ft = b.fn(ret, ps.map(p => if (p.length == 1) leaf(b, p) else b.struct(letters(p).map(c => leaf(b, c)))))
+	const f = b.function("callee", ft, false)
+	if (callee) {
+		b.at(b.block(f))
+		let total = b.constInt(i64, 0)
+		let n = 0
+		for (const k of 0 ... ps.length - 1) {
+			const cs = letters(ps[k])
+			for (const j of 0 ... cs.length - 1) {
+				const v = if (ps[k].length == 1) b.param(f, k as u32) else b.extract(b.param(f, k as u32), j as u32)
+				const x = switch (cs[j]) {
+					case "i": v
+					case "w": b.cast("sext", v, i64)
+					case "b": b.cast("zext", v, i64)
+					case "f": b.cast("fptosi", v, i64)
+					default: b.cast("ptrtoint", v, i64)
+				}
+				n++
+				total = b.binary("add", total, b.binary("mul", x, b.constInt(i64, n)))
+			}
+		}
+		const r = b.insert(b.insert(b.undef(ret), total, 0), b.binary("sub", b.constInt(i64, 0), total), 1)
+		b.ret(b.insert(r, b.cast("inttoptr", total, ptr), 2))
+		return
+	}
+	const main = b.function("main", b.fn(b.int(32), []), false)
+	b.at(b.block(main))
+	let n = 0
+	const value = (c: string) => {
+		n++
+		return switch (c) {
+			case "f": b.constFloat(b.f64(), (100 + n) as f64)
+			case "p": b.constCast("inttoptr", b.constInt(i64, 100 + n), ptr)
+			default: b.constInt(leaf(b, c), if (c == "b") n % 2 else 100 + n)
+		}
+	}
+	const args = ps.map(p => if (p.length == 1) value(p) else b.constStruct(letters(p).map(value)))
+	const r = b.call(ft, f, args)
+	const want = b.constInt(i64, sum)
+	const off = b.binary("or", b.binary("xor", b.extract(r, 0), want),
+		b.binary("or", b.binary("add", b.extract(r, 1), want), b.binary("xor", b.cast("ptrtoint", b.extract(r, 2), i64), want)))
+	b.ret(b.cast("zext", b.icmp("ne", off, b.constInt(i64, 0)), b.int(32)))
+}
+
+test "TPDE and LLVM pass each other's args and results where the other takes them" {
+	if (os == "macos" || os == "windows") {
+		return // TPDE's objects are ELF, which there only bober's linker takes
+	}
+	const out = `/tmp/bober-abi${getpid()}`
+	for (const s of ["i i i i i i i i i", "i i i i i iip w ii ib i", "i i i i i i i iip w ii ib", "i i i i i i ii w b",
+		"i i i i i i i ii iip", "f f f f f f f fff f f", "i i i i i i i i fi f f f f f f ff", "i i i i i i i i w w b w i p"]) {
+		let sum: i64 = 0
+		let n = 0
+		for (const c of letters(s).filter(c => c != " ")) {
+			n++
+			sum += n * (if (c == "b") n % 2 else 100 + n)
+		}
+		for (const llvm of [false, true]) { // the callee's backend; the caller's is the other
+			for (const callee of [true, false]) {
+				const b: Backend = if (llvm == callee) new LLVM("m") else new Tpde("m")
+				shaped(b, s, callee, sum)
+				b.verify()
+				b.emit(out + (if (callee) ".callee.o" else ".main.o"), false)
+			}
+			ld([out + ".callee.o", out + ".main.o"], out)
+			assert run([out]) == 0
+		}
+	}
+	for (const f of [".callee.o", ".main.o", ""]) {
+		remove(out + f)
+	}
 }
