@@ -20,7 +20,7 @@ import { alignUp, max, min } from "../../std/math"
 import { Arch } from "../../std/os"
 import { CompileError } from "../error"
 import { Bytes, zeros } from "./bytes"
-import { Region, State, read, record, write } from "./keep"
+import { Region, State, read, record, rest, write } from "./keep"
 import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Image32, Init, Kept, Local, Machine, Object, Page,
 	PageOff, Rel32, Rel64, Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Thread32, Unwind, Weak,
 	Zero } from "./object"
@@ -229,10 +229,8 @@ export class Linker {
 		this.regions = if (kept != null) keptRegions else regions
 		const s = if (kept != null) read(kept, format.headers, machine.arch) else null
 		const [at, cap, count] = s?.names ?? [0, 0, 0]
-		const fits = (u: [Object, u64[], string, [u64, u64][], i32[]]) =>
-			u[4].length == u[0].symbols.length && u[4].every(g => g >= -1 && ((g + 1) as u64) <= count)
 		if (s == null || count > cap / 2 || cap & (cap - 1) != 0 || at > kept!.length || cap > (kept!.length - at) / 12 ||
-			!s.units.every(fits) || !s.slots.every(e => e[0] < count)) {
+			!s.slots.every(e => e[0] < count)) {
 			return
 		}
 		this.state = s
@@ -241,7 +239,6 @@ export class Linker {
 			u.at = e[1]
 			u.encoded = e[2]
 			u.blocks = e[3]
-			u.names = e[4]
 			return u
 		})
 		this.units[0].frozen = true
@@ -354,7 +351,15 @@ export class Linker {
 				this.seed = fnv(random(8))
 			} catch (e: IoError) {}
 		}
-		// The names the continued image has, named as its units define.
+		// The symbols and fixups of the units the continued image holds, read only now, as a build that links nothing
+		// anew needs but their sections; and the names it has, named as its units define.
+		for (const u of this.units.slice(0, this.loaded)) {
+			const names = rest(u.object, u.encoded, this.shared)
+			if (names == null) {
+				throw new CompileError(`${u.object.name}'s record is not as written`)
+			}
+			u.names = names
+		}
 		for (const _ of 1 ... this.shared) {
 			this.names.push(new Name(""))
 		}
@@ -1027,7 +1032,7 @@ export class Linker {
 				image.symbols.push([syms, u.blocks[1][0], u.blocks[2][0]])
 			}
 		}
-		s.units = units.map(u => [u.object, u.at, u.encoded, u.blocks, u.names])
+		s.units = units.map(u => [u.object, u.at, u.encoded, u.blocks])
 		s.slots = []
 		for (const g of 0 ... this.shared - 1) {
 			if (this.names[g].slot != 0) {
