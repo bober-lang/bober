@@ -3,6 +3,7 @@
 import { CompileError } from "../error"
 import { Bytes, mapped } from "./bytes"
 import { addend, arm64 } from "./arm64"
+import { read, write } from "./keep"
 import { Image, Linker, Stale } from "./link"
 import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Init, Kept, Local, Machine, Object, Over, Page, PageOff,
 	Rel32, Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Thread32, Unwind, Weak, Zero } from "./object"
@@ -565,6 +566,30 @@ test "a kept image whose table of names is full is stale" {
 		syms.push(new Symbol(`g${i}`, Global, 0))
 	}
 	assert keep(kept(first), [obj("b", Data, [0], syms)]) throws new Stale("the table of names is full")
+}
+
+test "a kept image whose record of a unit is cut short is stale" {
+	const first = keep(kept(), [obj("a", Code, [0xd65f03c0], [new Symbol("f", Global, 0)])], ["f"])
+	// The head, where the 16 bytes after the headers say, written anew of a's record's block a byte shorter.
+	const s = read(first.bytes, 0x200, "arm64")!
+	const [at, size] = s.units[1][3][0]
+	s.units[1][3][0] = [at, size - 1]
+	const head = write(s, "arm64")
+	first.bytes.set(first.bytes.get(0x200, 8), head)
+	first.bytes.put(0x208, head.length as u64, 8)
+	assert keep(kept(file(first)), []) throws new Stale("a's record is not as written")
+}
+
+test "a kept image whose frozen unit's record has its tail flipped is stale once its local symbols are read" {
+	const l = kept()
+	l.lazy(["lz"], () => obj("z", Code, [0xd65f03c0], [new Symbol("lz", Global, 0), new Symbol("here", Local, 0)]))
+	const first = keep(l, [obj("a", Code, [0x94000000], [new Symbol("lz", Global)], [new Fixup(0, Call, 0, 0)])])
+	// The record's last byte, of the local's name, then one of the 126th, which the table has not.
+	const [at, size] = read(first.bytes, 0x200, "arm64")!.units[0][3][0]
+	first.bytes.put(at + size - 1, first.bytes.get(at + size - 1, 1) ^ 0x7f, 1)
+	assert keep(kept(file(first)), []).exports.length == 0
+	const b = obj("b", Code, [0x94000000], [new Symbol("puts", Global)], [new Fixup(0, Call, 0, 0)])
+	assert keep(kept(file(first)), [b]) throws new Stale("the image's record is not as written")
 }
 
 test "the slot of a local symbol stays the local's in a kept image's frozen unit" {
