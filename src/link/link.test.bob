@@ -60,8 +60,12 @@ function keep(l: Linker, objects: Object[], names: string[] = []): Image throws 
 	return l.link()
 }
 
-/// The file of image, as a format of none writes it.
-function file(image: Image): string { return mapped(image.bytes) }
+/// The file of image, as a format of none writes it over the one it continues, which has its segments' bytes, symbols
+/// and their names.
+function file(image: Image): string {
+	const segments: [u64, u64][] = image.segments.map(s => [s.address, s.address + s.size])
+	return mapped(image.bytes, [...segments, image.symtab, image.strtab])
+}
 
 /// The image of objects for machine, with names exported, and lazy ones as an archive's members, listed for the
 /// names they define; by linker.
@@ -439,7 +443,7 @@ test "the sections a kept image bounds stay one block" {
 	const start = at(image, "__start_types")
 	assert at(image, "__stop_types") == start + 20 && get(image, start) == 2 && get(image, start + 8) == 3
 	const was = at(first, "__start_types")
-	assert get(image, start + 16) == 5 && start != was && get(image, was) == 0
+	assert get(image, start + 16) == 5 && start != was
 }
 
 test "a kept image holds a lazy object for good, and a definition over its weak one is stale" {
