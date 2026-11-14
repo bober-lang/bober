@@ -219,6 +219,8 @@ class Emitter {
 	/// Whether it returns by value, where to, and which locals hold a tuple or object by value.
 	private val = false
 	private out: Value = 0
+	/// Whether it takes its args and gives its result each as a union of any type (see codeType).
+	private boxes = false
 	private held: bool[] = []
 	/// The ref to the instance of a class held by value that a constructor or initializer initializes, else 0.
 	private self: Value = 0
@@ -579,6 +581,7 @@ class Emitter {
 		this.code = c
 		this.ret = ret
 		this.val = val
+		this.boxes = this.dyn && env
 		this.out = if (val) b.param(f, params.length as u32) else 0
 		this.self = 0
 		this.selves = new HashMap[Value, bool]()
@@ -638,6 +641,7 @@ class Emitter {
 		this.held = if (this.facts.phase == "learned" && !env) this.heldLocals(c, np, val, this.facts.byValue)
 			else c.locals.map(_ => false)
 		this.newAt = this.newsOf(c, np)
+		const declared = if (this.boxes) this.p.items(this.p.decls[this.fnDecl].type) else []
 		for (const i of 0 ... c.locals.length - 1) {
 			const t = c.locals[i].type
 			const mem = this.mem(t)
@@ -646,7 +650,8 @@ class Emitter {
 			if (mem == this.void) {
 				continue // an untyped catch's local holds nothing
 			}
-			const p = if (i < np) b.param(f, (i + first) as u32) else 0
+			const arg = if (i < np) b.param(f, (i + first) as u32) else 0
+			const p = if (this.boxes && i < np && this.anyOf(declared[i])) this.fromAny(arg, t) else arg
 			if (i == 0 && np > 0 && params[first] == this.ref && this.inlined(t)) {
 				this.self = p // a constructor's or initializer's this
 				this.locals[i] = p
@@ -803,11 +808,10 @@ class Emitter {
 				const env = c.b(i)
 				const to = p.subst(t, env)
 				if (p.decls[d].kind == decl.Function) {
-					// A generic's, its type args' descriptors in the closure, adapted to its type as bound.
-					const f = this.callee(d)
-					const g = if (env == 0) this.value(f, false)
-						else this.closure(this.value(f, false), [], this.envDescs(env))
-					this.push(this.cast({ v: g, t: this.norm(t) }, to), to)
+					// A generic's, its type args' descriptors in the closure.
+					const g = if (env == 0) this.value(d, false)
+						else this.closure(this.value(d, false), [], this.envDescs(env))
+					this.push(g, to)
 				} else if (o == op.Global) {
 					const v = this.fetch(this.global(d, env), t)
 					this.push(this.cast({ v: v, t: this.norm(t) }, to), to) // held as declared, T boxed
@@ -856,7 +860,7 @@ class Emitter {
 				} else if (s.embed) {
 					this.copy(this.heap(v), { v: q, t: this.norm(s.t) })
 				} else {
-					this.write(q, this.heap(v), this.declared(s))
+					this.write(q, this.heap(v), s.t)
 				}
 			case op.Subscript:
 				const k = this.pop()
@@ -992,7 +996,9 @@ class Emitter {
 		if (this.val) {
 			this.ir().store(this.unboxed(this.stack.pop()), this.out, false)
 		}
-		const v = if (this.val || this.result(this.ret) == this.void) 0
+		const v = if (this.boxes) this.cast({ v: this.cast(this.popOrNull(), this.ret), t: this.norm(this.ret) },
+			this.any)
+			else if (this.val || this.result(this.ret) == this.void) 0
 			else this.returning(this.retval(this.popOrNull(), this.ret), this.ret)
 		this.leave(0)
 		if (v == 0) {
@@ -1224,7 +1230,7 @@ class Emitter {
 			first.push(if (this.name(d) == "constructor") this.ref else this.ll(x.code!.locals[0].type))
 		}
 		const val = this.facts.byValue.has(d)
-		const ft = this.fnType(ret, first, params, val)
+		const ft = if (this.dyn && env) this.codeType(ret, params) else this.fnType(ret, first, params, val)
 		const fn = if ((x.mods & Extern) != 0) this.cFunction(this.name(d), ret, params, ft) else this.function(d, ft)
 		return { sym: this.symbol(d), fn: fn, type: ft, ret: ret, params: params, self: self, env: env, first: first,
 			scope: scope, val: val }
@@ -1239,6 +1245,17 @@ class Emitter {
 		}
 		return this.b.fn(if (val) this.void else this.result(ret), ps)
 	}
+
+	/// The type of the code of a function value of result ret and params ps, which takes its env first; in a program as
+	/// lowered, of args and a result each a union of any type (see value), but a closure's optional params.
+	private codeType(ret: i32, ps: i32[]): IrType {
+		return if (this.dyn) this.b.fn(this.unionTy,
+			[this.ref, ...ps.map(t => if (this.anyOf(t)) this.unionTy else this.ll(t))])
+			else this.fnType(ret, [this.ref], ps)
+	}
+
+	/// Whether a function value's code takes an arg of type t as a union of any type (see codeType).
+	private anyOf(t: i32): bool { return this.dyn && this.kindOf(t) != kind.Optional }
 
 	/// Decl d as a function of type t, in this module or declared; one nested in a function local.
 	private function(d: i32, t: IrType): Value {
@@ -1405,6 +1422,10 @@ class Emitter {
 			return
 		}
 		const f = this.callee(d)
+		if (f.env && this.dyn) {
+			this.callRef({ v: this.b.constZero(this.ref), t: p.subst(x.type, env) }, this.popN(f.params.length), d)
+			return // a closure's code, of no env here, as its value's is called
+		}
 		let args = this.bound(this.popN(f.params.length), f, env)
 		if (f.self) {
 			const obj = this.pop()
@@ -1477,9 +1498,16 @@ class Emitter {
 	private callRef(f: V, xs: V[], via = -1) {
 		const ps = this.p.items(f.t)
 		const res = this.p.b(f.t)
-		const ft = this.fnType(res, [this.ref], ps)
+		const ft = this.codeType(res, ps)
 		const code = if (via < 0) this.captured(f.v, 0, this.ptr) else this.function(via, ft)
-		this.pushResult(this.returned(this.call(ft, code, [f.v, ...this.args(xs, ps)]), res), res)
+		const args = this.args(xs, ps)
+		for (const k of 0 ... args.length - 1) {
+			if (this.anyOf(ps[k])) {
+				args[k] = this.cast({ v: args[k], t: this.norm(ps[k]) }, this.any)
+			}
+		}
+		const r = this.call(ft, code, [f.v, ...args])
+		this.pushResult(if (this.dyn) this.fromAny(r, res) else this.returned(r, res), res)
 	}
 
 	/// What copied has of closure d, else of another instance of its source and owner.
@@ -1596,9 +1624,8 @@ class Emitter {
 			const q = this.p.subst(f.params[k], env)
 			const v: V = { v: this.cast(vs[k], q), t: this.norm(q) }
 			// A union passes as is, its tags meaning the same to the callee: cast to the param's type, it would be checked
-			// against type params not bound here. One holding a function is cast, as that is not adapted.
-			const asIs = this.p.kind(v.t) == kind.Union && !this.p.members(v.t).some(m => this.kindOf(m) == kind.Func)
-			r.push(if (asIs) v.v else this.retval(v, f.params[k]))
+			// against type params not bound here.
+			r.push(if (this.p.kind(v.t) == kind.Union) v.v else this.retval(v, f.params[k]))
 		}
 		return r
 	}
@@ -1626,7 +1653,8 @@ class Emitter {
 			const done = this.label()
 			this.unwind = this.label()
 			const pad = this.unwind
-			this.call(this.fnType(kind.Null, [this.ref], []), this.captured(f.v, 0, this.ptr), [f.v])
+			this.callRef(f, [])
+			this.stack.pop()
 			this.unwind = unwind
 			this.jump(done)
 			this.start(pad)
@@ -1838,54 +1866,50 @@ class Emitter {
 		}
 	}
 
-	/// A function as a value: its closure, a constant { thunk } calling it, or the thunk of a generic's { thunk, ...its
+	/// A function d as a value: its closure, a constant { thunk } calling it, or the thunk of a generic's { thunk, ...its
 	/// type args' descriptors }, or bound to an object { thunk, this, ...its class's }. The thunk leaves out the optional
-	/// params, as the function types it is called by have none.
-	private value(f: Callee, bound: bool): Value {
+	/// params, as the function types it is called by have none. In a program as lowered, it takes the args and gives the
+	/// result each as a union of any type, as a closure's code does, so that closed and generic code call a function
+	/// value alike, however they type it and wherever it is held.
+	private value(d: i32, bound: bool): Value {
 		const b = this.b
+		const f = this.callee(d)
 		const sym = f.sym + (if (bound) ".bound" else ".value")
 		const have = this.thunks.get(sym)
 		if (have != null) {
 			return have
 		}
 		const optional = f.params.map(t => this.kindOf(t) == kind.Optional)
-		const ps = [this.ref, ...f.params.filter(t => this.kindOf(t) != kind.Optional).map(t => this.ll(t))]
-		const rt = this.result(f.ret)
-		const thunk = b.function(sym, b.fn(rt, ps), true)
-		const here = b.here()
-		const dead = this.dead
-		const entry = this.entry
-		this.entry = b.block(thunk)
-		b.at(this.entry)
-		this.dead = false
-		const env = b.param(thunk, 0)
-		// Its env's descriptors, after this if bound, and this.
-		const at = if (bound) 2 else 1
-		const args: Value[] = []
-		for (const j of 0 ... f.scope.length - 1) {
-			args.push(this.captured(env, j + at, this.i64))
-		}
-		if (bound) {
-			args.push(this.captured(env, 1, this.ref))
-		}
-		let k: u32 = 1
-		for (const i of 0 ... f.params.length - 1) {
-			if (optional[i]) {
-				args.push(b.constZero(this.ll(f.params[i])))
-			} else {
-				args.push(b.param(thunk, k))
-				k++
+		const thunk = b.function(sym, this.codeType(f.ret, f.params.filter(t => this.kindOf(t) != kind.Optional)), true)
+		this.aside(thunk, f.scope, () => {
+			// Its env's descriptors, after this if bound, and this.
+			const env = b.param(thunk, 0)
+			for (const j of 0 ... f.scope.length - 1) {
+				this.descs.push(this.captured(env, j + (if (bound) 2 else 1), this.i64))
 			}
-		}
-		const r = this.returning(this.callByValue(f, args, false), f.ret)
-		if (rt == this.void) {
-			b.retVoid()
-		} else {
-			b.ret(r)
-		}
-		b.at(here)
-		this.dead = dead
-		this.entry = entry
+			const args = this.descs.slice(0, f.scope.length)
+			if (bound) {
+				args.push(this.captured(env, 1, this.ref))
+			}
+			let k: u32 = 1
+			for (const i of 0 ... f.params.length - 1) {
+				if (optional[i]) {
+					args.push(b.constZero(this.ll(f.params[i])))
+				} else {
+					args.push(if (this.anyOf(f.params[i])) this.fromAny(b.param(thunk, k), f.params[i])
+						else b.param(thunk, k))
+					k++
+				}
+			}
+			const r = this.callByValue(f, args, false)
+			if (this.dyn) {
+				b.ret(this.cast({ v: r, t: this.norm(f.ret) }, this.any))
+			} else if (this.result(f.ret) == this.void) {
+				b.retVoid()
+			} else {
+				b.ret(this.returning(r, f.ret))
+			}
+		})
 		const v = if (bound || f.scope.length > 0) thunk
 			else b.constCast("inttoptr", b.constCast("ptrtoint", b.constant(b.constStruct([thunk])), this.i64),
 			this.ref)
@@ -1893,13 +1917,13 @@ class Emitter {
 		return v
 	}
 
-	/// The code of a closure { code, g, ...the descriptors of the scope's type params } calling a function g of type from
-	/// as one of type to (4.6): its args cast to from's params but the optional ones, which g's thunk leaves out, its
-	/// result to to's.
+	/// The code of a closure { code, g } calling a function g of type from as one of type to (4.6): its args cast to
+	/// from's params but the optional ones, which g's thunk leaves out, its result to to's. In a program as lowered, only
+	/// where one converts (see converts), as generic code holds a number of a type param T as of T's type.
 	private adapter(from: i32, to: i32): Value {
 		const b = this.b
 		const p = this.p
-		const sym = `adapt.${this.key(from)}.${this.key(to)}${this.scope.map(x => `.${this.key(x)}`).join("")}`
+		const sym = `adapt.${this.key(from)}.${this.key(to)}`
 		const have = this.thunks.get(sym)
 		if (have != null) {
 			return have
@@ -1908,46 +1932,79 @@ class Emitter {
 		const tps = p.items(to)
 		const fr = p.b(from)
 		const tr = p.b(to)
-		const fn = this.fn
+		const code = b.function(sym, this.codeType(tr, tps), true)
+		this.thunks.set(sym, code)
+		this.aside(code, [], () => {
+			const g = this.captured(b.param(code, 0), 1, this.ref)
+			const start = this.label()
+			this.start(start)
+			const args = [g]
+			for (const i of 0 ... fps.length - 1) {
+				args.push(this.through(b.param(code, (i + 1) as u32), tps[i], fps[i]))
+			}
+			const r = this.call(this.codeType(fr, fps), this.captured(g, 0, this.ptr), args)
+			if (this.dyn) {
+				this.ir().ret(this.through(r, fr, tr))
+			} else if (this.result(tr) == this.void) {
+				this.ir().retVoid()
+			} else {
+				this.ir().ret(this.returning(this.through(this.returned(r, fr), fr, tr), tr))
+			}
+			b.at(this.entry)
+			b.br(start)
+		})
+		return code
+	}
+
+	/// Value x of type from cast to to; in a program as lowered, each a union of any type, as a function value's code
+	/// takes and gives them (see value).
+	private through(x: Value, from: i32, to: i32): Value {
+		if (!this.dyn) {
+			return this.cast({ v: x, t: this.norm(from) }, to)
+		}
+		const v = this.cast({ v: this.fromAny(x, from), t: this.norm(from) }, to)
+		return this.cast({ v: v, t: this.norm(to) }, this.any)
+	}
+
+	/// Whether a value of type f converts to t it fits other than as is: a number to a wider one (§4.1), also as a
+	/// function's result or param.
+	private converts(f: i32, t: i32): bool {
+		const p = this.p
+		const [a, b] = [this.norm(f), this.norm(t)]
+		if (p.kind(a) == kind.Func && p.kind(b) == kind.Func) {
+			const [fps, tps] = [p.items(a), p.items(b)]
+			let r = this.converts(p.b(a), p.b(b))
+			for (const k of 0 ... tps.length - 1) {
+				r = r || k < fps.length && this.converts(tps[k], fps[k])
+			}
+			return r
+		}
+		return (isNumber(p.kind(b)) || p.kind(b) == kind.Union)
+			&& p.members(a).some(m => isNumber(p.kind(m)) && !this.holds(b, m))
+	}
+
+	/// Emits by emit the code of fn, a thunk of the type params of scope, then goes on with what was being emitted.
+	private aside(fn: Value, scope: i32[], emit: () => void) {
+		const outer = this.fn
 		const entry = this.entry
 		const unwind = this.unwind
+		const here = this.b.here()
 		const dead = this.dead
-		const scope = this.scope
+		const scoped = this.scope
 		const descs = this.descs
 		const formed = this.formed
-		const here = b.here()
-		const code = b.function(sym, this.fnType(tr, [this.ref], tps), true)
-		this.thunks.set(sym, code)
-		this.fn = code
+		this.fn = fn
 		this.unwind = 0
 		this.enter(scope, [])
-		const g = this.captured(b.param(code, 0), 1, this.ref)
-		for (const k of 0 ... scope.length - 1) {
-			this.descs.push(this.captured(b.param(code, 0), k + 2, this.i64))
-		}
-		const start = this.label()
-		this.start(start)
-		const args = [g]
-		for (const i of 0 ... fps.length - 1) {
-			args.push(this.cast({ v: b.param(code, (i + 1) as u32), t: this.norm(tps[i]) }, fps[i]))
-		}
-		const r = this.call(this.fnType(fr, [this.ref], fps), this.captured(g, 0, this.ptr), args)
-		if (this.result(tr) == this.void) {
-			this.ir().retVoid()
-		} else {
-			this.ir().ret(this.returning(this.cast({ v: this.returned(r, fr), t: this.norm(fr) }, tr), tr))
-		}
-		b.at(this.entry)
-		b.br(start)
-		this.fn = fn
+		emit()
+		this.b.at(here)
+		this.fn = outer
 		this.entry = entry
-		this.scope = scope
-		this.descs = descs
-		this.formed = formed
 		this.unwind = unwind
 		this.dead = dead
-		b.at(here)
-		return code
+		this.scope = scoped
+		this.descs = descs
+		this.formed = formed
 	}
 
 	// Values.
@@ -1999,23 +2056,15 @@ class Emitter {
 		} else if (text == "length" && k == kind.FixedArray) {
 			this.push(this.b.constInt(this.i32, p.b(t)), kind.I32)
 		} else if (method >= 0 && p.decls[method].kind == decl.Function) {
-			// Its class's type args' descriptors in the closure, adapted as the Global of a generic's is.
+			// Its class's type args' descriptors in the closure, as in the Global of a generic's.
 			const env = p.b(t)
 			this.touch(t) // bound, by ref
-			const f = this.closure(this.value(this.callee(method), true), [this.taken(obj).v], this.envDescs(env))
-			const u = p.decls[method].type
-			this.push(this.cast({ v: f, t: this.norm(u) }, p.subst(u, env)), p.subst(u, env))
+			const f = this.closure(this.value(method, true), [this.taken(obj).v], this.envDescs(env))
+			this.push(f, p.subst(p.decls[method].type, env))
 		} else {
 			const [q, s] = this.place(obj, name)
-			const h = this.declared(s)
-			this.push(if (s.embed) q else this.cast({ v: this.read(q, h), t: this.norm(h) }, s.t), s.t)
+			this.push(if (s.embed) q else this.read(q, s.t), s.t)
 		}
-	}
-
-	/// The type the field of slot s is held as: a function's as declared, as its class's generic code calls it, which no
-	/// descriptor of a type param could adapt.
-	private declared(s: Slot): i32 {
-		return if (this.dyn && s.decl >= 0 && this.kindOf(s.t) == kind.Func) this.p.decls[s.decl].type else s.t
 	}
 
 	/// The place and slot of the field of a class instance, object or tuple of the name, a Str, also of one an embedded
@@ -2318,15 +2367,7 @@ class Emitter {
 				const ok = this.ir().binary("or", this.isa(v, t), this.tagIn(this.tagOf(v.v), widened))
 				this.check(ok, "cast to a type that is not the value's")
 			}
-			let r = v.v
-			for (const m of widened) {
-				const w = this.cast({ v: this.unbits(v.v, m), t: m }, t)
-				const is = this.ir().icmp("eq", this.tagOf(v.v), this.tag(m))
-				const pick = (x: Value, y: Value) => this.ir().select(is, x, y) // by part, as TPDE takes no aggregate
-				r = this.union(pick(this.tagOf(w), this.tagOf(r)), pick(this.bitsOf(w), this.bitsOf(r)),
-					pick(this.refOf(w), this.refOf(r)))
-			}
-			return r
+			return this.widen(v.v, widened, t)
 		}
 		if (tk == kind.Union) {
 			return this.unionOf(this.tag(f), v.v, f)
@@ -2336,8 +2377,8 @@ class Emitter {
 			this.check(this.isa(v, t), "cast to a type that is not the value's")
 			return this.unbits(v.v, t)
 		}
-		if (fk == kind.Func && tk == kind.Func) {
-			return this.closure(this.adapter(f, t), [v.v], this.descs)
+		if (fk == kind.Func && tk == kind.Func && (!this.dyn || this.converts(f, t))) {
+			return this.closure(this.adapter(f, t), [v.v])
 		}
 		if (fk == kind.Named && tk == kind.Named && (this.inlined(f) || this.inlined(t))) {
 			return this.b.constZero(this.ll(t)) // where a test of a class it is not narrows to it, never reached
@@ -2432,6 +2473,34 @@ class Emitter {
 		}
 		return if (k == kind.String || this.inlined(n)) this.ir().load(this.ll(n), this.refOf(u), false)
 			else this.refOf(u)
+	}
+
+	/// The value of type t union u of any type holds, as a function value's code is given its args and gives its result
+	/// (see value), of a type that fits t: a narrower number's widened (§4.1), as its bits are an integer's already.
+	private fromAny(u: Value, t: i32): Value {
+		const n = this.norm(t)
+		if (this.p.kind(n) == kind.Union) {
+			const narrow: i32[] = [kind.I8, kind.I16, kind.I32, kind.U8, kind.U16, kind.U32, kind.F32]
+			return this.widen(u,
+				narrow.filter(m => !this.holds(n, m) && this.p.members(n).some(x => kind.widens(m, x))), n)
+		} else if (n != kind.F64) {
+			return this.unbits(u, n)
+		}
+		const f32 = this.cast({ v: this.unbits(u, kind.F32), t: kind.F32 }, n)
+		return this.ir().select(this.ir().icmp("eq", this.tagOf(u), this.tag(kind.F32)), f32, this.unbits(u, n))
+	}
+
+	/// Union u, a number of a type of ms widened to t's wider member.
+	private widen(u: Value, ms: i32[], t: i32): Value {
+		let r = u
+		for (const m of ms) {
+			const w = this.cast({ v: this.unbits(u, m), t: m }, t)
+			const is = this.ir().icmp("eq", this.tagOf(u), this.tag(m))
+			const pick = (x: Value, y: Value) => this.ir().select(is, x, y) // by part, as TPDE takes no aggregate
+			r = this.union(pick(this.tagOf(w), this.tagOf(r)), pick(this.bitsOf(w), this.bitsOf(r)),
+				pick(this.refOf(w), this.refOf(r)))
+		}
+		return r
 	}
 
 	/// Whether v's type, the type of its tag if a union, fits t.
