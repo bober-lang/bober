@@ -1588,11 +1588,12 @@ class Checker {
 			const q = p.parts[i]
 			if (p.kind == "array") {
 				const e = element(t, i)
-				if (e == null) {
+				if (e == null || t.kind == "fixed" && i >= t.n) {
 					throw this.error(start(p), `cannot destructure ${show(t)} into ${i + 1} elements`)
 				}
 				if (q.kind == "unary") {
-					this.bind(q.parts[0], Type.array(e), mutable)
+					const tuple = t.kind == "tuple" && !t.rest
+					this.bind(q.parts[0], if (tuple) Type.tuple(t.types.slice(i, t.types.length), false) else Type.array(e), mutable)
 				} else if (q.kind == "binary") {
 					this.bindPart(q.parts[0], e, q.parts[1], mutable)
 				} else {
