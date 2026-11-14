@@ -360,6 +360,11 @@ test "generics" {
 	const id = "function id[T](x: T): T { return x }\n"
 	assert errors(id + "const a: i32 = id(5)\nconst b: string = id(5)\nconst c = id[i64](5)") == "76: expected string, got i32"
 	assert errors("class M[T] {\n\tstatic c = 0\n\tstatic d = M.c\n}\nconst n = M.c") == "57: M needs type arguments for its static c"
+	const mapper = "interface M[A, B] {\n\tmap(a: A): B\n}\nclass L {\n\tmap(a: string): i32 { return 1 }\n}\n"
+	assert errors(mapper + "function f[A, B](m: M[A, B], a: A): B { return m.map(a) }\nconst n = f(new L(), \"s\")\nconst i: i32 = n") == ""
+	assert errors(mapper + "interface E[A, B] {\n\t...M[A, B]\n}\nfunction f[A, B](e: E[A, B], a: A): B { return e.map(a) }\nconst i: i32 = f(new L(), \"s\")") == ""
+	const seq = "interface Seq[T] {\n\trest(): Seq[T]\n\thead(): T\n}\nclass C {\n\trest(): C { return this }\n\thead(): i32 { return 1 }\n}\n"
+	assert errors(seq + "function first[T](s: Seq[T]): T { return s.head() }\nconst i: i32 = first(new C())") == ""
 	// An instance made while its generic's members are typed takes their types once they are.
 	assert errors("class B[T] {\n\ta = 1\n\tb = new B[i32]().a\n\n\tget(): T | null { return null }\n}\nconst x: string = new B[i32]().b")
 		== "94: expected string, got i32"

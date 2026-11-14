@@ -378,12 +378,21 @@ export class Type {
 				if (e != null) {
 					r!.unify(e, params, found)
 				}
-			case "object": for (const f of this.fields) {
-				const m = v.member(f.name)
-				if (m != null) {
-					f.type.unify(m, params, found)
+			case "object", "interface":
+				if (this.kind == "interface" && v.kind == "interface" && (v.generic == this.generic || v.generic == this)) {
+					unifyAll(this.parts(), v.parts(), params, found)
+				} else if (!unifying.some(k => k[0] == this && k[1] == v)) {
+					// by the members v has of this, and by v what this embeds, as v fits this by them, but not again within,
+					// as a member may be this
+					unifying.push([this, v])
+					for (const f of members(this)) {
+						const m = if (f.embedded) v else if (f.static) null else v.member(f.name)
+						if (m != null) {
+							f.type.unify(m, params, found)
+						}
+					}
+					unifying.pop()
 				}
-			}
 			case "union":
 				const bare = this.types.filter(m => m.kind == "param")
 				const open = if (bare.length > 0) bare else this.types.filter(m => m.mentions(params))
@@ -856,6 +865,8 @@ const fitted = new HashMap[[Type, Type], bool]()
 /// The fits memoized, in order, so that those since a point are dropped: those resting on an assumption that fails
 /// (fitsRecursive), and those found while a class or interface is filled in (filled).
 const tried: [Type, Type][] = []
+/// The interfaces and the types unify is working out by their members.
+const unifying: [Type, Type][] = []
 
 function fresh(): i32 {
 	count++
