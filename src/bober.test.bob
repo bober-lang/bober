@@ -1,7 +1,7 @@
 //! Tests of src/bober.bob's builds into the image, which keeps what it holds across them.
 
 import { indexOf } from "../std/algo"
-import { mkdirAll, open } from "../std/fs"
+import { exists, mkdirAll, open, remove } from "../std/fs"
 import * as process from "../std/process"
 import { replace } from "../std/string"
 import { Compile, build, dir, format, machine } from "./bober"
@@ -37,6 +37,13 @@ function built(files: [string, string][], o1: bool, o2 = false): [string, string
 		.map(o => o.copy()) // not the image's, which a later build may write in place
 	image.close()
 	return [readFile(`${home}/out`)!, held]
+}
+
+/// Removes home's image, that the next build starts anew rather than as an edit of the last test's.
+function anew() {
+	if (exists(`${home}/build/image.so`)) {
+		remove(`${home}/build/image.so`)
+	}
 }
 
 const types = `
@@ -170,11 +177,27 @@ test "an edit of a module unlinks its overlay, the build running the new code" {
 	assert out == `1 2 1 1 p1,p1 18 1\nbad true i64\n` && held.length == 0
 }
 
+test "an edited module runs on its base code, the first -O2 build that finds it unchanged optimises it again" {
+	const overlays = (held: string[]) => held.filter(o => indexOf(o, "lib.bob^O2@") >= 0).length
+	anew()
+	const [_, held] = built(files(1), false, true)
+	const [out, kept] = built([["main.bob", replace(program(1), "let k = 0", "let k = 1")]], false, true)
+	assert overlays(held) == 1 && out == printed(2) && kept == held
+	for (const t of ["i64", "i16"]) {
+		const [edited, base] = built([["lib.bob", replace(lib, "return f(i32)", `return f(${t})`)]], false, true)
+		assert edited == `2 2 1 1 p1,p1 18 1\nbad true ${t}\n` && overlays(base) == 0
+	}
+	const [again, back] = built([], false, true)
+	assert again == `2 2 1 1 p1,p1 18 1\nbad true i16\n` && overlays(back) == 1
+}
+
 test "a trap in -O2's code shows its line, after an edit above it" {
 	const lib = "export function at(xs: i32[]): i32 { return xs[1] }\n"
 	const main = `import { at } from "./lib"\nfunction main() { at([]) }\n`
+	anew()
 	const out = built([["lib.bob", lib], ["main.bob", main]], false, true)[0]
-	const again = built([["lib.bob", `\n${lib}`]], false, true)[0]
+	built([["lib.bob", `\n${lib}`]], false, true) // its base code
+	const again = built([], false, true)[0]
 	assert indexOf(out, "lib.bob:1:47: trap") >= 0 && indexOf(again, "lib.bob:2:47: trap") >= 0
 }
 
@@ -182,6 +205,7 @@ test "an export added to a module keeps the code of one that imports it, a chang
 	const dep = "export function one(): i32 { return 1 }\n"
 	const lib = `import { one } from "./dep"\nexport function two(): i32 { return one() + 1 }\n`
 	const main = `import { two } from "./lib"\nfunction main() { print(\`\${two()}\`) }\n`
+	anew()
 	const [out, held] = built([["dep.bob", dep], ["lib.bob", lib], ["main.bob", main]], false, true)
 	const [again, kept] = built([["dep.bob", `${dep}export function three(): i32 { return 3 }\n`]], false, true)
 	assert out == "2\n" && again == out && held.length > 0 && kept == held
