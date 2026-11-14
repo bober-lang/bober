@@ -347,14 +347,15 @@ export class Box @Experimental {
 	assert errors("import * as lib from \"lib\"\nconst a = lib.one", ["lib.bob", lib]) == "41: warning: one is deprecated"
 	assert errors("function f() @Deprecated[{ why: i32 }] {}") == "25: @Deprecated takes a string, or { use: T, why: string }"
 	const gen = "export class G[T] {\n\told(): i32 @Deprecated { return 1 }\n\tstatic make(): i32 @Experimental { return 1 }\n}"
-	assert errors("import { G } from \"lib\"\nconst a = new G[i32]().old() + G.make()", ["lib.bob", gen])
-		== "47: warning: old is deprecated; 57: warning: make is experimental"
+	assert errors("import { G } from \"lib\"\nconst a = new G[i32]().old() + G[i32].make()", ["lib.bob", gen])
+		== "47: warning: old is deprecated; 62: warning: make is experimental"
 	assert errors("function f() {\n\tconst a: i32 @Deprecated = 1\n}") == "30: a local declaration has no tags"
 }
 
 test "generics" {
 	const id = "function id[T](x: T): T { return x }\n"
 	assert errors(id + "const a: i32 = id(5)\nconst b: string = id(5)\nconst c = id[i64](5)") == "76: expected string, got i32"
+	assert errors("class M[T] {\n\tstatic c = 0\n\tstatic d = M.c\n}\nconst n = M.c") == "57: M needs type arguments for its static c"
 	// An instance made while its generic's members are typed takes their types once they are.
 	assert errors("class B[T] {\n\ta = 1\n\tb = new B[i32]().a\n\n\tget(): T | null { return null }\n}\nconst x: string = new B[i32]().b")
 		== "94: expected string, got i32"
