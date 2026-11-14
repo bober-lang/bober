@@ -1,5 +1,5 @@
-//! What the file of a kept image (link.bob) holds of its linker, for a later link to continue it: the State, which the
-//! 16 bytes after the format's headers give the offset and size of.
+//! What the file of a kept image (link.bob) holds of its linker, for a later link to continue it: the State, its head
+//! where the 16 bytes after the format's headers say, and each unit's record in a block of its own (Linker.save).
 
 import { Reader, Writer } from "../../std/encoding/binary"
 import { Arch } from "../../std/os"
@@ -7,7 +7,7 @@ import { ParseError } from "../../std/string"
 import { Bytes } from "./bytes"
 import { Fixup, Object, Section, Symbol } from "./object"
 
-/// What the state starts with, and the version of its encoding.
+/// What the head starts with, and the version of the encoding.
 const magic = "bober image 5"
 
 /// Where the sections of one of regions are: from start to top, of which holes, in order, are free; cap, which top
@@ -27,9 +27,10 @@ export class Region {
 /// What a link continues a kept image from, beside its bytes.
 export class State {
 	regions: Region[] = []
-	/// The objects of the frozen unit, then those given, stripped; where their sections are; and the bytes an object
-	/// was read from, which it is written as, so that it must be as read: "" if it is not.
-	units: [Object, u64[], string][] = []
+	/// The objects of the frozen unit, then those given, stripped; where their sections are; the bytes an object was
+	/// read from, its record, so that it must be as read: "" if it is not; and the blocks of the file it has, from and
+	/// to where: its record's.
+	units: [Object, u64[], string, [u64, u64][]][] = []
 	/// Per name with a slot, its address and that of its stub, 0 if none.
 	slots: [string, u64, u64][] = []
 	/// Of the frozen units: per name and kind, from and to where their sections are; the pointers the loader adds the
@@ -46,7 +47,7 @@ export class State {
 	exports: string[] = []
 }
 
-/// s, of an image of arch, as bytes.
+/// The head of s, of an image of arch, as bytes.
 export function write(s: State, arch: Arch): string {
 	const w = new Writer()
 	const str = (x: string) => {
@@ -66,31 +67,9 @@ export function write(s: State, arch: Arch): string {
 	})
 	list(w, s.units, u => {
 		list(w, u[1], at => w.uleb(at))
-		if (u[2] != "") {
-			w.raw(u[2])
-			return
-		}
-		str(u[0].name)
-		list(w, u[0].sections, sec => {
-			str(sec.name)
-			w.u8(sec.kind)
-			str(sec.order)
-			w.uleb(sec.align)
-			w.uleb(sec.size)
-			str(sec.group)
-			list(w, sec.fixups, f => {
-				w.uleb(f.at)
-				w.u8(f.kind)
-				w.uleb(f.symbol as u64)
-				w.sleb(f.addend)
-			})
-		})
-		list(w, u[0].symbols, sym => {
-			str(sym.name)
-			w.u8(sym.binding)
-			w.sleb(sym.section as i64)
-			w.uleb(sym.value)
-			w.uleb(sym.size)
+		list(w, u[3], b => {
+			w.uleb(b[0])
+			w.uleb(b[1])
 		})
 	})
 	list(w, s.slots, e => {
@@ -118,16 +97,49 @@ export function write(s: State, arch: Arch): string {
 	return w.bytes
 }
 
+/// The record of o, a unit's object as State has it.
+export function record(o: Object): string {
+	const w = new Writer()
+	const str = (x: string) => {
+		w.uleb(x.length as u64)
+		w.raw(x)
+	}
+	str(o.name)
+	list(w, o.sections, sec => {
+		str(sec.name)
+		w.u8(sec.kind)
+		str(sec.order)
+		w.uleb(sec.align)
+		w.uleb(sec.size)
+		str(sec.group)
+		list(w, sec.fixups, f => {
+			w.uleb(f.at)
+			w.u8(f.kind)
+			w.uleb(f.symbol as u64)
+			w.sleb(f.addend)
+		})
+	})
+	list(w, o.symbols, sym => {
+		str(sym.name)
+		w.u8(sym.binding)
+		w.sleb(sym.section as i64)
+		w.uleb(sym.value)
+		w.uleb(sym.size)
+	})
+	return w.bytes
+}
+
 /// The state in the file of a kept image of arch, whose format's headers take headers bytes; null if it holds none.
 export function read(file: Bytes, headers: u64, arch: Arch): State | null {
 	try {
-		const at = file.get(headers, 8)
-		const size = file.get(headers + 8, 8)
-		if (at > file.length || size > file.length - at) {
-			return null
+		// The bytes of the block at at of size, which the file must have.
+		const block = (at: u64, size: u64) => {
+			if (at > file.length || size > file.length - at) {
+				throw new ParseError("range", 0)
+			}
+			return file.slice(at, at + size)
 		}
-		const kept = file.slice(at, at + size)
-		const r = new Reader(kept)
+		const r = new Reader(block(file.get(headers, 8), file.get(headers + 8, 8)))
 		const str = () => r.raw(r.uleb() as i32)
 		if (r.raw(magic.length) != magic || str() != arch) {
 			return null
@@ -142,19 +154,9 @@ export function read(file: Bytes, headers: u64, arch: Arch): State | null {
 		})
 		s.units = many(r, () => {
 			const at = many(r, () => r.uleb())
-			const from = r.pos
-			const o = new Object(str(), arch)
-			o.sections = many(r, () => {
-				const sec = new Section(str(), r.u8())
-				sec.order = str()
-				sec.align = r.uleb()
-				sec.size = r.uleb()
-				sec.group = str()
-				sec.fixups = many(r, () => new Fixup(r.uleb(), r.u8(), r.uleb() as i32, r.sleb()))
-				return sec
-			})
-			o.symbols = many(r, () => new Symbol(str(), r.u8(), r.sleb() as i32, r.uleb(), r.uleb()))
-			return [o, at, kept.slice(from, r.pos)]
+			const blocks: [u64, u64][] = many(r, () => [r.uleb(), r.uleb()])
+			const kept = block(blocks[0][0], blocks[0][1])
+			return [object(new Reader(kept), arch), at, kept, blocks]
 		})
 		s.slots = many(r, () => [str(), r.uleb(), r.uleb()])
 		s.sections = many(r, () => [str(), r.u8(), r.uleb(), r.uleb()])
@@ -169,6 +171,23 @@ export function read(file: Bytes, headers: u64, arch: Arch): State | null {
 	} catch (e: ParseError) {
 		return null
 	}
+}
+
+/// The object whose record r reads, of arch.
+function object(r: Reader, arch: Arch): Object throws ParseError {
+	const str = () => r.raw(r.uleb() as i32)
+	const o = new Object(str(), arch)
+	o.sections = many(r, () => {
+		const sec = new Section(str(), r.u8())
+		sec.order = str()
+		sec.align = r.uleb()
+		sec.size = r.uleb()
+		sec.group = str()
+		sec.fixups = many(r, () => new Fixup(r.uleb(), r.u8(), r.uleb() as i32, r.sleb()))
+		return sec
+	})
+	o.symbols = many(r, () => new Symbol(str(), r.u8(), r.sleb() as i32, r.uleb(), r.uleb()))
+	return o
 }
 
 /// Writes how many xs there are, then each by f.
