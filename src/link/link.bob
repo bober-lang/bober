@@ -13,21 +13,23 @@
 
 import { partitionPoint, sortBy, stableSort, startsWith } from "../../std/algo"
 import { HashMap } from "../../std/collections/hashmap"
-import { put, set } from "../../std/encoding/binary"
+import { get, put } from "../../std/encoding/binary"
 import { alignUp, max, min } from "../../std/math"
 import { Arch } from "../../std/os"
 import { CompileError } from "../error"
+import { Bytes, zeros } from "./bytes"
 import { Region, State, read, write } from "./keep"
 import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Image32, Init, Local, Machine, Object, Page, PageOff,
 	Rel32, Rel64, Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Thread32, Unwind, Weak,
 	Zero } from "./object"
 
-/// What a format's writer makes a file of. Its addresses are from where it is loaded; the file has each segment's
-/// bytes at its offset, which is its address but in a kept image, whose segments have room after them no file holds.
+/// What a format's writer makes a file of. Its addresses are from where it is loaded, and the file has each segment's
+/// bytes at their address; a kept image's segments have room after them, which the file has as a hole.
 export class Image {
 	arch: Arch
-	/// From offset 0, where the writer's headers go, to the end of the last segment's bytes.
-	bytes: u8[] = []
+	/// The file, from offset 0, where the writer's headers go, to the end of the last segment's bytes, or of a kept
+	/// image's state; the writer puts the rest after.
+	bytes = new Bytes()
 	/// Ascending, each at a multiple of page but the first, which is after the headers.
 	segments: Segment[] = []
 	page: u64
@@ -49,8 +51,6 @@ export class Image {
 	descs: [u64, u64][] = []
 	/// Every symbol with a name the image defines, its value its address and its section 0, as defined.
 	symbols: Symbol[] = []
-	/// What the file holds right after bytes, which no one loads: of a kept image, what its linker knows of it.
-	extra = ""
 
 	constructor(arch: Arch, page: u64) {
 		this.arch = arch
@@ -62,29 +62,23 @@ export class Image {
 		const i = partitionPoint(this.segments, s => s.address + s.size + s.zero > at)
 		return this.segments[min(i, (this.segments.length - 1) as u32)]
 	}
-
-	/// Where bytes has the byte at the address at.
-	at(at: u64): i32 {
-		const s = this.segment(at)
-		return (s.offset + at - s.address) as i32
-	}
 }
 
 /// A file format as who links needs it (elf.bob): the room at an image's start the file's headers take; whether who
 /// loads an image sets a pointer to an import wherever it is, or its slots only; the name code knows the image's first
 /// byte by, which the linker defines where no object does; read, the Object an object file's bytes are; exports, the
-/// names a shared library's file defines; and write, the file of an image, which it may change to make it.
+/// names a shared library's file defines; and write, which makes the image's bytes its file.
 export type Format = {
 	headers: u64,
 	bindsAnywhere: bool,
 	start: string,
 	read: (name: string, bytes: string) => Object throws CompileError,
 	exports: (name: string, bytes: string) => string[] throws CompileError,
-	write: (image: Image) => string throws CompileError,
+	write: (image: Image) => void throws CompileError,
 }
 
-/// Bytes the loader maps, which the file has at offset, then zero bytes after them.
-export type Segment = { address: u64, offset: u64, size: u64, zero: u64, write: bool, exec: bool }
+/// Bytes the loader maps, then zero bytes after them.
+export type Segment = { address: u64, size: u64, zero: u64, write: bool, exec: bool }
 
 /// A pointer the loader sets to the address of a symbol the library, an index in the image's, defines, plus addend;
 /// to 0 if it does not and the bind is weak.
@@ -181,11 +175,11 @@ export class Linker {
 	private regions: u8[][]
 	private state = new State()
 	private loaded = 0
-	private old = ""
+	private bytes = new Bytes()
 
 	/// A linker of objects of machine's CPU into an image for format's writer; if kept is not null, into one that is
-	/// kept, which continues the image whose file's bytes kept is, if it is one.
-	constructor(machine: Machine, format: Format, kept: string | null = null) {
+	/// kept, which continues the image whose file's bytes kept are, if it is one, writing over them.
+	constructor(machine: Machine, format: Format, kept: Bytes | null = null) {
 		this.machine = machine
 		this.format = format
 		this.keep = kept != null
@@ -203,7 +197,7 @@ export class Linker {
 		})
 		this.units[0].frozen = true
 		this.loaded = s.units.length
-		this.old = kept!
+		this.bytes = kept!
 		for (const [name, slot, stub] of s.slots) {
 			const n = this.names[this.name(name)]
 			n.slot = slot
@@ -214,10 +208,8 @@ export class Linker {
 			for (const i of 0 ... u.object.sections.length - 1) {
 				const sec = u.object.sections[i]
 				if (s.floating.includes(sec.name) && u.at[i] != dropped) {
-					const r = this.region(u.at[i])
-					const at = (r.file + u.at[i] - r.start) as i32
-					sec.bytes = if (sec.kind == Zero) "" else this.old.slice(at, at + (sec.size as i32))
-					this.free(u.at[i], sec.size)
+					sec.bytes = if (sec.kind == Zero) "" else this.bytes.slice(u.at[i], u.at[i] + sec.size)
+					this.free(u.at[i], sec)
 					u.at[i] = 0
 				}
 			}
@@ -404,7 +396,7 @@ export class Linker {
 				this.errors.push(`${u.object.name} has ${sec.name}, which the image has for good`)
 			}
 			if (u.at[i] != 0 && u.at[i] != dropped) {
-				this.free(u.at[i], sec.size)
+				this.free(u.at[i], sec)
 			}
 		}
 		this.units = this.units.filter(x => x != u)
@@ -655,9 +647,6 @@ export class Linker {
 		// Per run laid out now, or section laid out before: its name and kind, and from and to where it is.
 		const laid = [...this.state.sections]
 		const regions = this.regions
-		// How many bytes the continued image's file has where, and where bytes has them: its regions', but the holes,
-		// which are zeros, as elf.bob skips those in the Unwind sections.
-		const copies: [u64, u64, u64][] = []
 		let file = base
 		for (const r of 0 ... regions.length - 1) {
 			const fresh = this.state.regions.length == r
@@ -665,13 +654,6 @@ export class Linker {
 				this.state.regions.push(new Region(if (r == 0) base else this.state.regions[r - 1].cap))
 			}
 			const region = this.state.regions[r]
-			const held: [u64, u64][] = []
-			let from = region.start
-			for (const [hole, last] of region.holes) {
-				held.push([from, hole])
-				from = last
-			}
-			held.push([from, region.top])
 			let end = if (regions[r][0] == Zero) region.start else region.top
 			for (const kind of regions[r]) {
 				for (const [rk, name, secs] of runs) {
@@ -713,15 +695,9 @@ export class Linker {
 				region.cap = alignUp(region.top, image.page) + (if (this.keep) room else 0)
 			}
 			if (region.top > region.start) {
-				const was = region.file
-				// The loader maps pages, so the file has a segment where its address is, modulo the page.
-				region.file = file + (region.start - file) % image.page
-				for (const [a, b] of held.filter(h => h[1] > h[0] && regions[r][0] != Zero)) {
-					copies.push([was + a - region.start, b - a, region.file + a - region.start])
-				}
-				image.segments.push({ address: region.start, offset: region.file, size: end - region.start,
-					zero: region.top - end, write: regions[r][0] == Data || regions[r][0] == Zero, exec: regions[r][0] == Code })
-				file = if (end > region.start) region.file + end - region.start else file
+				image.segments.push({ address: region.start, size: end - region.start, zero: region.top - end,
+					write: regions[r][0] == Data || regions[r][0] == Zero, exec: regions[r][0] == Code })
+				file = max(file, end)
 			}
 		}
 		const all = merged(laid)
@@ -734,22 +710,21 @@ export class Linker {
 				image.unwinds.push([from, to])
 			}
 		}
-		image.bytes = new u8[](file as i32)
-		for (const [from, size, to] of copies) {
-			set(image.bytes, to as i32, this.old.slice(from as i32, (from + size) as i32))
-		}
+		image.bytes = this.bytes
+		image.bytes.length = file
 		for (const u of this.units) {
 			for (const i of 0 ... u.object.sections.length - 1) {
 				const b = u.object.sections[i].bytes
 				if (u.at[i] != dropped && b != "") {
-					set(image.bytes, image.at(u.at[i]), b)
+					image.bytes.set(u.at[i], b)
 				}
 			}
 		}
 	}
 
 	/// Lays the sections refs out one after another in region r: in the first of its holes they fit, else at its top,
-	/// which stays below its cap. From and to where.
+	/// which stays below its cap; the bytes between them zeros, where a hole may have others, as macho.bob's CIEs. From
+	/// and to where.
 	private place(r: Region, refs: i64[]): [u64, u64] throws CompileError {
 		const sec = (ref: i64) => this.units[ref >> 32].object.sections[ref & 0xffffffff]
 		const end = (from: u64) => {
@@ -761,29 +736,33 @@ export class Linker {
 		}
 		const align = sec(refs[0]).align
 		let from: u64 = 0
+		let at: u64 = 0
 		for (const i of 0 ... r.holes.length - 1) {
 			const [hole, last] = r.holes[i]
-			const at = alignUp(hole, align)
-			const to = end(at)
-			if (to > at && to <= last) {
-				const rest: [u64, u64][] = [[hole, at], [to, last]]
+			from = alignUp(hole, align)
+			const to = end(from)
+			if (to > from && to <= last) {
+				const rest: [u64, u64][] = [[hole, from], [to, last]]
 				r.holes = [...r.holes.slice(0, i), ...rest.filter(h => h[1] > h[0]), ...r.holes.slice(i + 1, r.holes.length)]
-				from = at
+				at = hole
 				break
 			}
 		}
-		if (from == 0) {
+		if (at == 0) {
+			at = r.top
 			from = alignUp(r.top, align)
 			r.top = end(from)
 			if (r.top >= r.cap) {
 				throw new CompileError(`there is no room for ${sec(refs[0]).name}`)
 			}
 		}
-		let at = from
 		for (const ref of refs) {
-			at = alignUp(at, sec(ref).align)
-			this.units[ref >> 32].at[ref & 0xffffffff] = at
-			at += sec(ref).size
+			const to = alignUp(at, sec(ref).align)
+			if (sec(ref).kind != Zero) {
+				this.bytes.set(at, zeros((to - at) as i32))
+			}
+			this.units[ref >> 32].at[ref & 0xffffffff] = to
+			at = to + sec(ref).size
 		}
 		return [from, at]
 	}
@@ -791,10 +770,14 @@ export class Linker {
 	/// The region of the continued image the address at is in.
 	private region(at: u64): Region { return this.state.regions[partitionPoint(this.state.regions, r => r.cap > at)] }
 
-	/// Frees size bytes at at for what is laid out later; the image has zeros there until then.
-	private free(at: u64, size: u64) {
+	/// Frees the bytes of sec at at for what is laid out later; the image has zeros there until then.
+	private free(at: u64, sec: Section) {
+		const size = sec.size
 		if (size == 0) {
 			return
+		}
+		if (sec.kind != Zero) {
+			this.bytes.set(at, zeros(size as i32))
 		}
 		const r = this.region(at)
 		let a = partitionPoint(r.holes, h => h[0] > at) as i32
@@ -818,6 +801,7 @@ export class Linker {
 	/// bind, and a Desc as a desc, which a frozen unit's fixup set for good the image keeps; reaching an import relative
 	/// to the code itself is only possible through a stub or slot.
 	private fix(image: Image) throws CompileError {
+		const word = new u8[](8) // where a fixup is set, of the 8 bytes at its address
 		for (const u of this.units) {
 			const o = u.object
 			for (const i of 0 ... o.sections.length - 1) {
@@ -882,9 +866,11 @@ export class Linker {
 						}
 					}
 					const v = s + (f.addend as u64) - (if (f.kind == Thread32) image.thread[0] else 0)
-					if (!this.apply(image.bytes, image.at(p), f.kind, v, p)) {
+					put(word, 0, image.bytes.get(p, 8), 8)
+					if (!this.apply(word, 0, f.kind, v, p)) {
 						throw new CompileError(`${place(o, i, f)} cannot reach its symbol`)
 					}
+					image.bytes.put(p, get(word, 0, 8), 8)
 				}
 			}
 		}
@@ -903,7 +889,8 @@ export class Linker {
 	}
 
 	/// Keeps in the image what a later link continues it from, which the 16 bytes after its headers say where the file
-	/// has: its units, the frozen ones as one and the others stripped; the slots and stubs of names; and exports.
+	/// has: its units, the frozen ones as one and the others stripped; the slots and stubs of names; and exports. It is
+	/// at the last region's start, which no segment's bytes grow over, as the loader takes none of the region's.
 	private save(image: Image, exports: string[]) {
 		const s = this.state
 		for (const x of this.bounded) {
@@ -924,9 +911,12 @@ export class Linker {
 		s.exports = exports
 		s.inits = image.inits
 		s.thread = image.thread
-		image.extra = write(s, this.machine.arch)
-		put(image.bytes, this.format.headers as i32, image.bytes.length as u64, 8)
-		put(image.bytes, (this.format.headers + 8) as i32, image.extra.length as u64, 8)
+		const kept = write(s, this.machine.arch)
+		const at = s.regions[s.regions.length - 1].start
+		image.bytes.set(at, kept)
+		image.bytes.length = at + (kept.length as u64)
+		image.bytes.put(this.format.headers, at, 8)
+		image.bytes.put(this.format.headers + 8, kept.length as u64, 8)
 	}
 
 	/// The frozen units as one, of a section per region from its start, of no bytes, that their symbols are in: those

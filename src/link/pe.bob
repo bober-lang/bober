@@ -2,7 +2,6 @@
 //! DLL. This is the only file of the linker that knows COFF or PE.
 
 import { slash } from "../../std/ascii"
-import { get, put } from "../../std/encoding/binary"
 import { alignUp, max } from "../../std/math"
 import { indexOf, sortBy, startsWith } from "../../std/algo"
 import { CompileError } from "../error"
@@ -293,13 +292,13 @@ function exports(name: string, bytes: string): string[] throws CompileError {
 /// consecutive slots of one library, the only pointers it binds. The exception directory is the Unwind sections,
 /// `.pdata`. Nothing in a DLL runs the image's Init pointers by itself; who loads it runs them. The image changes: the
 /// slots hold their names, the rebased pointers IMAGE_BASE more, and the function table is sorted.
-function write(image: Image): string {
+function write(image: Image) {
 	const x64 = image.arch == "x86_64"
 	const page = image.page
 	const segs = image.segments
 	const last = segs[segs.length - 1]
 	// The loader's tables are at address base, and at offset file in the file, both multiples of a page.
-	const file = alignUp(image.bytes.length as u64, page)
+	const file = alignUp(image.bytes.length, page)
 	const base = alignUp(last.address + last.size + last.zero, page)
 	let tail = ""
 	const place = (s: string) => {
@@ -341,7 +340,7 @@ function write(image: Image): string {
 			image.binds[j].at == first.at + 8 * ((j - i) as u64)) {
 			const hint = place(le(0, 2) + image.binds[j].name + "\x00")
 			lookup += le(hint, 8)
-			put(image.bytes, image.binds[j].at as i32, hint, 8)
+			image.bytes.put(image.binds[j].at, hint, 8)
 			j++
 		}
 		const dll = place(image.libraries[first.library] + "\x00")
@@ -365,7 +364,7 @@ function write(image: Image): string {
 		let block = ""
 		while (i < rebases.length && (rebases[i] & ~0xfff) == at) {
 			block += le(REL_BASED_DIR64 << 12 | rebases[i] & 0xfff, 2)
-			put(image.bytes, rebases[i] as i32, get(image.bytes, rebases[i] as i32, 8) + IMAGE_BASE, 8)
+			image.bytes.put(rebases[i], image.bytes.get(rebases[i], 8) + IMAGE_BASE, 8)
 			i++
 		}
 		block = pad(block, alignUp(block.length, 4))
@@ -380,16 +379,12 @@ function write(image: Image): string {
 	}
 	const [from, to] = image.unwinds.at(0) ?? [0, 0]
 	const entry = if (x64) 12 else 8
-	const rows: u8[][] = []
+	const rows: string[] = []
 	for (const k of 0 ... ((to - from) as i32) / entry - 1) {
-		rows.push(image.bytes.slice((from as i32) + entry * k, (from as i32) + entry * (k + 1)))
+		rows.push(image.bytes.slice(from + ((entry * k) as u64), from + ((entry * k + entry) as u64)))
 	}
-	sortBy(rows, (a, b) => get(a, 0, 4) < get(b, 0, 4))
-	for (const k of 0 ... rows.length - 1) {
-		for (const m of 0 ... entry - 1) {
-			image.bytes[(from as i32) + entry * k + m] = rows[k][m]
-		}
-	}
+	sortBy(rows, (a, b) => u(a, 0, 4) < u(b, 0, 4))
+	image.bytes.set(from, rows.join(""))
 
 	let sections = ""
 	for (const s of segs) {
@@ -445,10 +440,9 @@ function write(image: Image): string {
 		optional,
 		sections,
 	].join("")
-	for (const k of 0 ... head.length - 1) {
-		image.bytes[k] = head[k]
-	}
-	return pad(fromBytes(image.bytes), file as i32) + pad(tail, alignUp(size, page) as i32)
+	image.bytes.set(0, head)
+	image.bytes.set(file, pad(tail, alignUp(size, page) as i32))
+	image.bytes.length = file + alignUp(size, page)
 }
 
 /// A section header: its name, size and address in memory, size and offset in the file, and flags.

@@ -2,6 +2,111 @@
 
 import { isDigit, zero } from "../../std/ascii"
 import { indexOf } from "../../std/algo"
+import { get, set } from "../../std/encoding/binary"
+import { min } from "../../std/math"
+
+/// A file's bytes, zeros past its end, and pages of 4 KiB written over them, as Mach-O hashes them: all that who
+/// saves them writes over a copy of the file.
+export class Bytes {
+	readonly file: string
+	/// Per page, its bytes if written, else none.
+	pages: u8[][] = []
+	/// How many bytes there are now.
+	length: u64
+
+	constructor(file = "") {
+		this.file = file
+		this.length = file.length as u64
+	}
+
+	/// Whether the page the byte at at is in is written.
+	written(at: u64): bool {
+		const p = (at >> 12) as i32
+		return p < this.pages.length && this.pages[p].length > 0
+	}
+
+	/// The n bytes at at, little-endian.
+	get(at: u64, n: i32): u64 {
+		const end = at + (n as u64) - 1
+		if (at >> 12 == end >> 12 && this.written(at)) {
+			return get(this.pages[(at >> 12) as i32], (at & 0xfff) as i32, n)
+		}
+		if (!this.written(at) && !this.written(end) && end < (this.file.length as u64)) {
+			return u(this.file, at as i32, n)
+		}
+		return u(this.slice(at, end + 1), 0, n)
+	}
+
+	/// Puts v's low n bytes at at, little-endian, if they are not there.
+	put(at: u64, v: u64, n: i32) {
+		if (this.get(at, n) != v) {
+			for (const i of 0 ... n - 1) {
+				const a = at + (i as u64)
+				this.page(a)[(a & 0xfff) as i32] = (v >> 8 * i) as u8
+			}
+		}
+	}
+
+	/// Puts the bytes of s at at, on the pages they are not on yet.
+	set(at: u64, s: string) {
+		let i = 0
+		while (i < s.length) {
+			const a = at + (i as u64)
+			const part = s.slice(i, min(s.length, i + 4096 - ((a & 0xfff) as i32)))
+			if (this.slice(a, a + (part.length as u64)) != part) {
+				set(this.page(a), (a & 0xfff) as i32, part)
+			}
+			i += part.length
+		}
+	}
+
+	/// The bytes from from to to.
+	slice(from: u64, to: u64): string {
+		let s = ""
+		let at = from
+		while (at < to) {
+			let end = min(to, (at | 0xfff) + 1)
+			let part = ""
+			if (this.written(at)) {
+				part = fromBytes(this.pages[(at >> 12) as i32].slice((at & 0xfff) as i32, (end - (at & ~0xfff)) as i32))
+			} else {
+				while (end < to && !this.written(end)) {
+					end = min(to, end + 4096)
+				}
+				part = this.under(at, end)
+			}
+			// The first part as it is, which of a file's bytes shares them.
+			s = if (at == from) part else s + part
+			at = end
+		}
+		return s
+	}
+
+	/// The file's bytes from from to to.
+	private under(from: u64, to: u64): string {
+		const n = this.file.length as u64
+		return if (from >= n) zeros((to - from) as i32)
+			else if (to <= n) this.file.slice(from as i32, to as i32)
+			else this.file.slice(from as i32, n as i32) + zeros((to - n) as i32)
+	}
+
+	/// The page the byte at at is in, written from now on.
+	private page(at: u64): u8[] {
+		const p = (at >> 12) as i32
+		while (this.pages.length <= p) {
+			this.pages.push(none)
+		}
+		if (this.pages[p].length == 0) {
+			const from = at & ~0xfff
+			this.pages[p] = new u8[](4096)
+			set(this.pages[p], 0, this.under(from, from + 4096))
+		}
+		return this.pages[p]
+	}
+}
+
+/// A page not written.
+const none: u8[] = []
 
 /// The n bytes of s at at, little-endian.
 export function u(s: string, at: i32, n: i32): u64 {

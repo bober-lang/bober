@@ -18,10 +18,11 @@ import { fromCString } from "../std/c"
 import { Keys, Rest, Unknown, decode as decodeJson, encode, quoted } from "../std/encoding/json"
 import * as yaml from "../std/encoding/yaml"
 import * as optarg from "../std/encoding/optarg"
-import { exists, glob, mapFile, mkdirAll, readDir, readFile, remove, removeAll, rename, stat } from "../std/fs"
+import { exists, glob, mapFile, mkdirAll, open, readDir, readFile, remove, removeAll, rename, stat } from "../std/fs"
 import { base, dir as parent, isAbs, join, rel } from "../std/fs/path"
 import { fnv } from "../std/hash"
-import { stderr, stdin, stdout } from "../std/io"
+import { File, stderr, stdin, stdout } from "../std/io"
+import { min } from "../std/math"
 import { arch, os } from "../std/os"
 import { ParseError, codePoint, split, trim, utf8 } from "../std/string"
 import { abi, write } from "./bc/file"
@@ -43,6 +44,7 @@ import { elf } from "./link/elf"
 import { macho, named } from "./link/macho"
 import { pe } from "./link/pe"
 import { x64 } from "./link/x64"
+import { Bytes } from "./link/bytes"
 import { Linker, Stale } from "./link/link"
 import { Const, Global, Object, Section, Symbol } from "./link/object"
 import { SyntaxError } from "./lex"
@@ -532,7 +534,10 @@ const debug = { main: -1, tests: false, dyn: true }
 function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, o: Options, fresh = false): string {
 	const out = `${dir}/image${if (o.dyn) "" else ".mono"}.so`
 	const lib = `${sysroot}/usr/lib`
-	const l = new Linker(machine, format, if (fresh || !exists(out)) "" else mapFile(out))
+	// The image continued, which is mapped and copied of one descriptor, lest another build replace it in between.
+	const old = if (fresh || !exists(out)) null else open(out)
+	const kept = new Bytes(if (old != null) old.map() else "")
+	const l = new Linker(machine, format, kept)
 	const held = l.objects()
 	// Whether the image lacks the object name; another version of it is unlinked.
 	const lacks = (name: string) => {
@@ -565,6 +570,7 @@ function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, 
 		const info = stat(f)
 		const name = `${f}@${info.modified}.${info.size}`
 		if (held.some(h => h != name && startsWith(h, `${f}@`))) {
+			old?.close()
 			return image(p, mains, files, cxx, pin, o, true)
 		}
 		if (!held.includes(name)) {
@@ -593,11 +599,15 @@ function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, 
 			}
 		}
 		try {
-			save(tmp, format.write(l.link()))
+			const linked = l.link()
+			format.write(linked)
+			store(tmp, if (linked.bytes == kept) old else null, linked.bytes)
 		} catch (e: Stale) {
+			old?.close()
 			return image(p, mains, files, cxx, pin, o, true)
 		}
 	}
+	old?.close()
 	const own = `${tmp}.run`
 	if (pin) {
 		if (exists(own)) {
@@ -936,6 +946,25 @@ function file(path: string): string {
 		s += `.${fnv(path)}`
 	}
 	return `${dir}/${s}`
+}
+
+/// Writes bytes to path: their written pages, coalesced, over a copy of old if it is not null, else over an empty file;
+/// and their last page, at which the file ends.
+function store(path: string, old: File | null, bytes: Bytes) {
+	const f = if (old != null) old.copy(path, bytes.length) else open(path, "w")
+	const end = (bytes.length + 0xfff) >> 12
+	let p: u64 = 0
+	while (p < end) {
+		let q = p
+		while (q < end && (bytes.written(q << 12) || q == end - 1)) {
+			q++
+		}
+		if (q > p) {
+			f.writeAt(p << 12, bytes.slice(p << 12, min(q << 12, bytes.length)))
+		}
+		p = q + 1
+	}
+	f.close()
 }
 
 function save(path: string, s: string) {
