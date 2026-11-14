@@ -34,6 +34,7 @@ function built(files: [string, string][], o1: bool, o2 = false): [string, string
 	}
 	const image = open(`${home}/build/image.so`)
 	const held = new Linker(machine, format, new Bytes(image.map())).objects().filter(o => indexOf(o, "lib.bob~") >= 0 || indexOf(o, "lib.bob^") >= 0)
+		.map(o => o.copy()) // not the image's, which a later build may write in place
 	image.close()
 	return [readFile(`${home}/out`)!, held]
 }
@@ -167,4 +168,23 @@ test "an edit of a module unlinks its overlay, the build running the new code" {
 	built(files(1), false, true)
 	const [out, held] = built([["lib.bob", replace(lib, "return f(i32)", "return f(i64)")]], false)
 	assert out == `1 2 1 1 p1,p1 18 1\nbad true i64\n` && held.length == 0
+}
+
+test "a trap in -O2's code shows its line, after an edit above it" {
+	const lib = "export function at(xs: i32[]): i32 { return xs[1] }\n"
+	const main = `import { at } from "./lib"\nfunction main() { at([]) }\n`
+	const out = built([["lib.bob", lib], ["main.bob", main]], false, true)[0]
+	const again = built([["lib.bob", `\n${lib}`]], false, true)[0]
+	assert indexOf(out, "lib.bob:1:47: trap") >= 0 && indexOf(again, "lib.bob:2:47: trap") >= 0
+}
+
+test "an export added to a module keeps the code of one that imports it, a change of what it names does not" {
+	const dep = "export function one(): i32 { return 1 }\n"
+	const lib = `import { one } from "./dep"\nexport function two(): i32 { return one() + 1 }\n`
+	const main = `import { two } from "./lib"\nfunction main() { print(\`\${two()}\`) }\n`
+	const [out, held] = built([["dep.bob", dep], ["lib.bob", lib], ["main.bob", main]], false, true)
+	const [again, kept] = built([["dep.bob", `${dep}export function three(): i32 { return 3 }\n`]], false, true)
+	assert out == "2\n" && again == out && held.length > 0 && kept == held
+	const [changed, anew] = built([["dep.bob", "export function one(x = 2): i32 { return x }\n"]], false, true)
+	assert changed == "3\n" && anew.length > 0 && !anew.some(o => held.includes(o))
 }

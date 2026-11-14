@@ -142,6 +142,46 @@ export function abi(p: Program, m: i32): u64 {
 	return p.modules[m].abi
 }
 
+/// Module m's version, as -O2's overlay of its code is compiled against: bc, its file, but its ABI hash and deps, with
+/// the signatures of the exported decls of other modules its code names, and of those these name, which the ABIs it
+/// has of its deps cover, so that bc gives it; and the modules of the decls not exported it names, which theirs may
+/// not. Of each exported decl, signatures holds its signature's hash and the decls of other modules it names, once
+/// made.
+export function version(p: Program, m: i32, bc: string, signatures: HashMap[i32, [u64, i32[]]]): [u64, i32[]] {
+	let at = 0 // all of it, if malformed
+	try {
+		at = head(bc).r.pos
+	} catch (e: ParseError) {}
+	let h = combine(fnv(bc.slice(0, magic.length + 16)), fnv(bc.slice(at, bc.length))) // compiler, source; code
+	const others: i32[] = []
+	const seen = new HashMap[i32, bool]()
+	const todo = new Abi(p, m, p.modules[m].decls, true).foreign
+	while (todo.length > 0) {
+		let t = todo.pop()
+		while (p.decls[t].owner >= 0) {
+			t = p.decls[t].owner
+		}
+		if (seen.has(t)) {
+			continue
+		}
+		seen.set(t, true)
+		if ((p.decls[t].mods & decl.Export) == 0) {
+			if (!others.includes(p.decls[t].module)) {
+				others.push(p.decls[t].module)
+			}
+			continue
+		}
+		if (!signatures.has(t)) {
+			const a = new Abi(p, p.decls[t].module, [t])
+			signatures.set(t, [a.h, a.foreign])
+		}
+		const [sh, names] = signatures.get(t)!
+		h += sh
+		todo.append(names)
+	}
+	return [h, others]
+}
+
 /// The ids a file gives the entries of a table of the Program it uses, and their section, each entry after those it
 /// is made of.
 class Table {
@@ -583,7 +623,7 @@ class Abis {
 		const i = this.index.size
 		this.index.set(m, i)
 		this.stack.push(m)
-		const a = new Abi(this.p, m)
+		const a = new Abi(this.p, m, this.p.modules[m].decls.filter(d => (this.p.decls[d].mods & decl.Export) != 0))
 		this.made.set(m, a)
 		let low = i
 		for (const u of a.uses) {
@@ -613,22 +653,24 @@ class Abis {
 	}
 }
 
-/// Module m's signatures being hashed, and the other modules they name.
+/// The signatures of module m's decls ds being hashed, with all their code and what they own if all; and the other
+/// modules they name, and the decls of those.
 class Abi {
 	p: Program
 	m: i32
 	h = seed
 	uses: i32[] = []
+	foreign: i32[] = []
+	private all: bool
 	private done = new HashMap[i32, bool]()
 	private seen = new HashMap[i32, bool]()
 
-	constructor(p: Program, m: i32) {
+	constructor(p: Program, m: i32, ds: i32[], all = false) {
 		this.p = p
 		this.m = m
-		for (const d of p.modules[m].decls) {
-			if ((p.decls[d].mods & decl.Export) != 0) {
-				this.decl(d)
-			}
+		this.all = all
+		for (const d of ds) {
+			this.decl(d)
 		}
 	}
 
@@ -651,10 +693,10 @@ class Abi {
 		this.list(x.supers)
 		this.list(x.tags)
 		this.list(x.throws)
-		if (x.kind == decl.Var && (x.mods & decl.Readonly) != 0 && x.code != null) {
+		if (x.code != null && (this.all || x.kind == decl.Var && (x.mods & decl.Readonly) != 0)) {
 			this.code(x.code!)
 		}
-		if (x.kind == decl.Class || x.kind == decl.Interface) {
+		if (this.all || x.kind == decl.Class || x.kind == decl.Interface) {
 			for (const y of x.members) {
 				this.decl(y)
 			}
@@ -714,13 +756,17 @@ class Abi {
 		}
 	}
 
-	/// Adds decl d if of this module, else notes its module.
+	/// Adds decl d if of this module, else notes it and its module.
 	private named(d: i32) {
 		const m = this.p.decls[d].module
 		if (m == this.m) {
 			this.decl(d)
-		} else if (!this.uses.includes(m)) {
-			this.uses.push(m)
+		} else if (!this.done.has(d)) {
+			this.done.set(d, true)
+			this.foreign.push(d)
+			if (!this.uses.includes(m)) {
+				this.uses.push(m)
+			}
 		}
 	}
 }
