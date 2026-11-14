@@ -733,10 +733,12 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 			: fails("this bit operation on an i" + std::to_string(n));
 	}
 
-	/// A parameter's registers or stack slot; an empty struct has none.
+	/// A parameter's registers or stack slot; an empty struct has none. A struct's fields go each where a scalar would,
+	/// some in the last registers and the rest on the stack, as LLVM passes it; an array's all in registers or all on
+	/// the stack, as C's on arm64 (src/backend/abi.bob, which passes a C struct that does not fit through memory).
 	void prologue_assign_arg(tpde::CCAssigner *cc, u32 k, u32 arg, u32 align = 1, bool split = false) {
 		if (type(arg).parts.n > 0) {
-			B::prologue_assign_arg(cc, k, arg, align, split);
+			B::prologue_assign_arg(cc, k, arg, align, split || type(arg).kind == Type::Struct);
 		}
 	}
 
@@ -762,6 +764,8 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 			} else if (bool zext = attr(AttrKind::ZeroExt); zext || attr(AttrKind::SignExt)) {
 				a.flag = zext ? CallArg::Flag::zext : CallArg::Flag::sext;
 				a.ext_bits = bits(ops[k]);
+			} else if (type(ops[k]).kind == Type::Struct) {
+				a.flag = CallArg::Flag::allow_split; // as prologue_assign_arg takes it
 			}
 		}
 		std::optional<ValueRef> res;
