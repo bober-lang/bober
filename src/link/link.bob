@@ -11,7 +11,7 @@
 //! linked for good as one unit. Of the objects given, the image keeps the symbols and the fixups a link may set anew,
 //! not their bytes. A link the image cannot take is Stale, and who links then links all anew.
 
-import { partitionPoint, sort, sortBy, stableSort, startsWith } from "../../std/algo"
+import { merge, partitionPoint, sort, sortBy, stableSort, startsWith } from "../../std/algo"
 import { HashMap } from "../../std/collections/hashmap"
 import { bytes as random } from "../../std/crypto/random"
 import { get, put } from "../../std/encoding/binary"
@@ -41,7 +41,7 @@ export class Image {
 	exports: [string, u64][] = []
 	libraries: string[] = []
 	binds: Bind[] = []
-	/// The addresses of the pointers the loader adds the image's address to.
+	/// The addresses of the pointers the loader adds the image's address to, ascending.
 	rebases: u64[] = []
 	/// From and to where the Unwind sections are, ascending, and the Init ones, laid out as one.
 	unwinds: [u64, u64][] = []
@@ -384,8 +384,8 @@ export class Linker {
 		image.libraries = this.libraries
 		image.inits = this.state.inits
 		image.thread = this.state.thread
-		image.rebases = [...this.state.rebases]
 		image.descs = [...this.state.descs]
+		const frozen = this.state.rebases.length
 		this.layout(this.format.headers + (if (this.keep) 24 else 0), image)
 		for (const n of this.names) {
 			if (n.section >= 0) {
@@ -401,6 +401,13 @@ export class Linker {
 			this.names[own.names[f.symbol]].stub = own.at[0] + f.at - f.at % stub
 		}
 		this.fix(image)
+		// The frozen units' rebases, kept ascending, and this link's sorted in.
+		if (this.state.rebases.length > frozen) {
+			sort(this.state.rebases)
+		}
+		sort(image.rebases)
+		image.rebases = [...this.state.rebases, ...image.rebases]
+		merge(image.rebases, this.state.rebases.length, (a, b) => a < b)
 		// A continued image's exports are those it had, but the names no longer defined, and those asked for now.
 		const exports = [...this.state.exports.filter(e => defined(e) && !this.exported.includes(e)), ...this.exported]
 		for (const name of exports) {
@@ -963,10 +970,7 @@ export class Linker {
 						continue
 					}
 					if (inside && f.kind == Abs64) {
-						image.rebases.push(p)
-						if (stays) {
-							this.state.rebases.push(p)
-						}
+						(if (stays) this.state.rebases else image.rebases).push(p)
 					}
 					const v = s + (f.addend as u64) - (if (f.kind == Thread32) image.thread[0] else 0)
 					put(word, 0, image.bytes.get(p, 8), 8)
