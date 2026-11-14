@@ -438,7 +438,7 @@ void bober_zero(const bober_type *t, bober_union *u) {
   *u = (bober_union){t = t ? t->canon : t, 0, 0};
   if (!t) return;
   if (t->kind == KUNION) {
-    u->tag = t->parts[zeroOf(t)];  // as emit's zero
+    bober_zero(t->parts[zeroOf(t)], u);  // its member's, a string's boxed
   } else if (t->held == STRING || t->held == PLACE) {
     u->ref = bober_alloc(t->size, t->layout);
   }
