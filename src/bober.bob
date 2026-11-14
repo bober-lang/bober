@@ -422,8 +422,9 @@ function hasTests(path: string): bool {
 /// Compiles the program of main into the executable build/<name>, or with tests build/<name>.test, all as one,
 /// monomorphized, by LLVM, optimized, if release, else into the image, each module by TPDE, fast to compile: as
 /// lowered, or at -O1 monomorphized for the program; -O2 counts over -O0, -O0 over -O1. Returns the command that runs
-/// it, or its tests: the executable, or the launcher on the image's entry, run by the C library's loader where it is
-/// the sysroot's, the image as image has it if pin. Throws the errors, or what failed, as a CompileError or IoError.
+/// it, or its tests: the executable, or the launcher on the image's entry, named with the program's version, run by the
+/// C library's loader where it is the sysroot's, the image as image has it if pin. Throws the errors, or what failed,
+/// as a CompileError or IoError.
 export function build(main: string, tests: bool, f: Compile, pin: bool): string[] {
 	const p = lowered([main], f.headers.I)
 	const m = p.module(normal(main))
@@ -433,10 +434,10 @@ export function build(main: string, tests: bool, f: Compile, pin: bool): string[
 		if (!o.dyn) {
 			mono(p, m)
 		}
+		const [at, version] = image(p, [m], files, cxx, pin, o, if (f.O2) specialize(p) else null)
 		return [...(if (mac) [] else [`${sysroot}/usr/lib/libc.so`]),
-			if (packaged()) join(root, "lib/launch.c.exe") else launcher(dir),
-			image(p, [m], files, cxx, pin, o, if (f.O2) specialize(p) else null),
-			entry(p.modules[m].path, tests)]
+			if (packaged()) join(root, "lib/launch.c.exe") else launcher(dir), at,
+			`${entry(p.modules[m].path, tests)}@${version}`]
 	}
 	const exe = `${dir}/${name(main)}${if (tests) ".test" else ""}`
 	const o = { main: m, tests: tests, dyn: false }
@@ -560,9 +561,10 @@ let decoded: [u64, Linker, Bytes] | null = null
 /// linked anew, fresh. The image is written in place where no other process has it, else under a name of its own, then
 /// renamed, as a running program may have the old one mapped, or another build be reading it. Returns its path, or if
 /// pin that of a link to it of this process's, which the launcher removes, by which what the process runs loads this
-/// build's image though another build replaces it.
+/// build's image though another build replaces it; and the version of p's program, the hash of the names of what it is
+/// linked from but -O2's.
 function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, o: Options, o2: i32[][][] | null = null,
-	fresh = false): string {
+	fresh = false): [string, u64] {
 	const out = `${dir}/image${if (o.dyn) "" else ".mono"}.so`
 	// What a process gone left, a copy <out>.<pid> or a pin <out>.<pid>.<n>.run, which keeps the image from being
 	// written in place, is removed, unless another build was first; another name is of pid 0, kept.
@@ -589,7 +591,7 @@ function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, 
 
 /// The image out, which image links of old, the image continued if not null, written in place if alone.
 function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, o: Options, o2: i32[][][] | null,
-	out: string, old: File | null, alone: bool): string {
+	out: string, old: File | null, alone: bool): [string, u64] {
 	const lib = `${sysroot}/usr/lib`
 	const d = decoded
 	decoded = null
@@ -659,6 +661,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			l.remove(h)
 		}
 	}
+	const parts = [...names]
 	const cxxs: string[] = if (cxx) [`${lib}/libc++.a`, `${lib}/libc++abi.a`] else []
 	const archives: string[] = []
 	let added = false // an archive the image did not look in
@@ -667,6 +670,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		if (!endsWith(f, ".a")) {
 			const bytes = readFile(f)
 			const name = `${f}@${fnv(bytes)}`
+			parts.push(name)
 			if (lacks(name)) {
 				l.add(format.read(name, bytes))
 			}
@@ -675,6 +679,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		// An object stands for the archive, whose members are linked as what they define is named.
 		const info = stat(f)
 		const name = `${f}@${info.modified}.${info.size}`
+		parts.push(name)
 		if (held.some(h => h != name && startsWith(h, `${f}@`))) {
 			return image(p, mains, files, cxx, pin, o, o2, true)
 		}
@@ -741,7 +746,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	if (at != out) {
 		rename(tmp, out)
 	}
-	return if (pin) own else out
+	return [if (pin) own else out, fnv(parts.join(" "))]
 }
 
 /// Module m of p, compiled by TPDE as o says, as the object name. It defines a symbol named by its ABI, one by name,

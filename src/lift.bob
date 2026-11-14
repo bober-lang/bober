@@ -2,12 +2,13 @@
 //! types; and the modules of the bundle, linked into it from their files (src/bc/file.bob) rather than checked and
 //! lowered.
 
+import { indexOf, startsWith } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
 import { Reader, Writer } from "../std/encoding/binary"
 import { open } from "../std/fs"
 import { join } from "../std/fs/path"
 import { fnv } from "../std/hash"
-import { executable } from "../std/process"
+import { executable, name } from "../std/process"
 import { ParseError } from "../std/string"
 import * as decl from "./bc/decl"
 import { In, abi, head, read, write } from "./bc/file"
@@ -259,8 +260,13 @@ export function unbundle(s: string): HashMap[string, string] throws ParseError {
 	return files
 }
 
-/// The hash of the compiler's ID: Mach-O's UUID, which signing it keeps, else its first page, with ELF's build ID.
+/// The hash of the compiler's ID: of an image's, its entry and version, which name the code it runs (src/launch.c);
+/// else of its executable Mach-O's UUID, which signing it keeps, else its first page, with ELF's build ID.
 export function compilerId(): u64 throws IoError {
+	const launched = name()
+	if (startsWith(launched, "bober.") && indexOf(launched, "@") > 0) {
+		return fnv(launched)
+	}
 	const f = open(executable())
 	const page = f.read(4096) ?? ""
 	f.close()
