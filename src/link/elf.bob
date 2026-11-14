@@ -353,11 +353,11 @@ function exports(name: string, bytes: string): string[] throws CompileError {
 /// more, past them all, the loader's tables: the dynamic symbols, their hash table, the relocations, the
 /// eh_frame_hdr and the dynamic section, which glibc's loader writes. A section header per name of sections and a
 /// symbol table, which no loader reads, say what is where for debuggers and profilers.
-function write(image: Image): string throws CompileError {
+function write(image: Image) throws CompileError {
 	const segs = image.segments
 	const last = segs[segs.length - 1]
 	// The loader's tables are at address base, and at offset file in the file, both multiples of a page.
-	const file = alignUp((image.bytes.length + image.extra.length) as u64, image.page)
+	const file = alignUp(image.bytes.length, image.page)
 	const base = alignUp(last.address + last.size + last.zero, image.page)
 	let tail = ""
 	const place = (s: string) => {
@@ -394,7 +394,7 @@ function write(image: Image): string throws CompileError {
 		const at = image.rebases[i]
 		put(rela, 24 * i, at, 8)
 		put(rela, 24 * i + 8, if (x64) R_X86_64_RELATIVE else R_AARCH64_RELATIVE, 8)
-		put(rela, 24 * i + 16, get(image.bytes, image.at(at), 8), 8)
+		put(rela, 24 * i + 16, image.bytes.get(at, 8), 8)
 	}
 	for (const i of 0 ... image.binds.length - 1) {
 		const b = image.binds[i]
@@ -448,7 +448,7 @@ function write(image: Image): string throws CompileError {
 		const sflags = SHF_ALLOC | (if (seg.write) SHF_WRITE else 0) | (if (seg.exec) SHF_EXECINSTR else 0) |
 			(if (threaded(image, at)) SHF_TLS else 0)
 		const sht = if (at >= seg.address + seg.size && size > 0) SHT_NOBITS else SHT_PROGBITS
-		section(name, sht, sflags, at, image.at(at) as u64, size, 0, 0, 0)
+		section(name, sht, sflags, at, at, size, 0, 0, 0)
 	}
 	const t = (at: u64) => file + at - base
 	const dynsymIndex = section(".dynsym", SHT_DYNSYM, SHF_ALLOC, symAt, t(symAt), dynsym.length as u64, n + 2, 1, 24)
@@ -469,14 +469,14 @@ function write(image: Image): string throws CompileError {
 	for (const i of 0 ... segs.length - 1) {
 		const s = segs[i]
 		const start = if (i == 0) 0 else s.address
-		phdrs += program(PT_LOAD, flags(s), s.offset + start - s.address, start, s.address + s.size - start,
+		phdrs += program(PT_LOAD, flags(s), start, start, s.address + s.size - start,
 			s.address + s.size + s.zero - start, image.page)
 	}
 	phdrs += program(PT_LOAD, PF_R | PF_W, file, base, loaded, loaded, image.page)
 	phdrs += program(PT_DYNAMIC, PF_R | PF_W, t(dynAt), dynAt, dyn.length as u64, dyn.length as u64, 8)
 	const [tfrom, tto, talign] = image.thread
 	if (tto > tfrom) {
-		phdrs += program(PT_TLS, PF_R, image.at(tfrom) as u64, tfrom, tto - tfrom, tto - tfrom, talign)
+		phdrs += program(PT_TLS, PF_R, tfrom, tfrom, tto - tfrom, tto - tfrom, talign)
 	}
 	if (hdrAt != 0) {
 		phdrs += program(PT_GNU_EH_FRAME, PF_R, t(hdrAt), hdrAt, hdrSize, hdrSize, 4)
@@ -488,11 +488,9 @@ function write(image: Image): string throws CompileError {
 	const head = ident + le(0, 9) + le(ET_DYN, 2) + le(if (x64) EM_X86_64 else EM_AARCH64, 2) + le(1, 4) + le(0, 8) +
 		le(64, 8) + le(shoff, 8) + le(0, 4) + le(64, 2) + le(56, 2) + le((phdrs.length / 56) as u64, 2) + le(64, 2) +
 		le(n + 1, 2) + le(n, 2) + phdrs
-	for (const i of 0 ... head.length - 1) {
-		image.bytes[i] = head[i]
-	}
-	const body = fromBytes(image.bytes) + image.extra
-	return body + zeros((file as i32) - body.length) + tail
+	image.bytes.set(0, head)
+	image.bytes.set(file, tail)
+	image.bytes.length = file + (tail.length as u64)
 }
 
 /// A program header.
@@ -560,17 +558,17 @@ function hash(syms: Symbol[]): u8[] {
 /// The eh_frame_hdr, at address at, of the call frame information of image, from and to where its unwinds say: where
 /// the first is, and a table for the unwinder to search, of the code address of each FDE and its own, sorted.
 function frames(image: Image, at: u64): u8[] throws CompileError {
-	const b = image.bytes
 	const spans = image.unwinds
 	const fdes: [u64, u64][] = []
 	for (const [from, to] of spans) {
-		const d = from - (image.at(from) as u64) // what an address here is more than where b has it
+		const b = image.bytes.slice(from, to)
 		let p = from
 		while (p + 4 <= to) {
-			const size = get(b, (p - d) as i32, 4)
-			const cie = get(b, (p + 4 - d) as i32, 4)
+			const size = u(b, (p - from) as i32, 4)
+			const cie = u(b, (p + 4 - from) as i32, 4)
 			// An FDE of a dropped function was not fixed up, and its pc is its own address.
-			const pc = if (size != 0 && cie != 0) pointer(b, p + 8, encoding(b, (p + 4 - cie - d) as i32), d) else from
+			const pc = if (size != 0 && cie != 0) pointer(b, p + 8, encoding(b, (p + 4 - cie - from) as i32), from)
+				else from
 			if (pc < from || pc >= to) {
 				fdes.push([pc, p])
 			}
@@ -592,7 +590,7 @@ function frames(image: Image, at: u64): u8[] throws CompileError {
 /// The encoding of the code addresses of the FDEs of the CIE at cie: that its augmentation gives after an R, else
 /// absolute. The augmentation is a string of letters, of which a z says data of those after it follow the CIE's
 /// alignments and return address register: an R's an encoding, a P's an encoding and a pointer in it, an L's a byte.
-function encoding(b: u8[], cie: i32): u64 throws CompileError {
+function encoding(b: string, cie: i32): u64 throws CompileError {
 	const aug = cie + 9
 	let p = aug
 	while (b[p] != 0) {
@@ -614,10 +612,10 @@ function encoding(b: u8[], cie: i32): u64 throws CompileError {
 
 /// The address the pointer at the address p, which b has d before, holds in encoding enc: of the size and sign of its
 /// low 4 bits, and relative to p if its next 3 are 1, else absolute.
-function pointer(b: u8[], p: u64, enc: u64, d: u64): u64 throws CompileError {
+function pointer(b: string, p: u64, enc: u64, d: u64): u64 throws CompileError {
 	const n = size(enc)
 	const shift = 64 - 8 * n
-	let v = get(b, (p - d) as i32, n)
+	let v = u(b, (p - d) as i32, n)
 	v = if ((enc & 8) != 0) (((v << shift) as i64) >> shift) as u64 else v
 	if ((enc & 0x70) > 0x10) {
 		throw new CompileError(`unwind tables: pointer encoding ${enc} is not supported`)
@@ -638,7 +636,7 @@ function size(enc: u64): i32 throws CompileError {
 }
 
 /// p past the LEB128 number at p.
-function skip(b: u8[], p: i32): i32 {
+function skip(b: string, p: i32): i32 {
 	let q = p
 	while (b[q] >= 0x80) {
 		q++

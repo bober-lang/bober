@@ -4,18 +4,18 @@
 import { Reader, Writer } from "../../std/encoding/binary"
 import { Arch } from "../../std/os"
 import { ParseError } from "../../std/string"
+import { Bytes } from "./bytes"
 import { Fixup, Object, Section, Symbol } from "./object"
 
 /// What the state starts with, and the version of its encoding.
-const magic = "bober image 3"
+const magic = "bober image 4"
 
 /// Where the sections of one of regions are: from start to top, of which holes, in order, are free; cap, which top
-/// stays below, where the next region starts; and file, where the image's file has its bytes.
+/// stays below, where the next region starts.
 export class Region {
 	start: u64
 	top: u64
 	cap: u64 = 0xffffffff_ffffffff
-	file: u64 = 0
 	holes: [u64, u64][] = []
 
 	constructor(start: u64) {
@@ -59,7 +59,6 @@ export function write(s: State, arch: Arch): string {
 		w.uleb(r.start)
 		w.uleb(r.top)
 		w.uleb(r.cap)
-		w.uleb(r.file)
 		list(w, r.holes, h => {
 			w.uleb(h[0])
 			w.uleb(h[1])
@@ -120,16 +119,15 @@ export function write(s: State, arch: Arch): string {
 }
 
 /// The state in the file of a kept image of arch, whose format's headers take headers bytes; null if it holds none.
-export function read(file: string, headers: u64, arch: Arch): State | null {
+export function read(file: Bytes, headers: u64, arch: Arch): State | null {
 	try {
-		const r = new Reader(file)
-		r.pos = headers as i32
-		const at = r.fixed(8)
-		const size = r.fixed(8)
-		if (at > (file.length as u64) || size > (file.length as u64) - at) {
+		const at = file.get(headers, 8)
+		const size = file.get(headers + 8, 8)
+		if (at > file.length || size > file.length - at) {
 			return null
 		}
-		r.pos = at as i32
+		const kept = file.slice(at, at + size)
+		const r = new Reader(kept)
 		const str = () => r.raw(r.uleb() as i32)
 		if (r.raw(magic.length) != magic || str() != arch) {
 			return null
@@ -139,7 +137,6 @@ export function read(file: string, headers: u64, arch: Arch): State | null {
 			const region = new Region(r.uleb())
 			region.top = r.uleb()
 			region.cap = r.uleb()
-			region.file = r.uleb()
 			region.holes = many(r, () => [r.uleb(), r.uleb()])
 			return region
 		})
@@ -157,7 +154,7 @@ export function read(file: string, headers: u64, arch: Arch): State | null {
 				return sec
 			})
 			o.symbols = many(r, () => new Symbol(str(), r.u8(), r.sleb() as i32, r.uleb(), r.uleb()))
-			return [o, at, file.slice(from, r.pos)]
+			return [o, at, kept.slice(from, r.pos)]
 		})
 		s.slots = many(r, () => [str(), r.uleb(), r.uleb()])
 		s.sections = many(r, () => [str(), r.u8(), r.uleb(), r.uleb()])
