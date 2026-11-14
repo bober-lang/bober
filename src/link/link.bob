@@ -13,7 +13,9 @@
 
 import { partitionPoint, sort, sortBy, stableSort, startsWith } from "../../std/algo"
 import { HashMap } from "../../std/collections/hashmap"
+import { bytes as random } from "../../std/crypto/random"
 import { get, put } from "../../std/encoding/binary"
+import { combine, fnv } from "../../std/hash"
 import { alignUp, max, min } from "../../std/math"
 import { Arch } from "../../std/os"
 import { CompileError } from "../error"
@@ -188,8 +190,19 @@ export class Linker {
 	/// Per name a library defines, the first that does.
 	private imports = new HashMap[string, i32]()
 	private exported: string[] = []
+	/// The names: the shared ones, then the local ones a slot needs (unshared), from shared on; those of a continued
+	/// image made once it links. Until plan, shared is how many the continued image has.
 	private names: Name[] = []
-	private index = new HashMap[string, i32]()
+	private shared = 0
+	/// The table of the shared names' indices by their hash of seed, slot by slot (slot); in the image's bytes where a
+	/// continued image has it, else in bytes of its own; and whether it is not as made, so that the image is linked anew.
+	/// A kept image's has room for as many names again as it was made with, and is linked anew once that is full,
+	/// which drops those no longer named.
+	private table = new Bytes()
+	private at: u64 = 0
+	private cap: u64 = 1024
+	private seed: u64 = 0
+	private broken = false
 	/// The names wanted, in the order first wanted, for which lazy objects are looked for.
 	private wanted: i32[] = []
 	/// Per group, the unit whose sections of it are taken.
@@ -215,7 +228,11 @@ export class Linker {
 		this.keep = kept != null
 		this.regions = if (kept != null) keptRegions else regions
 		const s = if (kept != null) read(kept, format.headers, machine.arch) else null
-		if (s == null) {
+		const [at, cap, count] = s?.names ?? [0, 0, 0]
+		const fits = (u: [Object, u64[], string, [u64, u64][], i32[]]) =>
+			u[4].length == u[0].symbols.length && u[4].every(g => g >= -1 && ((g + 1) as u64) <= count)
+		if (s == null || count > cap / 2 || cap & (cap - 1) != 0 || at > kept!.length || cap > (kept!.length - at) / 12 ||
+			!s.units.every(fits) || !s.slots.every(e => e[0] < count)) {
 			return
 		}
 		this.state = s
@@ -224,16 +241,17 @@ export class Linker {
 			u.at = e[1]
 			u.encoded = e[2]
 			u.blocks = e[3]
+			u.names = e[4]
 			return u
 		})
 		this.units[0].frozen = true
 		this.loaded = s.units.length
 		this.bytes = kept!
-		for (const [name, slot, stub] of s.slots) {
-			const n = this.names[this.name(name)]
-			n.slot = slot
-			n.stub = stub
-		}
+		this.table = kept!
+		this.at = at
+		this.cap = cap
+		this.seed = s.seed
+		this.shared = count as i32
 		// The sections of a bound name are laid out anew, as one, of the bytes they have.
 		for (const u of this.units) {
 			for (const i of 0 ... u.object.sections.length - 1) {
@@ -330,13 +348,33 @@ export class Linker {
 	}
 
 	private make(): Image throws CompileError {
+		// A table made anew is of a seed of its own, drawn here, as a linker only read of (sections, objects) draws none.
+		if (this.shared == 0) {
+			try {
+				this.seed = fnv(random(8))
+			} catch (e: IoError) {}
+		}
+		// The names the continued image has, named as its units define.
+		for (const _ of 1 ... this.shared) {
+			this.names.push(new Name(""))
+		}
+		for (const [g, slot, stub] of this.state.slots) {
+			this.names[g as i32].slot = slot
+			this.names[g as i32].stub = stub
+		}
 		this.resolve()
 		const own = this.plan()
-		const defined = (name: string) => this.names[this.name(name)].unit >= 0
+		const defined = (name: string) => {
+			const g = this.find(name)
+			return g >= 0 && this.names[g].unit >= 0
+		}
 		for (const name of this.exported) {
 			if (!defined(name)) {
 				this.errors.push(`${name} is exported but not defined`)
 			}
+		}
+		if (this.broken) {
+			throw new CompileError("the table of names is broken")
 		}
 		if (this.errors.length > 0) {
 			throw new CompileError(this.errors.join("\n"))
@@ -366,7 +404,7 @@ export class Linker {
 		// A continued image's exports are those it had, but the names no longer defined, and those asked for now.
 		const exports = [...this.state.exports.filter(e => defined(e) && !this.exported.includes(e)), ...this.exported]
 		for (const name of exports) {
-			image.exports.push([name, this.names[this.name(name)].address])
+			image.exports.push([name, this.names[this.find(name)].address])
 		}
 		if (this.keep) {
 			this.save(image, exports)
@@ -401,14 +439,16 @@ export class Linker {
 			if (this.errors.length == errors) {
 				return
 			}
-			const missing = (s: Symbol) => {
-				if (s.binding != Global) {
-					return false
+			const missing = (u: Unit) => {
+				for (const i of 0 ... u.names.length - 1) {
+					const n = if (u.names[i] >= 0 && u.object.symbols[i].binding == Global) this.names[u.names[i]] else null
+					if (n != null && n.unit < 0 && n.library < 0) {
+						return true
+					}
 				}
-				const n = this.names[this.index.get(s.name)!]
-				return n.unit < 0 && n.library < 0
+				return false
 			}
-			const gone = this.units.slice(0, this.loaded).filter(u => !u.frozen && u.object.symbols.some(missing))
+			const gone = this.units.slice(0, this.loaded).filter(u => !u.frozen && missing(u))
 			if (gone.length == 0) {
 				return
 			}
@@ -427,10 +467,8 @@ export class Linker {
 			this.groups = new HashMap[string, i32]()
 			this.pointed = new HashMap[string, bool]()
 			this.bounded = []
-			for (const k of 0 ... this.units.length - 1) {
-				const u = this.units[k]
-				u.names = []
-				u.at = if (k < this.loaded) u.at else new u64[](u.object.sections.length)
+			for (const u of this.units.slice(this.loaded, this.units.length)) {
+				u.at = new u64[](u.object.sections.length)
 			}
 		}
 	}
@@ -481,14 +519,17 @@ export class Linker {
 				this.pointed.set(sec.name, true)
 			}
 		}
-		for (const s of o.symbols) {
-			if (s.binding == Local) {
-				u.names.push(-1)
+		if (u.names.length == 0) {
+			u.names = o.symbols.map(s => if (s.binding == Local) -1 else this.name(s.name))
+		}
+		for (const j of 0 ... o.symbols.length - 1) {
+			const s = o.symbols[j]
+			const g = u.names[j]
+			if (g < 0) {
 				continue
 			}
-			const g = this.name(s.name)
-			u.names.push(g)
 			const n = this.names[g]
+			n.name = s.name
 			if (s.section >= 0 && u.at[s.section] != dropped) {
 				if (n.unit < 0 || rank(s.binding) > rank(n.binding)) {
 					if (n.unit == 0 && this.loaded > 0) {
@@ -591,6 +632,7 @@ export class Linker {
 		const slots = new Section("slots", Data)
 		stubs.align = 4
 		slots.align = 8
+		this.shared = this.names.length
 		const own = new Unit(new Object("linker", this.machine.arch), this.keep)
 		own.object.sections = [stubs, slots]
 		own.at = [0, 0]
@@ -951,7 +993,7 @@ export class Linker {
 		}
 		const n = this.names[g]
 		return slotted(f.kind) || this.stubbed(f.kind, n) && p != n.slot || n.unit >= 0 && this.units[n.unit].frozen ||
-			(this.index.get(n.name) ?? -1) != g
+			g >= this.shared
 	}
 
 	/// Keeps in the image what a later link continues it from: its units, the frozen ones as one and the others
@@ -972,7 +1014,7 @@ export class Linker {
 		const [kept, table] = [s.regions[s.regions.length - 2], s.regions[s.regions.length - 1]]
 		for (const u of units.filter(u => u.blocks.length == 0)) {
 			const what = u.object.name
-			u.encoded = record(u.object)
+			u.encoded = record(u.object, u.names)
 			u.blocks = [this.block(kept, u.encoded, what)]
 			// Not those whose address a later link may change: of a floating section, or a thread's copy.
 			const syms = u.object.symbols.filter(x => {
@@ -986,14 +1028,25 @@ export class Linker {
 				image.symbols.push([syms, u.blocks[1][0], u.blocks[2][0]])
 			}
 		}
-		s.units = units.map(u => [u.object, u.at, u.encoded, u.blocks])
+		s.units = units.map(u => [u.object, u.at, u.encoded, u.blocks, u.names])
 		s.slots = []
-		for (const g of 0 ... this.names.length - 1) {
-			const n = this.names[g]
-			if (n.slot != 0 && (this.index.get(n.name) ?? -1) == g) {
-				s.slots.push([n.name, n.slot, n.stub])
+		for (const g of 0 ... this.shared - 1) {
+			if (this.names[g].slot != 0) {
+				s.slots.push([g as u64, this.names[g].slot, this.names[g].stub])
 			}
 		}
+		// A table not in the image's bytes is one made anew, or grown.
+		if (this.table != this.bytes) {
+			if (this.loaded > 0) {
+				throw new CompileError("the table of names is full")
+			}
+			if (4 * (this.shared as u64) > this.cap) {
+				this.grow()
+			}
+			this.at = this.block(kept, this.table.slice(this.at, this.at + 12 * this.cap), "names")[0]
+		}
+		s.names = [this.at, this.cap, this.shared as u64]
+		s.seed = this.seed
 		s.exports = exports
 		s.inits = image.inits
 		s.thread = image.thread
@@ -1027,9 +1080,11 @@ export class Linker {
 		const region = (at: u64) => partitionPoint(regions, r => r.cap > at) as i32
 		// Per name, its symbol in o, which a frozen unit defines, or one of the bounds of sections laid out for good.
 		const symbols = new HashMap[i32, i32]()
+		const names: i32[] = []
 		const symbol = (g: i32) => {
 			const j = symbols.get(g) ?? o.symbols.length
 			if (j == o.symbols.length) {
+				names.push(if (g < this.shared) g else -1)
 				const n = this.names[g]
 				const bounds = (x: string) => n.name == `__start_${x}` || n.name == `__stop_${x}`
 				const s = new Symbol(n.name, Weak)
@@ -1047,12 +1102,13 @@ export class Linker {
 		for (const u of units) {
 			for (const i of 0 ... u.object.symbols.length - 1) {
 				const s = u.object.symbols[i]
-				if (s.binding != Local) {
+				if (s.binding != Local && u.names[i] >= 0) {
 					const t = o.symbols[symbol(u.names[i])]
 					t.binding = if (t.section < 0 && (s.binding == Global || s.section >= 0)) Global else t.binding
 				} else if (s.name != "" && s.section >= 0 && u.at[s.section] != dropped) {
 					const at = u.at[s.section] + s.value
 					o.symbols.push(new Symbol(s.name, Local, region(at), at - regions[region(at)].start, s.size))
+					names.push(-1)
 				}
 			}
 			for (const i of 0 ... u.object.sections.length - 1) {
@@ -1071,7 +1127,7 @@ export class Linker {
 			}
 		}
 		for (const x of this.state.pinned) {
-			for (const g of [this.index.get(`__start_${x}`) ?? -1, this.index.get(`__stop_${x}`) ?? -1]) {
+			for (const g of [this.find(`__start_${x}`), this.find(`__stop_${x}`)]) {
 				if (g >= 0 && this.names[g].section >= 0) {
 					symbol(g)
 				}
@@ -1094,6 +1150,7 @@ export class Linker {
 		this.state.sections = merged([...this.state.sections, ...laid]).filter(e => e[0] != "")
 		const frozen = new Unit(o, true)
 		frozen.at = regions.map(r => r.start)
+		frozen.names = names
 		return frozen
 	}
 
@@ -1122,6 +1179,7 @@ export class Linker {
 		}
 		const kept = new Unit(o)
 		kept.at = u.at
+		kept.names = u.names.map(g => if (g < this.shared) g else -1)
 		return kept
 	}
 
@@ -1149,14 +1207,74 @@ export class Linker {
 		return true
 	}
 
-	/// The index of the Name of name, made if there is none.
+	/// The index of the shared Name of name, made if there is none.
 	private name(name: string): i32 {
-		const g = this.index.get(name) ?? this.names.length
-		if (g == this.names.length) {
-			this.index.set(name, g)
-			this.names.push(new Name(name))
+		const h = this.hash(name)
+		const g = this.id(this.slot(h))
+		if (g >= 0) {
+			return g
 		}
-		return g
+		if (2 * ((this.names.length as u64) + 1) > this.cap) {
+			this.grow()
+		}
+		const p = this.slot(h)
+		this.table.put(p, h, 8)
+		this.table.put(p + 8, (this.names.length as u64) + 1, 4)
+		this.names.push(new Name(name))
+		return this.names.length - 1
+	}
+
+	/// The index of the shared Name of name, -1 if there is none.
+	private find(name: string): i32 { return this.id(this.slot(this.hash(name))) }
+
+	/// The index of the name of the table's slot at p, -1 if none, or if the table is broken.
+	private id(p: u64): i32 {
+		const g = (this.table.get(p + 8, 4) as i64) - 1
+		this.broken = this.broken || g >= (this.names.length as i64)
+		return if (this.broken) -1 else g as i32
+	}
+
+	/// The hash of name; that of another name may be the same, which is not noticed, but for the seed of an image linked
+	/// anew.
+	private hash(name: string): u64 {
+		let h = this.seed
+		for (const c of name) {
+			h = combine(h, c)
+		}
+		return h
+	}
+
+	/// Where the table's slot of hash h is, of 12 bytes: h and the index of its name plus 1; else the free one it takes.
+	private slot(h: u64): u64 {
+		let i = (h ^ h >> 32) & (this.cap - 1)
+		for (const _ of 1 ... (this.cap as i32)) {
+			const p = this.at + 12 * i
+			if (this.table.get(p + 8, 4) == 0 || this.table.get(p, 8) == h) {
+				return p
+			}
+			i = (i + 1) & (this.cap - 1)
+		}
+		this.broken = true
+		return this.at
+	}
+
+	/// Makes the table, then in bytes of its own, of twice the slots.
+	private grow() {
+		const table = this.table
+		const at = this.at
+		const cap = this.cap
+		this.table = new Bytes()
+		this.at = 0
+		this.cap = 2 * cap
+		for (const i of 0 ... (cap as i32) - 1) {
+			const p = at + 12 * (i as u64)
+			const g = table.get(p + 8, 4)
+			if (g != 0) {
+				const q = this.slot(table.get(p, 8))
+				this.table.put(q, table.get(p, 8), 8)
+				this.table.put(q + 8, g, 4)
+			}
+		}
 	}
 }
 

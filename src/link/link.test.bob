@@ -518,8 +518,14 @@ test "a kept image's units keep their records and symbols where they are, and on
 	const image = keep(kept(file(first)), [obj("b", Code, [0xd65f03c0], [new Symbol("g", Global, 0)])], ["f", "g"])
 	const [g, _, name] = image.symbols[0]
 	assert image.symbols.length == 1 && g.length == 1 && g[0].name == "g" && g[0].value == at(image, "g")
-	const [from, to] = [first.strtab[0], first.strtab[1] - 1] // but the last byte, the top a later link adds from
-	assert image.bytes.slice(from, to) == first.bytes.slice(from, to)
+	// Of the Kept sections' region, but its last byte, the top a later link adds from, only g's slot in the names' table.
+	const [from, to] = [first.strtab[0], first.strtab[1] - 1]
+	const [was, now] = [first.bytes.slice(from, to), image.bytes.slice(from, to)]
+	let changed = 0
+	for (const i of 0 ... was.length - 1) {
+		changed += if (now[i] != was[i]) 1 else 0
+	}
+	assert now.length == was.length && changed <= 12
 	assert image.symtab[0] == first.symtab[0] && image.symtab[1] == first.symtab[1] + 24
 	assert image.bytes.slice(name, name + 3) == "_g\x00"
 }
@@ -530,4 +536,37 @@ test "an object a continued image links, a lazy one too, with a section the imag
 	l.lazy(["lz"], () => obj("z", Init, [0, 0], [new Symbol("lz", Global, 0)]))
 	assert keep(l, [obj("b", Data, [0, 0], [new Symbol("lz", Global)], [new Fixup(0, Abs64, 0, 0)])]) throws new Stale(
 		"z has sections the image has for good")
+}
+
+test "a kept image whose table of names is broken is stale" {
+	const first = keep(kept(), [obj("a", Code, [0xd65f03c0], [new Symbol("f", Global, 0)])], ["f"])
+	const c = obj("c", Code, [0x94000000], [new Symbol("f", Global)], [new Fixup(0, Call, 0, 0)])
+	assert keep(kept(file(first)), [c]).exports.length == 1
+	// The table is the last block of the Kept sections' region: of 1024 slots, each's index in its last 4 bytes.
+	const table = first.strtab[1] - 1 - 12 * 1024
+	for (const i of 0 ... 1023) {
+		const p = table + 12 * (i as u64) + 8
+		if (first.bytes.get(p, 4) != 0) {
+			first.bytes.put(p + 3, 0x80, 1)
+		}
+	}
+	assert keep(kept(file(first)), [c]) throws new Stale("the table of names is broken")
+}
+
+test "a kept image whose table of names is full is stale" {
+	const first = file(keep(kept(), [obj("a", Data, [0], [new Symbol("g", Global, 0)])]))
+	const syms: Symbol[] = []
+	for (const i of 1 ... 600) {
+		syms.push(new Symbol(`g${i}`, Global, 0))
+	}
+	assert keep(kept(first), [obj("b", Data, [0], syms)]) throws new Stale("the table of names is full")
+}
+
+test "the slot of a local symbol stays the local's in a kept image's frozen unit" {
+	const a = obj("a", Code, [0x90000000, 0xd65f03c0], [new Symbol("here", Local, 0, 4)], [new Fixup(0, SlotPage, 0, 0)])
+	const calls = (name: string, x: string) => obj(name, Code, [0x94000000], [new Symbol(x, Global)],
+		[new Fixup(0, Call, 0, 0)])
+	const first = file(keep(kept(), [a]))
+	const second = file(keep(kept(first), [calls("b", "puts")]))
+	assert keep(kept(second), [calls("c", "environ")]).binds.length == 2
 }
