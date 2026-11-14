@@ -140,12 +140,14 @@ export function le(v: u64, n: i32): string {
 	return s
 }
 
-/// Writes bytes to path: their written pages, coalesced, over a copy of old if it is not null, else over an empty file;
-/// and their last page, at which the file ends.
-export function store(path: string, old: File | null, bytes: Bytes) {
-	const f = if (old != null) old.copy(path, bytes.length) else open(path, "w")
+/// Writes bytes to f, as it has those the bytes are written over: their written pages, coalesced, and their last page,
+/// at which the file ends; their first page last, zeros until then, so that a file left half written is no image, nor
+/// one a build continues.
+export function store(f: File, bytes: Bytes) {
+	const first = bytes.slice(0, min(4096, bytes.length)).copy() // not the file's, which this may write
+	f.writeAt(0, zeros(first.length))
 	const end = (bytes.length + 0xfff) >> 12
-	let p: u64 = 0
+	let p: u64 = 1
 	while (p < end) {
 		let q = p
 		while (q < end && (bytes.written(q << 12) || q == end - 1)) {
@@ -156,14 +158,16 @@ export function store(path: string, old: File | null, bytes: Bytes) {
 		}
 		p = q + 1
 	}
-	f.close()
+	f.writeAt(0, first)
 }
 
 /// The bytes, stored as a build stores them, their holes kept, and mapped: of an image's address space, only what is
 /// written takes memory.
 export function mapped(bytes: Bytes): string {
 	const dir = makeTempDir("bober-")
-	store(`${dir}/image`, null, bytes)
+	const f = open(`${dir}/image`, "w")
+	store(f, bytes)
+	f.close()
 	const s = mapFile(`${dir}/image`)
 	removeAll(dir)
 	return s

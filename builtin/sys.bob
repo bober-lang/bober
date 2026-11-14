@@ -2,10 +2,10 @@
 
 import { BOBER_IO_AGAIN, BOBER_IO_HOST, bober_entropy, bober_env, bober_io_accept, bober_io_close, bober_io_connected,
 	bober_io_copy, bober_io_dial, bober_io_exe, bober_io_idle, bober_io_ip, bober_io_ip_text, bober_io_kind,
-	bober_io_list, bober_io_listen, bober_io_mkdir, bober_io_name, bober_io_open, bober_io_read, bober_io_readlink,
-	bober_io_ready, bober_io_recvfrom, bober_io_remove, bober_io_rename, bober_io_reset, bober_io_run, bober_io_sendto,
-	bober_io_shutdown, bober_io_size, bober_io_stat, bober_io_sync, bober_io_write, bober_io_write_at, bober_mono,
-	bober_tz } from "../src/rt.h"
+	bober_io_list, bober_io_listen, bober_io_lock, bober_io_mkdir, bober_io_name, bober_io_open, bober_io_read,
+	bober_io_readlink, bober_io_ready, bober_io_recvfrom, bober_io_remove, bober_io_rename, bober_io_reset, bober_io_run,
+	bober_io_sendto, bober_io_shutdown, bober_io_size, bober_io_stat, bober_io_sync, bober_io_write, bober_io_write_at,
+	bober_mono, bober_tz } from "../src/rt.h"
 import { fromC } from "./c"
 import { IoError, Kind } from "./error"
 import { fromBytes, mapped } from "./string"
@@ -156,6 +156,13 @@ export class Handle {
 			done += this.checked(bober_io_write_at(this.fd, rest, rest.length as u64, at + (done as u64)),
 				"write") as i32
 		}
+	}
+
+	/// Whether it locks the file, shared or for this handle alone, as flock does, waiting if wait for others' locks to
+	/// go, else false at once if one stands in the way; closing it unlocks it.
+	lock(shared: bool, wait: bool): bool throws IoError {
+		this.alive("lock")
+		return this.checked(bober_io_lock(this.fd, if (shared) 1 else 0, if (wait) 1 else 0), "lock") == 1
 	}
 
 	/// Waits until what was written is on the device.
