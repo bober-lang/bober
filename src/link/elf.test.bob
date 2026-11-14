@@ -1,11 +1,12 @@
 //! Tests of src/link/elf: a written shared library read back.
 
 import { CompileError } from "../error"
+import { Tpde } from "../backend/tpde"
 import { arm64 } from "./arm64"
 import { Bytes, le, mapped, zeros } from "./bytes"
 import { elf } from "./elf"
 import { Linker } from "./link"
-import { Code, Global, Object, Section, Symbol, Unwind } from "./object"
+import { Code, Global, Local, Object, Section, Symbol, Unwind } from "./object"
 
 /// The file of the image l links.
 function file(l: Linker): Bytes throws CompileError {
@@ -70,4 +71,21 @@ test "a symbol's entry is in the section its header says, of a kept image too, w
 	again.add(u)
 	const [names, _] = symbols(file(again))
 	assert names == "f"
+}
+
+test "a stack map's fixup names its own function, though another object's definition takes the name" {
+	const b = new Tpde("m")
+	b.collected()
+	const r = b.ref()
+	const g = b.function("g", b.fn(b.void(), [r]), false)
+	const f = b.function("f", b.fn(r, [r]), false)
+	b.at(b.block(f))
+	b.call(b.fn(b.void(), [r]), g, [b.param(f, 0)])
+	b.ret(b.param(f, 0))
+	const o = elf.read("m.o", b.object())
+	const maps = o.sections.filter(s => s.name == ".llvm_stackmaps")
+	assert maps.length == 1
+	const own = o.symbols[maps[0].fixups[0].symbol]
+	const def = o.symbols.find(s => s.name == "f")!
+	assert own.binding == Local && own.section == def.section && own.value == def.value
 }

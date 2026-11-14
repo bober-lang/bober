@@ -11,7 +11,7 @@ import { CompileError } from "../error"
 import { le, str, u, zeros } from "./bytes"
 import { Format, Image, Segment } from "./link"
 import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Init, Local, Object, Page, PageOff, Rel32, Rel64,
-	Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Thread32, Unwind, Weak, Zero } from "./object"
+	Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Thread32, Unwind, Weak, Zero, own } from "./object"
 
 /// The room the writer needs before the first linked address: the ELF header and 10 program headers, a PT_LOAD per
 /// segment, of at most 5 (link.bob's keptRegions), and one for the loader's tables, PT_DYNAMIC, PT_TLS, PT_GNU_EH_FRAME
@@ -268,7 +268,9 @@ function read(name: string, bytes: string): Object throws CompileError {
 					addend -= a
 				}
 				if (kind != 255) {
-					o.sections[index[info]].fixups.push(new Fixup(u(bytes, p, 8), kind as u8, sym, addend))
+					const s = o.sections[index[info]]
+					s.fixups.push(new Fixup(u(bytes, p, 8), kind as u8, if (s.name == ".llvm_stackmaps") own(o, sym) else sym,
+						addend))
 				}
 			}
 		}
