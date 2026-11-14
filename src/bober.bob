@@ -177,13 +177,16 @@ export function ld(args: string[], out: string) {
 	}
 }
 
+/// p, which is rooted or under cwd, rooted.
+const under = (cwd: string, p: string) => if (isAbs(p)) p else `${cwd}/${p}`
+
 /// The CMake toolchain file of C library c, built in cwd: bober's defaults for the target, its triple, the sysroot and on
 /// ELF static executables, with the compilers CMake finds, run by ccache if found with paths under cwd made relative,
 /// so that checkouts share hits, and so without precompiled headers, then c's toolchain file, which may override them.
-const toolchain = (c: CLib, cwd: string) => `set(CMAKE_C_COMPILER_TARGET ${triple})
+export const toolchain = (c: CLib, cwd: string) => `set(CMAKE_C_COMPILER_TARGET ${triple})
 set(CMAKE_CXX_COMPILER_TARGET ${triple})
 set(CMAKE_ASM_COMPILER_TARGET ${triple})
-${if (os == "macos") `set(CMAKE_OSX_SYSROOT "${sysroot}")` else `set(CMAKE_SYSROOT "${if (isAbs(sysroot)) "" else cwd + "/"}${sysroot}")
+${if (os == "macos") `set(CMAKE_OSX_SYSROOT "${sysroot}")` else `set(CMAKE_SYSROOT "${under(cwd, sysroot)}")
 set(CMAKE_EXE_LINKER_FLAGS_INIT "-static")`}
 find_program(CCACHE ccache)
 if(CCACHE)
@@ -191,7 +194,7 @@ if(CCACHE)
 	set(CMAKE_CXX_COMPILER_LAUNCHER \${CCACHE} "base_dir=${cwd}")
 	set(CMAKE_DISABLE_PRECOMPILE_HEADERS ON)
 endif()
-${if (c.toolchain == "") "" else `include("${cwd}/${c.toolchain}")\n`}`
+${if (c.toolchain == "") "" else `include("${under(cwd, c.toolchain)}")\n`}`
 
 function main(): i32 {
 	const argv = args()
@@ -1015,7 +1018,7 @@ file(ARCHIVE_EXTRACT INPUT "${o}/src.tar" DESTINATION "${o}/fetch")`)
 			}
 		}
 		for (const x of c.patches) {
-			run(["patch", "-s", "-p1", "-d", root, "-i", `${cwd}/${x}`])
+			run(["patch", "-s", "-p1", "-d", root, "-i", under(cwd, x)])
 		}
 		const preset = [...c.cmake.fields.map(e => `${quoted(e[0])}:${e[1]}`), `"name":"bober"`, `"generator":"Ninja"`]
 		save(`${root}/CMakeUserPresets.json`,
