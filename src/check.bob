@@ -2268,6 +2268,9 @@ class Checker {
 			case "assign": this.assign(p)
 			case "if": return this.ifStmt(p)
 			case "while":
+				if (p.parts.length == 4) {
+					return this.cFor(p)
+				}
 				this.forget(p.parts[1])
 				const broke = this.loop(p.parts[1], this.facts(p.parts[0]).yes)
 				return broke || !isTok(p.parts[0], "true")
@@ -2383,7 +2386,7 @@ class Checker {
 		}
 		for (const p of n.parts) {
 			this.forget(p)
-			if (n.kind == "block") {
+			if (n.kind == "block" || n.kind == "while") {
 				this.fail(p)
 			}
 		}
@@ -2411,6 +2414,29 @@ class Checker {
 		return left
 	}
 
+	/// Checks `for (init; cond; step) body`, init's names scoped to it. The step runs where cond held and the body ran,
+	/// so it is narrowed as the body's start, but to none in what the body assigns.
+	///
+	/// ```
+	/// for (let p = head; p != null; p = p.next) { n++ }
+	/// ```
+	private cFor(p: Node): bool {
+		const [init, cond, step, body] = p.parts
+		this.locals.enter()
+		this.stmt(init)
+		this.forget(step)
+		this.forget(body)
+		const yes = this.facts(cond).yes
+		const broke = this.loop(body, yes)
+		const mark = this.undo.length
+		this.narrow(yes)
+		this.forget(body)
+		this.stmt(step)
+		this.restore(mark)
+		this.locals.leave()
+		return broke || !isTok(cond, "true")
+	}
+
 	/// The type a for binds to each item of p.
 	///
 	/// ## for
@@ -2419,14 +2445,15 @@ class Checker {
 	/// evaluated once and have one integer type, `i32` if both are untyped, which `x` takes. `for (const x of xs)`
 	/// iterates the elements of an array, fixed array or tuple, or the code units of a string (§4.3), in order,
 	/// unrolled if `xs` is a static array or tuple (§4.11). The pattern is destructured each iteration; with `let` it
-	/// is assignable.
+	/// is assignable. `for (init; cond; step) body` runs init, then body and step while cond is true, a continue going
+	/// to step; init's variables are its own, copied anew for each iteration, which a closure captures.
 	///
 	/// ```
 	/// for (const i of 1 ... 4) { s += i }           // 10
 	/// for (const _ of 4 ... 1) { }                  // never
 	/// for (const [a, b] of [[1, 2], [3, 4]]) { }
 	/// for (const c of "hi") { }                     // c: u8, 104 then 105
-	/// for (let i = 0; i < 3; i++) { }               // error
+	/// for (let i = 0; i < 3; i++) { }
 	/// ```
 	private iterated(p: Node): Type {
 		if (p.kind == "binary" && p.t.kind == "...") {

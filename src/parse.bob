@@ -326,7 +326,7 @@ export class Parser {
 	/// Simple   = Postfix [AssignOp Expr | "++" | "--"] | Await
 	/// AssignOp = "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "**=" | "&=" | "|=" | "^=" | "<<=" | ">>=" | "??="
 	/// If       = "if" "(" Expr ")" Block ["else" (If | Block)]
-	/// For      = "for" "(" ("let" | "const") Pattern "of" Range ")" Block
+	/// For      = "for" "(" (("let" | "const") Pattern "of" Range | (Var | Simple) ";" Expr ";" Simple) ")" Block
 	/// While    = "while" "(" Expr ")" Block
 	/// Switch   = "switch" "(" Expr ")" "{" {CaseHead Stmt Term {Stmt Term}} "}"
 	/// Try      = "try" Block (Catch ["finally" Block] | "finally" Block)
@@ -401,17 +401,22 @@ export class Parser {
 		return n
 	}
 
+	/// `for (init; cond; step) body` is a while of these four parts.
 	private forStmt(): Tree {
 		const n = new Tree("for", this.next())
 		this.expect("(")
-		const decl = this.next()
-		if (decl.kind != "let" && decl.kind != "const") {
-			throw fail(decl, "let or const")
+		const k = this.peek().kind
+		const init = if (k == "let" || k == "const") this.decl([]) else this.simple()
+		if (init instanceof Tree && init.kind == "var" && init.parts.length == 1 && this.eat("of")) {
+			n.parts = [init.t, init.parts[0], this.range(1)]
+		} else {
+			n.kind = "while"
+			n.parts.push(init)
+			this.expect(";")
+			n.parts.push(this.expr())
+			this.expect(";")
+			n.parts.push(this.simple())
 		}
-		n.parts.push(decl)
-		n.parts.push(this.pattern())
-		this.expect("of")
-		n.parts.push(this.range(1))
 		this.expect(")")
 		n.parts.push(this.block())
 		return n
