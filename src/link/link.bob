@@ -182,6 +182,8 @@ export class Linker {
 	private taken: bool[] = []
 	/// Per name a lazy object defines, the first that does.
 	private members = new HashMap[string, i32]()
+	/// What lists the lazy objects, until called.
+	private listed: () => void throws CompileError = () => {}
 	private libraries: string[] = []
 	/// Per name a library defines, the first that does.
 	private imports = new HashMap[string, i32]()
@@ -289,6 +291,10 @@ export class Linker {
 		this.lazies.push(read)
 		this.taken.push(false)
 	}
+
+	/// Calls list, which gives the lazy objects, only once a name not defined is looked for that no object a continued
+	/// image holds names: one that one names an earlier link looked for in them, so they define none still undefined.
+	lazily(list: () => void throws CompileError) { this.listed = list }
 
 	/// A shared library the image is loaded with, and the symbols it defines.
 	library(name: string, symbols: string[]) {
@@ -505,6 +511,11 @@ export class Linker {
 
 	/// Links the lazy object that defines n, if one does and n is still not defined.
 	private pull(n: Name) throws CompileError {
+		if (n.unit < 0 && n.namer >= this.loaded) {
+			const list = this.listed
+			this.listed = () => {}
+			list()
+		}
 		const m = this.members.get(n.name) ?? -1
 		if (n.unit < 0 && m >= 0 && !this.taken[m]) {
 			this.taken[m] = true

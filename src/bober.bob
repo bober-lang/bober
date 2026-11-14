@@ -612,6 +612,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	}
 	const cxxs: string[] = if (cxx) [`${lib}/libc++.a`, `${lib}/libc++abi.a`] else []
 	const archives: string[] = []
+	let added = false // an archive the image did not look in
 	for (const f of [...files,
 		...(if (mac) [] else [...cxxs, `${lib}/libunwind.a`, `${lib}/libclang_rt.builtins.a`])]) {
 		if (!endsWith(f, ".a")) {
@@ -630,6 +631,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		}
 		if (!held.includes(name)) {
 			l.add(new Object(name, machine.arch))
+			added = true
 		}
 		archives.push(f)
 	}
@@ -648,11 +650,20 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	const tmp = `${out}.${getpid()}`
 	let at = out // where the image is written
 	if (changed) {
-		for (const f of archives) {
-			const bytes = mapFile(f)
-			for (const [member, b, names] of members(f, bytes)) {
-				l.lazy(if (mac) names.map(named) else names, () => format.read(member, b))
+		// The archives' members, listed once a name is looked for in them that the image did not look for; at once if an
+		// archive is new to it.
+		const list = () => {
+			for (const f of archives) {
+				const bytes = mapFile(f)
+				for (const [member, b, names] of members(f, bytes)) {
+					l.lazy(if (mac) names.map(named) else names, () => format.read(member, b))
+				}
 			}
+		}
+		if (added) {
+			list()
+		} else {
+			l.lazily(list)
 		}
 		try {
 			const linked = l.link()
