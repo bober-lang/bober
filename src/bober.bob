@@ -20,6 +20,7 @@ import * as yaml from "../std/encoding/yaml"
 import * as optarg from "../std/encoding/optarg"
 import { exists, glob, mapFile, mkdirAll, open, readDir, readFile, remove, removeAll, rename, stat } from "../std/fs"
 import { base, dir as parent, isAbs, join, rel } from "../std/fs/path"
+import { HashMap } from "../std/collections/hashmap"
 import { fnv } from "../std/hash"
 import { File, stderr, stdin, stdout } from "../std/io"
 import { arch, os } from "../std/os"
@@ -909,7 +910,8 @@ function archive(c: CLib, out: string, pkg: string, includes: string[]): string 
 
 /// Builds and installs each CMake project of p into its out, listing the static libraries it installs in out/libs,
 /// unless its stamp is what it was last: its entry in p, its patches and toolchain files, the stamps of those of p
-/// before it and the files of its src if a directory, by their contents, not times, which a checkout or a cache resets.
+/// before it and the files of its src if a directory, by their contents, not times, which a checkout or a cache resets;
+/// a file's hash taken from o/hashes where its time and size are as recorded there and older than it, as git's index.
 /// Its src, copied or fetched with its hash checked to out/src, patched, and configured afresh with its preset "bober"
 /// and toolchain file, finding those of p before it, in out/build, which is kept, as the archive fetched.
 function cmake(p: Package) {
@@ -923,10 +925,28 @@ function cmake(p: Package) {
 		const tools = toolchain(c, cwd)
 		const src = c.src
 		const files = if (src instanceof string) glob(`${src}/**/*`).filter(f => !stat(f).isDirectory) else []
+		const sides = `${o}/hashes`
+		const t = if (exists(sides)) stat(sides).modified else 0
+		const last = new HashMap[string, string]()
+		for (const l of split(if (t > 0) readFile(sides) else "", "\n")) {
+			const i = lastIndexOf(l, " ")
+			if (i >= 0) {
+				last.set(l.slice(0, i), l.slice(i + 1, l.length))
+			}
+		}
+		// Per file, its path, its time and size, and its hash.
+		const hashed = files.map(f => {
+			const s = stat(f)
+			const k = `${s.modified} ${s.size}`
+			return [f, k, (if (s.modified < t) last.get(`${f} ${k}`) else null) ?? `${fnv(mapFile(f))}`]
+		})
+		mkdirAll(o)
+		save(`${sides}.tmp`, hashed.map(h => `${h[0]} ${h[1]} ${h[2]}\n`).join(""))
+		rename(`${sides}.tmp`, sides) // whole, if at all
 		const entry = encode(src) + encode(c.cmake) + c.patches.map(x => readFile(x)).join("")
 			+ (if (c.toolchain == "") "" else readFile(c.toolchain)) + tools
 			+ before.map(b => `${b} ${fnv(readFile(`${b}/stamp`))}\n`).join("")
-			+ files.map(f => `${f} ${fnv(mapFile(f))}\n`).join("")
+			+ hashed.map(h => `${h[0]} ${h[2]}\n`).join("")
 		const prefixes = before.map(b => `${cwd}/${b}`).join(";")
 		before.push(o)
 		if (exists(`${o}/stamp`) && readFile(`${o}/stamp`) == entry) {
@@ -940,7 +960,6 @@ function cmake(p: Package) {
 		if (exists(root)) {
 			removeAll(root)
 		}
-		mkdirAll(o)
 		if (src instanceof string) {
 			run(["cmake", "-E", "copy_directory", src, root])
 		} else {
