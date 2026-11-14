@@ -23,10 +23,10 @@ import {
 	LLVMConstGEP2, LLVMConstInt, LLVMConstIntOfString, LLVMConstIntToPtr, LLVMConstNull, LLVMConstPtrToInt,
 	LLVMConstReal, LLVMConstRealOfString,
 	LLVMConstStringInContext2, LLVMConstStructInContext, LLVMConstTrunc, LLVMContextCreate, LLVMCountStructElementTypes,
-	LLVMCreateBuilderInContext, LLVMCreateEnumAttribute, LLVMCreateMemoryBufferWithMemoryRangeCopy,
+	LLVMCreateBuilderInContext, LLVMCreateEnumAttribute, LLVMCreateMemoryBufferWithMemoryRangeCopy, LLVMDisposeMemoryBuffer,
 	LLVMCountParams, LLVMCreateStringAttribute, LLVMCreateTypeAttribute, LLVMDeleteFunction, LLVMDeleteGlobal, LLVMDisposeMessage,
 	LLVMDoubleTypeInContext, LLVMDoubleTypeKind, LLVMX86FP80TypeInContext, LLVMGetDataLayoutStr, LLVMGetEntryBasicBlock, LLVMGetFirstBasicBlock,
-	LLVMGetFirstFunction, LLVMGetFirstInstruction, LLVMGetFirstUse, LLVMGetIncomingBlock, LLVMGetMDKindIDInContext, LLVMGetInstructionOpcode,
+	LLVMGetBufferSize, LLVMGetBufferStart, LLVMGetFirstFunction, LLVMGetFirstInstruction, LLVMGetFirstUse, LLVMGetIncomingBlock, LLVMGetMDKindIDInContext, LLVMGetInstructionOpcode,
 	LLVMGetNextBasicBlock, LLVMGetNextFunction, LLVMGetNextInstruction, LLVMGetInstructionParent, LLVMGetNextUse, LLVMGetNormalDest,
 	LLVMGetAlignment, LLVMGetCalledValue, LLVMGetMetadata, LLVMGetNumOperands, LLVMGetOperand, LLVMGetPointerAddressSpace, LLVMGetUser, LLVMCall, LLVMInvoke, LLVMLandingPad, LLVMPHI, LLVMStore, LLVMVectorTypeKind,
 	LLVMPositionBuilderBefore, LLVMSetDataLayout, LLVMSetGC, LLVMSetOperand, LLVMFAdd, LLVMFDiv, LLVMFloatTypeInContext, LLVMFloatTypeKind, LLVMFP128TypeInContext, LLVMFMul,
@@ -63,7 +63,7 @@ import {
 import {
 	LLVMABIAlignmentOfType, LLVMABISizeOfType, LLVMAssemblyFile, LLVMCodeModelDefault, LLVMCreateTargetDataLayout,
 	LLVMCreateTargetMachine, LLVMGetTargetFromTriple, LLVMObjectFile, LLVMOffsetOfElement,
-	LLVMRelocPIC, LLVMSetModuleDataLayout, LLVMTargetMachineEmitToFile,
+	LLVMRelocPIC, LLVMSetModuleDataLayout, LLVMTargetMachineEmitToFile, LLVMTargetMachineEmitToMemoryBuffer,
 } from "llvm-c/TargetMachine.h"
 import { LLVMCreatePassBuilderOptions, LLVMRunPasses } from "llvm-c/Transforms/PassBuilder.h"
 import {
@@ -644,6 +644,23 @@ export class LLVM implements Backend {
 		checked(err => LLVMVerifyModule(this.m, LLVMReturnStatusAction as u32, err) as u64)
 	}
 	emit(path: string, asm: bool) {
+		this.compiled()
+		const kind = if (asm) LLVMAssemblyFile else LLVMObjectFile
+		checked(err => LLVMTargetMachineEmitToFile(this.tm, this.m, path, kind as u32, err) as u64)
+	}
+
+	/// The object file's bytes, as emit writes them.
+	object(): string {
+		this.compiled()
+		const buf = [0 as u64]
+		checked(err => LLVMTargetMachineEmitToMemoryBuffer(this.tm, this.m, LLVMObjectFile as u32, err, buf) as u64)
+		const s = fromBytes(LLVMGetBufferStart(buf[0]) as u64, LLVMGetBufferSize(buf[0]))
+		LLVMDisposeMemoryBuffer(buf[0])
+		return s
+	}
+
+	/// Finishes the module, optimizes it, and if collected, makes its refs the collector's for code to be made of it.
+	private compiled() {
 		this.finish()
 		if (this.gc) {
 			this.scalars()
@@ -653,8 +670,6 @@ export class LLVM implements Backend {
 			this.barriers()
 			this.statepoints()
 		}
-		const kind = if (asm) LLVMAssemblyFile else LLVMObjectFile
-		checked(err => LLVMTargetMachineEmitToFile(this.tm, this.m, path, kind as u32, err) as u64)
 	}
 
 	/// Moves the module of other, verified, into this one, to be optimized with it as one.
