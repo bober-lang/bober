@@ -3,6 +3,8 @@
 import { isDigit, zero } from "../../std/ascii"
 import { indexOf } from "../../std/algo"
 import { get, set } from "../../std/encoding/binary"
+import { makeTempDir, mapFile, open, removeAll } from "../../std/fs"
+import { File } from "../../std/io"
 import { min } from "../../std/math"
 
 /// A file's bytes, zeros past its end, and pages of 4 KiB written over them, as Mach-O hashes them: all that who
@@ -135,6 +137,35 @@ export function le(v: u64, n: i32): string {
 	for (const i of 0 ... n - 1) {
 		s += chr(if (i < 8) (v >> 8 * i) as u8 else 0)
 	}
+	return s
+}
+
+/// Writes bytes to path: their written pages, coalesced, over a copy of old if it is not null, else over an empty file;
+/// and their last page, at which the file ends.
+export function store(path: string, old: File | null, bytes: Bytes) {
+	const f = if (old != null) old.copy(path, bytes.length) else open(path, "w")
+	const end = (bytes.length + 0xfff) >> 12
+	let p: u64 = 0
+	while (p < end) {
+		let q = p
+		while (q < end && (bytes.written(q << 12) || q == end - 1)) {
+			q++
+		}
+		if (q > p) {
+			f.writeAt(p << 12, bytes.slice(p << 12, min(q << 12, bytes.length)))
+		}
+		p = q + 1
+	}
+	f.close()
+}
+
+/// The bytes, stored as a build stores them, their holes kept, and mapped: of an image's address space, only what is
+/// written takes memory.
+export function mapped(bytes: Bytes): string {
+	const dir = makeTempDir("bober-")
+	store(`${dir}/image`, null, bytes)
+	const s = mapFile(`${dir}/image`)
+	removeAll(dir)
 	return s
 }
 

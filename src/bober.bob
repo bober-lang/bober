@@ -21,8 +21,7 @@ import * as optarg from "../std/encoding/optarg"
 import { exists, glob, mapFile, mkdirAll, open, readDir, readFile, remove, removeAll, rename, stat } from "../std/fs"
 import { base, dir as parent, isAbs, join, rel } from "../std/fs/path"
 import { fnv } from "../std/hash"
-import { File, stderr, stdin, stdout } from "../std/io"
-import { min } from "../std/math"
+import { stderr, stdin, stdout } from "../std/io"
 import { arch, os } from "../std/os"
 import { ParseError, codePoint, split, trim, utf8 } from "../std/string"
 import { abi, write } from "./bc/file"
@@ -46,7 +45,7 @@ import { elf } from "./link/elf"
 import { macho, named } from "./link/macho"
 import { pe } from "./link/pe"
 import { x64 } from "./link/x64"
-import { Bytes } from "./link/bytes"
+import { Bytes, store } from "./link/bytes"
 import { Linker, Stale } from "./link/link"
 import { Const, Global, Object, Section, Symbol } from "./link/object"
 import { SyntaxError } from "./lex"
@@ -1031,25 +1030,6 @@ function file(path: string): string {
 		s += `.${fnv(path)}`
 	}
 	return `${dir}/${s}`
-}
-
-/// Writes bytes to path: their written pages, coalesced, over a copy of old if it is not null, else over an empty file;
-/// and their last page, at which the file ends.
-function store(path: string, old: File | null, bytes: Bytes) {
-	const f = if (old != null) old.copy(path, bytes.length) else open(path, "w")
-	const end = (bytes.length + 0xfff) >> 12
-	let p: u64 = 0
-	while (p < end) {
-		let q = p
-		while (q < end && (bytes.written(q << 12) || q == end - 1)) {
-			q++
-		}
-		if (q > p) {
-			f.writeAt(p << 12, bytes.slice(p << 12, min(q << 12, bytes.length)))
-		}
-		p = q + 1
-	}
-	f.close()
 }
 
 function save(path: string, s: string) {
