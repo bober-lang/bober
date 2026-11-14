@@ -154,6 +154,25 @@ test "a lazy object is read only once a linked one wants a name it is listed for
 	assert read.join(" ") == "f"
 }
 
+test "a continued image lists the lazy objects only once a name is looked for in them that it did not name" {
+	const calls = (name: string, x: string) => obj(name, Code, [0x94000000], [new Symbol(x, Global)],
+		[new Fixup(0, Call, 0, 0)])
+	const first = file(keep(kept(), [calls("a", "puts")]))
+	let listed = 0
+	const list = (l: Linker) => l.lazily(() => {
+		listed++
+		l.lazy(["f"], () => obj("f.o", Code, [0xd65f03c0], [new Symbol("f", Global, 0)]))
+	})
+	const l = kept(first)
+	list(l)
+	keep(l, [calls("b", "puts")])
+	assert listed == 0
+	const m = kept(first)
+	list(m)
+	const image = keep(m, [calls("b", "f")], ["f"])
+	assert listed == 1 && at(image, "f") != 0
+}
+
 test "of the sections of a group, the first object's are taken, and its symbols there" {
 	const a = obj("a", Const, [1], [new Symbol("k", Weak, 0)], [], "k")
 	const b = obj("b", Const, [2], [new Symbol("k", Weak, 0), new Symbol("only", Weak, 0)], [], "k")
