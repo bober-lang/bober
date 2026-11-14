@@ -1295,14 +1295,24 @@ class Gen {
 		for (const i of 0 ... p.parts.length - 1) {
 			const q = p.parts[i]
 			this.op(op.Local, tmp)
-			if (q.kind == "unary" && p.kind == "array") {
-				if (pt.kind != "array") {
-					throw this.fail(q, "a rest of a tuple")
-				}
+			if (q.kind == "unary" && pt.kind == "array") {
 				this.int(kind.I32, i)
 				this.op(op.Local, tmp)
 				this.op(op.Field, this.prog.intern("length"))
 				this.method(pt, "slice")
+				this.bind(q.parts[0], ro)
+			} else if (q.kind == "unary" && p.kind == "array") {
+				// Of a tuple or T[n], made of the elements left.
+				if (pt.rest) {
+					throw this.fail(q, "a rest of a tuple with a rest")
+				}
+				const n = if (pt.kind == "tuple") pt.types.length else pt.n
+				for (const j of i ... n - 1) {
+					this.read(pt, `${j}`, element(pt, j)!, true)
+					this.op(op.Local, tmp)
+				}
+				this.op(op.Drop)
+				this.op(op.Array, this.ty(q.parts[0].type!), n - i, 0)
 				this.bind(q.parts[0], ro)
 			} else if (q.kind == "unary") {
 				this.op(op.Object, this.ty(q.parts[0].type!), 1, this.code.list([0])) // {...tmp} of the unnamed fields
