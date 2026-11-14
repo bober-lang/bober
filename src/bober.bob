@@ -598,15 +598,19 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		return !held.includes(name)
 	}
 	const compiler = compilerId()
-	const names: string[] = []
+	const names: string[] = [] // of each module's unit, <path>@<source>.<version>: by source a build knows it edited
 	// Of each module, the symbol its unit defines of its version (src/bc/file.bob's), which -O2's overlay of its code
 	// names, and the other modules of the decls not exported it names; made when unit or -O2 wants them.
 	const versions: [string, i32[]][] = []
 	const signatures = new HashMap[i32, [u64, i32[]]]()
+	const edited: bool[] = [] // whether the image held the module's unit of another source
 	for (const m of 0 ... p.modules.length - 1) {
 		const bc = if (p.modules[m].bc != "") p.modules[m].bc else write(p, m, compiler)
 		const b = bound.get(p.modules[m].path)?.bytes(p.modules[m].path) ?? ""
-		names.push(`${p.modules[m].path}@${fnv(bc + b)}`)
+		const own = `${p.modules[m].path}@${p.modules[m].source}.`
+		const was = held.find(h => startsWith(h, `${p.modules[m].path}@`))
+		edited.push(was != null && !startsWith(was!, own))
+		names.push(`${own}${fnv(bc + b)}`)
 		const rebuilt = lacks(names[m])
 		const [v, others] = if (o2 || rebuilt) version(p, m, bc, signatures) else [0 as u64, []]
 		versions.push([`bober.o2.${p.modules[m].path}@${combine(v, fnv(b))}`, others])
@@ -636,7 +640,8 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			}
 		}
 		if (o2) {
-			for (const ds of groups(p)) {
+			// An edited module runs on its base code; the first build that finds it unchanged optimises it again.
+			for (const ds of groups(p).filter(ds => !edited[p.decls[ds[0]].module])) {
 				const m = p.decls[ds[0]].module
 				const [symbol, others] = versions[m]
 				const refs = [symbol, ...abis(p, m, [], names), ...others.map(x => `bober.code.${names[x]}`)]
