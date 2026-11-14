@@ -20,7 +20,7 @@
 //! of …)` over a tuple or an array an Each of a Readonly local.
 
 import { bits } from "../builtin/math"
-import { endsWith, indexOf, sortBy } from "../std/algo"
+import { endsWith, indexOf, sortBy, startsWith } from "../std/algo"
 import { digit, isAlphabetic, lf, minus, o, underscore, x, zero } from "../std/ascii"
 import { HashMap } from "../std/collections/hashmap"
 import { ScopedMap } from "../std/collections/scopedmap"
@@ -42,16 +42,23 @@ import { builtinPath } from "./root"
 import { Bool, Field, Null, String, Type, basics, members } from "./type"
 import { strtod } from "stdlib.h"
 
-/// The modules at paths and those they import, checked and lowered into one Program. Throws the type errors, or what
-/// is not lowered, as a CompileError.
-export function lower(paths: string[], dirs: string[] = [], read: (path: string) => string | null = p => readFile(p)): Program {
+/// The modules at paths and those they import, checked and lowered into one Program, but those linked from the files
+/// cache (Lift.cached); checked again without them on an import cycle, which they may let it report through another
+/// module, or if the ABI of a module one of them uses is not what it holds (Lift.current). Throws the type errors, or
+/// what is not lowered, as a CompileError.
+export function lower(paths: string[], dirs: string[] = [], cache: string[] = [],
+	read: (path: string) => string | null = p => readFile(p)): Program {
 	const l = new Lower()
+	l.lift.cached(cache, read)
 	const errors = check(paths, dirs, read, l, l.lift).filter(e => !e.warning)
-		.map(e => `${e.path}:${e.line}:${e.col}: ${e.msg}`)
-	if (errors.length > 0) {
-		throw new CompileError(errors.join("\n"))
+	if (cache.length > 0 && errors.some(e => startsWith(e.msg, "import cycle"))) {
+		return lower(paths, dirs, [], read)
 	}
-	return l.finish()
+	if (errors.length > 0) {
+		throw new CompileError(errors.map(e => `${e.path}:${e.line}:${e.col}: ${e.msg}`).join("\n"))
+	}
+	const p = l.finish()
+	return if (l.lift.current()) p else lower(paths, dirs, [], read)
 }
 
 /// The stage after the checker: lowers each module's declarations as they are handed on.

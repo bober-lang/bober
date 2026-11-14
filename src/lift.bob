@@ -2,6 +2,7 @@
 //! types; and the modules of the bundle, linked into it from their files (src/bc/file.bob) rather than checked and
 //! lowered.
 
+import { indexOf } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
 import { Reader, Writer } from "../std/encoding/binary"
 import { open } from "../std/fs"
@@ -10,10 +11,10 @@ import { fnv } from "../std/hash"
 import { executable } from "../std/process"
 import { ParseError } from "../std/string"
 import * as decl from "./bc/decl"
-import { deps, pathOf, read, write } from "./bc/file"
-import { Program } from "./bc/program"
+import { In, abi, head, read, write } from "./bc/file"
+import { Program, sourceHash } from "./bc/program"
 import { CompileError } from "./error"
-import { root } from "./root"
+import { builtin, root } from "./root"
 import { Type } from "./type"
 
 /// lib/std.bobc, the package's bundle (src/root.bob), once read; empty in a repo, which has none, or if malformed. std
@@ -33,10 +34,70 @@ export class Lift {
 	/// The bundle: the file of each module by the path it holds, of source hash 0 and made by this compiler; the
 	/// package's, stdBundle, unless set.
 	bundle = stdBundle()
+	/// The cache: the files a build's kept image holds (src/bober.bob) of modules of their source as it is, made by
+	/// this compiler, by the path each holds (cached).
+	cache = new HashMap[string, string]()
+	/// The headers of the files linked from the cache.
+	private served: In[] = []
 
-	/// The module at path of the bundle, linked with the modules it imports not yet linked, each top-level decl an
-	/// entry; -1 if the bundle lacks it. Throws a CompileError if a file is missing, stale or malformed.
-	module(path: string): i32 {
+	/// Adds those of files to the cache that are of their module's source as read gives it and made by this compiler,
+	/// but builtin/'s, which every program checks first (src/check.bob), and those of or using a C header's module,
+	/// which is bound anew.
+	cached(files: string[], read: (path: string) => string | null) throws IoError {
+		const compiler = compilerId()
+		for (const f of files) {
+			try {
+				const h = head(f)
+				const skip = builtin(h.path) || [h.path, ...h.paths].some(x => indexOf(x, ": ") >= 0)
+				const src = if (skip) null else read(h.path)
+				if (src != null && h.source == sourceHash(h.path, src!) && h.compiler == compiler) {
+					this.cache.set(h.path, f)
+				}
+			} catch (e: ParseError) {}
+		}
+	}
+
+	/// The module at path of the bundle, linked with the modules it imports not yet linked; else of the cache, linked
+	/// once each module it uses is loaded by load, as the checker checks a module, which says whether it is done; each
+	/// top-level decl but a test an entry. -1 if neither has it, or one of those is not done or of another ABI than the
+	/// cache's file has. Throws a CompileError if the bundle's, or a module it imports, is missing, stale or malformed.
+	module(path: string, load: (path: string) => bool = _ => false): i32 {
+		const file = this.cache.get(path)
+		if (file == null) {
+			return this.bundled(path)
+		}
+		this.cache.delete(path) // once: one using it while those it uses load checks it
+		try {
+			const h = head(file!)
+			if (h.paths.every(load) && this.prog.module(path) < 0) {
+				const ms = read(this.prog, [file!], compilerId(), [h.source])
+				if (ms != null) {
+					this.served.push(h)
+					return this.entered(ms!)
+				}
+			}
+		} catch (e: ParseError | IoError) {}
+		return -1
+	}
+
+	/// Whether each module linked from the cache holds the ABI hash each module it uses has, now that all are made;
+	/// those hashed before, when some a module's signatures reach may not have been, forgotten.
+	current(): bool {
+		const p = this.prog
+		for (const x of p.modules) {
+			x.abi = 0
+		}
+		for (const h of this.served) {
+			for (const i of 0 ... h.paths.length - 1) {
+				if (abi(p, p.module(h.paths[i])) != h.hashes[i]) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	private bundled(path: string): i32 {
 		const file = this.bundle.get(path)
 		if (file == null) {
 			return -1
@@ -51,7 +112,7 @@ export class Lift {
 		try {
 			let i = 0
 			while (i < files.length) {
-				for (const d of deps(files[i], root)) {
+				for (const d of head(files[i], root).paths) {
 					const f = if (p.module(d) < 0 && !paths.includes(d)) this.bundle.get(d) else null
 					if (f != null) {
 						paths.push(d)
@@ -62,15 +123,21 @@ export class Lift {
 			}
 			const ms = read(p, files, compilerId(), files.map(_ => 0 as u64), root)
 			if (ms != null) {
-				for (const m of ms!) {
-					for (const d of p.modules[m].decls) {
-						this.entries.set(`${p.modules[m].path}:${p.strings[p.decls[d].name]}`, d)
-					}
-				}
-				return ms![0]
+				return this.entered(ms!)
 			}
 		} catch (e: ParseError | IoError) {}
 		throw new CompileError(`the bundle's ${path}, or a module it imports, is missing, stale or malformed`)
+	}
+
+	/// The first of modules ms, each top-level decl of which but a test made an entry.
+	private entered(ms: i32[]): i32 {
+		const p = this.prog
+		for (const m of ms) {
+			for (const d of p.modules[m].decls.filter(d => p.decls[d].kind != decl.Test)) {
+				this.entries.set(`${p.modules[m].path}:${p.strings[p.decls[d].name]}`, d)
+			}
+		}
+		return ms[0]
 	}
 }
 
@@ -108,7 +175,7 @@ export function unbundle(s: string): HashMap[string, string] throws ParseError {
 	const r = new Reader(s)
 	while (r.pos < s.length) {
 		const f = r.raw(r.uleb() as i32)
-		files.set(pathOf(f, root), f)
+		files.set(head(f, root).path, f)
 	}
 	return files
 }

@@ -36,8 +36,9 @@ const documented: Syntax[] = ["test", "var", "function", "class", "type", "metho
 /// What the compiler lowers the builtin types and the prelude to, which every program holds.
 let lowered = [...first, ...["equal", "show", "math", "fiber"].map(builtinPath)]
 
-/// The errors of the modules at paths and of those they import, each checked once and handed on to next; one lift's
-/// bundle holds is made from its decls instead.
+/// The errors of the modules at paths and of those they import, each checked once and handed on to next, after
+/// builtin/'s lowered ones, so that those are done before lift compares a module's ABI hash, which may reach them; one
+/// lift's bundle or cache holds is made from its decls instead.
 export function check(paths: string[], includes: string[] = [], read: (path: string) => string | null = p => readFile(p),
 	next: Checked = new Ignore(), lift = new Lift()): TypeError[] {
 	info = new HashMap[string, Member]()
@@ -54,7 +55,7 @@ export function check(paths: string[], includes: string[] = [], read: (path: str
 	visited = 0
 	tagTypes = new HashMap[string, Type]()
 	const ms = new Modules(includes, read, next, new Linked(lift))
-	for (const path of [...paths, ...lowered]) {
+	for (const path of [...lowered, ...paths]) {
 		const m = ms.load(normal(path))
 		if (m instanceof string) {
 			ms.errors.push(new TypeError(path, Loc.at(0, 0), m))
@@ -430,14 +431,15 @@ class Modules {
 		}
 	}
 
-	/// The module at path made from the bundle's decls, or why it cannot be; null if the bundle lacks it.
+	/// The module at path made from the decls of the bundle or the cache, or why it cannot be, or as loaded while those
+	/// it uses were; null if neither.
 	private bundled(path: string): Module | string | null {
 		try {
-			const m = this.linked.module(path)
+			const m = this.linked.module(path, p => this.load(p) instanceof Module)
 			if (m != null) {
 				this.loaded.set(path, m)
 			}
-			return m
+			return m ?? this.loaded.get(path)
 		} catch (e: CompileError) {
 			return e.msg
 		}
@@ -475,11 +477,11 @@ class Module {
 	constructor(path: string) { this.path = path }
 }
 
-/// The modules the bundle holds (src/lift.bob), made from the decls linked into its Program rather than checked, each
-/// decl known to lift by its checker type, as one checked and lowered is. What the checker keeps of a declaration but
-/// a decl does not tell is lost: a literal type where lowering takes its base, or spelled otherwise than quoted spells
-/// it, a type a const holds, the value of an untyped int const but a literal, negated or not, whether a const depends
-/// on a let, the errors a function infers rather than lists, and what its tags warn of.
+/// The modules the bundle or the cache holds (src/lift.bob), made from the decls linked into its Program rather than
+/// checked, each decl known to lift by its checker type, as one checked and lowered is. What the checker keeps of a
+/// declaration but a decl does not tell is lost: a literal type where lowering takes its base, or spelled otherwise
+/// than quoted spells it, a type a const holds, the value of an untyped int const but a literal, negated or not,
+/// whether a const depends on a let, the errors a function infers rather than lists, and what its tags warn of.
 class Linked {
 	private lift: Lift
 	private p: Program
@@ -491,14 +493,15 @@ class Linked {
 		this.p = lift.prog
 	}
 
-	/// The module at path, of its top-level decls, done; null if the bundle lacks it.
-	module(path: string): Module | null throws CompileError {
-		const m = this.lift.module(path)
+	/// The module at path, of its top-level decls but tests, done; null if lift has none, loading those it uses by load
+	/// (Lift.module).
+	module(path: string, load: (path: string) => bool): Module | null throws CompileError {
+		const m = this.lift.module(path, load)
 		if (m < 0) {
 			return null
 		}
 		const x = new Module(path)
-		for (const d of this.p.modules[m].decls) {
+		for (const d of this.p.modules[m].decls.filter(d => this.p.decls[d].kind != decl.Test)) {
 			const name = this.p.strings[this.p.decls[d].name]
 			const b = this.binding(d)
 			b.symbol = `${path}:${name}`

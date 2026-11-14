@@ -1,5 +1,7 @@
-import { startsWith } from "../std/algo"
+import { sort, startsWith } from "../std/algo"
+import { fnv } from "../std/hash"
 import { HashMap } from "../std/collections/hashmap"
+import { write } from "./bc/file"
 import { show as shown } from "./bc/show"
 import { Checked, Node, TypeError, check, show } from "./check"
 import { CompileError } from "./error"
@@ -590,7 +592,7 @@ function lowered(src: string, files: string[], bundle: HashMap[string, string]):
 
 /// The bundle of the modules at paths and of those they import, made by the compiler whose hash is compiler.
 function bundled(paths: string[], files: string[], compiler = compilerId()): HashMap[string, string] {
-	return unbundle(bundle(lower(paths, [], path => source(path, "", files)), compiler))
+	return unbundle(bundle(lower(paths, [], [], path => source(path, "", files)), compiler))
 }
 
 test "a module of the bundle, linked once if this compiler made it, checks and lowers what imports it as from source" {
@@ -648,4 +650,71 @@ const w: Writer = new W()`)
 	stale.bundle = bundled(["lib.bob"], files, 1)
 	assert stale.module("lib.bob") throws new CompileError(
 		"the bundle's lib.bob, or a module it imports, is missing, stale or malformed")
+}
+
+/// The checker's stages, the paths of the modules checked logged to checked.
+class Logged implements Checked {
+	next: Checked
+	checked: string[] = []
+
+	constructor(next: Checked) { this.next = next }
+	decl(n: Node, path: string, src: string) { this.next.decl(n, path, src) }
+	declare(n: Node, path: string, src: string) { this.next.declare(n, path, src) }
+	done(path: string) {
+		this.checked.push(path)
+		this.next.done(path)
+	}
+}
+
+/// The modules of main.bob of source src and of files that a build of them with the files of cache checks; the errors;
+/// and the file of each module, as a build's kept image holds it.
+function built(src: string, files: string[], cache: string[]): [string[], string[], string[]] {
+	const read = (path: string) => source(path, src, files)
+	const l = new Lower()
+	const log = new Logged(l)
+	l.lift.cached(cache, read)
+	const errors = check(["main.bob"], [], read, log, l.lift).map(message)
+	if (errors.length > 0) {
+		return [[], errors, []]
+	}
+	const p = l.finish()
+	const checked = log.checked.filter(x => x == "main.bob" || files.includes(x))
+	sort(checked)
+	const out: string[] = []
+	for (const m of 0 ... p.modules.length - 1) {
+		out.push(write(p, m, compilerId()))
+	}
+	return [checked, [], out]
+}
+
+test "a module whose file the cache holds is linked unless its source, or the ABI of one it imports, changed" {
+	const main = "import { f } from \"b\"\nexport function main(): i32 { return f() }"
+	const b = ["b.bob", "import { g } from \"a\"\nexport function f(): i32 { return g() }"]
+	const units = (fs: string[]): string => {
+		const xs = fs.map(f => `${fnv(f)}`)
+		sort(xs)
+		return xs.join(" ")
+	}
+	const same = (a: string, cache: string[], checked: string): string[] => {
+		const [c, errors, out] = built(main, [...b, "a.bob", a], cache)
+		assert c.join(" ") == checked && errors.length == 0
+		assert units(out) == units(built(main, [...b, "a.bob", a], [])[2])
+		return out
+	}
+	const all = same("export function g(): i32 { return 1 }", [], "a.bob b.bob main.bob")
+	same("export function g(): i32 { return 1 }", all, "")
+	same("export function g(): i32 { return 2 }", all, "a.bob")
+	same("export function g(x = 1): i32 { return x }", all, "a.bob b.bob")
+	const errors = (a: string, cache: string[]): string => {
+		try {
+			lower(["main.bob"], [], cache, path => source(path, main, [...b, "a.bob", a]))
+		} catch (e: CompileError) {
+			return e.msg
+		}
+		return ""
+	}
+	const cycle = "import { f } from \"b\"\nexport function g(): i32 { return 1 }"
+	assert errors(cycle, all) == errors(cycle, []) && errors(cycle, []) == "a.bob:1:19: import cycle through b.bob"
+	const i64 = "export function g(): i64 { return 1 }"
+	assert errors(i64, all) == errors(i64, []) && errors(i64, []) != ""
 }
