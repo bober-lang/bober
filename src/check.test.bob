@@ -2,7 +2,7 @@ import { sort, startsWith } from "../std/algo"
 import { fnv } from "../std/hash"
 import { HashMap } from "../std/collections/hashmap"
 import { split } from "../std/string"
-import { write } from "./bc/file"
+import { head, write } from "./bc/file"
 import { show as shown } from "./bc/show"
 import { Checked, Node, TypeError, check, show } from "./check"
 import { CompileError } from "./error"
@@ -725,6 +725,10 @@ test "a module whose file the cache holds is linked unless its source, or the AB
 	assert errors(cycle, all[0]) == errors(cycle, []) && errors(cycle, []) == "a.bob:1:19: import cycle through b.bob"
 	const i64 = "export function g(): i64 { return 1 }"
 	assert errors(i64, all[0]) == errors(i64, []) && errors(i64, []) != ""
+	const a = "export function g(): i32 { return 1 }"
+	const g = (cache: string[]) => lower(["main.bob"], [], cache, path => source(path, main, [...b, "a.bob", a]))
+	const cut = all[0].map(f => if (head(f).path == "a.bob") f.slice(0, f.length - 1) else f)
+	assert g(cut).modules.length == g([]).modules.length
 }
 
 test "a header's module and its users are linked from the cache while the files bind and located read are unchanged" {

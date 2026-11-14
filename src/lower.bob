@@ -44,14 +44,14 @@ import { strtod } from "stdlib.h"
 
 /// The modules at paths and those they import, checked and lowered into one Program, but those linked from the files
 /// cache (Lift.cached); checked again without them on an import cycle, which they may let it report through another
-/// module, or if the ABI of a module one of them uses is not what it holds (Lift.current). Throws the type errors, or
-/// what is not lowered, as a CompileError.
+/// module, if one of them is malformed, or if the ABI of a module one of them uses is not what it holds
+/// (Lift.current). Throws the type errors, or what is not lowered, as a CompileError.
 export function lower(paths: string[], dirs: string[] = [], cache: string[] = [],
 	read: (path: string) => string | null = p => readFile(p)): Program {
 	const l = new Lower()
 	l.lift.cached(cache, dirs, read)
 	const errors = check(paths, dirs, read, l, l.lift).filter(e => !e.warning)
-	if (cache.length > 0 && errors.some(e => startsWith(e.msg, "import cycle"))) {
+	if (cache.length > 0 && (l.lift.malformed || errors.some(e => startsWith(e.msg, "import cycle")))) {
 		return lower(paths, dirs, [], read)
 	}
 	if (errors.length > 0) {
