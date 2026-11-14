@@ -1,7 +1,7 @@
 //! ELF64, little-endian, of x86-64 and arm64: relocatable objects read as Objects, the symbols a shared library
 //! defines, and an Image written as a shared library. This is the only file of the linker that knows ELF.
 
-import { partitionPoint, sortBy, startsWith } from "../../std/algo"
+import { partitionPoint, sort, sortBy, startsWith } from "../../std/algo"
 import { L, P, R, z } from "../../std/ascii"
 import { HashMap } from "../../std/collections/hashmap"
 import { get, put } from "../../std/encoding/binary"
@@ -42,6 +42,7 @@ const SHT_INIT_ARRAY: u64 = 14
 const SHT_FINI_ARRAY: u64 = 15
 const SHT_PREINIT_ARRAY: u64 = 16
 const SHT_GROUP: u64 = 17
+const SHT_RELR: u64 = 19
 /// sh_flags: written, loaded, run, thread-local.
 const SHF_WRITE: u64 = 1
 const SHF_ALLOC: u64 = 2
@@ -141,6 +142,9 @@ const DT_STRSZ: u64 = 10
 const DT_SYMENT: u64 = 11
 const DT_INIT_ARRAY: u64 = 25
 const DT_INIT_ARRAYSZ: u64 = 27
+const DT_RELRSZ: u64 = 35
+const DT_RELR: u64 = 36
+const DT_RELRENT: u64 = 37
 
 /// The relocatable object bytes, read from the file name, as an Object of its loaded sections; those not loaded, as
 /// symbol tables, notes and comments, and the relocations of them are dropped. The functions of `.init_array.N` run
@@ -388,24 +392,50 @@ function write(image: Image) throws CompileError {
 	const strAt = place(strs)
 	const hashAt = place(fromBytes(hash(dynamic)))
 
+	// The rebases of words as RELR: an address, then bitmaps of the 63 words after what the entry before covers.
+	const words = image.rebases.filter(at => at % 8 == 0)
+	sort(words)
+	const relr: string[] = []
+	let i = 0
+	while (i < words.length) {
+		relr.push(le(words[i], 8))
+		let next = words[i] + 8
+		i++
+		let bits: u64 = 1
+		while (bits != 0) {
+			bits = 0
+			while (i < words.length && words[i] < next + 63 * 8) {
+				bits |= 1 << (words[i] - next) / 8
+				i++
+			}
+			if (bits != 0) {
+				relr.push(le(bits << 1 | 1, 8))
+			}
+			next += 63 * 8
+		}
+	}
+	const relrAt = place(relr.join(""))
+
+	// The other rebases, the binds and the descs as RELA.
 	const x64 = image.arch == "x86_64"
-	const rela = new u8[](24 * (image.rebases.length + image.binds.length + image.descs.length))
-	for (const i of 0 ... image.rebases.length - 1) {
-		const at = image.rebases[i]
+	const rebases = image.rebases.filter(at => at % 8 != 0)
+	const rela = new u8[](24 * (rebases.length + image.binds.length + image.descs.length))
+	for (const i of 0 ... rebases.length - 1) {
+		const at = rebases[i]
 		put(rela, 24 * i, at, 8)
 		put(rela, 24 * i + 8, if (x64) R_X86_64_RELATIVE else R_AARCH64_RELATIVE, 8)
 		put(rela, 24 * i + 16, image.bytes.get(at, 8), 8)
 	}
 	for (const i of 0 ... image.binds.length - 1) {
 		const b = image.binds[i]
-		const e = 24 * (image.rebases.length + i)
+		const e = 24 * (rebases.length + i)
 		put(rela, e, b.at, 8)
 		put(rela, e + 8, (imported.get(b.name)! as u64) << 32 | (if (x64) R_X86_64_64 else R_AARCH64_ABS64), 8)
 		put(rela, e + 16, b.addend as u64, 8)
 	}
 	for (const i of 0 ... image.descs.length - 1) {
 		const [at, offset] = image.descs[i]
-		const e = 24 * (image.rebases.length + image.binds.length + i)
+		const e = 24 * (rebases.length + image.binds.length + i)
 		put(rela, e, at, 8)
 		put(rela, e + 8, if (x64) R_X86_64_DTPMOD64 else R_AARCH64_TLSDESC, 8)
 		put(rela, e + 16, offset, 8)
@@ -418,7 +448,8 @@ function write(image: Image) throws CompileError {
 
 	let dyn = needed.map(at => le(DT_NEEDED, 8) + le(at as u64, 8)).join("")
 	for (const [tag, v] of [[DT_HASH, hashAt], [DT_STRTAB, strAt], [DT_SYMTAB, symAt], [DT_STRSZ, strs.length as u64],
-		[DT_SYMENT, 24], [DT_RELA, relaAt], [DT_RELASZ, rela.length as u64], [DT_RELAENT, 24]]) {
+		[DT_SYMENT, 24], [DT_RELA, relaAt], [DT_RELASZ, rela.length as u64], [DT_RELAENT, 24], [DT_RELR, relrAt],
+		[DT_RELRSZ, 8 * (relr.length as u64)], [DT_RELRENT, 8]]) {
 		dyn += le(tag, 8) + le(v, 8)
 	}
 	if (image.inits[1] > image.inits[0]) {
@@ -454,6 +485,7 @@ function write(image: Image) throws CompileError {
 	const dynsymIndex = section(".dynsym", SHT_DYNSYM, SHF_ALLOC, symAt, t(symAt), dynsym.length as u64, n + 2, 1, 24)
 	section(".dynstr", SHT_STRTAB, SHF_ALLOC, strAt, t(strAt), strs.length as u64, 0, 0, 0)
 	section(".hash", SHT_HASH, SHF_ALLOC, hashAt, t(hashAt), 8 * ((dynamic.length as u64) + 2), dynsymIndex, 0, 4)
+	section(".relr.dyn", SHT_RELR, SHF_ALLOC, relrAt, t(relrAt), 8 * (relr.length as u64), 0, 0, 8)
 	section(".rela.dyn", SHT_RELA, SHF_ALLOC, relaAt, t(relaAt), rela.length as u64, dynsymIndex, 0, 24)
 	if (hdrAt != 0) {
 		section(".eh_frame_hdr", SHT_PROGBITS, SHF_ALLOC, hdrAt, t(hdrAt), hdrSize, 0, 0, 0)
