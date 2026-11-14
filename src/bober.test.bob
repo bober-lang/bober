@@ -1,6 +1,6 @@
 //! Tests of src/bober.bob's builds into the image, which keeps what it holds across them.
 
-import { indexOf } from "../std/algo"
+import { endsWith, indexOf, startsWith } from "../std/algo"
 import { exists, mkdirAll, open, remove } from "../std/fs"
 import * as process from "../std/process"
 import { replace } from "../std/string"
@@ -208,6 +208,16 @@ test "an export added to a module keeps the code of one that imports it, a chang
 	assert out == "2\n" && again == out && held.length > 0 && kept == held
 	const [changed, anew] = built([["dep.bob", "export function one(x = 2): i32 { return x }\n"]], true)
 	assert changed == "3\n" && anew.length > 0 && !anew.some(o => held.includes(o))
+}
+
+test "a program is launched as its entry and the version of what it is linked from, which an edit of a module changes" {
+	const main = `import { name } from "../../std/process"\nimport { one } from "./dep"\n
+function main() { print(\`\${name()} \${one()}\`) }\n`
+	const run = (one: string) => built([["dep.bob", `export function one(): i32 { return ${one} }\n`], ["main.bob", main]],
+		false)[0]
+	const [out, again, edited] = [run("1"), run("1"), run("2")]
+	assert startsWith(out, `bober.main.${home}/main.bob@`) && again == out
+	assert edited != replace(out, " 1", " 2") && endsWith(edited, " 2\n")
 }
 
 test "a C library's toolchain file includes its own, of a package found by a rooted path or not" {
