@@ -37,7 +37,6 @@ import { Facts, Options, emit, entry, learn, listed } from "./emit"
 import { check, normal } from "./check"
 import { CompileError } from "./error"
 import { formatFile } from "./format"
-import { Backend } from "./backend/backend"
 import { LLVM, triple } from "./backend/llvm"
 import { Tpde } from "./backend/tpde"
 import { Bound, bound, bundle, compilerId } from "./lift"
@@ -86,12 +85,10 @@ export class Compile @optarg.Cc {
 	/// optimize with LLVM
 	release: bool = false
 	/// monomorphize first, so that it runs fast; by default where CI is set
-	mono: bool @optarg.Verbose = process.env("CI") != null
-	/// compile also the instances of generics the program calls, into the image, which then keeps them
-	O1: bool @optarg.Verbose = false
-	/// as -O1, by LLVM, and also the program's functions over their code, slower to compile, and fast
+	O1: bool @optarg.Verbose = process.env("CI") != null
+	/// LLVM compiles the instances of generics and each module's functions over their code: runs fast, slow to compile
 	O2: bool @optarg.Verbose = false
-	/// compile no instances, but keep those the image has (the default)
+	/// each module as it is, fastest to compile, though CI is set; -O2 counts over it
 	O0: bool @optarg.Verbose = false
 }
 
@@ -418,23 +415,22 @@ function hasTests(path: string): bool {
 }
 
 /// Compiles the program of main into the executable build/<name>, or with tests build/<name>.test, all as one,
-/// monomorphized, by LLVM at -O2 if release, else into the image, each module by TPDE, fast to compile: as lowered, or
-/// if mono monomorphized for the program. Returns the command that runs it, or its tests: the executable, or the
-/// launcher on the image's entry, run by the C library's loader where it is the sysroot's, the image as image has it if
-/// pin. Throws the errors, or what failed, as a CompileError or IoError.
+/// monomorphized, by LLVM, optimized, if release, else into the image, each module by TPDE, fast to compile: as
+/// lowered, or at -O1 monomorphized for the program; -O2 counts over -O0, -O0 over -O1. Returns the command that runs
+/// it, or its tests: the executable, or the launcher on the image's entry, run by the C library's loader where it is
+/// the sysroot's, the image as image has it if pin. Throws the errors, or what failed, as a CompileError or IoError.
 export function build(main: string, tests: bool, f: Compile, pin: bool): string[] {
 	const p = lowered([main], f.headers.I)
 	const m = p.module(normal(main))
 	const [files, cxx] = linked(p, tests, f.headers.I)
 	if (!f.release) {
-		if (f.mono) {
+		const o = { main: -1, tests: false, dyn: !f.O1 || f.O2 || f.O0 }
+		if (!o.dyn) {
 			mono(p, m)
 		}
-		const o = { main: -1, tests: false, dyn: !f.mono }
-		const o1 = if ((f.O1 || f.O2) && !f.mono) specialize(p) else null
 		return [...(if (mac) [] else [`${sysroot}/usr/lib/libc.so`]),
 			if (packaged()) join(root, "lib/launch.c.exe") else launcher(dir),
-			image(p, [m], files, cxx, pin, o, o1, f.O2 && !f.mono),
+			image(p, [m], files, cxx, pin, o, if (f.O2) specialize(p) else null),
 			entry(p.modules[m].path, tests)]
 	}
 	const exe = `${dir}/${name(main)}${if (tests) ".test" else ""}`
@@ -560,8 +556,8 @@ let decoded: [u64, Linker, Bytes] | null = null
 /// renamed, as a running program may have the old one mapped, or another build be reading it. Returns its path, or if
 /// pin that of a link to it of this process's, which the launcher removes, by which what the process runs loads this
 /// build's image though another build replaces it.
-function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, o: Options, o1: i32[][][] | null = null,
-	o2 = false, fresh = false): string {
+function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, o: Options, o2: i32[][][] | null = null,
+	fresh = false): string {
 	const out = `${dir}/image${if (o.dyn) "" else ".mono"}.so`
 	// The image continued, which is mapped and written of one descriptor, lest another build replace it in between:
 	// in place if this build has it alone, which no run maps or is about to, by a pin, nor another build reads, but on
@@ -572,15 +568,15 @@ function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, 
 		if (old != null && !alone) {
 			old.lock(true, true)
 		}
-		return relink(p, mains, files, cxx, pin, o, o1, o2, out, old, alone)
+		return relink(p, mains, files, cxx, pin, o, o2, out, old, alone)
 	} finally {
 		old?.close()
 	}
 }
 
 /// The image out, which image links of old, the image continued if not null, written in place if alone.
-function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, o: Options, o1: i32[][][] | null,
-	o2: bool, out: string, old: File | null, alone: bool): string {
+function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, o: Options, o2: i32[][][] | null,
+	out: string, old: File | null, alone: bool): string {
 	const lib = `${sysroot}/usr/lib`
 	const d = decoded
 	decoded = null
@@ -612,43 +608,40 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		edited.push(was != null && !startsWith(was!, own))
 		names.push(`${own}${fnv(bc + b)}`)
 		const rebuilt = lacks(names[m])
-		const [v, others] = if (o2 || rebuilt) version(p, m, bc, signatures) else [0 as u64, []]
+		const [v, others] = if (o2 != null || rebuilt) version(p, m, bc, signatures) else [0 as u64, []]
 		versions.push([`bober.o2.${p.modules[m].path}@${combine(v, fnv(b))}`, others])
 		if (rebuilt) {
 			l.add(unit(p, m, names[m], o, bc, b, versions[m][0]))
 		}
 	}
-	// -O1's instances, an object per bucket of each module's (`<path>~<bucket>@<version>`), and -O2's overlays of the
-	// code of each group's (`<path>^O2@<version>`), but those held; and of those held, but these. -O2 compiles each by
-	// LLVM (`^O2@` after the bucket), and a build that does not keeps what it has of those. A build without keeps them
-	// all, but those that name what no longer is (compiled).
-	if (o1 != null) {
+	// -O2's instances, o2 (src/mono.bob's specialize), an object per bucket of each module's, named
+	// `<path>~<bucket>^O2@<version>`, and its overlays of the code of each group's, `<path>^O2@<version>`, but those
+	// held; and of those held, but these. A build without keeps them all, but those that name what no longer is
+	// (compiled).
+	if (o2 != null) {
 		const wanted: string[] = []
 		const part = (m: i32, ds: i32[], what: string, refs: string[], over: bool) => {
 			const version = fnv(`${refs.join(" ")} ${ds.map(d => p.decls[d].hash).join(" ")}`)
-			const optimized = `${what}^O2@${version}`
-			const name = if (o2 || held.includes(optimized)) optimized else `${what}@${version}`
+			const name = `${what}^O2@${version}`
 			wanted.push(name)
 			if (ds.length > 0 && !held.includes(name)) {
-				l.add(compiled(p, m, ds, name, refs, name == optimized, over))
+				l.add(compiled(p, m, ds, name, refs, over))
 			}
 		}
 		for (const m of 0 ... p.modules.length - 1) {
-			for (const i of 0 ... o1[m].length - 1) {
-				const ds = o1[m][i]
+			for (const i of 0 ... o2[m].length - 1) {
+				const ds = o2[m][i]
 				part(m, ds, `${p.modules[m].path}~${i}`, [`bober.code.${names[m]}`, ...abis(p, m, ds, names)], false)
 			}
 		}
-		if (o2) {
-			// An edited module runs on its base code; the first build that finds it unchanged optimises it again.
-			for (const ds of groups(p).filter(ds => !edited[p.decls[ds[0]].module])) {
-				const m = p.decls[ds[0]].module
-				const [symbol, others] = versions[m]
-				const refs = [symbol, ...abis(p, m, [], names), ...others.map(x => `bober.code.${names[x]}`)]
-				part(m, ds, p.modules[m].path, refs, true)
-			}
+		// An edited module runs on its base code; the first build that finds it unchanged optimises it again.
+		for (const ds of groups(p).filter(ds => !edited[p.decls[ds[0]].module])) {
+			const m = p.decls[ds[0]].module
+			const [symbol, others] = versions[m]
+			const refs = [symbol, ...abis(p, m, [], names), ...others.map(x => `bober.code.${names[x]}`)]
+			part(m, ds, p.modules[m].path, refs, true)
 		}
-		const ours = (h: string) => p.modules.some(x => startsWith(h, `${x.path}~`) || o2 && startsWith(h, `${x.path}^`))
+		const ours = (h: string) => p.modules.some(x => startsWith(h, `${x.path}~`) || startsWith(h, `${x.path}^`))
 		for (const h of held.filter(h => ours(h) && !wanted.includes(h))) {
 			l.remove(h)
 		}
@@ -670,7 +663,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		const info = stat(f)
 		const name = `${f}@${info.modified}.${info.size}`
 		if (held.some(h => h != name && startsWith(h, `${f}@`))) {
-			return image(p, mains, files, cxx, pin, o, o1, o2, true)
+			return image(p, mains, files, cxx, pin, o, o2, true)
 		}
 		if (!held.includes(name)) {
 			l.add(new Object(name, machine.arch))
@@ -720,7 +713,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 				f.close() // old once the pin is made, which a build sees
 			}
 		} catch (e: Stale) {
-			return image(p, mains, files, cxx, pin, o, o1, o2, true)
+			return image(p, mains, files, cxx, pin, o, o2, true)
 		}
 	}
 	const own = `${tmp}.run`
@@ -739,12 +732,11 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 }
 
 /// Module m of p, compiled by TPDE as o says, as the object name. It defines a symbol named by its ABI, one by name,
-/// bober.code.<name>, which the instances -O1 makes of its generics name (image), versioned, which -O2's overlay of
-/// its code names (relink), and names
-/// those of the modules it imports and of builtin/'s, whose functions the compiler calls unasked, so that a kept image
-/// unlinks it once one of them has another: an object another program left there, or after a change of builtin/, which
-/// no bytecode names. As lowered, it holds bc, its bytecode, in section bober_bc, which a build links rather than
-/// checks the module of (lowered), and its Bound, if any (src/lift.bob), in bober_bind.
+/// bober.code.<name>, which -O2's instances of its generics name, and one versioned, which its overlay of its code
+/// names (relink), and names those of the modules it imports and of builtin/'s, whose functions the compiler calls
+/// unasked, so that a kept image unlinks it once one of them has another: an object another program left there, or
+/// after a change of builtin/, which no bytecode names. As lowered, it holds bc, its bytecode, in section bober_bc,
+/// which a build links rather than checks the module of (lowered), and its Bound, if any (src/lift.bob), in bober_bind.
 function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: string, versioned: string): Object {
 	const b = new Tpde(p.modules[m].path)
 	emit(p, m, b, o)
@@ -773,16 +765,15 @@ function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: s
 /// The symbol named by the ABI of p's module m.
 function abiSymbol(p: Program, m: i32): string { return `bober.abi.${p.modules[m].path}.${abi(p, m)}` }
 
-/// Module m's decls ds, compiled as the object name, by LLVM if optimized, else TPDE, which names refs, so that a kept
-/// image unlinks it once one of them is not: that of m's code (unit), and abis'; or of m's version (relink's versions).
-/// ds are -O1's instances of m's generics (src/mono.bob's specialize), or if over, -O2's group of its functions, whose
-/// definitions of code are taken over the unit's; the group defines no other, which would be a second of what the unit
-/// defines.
-function compiled(p: Program, m: i32, ds: i32[], name: string, refs: string[], optimized: bool, over: bool): Object {
-	const b: Backend = if (optimized) new LLVM(p.modules[m].path) else new Tpde(p.modules[m].path)
+/// Module m's decls ds, compiled by LLVM as the object name, which names refs, so that a kept image unlinks it once
+/// one of them is not: that of m's code (unit), and abis'; or of m's version (relink's versions). ds are -O2's
+/// instances of m's generics (src/mono.bob's specialize), or if over, its group of m's functions, whose definitions of
+/// code are taken over the unit's; the group defines no other, which would be a second of what the unit defines.
+function compiled(p: Program, m: i32, ds: i32[], name: string, refs: string[], over: bool): Object {
+	const b = new LLVM(p.modules[m].path)
 	emit(p, m, b, debug, new Facts(), ds)
 	b.verify()
-	const x = (if (optimized) format else elf).read(name, b.object())
+	const x = format.read(name, b.object())
 	for (const s of x.symbols) {
 		if (over && s.binding == Global && s.section >= 0 && x.sections[s.section].kind == Code) {
 			s.binding = Over
