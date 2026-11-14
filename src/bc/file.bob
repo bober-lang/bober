@@ -88,7 +88,7 @@ export function write(p: Program, m: i32, compiler: u64): string { return new Ou
 
 /// The modules of files, linked into p, each of whose deps p holds or is among them; null if one is stale, or made by
 /// another compiler or of another source than its hash in sources (sourceHash). A relative path a file holds is
-/// relative to root.
+/// relative to root. Throws for a malformed file, perhaps once p holds part of it.
 export function read(p: Program, files: string[], compiler: u64, sources: u64[],
 	root = "."): i32[] | null throws ParseError {
 	const abis = new HashMap[string, u64]()
@@ -100,7 +100,6 @@ export function read(p: Program, files: string[], compiler: u64, sources: u64[],
 		}
 		abis.set(heads[i].path, heads[i].abi)
 	}
-	const scratch = new Program()
 	for (const x of heads) {
 		for (const i of 0 ... x.paths.length - 1) {
 			const m = p.module(x.paths[i])
@@ -108,29 +107,13 @@ export function read(p: Program, files: string[], compiler: u64, sources: u64[],
 			if (h == 0 || x.hashes[i] != h) {
 				return null
 			}
-			if (!abis.has(x.paths[i]) && scratch.module(x.paths[i]) < 0) {
-				const s = scratch.addModule(x.paths[i])
-				for (const d of p.modules[m].decls) {
-					declare(scratch, s, -1, p, d)
-				}
-			}
 		}
 	}
-	link(scratch, files, root) // which throws for a malformed file before p changes
 	return link(p, files, root)
 }
 
 /// The header of file and its deps, a relative path relative to root.
 export function head(file: string, root = "."): In throws ParseError { return new In(new Program(), file, root) }
-
-/// Declares in module m of q, in owner, decl d of p and the decls it owns, without their parts.
-function declare(q: Program, m: i32, owner: i32, p: Program, d: i32): void {
-	const x = p.decls[d]
-	const y = q.decl(m, owner, p.strings[x.name], x.kind)
-	for (const z of x.members) {
-		declare(q, m, y, p, z)
-	}
-}
 
 /// The modules of files, linked into p.
 function link(p: Program, files: string[], root: string): i32[] throws ParseError {

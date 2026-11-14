@@ -39,6 +39,8 @@ export class Lift {
 	cache = new HashMap[string, string]()
 	/// The headers of the files linked from the cache.
 	private served: In[] = []
+	/// Whether a file of the cache was malformed, perhaps once prog held part of it, after which the cache is dropped.
+	malformed = false
 
 	/// Adds those of files to the cache that are of their module's source as it is, made by this compiler, but
 	/// builtin/'s, which every program checks first (src/check.bob): as read gives it, or for a header's module as bind
@@ -81,7 +83,10 @@ export class Lift {
 					return this.entered(ms!)
 				}
 			}
-		} catch (e: ParseError | IoError) {}
+		} catch (e: ParseError | IoError) {
+			this.malformed = true
+			this.cache = new HashMap[string, string]()
+		}
 		return -1
 	}
 
@@ -131,6 +136,7 @@ export class Lift {
 				return this.entered(ms!)
 			}
 		} catch (e: ParseError | IoError) {}
+		this.bundle = new HashMap[string, string]() // as p may hold part of it
 		throw new CompileError(`the bundle's ${path}, or a module it imports, is missing, stale or malformed`)
 	}
 
