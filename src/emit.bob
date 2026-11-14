@@ -1256,7 +1256,6 @@ class Emitter {
 	/// descriptors.
 	private trampoline(d: i32, env: i32, f: Callee) {
 		const g = this.callee(d)
-		this.b.weak(f.fn)
 		const start = this.startThunk(f.fn, [])
 		const n = f.first.length
 		const xs: V[] = []
@@ -1272,6 +1271,7 @@ class Emitter {
 		}
 		this.b.at(this.entry)
 		this.b.br(start)
+		this.b.overridable(f.fn) // once defined, as a declaration it would be extern_weak; not weak, which LLVM inlines
 	}
 
 	/// callee's, made.
@@ -1320,11 +1320,12 @@ class Emitter {
 	/// Whether decl d is defined here: of this module, but where only its instances are emitted.
 	private here(d: i32): bool { return this.p.decls[d].module == this.m && !this.overlay }
 
-	/// Decl d as a function of type t, in this module or declared; one nested in a function local.
+	/// Decl d as a function of type t, in this module or declared; one nested in a function local, also where only some
+	/// decls are emitted, which emit it with the function.
 	private function(d: i32, t: IrType): Value {
 		const x = this.p.decls[d]
-		return this.b.function(this.symbol(d), t,
-			this.here(d) && x.owner >= 0 && this.p.classOf(d) < 0 && (x.mods & decl.Export) == 0)
+		return this.b.function(this.symbol(d), t, (this.here(d) || this.overlay && this.decls.includes(d)) && x.owner >= 0
+			&& this.p.classOf(d) < 0 && (x.mods & decl.Export) == 0)
 	}
 
 	/// C's function name, called through a local function of type ft, bober's convention, which makes the call as C's ABI
