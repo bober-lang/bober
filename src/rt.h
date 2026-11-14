@@ -209,6 +209,13 @@ long bober_io_read(int fd, void *buf, unsigned long n);
 long bober_io_map(int fd, void *at, unsigned long n);
 /// Writes up to n bytes of buf, without SIGPIPE: how many.
 long bober_io_write(int fd, const void *buf, unsigned long n);
+/// Writes the n bytes of buf at offset at of the file: how many.
+long bober_io_write_at(int fd, const void *buf, unsigned long n, unsigned long at);
+/// How many bytes the file has.
+long bober_io_size(int fd);
+/// A descriptor, to read and write, of a new file at path of fd's first n bytes, zeros past its end: copied by the
+/// kernel, which shares their blocks where the file system can, else copies its data only, its holes kept.
+long bober_io_copy(int fd, const char *path, unsigned long n);
 long bober_io_sync(int fd);
 long bober_io_mkdir(const char *path);
 /// Removes a file or an empty directory.

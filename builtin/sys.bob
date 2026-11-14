@@ -1,10 +1,11 @@
 //! The system as std reaches it: files, sockets, paths, processes and the environment. A failure throws an IoError.
 
 import { BOBER_IO_AGAIN, BOBER_IO_HOST, bober_entropy, bober_env, bober_io_accept, bober_io_close, bober_io_connected,
-	bober_io_dial, bober_io_exe, bober_io_idle, bober_io_ip, bober_io_ip_text, bober_io_kind, bober_io_list,
-	bober_io_listen, bober_io_mkdir, bober_io_name, bober_io_open, bober_io_read, bober_io_readlink, bober_io_ready,
-	bober_io_recvfrom, bober_io_remove, bober_io_rename, bober_io_reset, bober_io_run, bober_io_sendto,
-	bober_io_shutdown, bober_io_stat, bober_io_sync, bober_io_write, bober_mono, bober_tz } from "../src/rt.h"
+	bober_io_copy, bober_io_dial, bober_io_exe, bober_io_idle, bober_io_ip, bober_io_ip_text, bober_io_kind,
+	bober_io_list, bober_io_listen, bober_io_mkdir, bober_io_name, bober_io_open, bober_io_read, bober_io_readlink,
+	bober_io_ready, bober_io_recvfrom, bober_io_remove, bober_io_rename, bober_io_reset, bober_io_run, bober_io_sendto,
+	bober_io_shutdown, bober_io_size, bober_io_stat, bober_io_sync, bober_io_write, bober_io_write_at, bober_mono,
+	bober_tz } from "../src/rt.h"
 import { fromC } from "./c"
 import { IoError, Kind } from "./error"
 import { fromBytes, mapped } from "./string"
@@ -126,6 +127,35 @@ export class Handle {
 		this.alive("reset")
 		this.closed = true
 		this.checked(bober_io_reset(this.fd), "reset")
+	}
+
+	/// The file's bytes, mapped: they must not change while they are reached.
+	map(): string throws IoError {
+		this.alive("map")
+		const n = this.checked(bober_io_size(this.fd), "map")
+		const s = if (n == 0) "" else mapped(this.fd, n)
+		if (s instanceof i64) {
+			throw failure(s, "map", `${this.fd}`)
+		}
+		return s
+	}
+
+	/// A new file at path, open to read and write, of the file's first n bytes, zeros past its end: which the kernel
+	/// copies, sharing their blocks where the file system can, else its data only, its holes kept.
+	copy(path: string, n: u64): Handle throws IoError {
+		this.alive("copy")
+		return Handle.of(checked(bober_io_copy(this.fd, cPath("copy", path), n), "copy", path) as i32)
+	}
+
+	/// Writes s at offset at of the file.
+	writeAt(at: u64, s: string) throws IoError {
+		this.alive("write")
+		let done = 0
+		while (done < s.length) {
+			const rest = s.slice(done, s.length)
+			done += this.checked(bober_io_write_at(this.fd, rest, rest.length as u64, at + (done as u64)),
+				"write") as i32
+		}
 	}
 
 	/// Waits until what was written is on the device.

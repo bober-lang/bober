@@ -60,7 +60,9 @@ static void edge(int fd, int write);
 enum { ADD, MOD, DEL };
 static int q = -1;  // the kernel's queue
 #if defined(__linux__)
+#include <linux/fs.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
 static int queue(void) { return epoll_create1(EPOLL_CLOEXEC); }
 static int watch(int fd, int how) {
   struct epoll_event e = {EPOLLIN | EPOLLOUT | EPOLLET, {.fd = fd}};
@@ -256,6 +258,54 @@ long bober_io_map(int fd, void *at, unsigned long n) {
 long bober_io_write(int fd, const void *buf, unsigned long n) {
   return NET(fd) ? bober_net.write(fd, buf, n) : result_on(fd, 1, write(fd, buf, n));
 }
+long bober_io_write_at(int fd, const void *buf, unsigned long n, unsigned long at) {
+  return result(pwrite(fd, buf, n, at));
+}
+long bober_io_size(int fd) {
+  struct stat s;
+  return result(fstat(fd, &s) ? -1 : s.st_size);
+}
+
+/// Copies fd's bytes from at to end into to.
+static int copy(int fd, int to, off_t at, off_t end) {
+#if defined(__linux__)
+  for (off_t o = at; at < end; o = at)
+    if (copy_file_range(fd, &at, to, &o, end - at, 0) <= 0) break;  // the rest by hand, as on a file system that cannot
+#endif
+  char buf[1 << 16];
+  for (ssize_t k; at < end; at += k)
+    if ((k = pread(fd, buf, end - at < (off_t)sizeof buf ? end - at : sizeof buf, at)) <= 0 || pwrite(to, buf, k, at) != k)
+      return -1;
+  return 0;
+}
+
+/// Copies fd's bytes into to: sharing their blocks where the file system can, else its data only, its holes kept.
+static int replicate(int fd, int to) {
+#if defined(__linux__)
+  if (ioctl(to, FICLONE, fd) == 0) return 0;
+#endif
+  for (off_t at = 0, end; (at = lseek(fd, at, SEEK_DATA)) >= 0; at = end)
+    if ((end = lseek(fd, at, SEEK_HOLE)) < 0 || copy(fd, to, at, end)) return -1;
+  return errno == ENXIO ? 0 : -1;
+}
+
+long bober_io_copy(int fd, const char *path, unsigned long n) {
+  unlink(path);
+#ifdef __APPLE__
+  int fclonefileat(int, int, const char *, uint32_t);  // of <sys/clonefile.h>
+  int cloned = fclonefileat(fd, AT_FDCWD, path, 0) == 0;
+#else
+  int cloned = 0;
+#endif
+  int to = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+  if (to >= 0 && ((!cloned && replicate(fd, to)) || ftruncate(to, n))) {
+    long r = result(-1);
+    close(to);
+    return r;
+  }
+  return result(to);
+}
+
 long bober_io_sync(int fd) { return result(fsync(fd)); }
 long bober_io_mkdir(const char *path) { return result(mkdir(path, 0777)); }
 long bober_io_rename(const char *from, const char *to) { return result(rename(from, to)); }
