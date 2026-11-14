@@ -5,6 +5,7 @@ import * as kind from "./bc/kind"
 import * as op from "./bc/op"
 import { Code, Program } from "./bc/program"
 import { qualified, showCode, showType } from "./bc/show"
+import { CompileError } from "./error"
 import { mono } from "./mono"
 
 function fn(p: Program, params: i32[], result: i32): i32 { return p.type(kind.Func, p.list(params), result) }
@@ -97,6 +98,24 @@ test "an untyped constant cast to a union takes its first number type, whatever 
 	Return
 End
 `
+}
+
+/// `function f[T](x: T) { f([x]) }`, which no number of instances ends.
+test "a generic instanced with type args nested ever deeper is an error" {
+	const p = new Program()
+	const m = p.addModule("main")
+	const f = add(p, m, -1, "f", decl.Function, 0, null, ["T"])
+	const t = p.type(kind.Param, f, 0)
+	p.decls[f].type = fn(p, [t], Null)
+	p.decls[f].code = code(p, [["x", t]], [[op.Local, 0], [op.Array, p.type(kind.Array, t), 1],
+		[op.Call, f, p.list([p.type(kind.Array, t)])], [op.Drop], [op.Null], [op.Return], [op.End]])
+	add(p, m, -1, "main", decl.Function, fn(p, [], I32), code(p, [], [
+		[op.Int, I32, p.int(1)], [op.Call, f, p.list([I32])], [op.Drop], [op.Int, I32, p.int(0)], [op.Return], [op.End]]))
+	let deep = "i32"
+	for (const i of 1 ... 255) {
+		deep += "[]"
+	}
+	assert mono(p, m) throws new CompileError(`f is instanced with type args nested ever deeper (f[${deep}])`)
 }
 
 /// `class Box[T] { item: T; get(): T { return this.item } }`, and a main making a Box[i32] and getting its item.
