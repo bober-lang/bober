@@ -1,14 +1,15 @@
 //! What the file of a kept image (link.bob) holds of its linker, for a later link to continue it: the State, its head
 //! where the 16 bytes after the format's headers say, and each unit's record in a block of its own (Linker.save).
 
+import { bytes as random } from "../../std/crypto/random"
 import { Reader, Writer } from "../../std/encoding/binary"
 import { Arch } from "../../std/os"
 import { ParseError } from "../../std/string"
-import { Bytes } from "./bytes"
+import { Bytes, u } from "./bytes"
 import { Fixup, Object, Section, Symbol } from "./object"
 
 /// What the head starts with, and the version of the encoding.
-const magic = "bober image 5"
+const magic = "bober image 6"
 
 /// Where the sections of one of regions are: from start to top, of which holes, in order, are free; cap, which top
 /// stays below, where the next region starts.
@@ -128,6 +129,12 @@ export function record(o: Object): string {
 	})
 	return w.bytes
 }
+
+/// The stamp of the file of a kept image whose format's headers take headers bytes, after where its head is.
+export function stamp(file: Bytes, headers: u64): u64 { return file.get(headers + 16, 8) }
+
+/// Gives file a random stamp, as each store of it does.
+export function stamped(file: Bytes, headers: u64) throws IoError { file.put(headers + 16, u(random(8), 0, 8), 8) }
 
 /// The state in the file of a kept image of arch, whose format's headers take headers bytes; null if it holds none.
 export function read(file: Bytes, headers: u64, arch: Arch): State | null {
