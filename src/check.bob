@@ -3133,7 +3133,7 @@ class Checker {
 				this.cond(n)
 				return Bool
 			case "-", "~":
-				const t = this.expr(x, want)
+				const t = this.expr(x, operand(want))
 				if (!(if (op == "-") t.isNumber() else t.isInt())) {
 					throw this.error(n.t.loc, `${op} needs ${if (op == "-") "a number" else "an integer"}, got ${show(t)}`)
 				}
@@ -3294,8 +3294,8 @@ class Checker {
 		}
 		// An untyped operand is in the other operand's context, else in the operation's (§4.1).
 		const shift = n.t.kind == "<<" || n.t.kind == ">>"
-		const l = this.expr(a, want)
-		const t = this.operate(n.t.kind, l, this.expr(b, if (!shift && l.isNumber() && !l.isUntyped()) bases(l) else want), want, n.t)
+		const l = this.expr(a, operand(want))
+		const t = this.operate(n.t.kind, l, this.expr(b, if (!shift && l.isNumber() && !l.isUntyped()) bases(l) else operand(want)), want, n.t)
 		this.convert(a, t)
 		this.convert(b, t)
 		return t
@@ -4694,6 +4694,12 @@ function taken(u: Type, t: Type): Type {
 		}
 	}
 	return c
+}
+
+/// What an operand of an operation wanted as want is wanted as: not null, nor a choice of types, which no operation's is.
+function operand(want: Type | null): Type | null {
+	const w = want?.nonNull()
+	return if (w?.kind == "union") null else w
 }
 
 /// The phase infer checks arg p in.
