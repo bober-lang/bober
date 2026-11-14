@@ -8,7 +8,7 @@ import { lower } from "./lower"
 /// The bytecode of main.bob of source src shown, where it imports lib.bob of source lib: the module's top-level decls,
 /// its vars in the order its init runs them and the modules it depends on, then each decl it has.
 function lowered(src: string, lib: string = ""): string {
-	const p = lower(["main.bob"], [], path => if (path == "main.bob") src else if (path == "lib.bob") lib else null)
+	const p = lower(["main.bob"], [], [], path => if (path == "main.bob") src else if (path == "lib.bob") lib else null)
 	const m = p.module("main.bob")
 	const names = (ds: i32[]) => ds.map(d => p.strings[p.decls[d].name]).join(", ")
 	const deps = p.modules[m].deps.map(d => p.modules[d].path).join(", ")
@@ -686,7 +686,8 @@ End
 }
 
 test "each op carries the position of its construct" {
-	const p = lower(["main.bob"], [], path => if (path == "main.bob") "function f(): i32 {\n\treturn 1 + 2\n}" else null)
+	const p = lower(["main.bob"], [], [],
+		path => if (path == "main.bob") "function f(): i32 {\n\treturn 1 + 2\n}" else null)
 	const c = p.decls[p.find(p.module("main.bob"), -1, "f")].code!
 	const ps: string[] = []
 	for (const i of 0 ... c.ops.length - 1) {

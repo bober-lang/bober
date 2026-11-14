@@ -493,13 +493,18 @@ function inspect(path: string, out: string, includes: string[], release: bool) {
 	b.emit(out, false)
 }
 
-/// Program p of mains, lowered after the CMake projects of main's package are built, with the build directory made.
+/// Program p of mains, lowered after the CMake projects of main's package are built, but the modules linked from the
+/// bytecode build/image.so holds (unit), with the build directory made.
 function lowered(mains: string[], includes: string[]): Program {
 	const home = nearest(mains[0])
 	if (home != null) {
 		cmake(load(home))
 	}
-	const p = lower(mains, includes)
+	const image = `${dir}/image.so`
+	const f = if (exists(image)) open(image) else null // mapped of one descriptor, lest another build replace it
+	const cache = if (f == null) [] else new Linker(machine, format, new Bytes(f.map())).sections("bober_bc")
+	f?.close()
+	const p = lower(mains, includes, cache)
 	mkdirAll(dir)
 	return p
 }
@@ -549,9 +554,10 @@ function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, 
 	}
 	const compiler = compilerId()
 	for (const m of 0 ... p.modules.length - 1) {
-		const name = `${p.modules[m].path}@${fnv(write(p, m, compiler))}`
+		const bc = write(p, m, compiler)
+		const name = `${p.modules[m].path}@${fnv(bc)}`
 		if (lacks(name)) {
-			l.add(unit(p, m, name, o))
+			l.add(unit(p, m, name, o, bc))
 		}
 	}
 	const cxxs: string[] = if (cxx) [`${lib}/libc++.a`, `${lib}/libc++abi.a`] else []
@@ -626,13 +632,20 @@ function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, 
 /// Module m of p, compiled by TPDE as o says, as the object name. It defines a symbol named by its ABI, and names
 /// those of the modules it imports and of builtin/'s, whose functions the compiler calls unasked, so that a kept image
 /// unlinks it once one of them has another: an object another program left there, or after a change of builtin/, which
-/// no bytecode names.
-function unit(p: Program, m: i32, name: string, o: Options): Object {
+/// no bytecode names. As lowered, it holds bc, its bytecode, in section bober_bc, which a build links rather than
+/// checks the module of (lowered).
+function unit(p: Program, m: i32, name: string, o: Options, bc: string): Object {
 	const b = new Tpde(p.modules[m].path)
 	emit(p, m, b, o)
 	b.verify()
 	const x = elf.read(name, b.object())
 	const symbol = (m: i32, section: i32) => new Symbol(`bober.abi.${p.modules[m].path}.${abi(p, m)}`, Global, section)
+	if (o.dyn) {
+		const s = new Section("bober_bc", Const)
+		s.bytes = bc
+		s.size = bc.length as u64
+		x.sections.push(s)
+	}
 	x.sections.push(new Section(".rodata", Const))
 	x.symbols.push(symbol(m, x.sections.length - 1))
 	for (const d of 0 ... p.modules.length - 1) {
