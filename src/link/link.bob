@@ -219,6 +219,9 @@ export class Linker {
 	private state = new State()
 	private loaded = 0
 	private bytes = new Bytes()
+	/// The frozen unit's record as the continued image has it, apart from its encoded, which fix may clear: make reads
+	/// its symbols with a name, and freeze, on making a frozen unit anew, its local ones.
+	private held = ""
 
 	/// A linker of objects of machine's CPU into an image for format's writer; if kept is not null, into one that is
 	/// kept, which continues the image whose file's bytes kept are, if it is one, writing over them.
@@ -242,6 +245,7 @@ export class Linker {
 			return u
 		})
 		this.units[0].frozen = true
+		this.held = this.units[0].encoded
 		this.loaded = s.units.length
 		this.bytes = kept!
 		this.table = kept!
@@ -352,13 +356,10 @@ export class Linker {
 			} catch (e: IoError) {}
 		}
 		// The symbols and fixups of the units the continued image holds, read only now, as a build that links nothing
-		// anew needs but their sections; and the names it has, named as its units define.
+		// anew needs but their sections, and but the frozen one's local symbols; and the names it has, named as its
+		// units define.
 		for (const u of this.units.slice(0, this.loaded)) {
-			const names = rest(u.object, u.encoded, this.shared)
-			if (names == null) {
-				throw new CompileError(`${u.object.name}'s record is not as written`)
-			}
-			u.names = names
+			u.names = this.rest(u, u.encoded, u.frozen)
 		}
 		for (const _ of 1 ... this.shared) {
 			this.names.push(new Name(""))
@@ -1065,9 +1066,9 @@ export class Linker {
 	}
 
 	/// The frozen units as one, of a section per region from its start, of no bytes, that their symbols are in: those
-	/// with a name, but the weak definitions another unit's took over, which are references; and their fixups not set
-	/// for good. Notes where their sections are. The continued image's is as it is where no lazy object, slot or stub
-	/// adds to it.
+	/// with a name, but the weak definitions another unit's took over, which are references, and then the local ones;
+	/// and their fixups not set for good. Notes where their sections are. The continued image's is as it is where no
+	/// lazy object, slot or stub adds to it.
 	private freeze(): Unit {
 		const units = this.units.filter(u => u.frozen)
 		if (units.length == 2 && units[0].encoded != "" && units[1].object.symbols.length == 0) {
@@ -1077,6 +1078,9 @@ export class Linker {
 			for (const [at, size] of u.blocks) {
 				this.free(at, size)
 			}
+		}
+		if (this.held != "") {
+			units[0].names = this.rest(units[0], this.held, false)
 		}
 		const regions = this.state.regions
 		const o = new Object("the image", this.machine.arch)
@@ -1103,6 +1107,7 @@ export class Linker {
 			return j
 		}
 		const laid: [string, u8, u64, u64][] = []
+		const locals: Symbol[] = []
 		for (const u of units) {
 			for (const i of 0 ... u.object.symbols.length - 1) {
 				const s = u.object.symbols[i]
@@ -1111,8 +1116,7 @@ export class Linker {
 					t.binding = if (t.section < 0 && (s.binding == Global || s.section >= 0)) Global else t.binding
 				} else if (s.name != "" && s.section >= 0 && u.at[s.section] != dropped) {
 					const at = u.at[s.section] + s.value
-					o.symbols.push(new Symbol(s.name, Local, region(at), at - regions[region(at)].start, s.size))
-					names.push(-1)
+					locals.push(new Symbol(s.name, Local, region(at), at - regions[region(at)].start, s.size))
 				}
 			}
 			for (const i of 0 ... u.object.sections.length - 1) {
@@ -1152,10 +1156,21 @@ export class Linker {
 			}
 		}
 		this.state.sections = merged([...this.state.sections, ...laid]).filter(e => e[0] != "")
+		o.symbols = [...o.symbols, ...locals]
 		const frozen = new Unit(o, true)
 		frozen.at = regions.map(r => r.start)
-		frozen.names = names
+		frozen.names = [...names, ...locals.map(_ => -1)]
 		return frozen
+	}
+
+	/// u's symbols and fixups as record has them, if named but its local symbols after the others; the indices of its
+	/// symbols' names.
+	private rest(u: Unit, record: string, named: bool): i32[] throws CompileError {
+		const names = rest(u.object, record, this.shared, named)
+		if (names == null) {
+			throw new CompileError(`${u.object.name}'s record is not as written`)
+		}
+		return names
 	}
 
 	/// u without the bytes of its sections, and but the fixups a later link sets again: of a shared name, or a pointer

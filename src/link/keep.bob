@@ -6,10 +6,10 @@ import { Reader, Writer } from "../../std/encoding/binary"
 import { Arch } from "../../std/os"
 import { ParseError } from "../../std/string"
 import { Bytes, u } from "./bytes"
-import { Fixup, Object, Section, Symbol } from "./object"
+import { Fixup, Local, Object, Section, Symbol } from "./object"
 
 /// What the head starts with, and the version of the encoding.
-const magic = "bober image 9"
+const magic = "bober image 10"
 
 /// Where the sections of one of regions are: from start to top, of which holes, in order, are free; cap, which top
 /// stays below, where the next region starts.
@@ -133,14 +133,16 @@ export function record(o: Object, names: i32[]): string {
 			w.sleb(f.addend)
 		})
 	}
+	let i = 0
 	list(w, o.symbols, sym => {
 		str(sym.name)
 		w.u8(sym.binding)
 		w.sleb(sym.section as i64)
 		w.uleb(sym.value)
 		w.uleb(sym.size)
+		w.uleb((names[i] + 1) as u64)
+		i++
 	})
-	list(w, names, g => w.uleb((g + 1) as u64))
 	return w.bytes
 }
 
@@ -215,9 +217,9 @@ function object(r: Reader, arch: Arch): Object throws ParseError {
 	return o
 }
 
-/// Reads o's symbols and fixups from its record, of which read read the head; the indices of its symbols' names, of
-/// a table of count, null if the record is not as written.
-export function rest(o: Object, record: string, count: i32): i32[] | null {
+/// Reads o's symbols and fixups from its record, of which read read the head, if named but the local symbols after
+/// the others; the indices of its symbols' names, of a table of count, null if the record is not as written.
+export function rest(o: Object, record: string, count: i32, named = false): i32[] | null {
 	const r = new Reader(record)
 	const str = () => r.raw(r.uleb() as i32)
 	try {
@@ -225,9 +227,21 @@ export function rest(o: Object, record: string, count: i32): i32[] | null {
 		for (const sec of o.sections) {
 			sec.fixups = many(r, () => new Fixup(r.uleb(), r.u8(), r.uleb() as i32, r.sleb()))
 		}
-		o.symbols = many(r, () => new Symbol(str(), r.u8(), r.sleb() as i32, r.uleb(), r.uleb()))
-		const names = many(r, () => (r.uleb() as i32) - 1)
-		return if (names.length == o.symbols.length && names.every(g => g >= -1 && g < count)) names else null
+		o.symbols = []
+		const names: i32[] = []
+		for (const _ of 1 ... (r.uleb() as i32)) {
+			const s = new Symbol(str(), r.u8(), r.sleb() as i32, r.uleb(), r.uleb())
+			if (named && s.binding == Local) {
+				break
+			}
+			const g = (r.uleb() as i32) - 1
+			if (g < -1 || g >= count) {
+				return null
+			}
+			o.symbols.push(s)
+			names.push(g)
+		}
+		return names
 	} catch (e: ParseError) {
 		return null
 	}
