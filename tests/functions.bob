@@ -166,6 +166,75 @@ test "a generic class's function field is called as its instance types it" {
 	assert f(1) == 2 && h.f(2) == 6 && h.run(3) == 12
 }
 
+class Box[T] {
+	f: ((x: T) => T) | null = null
+	pair: [(x: T) => T, i32] | null = null
+	obj: { g: (x: T) => T } | null = null
+}
+
+function keep[T](fs: ((x: T) => T)[], f: (x: T) => T) { fs.push(f) }
+function push[T](xs: T[], x: T) { xs.push(x) }
+function callFirst[T](fs: ((x: T) => T)[], x: T): T { return fs[0](x) }
+function viaView[T](o: { f: (x: T) => T }, x: T): T { return o.f(x) }
+
+function fill[T](b: Box[T], f: (x: T) => T) {
+	b.f = f
+	b.pair = [f, 1]
+	b.obj = { g: f }
+}
+
+function attempt[T](f: (x: T) => T, x: T): T {
+	try {
+		return f(x)
+	} catch (e: i32) {
+		return x
+	}
+}
+
+function same[T](f: () => T, x: T): bool { return f() == x }
+function collect[T](f: () => T, xs: T[]) { xs.push(f()) }
+function applyTo[T](f: (x: T) => i32, x: T): i32 { return f(x) }
+function sum3(xs: i32[3]): i32 { return xs[0] + xs[1] + xs[2] }
+function quarter(): f32 { return 0.25 }
+function half(x: f64): f64 { return x / 2.0 }
+function neg(x: i64): i32 { return -(x as i32) }
+
+test "function values pass between generic and closed code in arrays, views, unions and fields" {
+	const fs: ((x: f64) => f64)[] = []
+	keep(fs, x => x * 2.0)
+	const ss: ((s: string) => string)[] = [s => s + "!"]
+	assert fs[0](1.5) == 3.0 && callFirst([(x: i32) => x + 1], 4) == 5 && callFirst(ss, "hi") == "hi!"
+	const view: { f: (x: i32) => i32 } = new Holder[i32](x => x + 1)
+	assert view.f(1) == 2 && viaView({ f: (x: i32) => x * 3 }, 2) == 6
+	const b = new Box[i32]()
+	fill(b, x => x + 10)
+	assert b.f!(1) == 11 && b.pair![0](2) == 12 && b.obj!.g(3) == 13
+	const limit = 5
+	const capped = (x: i32): i32 => {
+		if (x > limit) {
+			throw x
+		}
+		return x + limit
+	}
+	assert attempt(capped, 1) == 6 && attempt(capped, 9) == 9
+	const triple: i32[3] = [1, 2, 3]
+	const sums: ((xs: i32[3]) => i32)[] = [sum3]
+	sums.push(xs => xs[2] * limit)
+	assert sums[0](triple) == 6 && applyTo(sum3, triple) == 6 && sums[1](triple) == 15
+}
+
+test "a function value is called as a wider type it fits" {
+	const f: (x: f32) => f64 = half
+	const g: (x: i32) => i64 | null = neg
+	const gs: ((x: i32) => i64 | null)[] = []
+	push(gs, neg)
+	const r = gs[0](5)
+	assert f(3.0) == 1.5 && g(4) == -4 && r instanceof i64 && r == -5
+	const xs: f64[] = []
+	collect[f64](quarter, xs)
+	assert same[f64](quarter, 0.25) && xs[0] == 0.25
+}
+
 test "nested functions are visible from their declaration on" {
 	function helper(): i32 { return 2 }
 	function a(): i32 { return helper() }
