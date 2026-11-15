@@ -3,11 +3,12 @@
 //! span of the source; the parser throws at a token it cannot place.
 
 // Ported from eemeli/yaml (ISC, github.com/eemeli/yaml).
-
 import * as ascii from "../../ascii"
+
 import { ampersand, apostrophe, backslash, colon, comma, cr, dollar, dot, equal, exclamation, greater, hash,
 	isAlphanumeric, isHexDigit, lbrace, lbracket, less, lf, lparen, minus, nine, one, percent, pipe, plus, question,
 	quote, rbrace, rbracket, rparen, semicolon, slash, space, star, tab, tilde, underscore } from "../../ascii"
+
 import { max, min } from "../../math"
 import { ParseError } from "../../string"
 import * as kind from "./kind"
@@ -167,12 +168,13 @@ export function parse(s: string): Cst throws ParseError {
 
 /// The byte of s at i, -1 outside it.
 export function byte(s: string, i: i32): i32 { return if (i >= 0 && i < s.length) s[i] as i32 else -1 }
-
 function isEmpty(c: i32): bool { return c == -1 || c == space || c == lf || c == cr || c == tab }
 function isBlank(c: i32): bool { return c == space || c == tab }
+
 function isFlowIndicator(c: i32): bool {
 	return c == comma || c == lbracket || c == rbracket || c == lbrace || c == rbrace
 }
+
 /// Whether c is white space as a regular expression's \s takes it, of ASCII.
 function isWhite(c: i32): bool { return c == space || c >= tab && c <= cr }
 
@@ -400,8 +402,8 @@ class Lexer {
 		let c = this.ch(0)
 		// A ] or } as indented as the [ or { is technically invalid, but taken.
 		if (indent != -1 && indent < this.indentNext && c != hash
-				&& !(indent == this.indentNext - 1 && this.flowLevel == 1 && (c == rbracket || c == rbrace))
-				|| indent == 0 && byte(this.s, this.pos - 1) == lf && isDocMarker(this.s, this.pos)) {
+			&& !(indent == this.indentNext - 1 && this.flowLevel == 1 && (c == rbracket || c == rbrace))
+			|| indent == 0 && byte(this.s, this.pos - 1) == lf && isDocMarker(this.s, this.pos)) {
 			this.flowLevel = 0
 			this.mark(kind.flowErrorEnd)
 			return this.lineStart()
@@ -440,11 +442,10 @@ class Lexer {
 				} else {
 					this.plainScalar()
 				}
-			default:
-				if (c != cr || this.ch(1) != lf) {
-					this.flowKey = false
-					this.plainScalar()
-				}
+			default: if (c != cr || this.ch(1) != lf) {
+				this.flowKey = false
+				this.plainScalar()
+			}
 		}
 		return "flow"
 	}
@@ -572,7 +573,6 @@ class Lexer {
 			this.tok(kind.comment, e)
 		}
 		this.newline()
-
 		let nl = this.pos - 1
 		let indent = 0
 		i = this.pos
@@ -708,9 +708,8 @@ class Lexer {
 /// Whether c may be in a tag's name besides letters, digits and %-escapes.
 export function isTagChar(c: u8): bool {
 	switch (c) {
-		case minus, hash, semicolon, slash, question, colon, ascii.at, ampersand, equal, plus,
-			dollar, underscore, dot, exclamation, tilde, star, apostrophe, lparen, rparen:
-			return true
+		case minus, hash, semicolon, slash, question, colon, ascii.at, ampersand, equal, plus, dollar, underscore, dot,
+			exclamation, tilde, star, apostrophe, lparen, rparen: return true
 		default: return false
 	}
 }
@@ -742,7 +741,7 @@ function keyStart(c: Cst, prev: i32): i32 {
 	while (i >= c.from(prev)) {
 		const k = c.kind[i]
 		if (k == kind.docStart || k == kind.explicitKeyInd || k == kind.mapValueInd || k == kind.seqItemInd
-				|| k == kind.newline) {
+			|| k == kind.newline) {
 			break
 		}
 		i--
@@ -772,7 +771,7 @@ function fixFlowSeqItems(c: Cst, fc: Tok) {
 	for (const it of fc.items!) {
 		const sep = it.sep
 		if (sep != none && it.value == null && !c.includes(it.start, kind.explicitKeyInd)
-				&& !c.includes(sep, kind.mapValueInd)) {
+			&& !c.includes(sep, kind.mapValueInd)) {
 			const v = it.key
 			it.value = v
 			it.key = null
@@ -823,14 +822,12 @@ class Parser {
 			case kind.newline:
 				this.atNewLine = true
 				this.indent = 0
-			case kind.space:
-				if (this.atNewLine && this.s[at] == space) {
-					this.indent += end - at
-				}
-			case kind.explicitKeyInd, kind.mapValueInd, kind.seqItemInd:
-				if (this.atNewLine) {
-					this.indent += end - at
-				}
+			case kind.space: if (this.atNewLine && this.s[at] == space) {
+				this.indent += end - at
+			}
+			case kind.explicitKeyInd, kind.mapValueInd, kind.seqItemInd: if (this.atNewLine) {
+				this.indent += end - at
+			}
 			case kind.byteOrderMark, kind.docMode, kind.flowErrorEnd: {}
 			default: this.atNewLine = false
 		}
@@ -838,12 +835,9 @@ class Parser {
 
 	/// The current token as a node.
 	src(): Tok { return new Tok(this.kind, this.at, this.end, this.indent) }
-
 	/// Adds the current token to the end of list l, or of a new list if none; the list.
 	push(l: i32): i32 { return this.c.add(l, this.kind, this.at, this.end, this.indent) }
-
 	fail(): ParseError { return new ParseError("syntax", this.at) }
-
 	peek(n: i32): Tok | null { return this.stack.at(this.stack.length - n) }
 
 	step() throws ParseError {
@@ -931,11 +925,11 @@ class Parser {
 		}
 		// A last item of only spaces, comments and newlines that are not more indented moves to the parent.
 		if ((t.kind == kind.blockMap || t.kind == kind.blockSeq)
-				&& (top.kind == kind.document || top.kind == kind.blockMap || top.kind == kind.blockSeq)) {
+			&& (top.kind == kind.document || top.kind == kind.blockMap || top.kind == kind.blockSeq)) {
 			const items = t.items!
 			const last = items.at(items.length - 1)
 			if (last != null && last.sep == none && last.value == null && c.size(last.start) > 0 && c.blank(last.start)
-					&& (t.indent == 0 || commentsBelow(c, last.start, t.indent))) {
+				&& (t.indent == 0 || commentsBelow(c, last.start, t.indent))) {
 				if (top.kind == kind.document) {
 					top.tail = last.start
 				} else {
@@ -966,13 +960,12 @@ class Parser {
 			return
 		}
 		switch (this.kind) {
-			case kind.docStart:
-				if (!this.c.blank(doc.start)) {
-					this.pop()
-					this.step()
-				} else {
-					doc.start = this.push(doc.start)
-				}
+			case kind.docStart: if (!this.c.blank(doc.start)) {
+				this.pop()
+				this.step()
+			} else {
+				doc.start = this.push(doc.start)
+			}
 			case kind.anchor, kind.tag, kind.space, kind.comment, kind.newline: doc.start = this.push(doc.start)
 			default:
 				const bv = this.startBlockValue(doc)
@@ -1053,10 +1046,9 @@ class Parser {
 							}
 							nl++
 						case kind.space: {}
-						case kind.comment:
-							if (c.indent[i] > map.indent) {
-								nl = 0
-							}
+						case kind.comment: if (c.indent[i] > map.indent) {
+							nl = 0
+						}
 						default: nl = 0
 					}
 				}
@@ -1135,7 +1127,8 @@ class Parser {
 				if (atNextItem) {
 					it.sep = this.push(none)
 				} else {
-					this.stack.push(blockMap(this.at, this.indent, new Item(keyStart(c, it.start), null, this.push(none))))
+					this.stack.push(blockMap(this.at, this.indent,
+						new Item(keyStart(c, it.start), null, this.push(none))))
 				}
 			} else if (it.value != null || atNextItem && c.includes(sep, kind.mapValueInd)) {
 				items.push(new Item(start, null, this.push(none)))
@@ -1176,7 +1169,8 @@ class Parser {
 	/// it, with the last item's tokens.
 	indentedComment(items: Item[], it: Item, indent: i32): bool {
 		const c = this.c
-		if (this.kind != kind.comment || this.indent <= indent || !c.blank(it.start) || c.includes(it.start, kind.comment)) {
+		if (this.kind != kind.comment || this.indent <= indent || !c.blank(it.start)
+			|| c.includes(it.start, kind.comment)) {
 			return false
 		}
 		const v = items.at(items.length - 2)?.value
@@ -1206,20 +1200,18 @@ class Parser {
 					it.start = this.push(it.start)
 				}
 				return
-			case kind.anchor, kind.tag:
-				if (it.value == null && this.indent > seq.indent) {
+			case kind.anchor, kind.tag: if (it.value == null && this.indent > seq.indent) {
+				it.start = this.push(it.start)
+				return
+			}
+			case kind.seqItemInd: if (this.indent == seq.indent) {
+				if (it.value != null || this.c.includes(it.start, kind.seqItemInd)) {
+					items.push(new Item(this.push(none)))
+				} else {
 					it.start = this.push(it.start)
-					return
 				}
-			case kind.seqItemInd:
-				if (this.indent == seq.indent) {
-					if (it.value != null || this.c.includes(it.start, kind.seqItemInd)) {
-						items.push(new Item(this.push(none)))
-					} else {
-						it.start = this.push(it.start)
-					}
-					return
-				}
+				return
+			}
 		}
 		if (this.indent > seq.indent) {
 			const bv = this.startBlockValue(seq)
@@ -1248,27 +1240,27 @@ class Parser {
 			switch (this.kind) {
 				case kind.comma, kind.explicitKeyInd:
 					// A comma after a ? or props, on a later line, ends their item, whose node is empty.
-					if (it == null || it.sep != none || this.kind == kind.comma
-							&& (c.includes(it.start, kind.explicitKeyInd) || c.includes(it.start, kind.anchor)
-							|| c.includes(it.start, kind.tag))) {
+					if (it == null || it.sep != none
+						|| this.kind == kind.comma
+						&& (c.includes(it.start, kind.explicitKeyInd) || c.includes(it.start, kind.anchor)
+						|| c.includes(it.start, kind.tag))) {
 						items.push(new Item(this.push(none)))
 					} else {
 						it.start = this.push(it.start)
 					}
-				case kind.mapValueInd:
-					if (it == null || it.value != null) {
-						items.push(new Item(none, null, this.push(none)))
-					} else {
-						it.sep = this.push(it.sep)
-					}
-				case kind.space, kind.comment, kind.newline, kind.anchor, kind.tag:
-					if (it == null || it.value != null) {
-						items.push(new Item(this.push(none)))
-					} else if (it.sep != none) {
-						it.sep = this.push(it.sep)
-					} else {
-						it.start = this.push(it.start)
-					}
+				case kind.mapValueInd: if (it == null || it.value != null) {
+					items.push(new Item(none, null, this.push(none)))
+				} else {
+					it.sep = this.push(it.sep)
+				}
+				case kind.space, kind.comment, kind.newline, kind.anchor,
+					kind.tag: if (it == null || it.value != null) {
+					items.push(new Item(this.push(none)))
+				} else if (it.sep != none) {
+					it.sep = this.push(it.sep)
+				} else {
+					it.start = this.push(it.start)
+				}
 				case kind.alias, kind.scalar, kind.singleQuotedScalar, kind.doubleQuotedScalar:
 					const fs = this.src()
 					if (it == null || it.value != null) {
@@ -1292,8 +1284,9 @@ class Parser {
 		} else {
 			const parent = this.peek(2)!
 			const last = if (parent.kind == kind.blockMap) parent.items![parent.items!.length - 1] else null
-			if (last != null && (this.kind == kind.mapValueInd && parent.indent == fc.indent
-					|| this.kind == kind.newline && last.sep == none)) {
+			if (last != null
+				&& (this.kind == kind.mapValueInd && parent.indent == fc.indent
+				|| this.kind == kind.newline && last.sep == none)) {
 				if (this.kind == kind.mapValueInd && last.sep != none) {
 					throw this.fail() // a key on the line of a value, as in `a: {}: b`
 				}
@@ -1348,8 +1341,8 @@ class Parser {
 				return blockMap(this.at, this.indent, it)
 			case kind.mapValueInd:
 				this.onKeyLine = true
-				return blockMap(this.at, this.indent, new Item(keyStart(this.c, this.prevProps(parent)), null,
-					this.push(none)))
+				return blockMap(this.at, this.indent,
+					new Item(keyStart(this.c, this.prevProps(parent)), null, this.push(none)))
 			default: return null
 		}
 	}

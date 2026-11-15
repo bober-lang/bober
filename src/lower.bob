@@ -33,10 +33,10 @@ import * as kind from "./bc/kind"
 import * as op from "./bc/op"
 import { Opcode } from "./bc/op"
 import { Code, Program, TypeParam, sourceHash } from "./bc/program"
-import {
-	Checked, Node, after, arrowBody, bodyOf, check, child, compared, element, has, isLink, isTok, isTypeValue, operands,
-	optional, selfOf, show as showType, sourceOf, standsFor, substitute, supers,
-} from "./check"
+
+import { Checked, Node, after, arrowBody, bodyOf, check, child, compared, element, has, isLink, isTok, isTypeValue,
+	operands, optional, selfOf, show as showType, sourceOf, standsFor, substitute, supers } from "./check"
+
 import { CompileError } from "./error"
 import { Tok } from "./lex"
 import { Lift } from "./lift"
@@ -84,7 +84,9 @@ export class Lower implements Checked {
 	declare(n: Node, path: string, src: string) {
 		const u = this.unit(path)
 		u.src = src
-		this.trying(() => { u.declare(n) })
+		this.trying(() => {
+			u.declare(n)
+		})
 	}
 
 	done(path: string) { this.trying(() => this.unit(path).finish()) }
@@ -165,7 +167,9 @@ export class Lower implements Checked {
 		if (this.top(symbol) == null) {
 			this.lift.module(path)
 		}
-		return this.top(symbol) ?? this.unit(path).entry(symbol, -1, name, if (name == "Future") decl.Class else decl.Function, decl.Export, Null, "", null)
+		return this.top(symbol)
+			?? this.unit(path).entry(symbol, -1, name, if (name == "Future") decl.Class else decl.Function, decl.Export,
+			Null, "", null)
 	}
 }
 
@@ -213,7 +217,8 @@ class Unit {
 		if (name.kind != "token") {
 			throw this.fail(name, "a pattern at the top level")
 		}
-		const mods = (if (isTok(n.parts[0], "export")) decl.Export else 0) | (if (n.t.kind == "const") decl.Readonly else 0)
+		const mods = (if (isTok(n.parts[0], "export")) decl.Export else 0)
+			| (if (n.t.kind == "const") decl.Readonly else 0)
 		const t = n.type ?? Type.function([], Null)
 		// A function's, with those of its `T[readonly]` params, or an alias's.
 		const ps = if (n.kind == "function") t.params else child(n, "typeParams")?.parts.map(p => p.type!) ?? []
@@ -225,12 +230,14 @@ class Unit {
 			case "function":
 				const body = bodyOf(n)
 				const extern = body == null && indexOf(this.path(), ": ") >= 0 // a C header's, not an intrinsic's
-				const d = this.entry(name.symbol, -1, text, decl.Function, mods | (if (extern) decl.Extern else 0), t, n.doc, null)
+				const d = this.entry(name.symbol, -1, text, decl.Function, mods | (if (extern) decl.Extern else 0), t,
+					n.doc, null)
 				this.generic(ps, d)
 				this.later(() => {
 					this.prog.decls[d].params = this.typeParams(ps)
 					this.prog.decls[d].throws = this.throws(n)
-					this.define(d, this.fn(t, child(n, "params")), this.body(d, t, null, child(n, "params"), body, t.params))
+					this.define(d, this.fn(t, child(n, "params")),
+						this.body(d, t, null, child(n, "params"), body, t.params))
 				})
 			case "var":
 				const d = this.entry(name.symbol, -1, text, decl.Var, mods, t, n.doc, this.vars)
@@ -256,7 +263,8 @@ class Unit {
 		// A local one is new, never declared ahead, though its function may have another of its name.
 		const d = if (owner < 0) this.entry(symbol, owner, name, k, mods, t, n.doc, null)
 			else this.l.newDecl(this.m, owner, name, k, mods, t, n.doc)
-		if (this.l.lift.nominals.get(t.id) == null) { // not declared ahead
+		if (this.l.lift.nominals.get(t.id) == null) {
+			// not declared ahead
 			this.l.lift.nominals.set(t.id, d)
 			this.generic(t.params, d)
 		}
@@ -279,8 +287,9 @@ class Unit {
 	private member(p: Node, t: Type, d: i32, mods: i32) {
 		const key = if (p.kind == "unary") showType(p.type!.generic ?? p.type!) else this.key(p.t)
 		const embedded = p.kind == "unary" || after(p, ":")?.kind == "unary"
-		const pm = (mods & decl.Export) | (if (has(p, "static")) decl.Static else 0) | (if (has(p, "private")) decl.Private else 0)
-			| (if (has(p, "readonly")) decl.Readonly else 0) | (if (embedded) decl.Embed else 0)
+		const pm = (mods & decl.Export) | (if (has(p, "static")) decl.Static else 0)
+			| (if (has(p, "private")) decl.Private else 0) | (if (has(p, "readonly")) decl.Readonly else 0)
+			| (if (embedded) decl.Embed else 0)
 		const k: decl.Kind = if (p.kind == "method") decl.Function else decl.Var
 		const self = if (has(p, "static")) null else selfOf(t)
 		const pt = p.type!
@@ -288,16 +297,20 @@ class Unit {
 		if (self != null && (k == decl.Var || key == "constructor")) {
 			this.depend(d, md) // what new runs (spec 3)
 		}
-		this.later(() => { this.prog.decls[md].tags = this.tags(p) })
+		this.later(() => {
+			this.prog.decls[md].tags = this.tags(p)
+		})
 		if (k == decl.Function) {
 			this.generic(pt.params, md)
 			this.later(() => {
 				this.prog.decls[md].params = this.typeParams(pt.params)
 				this.prog.decls[md].throws = this.throws(p)
-				this.define(md, this.fn(pt), this.body(md, pt, self, child(p, "params"), bodyOf(p), [...this.args(t), ...pt.params]))
+				this.define(md, this.fn(pt),
+					this.body(md, pt, self, child(p, "params"), bodyOf(p), [...this.args(t), ...pt.params]))
 			})
 		} else {
-			this.later(() => this.define(md, this.ty(pt, true), this.initializer(md, after(p, "="), pt, self, this.args(t), if (embedded) key else "")))
+			this.later(() => this.define(md, this.ty(pt, true),
+				this.initializer(md, after(p, "="), pt, self, this.args(t), if (embedded) key else "")))
 		}
 	}
 
@@ -401,7 +414,8 @@ class Unit {
 				if (!exact) {
 					return base
 				}
-				const v = if (base == kind.String) p.intern(unquoted(t.text)) else if (base == kind.Bool) (if (t.text == "true") 1 else 0)
+				const v = if (base == kind.String) p.intern(unquoted(t.text))
+					else if (base == kind.Bool) (if (t.text == "true") 1 else 0)
 					else p.int(integer(t.text))
 				return p.type(kind.Literal, base, v)
 			case "array": return p.type(kind.Array, this.ty(t.params[0], false, g))
@@ -456,8 +470,10 @@ class Unit {
 		for (const i of 0 ... t.types.length - 1) {
 			const p = this.ty(t.types[i], false, g)
 			const embed = params != null && after(params.parts[i], ":")?.kind == "unary"
-			ps.push(if (t.rest && i == t.types.length - 1) this.prog.type(kind.Rest, p) else if (i >= t.n) this.prog.type(kind.Optional, p)
-				else if (embed) this.prog.type(kind.Embed, p) else p)
+			ps.push(if (t.rest && i == t.types.length - 1) this.prog.type(kind.Rest, p)
+				else if (i >= t.n) this.prog.type(kind.Optional, p)
+				else if (embed) this.prog.type(kind.Embed, p)
+				else p)
 		}
 		return this.prog.type(kind.Func, this.prog.list(ps), this.ty(t.base!, false, g))
 	}
@@ -478,7 +494,8 @@ class Unit {
 	/// The decl of name in owner, -1 for none, of the checker's symbol if top-level, of type t: declared ahead, or else
 	/// now; added to tops if top-level and to list when lowered, so that they are in the order its declarations are
 	/// lowered whatever was declared ahead, and a module is lowered the same in every program.
-	entry(symbol: string, owner: i32, name: string, k: decl.Kind, mods: i32, t: Type, doc: string, list: i32[] | null): i32 {
+	entry(symbol: string, owner: i32, name: string, k: decl.Kind, mods: i32, t: Type, doc: string,
+		list: i32[] | null): i32 {
 		const ahead = if (owner < 0) this.l.lift.entries.get(symbol) ?? -1 else this.prog.find(this.m, owner, name)
 		const d = if (ahead >= 0) ahead else this.l.newDecl(this.m, owner, name, k, mods, t, doc)
 		if (ahead >= 0) {
@@ -523,7 +540,8 @@ class Unit {
 
 	/// The code of an initializer, converted to t; a field's runs with this. That of a field embedded under the given key
 	/// copies its object literal into the T new placed there, as assigning it does, and gives that T.
-	private initializer(d: i32, init: Node | null, t: Type, self: Type | null, tps: Type[], embedded: string = ""): Code | null {
+	private initializer(d: i32, init: Node | null, t: Type, self: Type | null, tps: Type[],
+		embedded: string = ""): Code | null {
 		if (init == null) {
 			return null
 		}
@@ -547,7 +565,6 @@ class Unit {
 
 	path(): string { return this.prog.modules[this.m].path }
 	text(t: Tok): string { return this.src.slice(t.loc.pos, t.loc.end()) }
-
 	key(t: Tok): string { return if (t.kind == "string") unquoted(this.text(t)) else this.text(t) }
 
 	/// The message of what is not lowered, where p is.
@@ -587,8 +604,8 @@ function primitive(t: Type): i32 {
 const chunk = 64
 
 const operators: [string, Opcode][] = [["+", op.Add], ["-", op.Sub], ["*", op.Mul], ["/", op.Div], ["%", op.Rem],
-	["**", op.Pow], ["&", op.And], ["|", op.Or], ["^", op.Xor], ["<<", op.Shl], [">>", op.Shr], ["==", op.Eq], ["!=", op.Ne],
-	["<", op.Lt], [">", op.Gt], ["<=", op.Le], [">=", op.Ge]]
+	["**", op.Pow], ["&", op.And], ["|", op.Or], ["^", op.Xor], ["<<", op.Shl], [">>", op.Shr], ["==", op.Eq],
+	["!=", op.Ne], ["<", op.Lt], [">", op.Gt], ["<=", op.Le], [">=", op.Ge]]
 
 /// Where break and continue in a loop go: the levels of the blocks they branch out of.
 class Loop {
@@ -691,7 +708,6 @@ class Gen {
 	}
 
 	private br(o: Opcode, level: i32) { this.op(o, this.depth - 1 - level) }
-
 	private int(t: i32, v: i64) { this.op(op.Int, t, this.prog.int(v)) }
 	private real(t: i32, f: f64) { this.op(op.Float, t, this.prog.int(bits(f) as i64)) }
 
@@ -768,7 +784,8 @@ class Gen {
 			patterns.push(pattern)
 			// A param holding Types takes them when compiling (4.11).
 			const types = holdsTypes(p.type!)
-			const l = this.local(if (pattern.kind == "token") this.text(pattern) else "", kind.None, if (types) decl.Readonly else 0)
+			const l = this.local(if (pattern.kind == "token") this.text(pattern) else "", kind.None,
+				if (types) decl.Readonly else 0)
 			this.paramLocals.push(l)
 		}
 		// Typed once each is a local, so that the locals typing them captures follow them.
@@ -858,7 +875,9 @@ class Gen {
 				const name = operands(p)[0]
 				const ro = p.t.kind == "const"
 				// Declared from its start, for a function in its initializer to capture (§3).
-				const l = if (name.kind == "token") this.declare(this.text(name), this.ty(p.type!), if (ro) decl.Readonly else 0) else -1
+				const l = if (name.kind
+					== "token") this.declare(this.text(name), this.ty(p.type!), if (ro) decl.Readonly else 0)
+					else -1
 				const temps = if (init == null) [] else this.elements(name, init!)
 				if (temps.length > 0) {
 					this.bind(name, ro, temps)
@@ -1260,7 +1279,8 @@ class Gen {
 		this.open(op.If, kind.None)
 		this.op(op.Else)
 		this.op(op.Str, this.prog.intern(this.brief(p)))
-		for (const i of (if (texts) 2 else 0) ... this.shown.length - 1) { // the strings compared show as their diff
+		for (const i of (if (texts) 2 else 0) ... this.shown.length - 1) {
+			// the strings compared show as their diff
 			const q = this.shown[i]
 			if (this.kept[i] >= 0) {
 				this.op(op.Str, this.prog.intern(`\n  ${this.brief(q)}: `))
@@ -1562,7 +1582,8 @@ class Gen {
 			return at
 		}
 		const r = p.parts[0]
-		if (saved && p.kind == "index" && r.type!.kind == "fixed" && (r.kind == "token" || r.kind == "member" || r.kind == "index")) {
+		if (saved && p.kind == "index" && r.type!.kind == "fixed"
+			&& (r.kind == "token" || r.kind == "member" || r.kind == "index")) {
 			// A fixed array is a value; a copy of it in a temp would take the update.
 			const at = new Place(op.Subscript, op.SetSubscript)
 			at.type = this.ty(p.type!)
@@ -1574,10 +1595,13 @@ class Gen {
 		}
 		// A local's member's object is the local, loaded again before the value, not kept in a temp; unless narrowed, as
 		// loaded it is cast.
-		const loc = if (saved && p.kind == "member" && r.kind == "token" && r.symbol == "") this.find(this.text(r)) else null
+		const loc = if (saved && p.kind == "member" && r.kind == "token" && r.symbol == "") this.find(this.text(r))
+			else null
 		const i = if (p.kind == "index") p.parts[1] else null
 		const key = if (i == null) this.text(p.parts[1]) else this.fieldKey(i!, r.type!)
-		const own = if (loc != null && (key == null || through(r.type!, key!) == null) && this.code.locals[loc!].type == this.ty(r.type!)) loc else null
+		const own = if (loc != null && (key == null || through(r.type!, key!) == null)
+			&& this.code.locals[loc!].type == this.ty(r.type!)) loc
+			else null
 		const o = if (own != null) r.type! else this.promote(this.receiver(p, -1), key)
 		const at = if (key != null) this.slot(o, key!) else new Place(op.Subscript, op.SetSubscript)
 		at.type = this.ty(p.type!)
@@ -1911,7 +1935,8 @@ class Gen {
 		const f = callee.type!
 		const r = this.ty(p.type!)
 		// Without its type args, as f in f[T](); a subscript, as fs[0], is called as a value.
-		const named = if (callee.kind == "index" && callee.parts[0].type?.kind == "function") callee.parts[0] else callee
+		const named = if (callee.kind == "index" && callee.parts[0].type?.kind == "function") callee.parts[0]
+			else callee
 		const d = this.global(named)
 		const l = if (isTok(named, "ident") && named.symbol == "") this.find(this.text(named)) else null
 		if (d != null && this.prog.decls[d!].kind != decl.Var) {
@@ -1997,7 +2022,8 @@ class Gen {
 	/// one holding Types, which is known when compiling.
 	private spread(o: Opcode, t: Type, ps: Node[], item: (q: Node, i: i32) => void) {
 		const init = !ps.some(q => q.kind == "unary" && q.t.kind == "...")
-		if (init && ps.length > chunk && (t.kind == "array" || t.kind == "object") && !holdsType(this.prog, this.ty(t))) {
+		if (init && ps.length > chunk && (t.kind == "array" || t.kind == "object")
+			&& !holdsType(this.prog, this.ty(t))) {
 			this.outline(t, ps)
 			return
 		}
@@ -2289,7 +2315,8 @@ class Gen {
 				// An integer becomes a value of an integer literal type only where it is one of its literals (§4.2), which
 				// expr's Cast then makes it.
 				const ls = t.alternatives()
-				if (a.type!.isInt() && !a.type!.fits(t) && ls.every(m => m.kind == "literal" && m.base!.kind == "int")) {
+				if (a.type!.isInt() && !a.type!.fits(t)
+					&& ls.every(m => m.kind == "literal" && m.base!.kind == "int")) {
 					const from = this.ty(a.type!)
 					const v = this.temp(from)
 					this.op(op.SetLocal, v)
@@ -2350,11 +2377,10 @@ class Gen {
 				this.expr(a)
 				this.orElse(a.type!, () => this.value(b, t), t)
 				return this.ty(t)
-			case "|":
-				if (standsFor(t) != null) {
-					this.op(op.Type, this.ty(standsFor(t)!))
-					return kind.Type
-				}
+			case "|": if (standsFor(t) != null) {
+				this.op(op.Type, this.ty(standsFor(t)!))
+				return kind.Type
+			}
 		}
 		this.value(a, t)
 		this.value(b, t)
@@ -2491,11 +2517,9 @@ function eached(t: Type): bool {
 }
 
 function holdsTypes(t: Type): bool { return isTypeValue(t) || t.kind == "array" && holdsTypes(t.params[0]) }
-
 /// Whether p names something, so that its value may be other than what its source spells; this, often large, alone is
 /// not shown.
 function names(p: Node): bool { return if (p.kind == "token") p.t.kind == "ident" else p.parts.some(names) }
-
 /// Whether a value of type t is text as is in a template: a string or a string literal.
 function textual(t: Type): bool { return t.kind == "string" || t.kind == "literal" && t.base!.kind == "string" }
 

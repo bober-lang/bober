@@ -72,11 +72,13 @@ export class Known {
 }
 
 function typeValue(t: i32): Known { return new Known(null, t) }
+
 function closureValue(k: i32): Known {
 	const v = new Known(null)
 	v.fn = k
 	return v
 }
+
 function array(items: Known[], names: string[] = []): Known { return new Known(null, -1, items, names) }
 function truth(b: bool): Known { return new Known(new Op(if (b) op.True else op.False)) }
 
@@ -166,7 +168,8 @@ export class Instances {
 		}
 		const p = this.p
 		const x = p.decls[d]
-		const o = if (owner >= 0 || x.owner < 0) owner else this.instance(x.owner, this.prefix(env, p.identity(x.owner).length))
+		const o = if (owner >= 0 || x.owner < 0) owner
+			else this.instance(x.owner, this.prefix(env, p.identity(x.owner).length))
 		let h = combine(if (owner < 0) 0 else p.decls[owner].hash, values.length)
 		for (const v of values) {
 			h = combine(h, hashOf(p, v))
@@ -248,10 +251,8 @@ export class Instances {
 	}
 
 	// Types.
-
 	/// The kind of class or interface decl t names, -1 if it names none.
 	nominal(t: i32): i32 { return if (this.p.kind(t) == kind.Named) this.p.decls[this.p.a(t)].kind else -1 }
-
 	/// Whether t is held as a union of what is converted to it: an interface or object type.
 	abstract(t: i32): bool { return this.nominal(t) == decl.Interface || this.p.kind(t) == kind.Object }
 
@@ -368,7 +369,6 @@ export class Instances {
 	}
 
 	// Reflection (§4.11).
-
 	/// Member name of Type t.
 	reflect(t: i32, name: string): Known throws CompileError {
 		const p = this.p
@@ -382,7 +382,8 @@ export class Instances {
 			case "tags": return if (named) this.tags(d, p.b(t)) else array([])
 			case "args":
 				const env = if (named) p.lists[p.b(t)] else []
-				return array(env.slice(env.length - (if (named) p.decls[d].params.length else 0), env.length).map(typeValue))
+				return array(env.slice(env.length - (if (named) p.decls[d].params.length else 0),
+					env.length).map(typeValue))
 			case "base", "elem":
 				const r = p.type(kind.Member, t, p.intern(name))
 				if (p.kind(r) == kind.Member) {
@@ -391,11 +392,15 @@ export class Instances {
 				return typeValue(r)
 			case "members": return array(if (p.kind(t) == kind.Union) p.members(t).map(typeValue) else [])
 			case "bits": return this.int(if (kind.isInt(t) || kind.isFloat(t)) kind.width(t) else 0)
-			case "length": return this.int(if (p.kind(t) == kind.FixedArray) p.b(t) else if (p.kind(t) == kind.Func) p.items(t).length else 0)
+			case "length": return this.int(if (p.kind(t) == kind.FixedArray) p.b(t)
+				else if (p.kind(t) == kind.Func) p.items(t).length
+				else 0)
 			case "value":
 				const a = p.a(t)
-				return if (t == kind.Null) new Known(new Op(op.Null)) else if (a == kind.String) new Known(new Op(op.Str, p.b(t)))
-					else if (a == kind.Bool) truth(p.b(t) == 1) else new Known(new Op(op.Int, a, p.b(t)))
+				return if (t == kind.Null) new Known(new Op(op.Null))
+					else if (a == kind.String) new Known(new Op(op.Str, p.b(t)))
+					else if (a == kind.Bool) truth(p.b(t) == 1)
+					else new Known(new Op(op.Int, a, p.b(t)))
 		}
 		throw new CompileError(`Type has no member ${name} (${this.where})`)
 	}
@@ -405,8 +410,8 @@ export class Instances {
 		const p = this.p
 		const fs: Known[] = []
 		const field = (name: i32, ft: i32, ro: bool, doc: i32, tags: Known) => {
-			fs.push(array([new Known(new Op(op.Str, name)), typeValue(ft), truth(ro), new Known(new Op(op.Str, doc)), tags],
-				["name", "type", "readonly", "doc", "tags"]))
+			fs.push(array([new Known(new Op(op.Str, name)), typeValue(ft), truth(ro), new Known(new Op(op.Str, doc)),
+				tags], ["name", "type", "readonly", "doc", "tags"]))
 		}
 		const k = p.kind(t)
 		const ts = if (k == kind.Object || k == kind.Tuple) p.items(t) else []
@@ -416,23 +421,23 @@ export class Instances {
 				for (const i of 0 ... ts.length - 1) {
 					field(ns[2 * i], ts[i], (ns[2 * i + 1] & decl.Readonly) != 0, 0, array([]))
 				}
-			case kind.Tuple:
-				for (const i of 0 ... ts.length - 1) {
-					field(p.elementName(i), ts[i], false, 0, array([]))
+			case kind.Tuple: for (const i of 0 ... ts.length - 1) {
+				field(p.elementName(i), ts[i], false, 0, array([]))
+			}
+			case kind.Named: for (const m of p.decls[p.a(t)].members) {
+				const x = p.decls[m]
+				if (x.kind == decl.Var && (x.mods & decl.Static) == 0) {
+					field(x.name, p.subst(x.type, p.b(t)), (x.mods & decl.Readonly) != 0, x.doc, this.tags(m, p.b(t)))
 				}
-			case kind.Named:
-				for (const m of p.decls[p.a(t)].members) {
-					const x = p.decls[m]
-					if (x.kind == decl.Var && (x.mods & decl.Static) == 0) {
-						field(x.name, p.subst(x.type, p.b(t)), (x.mods & decl.Readonly) != 0, x.doc, this.tags(m, p.b(t)))
-					}
-				}
+			}
 		}
 		return fs
 	}
 
 	/// The tags of decl d in env, as Type values.
-	private tags(d: i32, env: i32): Known { return array(this.p.lists[this.p.decls[d].tags].map(t => typeValue(this.p.subst(t, env)))) }
+	private tags(d: i32, env: i32): Known {
+		return array(this.p.lists[this.p.decls[d].tags].map(t => typeValue(this.p.subst(t, env))))
+	}
 
 	str(s: string): Known { return new Known(new Op(op.Str, this.p.intern(s))) }
 	int(v: i64): Known { return new Known(new Op(op.Int, kind.I32, this.p.int(v))) }
@@ -462,7 +467,6 @@ function kindName(p: Program, t: i32): string {
 
 /// The decl instance k is of.
 function source(p: Program, k: i32): i32 { return if (p.decls[k].generic < 0) k else p.decls[k].generic }
-
 /// Whether member d embeds its type.
 export function embedded(p: Program, d: i32): bool { return (p.decls[d].mods & decl.Embed) != 0 }
 
@@ -514,7 +518,10 @@ function keyOf(v: Known | null): string {
 		return "_"
 	}
 	const o = v.op
-	return if (v.fn >= 0) `f${v.fn}` else if (o != null) `${o.op as i32}.${o.a}.${o.b}` else if (v.t >= 0) `t${v.t}` else `[${v.items!.map(x => keyOf(x)).join(",")}]`
+	return if (v.fn >= 0) `f${v.fn}`
+		else if (o != null) `${o.op as i32}.${o.a}.${o.b}`
+		else if (v.t >= 0) `t${v.t}`
+		else `[${v.items!.map(x => keyOf(x)).join(",")}]`
 }
 
 /// The hash of a known value, of what its ids stand for, the same in every program.
@@ -540,7 +547,8 @@ function hashOf(p: Program, v: Known | null): u64 {
 
 /// Whether a param of decl d holds a Type, so that d is instanced per what they get.
 export function takesType(p: Program, d: i32, env = 0): bool {
-	return p.decls[d].kind == decl.Function && p.items(p.subst(p.decls[d].type, env)).some(t => holdsType(p, t) || coded(p, t))
+	return p.decls[d].kind == decl.Function
+		&& p.items(p.subst(p.decls[d].type, env)).some(t => holdsType(p, t) || coded(p, t))
 }
 
 /// Whether a value of t holds a Type, and so is never at run time in a release build.
@@ -549,7 +557,9 @@ export function holdsType(p: Program, t: i32): bool {
 }
 
 /// Whether t is a function type taking or giving a Type, so that a value of it is known as its code (see Known.fn).
-function coded(p: Program, t: i32): bool { return p.kind(t) == kind.Func && p.parts(t).some(x => holdsType(p, x) || coded(p, x)) }
+function coded(p: Program, t: i32): bool {
+	return p.kind(t) == kind.Func && p.parts(t).some(x => holdsType(p, x) || coded(p, x))
+}
 
 /// Whether decl x is a module's const of a number literal, which its uses take, as they do an untyped one's, rather
 /// than load the global that its module's init sets.
@@ -560,7 +570,9 @@ function numeral(x: Decl): bool {
 }
 
 /// Whether t is a literal type or a union of them.
-function literals(p: Program, t: i32): bool { return p.kind(t) == kind.Literal || p.kind(t) == kind.Union && p.items(t).every(m => literals(p, m)) }
+function literals(p: Program, t: i32): bool {
+	return p.kind(t) == kind.Literal || p.kind(t) == kind.Union && p.items(t).every(m => literals(p, m))
+}
 
 /// A value on the operand stack: its type, its value if known, and the index of the op that pushed it if a later op
 /// may leave that out, folding or fusing it, else -1.
@@ -697,7 +709,8 @@ class Copy {
 					throw new CompileError(`an if needs a bool (${this.ins.where})`)
 				}
 				// A known result stays known, without the Block.
-				let kept = t != kind.None && this.stack.length > this.frames[this.frames.length - 1].base && this.top().v != null
+				let kept = t != kind.None && this.stack.length > this.frames[this.frames.length - 1].base
+					&& this.top().v != null
 				for (const j of at + 1 ... this.dst.ops.length - 1) {
 					kept = kept && (this.dead[j] || j == this.top().at)
 				}
@@ -800,12 +813,11 @@ class Copy {
 				} else {
 					this.plain(o, a + 1, p.b(f.t), a)
 				}
-			case op.Drop:
-				if (this.top().v != null) {
-					this.take()
-				} else {
-					this.plain(o, 1, kind.None)
-				}
+			case op.Drop: if (this.top().v != null) {
+				this.take()
+			} else {
+				this.plain(o, 1, kind.None)
+			}
 			case op.Local:
 				const v = this.values[a]
 				if (v != null && v.fn < 0) {
@@ -853,15 +865,14 @@ class Copy {
 				} else {
 					this.plain(o, 2, elem(p, xs.t, if (k.v == null) -1 else p.ints[k.v!.op!.b] as i32))
 				}
-			case op.SetSubscript:
-				if (this.stack[this.stack.length - 2].v?.op?.op == op.Str) {
-					const v = this.stack.pop()
-					const n = this.name(this.take())
-					this.stack.push(v)
-					this.setField(n)
-				} else {
-					this.plain(o, 3, kind.None)
-				}
+			case op.SetSubscript: if (this.stack[this.stack.length - 2].v?.op?.op == op.Str) {
+				const v = this.stack.pop()
+				const n = this.name(this.take())
+				this.stack.push(v)
+				this.setField(n)
+			} else {
+				this.plain(o, 3, kind.None)
+			}
 			case op.Unpack: this.emit(o, a)
 			case op.Array, op.Object:
 				const t = this.type(a)
@@ -882,7 +893,8 @@ class Copy {
 					this.known(array(items))
 				} else {
 					// The elements of the arrays spread, which mono notes as converted to t's.
-					const from = spreads.map(j => this.stack[this.stack.length - b + j].t).filter(s => p.kind(s) == kind.Array)
+					const from = spreads.map(j => this.stack[this.stack.length - b
+						+ j].t).filter(s => p.kind(s) == kind.Array)
 					this.plain(o, b, t, t, b, this.dst.list(spreads))
 					this.info[this.info.length - 1] = if (from.length > 0) p.union(from.map(s => p.a(s))) else -1
 				}
@@ -944,12 +956,11 @@ class Copy {
 				} else {
 					this.plain(o, 1, this.top().t)
 				}
-			case op.Eq, op.Ne:
-				if (this.top().v != null && this.stack[this.stack.length - 2].v != null) {
-					this.known(truth(equal(p, this.take(), this.take()) == (o == op.Eq)))
-				} else {
-					this.eq(o)
-				}
+			case op.Eq, op.Ne: if (this.top().v != null && this.stack[this.stack.length - 2].v != null) {
+				this.known(truth(equal(p, this.take(), this.take()) == (o == op.Eq)))
+			} else {
+				this.eq(o)
+			}
 			case op.Lt, op.Gt, op.Le, op.Ge, op.Same: this.plain(o, 2, kind.Bool)
 			case op.And, op.Or:
 				const y = this.bool(this.top())
@@ -975,7 +986,8 @@ class Copy {
 				} else {
 					this.plain(o, 2, a.t)
 				}
-			case op.Sub, op.Mul, op.Div, op.Rem, op.Xor, op.Shl, op.Shr: this.plain(o, 2, this.stack[this.stack.length - 2].t)
+			case op.Sub, op.Mul, op.Div, op.Rem, op.Xor, op.Shl,
+				op.Shr: this.plain(o, 2, this.stack[this.stack.length - 2].t)
 			case op.Neg: this.plain(o, 1, this.top().t)
 		}
 	}
@@ -1030,7 +1042,8 @@ class Copy {
 
 	/// A Call of decl d with the type args.
 	private callOf(d: i32, args: i32[]) throws CompileError {
-		if (builtin(this.p.modules[this.p.decls[d].module].path) && d == this.p.lang("literal") && !this.spelled(args[0])) {
+		if (builtin(this.p.modules[this.p.decls[d].module].path) && d == this.p.lang("literal")
+			&& !this.spelled(args[0])) {
 			// A generic as whose type turns out to be no string literal type converts as any.
 			this.cast(args[0])
 			return
@@ -1071,7 +1084,8 @@ class Copy {
 			}
 		}
 		const k = if (via != null) this.ins.special(d, env, values, p.decls[via.fn].owner)
-			else if (fixed) this.ins.special(d, env, values) else this.ins.instance(d, env)
+			else if (fixed) this.ins.special(d, env, values)
+			else this.ins.instance(d, env)
 		const r = p.b(p.decls[k].type)
 		const returnsType = holdsType(p, r)
 		const given = this.stack.length - base
@@ -1169,7 +1183,8 @@ class Copy {
 	private field(name: i32) throws CompileError {
 		const r = this.top()
 		if (r.v == null) {
-			const d = if (this.ins.nominal(r.t) == decl.Class) this.ins.memberOf(this.ins.owner(r.t, name), name) else -1
+			const d = if (this.ins.nominal(r.t) == decl.Class) this.ins.memberOf(this.ins.owner(r.t, name), name)
+				else -1
 			if (d >= 0 && this.p.decls[d].kind == decl.Function) {
 				this.emit(op.Member, d)
 			} else {
@@ -1187,7 +1202,8 @@ class Copy {
 		} else if (v.t >= 0) {
 			this.known(this.ins.reflect(v.t, this.p.strings[name]))
 		} else if (v.items != null) {
-			this.known(if (this.p.strings[name] == "length") this.ins.int(v.items!.length) else v.get(this.p.strings[name]))
+			this.known(if (this.p.strings[name] == "length") this.ins.int(v.items!.length)
+				else v.get(this.p.strings[name]))
 		} else {
 			this.known(this.ins.int(this.p.strings[this.name(v)].length))
 		}
@@ -1337,9 +1353,7 @@ class Copy {
 	}
 
 	/// Ends the code run after a Return or Throw: all of it, if no branch taken at run time holds it.
-	private end() {
-		this.gone = this.gone || this.frames.every(f => f.taken)
-	}
+	private end() { this.gone = this.gone || this.frames.every(f => f.taken) }
 
 	/// Copies an op that pops n values used at run time and pushes one of type t, none for None.
 	private plain(o: Opcode, n: i32, t: i32, a: i32 = 0, b: i32 = 0, c: i32 = 0) throws CompileError {

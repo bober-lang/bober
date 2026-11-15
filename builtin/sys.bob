@@ -6,6 +6,7 @@ import { BOBER_IO_AGAIN, BOBER_IO_HOST, bober_arg, bober_entropy, bober_env, bob
 	bober_io_read, bober_io_readlink, bober_io_ready, bober_io_recvfrom, bober_io_remove, bober_io_rename,
 	bober_io_reset, bober_io_run, bober_io_sendto, bober_io_shutdown, bober_io_size, bober_io_stat, bober_io_sync,
 	bober_io_write, bober_io_write_at, bober_mono, bober_tz } from "../src/rt.h"
+
 import { fromC } from "./c"
 import { IoError, Kind } from "./error"
 import { fromBytes, mapped } from "./string"
@@ -24,6 +25,7 @@ function checked(r: i64, op: string, what: string): i64 throws IoError {
 }
 
 const chunk: i32 = 1 << 16
+
 // What reads of up to chunk bytes share: one writes it only in the call of the run time's, which never parks, and
 // copies what came before it returns.
 let scratch = new u8[](chunk)
@@ -61,7 +63,8 @@ export class Handle {
 
 	/// A socket of net bound to host and port, as dial takes them, and listening unless "udp".
 	static listen(net: string, host: string, port: i32, backlog: i32 = 1024): Handle throws IoError {
-		return Handle.of(checked(bober_io_listen(net, cPath("listen", host), port, backlog), "listen", address(host, port)) as i32)
+		return Handle.of(checked(bober_io_listen(net, cPath("listen", host), port, backlog), "listen",
+			address(host, port)) as i32)
 	}
 
 	static private of(fd: i32): Handle {
@@ -96,23 +99,23 @@ export class Handle {
 		const buf = if (n <= chunk) scratch else new u8[](n)
 		const host = new u8[](BOBER_IO_HOST)
 		const port = new i32[](1)
-		const got = this.waited(false, by, "receive", () => bober_io_recvfrom(this.fd, buf, n as u64, host, port)) as i32
+		const got = this.waited(false, by, "receive",
+			() => bober_io_recvfrom(this.fd, buf, n as u64, host, port)) as i32
 		return [fromBytes(buf.slice(0, got)), upToNul(host), port[0] as u16]
 	}
 
 	/// Sends data as one datagram to host and port.
 	send(data: string, host: string, port: i32, by: i64 = 0) throws IoError {
-		this.waited(true, by, "send", () => bober_io_sendto(this.fd, data, data.length as u64, cPath("send", host), port))
+		this.waited(true, by, "send",
+			() => bober_io_sendto(this.fd, data, data.length as u64, cPath("send", host), port))
 	}
 
 	/// The socket's host and port, as dial takes them.
 	local(): [string, u16] throws IoError { return this.name(0) }
 	/// Those of the socket's peer.
 	peer(): [string, u16] throws IoError { return this.name(1) }
-
 	/// Parks until it is ready to read: whether it is by then. Closed, it is: a call fails at once.
 	ready(by: i64): bool { return this.closed || bober_io_ready(this.fd, 0, left(by)) == 0 }
-
 	/// Whether the socket is open, with nothing unread and its peer not ended; never waits.
 	idle(): bool { return !this.closed && bober_io_idle(this.fd) != 0 }
 
@@ -223,7 +226,8 @@ export class Handle {
 
 /// "host:port", a v6 host in brackets, or a Unix socket's path.
 function address(host: string, port: i32): string {
-	return if (port == 0 && host.some(c => c == 0x2f)) host else if (host.some(c => c == 0x3a)) `[${host}]:${port}`
+	return if (port == 0 && host.some(c => c == 0x2f)) host
+		else if (host.some(c => c == 0x3a)) `[${host}]:${port}`
 		else `${host}:${port}`
 }
 
@@ -309,7 +313,6 @@ export function map(path: string, n: i64): string throws IoError {
 }
 
 export function mkdir(path: string) throws IoError { checked(bober_io_mkdir(cPath("mkdir", path)), "mkdir", path) }
-
 /// Removes a file or an empty directory.
 export function remove(path: string) throws IoError { checked(bober_io_remove(cPath("remove", path)), "remove", path) }
 

@@ -183,8 +183,8 @@ class Formatter {
 	/// lines take theirs first, and the rest follow the line they are in.
 	private parts(f: Tree): Part[] {
 		const lines = f.kind == "block" || f.kind == "members" || f.kind == "switch" || f.kind == "switchExpr"
-			|| f.kind == "array" || f.kind == "object" || f.kind == "params" || f.kind == "typeParams" || f.kind == "call"
-			|| f.kind == "index" || f.kind == "new"
+			|| f.kind == "array" || f.kind == "object" || f.kind == "params" || f.kind == "typeParams"
+			|| f.kind == "call" || f.kind == "index" || f.kind == "new"
 		const out: Part[] = []
 		for (const p of f.parts) {
 			if (lines) {
@@ -229,7 +229,8 @@ class Formatter {
 			case "function", "method":
 				const name = if (f.kind == "function") n(["function ", r.next()]) else n([t])
 				const params = n([r.take("typeParams"), r.next()])
-				const sig = n([r.mods, name, params, r.opt(":", ": "), r.opt("throws", " throws "), r.tags()], "function")
+				const sig = n([r.mods, name, params, r.opt(":", ": "), r.opt("throws", " throws "), r.tags()],
+					"function")
 				if (!r.more()) {
 					return sig
 				}
@@ -319,12 +320,15 @@ class Formatter {
 				g.pieces.push([t + " ", ...xs[1].doc])
 				return n([g], f.t.kind)
 			case "member": return n([xs[0], t, xs[1]])
-			case "index": return n([xs[0], if (f.t.kind == "?.") "?.[" else "[", this.items(parts, xs.slice(1, xs.length)), "]"])
-			case "call": return n([xs[0], if (f.t.kind == "?.") "?.(" else "(", this.items(parts, xs.slice(1, xs.length)), ")"])
+			case "index": return n([xs[0], if (f.t.kind == "?.") "?.[" else "[",
+				this.items(parts, xs.slice(1, xs.length)), "]"])
+			case "call": return n([xs[0], if (f.t.kind == "?.") "?.(" else "(",
+				this.items(parts, xs.slice(1, xs.length)), ")"])
 			case "array": return n(["[", this.items(parts, xs), "]"])
 			case "object":
 				const items = this.items(parts, xs)
-				return if (items.doc.length == 0) n(["{}"]) else if (items.doc[0] instanceof Body) n(["{", items, "}"])
+				return if (items.doc.length == 0) n(["{}"])
+					else if (items.doc[0] instanceof Body) n(["{", items, "}"])
 					else n(["{ ", items, " }"])
 			case "prop": return n([r.mods, t, r.opt(":", ": "), r.tags(), r.opt("=", " = ")], "prop")
 			case "arrow": return n([r.next(), r.opt(":", ": "), " => ", r.next(), r.opt("throws", " throws ")])

@@ -43,8 +43,7 @@ export function serve(includes: string[]) {
 			}
 			buf += c
 		}
-	} catch (e: IoError | ParseError) {
-	}
+	} catch (e: IoError | ParseError) {}
 }
 
 /// A message, its id and params left as text.
@@ -85,9 +84,9 @@ class Server implements Checked {
 	private defs = new HashMap[string, [string, Node]]()
 
 	constructor(includes: string[]) { this.includes = includes }
-
 	done(path: string) {}
 	declare(n: Node, path: string, src: string) {}
+
 	decl(n: Node, path: string, src: string) {
 		if (indexOf(path, ": ") >= 0) {
 			return // a C header's, which has no file of its own (src/check.bob, Modules.header)
@@ -151,15 +150,16 @@ class Server implements Checked {
 				if (u != null) {
 					// A namespace's symbol is its module's path and the colon.
 					const d = this.defs.get(u.symbol)
-					result = if (endsWith(u.symbol, ":")) this.location(u.symbol.slice(0, u.symbol.length - 1), new Loc())
-						else if (d != null) this.location(d[0], d[1].t.loc) else "null"
+					result = if (endsWith(u.symbol,
+						":")) this.location(u.symbol.slice(0, u.symbol.length - 1), new Loc())
+						else if (d != null) this.location(d[0], d[1].t.loc)
+						else "null"
 				}
 			case "textDocument/formatting":
 				const src = this.open.get(path) ?? ""
 				try {
 					result = `[{"range":${range(src, Loc.at(0, src.length))},"newText":${quoted(format(src))}}]`
-				} catch (e: SyntaxError) {
-				}
+				} catch (e: SyntaxError) {}
 		}
 		if (id != "") {
 			this.send(`{"jsonrpc":"2.0","id":${id},"result":${result}}`)
@@ -248,7 +248,9 @@ function offset(src: string, p: Pos): i32 {
 	return i
 }
 
-function range(src: string, loc: Loc): string { return `{"start":${position(src, loc.pos)},"end":${position(src, loc.end())}}` }
+function range(src: string, loc: Loc): string {
+	return `{"start":${position(src, loc.pos)},"end":${position(src, loc.end())}}`
+}
 
 function position(src: string, pos: i32): string {
 	let line = 0

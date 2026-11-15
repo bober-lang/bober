@@ -511,7 +511,8 @@ class Emitter {
 				this.write(q, { v: init(), t: this.norm(s.t) }, s.t)
 			} else if (this.kindOf(s.t) == kind.FixedArray) {
 				this.ir().store(this.zero(s.t), q, false) // a constant, not held by address as write takes it
-			} else if (!this.packed(s.t)) { // a packed union's zero is its zero bytes, as allocated (tagByte)
+			} else if (!this.packed(s.t)) {
+				// a packed union's zero is its zero bytes, as allocated (tagByte)
 				this.write(q, { v: this.zero(s.t), t: this.norm(s.t) }, s.t)
 			}
 		}
@@ -957,7 +958,8 @@ class Emitter {
 					// A number not of n at run time converted to it, its bits as they are else.
 					const d = this.desc(n)
 					const tag = this.ir().select(this.isa(v, n), this.tagOf(v.v), d)
-					this.push(this.union(tag, this.rt("convert", [d, this.tagOf(v.v), this.bitsOf(v.v)], false), this.refOf(v.v)), n)
+					this.push(this.union(tag, this.rt("convert", [d, this.tagOf(v.v), this.bitsOf(v.v)], false),
+						this.refOf(v.v)), n)
 				} else {
 					this.push(this.cast(v, n), n)
 				}
@@ -1273,6 +1275,7 @@ class Emitter {
 		this.thunks.set(sym, thunk)
 		return thunk
 	}
+
 	// Calls.
 	/// The callee of Function decl d, declared if of another module.
 	private callee(d: i32): Callee { return this.callees.get(d) ?? put(this.callees, d, this.calleeOf(d)) }
@@ -1324,7 +1327,8 @@ class Emitter {
 	private function(d: i32, t: IrType): Value {
 		const x = this.p.decls[d]
 		const f = this.b.function(this.symbol(d), t,
-			this.copies.has(d) || this.here.has(d) && x.owner >= 0 && this.p.classOf(d) < 0 && (x.mods & decl.Export) == 0)
+			this.copies.has(d)
+			|| this.here.has(d) && x.owner >= 0 && this.p.classOf(d) < 0 && (x.mods & decl.Export) == 0)
 		if ((x.mods & decl.Outlined) != 0) {
 			this.b.attr(f, -1, "noinline", 0)
 		}
@@ -2359,7 +2363,8 @@ class Emitter {
 			case kind.Array:
 				const at = this.ir().gep(this.arrayTy, l.r, [this.i64Const(1)])
 				this.write(this.at(at, e, this.i64Const(j)), v, e)
-			case kind.FixedArray: this.write(this.ir().gep(this.mem(u), l.r, [this.i64Const(0), this.i64Const(j)]), v, e)
+			case kind.FixedArray: this.write(this.ir().gep(this.mem(u), l.r, [this.i64Const(0), this.i64Const(j)]), v,
+				e)
 			default: this.write(this.gep(l.r, u, j), v, this.layout(u)[j].t)
 		}
 	}
@@ -2461,7 +2466,8 @@ class Emitter {
 					// Checked as a member's is (§6.6), by the tag alone if the other is null, as of x!.
 					const others = this.p.members(f).filter(m => !this.holds(t, m))
 					const nullOnly = others.length == 1 && this.p.kind(others[0]) == kind.Null
-					const ok = if (nullOnly) this.ir().icmp("ne", this.tagOf(v.v), this.tag(others[0])) else this.isa(v, t)
+					const ok = if (nullOnly) this.ir().icmp("ne", this.tagOf(v.v), this.tag(others[0]))
+						else this.isa(v, t)
 					this.check(ok, "cast to a type that is not the value's")
 				}
 				return if (fk == kind.Union) v.v else this.unionOf(this.desc(f), v.v, f)

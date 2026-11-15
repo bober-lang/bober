@@ -17,14 +17,13 @@ export function decompress(req: Request, next: Handler): Response throws IoError
 	const res = next(req)
 	const enc = lower(res.headers.get("content-encoding") ?? "")
 	const gz = enc == "gzip" || enc == "x-gzip"
-	const kept = req.method == "HEAD" || res.status < 200 || res.status == 204 || res.status == 206
-		|| res.status == 304 || res.body.length == 0
+	const kept = req.method == "HEAD" || res.status < 200 || res.status == 204 || res.status == 206 || res.status == 304
+		|| res.body.length == 0
 	if (!gz && enc != "deflate" || kept) {
 		return res
 	}
 	const out = new Response(res.status)
-	out.body = new Body(if (gz) new Gunzipper(res.body) else new Inflater(res.body, true), null,
-		() => res.close())
+	out.body = new Body(if (gz) new Gunzipper(res.body) else new Inflater(res.body, true), null, () => res.close())
 	out.headers = res.headers
 	out.headers.delete("content-encoding")
 	out.headers.delete("content-length")
@@ -34,11 +33,12 @@ export function decompress(req: Request, next: Handler): Response throws IoError
 
 /// Whether a request accepts gzip: names it, or x-gzip, or else *, not with a q of zero in any of its spellings.
 function acceptsGzip(req: Request): bool {
-	const codings = split(req.headers.all("accept-encoding").join(","), ",")
-		.map(t => split(t, ";").map(x => lower(trim(x))))
+	const codings = split(req.headers.all("accept-encoding").join(","),
+		",").map(t => split(t, ";").map(x => lower(trim(x))))
 	const gzip = codings.filter(p => p[0] == "gzip" || p[0] == "x-gzip")
-	return (if (gzip.length > 0) gzip else codings.filter(p => p[0] == "*")).some(p =>
-		!p.slice(1, p.length).some(q => startsWith(q, "q=") && replace(replace(q, "0", ""), ".", "") == "q="))
+	return (if (gzip.length > 0) gzip
+		else codings.filter(p => p[0] == "*")).some(p => !p.slice(1,
+		p.length).some(q => startsWith(q, "q=") && replace(replace(q, "0", ""), ".", "") == "q="))
 }
 
 class Compressor {

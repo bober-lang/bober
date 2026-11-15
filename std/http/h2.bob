@@ -213,7 +213,6 @@ export class Conn {
 	/// Serves the peer's requests through handle, each on a fiber of its own, until the connection ends and s is
 	/// closed.
 	serve(handle: Handle) { this.run(handle) }
-
 	/// Whether a request would have a stream at once: the connection open, its peer's limit known and not reached,
 	/// nor one of its own.
 	free(): bool { return this.settled && !this.refusing && !this.closed && this.streams.size < this.peerStreams }
@@ -330,7 +329,7 @@ export class Conn {
 				const waiting = this.streams.values().filter(st => st.writes == 0
 					&& (st.parked && (st.window <= 0 || this.window <= 0)
 					|| !st.ended && st.buf.length == 0 && this.left > 0
-						&& (st.reading || st.sent && (st.head == null || interim(st.head!)))))
+					&& (st.reading || st.sent && (st.head == null || interim(st.head!)))))
 				const stuck = waiting.filter(st => st.since <= since)
 				const up = if (idle) this.streams.size == 0 && this.b.deadline == end
 					else stuck.length > 0 && stuck.length == this.streams.size
@@ -379,7 +378,8 @@ export class Conn {
 			// 9113 §5.1): ours from next on, any of a server's, push being off, a client's past last unless past a
 			// GOAWAY, which leaves those refused uncounted.
 			const unopened = if ((id % 2 == 0) == this.server) id >= this.next
-				else if (this.server) !this.closed && id > this.last else id != 0
+				else if (this.server) !this.closed && id > this.last
+				else id != 0
 			if (kind <= rst && id == 0 || (kind == settings || kind == ping || kind == goaway) && id != 0
 				|| (kind == data || kind == rst || kind == update || kind == headers && !this.server) && unopened) {
 				throw this.fault(protocolError, "stream")
@@ -410,10 +410,8 @@ export class Conn {
 						f = f.slice(5, f.length)
 					}
 					this.fragment(id, f, flags, (flags & endStream) != 0, handle)
-				case priority:
-					this.depends(id, if (n == 5) p else "") // One of any other size is short.
-				case continuation:
-					this.fragment(id, p, flags, this.blockEnd, handle)
+				case priority: this.depends(id, if (n == 5) p else "") // One of any other size is short.
+				case continuation: this.fragment(id, p, flags, this.blockEnd, handle)
 				case rst:
 					if (n != 4) {
 						throw this.fault(sizeError, "reset")
@@ -532,9 +530,9 @@ export class Conn {
 	/// connection's window opened to ours.
 	private ours(): string {
 		const set = (id: i64, v: i64) => big(id, 2) + big(v, 4)
-		return frame(settings, 0, 0, set(enablePush, 0) + set(maxConcurrentStreams, this.maxStreams)
-			+ set(initialWindowSize, streamWindow) + set(maxHeaderListSize, this.maxHeaders))
-			+ frame(update, 0, 0, big(connWindow - initial, 4))
+		return frame(settings, 0, 0,
+			set(enablePush, 0) + set(maxConcurrentStreams, this.maxStreams) + set(initialWindowSize, streamWindow)
+			+ set(maxHeaderListSize, this.maxHeaders)) + frame(update, 0, 0, big(connWindow - initial, 4))
 	}
 
 	/// Opens the connection's window again once half its room is free, not left to the peer: the room is connWindow
@@ -647,19 +645,20 @@ export class Conn {
 			const colon = startsWith(name, ":")
 			pseudo = pseudo && colon
 			// :status is a response's alone, the rest a request's.
-			if (colon && (!pseudo || !pseudos.includes(name) || this.server == (name == ":status")
-				|| head.filter(h => h[0] == name).length > 1)
-				|| !colon && !isToken(name) || !isValue(value) || lower(name) != name || hop.includes(name)
-				|| name == "te" && value != "trailers"
+			if (colon
+				&& (!pseudo || !pseudos.includes(name) || this.server == (name == ":status")
+				|| head.filter(h => h[0] == name).length > 1) || !colon && !isToken(name) || !isValue(value)
+				|| lower(name) != name || hop.includes(name) || name == "te" && value != "trailers"
 				|| name == "content-length" && (st.length != null || startsWith(value, "-"))
 				|| name == ":method" && !isToken(value)
-				// HTTP/2 has no upgrade, so no 101 (RFC 9113 §8.6), nor a 0xx.
-				|| name == ":status" && !(value.length == 3 && value != "101" && value[0] != zero && isDigit(value[0])
-					&& isDigit(value[1]) && isDigit(value[2]))
+				|| name == ":status"
+				&& !(value.length == 3 && value != "101" && value[0] != zero && isDigit(value[0]) && isDigit(value[1])
+				&& isDigit(value[2]))
 				|| name == ":path" && !(isTarget(value) && (startsWith(value, "/") || value == "*"))) {
 				this.reset(st, protocolError)
 				return false
 			}
+			// HTTP/2 has no upgrade, so no 101 (RFC 9113 §8.6), nor a 0xx.
 			if (name == "content-length") {
 				try {
 					st.length = parseInt[i64](value)
@@ -1019,16 +1018,12 @@ export class Body implements ReadCloser {
 
 	/// Sends 100 Continue if the peer waits for it, as a response that streams may read the body after its head.
 	proceed() throws IoError { this.c.proceed(this.st) }
-
 	/// Ends it unread, cancelling the stream.
 	close() { this.c.reset(this.st, cancel) }
 }
 
 /// A response head's status; "" if it is not one.
-function status(head: Head): string {
-	return if (head.length > 0 && head[0][0] == ":status") head[0][1] else ""
-}
-
+function status(head: Head): string { return if (head.length > 0 && head[0][0] == ":status") head[0][1] else "" }
 /// Whether head is an interim response, a 1xx.
 function interim(head: Head): bool { return startsWith(status(head), "1") }
 

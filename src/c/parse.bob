@@ -62,8 +62,10 @@ class Attrs {
 }
 
 type Storage = "typedef" | "extern" | "static" | ""
+
 /// A word of a basic type, as in unsigned long int.
-type Word = "void" | "_Bool" | "char" | "short" | "int" | "long" | "float" | "double" | "signed" | "unsigned" | "__int128"
+type Word = "void" | "_Bool" | "char" | "short" | "int" | "long" | "float" | "double" | "signed" | "unsigned"
+	| "__int128"
 
 /// Declaration specifiers (C11 6.7.1-4).
 class Spec {
@@ -155,7 +157,6 @@ export class Parser {
 	// For bind
 	/// What name, or a tag under a key like "struct S", declares at file scope.
 	declared(name: string): Val | Type | null { return this.scopes.get(name) }
-
 	/// Whether the global sym has static linkage.
 	local(sym: string): bool { return this.globals.get(sym)?.local ?? false }
 
@@ -323,7 +324,8 @@ export class Parser {
 
 	/// Whether t starts declaration specifiers: a specifier word, an attribute or a typedef name.
 	private startsDecl(t: Tok): bool {
-		return t.kind == "ident" && (isSpecifier(t.text) || isAttribute(t.text) || this.scopes.get(t.text) instanceof Type)
+		return t.kind == "ident"
+			&& (isSpecifier(t.text) || isAttribute(t.text) || this.scopes.get(t.text) instanceof Type)
 	}
 
 	// Declarations
@@ -557,11 +559,12 @@ export class Parser {
 			case "__int128_t": s.named = Int128
 			case "__uint128_t": s.named = UInt128
 			case "typeof", "__typeof__", "__typeof": s.named = this.typeOf()
-			case "void", "_Bool", "char", "short", "int", "long", "float", "double", "unsigned", "__int128":
-				s.words.push(w as Word)
+			case "void", "_Bool", "char", "short", "int", "long", "float", "double", "unsigned",
+				"__int128": s.words.push(w as Word)
 			case "signed", "__signed", "__signed__": s.words.push("signed")
-			case "_Noreturn": s.attrs.fn.push("noreturn")
-			// Qualifiers, auto and register: only volatile changes anything here.
+			case "_Noreturn":
+				s.attrs.fn.push("noreturn")
+				// Qualifiers, auto and register: only volatile changes anything here.
 			default: s.volatile = s.volatile || isVolatileWord(w)
 		}
 		return true
@@ -633,26 +636,24 @@ export class Parser {
 				const v = this.next().text
 				a.hidden = v == `"hidden"` || v == `"internal"`
 				this.expect(")")
-			// What only checks the code, or lets it be optimized, but changes nothing it does.
-			case "const", "pure", "hot", "nothrow", "malloc", "may_alias", "format", "format_arg", "nonnull", "returns_nonnull",
-				"warn_unused_result", "deprecated", "warning", "error", "unused", "maybe_unused", "nodiscard", "sentinel",
-				"access", "leaf", "artificial", "nonstring", "alloc_size", "alloc_align", "assume_aligned", "fallthrough",
-				"no_sanitize":
-				if (this.is("(")) {
-					this.skipParens()
-				}
+				// What only checks the code, or lets it be optimized, but changes nothing it does.
+			case "const", "pure", "hot", "nothrow", "malloc", "may_alias", "format", "format_arg", "nonnull",
+				"returns_nonnull", "warn_unused_result", "deprecated", "warning", "error", "unused", "maybe_unused",
+				"nodiscard", "sentinel", "access", "leaf", "artificial", "nonstring", "alloc_size", "alloc_align",
+				"assume_aligned", "fallthrough", "no_sanitize": if (this.is("(")) {
+				this.skipParens()
+			}
 			case "vector_size": throw CError.at(t, "vector types are not supported")
 			case "mode":
 				this.expect("(")
 				a.mode = intMode(strip(this.next().text, "__"))
 				this.expect(")")
-			case "aligned":
-				if (this.eat("(")) {
-					a.align = max(a.align, this.constant() as i32)
-					this.expect(")")
-				} else {
-					a.align = max(a.align, 16)
-				}
+			case "aligned": if (this.eat("(")) {
+				a.align = max(a.align, this.constant() as i32)
+				this.expect(")")
+			} else {
+				a.align = max(a.align, 16)
+			}
 			default:
 				this.warn(t, `ignored attribute ${name}`)
 				if (this.is("(")) {
@@ -782,7 +783,8 @@ export class Parser {
 				this.expect(",")
 			}
 		}
-		const ty = fixed ?? (if (low >= 0) (if (fits(high, UInt)) UInt else ULong)
+		const ty = fixed
+			?? (if (low >= 0) (if (fits(high, UInt)) UInt else ULong)
 			else if (fits(low, Int) && fits(high, Int)) Int
 			else Long)
 		if (name != "") {
@@ -1826,8 +1828,9 @@ export class Parser {
 			case "__atomic_store_n": g.atomic(this.pointer(t, g.rv(a[0])), a[1])
 			case "__atomic_load_n": return g.atomic(this.pointer(t, g.rv(a[0])), null)
 			case "expect": return a[0]
-			case "constant_p": return int(if (a[0].known == "int" || a[0].known == "float") 1 else 0, Int)
-			// The size is unknown: -1 for types 0 and 1, which ask for a maximum, else 0.
+			case "constant_p":
+				return int(if (a[0].known == "int" || a[0].known == "float") 1 else 0, Int)
+				// The size is unknown: -1 for types 0 and 1, which ask for a maximum, else 0.
 			case "object_size": return int(if (g.rv(a[1]).n < 2) -1 else 0, ULong)
 			case "inf", "inff", "infl": return g.cast(float(1.0 / 0.0, Double), suffixed(b, "inf"))
 			case "huge_val", "huge_valf", "huge_vall": return g.cast(float(1.0 / 0.0, Double), suffixed(b, "huge_val"))
@@ -1839,7 +1842,9 @@ export class Parser {
 					else if (startsWith(b, "clz")) "ctlz"
 					else if (startsWith(b, "ctz")) "cttz"
 					else "ctpop"
-				const width = if (endsWith(b, "16")) UShort else if (endsWith(b, "64") || endsWith(b, "l")) ULong else UInt
+				const width = if (endsWith(b, "16")) UShort
+					else if (endsWith(b, "64") || endsWith(b, "l")) ULong
+					else UInt
 				return g.intrinsic(op, width, g.rv(a[0]))
 			default:
 				const chk = startsWith(b, "__") && endsWith(b, "_chk")
@@ -2315,6 +2320,7 @@ function isQualifier(w: string): bool {
 }
 
 function isVolatileWord(w: string): bool { return w == "volatile" || w == "__volatile" || w == "__volatile__" }
+
 /// The integer mode m the mode attribute names: 1 to 5 for 1, 2, 4, 8 and 16 bytes, or 0 for another.
 function intMode(m: string): i32 {
 	switch (m) {
@@ -2339,7 +2345,6 @@ function moded(t: Type, mode: i32): Type {
 function isAttribute(w: string): bool { return w == "__attribute__" || w == "__attribute" || w == "_Alignas" }
 function isAsmLabel(w: string): bool { return w == "__asm" || w == "__asm__" }
 function isAsm(w: string): bool { return w == "asm" || isAsmLabel(w) }
-
 /// Whether n is a value of the integer type t.
 function fits(n: i64, t: Type): bool { return n == wrap(n, t) }
 

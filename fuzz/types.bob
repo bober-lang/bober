@@ -46,7 +46,6 @@ class Flags {
 
 /// A construct to edit: where its source is, the top-level declaration it is in, and the call it is an argument of.
 type Site = { n: Node, at: Loc, decl: i32, call: i32 }
-
 /// An edit: where it is, and what it puts there.
 type Mutant = { kind: string, src: string, at: i32, text: string }
 
@@ -93,6 +92,7 @@ class File implements Checked {
 
 	done(path: string) {}
 	declare(n: Node, path: string, src: string) {}
+
 	decl(n: Node, path: string, src: string) {
 		this.note(n, src)
 		if (path == this.copy) {
@@ -120,8 +120,9 @@ class File implements Checked {
 			this.value(n.parts[0], 0)
 		}
 		const ann = after(n, ":")
-		if (ann != null && (n.kind == "var" || n.kind == "param" || n.kind == "function" || n.kind == "method"
-			|| n.kind == "arrow" || n.kind == "prop" && up.kind == "members")) {
+		if (ann != null
+			&& (n.kind == "var" || n.kind == "param" || n.kind == "function" || n.kind == "method" || n.kind == "arrow"
+			|| n.kind == "prop" && up.kind == "members")) {
 			this.add(this.types, ann, 0)
 		}
 		for (const p of n.parts) {
@@ -182,8 +183,8 @@ class File implements Checked {
 		}
 		const e = r.of(this.values)
 		/// The annotations of a declaration that spell the type of a node.
-		const spelled = (of: Node, decl: i32) => this.types
-			.filter(a => a.decl == decl && show(a.n.type!) == show(of.type!)).map(a => this.text(a))
+		const spelled = (of: Node, decl: i32) => this.types.filter(a => a.decl == decl
+			&& show(a.n.type!) == show(of.type!)).map(a => this.text(a))
 		const law = laws.find(l => l[1].includes(kind))
 		if (law != null) {
 			const [gate, _] = law!
@@ -197,8 +198,8 @@ class File implements Checked {
 				&& ok("c", !name || !this.lets.includes(this.text(e))) && ok("f", !ty.isLoose())
 				&& ok("a", e.n.kind != "arrow") && ok("o", !ty.hasNull() && ty.kind != "param")
 				&& ok("i", ty.kind == "int" && !ty.isUntyped()) && ok("d", ty.kind == "float" && !ty.isUntyped())
-				&& ok("b", ty.kind == "bool") && ok("s", show(ty) == "string"))
-				this.edit(kind, e.at, replace(replace(kind, "#", t), "@", `(${this.text(e)})`))
+				&& ok("b", ty.kind == "bool") && ok("s", show(ty) == "string")) this.edit(kind, e.at,
+				replace(replace(kind, "#", t), "@", `(${this.text(e)})`))
 				else null
 		}
 		switch (kind) {
@@ -214,8 +215,9 @@ class File implements Checked {
 			case "graft":
 				const near = this.values.filter(o => o.decl == e.decl && o.at.pos != e.at.pos)
 				return if (near.length > 0) this.edit(kind, e.at, this.text(r.of(near))) else null
-			case "retype":
-				return if (this.types.length > 0) this.edit(kind, r.of(this.types).at, this.text(r.of(this.types))) else null
+			case "retype": return if (this.types.length
+				> 0) this.edit(kind, r.of(this.types).at, this.text(r.of(this.types)))
+				else null
 		}
 		if (this.vars.length == 0) {
 			return null
@@ -227,7 +229,8 @@ class File implements Checked {
 			return if (ann.length > 0) this.edit(kind, Loc.at(name.end(), ann[0].at.end() - name.end()), "") else null
 		}
 		const vs = spelled(v.n.parts[0], v.decl)
-		return if (vs.length > 0 && after(v.n, ":") == null) this.edit(kind, Loc.at(name.end(), 0), `: ${r.of(vs)}`) else null
+		return if (vs.length > 0 && after(v.n, ":") == null) this.edit(kind, Loc.at(name.end(), 0), `: ${r.of(vs)}`)
+			else null
 	}
 
 	private edit(kind: string, at: Loc, text: string): Mutant {
@@ -257,29 +260,31 @@ class FuzzBox[T] {
 /// an untyped const's, whose type is its own and not what its context wants; `c`, not a let's name, which a closure
 /// does not see narrowed; `f`, not loose; `a`, not a function literal, whose body counts in a call (3); `o`, not
 /// nullable; `i`, `d`, `b`, `s`, of a typed int, a float, a bool, a string.
-const laws: [string, string[]][] = [
-	["*", ["@", "(@ as (#))"]],
+const laws: [string, string[]][] = [["*", ["@", "(@ as (#))"]],
 	["f", ["(if (fuzzYes()) @ else @)", "(switch (fuzzYes()) { case true: @; default: @ })"]],
-	["n", ["fuzzId(@)", "[@][0]", "[...[@]][0]", "[@].map(fuzzV => fuzzV)[0]", "({ v: @ }).v", "({ ...{ v: @ } }).v",
-		"new FuzzBox(@).v", "new FuzzBox(@).get()", "fuzzPipe(@, fuzzV => fuzzV)", "fuzzWrap(@).v", "fuzzLast(@)"]],
-	["nc", ["(() => @)()", "(() => { return @ })()", "(() => { const fuzzV = @; return fuzzV })()", "fuzzApply(() => @)"]],
-	["a", ["fuzzId[#](@)", "new FuzzBox[#](@).v", "fuzzPipe[#, #](@, fuzzV => fuzzV)", "fuzzWrap[#](@).v",
-		"fuzzLast[#](@)"]],
-	["ac", ["fuzzApply[#](() => @)", "(() => { const fuzzV: # = @; return fuzzV })()",
-		"(() => { let fuzzV: # = @; return fuzzV })()", "(() => { const fuzzA: (#)[] = [@]; return fuzzA[0] })()"]],
+	["n",
+	["fuzzId(@)", "[@][0]", "[...[@]][0]", "[@].map(fuzzV => fuzzV)[0]", "({ v: @ }).v", "({ ...{ v: @ } }).v",
+	"new FuzzBox(@).v", "new FuzzBox(@).get()", "fuzzPipe(@, fuzzV => fuzzV)", "fuzzWrap(@).v", "fuzzLast(@)"]],
+	["nc",
+	["(() => @)()", "(() => { return @ })()", "(() => { const fuzzV = @; return fuzzV })()", "fuzzApply(() => @)"]],
+	["a",
+	["fuzzId[#](@)", "new FuzzBox[#](@).v", "fuzzPipe[#, #](@, fuzzV => fuzzV)", "fuzzWrap[#](@).v", "fuzzLast[#](@)"]],
+	["ac",
+	["fuzzApply[#](() => @)", "(() => { const fuzzV: # = @; return fuzzV })()",
+	"(() => { let fuzzV: # = @; return fuzzV })()", "(() => { const fuzzA: (#)[] = [@]; return fuzzA[0] })()"]],
 	["ao", ["fuzzSome[#](@)!", "(fuzzSome[#](@) ?? @)"]],
 	["ni", ["(@ + 0)", "(@ - 0)", "(@ * 1)", "(@ / 1)", "(@ | 0)", "(@ ^ 0)", "(@ << 0)", "(~~@)"]],
 	["nd", ["(@ * 1.0)", "(@ + -0.0)", "(@ / 1.0)"]],
 	["nb", ["(!!@)", "(@ && true)", "(@ || false)", "(@ == true)", "(if @ true else false)"]],
-	["ns", ["(@ + \"\")", "`${@}`"]],
-]
+	["ns", ["(@ + \"\")", "`${@}`"]]]
+
 /// The edits the checker may reject.
 const risky = ["swap", "graft", "retype", "untype"]
 
-
 /// Whether n is a number or string literal, possibly negated.
 function literal(n: Node): bool {
-	return n.kind == "token" && ["int", "float", "string"].includes(n.t.kind) || n.kind == "unary" && literal(n.parts[0])
+	return n.kind == "token" && ["int", "float", "string"].includes(n.t.kind)
+		|| n.kind == "unary" && literal(n.parts[0])
 }
 
 /// The tokens of src but comments, a template's text between its expressions as the parser takes it.
@@ -325,7 +330,9 @@ function cover(n: Node): Loc {
 	return c
 }
 
-function splice(src: string, at: Loc, text: string): string { return src.slice(0, at.pos) + text + src.slice(at.end(), src.length) }
+function splice(src: string, at: Loc, text: string): string {
+	return src.slice(0, at.pos) + text + src.slice(at.end(), src.length)
+}
 
 /// The line and column of pos in src, from 1, as an error has them.
 function place(src: string, pos: i32): string {

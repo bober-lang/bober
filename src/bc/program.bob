@@ -121,7 +121,6 @@ export class Program {
 	names: i32[][] = []
 	/// Each instance, by pair(its generic decl, env), which mono makes.
 	instances = new HashMap[i64, i32]()
-
 	private kinds: kind.Kind[] = []
 	private as: i32[] = []
 	private bs: i32[] = []
@@ -221,7 +220,9 @@ export class Program {
 
 	/// The type of kind k and parts a and b; a union's as union makes it, a Member resolved where its type tells it.
 	type(k: kind.Kind, a: i32 = 0, b: i32 = 0): i32 {
-		return if (k == kind.Union) this.union(this.lists[a]) else if (k == kind.Member) this.typeMember(a, b) else this.row(k, a, b)
+		return if (k == kind.Union) this.union(this.lists[a])
+			else if (k == kind.Member) this.typeMember(a, b)
+			else this.row(k, a, b)
 	}
 
 	kind(t: i32): kind.Kind { return this.kinds[t] }
@@ -332,7 +333,6 @@ export class Program {
 
 	/// The types t lists: a function's params, a tuple's or object's parts, a union's members.
 	items(t: i32): i32[] { return this.lists[this.as[t]] }
-
 	/// The members of t, a union, in canonical order, which src/type.c's is too, by hash; else t itself.
 	members(t: i32): i32[] { return if (this.kinds[t] == kind.Union) this.lists[this.as[t]] else [t] }
 
@@ -340,7 +340,9 @@ export class Program {
 	/// of its family, or a typed number widens to, the one of the lowest id, which is the narrowest of its family and
 	/// the checker's order (src/type.bob), whatever the union's; t if it is no union or has none.
 	numberIn(t: i32, k: i32): i32 {
-		const ms = this.members(t).filter(x => if (kind.untyped(k)) x != k && (kind.isInt(x) && kind.isInt(k) || kind.isFloat(x) && kind.isFloat(k)) else kind.widens(k, x))
+		const ms = this.members(t).filter(x => if (kind.untyped(k)) x != k
+			&& (kind.isInt(x) && kind.isInt(k) || kind.isFloat(x) && kind.isFloat(k))
+			else kind.widens(k, x))
 		sort(ms)
 		return if (this.kinds[t] != kind.Union || ms.length == 0) t else ms[0]
 	}
@@ -405,7 +407,8 @@ export class Program {
 			case kind.Object: combine(h, this.nameHashes[b])
 			case kind.Named: combine(h, this.decls[a].hash)
 			case kind.Param: combine(combine(h, this.decls[a].hash), b)
-			case kind.Literal: combine(combine(h, a), if (a == kind.String) fnv(this.strings[b]) else if (kind.isInt(a)) this.ints[b] as u64 else b as u64)
+			case kind.Literal: combine(combine(h, a),
+				if (a == kind.String) fnv(this.strings[b]) else if (kind.isInt(a)) this.ints[b] as u64 else b as u64)
 			case kind.Of: combine(combine(h, a), fnv(this.strings[b]))
 			case kind.Member: combine(h, fnv(this.strings[b]))
 			default: h
@@ -430,8 +433,7 @@ export class Program {
 			f = f | this.listFlags[l]
 		}
 		switch (k) {
-			case kind.Array, kind.Optional, kind.Rest, kind.Embed, kind.FixedArray, kind.Literal, kind.Member:
-				part(a)
+			case kind.Array, kind.Optional, kind.Rest, kind.Embed, kind.FixedArray, kind.Literal, kind.Member: part(a)
 			case kind.Tuple, kind.Union, kind.Object: list(a)
 			case kind.Func:
 				list(a)
@@ -462,7 +464,8 @@ export class Program {
 		const s = this.intern(name)
 		const before = this.scopes[m].get(pair(owner, s))
 		const nth = if (before == null) 0 else this.decls[before!].nth + 1
-		const h = combine(combine(if (owner >= 0) this.decls[owner].hash else fnv(this.modules[m].path), fnv(name)), nth)
+		const h = combine(combine(if (owner >= 0) this.decls[owner].hash else fnv(this.modules[m].path), fnv(name)),
+			nth)
 		const d = this.decls.length
 		this.decls.push(new Decl(s, k, m, owner, h))
 		this.decls[d].nth = nth
@@ -552,7 +555,6 @@ export class Program {
 
 /// The key of a and b, as one int.
 export function pair(a: i32, b: i32): i64 { return (a as i64) << 32 | ((b as i64) & 0xffffffff) }
-
 /// The hash of the source src of the module at path.
 export function sourceHash(path: string, src: string): u64 { return combine(fnv(path), fnv(src)) }
 

@@ -12,11 +12,14 @@ export type Block = u64
 /// Arithmetic on two values of one type; the f ops on floats, the others on integers.
 export type Binary = "add" | "sub" | "mul" | "udiv" | "sdiv" | "urem" | "srem" | "shl" | "lshr" | "ashr" | "and" | "or"
 	| "xor" | "fadd" | "fsub" | "fmul" | "fdiv" | "frem" | "fpow"
+
 /// Conversions between widths and kinds.
 export type Cast = "trunc" | "zext" | "sext" | "fptoui" | "fptosi" | "uitofp" | "sitofp" | "fptrunc" | "fpext"
 	| "ptrtoint" | "inttoptr" | "bitcast"
+
 /// Integer comparisons; u and s the unsigned and signed orders.
 export type Cmp = "eq" | "ne" | "ugt" | "uge" | "ult" | "ule" | "sgt" | "sge" | "slt" | "sle"
+
 /// Float comparisons; the o ones false and the u ones true when an operand is NaN.
 export type FCmp = "oeq" | "ogt" | "oge" | "olt" | "ole" | "one" | "ord" | "ueq" | "ugt" | "uge" | "ult" | "ule" | "une"
 	| "uno"
@@ -55,7 +58,6 @@ export interface Backend {
 	variadic(result: Type, params: Type[]): Type
 	struct(fields: Type[]): Type
 	array(elem: Type, n: u64): Type
-
 	/// n, sign extended to t where that is wider.
 	constInt(t: Type, n: i64): Value
 	constFloat(t: Type, x: f64): Value
@@ -79,7 +81,6 @@ export interface Backend {
 	constOffset(p: Value, bytes: i64): Value
 	/// The constant v converted by op, which is trunc, ptrtoint, inttoptr or bitcast.
 	constCast(op: Cast, v: Value, to: Type): Value
-
 	/// The function of that name, declared until blocks define it. A local one is seen only in this module.
 	function(name: string, t: Type, local: bool): Value
 	/// The function or else global of that name, or 0.
@@ -126,14 +127,12 @@ export interface Backend {
 	threadLocal(g: Value)
 	/// Keeps the function fn's body for inlining only; the symbol is defined in another module.
 	inlineOnly(fn: Value)
-
 	param(fn: Value, i: u32): Value
 	typeOf(v: Value): Type
 	/// The result type of the function type t.
 	resultOf(t: Type): Type
 	/// The type of the function f, or of the value a global holds.
 	valueType(f: Value): Type
-
 	/// A new block at the end of fn.
 	block(fn: Value): Block
 	/// Appends what follows to b.
@@ -142,7 +141,6 @@ export interface Backend {
 	here(): Block
 	/// Whether the block being appended to has its terminator.
 	ended(): bool
-
 	ret(v: Value)
 	retVoid()
 	br(to: Block)
@@ -154,7 +152,6 @@ export interface Backend {
 	/// Jumps to the address p, of one of targets.
 	indirectBr(p: Value, targets: Block[])
 	unreachable()
-
 	binary(op: Binary, a: Value, b: Value): Value
 	icmp(pred: Cmp, a: Value, b: Value): Value
 	fcmp(pred: FCmp, a: Value, b: Value): Value
@@ -219,7 +216,6 @@ export interface Backend {
 	/// Where an invoke unwinds to, catching the C++ exceptions of typeinfo, or every one for a null pointer; it gives
 	/// no value, the personality passing the exception some other way. Its function needs a personality.
 	landingPad(typeinfo: Value)
-
 	// Debug information, which a generator may drop. Instructions get the line set last, within the function
 	// debugged last; a function debugged has one until the next is.
 	/// Names the file the module is compiled from, and the compiler, as producer.
@@ -230,7 +226,6 @@ export interface Backend {
 	line(n: u32, col: u32)
 	/// Lets the debugger see the slot p of the function debugged as its local name, of type t, declared at line.
 	debugLocal(name: string, p: Value, t: Type, line: u32)
-
 	/// Has the collector walk the frames of the module's functions: each ref they hold across a call is kept where
 	/// it finds and updates it.
 	collected()
@@ -351,6 +346,7 @@ export class Nothing implements Backend {
 	readable(p: Value, n: Value, align: i64) {}
 	vaStart(ap: Value) {}
 	frameAddress(): Value { return this.fresh() }
+
 	asm(text: string, outs: Operand[], ins: Operand[], clobbers: string[]): Value[] {
 		const out: Value[] = []
 		for (const o of outs) {
@@ -360,6 +356,7 @@ export class Nothing implements Backend {
 		}
 		return out
 	}
+
 	hasAsm(): bool { return true }
 	moduleAsm(text: string) {}
 	common(g: Value) {}
@@ -387,7 +384,8 @@ export function mark(b: Backend, heap: Value, q: Value) {
 	const i64 = b.int(64)
 	const card = b.binary("lshr", b.binary("sub", b.cast("ptrtoint", q, i64), heap), b.constInt(i64, 9))
 	const n = b.constInt(i64, 0x8000000)
-	const at = b.binary("add", heap, b.binary("add", b.select(b.icmp("ult", card, n), card, n), b.constInt(i64, 0x1000000000)))
+	const at = b.binary("add", heap,
+		b.binary("add", b.select(b.icmp("ult", card, n), card, n), b.constInt(i64, 0x1000000000)))
 	b.store(b.constInt(b.int(8), 1), b.cast("inttoptr", at, b.ptr()), false)
 }
 

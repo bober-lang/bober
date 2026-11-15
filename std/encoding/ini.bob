@@ -27,9 +27,7 @@ export class EncodeError {
 	constructor(path: string) { this.path = path }
 }
 
-export function encode[T extends New](v: T): string throws EncodeError {
-	return section(v, "")
-}
+export function encode[T extends New](v: T): string throws EncodeError { return section(v, "") }
 
 export function decode[T extends New](s: string): T throws ParseError {
 	const d = new Decoder(s)
@@ -70,16 +68,15 @@ function section[T](v: T, path: string): string throws EncodeError {
 	const keys: string[] = []
 	const sections: string[] = []
 	switch (t.kind) {
-		case "class", "object", "interface":
-			for (const f of t.fields) {
-				if (has(f.tags, Rest) && f.type == Unknown[]) {
-					for (const [k, text] of v[f.name]) {
-						keys.push(`${k} = ${text}\n`)
-					}
-				} else if (!encoding.omits(f.tags, Skip, OmitEmpty, v[f.name])) {
-					field(keys, sections, path, encoding.key(f.tags, Name, f.name), v[f.name])
+		case "class", "object", "interface": for (const f of t.fields) {
+			if (has(f.tags, Rest) && f.type == Unknown[]) {
+				for (const [k, text] of v[f.name]) {
+					keys.push(`${k} = ${text}\n`)
 				}
+			} else if (!encoding.omits(f.tags, Skip, OmitEmpty, v[f.name])) {
+				field(keys, sections, path, encoding.key(f.tags, Name, f.name), v[f.name])
 			}
+		}
 		default: throw new EncodeError(path)
 	}
 	let out = keys.join("")
@@ -95,17 +92,15 @@ function field[T](keys: string[], sections: string[], path: string, name: string
 	const p = path + name
 	switch (t.kind) {
 		case "null": return
-		case "union":
-			for (const M of t.members) {
-				if (v instanceof M) {
-					field(keys, sections, path, name, v)
-				}
+		case "union": for (const M of t.members) {
+			if (v instanceof M) {
+				field(keys, sections, path, name, v)
 			}
+		}
 		case "class", "object", "interface": sections.push(`[${p}]\n${section(v, `${p}.`)}`)
-		case "array":
-			for (const x of v) {
-				keys.push(`${name} = ${value(x, p)}\n`)
-			}
+		case "array": for (const x of v) {
+			keys.push(`${name} = ${value(x, p)}\n`)
+		}
 		default: keys.push(`${name} = ${value(v, p)}\n`)
 	}
 }
@@ -114,18 +109,16 @@ function value[T](v: T, path: string): string throws EncodeError {
 	const t = typeof v
 	switch (t.kind) {
 		case "bool", "int": return `${v}`
-		case "float":
-			if (isFinite(v)) {
-				return `${v}`
-			}
+		case "float": if (isFinite(v)) {
+			return `${v}`
+		}
 		case "string": return if (plain(v)) v else json.quoted(v)
 		case "literal": return value[string | bool | i64 | null](t.value, path)
-		case "union":
-			for (const M of t.members) {
-				if (v instanceof M) {
-					return value(v, path)
-				}
+		case "union": for (const M of t.members) {
+			if (v instanceof M) {
+				return value(v, path)
 			}
+		}
 		default: throw new EncodeError(path)
 	}
 	throw new EncodeError(path)
@@ -161,19 +154,18 @@ class Decoder {
 			return this.leaf[T](v, path)
 		}
 		switch (T.kind) {
-			case "union":
-				for (const M of T.members) {
-					if (M.kind == "class") {
-						return this.walk[M](if (v instanceof M) v else new M(), path, i, key, at)
-					}
+			case "union": for (const M of T.members) {
+				if (M.kind == "class") {
+					return this.walk[M](if (v instanceof M) v else new M(), path, i, key, at)
 				}
+			}
 			case "class":
 				if (i == path.length) {
 					return v
 				}
 				for (const f of T.fields) {
-					if (path[i] == encoding.key(f.tags, Name, f.name)
-							&& !encoding.skips(f.tags, Skip) && !has(f.tags, Rest)) {
+					if (path[i] == encoding.key(f.tags, Name, f.name) && !encoding.skips(f.tags, Skip)
+						&& !has(f.tags, Rest)) {
 						v[f.name] = this.walk[f.type](v[f.name], path, i + 1, key, at)
 						return v
 					}
@@ -216,17 +208,15 @@ class Decoder {
 	value[T extends Decodable](): T throws ParseError {
 		const t = this.text
 		switch (T.kind) {
-			case "bool":
-				switch (lower(t)) {
-					case "true", "yes", "on", "1": return true
-					case "false", "no", "off", "0": return false
-				}
+			case "bool": switch (lower(t)) {
+				case "true", "yes", "on", "1": return true
+				case "false", "no", "off", "0": return false
+			}
 			case "int", "float": return this.parse[T]()
 			case "string": return if (t.length > 0 && t[0] == quote) this.parse[string]() else t
-			case "literal":
-				if (this.value[string]() == `${T.value}`) {
-					return T.value
-				}
+			case "literal": if (this.value[string]() == `${T.value}`) {
+				return T.value
+			}
 			case "union":
 				// Integers first, as 1 fits a float too and the members are in canonical order (§4.4), not as written.
 				for (const ints of [true, false]) {

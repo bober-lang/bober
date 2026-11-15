@@ -1,6 +1,7 @@
 import { Date, DateTime, dateOf, daysInMonth, daysOf, deadline, fixed, formatDuration, head, hour, httpDate, httpDateAt,
 	isLeap, isValid, local, maxDays, millisecond, minDays, minute, monotonic, parseHttpDate, parseRfc3339, posix,
 	rfc3339, second, tzif, utc } from "./time"
+
 import { maxOf, minOf } from "./limits"
 import { ParseError } from "./string"
 
@@ -39,7 +40,8 @@ test "leap years" {
 	assert isLeap(2000) && isLeap(2024) && isLeap(0) && isLeap(-4) && isLeap(-400)
 	assert !isLeap(1900) && !isLeap(2023) && !isLeap(-100) && !isLeap(-1)
 	assert daysInMonth(2024, 2) == 29 && daysInMonth(2023, 2) == 28
-	assert [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map(m => daysInMonth(2023, m)) == [31, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+	assert [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map(m => daysInMonth(2023, m))
+		== [31, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
 }
 
 test "dates" {
@@ -52,7 +54,8 @@ test "dates" {
 	assert new Date(2024, 2, 29).addMonths(12) == new Date(2025, 2, 28)
 	assert new Date(2024, 12, 31).addDays(1) == new Date(2025, 1, 1)
 	assert new Date(2024, 1, 1).compare(new Date(2023, 12, 31)) > 0 && d.compare(new Date(1970, 1, 1)) == 0
-	assert isValid(2024, 2, 29) && !isValid(2023, 2, 29) && !isValid(2023, 13, 1) && !isValid(2023, 0, 1) && !isValid(10000, 1, 1)
+	assert isValid(2024, 2, 29) && !isValid(2023, 2, 29) && !isValid(2023, 13, 1) && !isValid(2023, 0, 1)
+		&& !isValid(10000, 1, 1)
 	assert isValid(1582, 10, 10) // proleptic Gregorian, with no Julian switch as Java's GregorianCalendar has
 }
 
@@ -72,7 +75,8 @@ test "RFC 3339" {
 	assert parseRfc3339("1985-04-12T23:20:50.52Z") == 482196050_520_000_000
 	assert parseRfc3339("1996-12-19T16:39:57-08:00") == 851042397 * second
 	assert parseRfc3339("1990-12-31t15:59:59.123456789z") == 662659199_123_456_789
-	assert parseRfc3339("2262-04-11T23:47:16.854775807Z") == max && parseRfc3339("1677-09-21T00:12:43.145224192Z") == min
+	assert parseRfc3339("2262-04-11T23:47:16.854775807Z") == max
+		&& parseRfc3339("1677-09-21T00:12:43.145224192Z") == min
 	assert failure(() => parseRfc3339("2262-04-11T23:47:16.854775808Z"))!.at == 0
 	assert failure(() => parseRfc3339("1677-09-21T00:12:43.145224191Z"))!.at == 0
 	assert failure(() => parseRfc3339("9999-12-31T23:59:59Z"))!.kind == "range"
@@ -142,13 +146,13 @@ test "HTTP dates" {
 
 const max = maxOf[i64]()
 const min = minOf[i64]()
-
 const vienna = posix("CET-1CEST,M3.5.0,M10.5.0/3")
 
 test "a POSIX rule, its gap and its fold" {
 	const spring = parseRfc3339("2024-03-31T01:00:00Z")
 	assert vienna.offset(spring - 1) == 3600 && vienna.offset(spring) == 7200
-	assert rfc3339(spring - second, vienna) == "2024-03-31T01:59:59+01:00" && rfc3339(spring, vienna) == "2024-03-31T03:00:00+02:00"
+	assert rfc3339(spring - second, vienna) == "2024-03-31T01:59:59+01:00"
+		&& rfc3339(spring, vienna) == "2024-03-31T03:00:00+02:00"
 	const gap = new DateTime(new Date(2024, 3, 31), 2, 30)
 	assert vienna.instants(gap) == []
 	assert vienna.instant(gap) == spring + 30 * minute && vienna.instant(gap, "later") == spring + 30 * minute
@@ -181,7 +185,8 @@ test "POSIX rules of the southern hemisphere, the US by default, and every kind 
 	}
 	// Greenland's times before midnight; J and zero-based days, in a leap year.
 	const nuuk = posix("<-02>2<-01>,M3.5.0/-1,M10.5.0/0")
-	assert nuuk.offset(parseRfc3339("2024-03-31T00:59:59Z")) == -7200 && nuuk.offset(parseRfc3339("2024-03-31T01:00:00Z")) == -3600
+	assert nuuk.offset(parseRfc3339("2024-03-31T00:59:59Z")) == -7200
+		&& nuuk.offset(parseRfc3339("2024-03-31T01:00:00Z")) == -3600
 	const j = posix("XXX0YYY,J60/0,J61/0")
 	const n = posix("XXX0YYY,59/0,60/0")
 	const days: [string, i32, i32][] = [["2023-02-28", 0, 0], ["2023-03-01", 3600, 3600], ["2023-03-02", 0, 0],
@@ -203,8 +208,9 @@ test "POSIX rules of the southern hemisphere, the US by default, and every kind 
 }
 
 test "malformed POSIX rules" {
-	const cases: [string, i32][] = [["", 0], ["CE-1", 0], ["CET", 3], ["CET-1CEST,M3.5.0", 16], ["CET-1CEST,M13.5.0,M10.5.0", 11],
-		["CET-1CEST,M3.5.0,M10.5.0/168", 25], ["<+01-1", 0], ["<A,B>-1", 0], ["CET-1CEST,M3.5,M10.5.0", 14], ["CET-1x", 5]]
+	const cases: [string, i32][] = [["", 0], ["CE-1", 0], ["CET", 3], ["CET-1CEST,M3.5.0", 16],
+		["CET-1CEST,M13.5.0,M10.5.0", 11], ["CET-1CEST,M3.5.0,M10.5.0/168", 25], ["<+01-1", 0], ["<A,B>-1", 0],
+		["CET-1CEST,M3.5,M10.5.0", 14], ["CET-1x", 5]]
 	for (const [rule, at] of cases) {
 		try {
 			posix(rule)

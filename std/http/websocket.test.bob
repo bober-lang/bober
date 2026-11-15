@@ -7,15 +7,20 @@ import * as net from "../net"
 
 /// What /flood's second send came to, once its first has timed out.
 let flooded = ""
+
 const stalled = new Signal()
 /// /late's handler is in, and let go; /linger's has seen the end, and is let go.
 const entered = new Signal()
 const late = new Signal()
+
 let lingering = false
+
 const seen = new Signal()
 const held = new Signal()
+
 /// The head of the last frame /shut read, once it read to the end.
 let last = ""
+
 const shut = new Signal()
 
 function app(req: Request): Response throws IoError | ParseError {
@@ -33,107 +38,124 @@ function app(req: Request): Response throws IoError | ParseError {
 				}
 			}
 		}, ["chat", "echo"])
-		case "/bye": return accept(req, ws => {
-			ws.send("so long")
-			const q = req.url.query
-			ws.close(1001, if (q.has("long")) repeat("é", 100) else if (q.has("bare")) repeat("\x80", 124) else "going away")
-		})
-		// A close of one byte.
-		case "/close": return accept(req, ws => { ws.stream.write("\x88\x01\x03") })
-		// Half a message, the rest and a close once the client's close is in.
-		case "/half": return accept(req, ws => {
-			ws.stream.write("\x81\x05he")
-			ws.stream.read(1 << 16)
-			ws.stream.write("llo\x88\x02\x03\xe8")
-		})
-		// A 101 with the query's pairs as headers, such as a subprotocol or an extension the client did not offer.
+		case "/bye":
+			return accept(req, ws => {
+				ws.send("so long")
+				const q = req.url.query
+				ws.close(1001,
+					if (q.has("long")) repeat("é", 100) else if (q.has("bare")) repeat("\x80", 124) else "going away")
+			})
+			// A close of one byte.
+		case "/close":
+			return accept(req, ws => {
+				ws.stream.write("\x88\x01\x03")
+			})
+			// Half a message, the rest and a close once the client's close is in.
+		case "/half":
+			return accept(req, ws => {
+				ws.stream.write("\x81\x05he")
+				ws.stream.read(1 << 16)
+				ws.stream.write("llo\x88\x02\x03\xe8")
+			})
+			// A 101 with the query's pairs as headers, such as a subprotocol or an extension the client did not offer.
 		case "/rogue":
 			const res = accept(req, ws => {})
 			for (const e of req.url.query.entries) {
 				res.headers.set(e[0], e[1])
 			}
 			return res
-		// 16 MiB to a client that reads none of it within the 100 ms a write may take, then a word.
-		case "/flood": return accept(req, ws => {
-			ws.stream.timeout = 100 * millisecond
-			try {
-				ws.send(repeat(repeat("x", 1 << 12), 1 << 12))
-			} catch (e: IoError) {}
-			stalled.wake()
-			try {
-				ws.send("x")
-				flooded = "sent"
-			} catch (e: IoError) {
-				flooded = e.kind
-			}
-		})
-		// An upgrade once let go.
+			// 16 MiB to a client that reads none of it within the 100 ms a write may take, then a word.
+		case "/flood":
+			return accept(req, ws => {
+				ws.stream.timeout = 100 * millisecond
+				try {
+					ws.send(repeat(repeat("x", 1 << 12), 1 << 12))
+				} catch (e: IoError) {}
+				stalled.wake()
+				try {
+					ws.send("x")
+					flooded = "sent"
+				} catch (e: IoError) {
+					flooded = e.kind
+				}
+			})
+			// An upgrade once let go.
 		case "/late":
 			entered.wake()
 			late.wait()
-			return accept(req, ws => { while (ws.receive() != null) {} })
-		// A handler that goes on past the end it read, which closed its connection.
-		case "/linger": return accept(req, ws => {
-			while (ws.receive() != null) {}
-			lingering = true
-			seen.wake()
-			held.wait()
-		})
-		// A close after 100 ms, nothing read till 100 ms after, then everything.
-		case "/shut": return accept(req, ws => {
-			pause(100 * millisecond)
-			ws.stream.write("\x88\x02\x03\xe8")
-			pause(100 * millisecond)
-			let got = ""
-			while (true) {
-				const p = ws.stream.read(1 << 16)
-				if (p == null) {
-					break
-				}
-				got += p
-			}
-			last = got.slice(got.length - 8, got.length - 6)
-			shut.wake()
-		})
-		// A peer that pings, then sends a message past the socket's buffers while it reads one.
-		case "/both": return accept(req, ws => {
-			ws.stream.timeout = 2 * second
-			ws.ping("p")
-			const sending = async ws.sendBinary(repeat("y", 12 << 20))
-			const m = ws.receive()
-			last = if (m == null) "none" else `${m.data.length}`
-			await sending
-			shut.wake()
-		})
-		// A peer that reads 4 MB/s and never answers.
-		case "/slow": return accept(req, ws => {
-			let got = ""
-			while (true) {
-				const p = ws.stream.read(1 << 16)
-				if (p == null) {
-					break
-				}
-				got = got.slice(if (got.length < 8) 0 else got.length - 8, got.length) + p
-				pause(16 * millisecond)
-			}
-			last = got.slice(got.length - 8, got.length - 6)
-			shut.wake()
-		})
-		// A peer that never answers.
-		case "/mute": return accept(req, ws => { while (ws.stream.read(1 << 16) != null) {} })
-		// A peer that keeps sending for 1.5 s: a ping, or a byte of a frame of 1000, each 100 ms.
-		case "/drip": return accept(req, ws => {
-			const ping = req.url.query.has("ping")
-			if (!ping) {
-				ws.stream.write("\x82\x7e\x03\xe8")
-			}
-			for (const i of 1 ... 15) {
+			return accept(req, ws => {
+				while (ws.receive() != null) {}
+			})
+			// A handler that goes on past the end it read, which closed its connection.
+		case "/linger":
+			return accept(req, ws => {
+				while (ws.receive() != null) {}
+				lingering = true
+				seen.wake()
+				held.wait()
+			})
+			// A close after 100 ms, nothing read till 100 ms after, then everything.
+		case "/shut":
+			return accept(req, ws => {
 				pause(100 * millisecond)
-				ws.stream.write(if (ping) "\x89\0" else "x")
-			}
-		})
-		// A fragment of 3 bytes, then the head of another 3, its payload never sent: a continuation's, or with ?text a
-		// text's, with ?odd one of reserved opcode 3.
+				ws.stream.write("\x88\x02\x03\xe8")
+				pause(100 * millisecond)
+				let got = ""
+				while (true) {
+					const p = ws.stream.read(1 << 16)
+					if (p == null) {
+						break
+					}
+					got += p
+				}
+				last = got.slice(got.length - 8, got.length - 6)
+				shut.wake()
+			})
+			// A peer that pings, then sends a message past the socket's buffers while it reads one.
+		case "/both":
+			return accept(req, ws => {
+				ws.stream.timeout = 2 * second
+				ws.ping("p")
+				const sending = async ws.sendBinary(repeat("y", 12 << 20))
+				const m = ws.receive()
+				last = if (m == null) "none" else `${m.data.length}`
+				await sending
+				shut.wake()
+			})
+			// A peer that reads 4 MB/s and never answers.
+		case "/slow":
+			return accept(req, ws => {
+				let got = ""
+				while (true) {
+					const p = ws.stream.read(1 << 16)
+					if (p == null) {
+						break
+					}
+					got = got.slice(if (got.length < 8) 0 else got.length - 8, got.length) + p
+					pause(16 * millisecond)
+				}
+				last = got.slice(got.length - 8, got.length - 6)
+				shut.wake()
+			})
+			// A peer that never answers.
+		case "/mute":
+			return accept(req, ws => {
+				while (ws.stream.read(1 << 16) != null) {}
+			})
+			// A peer that keeps sending for 1.5 s: a ping, or a byte of a frame of 1000, each 100 ms.
+		case "/drip":
+			return accept(req, ws => {
+				const ping = req.url.query.has("ping")
+				if (!ping) {
+					ws.stream.write("\x82\x7e\x03\xe8")
+				}
+				for (const i of 1 ... 15) {
+					pause(100 * millisecond)
+					ws.stream.write(if (ping) "\x89\0" else "x")
+				}
+			})
+			// A fragment of 3 bytes, then the head of another 3, its payload never sent: a continuation's, or with ?text a
+			// text's, with ?odd one of reserved opcode 3.
 		case "/part": return accept(req, ws => {
 			const q = req.url.query
 			const last = if (q.has("text")) "\x81\x03" else if (q.has("odd")) "\x83\x03" else "\x80\x03"
@@ -424,7 +446,8 @@ test "bad handshakes and limits" {
 		"sec-websocket-extensions=permessage-deflate"]) {
 		assert connect(rogue + q) throws new IoError("Protocol", "connect", "101")
 	}
-	assert connect(rogue + "sec-websocket-protocol=mqtt", null, ["chat"]) throws new IoError("Protocol", "connect", "101")
+	assert connect(rogue + "sec-websocket-protocol=mqtt", null,
+		["chat"]) throws new IoError("Protocol", "connect", "101")
 	connect(rogue + "upgrade=WebSocket&connection=keep-alive,%20UPGRADE").close()
 	const ws = connect(`ws://${s.addr}/echo`)
 	ws.maxMessage = 4

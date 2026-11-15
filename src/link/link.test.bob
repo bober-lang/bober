@@ -5,8 +5,10 @@ import { Bytes, mapped } from "./bytes"
 import { addend, arm64 } from "./arm64"
 import { read, write } from "./keep"
 import { Image, Linker, Stale } from "./link"
+
 import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Init, Kept, Local, Machine, Object, Page, PageOff, Rel32,
 	Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Thread32, Unwind, Weak, Zero } from "./object"
+
 import { x64 } from "./x64"
 
 /// An object named name of one section of kind, of the bytes of words, and of symbols.
@@ -32,15 +34,10 @@ function obj(name: string, kind: u8, words: u64[], symbols: Symbol[], fixups: Fi
 /// A linker for machine, for a format of no file, whose loader sets a pointer to an import anywhere, or its slots only,
 /// and whose image starts at `__image`; of a kept image if kept is not null, as Linker's.
 function linker(bindsAnywhere = true, machine: Machine = arm64, kept: Bytes | null = null): Linker {
-	return new Linker(machine, {
-		headers: 0x200,
-		symbol: 24,
-		bindsAnywhere: bindsAnywhere,
-		start: "__image",
+	return new Linker(machine,
+		{ headers: 0x200, symbol: 24, bindsAnywhere: bindsAnywhere, start: "__image",
 		read: (name: string, bytes: string) => new Object(name, "arm64"),
-		exports: (name: string, bytes: string) => [name],
-		write: (image: Image) => {},
-	}, kept)
+		exports: (name: string, bytes: string) => [name], write: (image: Image) => {} }, kept)
 }
 
 /// A linker into a kept image, which continues the one whose file file is, with link's library.
@@ -119,8 +116,7 @@ test "a strong definition is taken over a weak one, and the first weak one over 
 test "a name defined twice, or wanted and not defined, is an error naming the objects" {
 	const a = obj("a", Data, [0], [new Symbol("x", Global, 0), new Symbol("u", Global)])
 	const b = obj("b", Data, [0], [new Symbol("x", Global, 0), new Symbol("v", Global)])
-	assert link([a, b], []) throws new CompileError(
-		"x is defined in a and b\nu is not defined, but a names it\nv is not defined, but b names it")
+	assert link([a, b], []) throws new CompileError("x is defined in a and b\nu is not defined, but a names it\nv is not defined, but b names it")
 	assert link([obj("c", Data, [0], [])], ["w"]) throws new CompileError("w is exported but not defined")
 }
 
@@ -160,8 +156,8 @@ test "a lazy object is read only once a linked one wants a name it is listed for
 }
 
 test "a continued image lists the lazy objects only once a name is looked for in them that it did not name" {
-	const calls = (name: string, x: string) => obj(name, Code, [0x94000000], [new Symbol(x, Global)],
-		[new Fixup(0, Call, 0, 0)])
+	const calls = (name: string,
+		x: string) => obj(name, Code, [0x94000000], [new Symbol(x, Global)], [new Fixup(0, Call, 0, 0)])
 	const first = file(keep(kept(), [calls("a", "puts")]))
 	let listed = 0
 	const list = (l: Linker) => l.lazily(() => {
@@ -192,19 +188,21 @@ test "__start_ and __stop_ are the bounds of the sections of a name, if it is a 
 	const a = obj("a", Data, [1, 2], [new Symbol("__start_data", Global), new Symbol("__stop_data", Global)])
 	const b = obj("b", Data, [3], [new Symbol("__stop_data", Global)])
 	const image = link([a, b], ["__start_data", "__stop_data"])
-	assert at(image, "__start_data") == section(image, "data") && at(image, "__stop_data") == section(image, "data") + 12
-	assert link([obj("c", Data, [0], [new Symbol("__start_.x", Global)])], []) throws new CompileError(
-		"__start_.x is not defined, but c names it")
+	assert at(image, "__start_data") == section(image, "data")
+		&& at(image, "__stop_data") == section(image, "data") + 12
+	assert link([obj("c", Data, [0], [new Symbol("__start_.x", Global)])],
+		[]) throws new CompileError("__start_.x is not defined, but c names it")
 	const kinds = " bounds sections of several kinds, as that of d"
 	assert link([a, obj("d", Const, [0], [])], []) throws new CompileError(`__start_data${kinds}\n__stop_data${kinds}`)
 }
 
 test "a call to an import goes through a stub, a pointer to it is bound, and one to the image rebased" {
-	const code = obj("a", Code, [0x94000000, 0x90000000, 0xf9400000], [new Symbol("puts", Global),
-		new Symbol("main", Global, 0), new Symbol("here", Local, 0, 4)],
+	const code = obj("a", Code, [0x94000000, 0x90000000, 0xf9400000],
+		[new Symbol("puts", Global), new Symbol("main", Global, 0), new Symbol("here", Local, 0, 4)],
 		[new Fixup(0, Call, 0, 0), new Fixup(4, SlotPage, 2, 0), new Fixup(8, SlotPageOff, 2, 0)])
-	const data = obj("b", Data, [0, 0, 0, 0], [new Symbol("environ", Global), new Symbol("main", Global),
-		new Symbol("p", Global, 0)], [new Fixup(0, Abs64, 0, 16), new Fixup(8, Abs64, 1, 4)])
+	const data = obj("b", Data, [0, 0, 0, 0],
+		[new Symbol("environ", Global), new Symbol("main", Global), new Symbol("p", Global, 0)],
+		[new Fixup(0, Abs64, 0, 16), new Fixup(8, Abs64, 1, 4)])
 	const image = link([code, data], ["main", "p"])
 	const main = at(image, "main")
 	const p = at(image, "p")
@@ -248,11 +246,13 @@ test "read-only bytes of a name of which some hold a pointer are laid out as dat
 
 test "a pointer to an import relative to itself is an error" {
 	const a = obj("a", Code, [0x90000000], [new Symbol("puts", Global)], [new Fixup(0, Page, 0, 0)])
-	assert link([a], []) throws new CompileError("a: text+0 reaches puts relative to itself, but it is not in the image")
+	assert link([a],
+		[]) throws new CompileError("a: text+0 reaches puts relative to itself, but it is not in the image")
 }
 
 test "if the loader sets only slots, any reference to an import but through its slot is to its stub" {
-	const a = obj("a", Data, [0, 0], [new Symbol("puts", Global), new Symbol("p", Global, 0)], [new Fixup(0, Abs64, 0, 0)])
+	const a = obj("a", Data, [0, 0], [new Symbol("puts", Global), new Symbol("p", Global, 0)],
+		[new Fixup(0, Abs64, 0, 0)])
 	const image = link([a], ["p"], [], false)
 	const slots = section(image, "slots")
 	const p = at(image, "p")
@@ -302,8 +302,9 @@ test "an x86-64 call's displacement is of 32 bits, from the end of the instructi
 
 test "an x86-64 call to an import jumps through its slot in a stub, and a load of a slot is relative to itself" {
 	// call puts; mov here@GOTPCREL(%rip), %rax
-	const a = obj("a", Code, [0xe8, 0x058b4800, 0], [new Symbol("puts", Global), new Symbol("main", Global, 0),
-		new Symbol("here", Local, 0, 5)], [new Fixup(1, Call, 0, -4), new Fixup(8, SlotRel32, 2, -4)])
+	const a = obj("a", Code, [0xe8, 0x058b4800, 0],
+		[new Symbol("puts", Global), new Symbol("main", Global, 0), new Symbol("here", Local, 0, 5)],
+		[new Fixup(1, Call, 0, -4), new Fixup(8, SlotRel32, 2, -4)])
 	a.arch = "x86_64"
 	const image = link([a], ["main"], [], true, x64)
 	const main = at(image, "main")
@@ -324,8 +325,8 @@ test "sections of one name are laid out by their order, then as linked" {
 }
 
 test "the Thread sections are laid out together after the data; a Desc and a Thread32 have S + A's offset there" {
-	const t = obj("t", Thread, [1, 2], [new Symbol("x", Global, 0, 4), new Symbol("y", Local, 1, 4),
-		new Symbol("p", Global, 2)])
+	const t = obj("t", Thread, [1, 2],
+		[new Symbol("x", Global, 0, 4), new Symbol("y", Local, 1, 4), new Symbol("p", Global, 2)])
 	const tbss = new Section("tbss", Thread)
 	tbss.align = 16
 	tbss.size = 8
@@ -357,8 +358,8 @@ test "the format's start is the image's first byte, where no object defines it, 
 }
 
 test "an object of another CPU is an error" {
-	assert link([obj("a", Data, [0], []), new Object("x", "x86_64")], []) throws new CompileError(
-		"x is of x86_64, not arm64")
+	assert link([obj("a", Data, [0], []), new Object("x", "x86_64")],
+		[]) throws new CompileError("x is of x86_64, not arm64")
 }
 
 /// An object as obj's whose section is named name.
@@ -387,7 +388,8 @@ test "an object replaced in a kept image leaves the others' bytes where they are
 
 test "a pointer a kept image's frozen unit has set for good is rebased once" {
 	const v = named("set", obj("v", Data, [1, 0], [new Symbol("lz", Global)], [new Fixup(0, Abs64, 0, 0)]))
-	const z = named("set", obj("z", Data, [0, 0], [new Symbol("__start_set", Global), new Symbol("lz", Global, 0)],
+	const z = named("set",
+		obj("z", Data, [0, 0], [new Symbol("__start_set", Global), new Symbol("lz", Global, 0)],
 		[new Fixup(0, Abs64, 0, 0)]))
 	const l = kept()
 	l.lazy(["lz"], () => z)
@@ -407,8 +409,8 @@ test "an object a kept image holds that names what is no longer defined is unlin
 	assert at(image, "f") == 0 && at(image, "h") != 0 && kept(file(image)).objects().join(" ") == "c"
 	const again = kept(first)
 	again.remove("b")
-	assert keep(again, [obj("d", Data, [0], [new Symbol("g", Global)])]) throws new Stale(
-		"g is not defined, but d names it")
+	assert keep(again,
+		[obj("d", Data, [0], [new Symbol("g", Global)])]) throws new Stale("g is not defined, but d names it")
 }
 
 test "the sections a kept image bounds stay one block" {
@@ -432,12 +434,13 @@ test "a kept image holds a lazy object for good, and a definition over its weak 
 	l.lazy(["lz", "w"], () => z)
 	const first = file(keep(l, [a]))
 	assert kept(first).objects().join(" ") == "a"
-	assert keep(kept(first), [obj("d", Code, [0], [new Symbol("w", Global, 0)])]) throws new Stale(
-		"w of d is defined for good")
+	assert keep(kept(first),
+		[obj("d", Code, [0], [new Symbol("w", Global, 0)])]) throws new Stale("w of d is defined for good")
 }
 
 test "the sections a kept image has for good are not one where another object's are between" {
-	const wants = (name: string, x: string) => obj(name, Data, [0, 0], [new Symbol(x, Global)], [new Fixup(0, Abs64, 0, 0)])
+	const wants = (name: string,
+		x: string) => obj(name, Data, [0, 0], [new Symbol(x, Global)], [new Fixup(0, Abs64, 0, 0)])
 	const has = (name: string, x: string) => named("f", obj(name, Data, [1], [new Symbol(x, Global, 0)]))
 	const l = kept()
 	l.lazy(["x"], () => has("zx", "x"))
@@ -517,8 +520,7 @@ test "an object a continued image links, a lazy one too, with a section the imag
 	const first = file(keep(kept(), [obj("a", Code, [0xd65f03c0], [])]))
 	const l = kept(first)
 	l.lazy(["lz"], () => obj("z", Init, [0, 0], [new Symbol("lz", Global, 0)]))
-	assert keep(l, [obj("b", Data, [0, 0], [new Symbol("lz", Global)], [new Fixup(0, Abs64, 0, 0)])]) throws new Stale(
-		"z has sections the image has for good")
+	assert keep(l, [obj("b", Data, [0, 0], [new Symbol("lz", Global)], [new Fixup(0, Abs64, 0, 0)])]) throws new Stale("z has sections the image has for good")
 }
 
 test "a kept image whose table of names is broken is stale" {
@@ -570,9 +572,10 @@ test "a kept image whose frozen unit's record has its tail flipped is stale once
 }
 
 test "the slot of a local symbol stays the local's in a kept image's frozen unit" {
-	const a = obj("a", Code, [0x90000000, 0xd65f03c0], [new Symbol("here", Local, 0, 4)], [new Fixup(0, SlotPage, 0, 0)])
-	const calls = (name: string, x: string) => obj(name, Code, [0x94000000], [new Symbol(x, Global)],
-		[new Fixup(0, Call, 0, 0)])
+	const a = obj("a", Code, [0x90000000, 0xd65f03c0], [new Symbol("here", Local, 0, 4)],
+		[new Fixup(0, SlotPage, 0, 0)])
+	const calls = (name: string,
+		x: string) => obj(name, Code, [0x94000000], [new Symbol(x, Global)], [new Fixup(0, Call, 0, 0)])
 	const first = file(keep(kept(), [a]))
 	const second = file(keep(kept(first), [calls("b", "puts")]))
 	assert keep(kept(second), [calls("c", "environ")]).binds.length == 2
