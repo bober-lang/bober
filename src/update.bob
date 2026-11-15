@@ -1,0 +1,80 @@
+//! The edge build of bober's package: the line naming it, the update to the latest, and the notice that one is out,
+//! checked on few invocations, never waiting for the network.
+
+import { mkdirAll, removeAll, rename } from "../std/fs"
+import { dir, join } from "../std/fs/path"
+import { stderr } from "../std/io"
+import { arch, os } from "../std/os"
+import { trim } from "../std/string"
+import { CompileError } from "./error"
+import { root } from "./root"
+import * as process from "../std/process"
+import { getpid } from "unistd.h"
+
+/// Where CI publishes the packages, and edge/version, the line naming their build.
+const edge = "https://dl.bober-lang.dev/edge"
+
+/// The line naming this build, which dist.sh writes to the package's lib/version: `bober <commit> <date>`, else
+/// `bober dev`.
+export function version(): string { return trim(readFile(join(root, "lib/version")) ?? "bober dev") }
+
+/// The update command: fetches the latest edge of this OS and CPU beside bober's package, unpacks it there and renames
+/// it in its place, the running one whole until then.
+export function update(): i32 {
+	if (version() == "bober dev") {
+		print("bober update: this bober is not a package")
+		return 1
+	}
+	const p = dir(dir(process.executable())) // rooted, through a symlink to bin/bober
+	const tmp = `${p}.${getpid()}`
+	mkdirAll(tmp)
+	try {
+		fetch(`${edge}/version`, `${tmp}/version`)
+		const latest = trim(readFile(`${tmp}/version`)!)
+		if (latest == version()) {
+			print(`${latest} is the latest`)
+			return 0
+		}
+		const name = `${if (os == "macos") "macOS" else "Linux"}-${if (arch == "arm64") "ARM64" else "X64"}`
+		fetch(`${edge}/bober-${name}.tar.gz`, `${tmp}/bober.tar.gz`)
+		if (process.run(["tar", "-xzf", `${tmp}/bober.tar.gz`, "-C", tmp]) != 0) {
+			throw new CompileError(`cannot unpack ${tmp}/bober.tar.gz`)
+		}
+		rename(p, `${tmp}/old`)
+		try {
+			rename(`${tmp}/bober`, p)
+		} catch (e: IoError) {
+			rename(`${tmp}/old`, p) // before tmp is removed
+			throw e
+		}
+		print(`updated to ${latest}`)
+		return 0
+	} finally {
+		removeAll(tmp)
+	}
+}
+
+/// Fetches url to the file out by curl.
+function fetch(url: string, out: string) {
+	if (process.run(["curl", "-fsSL", "-o", out, url]) != 0) {
+		throw new CompileError(`cannot fetch ${url}`)
+	}
+}
+
+/// On one invocation in 32 of a package, by its process ID, unless BOBER_NO_UPDATE_CHECK is set: tells on stderr if the
+/// edge's version line last fetched, lib/latest, is not its own, and fetches it anew in the background, for a later one.
+/// Silent on any failure.
+export function notice() {
+	if (getpid() % 32 != 0 || version() == "bober dev" || process.env("BOBER_NO_UPDATE_CHECK") != null) {
+		return
+	}
+	const latest = join(root, "lib/latest")
+	try {
+		const l = readFile(latest)
+		if (l != null && trim(l) != version()) {
+			stderr.write("bober: a newer version is out, `bober update` gets it\n")
+		}
+		process.run(["sh", "-c", `curl -fsm 30 -o "$2.$$" "$1" && mv "$2.$$" "$2" &`, "sh", `${edge}/version`, latest],
+			"/dev/null")
+	} catch (e: IoError) {}
+}
