@@ -59,11 +59,18 @@ export function show[T](x: T): string {
 	return T.kind
 }
 
-/// x as an element or field of what show shows, or a value a failed assert shows: a string quoted, else by its
-/// toString.
+/// x as an element or field of what show shows, or a value a failed assert shows: a string quoted, also as a union's
+/// member or a literal, else by its toString.
 export function item[T](x: T): string {
-	if (T.kind == "string") {
-		return quoted(x)
+	switch (T.kind) {
+		case "string": return quoted(x)
+		case "literal": return item[string | bool | i64 | null](T.value)
+		case "union":
+			for (const M of T.members) {
+				if (x instanceof M) {
+					return item(x)
+				}
+			}
 	}
 	return `${x}`
 }
