@@ -314,8 +314,8 @@ class Emitter {
 		b.allocator(declare("alloc", this.ref, [i64, ptr]))
 		b.attr(declare("trap", v, [ptr, ptr, i32]), -1, "noreturn", 0)
 		b.attr(declare("fail", v, [this.ref, ptr, i32]), -1, "noreturn", 0)
-		declare("throw", v, [i64, i64, this.ref, ptr, i32])
-		b.attr(declare("uncaught", v, [i64, i64, this.ref, this.ref]), -1, "noreturn", 0)
+		declare("throw", v, [i64, i64, this.ref, ptr, i32, ptr])
+		b.attr(declare("uncaught", v, [this.ref]), -1, "noreturn", 0)
 		declare("caught", ptr, [])
 		declare("start", v, [i32, ptr, i32])
 		declare("test", v, [ptr, ptr, ptr])
@@ -332,6 +332,7 @@ class Emitter {
 		this.rts.set("heap", b.extern("bober_heap", i64))
 		this.rts.set("thrownFile", b.extern("bober_thrown_file", ptr))
 		this.rts.set("thrownAt", b.extern("bober_thrown_at", i32))
+		this.rts.set("thrownShow", b.extern("bober_thrown_show", ptr))
 		if (this.dyn) {
 			declare("type_of", i64, [i64, i64, ptr, ptr])
 			declare("field_of", i64, [i64, ptr, i64, ptr])
@@ -780,7 +781,7 @@ class Emitter {
 			case op.Try: this.try(i)
 			case op.Catch: this.catch(n, c.b(i))
 			case op.Finally: this.finally()
-			case op.Throw: this.raise(this.cast(this.pop(), this.any), this.site())
+			case op.Throw: this.raise(this.cast(this.pop(), this.any), [...this.site(), this.showing(n)])
 			case op.Br: this.branch(n)
 			case op.BrIf:
 				const yes = this.cond()
@@ -1201,7 +1202,7 @@ class Emitter {
 		const f = this.frames[this.frames.length - 1]
 		this.jump(f.done)
 		this.start(f.pad)
-		const caught = this.landing()
+		const [caught, site] = this.landing()
 		f.phase = "catch"
 		if (f.fin >= 0) {
 			f.pad = this.label()
@@ -1216,7 +1217,7 @@ class Emitter {
 		const v = { v: caught, t: this.any }
 		this.condBr(this.isa(v, t), yes, no)
 		this.start(no)
-		this.rethrow(caught)
+		this.raise(caught, site)
 		this.start(yes)
 		this.putLocal(local, this.locals[local], v, t)
 	}
@@ -1226,37 +1227,52 @@ class Emitter {
 		const f = this.frames[this.frames.length - 1]
 		this.jump(f.done)
 		this.start(f.pad)
-		const caught = this.landing()
+		const [caught, site] = this.landing()
 		this.unwind = f.outer
 		this.final(this.frames.length - 1)
-		this.rethrow(caught)
+		this.raise(caught, site)
 		this.start(f.done)
 		f.phase = "finally"
 		this.stack = this.stack.slice(0, f.height)
 	}
 
-	/// The union value caught, which the exception holds.
-	private landing(): Value {
+	/// The union value caught, which the exception holds, and its site, as rt.c keeps it.
+	private landing(): [Value, Value[]] {
 		this.ir().landingPad(this.b.constZero(this.ptr))
-		return this.ir().load(this.unionTy, this.rt("caught", [], false), false)
+		const u = this.ir().load(this.unionTy, this.rt("caught", [], false), false)
+		const kept = (g: string, t: IrType) => this.ir().load(t, this.rts.get(g)!, false)
+		return [u, [kept("thrownFile", this.ptr), kept("thrownAt", this.i32), kept("thrownShow", this.ptr)]]
 	}
 
-	/// Throws the union value u, where it is thrown being its site; if nothing catches it, traps showing it, in a debug
-	/// build as `${}` shows a value, else if a primitive.
+	/// Throws the union value u from its site: where it is thrown and the code showing it; if nothing catches it, traps
+	/// showing it by that code.
 	private raise(u: Value, site: Value[]) {
 		this.rt("throw", [this.tagOf(u), this.bitsOf(u), this.refOf(u), ...site])
-		let shown = this.b.constZero(this.ref)
-		if (this.dyn) {
-			const show = this.lang("show")
-			shown = this.refOf(this.cast({ v: this.call(show.type, show.fn, [this.tagOf(u), u]), t: kind.String },
-				this.any))
-		}
-		this.rt("uncaught", [this.tagOf(u), this.bitsOf(u), this.refOf(u), shown], false)
+		const shown = this.call(this.b.fn(this.stringTy, [this.unionTy]), site[2], [u])
+		this.rt("uncaught", [this.refOf(this.cast({ v: shown, t: kind.String }, this.any))], false)
 		this.ir().unreachable()
 		this.dead = true
 	}
 
-	private rethrow(u: Value) { this.raise(u, [this.b.constZero(this.ptr), this.b.constInt(this.i32, 0)]) }
+	/// The code showing a thrown value, a union, as `${}` does, by a Throw's instance d of show: of the type thrown, or
+	/// as lowered, of its tag's.
+	private showing(d: i32): Value {
+		const f = this.callee(d)
+		const sym = `${f.sym}.shown`
+		const have = this.thunks.get(sym)
+		if (have != null) {
+			return have
+		}
+		const b = this.b
+		const thunk = b.function(sym, b.fn(this.stringTy, [this.unionTy]), true)
+		this.aside(thunk, [], () => {
+			const u = b.param(thunk, 0)
+			b.ret(if (this.dyn) this.call(f.type, f.fn, [this.tagOf(u), u])
+				else this.returning(this.callByValue(f, [this.cast({ v: u, t: this.any }, f.params[0])], false), f.ret))
+		})
+		this.thunks.set(sym, thunk)
+		return thunk
+	}
 	// Calls.
 	/// The callee of Function decl d, declared if of another module.
 	private callee(d: i32): Callee { return this.callees.get(d) ?? put(this.callees, d, this.calleeOf(d)) }
@@ -1715,12 +1731,12 @@ class Emitter {
 			this.unwind = unwind
 			this.jump(done)
 			this.start(pad)
-			this.ir().store(this.landing(), into.v, false)
+			const [u, site] = this.landing()
+			this.ir().store(u, into.v, false)
 			this.written(into.v, this.unionTy)
-			const keep = (g: string, i: i32, t: IrType) =>
-				this.ir().store(this.ir().load(t, this.rts.get(g)!, false), this.gep(into.v, into.t, i), false)
-			keep("thrownFile", 3, this.ptr)
-			keep("thrownAt", 4, this.i32)
+			for (const i of 0 ... 2) {
+				this.ir().store(site[i], this.gep(into.v, into.t, 3 + i), false)
+			}
 			this.ir().store(this.bool(true), threw, false)
 			this.jump(done)
 			this.start(done)
@@ -1730,7 +1746,8 @@ class Emitter {
 		if (name == "rethrow") {
 			const from = this.pop()
 			const kept = (i: i32, t: IrType) => this.ir().load(t, this.gep(from.v, from.t, i), false)
-			this.raise(this.ir().load(this.unionTy, from.v, false), [kept(3, this.ptr), kept(4, this.i32)])
+			this.raise(this.ir().load(this.unionTy, from.v, false),
+				[kept(3, this.ptr), kept(4, this.i32), kept(5, this.ptr)])
 			this.push(this.bool(false), ret)
 			return
 		}

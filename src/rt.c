@@ -108,44 +108,26 @@ static void fault(int sig, siginfo_t *info, void *c) {
   signal(sig, SIG_DFL), raise(sig);
 }
 
-/// A value of primitive kind (§8.2) held in bits as text, in buf; a string is boxed in ref, laid out as
-/// builtin/string.bob says.
-static int show(char *buf, int n, int32_t kind, int64_t bits, const uint8_t *ref) {
-  switch (kind) {
-  case 1: return snprintf(buf, n, "null");
-  case 2: return snprintf(buf, n, bits & 1 ? "true" : "false");
-  case 3: return snprintf(buf, n, "%d", (int8_t)bits);
-  case 4: return snprintf(buf, n, "%d", (int16_t)bits);
-  case 5: return snprintf(buf, n, "%d", (int32_t)bits);
-  case 6: return snprintf(buf, n, "%lld", (long long)bits);
-  case 7: return snprintf(buf, n, "%u", (uint8_t)bits);
-  case 8: return snprintf(buf, n, "%u", (uint16_t)bits);
-  case 9: return snprintf(buf, n, "%u", (uint32_t)bits);
-  case 10: return snprintf(buf, n, "%llu", (unsigned long long)bits);
-  case 11: { float f; int32_t i = bits; memcpy(&f, &i, 4); return snprintf(buf, n, "%g", f); }
-  case 12: { double d; memcpy(&d, &bits, 8); return snprintf(buf, n, "%g", d); }
-  case 13: {
-    const uint8_t *s = ref;
-    bool far = s[0] == 0xff;
-    int64_t len = far ? *(const uint64_t *)s >> 8 : s[0];
-    return snprintf(buf, n, "%.*s", (int)len, far ? *(const char **)(s + 16) + *(const uint64_t *)(s + 8) : (const char *)s + 1);
-  }
-  default: return snprintf(buf, n, "<value>");
-  }
+/// String s as text, in buf; s is boxed, laid out as builtin/string.bob says.
+static int show(char *buf, int n, const uint8_t *s) {
+  bool far = s[0] == 0xff;
+  int64_t len = far ? *(const uint64_t *)s >> 8 : s[0];
+  return snprintf(buf, n, "%.*s", (int)len, far ? *(const char **)(s + 16) + *(const uint64_t *)(s + 8) : (const char *)s + 1);
 }
 
 _Noreturn void bober_fail(const uint8_t *how, const char *file, int32_t at) {
   char what[2048] = "assert failed: ";
-  show(what + 15, sizeof what - 15, 13, 0, how);
+  show(what + 15, sizeof what - 15, how);
   bober_trap(what, file, at);
 }
 
-/// Where the value last thrown was first thrown, for bober_uncaught, and for builtin/fiber.bob's Thrown to keep.
+/// Where the value last thrown was first thrown, and the code showing it, for a landing pad to keep.
 const char *bober_thrown_file;
 int32_t bober_thrown_at;
+void *bober_thrown_show;
 
-void bober_throw(int64_t tag, int64_t bits, void *ref, const char *file, int32_t at) {
-  if (file) bober_thrown_file = file, bober_thrown_at = at;
+void bober_throw(int64_t tag, int64_t bits, void *ref, const char *file, int32_t at, void *show) {
+  bober_thrown_file = file, bober_thrown_at = at, bober_thrown_show = show;
   free(caught), caught = 0;  // A landing pad loads what it caught at once, so the last throw's is done with.
   Thrown *e = bober_malloc(sizeof(Thrown));
   *e = (Thrown){.tag = tag, .bits = bits, .ref = ref};
@@ -153,9 +135,9 @@ void bober_throw(int64_t tag, int64_t bits, void *ref, const char *file, int32_t
   _Unwind_RaiseException(&e->header);
 }
 
-_Noreturn void bober_uncaught(int64_t tag, int64_t bits, void *ref, const uint8_t *shown) {
+_Noreturn void bober_uncaught(const uint8_t *shown) {
   char what[2048] = "uncaught throw: ";
-  show(what + 16, sizeof what - 16, shown ? 13 : *(const int64_t *)tag, bits, shown ? shown : ref);
+  show(what + 16, sizeof what - 16, shown);
   bober_trap(what, bober_thrown_file, bober_thrown_at);
 }
 
