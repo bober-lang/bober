@@ -4108,7 +4108,7 @@ class Checker {
 			if (ew != null && shaped) {
 				this.fit(t, ew, e)
 			} else if (tuple) {
-				ts.push(if (t.kind == "literal" && t.params.length == 0) t.base! else t)
+				ts.push(based(t))
 			} else {
 				elem = if (elem == null || t == elem || t.fits(elem)) elem ?? t else this.joined(elem, t, null, start(e))
 			}
@@ -4123,7 +4123,7 @@ class Checker {
 			throw this.error(n.t.loc, "an empty array needs a type")
 		}
 		// Not yet a variable's, a literal's elements are not their literal types, so ["a"] fits a string[].
-		const t = if (elem.kind == "literal" && elem.params.length == 0) elem.base! else elem
+		const t = based(elem)
 		for (const e of n.parts) {
 			this.convert(e, t) // untyped constants take the type the other elements give
 		}
@@ -4169,7 +4169,7 @@ class Checker {
 				this.fit(t, ft, v ?? q)
 			}
 			q.type = ft ?? t
-			fs.push(new Field(name, ft ?? t))
+			fs.push(new Field(name, ft ?? (if (want == null) based(t) else t))) // as an array literal's elements
 		}
 		return cls ?? Type.object(fs)
 	}
@@ -4559,7 +4559,10 @@ class Checker {
 		if (p.kind == "unary" && p.t.kind == "...") {
 			return this.convert(p.parts[0], Type.array(t)) // an array spread's elements convert to t
 		}
-		const c = taken(u, t)
+		const m = taken(u, t)
+		// An object literal with a member t lacks keeps its own members, converting to t as one of typed values does.
+		const own = p.kind == "object" && u.kind == "object" && u.fields.some(f => m.member(f.name) == null)
+		const c = if (own) Type.object(u.fields.map(f => new Field(f.name, m.member(f.name) ?? f.type.widen(true)))) else m
 		p.type = c
 		if (checked) {
 			this.representable(p, c)
@@ -5003,6 +5006,9 @@ function isConstant(p: Node): bool {
 	return p.kind == "token" || p.kind == "member" || (p.kind == "paren" || p.kind == "unary" && p.t.kind == "-")
 		&& isConstant(p.parts[0])
 }
+
+/// t, or if a literal of a value, its base: the type a literal's element or member is of where no type is wanted.
+function based(t: Type): Type { return if (t.kind == "literal" && t.params.length == 0) t.base! else t }
 
 /// The function literals p gives as its value or an element or member of it, unrun (3).
 function unrun(p: Node): Node[] {
