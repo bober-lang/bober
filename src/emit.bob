@@ -2569,9 +2569,12 @@ class Emitter {
 	/// The tag of a union holding a value of type t: as lowered the address of t's descriptor, else t's id.
 	private tag(t: i32): Value { return if (this.dyn) this.desc(t) else this.i64Const(this.id(this.norm(t))) }
 
-	/// What tells normed type n apart in a switch on a tag: its hash, which its descriptor holds too and no two types
-	/// share.
-	private id(n: i32): i64 { return this.p.hash(n) as i64 }
+	/// What tells normed type n apart in a switch on a tag: in a closed world its number, past those mono numbered if
+	/// it did not, else its hash, which its descriptor holds too and no two types share.
+	private id(n: i32): i64 {
+		const tags = this.p.tags
+		return if (tags != null) (tags.get(n) ?? (tags.size + n)) as i64 else this.p.hash(n) as i64
+	}
 
 	/// Whether union u holds a value of type t: has it as a member, or is the union of any type.
 	private holds(u: i32, t: i32): bool { return u == this.any || this.p.members(u).includes(this.norm(t)) }
@@ -2802,8 +2805,8 @@ class Emitter {
 	}
 
 	/// Branches to the block of to of the first list of types ts whose member tag is of, else to the last: of a few
-	/// types or one a type param decides, by comparing tag with each one's; else by a switch on the top bits of its id,
-	/// then comparing it with the ids of those.
+	/// types or one a type param decides, by comparing tag with each one's; else by a switch on its id, in a closed
+	/// world a number, else a hash, by its top bits and then comparing it with the ids of those.
 	private branchTag(tag: Value, ts: i32[][], to: Block[]) {
 		const types: i32[] = []
 		const targets: Block[] = []
@@ -2830,6 +2833,10 @@ class Emitter {
 			return
 		}
 		const id = if (this.dyn) this.word(tag, hashAt) else tag
+		if (this.p.tags != null) {
+			this.switch(id, types.map(t => this.id(t)), [...targets, other])
+			return
+		}
 		let shift = 63 as u64 // to the top bits of a hash, of twice as many values as there are types
 		while (((1 as u64) << (64 - shift)) < 2 * (types.length as u64)) {
 			shift--
