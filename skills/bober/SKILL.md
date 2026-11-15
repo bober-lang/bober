@@ -109,7 +109,7 @@ test "inc increments on every call" {
 
 ## Standard library
 
-`bober doc std` lists the modules; `bober doc std/fs` prints one module's exports with their docs. The methods of strings and arrays are in `bober doc builtin/string` and `bober doc builtin/array`. The sources lie beside the installed bober, in `std/` and `builtin/`.
+`bober doc std` lists the modules; `bober doc std/fs` prints one module's exports with their docs. The methods of strings and arrays are in `bober doc builtin/string` and `bober doc builtin/array`.
 
 ## Reporting
 
