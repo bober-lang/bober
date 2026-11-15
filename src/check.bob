@@ -1647,9 +1647,9 @@ class Checker {
 	/// ```
 	///
 	/// Without a result type a function returns what its body returns; a function that calls itself shall state its
-	/// type. A default is evaluated by the callee when the argument is left out, each call. A rest parameter is of an
-	/// array type and takes the remaining arguments as one. A nested function is a closure over the enclosing locals,
-	/// which it shares by reference.
+	/// type. A default is evaluated by the callee when the argument is left out, each call. A rest parameter, the last,
+	/// is of an array type and takes the remaining arguments as one. A nested function is a closure over the enclosing
+	/// locals, which it shares by reference.
 	///
 	/// ```
 	/// function sum(...xs: i32[]): i32 { let s = 0; for (const x of xs) { s += x }; return s }
@@ -1699,11 +1699,20 @@ class Checker {
 		const types: Type[] = []
 		let required = 0
 		let rest = false
+		let defaulted = false
 		for (const i of 0 ... n.parts.length - 1) {
 			const p = n.parts[i]
 			const name = if (p.parts[0].kind == "unary") p.parts[0].parts[0] else p.parts[0]
+			if (rest) {
+				this.report(start(p), "a rest param is the last")
+			}
 			rest = p.parts[0].kind == "unary"
-			if (!rest && after(p, "=") == null) {
+			if (after(p, "=") != null) {
+				defaulted = true
+			} else if (!rest) {
+				if (defaulted) {
+					this.report(start(p), "a param after one with a default needs a default")
+				}
 				required = i + 1
 			}
 			let pt = Empty
