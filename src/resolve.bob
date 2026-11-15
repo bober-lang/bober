@@ -18,6 +18,7 @@
 
 import { bits, fromBits } from "../builtin/math"
 import { HashMap } from "../std/collections/hashmap"
+import { combine, fnv } from "../std/hash"
 import * as decl from "./bc/decl"
 import * as kind from "./bc/kind"
 import * as op from "./bc/op"
@@ -166,7 +167,11 @@ export class Instances {
 		const p = this.p
 		const x = p.decls[d]
 		const o = if (owner >= 0 || x.owner < 0) owner else this.instance(x.owner, this.prefix(env, p.identity(x.owner).length))
-		const k = this.add(p.instance(d, env, o, this.specials.size + 1), values, true)
+		let h = combine(if (owner < 0) 0 else p.decls[owner].hash, values.length)
+		for (const v of values) {
+			h = combine(h, hashOf(p, v))
+		}
+		const k = this.add(p.instance(d, env, o, h), values, true)
 		this.specials.set(key, k)
 		return k
 	}
@@ -510,6 +515,27 @@ function keyOf(v: Known | null): string {
 	}
 	const o = v.op
 	return if (v.fn >= 0) `f${v.fn}` else if (o != null) `${o.op as i32}.${o.a}.${o.b}` else if (v.t >= 0) `t${v.t}` else `[${v.items!.map(x => keyOf(x)).join(",")}]`
+}
+
+/// The hash of a known value, of what its ids stand for, the same in every program.
+function hashOf(p: Program, v: Known | null): u64 {
+	const o = v?.op
+	if (v == null || v.fn >= 0) {
+		return if (v == null) 0 else p.decls[v.fn].hash
+	} else if (o != null) {
+		// Of an Int or Float its type and number, of a Str its text.
+		const typed = o.op == op.Int || o.op == op.Float
+		const a = if (typed) p.hash(o.a) else if (o.op == op.Str) fnv(p.strings[o.a]) else 0
+		return combine(combine(o.op as u64, a), if (typed) p.ints[o.b] as u64 else 0)
+	}
+	let h = if (v.t >= 0) p.hash(v.t) else v.items!.length as u64
+	for (const x of v.items ?? []) {
+		h = combine(h, hashOf(p, x))
+	}
+	for (const n of v.names) {
+		h = combine(h, fnv(n))
+	}
+	return h
 }
 
 /// Whether a param of decl d holds a Type, so that d is instanced per what they get.
