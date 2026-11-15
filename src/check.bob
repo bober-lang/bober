@@ -8,7 +8,7 @@ import { HashMap } from "../std/collections/hashmap"
 import { ScopedMap } from "../std/collections/scopedmap"
 import { Set } from "../std/collections/set"
 import { join } from "../std/fs/path"
-import { quoted } from "../std/string"
+import { codePoint, quoted, unquoted } from "../std/string"
 import * as decl from "./bc/decl"
 import * as kind from "./bc/kind"
 import * as op from "./bc/op"
@@ -3642,12 +3642,12 @@ class Checker {
 	/// in `T`.
 	///
 	/// ```
-	/// let n: i32 = 300; n as u8 == 44     let m = -1; m as u32 == 4294967295
-	/// let f = 1e20; f as i32 == 2147483647
+	/// let n: i32 = 300; (n as u8) == 44     let m = -1; (m as u32) == 4294967295
+	/// let f = 1e20; (f as i32) == 2147483647
 	/// (v as i32) + 1      // traps if v: i32 | string holds a string
 	/// x as u8 as i32
 	/// 300 as u8           // error: not representable
-	/// "a" as u8 == 97     "\u{1F600}" as u32 == 0x1F600
+	/// ("a" as u8) == 97     ("\u{1F600}" as u32) == 0x1F600
 	/// "é" as u8           // error: u8 takes only ASCII, as "é"[0] == 0xC3
 	/// ```
 	private cast(n: Node): Type {
@@ -3655,7 +3655,11 @@ class Checker {
 		const t = this.typeExpr(n.parts[1])
 		const v = this.expr(x, t)
 		const scalars = (v.isNumber() || v.kind == "bool") && (t.isNumber() || t.kind == "bool")
-		if (!scalars && !v.fits(t) && !t.fits(v) && !(isTok(x, "string") && t.kind == "int")) {
+		const char = isTok(x, "string") && t.kind == "int"
+		if (char && !isChar(unquoted(this.text(x.t)), t)) {
+			throw this.error(start(x), `${this.text(x.t)} is not representable as ${show(t)}`)
+		}
+		if (!scalars && !char && !v.fits(t) && !t.fits(v)) {
 			throw this.error(n.t.loc, `cannot cast ${show(v)} to ${show(t)}`)
 		}
 		this.convert(x, if (v.fits(t)) t else v.widen(false))
@@ -4698,6 +4702,15 @@ function holds(t: Type, v: string): bool {
 	const m = magnitude(v)
 	const w = if (t.signed) t.n - 1 else t.n
 	return m != null && (if (v[0] == minus) t.signed && m <= (1 as u64) << w else w == 64 || m < (1 as u64) << w)
+}
+
+/// Whether s is one code point that integer type t holds, below 0x80 for 8 bits (6.6).
+function isChar(s: string, t: Type): bool {
+	if (s == "") {
+		return false
+	}
+	const [c, end] = codePoint(s, 0)
+	return end == s.length && holds(t, `${c}`) && (c < 0x80 || end > 1 && t.n > 8)
 }
 
 /// Whether `new` makes a t without arguments: a class or tuple, or an interface with a constructor, that needs none,
