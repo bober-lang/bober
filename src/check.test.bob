@@ -380,6 +380,10 @@ test "generics" {
 	const id = "function id[T](x: T): T { return x }\n"
 	assert errors(id + "const a: i32 = id(5)\nconst b: string = id(5)\nconst c = id[i64](5)") == "76: expected string, got i32"
 	assert errors("function one[T](x: T): T[] { return [x] }\nconst u: i32[] | string[] = one(\"a\")") == ""
+	const fst = "function fst[K, V](ps: [K, V][]): K { return ps[0][0] }\ntype R = [string, i32] | [i32, string]\n"
+	assert errors(fst + "const k: string = fst([[\"a\", 1]])\nconst r: R = [1, \"a\"]\nconst s: R = [\"a\", \"b\"]")
+		== "164: expected [i32, string] | [string, i32], got [string, string]"
+	assert errors("const x: i32[] | [string, string] = [1, 2]\nconst y: i32[] | [i32, i32] = [1, 2, 3]") == ""
 	assert errors(id + "const h = id\nconst k = id[i32]\nclass C {\n\tg[T](x: T): T { return x }\n}\nconst m = [new C().g, k]")
 		== "47: id needs type arguments; 119: new C().g needs type arguments"
 	assert errors("class M[T] {\n\tstatic c = 0\n\tstatic d = M.c\n}\nconst n = M.c") == "57: M needs type arguments for its static c"

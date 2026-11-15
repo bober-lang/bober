@@ -941,6 +941,9 @@ class Checker {
 	/// In a local class's body, the function depth it is declared at, whose locals but types it cannot capture (5.3);
 	/// else -1.
 	private wall = -1
+	/// The type params of the generic call whose args are being checked, which an array literal's elements wanted as
+	/// one of them are not yet wanted as, but give the literal their shape (4.9).
+	private inferring: Type[] = []
 	/// The narrowings to undo, with what each binding was narrowed to before.
 	private undo: Narrowing[] = []
 	/// The bindings narrowing params that no name declares, as the type of each of `T.fields` (4.11).
@@ -4012,21 +4015,33 @@ class Checker {
 			throw this.error(n.t.loc, `expected ${n0} elements, got ${n.parts.length}`)
 		}
 		// A sibling literal's or a ?? operand's untyped constants shape the elements, but are no type to take.
-		const shaped = w != null && !w.isLoose()
+		const shaped = w != null && !w.isLoose() && !w.mentions(this.inferring)
+		// Wanted as one of several tuples and no array, or as a tuple of type args being inferred, it is the tuple of its
+		// elements' types, which are not their literal types, for what it is wanted as to pick or infer from.
+		const ms = (w ?? want)?.alternatives() ?? []
+		const tuple = !shaped && !n.parts.some(e => e.kind == "unary" && e.t.kind == "...")
+			&& ms.some(m => m.kind == "tuple") && !ms.some(m => m.kind == "array" || m.kind == "fixed")
 		let elem: Type | null = null
+		const ts: Type[] = []
 		for (const i of 0 ... n.parts.length - 1) {
 			const e = n.parts[i]
 			const ew = if (w == null) null else element(w, i)
 			const spread = e.kind == "unary" && e.t.kind == "..."
-			const t = if (spread) element(this.expr(e, null), 0)! else this.expr(e, ew)
+			const t = if (spread) element(this.expr(e, null), 0)!
+				else this.expr(e, if (ew == null || e.kind == "array" || !ew.mentions(this.inferring)) ew else null)
 			if (ew != null && shaped) {
 				this.fit(t, ew, e)
+			} else if (tuple) {
+				ts.push(if (t.kind == "literal" && t.params.length == 0) t.base! else t)
 			} else {
 				elem = if (elem == null || t == elem || t.fits(elem)) elem ?? t else this.joined(elem, t, null, start(e))
 			}
 		}
-		if (shaped || elem == null && w != null) {
+		if (shaped || n.parts.length == 0 && w != null && !w.mentions(this.inferring)) {
 			return w!
+		}
+		if (tuple) {
+			return Type.tuple(ts, false)
 		}
 		if (elem == null) {
 			throw this.error(n.t.loc, "an empty array needs a type")
@@ -4347,7 +4362,13 @@ class Checker {
 					continue
 				}
 				const w = if (phase == 0) null else this.partly(p, ps, found, phase == 1 && (a.kind == "array" || a.kind == "object"))
-				known[i] = this.expr(a, if (w != null && (a.kind == "arrow" || !w.mentions(ps))) w else null)
+				const inferring = this.inferring
+				this.inferring = ps
+				try {
+					known[i] = this.expr(a, if (w != null && (a.kind == "arrow" || a.kind == "array" || !w.mentions(ps))) w else null)
+				} finally {
+					this.inferring = inferring
+				}
 				p.unify(known[i]!, ps, found)
 			}
 		}
