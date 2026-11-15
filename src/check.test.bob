@@ -308,6 +308,14 @@ test "readonly fields are assigned only by their initializer or, on this, by the
 	assert errors("class Q {\n\treadonly x = 0\n}\nclass F {\n\tq: ...Q = {x: 0}\n\n\tconstructor() { this.x = 1 }\n}\nfunction h(f: F) { f.x = 2 }") == "79: x is readonly; 110: x is readonly"
 }
 
+test "a doc comment documents what follows it or the line it ends, a module doc comes first" {
+	assert errors("//! m\n/// f\nfunction f(a: i32, /// a\n\tb: i32 /// b\n) {\n\t/// c\n\tconst c = 1\n}") == ""
+	assert errors("/// f\n// x\nfunction f() {}\n////\nfunction g() {}") == ""
+	assert errors("/// f\n\nfunction f() {\n\t/// g\n\tg()\n}\nfunction g() {}\n//! m")
+		== "0: warning: a doc comment documents what follows it or the line it ends; "
+		+ "23: warning: a doc comment documents what follows it or the line it ends; 52: a module doc comes before the first token"
+}
+
 test "names" {
 	assert errors("function f() { a = 2 }") == "15: a is not declared"
 	assert errors("function f() { for (const x of a.b) {} }") == "31: a is not declared"
