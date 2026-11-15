@@ -72,7 +72,7 @@ typedef struct { bober_string name; void *fn; } bober_method;
 /// held (held, size, align and layout) and the struct one refers to (ssize, slayout and the fields' offsets) are
 /// completed from those.
 typedef struct bober_type {
-  int64_t id;  // the TypeId of a primitive, else 0, as rt.c shows a thrown value by
+  int64_t id;  // the TypeId of a primitive, else 0
   int64_t kind;
   bober_string key, name, doc, kindName;
   const struct bober_type *elem, *base;
@@ -135,12 +135,11 @@ void bober_subtest(const char *name, uint64_t f);
 /// Notes that the running test is at the statement at its source position at, which a trap elsewhere says it was called
 /// at.
 void bober_mark(int32_t at);
-/// Raises a value as a union holds it, its tag, bits and ref, noting where it was first thrown, a rethrow passing a null
-/// file; returns if nothing catches it, for the thrower to call bober_uncaught.
-void bober_throw(int64_t tag, int64_t bits, void *ref, const char *file, int32_t at);
-/// Traps with the value nothing caught, as a union holds it, where it was first thrown: as shown, a string, if the
-/// thrower made one, else by its primitive kind (§8.2), which its tag's descriptor holds.
-_Noreturn void bober_uncaught(int64_t tag, int64_t bits, void *ref, const uint8_t *shown);
+/// Raises a value as a union holds it, its tag, bits and ref, noting where it was first thrown and the code showing it;
+/// returns if nothing catches it, for the thrower to call bober_uncaught.
+void bober_throw(int64_t tag, int64_t bits, void *ref, const char *file, int32_t at, void *show);
+/// Traps with the value nothing caught, as shown, a string, where it was first thrown.
+_Noreturn void bober_uncaught(const uint8_t *shown);
 
 /// The program's argument i, 0 its name, null past the last.
 const char *bober_arg(int32_t i);
