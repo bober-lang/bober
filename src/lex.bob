@@ -8,7 +8,7 @@
 //! expressions.
 
 import { lowerBound } from "../std/algo"
-import { values } from "../std/types"
+import { min } from "../std/math"
 import * from "../std/ascii"
 
 /// ## Identifiers and keywords
@@ -110,7 +110,7 @@ export class Lexer {
 
 	/// Whether t is of kind `want`, retagging t first if it spells that contextual keyword.
 	is(t: Tok, want: Kind): bool {
-		if (t.kind == "ident" && this.text(t) == want && contextual(want)) {
+		if (t.kind == "ident" && want instanceof Contextual && this.text(t) == want) {
 			t.kind = want
 		}
 		return t.kind == want
@@ -203,8 +203,7 @@ export class Lexer {
 			this.pos++
 		}
 		const s = this.src.slice(start, this.pos)
-		const k = keyword(s)
-		return if (k == null || contextual(k) || this.last == "." || this.last == "?.") "ident" else k
+		return if (s instanceof Reserved && this.last != "." && this.last != "?.") s else "ident"
 	}
 
 	private number(): Kind {
@@ -357,13 +356,18 @@ export class Lexer {
 		}
 	}
 
+	/// The longest operator ahead.
 	private punct(): Kind {
-		const op = operator([this.at(0), this.at(1), this.at(2)])
-		if (op == null) {
-			throw this.error("unexpected character")
+		let n = min(3, this.src.length - this.pos)
+		while (n > 0) {
+			const op = this.src.slice(this.pos, this.pos + n)
+			if (op instanceof Operator) {
+				this.pos += n
+				return op
+			}
+			n--
 		}
-		this.pos += op.length
-		return op
+		throw this.error("unexpected character")
 	}
 
 	private at(i: i32): u8 {
@@ -373,44 +377,6 @@ export class Lexer {
 
 	private newline() { this.lines.push(this.pos) }
 	private error(msg: string): SyntaxError { return new SyntaxError(Loc.at(this.pos, 1), msg) }
-}
-
-// Read once: reflecting them per token costs more than the lexing.
-const keywords = values[Keyword]()
-const contextuals = values[Contextual]()
-const operators = values[Operator]()
-
-export function keyword(s: string): Keyword | null {
-	for (const k of keywords) {
-		if (s == k) {
-			return k
-		}
-	}
-	return null
-}
-
-function contextual(s: string): bool {
-	for (const k of contextuals) {
-		if (s == k) {
-			return true
-		}
-	}
-	return false
-}
-
-/// The longest operator that ahead starts with.
-function operator(ahead: u8[3]): Operator | null {
-	let op: Operator | null = null
-	for (const s of operators) {
-		let i = 0
-		while (i < s.length && s[i] == ahead[i]) {
-			i++
-		}
-		if (i == s.length && s.length > (op?.length ?? 0)) {
-			op = s
-		}
-	}
-	return op
 }
 
 /// The binding level of a binary operator, or 0.
