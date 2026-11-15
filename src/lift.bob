@@ -43,20 +43,15 @@ export class Lift {
 	/// Whether a file of the cache was malformed, perhaps once prog held part of it, after which the cache is dropped.
 	malformed = false
 
-	/// Adds those of files to the cache that are of their module's source as it is, made by this compiler, but
-	/// builtin/'s, which every program checks first (src/check.bob): as read gives it, or for a header's module as bind
-	/// made it; each while its Bound, if any, is current.
+	/// Adds those of files to the cache that are of their module's source as it is, made by this compiler,
+	/// but builtin/'s, which every program checks first (src/check.bob).
 	cached(files: string[], includes: string[], read: (path: string) => string | null) throws IoError {
 		const compiler = compilerId()
 		const joined = searched(includes)
 		for (const f of files) {
 			try {
 				const h = head(f)
-				const b = bound.get(h.path)
-				if (builtin(h.path) || b != null && !b.current(joined, read)) {
-					continue
-				}
-				const src = if (b != null && b.src != "") b!.src else read(h.path)
+				const src = if (builtin(h.path)) null else source(h.path, joined, read)
 				if (src != null && h.source == sourceHash(h.path, src!) && h.compiler == compiler) {
 					this.cache.set(h.path, f)
 				}
@@ -218,6 +213,16 @@ export const bound = new HashMap[string, Bound]()
 
 /// includes, then the system's, joined by lines.
 export function searched(includes: string[]): string { return [...includes, system].join("\n") }
+
+/// The source of the module at path as it is: as read gives it, or for a header's module as bind made it; null if its
+/// Bound is not current, as includes, the includes searched, or a file it read changed.
+export function source(path: string, includes: string, read: (path: string) => string | null): string | null {
+	const b = bound.get(path)
+	if (b == null) {
+		return read(path)
+	}
+	return if (!b.current(includes, read)) null else if (b.src != "") b.src else read(path)
+}
 
 function hash(s: string | null): u64 { return if (s == null) 0 else fnv(s!) }
 
