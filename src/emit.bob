@@ -330,6 +330,8 @@ class Emitter {
 		libc("memcpy", ptr)
 		libc("memcmp", i32)
 		this.rts.set("heap", b.extern("bober_heap", i64))
+		this.rts.set("thrownFile", b.extern("bober_thrown_file", ptr))
+		this.rts.set("thrownAt", b.extern("bober_thrown_at", i32))
 		if (this.dyn) {
 			declare("type_of", i64, [i64, i64, ptr, ptr])
 			declare("field_of", i64, [i64, ptr, i64, ptr])
@@ -778,7 +780,7 @@ class Emitter {
 			case op.Try: this.try(i)
 			case op.Catch: this.catch(n, c.b(i))
 			case op.Finally: this.finally()
-			case op.Throw: this.raise(this.cast(this.pop(), this.any), this.cstr(this.path), this.pos)
+			case op.Throw: this.raise(this.cast(this.pop(), this.any), this.site())
 			case op.Br: this.branch(n)
 			case op.BrIf:
 				const yes = this.cond()
@@ -1241,8 +1243,8 @@ class Emitter {
 
 	/// Throws the union value u, where it is thrown being its site; if nothing catches it, traps showing it, in a debug
 	/// build as `${}` shows a value, else if a primitive.
-	private raise(u: Value, path: Value, pos: i32) {
-		this.rt("throw", [this.tagOf(u), this.bitsOf(u), this.refOf(u), path, this.b.constInt(this.i32, pos)])
+	private raise(u: Value, site: Value[]) {
+		this.rt("throw", [this.tagOf(u), this.bitsOf(u), this.refOf(u), ...site])
 		let shown = this.b.constZero(this.ref)
 		if (this.dyn) {
 			const show = this.lang("show")
@@ -1254,7 +1256,7 @@ class Emitter {
 		this.dead = true
 	}
 
-	private rethrow(u: Value) { this.raise(u, this.b.constZero(this.ptr), 0) }
+	private rethrow(u: Value) { this.raise(u, [this.b.constZero(this.ptr), this.b.constInt(this.i32, 0)]) }
 	// Calls.
 	/// The callee of Function decl d, declared if of another module.
 	private callee(d: i32): Callee { return this.callees.get(d) ?? put(this.callees, d, this.calleeOf(d)) }
@@ -1698,7 +1700,8 @@ class Emitter {
 			this.push(this.returned(this.rt(name, [to, from, n], false), ret), ret)
 			return
 		}
-		// builtin/fiber.bob's: what a call throws, kept in a Thrown, whose fields are laid out as the union thrown.
+		// builtin/fiber.bob's: what a call throws, kept in a Thrown, whose fields are laid out as the union thrown, then
+		// where rt.c has it thrown.
 		if (name == "catching") {
 			const into = this.pop()
 			const f = this.pop()
@@ -1714,6 +1717,10 @@ class Emitter {
 			this.start(pad)
 			this.ir().store(this.landing(), into.v, false)
 			this.written(into.v, this.unionTy)
+			const keep = (g: string, i: i32, t: IrType) =>
+				this.ir().store(this.ir().load(t, this.rts.get(g)!, false), this.gep(into.v, into.t, i), false)
+			keep("thrownFile", 3, this.ptr)
+			keep("thrownAt", 4, this.i32)
 			this.ir().store(this.bool(true), threw, false)
 			this.jump(done)
 			this.start(done)
@@ -1721,7 +1728,9 @@ class Emitter {
 			return
 		}
 		if (name == "rethrow") {
-			this.rethrow(this.ir().load(this.unionTy, this.pop().v, false))
+			const from = this.pop()
+			const kept = (i: i32, t: IrType) => this.ir().load(t, this.gep(from.v, from.t, i), false)
+			this.raise(this.ir().load(this.unionTy, from.v, false), [kept(3, this.ptr), kept(4, this.i32)])
 			this.push(this.bool(false), ret)
 			return
 		}
