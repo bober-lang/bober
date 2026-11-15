@@ -222,7 +222,7 @@ class Mono {
 		}
 		for (const [t, name] of this.reached.values()) {
 			for (const m of this.ins.flat(t)) {
-				this.ins.memberOf(m, name)
+				this.ins.memberOf(this.owner(m, name), name)
 			}
 		}
 		return end
@@ -406,9 +406,11 @@ class Mono {
 				c.add(op.Is, ct)
 				c.add(op.If, kind.None)
 			}
-			const d = ins.memberOf(mt, name)
+			// Of the class it is promoted from, which emit reaches in mt's place.
+			const o = this.owner(mt, name)
+			const d = ins.memberOf(o, name)
 			const method = how == "()" && d >= 0 && p.decls[d].kind == decl.Function
-			const [takes, gives] = shape(p, how, if (method) p.decls[d].type else ins.fieldType(mt, name))
+			const [takes, gives] = shape(p, how, if (method) p.decls[d].type else ins.fieldType(o, name))
 			const recv = () => {
 				c.add(op.Local, 0)
 				cast(t, ct)
@@ -452,6 +454,21 @@ class Mono {
 		this.dispatches.push(k)
 		return k
 	}
+
+	/// The class embedded in class t, its type args bound, that t's member name is promoted from (5.3), else t.
+	private owner(t: i32, name: i32): i32 {
+		const p = this.p
+		if (this.ins.nominal(t) != decl.Class || this.ins.member(t, name) >= 0) {
+			return t
+		}
+		for (const e of p.decls[p.a(t)].members.filter(e => embedded(p, e))) {
+			const o = this.owner(p.subst(p.decls[e].type, p.b(t)), name)
+			if (this.ins.member(o, name) >= 0) {
+				return o
+			}
+		}
+		return t
+	}
 }
 
 /// Adds v to the list of k in m.
@@ -465,7 +482,7 @@ function add(m: HashMap[i32, i32[]], k: i32, v: i32) {
 }
 
 /// Whether class, interface or object type s has a field or method of each name interface or object type x has, an
-/// interface's embedded ones counted as its own.
+/// embedded class's or interface's counted as its own.
 function covers(p: Program, s: i32, x: i32): bool {
 	const has = (name: i32) => if (p.kind(s) == kind.Named) hasMember(p, p.a(s), name) else p.field(s, name) >= 0
 	if (p.kind(x) == kind.Named) {
@@ -479,10 +496,10 @@ function covers(p: Program, s: i32, x: i32): bool {
 	return true
 }
 
-/// Whether class or interface decl d has member name, a Str, or an interface d embeds has.
+/// Whether class or interface decl d has member name, a Str, or a class or interface d embeds has.
 function hasMember(p: Program, d: i32, name: i32): bool {
-	return p.member(d, name) >= 0 || p.decls[d].kind == decl.Interface
-		&& p.decls[d].members.some(m => embedded(p, m) && hasMember(p, p.a(p.decls[m].type), name))
+	return p.member(d, name) >= 0
+		|| p.decls[d].members.some(m => embedded(p, m) && hasMember(p, p.a(p.decls[m].type), name))
 }
 
 /// What a dispatch function's access how of a member of type ft takes after the receiver, and gives: nothing and the

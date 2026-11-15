@@ -117,6 +117,8 @@ void *bober_element(const bober_union *u, int64_t i, const bober_type **type, co
 int64_t bober_field_of(const bober_type *t, const char *name, int64_t n, const bober_type **type);
 /// The thunk of t's method name, or null.
 void *bober_method_of(const bober_type *t, const char *name, int64_t n);
+/// The thunk of the method name of the value self, which then is the place that has it as its own, or null.
+void *bober_method_on(bober_union *self, const char *name, int64_t n);
 /// Number ops on the bits of values as a union holds them, both of t: op is bc's opcode, its index among Eq through Shr.
 uint64_t bober_number(int64_t op, const bober_type *t, uint64_t a, uint64_t b, const char *file, int32_t at);
 /// The bits of a number of type from converted to type to, as Cast does.

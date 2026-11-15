@@ -322,6 +322,7 @@ class Emitter {
 			declare("type_of", i64, [i64, i64, ptr, ptr])
 			declare("field_of", i64, [i64, ptr, i64, ptr])
 			declare("method_of", ptr, [i64, ptr, i64])
+			declare("method_on", ptr, [ptr, ptr, i64])
 			declare("number", i64, [i64, i64, i64, i64, ptr, i32])
 			declare("convert", i64, [i64, i64, i64])
 			declare("load", i64, [i64, ptr, ptr])
@@ -1524,14 +1525,17 @@ class Emitter {
 		const self = if (this.p.kind(recv.t)
 			== kind.Type) this.union(recv.v, this.i64Const(0), this.b.constZero(this.ref))
 			else this.cast(recv, this.any)
-		const fn = this.rt("method_of", [this.tagOf(self), this.cstr(name), this.i64Const(name.length)], false)
+		// Self as the place that has the method, an embedded field where it is promoted.
+		const at = this.spill(self, this.unionTy)
+		const fn = this.rt("method_on", [at, this.cstr(name), this.i64Const(name.length)], false)
 		const r = this.slot(this.unionTy)
 		const yes = this.label()
 		const no = this.label()
 		const done = this.label()
 		this.condBr(this.ir().icmp("ne", this.ir().cast("ptrtoint", fn, this.i64), this.i64Const(0)), yes, no)
 		this.start(yes)
-		this.ir().store(this.call(this.b.fn(this.unionTy, [self, ...args].map(_ => this.unionTy)), fn, [self, ...args]),
+		const mine = this.ir().load(this.unionTy, at, false)
+		this.ir().store(this.call(this.b.fn(this.unionTy, [self, ...args].map(_ => this.unionTy)), fn, [mine, ...args]),
 			r, false)
 		this.jump(done)
 		this.start(no)
