@@ -614,15 +614,18 @@ function frames(image: Image, at: u64): u8[] throws CompileError {
 		const b = image.bytes.slice(from, to)
 		let p = from
 		while (p + 4 <= to) {
-			const size = u(b, (p - from) as i32, 4)
+			const length = u(b, (p - from) as i32, 4)
 			const cie = u(b, (p + 4 - from) as i32, 4)
-			// An FDE of a dropped function was not fixed up, and its pc is its own address.
-			const pc = if (size != 0 && cie != 0) pointer(b, p + 8, encoding(b, (p + 4 - cie - from) as i32), from)
-				else from
-			if (pc < from || pc >= to) {
-				fdes.push([pc, p])
+			// An FDE of a dropped function was not fixed up, and its pc is its own address. One of an empty function,
+			// of range 0, is at the next one's address, where it could hide that one's from the unwinder's search.
+			if (length != 0 && cie != 0) {
+				const enc = encoding(b, (p + 4 - cie - from) as i32)
+				const pc = pointer(b, p + 8, enc, from)
+				if ((pc < from || pc >= to) && u(b, ((p + 8 - from) as i32) + size(enc), size(enc)) != 0) {
+					fdes.push([pc, p])
+				}
 			}
-			p += 4 + size
+			p += 4 + length
 		}
 	}
 	sortBy(fdes, (x, y) => x[0] < y[0])
