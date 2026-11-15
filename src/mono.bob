@@ -122,8 +122,12 @@ class Mono {
 	private converted = new HashMap[i64, bool]()
 	/// Per type, as it is at run time.
 	private lows = new HashMap[i32, i32]()
+	/// Per object type, as conc holds it; 0 while its fields are lowered.
+	private structs = new HashMap[i32, i32]()
+	private main = 0
 	/// Per module, type, member and access, the dispatch function made there.
 	private made = new HashMap[[i32, i32, i32, string], i32]()
+	/// The dispatch functions and classes made.
 	private dispatches: i32[] = []
 	/// The types thrown and caught, and the types and names of the members accessed through a union, as collected.
 	private thrown: i32[] = []
@@ -137,6 +141,7 @@ class Mono {
 
 	run(main: i32, whole: bool) throws CompileError {
 		const p = this.p
+		this.main = main
 		for (const d of p.modules[main].decls) {
 			const x = p.decls[d]
 			const plain = x.params.length == 0 && (x.kind == decl.Class || x.kind == decl.Function && !takesType(p, d))
@@ -331,8 +336,39 @@ class Mono {
 		return r
 	}
 
-	/// A type a value is held as at run time: an object type as the struct its literals make.
-	private conc(t: i32): i32 throws CompileError { return if (this.p.kind(t) == kind.Object) this.p.map(t, x => this.low(x)) else this.low(t) }
+	/// A type a value is held as at run time: an object type as the struct its literals make, but one its fields hold
+	/// again as a class of them, made in module main, as a structural type cannot be cyclic in the type table.
+	private conc(t: i32): i32 throws CompileError {
+		const p = this.p
+		if (p.kind(t) != kind.Object) {
+			return this.low(t)
+		}
+		const found = this.structs.get(t)
+		if (found == 0) { // a field holds it again: a class, its fields' types set once they are lowered
+			const c = p.decl(this.main, -1, showType(p, t), decl.Class)
+			const names = p.names[p.b(t)]
+			for (const i of 0 ... p.items(t).length - 1) {
+				p.decls[p.decl(this.main, c, p.strings[names[2 * i]], decl.Var)].mods = names[2 * i + 1]
+			}
+			this.dispatches.push(c)
+			this.structs.set(t, p.type(kind.Named, c, 0))
+		}
+		if (found != null) {
+			return this.structs.get(t)!
+		}
+		this.structs.set(t, 0)
+		const r = p.map(t, x => this.low(x))
+		const c = this.structs.get(t)!
+		if (c == 0) {
+			this.structs.set(t, r)
+			return r
+		}
+		const fs = p.decls[p.a(c)].members
+		for (const i of 0 ... fs.length - 1) {
+			p.decls[fs[i]].type = p.items(r)[i]
+		}
+		return c
+	}
 
 	/// Code c of module m lowered, info per op as src/resolve.bob's Inst has it.
 	private lower(m: i32, c: Code, info: i32[]): Code throws CompileError {
