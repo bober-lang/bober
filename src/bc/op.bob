@@ -10,10 +10,10 @@
 //! `Local`, `Global`, `Member`, `Field` or `Subscript` that yields a FixedArray names its place, which the `SetLocal`,
 //! `SetGlobal`, `SetMember`, `SetField` or `SetSubscript` consuming it writes in place.
 //!
-//! Control flow is WebAssembly's. `Block`, `Loop`, `If`, `Each`, `Try` and `Default` open a block to its `End`;
-//! `Br n` leaves the n-th enclosing block, carrying its result if it has one, or restarts a `Loop`, or goes on to an
-//! `Each`'s next element. Nothing follows `Unreachable`, `Br`, `Return`, `Throw` or `Fail` before the next `Else`,
-//! `Catch`, `Finally` or `End`.
+//! Control flow is WebAssembly's. `Block`, `Loop`, `If`, `Match`, `Each`, `Try` and `Default` open a block to its
+//! `End`; `Br n` leaves the n-th enclosing block, carrying its result if it has one, or restarts a `Loop`, or goes on
+//! to an `Each`'s next element. Nothing follows `Unreachable`, `Br`, `Return`, `Throw` or `Fail` before the next
+//! `Else`, `Catch`, `Finally` or `End`.
 //!
 //! A `Try` is its body, then a `Catch`, a `Finally` or both, in that order. A throw unwinds to the innermost `Try` of
 //! the fiber whose `Catch` handles the value, running the `Finally` of each `Try` it leaves on the way. A `Finally`
@@ -23,7 +23,7 @@
 //!
 //! Operators take their type from their operands, of one type after any widening `Cast` for numbers. Integers wrap and
 //! take signedness from their type, floats are IEEE 754, and `~x` is `Xor` with all ones. A union holds its value with
-//! the type it was cast from, which `Is`, `BrNull` and `Eq` test.
+//! the type it was cast from, which `Is`, `Match`, `BrNull` and `Eq` test.
 //!
 //! Code means what a debug build runs, so there are no static ops: what is static (§4.11) is the checker's rule, not
 //! a form here. A static `if` or `switch` is an `If`, an unrolled `for` an `Each`, and a subscript of an object, class
@@ -42,7 +42,7 @@ export const Block: u8 = 2
 export const Loop: u8 = 3
 /// bool → T at End: runs to Else if true, else from it.
 export const If: u8 = 4
-/// Splits an If.
+/// Splits an If, or a Match's arms.
 export const Else: u8 = 5
 /// array, fixed array or tuple →: opens a block run per element, in order, the local holding it, a new variable
 /// each time, as by Fresh.
@@ -172,12 +172,15 @@ export const Fail: u8 = 68
 /// the literal first and stores each value as it is made, so the values after hold only it across their calls, not
 /// those before.
 export const Init: u8 = 69
+/// union →: opens a block of an arm per type, split by Else, and runs the first arm whose type the union's tag fits;
+/// that none fits is unreachable.
+export const Match: u8 = 70
 
 export type Opcode = End | Unreachable | Block | Loop | If | Else | Each | Try | Catch | Finally | Throw | Br | BrIf
 	| BrNull | Default | Return | Call | CallMethod | CallRef | Drop | Local | SetLocal | Global | SetGlobal | False
 	| True | Int | Float | Str | Null | Missing | Type | Member | SetMember | Field | SetField | Subscript
 	| SetSubscript | Unpack | Array | Object | New | Closure | Cast | Is | Assert | Not | Eq | Ne | Lt | Gt | Le | Ge
-	| Add | Sub | Mul | Div | Rem | Pow | And | Or | Xor | Shl | Shr | Neg | Fresh | Same | Concat | Fail | Init
+	| Add | Sub | Mul | Div | Rem | Pow | And | Or | Xor | Shl | Shr | Neg | Fresh | Same | Concat | Fail | Init | Match
 
 /// What an immediate is: an id of a table of the Program or of the Code, or a number.
 export const TypeId: u8 = 0
@@ -210,13 +213,14 @@ const table: [string, Imm[]][] = [["End", []], ["Unreachable", []], ["Block", [T
 	["Closure", [DeclId, TypeList, LocalList]], ["Cast", [TypeId]], ["Is", [TypeId]], ["Assert", []], ["Not", []],
 	["Eq", []], ["Ne", []], ["Lt", []], ["Gt", []], ["Le", []], ["Ge", []], ["Add", []], ["Sub", []], ["Mul", []],
 	["Div", []], ["Rem", []], ["Pow", []], ["And", []], ["Or", []], ["Xor", []], ["Shl", []], ["Shr", []], ["Neg", []],
-	["Fresh", [LocalId]], ["Same", []], ["Concat", [Num]], ["Fail", []], ["Init", [TypeId, Num, Num]]]
+	["Fresh", [LocalId]], ["Same", []], ["Concat", [Num]], ["Fail", []], ["Init", [TypeId, Num, Num]],
+	["Match", [TypeList]]]
 
 /// Each opcode's name and immediates.
 export const names = table.map(r => r[0])
 export const shape = table.map(r => r[1])
 /// The ops that open a block, that split one, and after which the rest of the block is unreachable.
-export const opens = flags([Block, Loop, If, Each, Try, Default])
+export const opens = flags([Block, Loop, If, Match, Each, Try, Default])
 export const splits = flags([Else, Catch, Finally])
 export const jumps = flags([Unreachable, Br, Return, Throw, Fail])
 

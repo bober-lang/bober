@@ -262,14 +262,10 @@ test "an interface is the union of the classes converted to it" {
 	mono(p, m)
 	const u = p.decls[p.modules[m].decls[2]].code!.locals[0].type
 	const [first, second] = if (showType(p, u) == "Square | Circle") ["Square", "Circle"] else ["Circle", "Square"]
-	const branch = (c: string) => `	Local 0
-	Is ${c}
-	If none
-		Local 0
+	const branch = (c: string) => `		Local 0
 		Cast ${c}
 		Call ${c}.area
 		Return
-	End
 `
 	assert out(p, m)
 		== `class Square
@@ -305,7 +301,11 @@ function main: () => i32
 End
 function .area()[Shape]: (${first} | ${second}) => f64
 	locals this: ${first} | ${second}
-${branch(first)}${branch(second)}	Unreachable
+	Local 0
+	Match [${first}, ${second}]
+${branch(first)}	Else
+${branch(second)}	End
+	Unreachable
 End
 `
 }
@@ -396,14 +396,11 @@ test "an object type is the union of its literals and what is converted to it" {
 		[op.Object, b, 2], [op.Cast, a], [op.SetLocal, 0], [op.Local, 0], [op.Field, x], [op.Return], [op.End]]))
 	mono(p, m)
 	const u = showType(p, p.union([a, b]))
-	const branch = (t: i32) => `	Local 0
-	Is ${showType(p, t)}
-	If none
-		Local 0
+	const ms = p.items(p.union([a, b]))
+	const branch = (t: i32) => `		Local 0
 		Cast ${showType(p, t)}
 		Field "x"
 		Return
-	End
 `
 	assert out(p, m)
 		== `function main: () => i32
@@ -423,7 +420,10 @@ test "an object type is the union of its literals and what is converted to it" {
 End
 function .x[{ x: i32 }]: (${u}) => i32
 	locals this: ${u}
-${p.items(p.union([a, b])).map(branch).join("")}	Unreachable
+	Local 0
+	Match [${ms.map(t => showType(p, t)).join(", ")}]
+${ms.map(branch).join("	Else\n")}	End
+	Unreachable
 End
 `
 }
