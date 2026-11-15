@@ -71,6 +71,8 @@ TpdeValueRef TpdeGetNamedGlobal(TpdeModuleRef m, const char *name);
 TpdeValueRef TpdeAddGlobal(TpdeModuleRef m, const char *name, TpdeValueRef init, int local, unsigned align);
 /// A global of type t defined elsewhere.
 TpdeValueRef TpdeAddExternal(TpdeModuleRef m, const char *name, TpdeTypeRef t);
+/// Defines the global g, which TpdeAddExternal declared, as TpdeAddGlobal would.
+void TpdeDefineGlobal(TpdeModuleRef m, TpdeValueRef g, TpdeValueRef init, int local, unsigned align);
 /// Attributes as LLVM names them; byval, sret, zeroext and signext change the code, others are ignored.
 void TpdeAddAttributeAtIndex(TpdeModuleRef m, TpdeValueRef fn, int index, const char *name, TpdeTypeRef t);
 int TpdeIsDeclaration(TpdeModuleRef m, TpdeValueRef g);

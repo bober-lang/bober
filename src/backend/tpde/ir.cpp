@@ -319,6 +319,13 @@ TpdeValueRef TpdeAddGlobal(TpdeModuleRef m, const char *name, TpdeValueRef init,
 TpdeValueRef TpdeAddExternal(TpdeModuleRef m, const char *name, TpdeTypeRef t) {
 	return symbol(*m, name, {.op = Op::Global}, {.type = u32(t)});
 }
+void TpdeDefineGlobal(TpdeModuleRef m, TpdeValueRef g, TpdeValueRef init, int local, unsigned align) {
+	Sym &s = m->sym(g);
+	s.local = local != 0;
+	s.init = u32(init);
+	s.align = align;
+	s.type = m->vals[init].type;
+}
 void TpdeAddAttributeAtIndex(TpdeModuleRef m, TpdeValueRef fn, int index, const char *name, TpdeTypeRef t) {
 	static constexpr const char *names[] = {"byval", "sret", "zeroext", "signext"};
 	for (u8 k = 0; k < std::size(names); k++) {
