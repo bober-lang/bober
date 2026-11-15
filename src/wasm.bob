@@ -83,7 +83,8 @@ export function wasm(p: Program, main: i32, tests: bool, path: string) throws Co
 	}
 }
 
-/// A value: the local holding it and its type, normalized; of a left-out arg, Missing's, local -1.
+/// A value: the local holding it and its type, normalized; of a left-out arg, Missing's, local -1; of an optional, whether
+/// it was given in the local after.
 type V = { l: i32, t: i32 }
 /// A field of a class instance, object or tuple; an embedded one a ref to its own struct.
 type Slot = { name: i32, t: i32, embed: bool, decl: i32 }
@@ -575,7 +576,16 @@ class Wasm {
 				const f = this.pop()
 				this.pushResult(this.callClosure(f, this.args(xs, p.items(f.t)), c.b(i) - 1), p.b(f.t))
 			case op.Drop: this.stack.pop()
-			case op.Local: this.push(this.load(n), this.bare(c.locals[n].type))
+			case op.Local:
+				const t = this.norm(c.locals[n].type)
+				if (p.kind(t) != kind.Optional) {
+					this.push(this.load(n), t)
+				} else {
+					// An optional param, a dispatch's, passed on as given.
+					const l = this.spill(this.load(n), this.val(t))
+					this.spill(BinaryenLocalGet(this.m, this.given[n] as u32, this.i32), this.i32)
+					this.stack.push({ l: l, t: t })
+				}
 			case op.SetLocal: this.setLocal(n, this.pop())
 			case op.Fresh: this.renew(n)
 			case op.Global:
