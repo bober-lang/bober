@@ -38,7 +38,8 @@ export function mono(p: Program, main: i32, units = false) throws CompileError {
 class Mono {
 	p: Program
 	ins: Instances
-	/// The interfaces and object types something is converted into, and per one, what: itself for a literal of it.
+	/// The interfaces and object types something is converted into, and per one, what: itself for a literal of it, and
+	/// of an interface or object type what that holds having its members.
 	private abstracts: i32[] = []
 	private sources = new HashMap[i32, i32[]]()
 	/// The pairs of types convert has seen.
@@ -162,7 +163,8 @@ class Mono {
 				this.dispatched(t, name)
 			}
 			for (const x of this.abstracts) {
-				const ss = this.sources.get(x)!.map(s => if (s != x && this.ins.abstract(s)) p.union(this.ins.flat(s)) else s)
+				const having = (s: i32) => p.union(this.ins.flat(s).filter(c => covers(p, c, x)))
+				const ss = this.sources.get(x)!.map(s => if (s != x && this.ins.abstract(s)) having(s) else s)
 				const u = p.union(ss)
 				if (u != (this.ins.held.get(x) ?? p.union([]))) {
 					this.ins.held.set(x, u)
@@ -198,8 +200,8 @@ class Mono {
 		}
 	}
 
-	/// Notes the members of src that a Cast into to puts into one of its interfaces or object types: each class,
-	/// interface or object type having each of its members, unless to holds it as itself; once per src and to.
+	/// Notes the members of src that a Cast into to puts into one of its interfaces or object types: each class having
+	/// each of its members, and each interface or object type, unless to holds it as itself; once per src and to.
 	private convert(src: i32, to: i32) {
 		const p = this.p
 		const ins = this.ins
@@ -210,7 +212,7 @@ class Mono {
 		const targets = p.members(to)
 		for (const x of targets.filter(x => ins.abstract(x))) {
 			for (const s of p.members(src)) {
-				if ((ins.abstract(s) || ins.nominal(s) == decl.Class) && !targets.includes(s) && covers(p, s, x)) {
+				if ((ins.abstract(s) || ins.nominal(s) == decl.Class && covers(p, s, x)) && !targets.includes(s)) {
 					this.source(x, s)
 				}
 			}
