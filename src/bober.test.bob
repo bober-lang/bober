@@ -198,6 +198,15 @@ function main() { print(\`\${new Box[${t}](${v}).v} \${named(new ${c}())}\`) }\n
 	assert a == "1 A\n" && built([], "-O1", "b.bob") == "s B\n" && built([], "-O1", "a.bob") == a
 }
 
+test "a class changed, a generic of another module instanced of it is compiled anew, monomorphized" {
+	const lib = `export interface HasV { v: i32 }\n\nexport function v[T extends HasV](x: T): i32 { return x.v }\n`
+	const main = (q: string) => `import { v } from "./lib"\n\nclass Q {${q}\n\tv = 1\n}\n
+function main() { print(\`\${v(new Q())}\`) }\n`
+	anew()
+	assert built([["lib.bob", lib], ["main.bob", main("")]], "-O1") == "1\n"
+	assert built([["main.bob", main("\n\ty = 5")]], "-O1") == "1\n"
+}
+
 test "a C library's toolchain file includes its own, of a package found by a rooted path or not" {
 	const c = new CLib()
 	c.toolchain = "/p/tc.cmake"

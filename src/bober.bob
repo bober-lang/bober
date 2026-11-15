@@ -25,7 +25,7 @@ import { fnv } from "../std/hash"
 import { File, stderr, stdin, stdout } from "../std/io"
 import { arch, os } from "../std/os"
 import { ParseError, codePoint, split, trim, utf8 } from "../std/string"
-import { abi, write } from "./bc/file"
+import { abi, signatures, write } from "./bc/file"
 import { Program } from "./bc/program"
 import { show } from "./bc/show"
 import { glue, includesOf, sysroot } from "./c/bind"
@@ -646,7 +646,9 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		const path = p.modules[m].path
 		const bc = if (p.modules[m].bc != "") p.modules[m].bc else write(p, m, compiler)
 		const b = bound.get(path)?.bytes(path) ?? ""
-		const version = `@${p.modules[m].source}.${fnv(bc + b + (if (o.dyn) "" else write(p, m, compiler)))}`
+		// Monomorphized, its code names what the ABIs its bytecode has do not cover: its signatures too.
+		const version = `@${p.modules[m].source}.${fnv(bc + b
+			+ (if (o.dyn) "" else `${write(p, m, compiler)}${signatures(p, m)}`))}`
 		const [fast, opt] = [`${path}^O1${version}`, `${path}^O2${version}`]
 		// LLVM's if the image holds it, or at -O2 if it holds TPDE's, which this build finds unchanged, or none of the
 		// module's; else TPDE's, as after an edit.

@@ -142,6 +142,10 @@ export function abi(p: Program, m: i32): u64 {
 	return p.modules[m].abi
 }
 
+/// The hash of what module m's code is compiled against (Abi), which its bytecode with the ABIs of its imports does
+/// not hold once monomorphized: a generic's instance names the class it is of, of another module, exported or not.
+export function signatures(p: Program, m: i32): u64 { return new Abi(p, m, true).h }
+
 /// The ids a file gives the entries of a table of the Program it uses, and their section, each entry after those it
 /// is made of.
 class Table {
@@ -613,20 +617,23 @@ class Abis {
 	}
 }
 
-/// Module m's signatures being hashed, and the other modules they name.
+/// Module m's signatures being hashed, and the other modules they name; or if all, its decls with their code, and the
+/// signatures of all they name, of other modules too, and of what these name.
 class Abi {
 	p: Program
 	m: i32
 	h = seed
 	uses: i32[] = []
+	private all: bool
 	private done = new HashMap[i32, bool]()
 	private seen = new HashMap[i32, bool]()
 
-	constructor(p: Program, m: i32) {
+	constructor(p: Program, m: i32, all = false) {
 		this.p = p
 		this.m = m
+		this.all = all
 		for (const d of p.modules[m].decls) {
-			if ((p.decls[d].mods & decl.Export) != 0) {
+			if (all || (p.decls[d].mods & decl.Export) != 0) {
 				this.decl(d)
 			}
 		}
@@ -651,10 +658,11 @@ class Abi {
 		this.list(x.supers)
 		this.list(x.tags)
 		this.list(x.throws)
-		if (x.kind == decl.Var && (x.mods & decl.Readonly) != 0 && x.code != null) {
+		const own = this.all && x.module == this.m
+		if (x.code != null && (own || x.kind == decl.Var && (x.mods & decl.Readonly) != 0)) {
 			this.code(x.code!)
 		}
-		if (x.kind == decl.Class || x.kind == decl.Interface) {
+		if (own || x.kind == decl.Class || x.kind == decl.Interface) {
 			for (const y of x.members) {
 				this.decl(y)
 			}
@@ -714,10 +722,10 @@ class Abi {
 		}
 	}
 
-	/// Adds decl d if of this module, else notes its module.
+	/// Adds decl d if of this module, or all are, else notes its module.
 	private named(d: i32) {
 		const m = this.p.decls[d].module
-		if (m == this.m) {
+		if (m == this.m || this.all) {
 			this.decl(d)
 		} else if (!this.uses.includes(m)) {
 			this.uses.push(m)
