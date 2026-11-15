@@ -274,6 +274,21 @@ export class Instances {
 		return -1
 	}
 
+	/// The class embedded in class t, its type args bound, that t's member name is promoted from (5.3), else t.
+	owner(t: i32, name: i32): i32 {
+		const p = this.p
+		if (this.nominal(t) != decl.Class || this.member(t, name) >= 0) {
+			return t
+		}
+		for (const e of p.decls[p.a(t)].members.filter(e => embedded(p, e))) {
+			const o = this.owner(p.subst(p.decls[e].type, p.b(t)), name)
+			if (this.member(o, name) >= 0) {
+				return o
+			}
+		}
+		return t
+	}
+
 	/// Instances each field of t if a class of builtin/, whose fields are otherwise instanced only where named; what new
 	/// makes holds them all, as builtin/fiber.bob's Thrown, written through its layout alone.
 	allFields(t: i32) throws CompileError {
@@ -295,7 +310,7 @@ export class Instances {
 		if (k == kind.Union) {
 			return p.union(p.items(t).map(m => this.fieldType(m, name)))
 		}
-		const d = this.memberOf(t, name)
+		const d = this.memberOf(this.owner(t, name), name)
 		if (d >= 0) {
 			return p.decls[d].type
 		}
@@ -325,7 +340,7 @@ export class Instances {
 			}
 			return p.type(kind.Func, p.list(ps), p.union(fs.map(f => p.b(f))))
 		}
-		const d = this.memberOf(t, name)
+		const d = this.memberOf(this.owner(t, name), name)
 		if (d >= 0) {
 			return if (p.decls[d].kind == decl.Function) p.decls[d].type else -1
 		}
@@ -1065,8 +1080,8 @@ class Copy {
 		return s.v!
 	}
 
-	/// A CallMethod of name and n args: on a class it becomes a Call of the method's instance; a toString the type lacks
-	/// a Call of builtin/'s show.
+	/// A CallMethod of name and n args: of a class's own method it becomes a Call of the method's instance; a toString
+	/// the type lacks a Call of builtin/'s show.
 	private callMethod(name: i32, n: i32) throws CompileError {
 		const p = this.p
 		const slot = this.stack[this.stack.length - 1 - n]
@@ -1079,12 +1094,12 @@ class Copy {
 			return
 		}
 		const f = this.ins.methodType(slot.t, name)
+		const d = if (this.ins.nominal(slot.t) == decl.Class) this.ins.member(slot.t, name) else -1
 		if (f < 0 && p.strings[name] == "toString") {
 			this.call(this.p.lang("show"), p.list([slot.t]))
 		} else if (f < 0) {
 			throw new CompileError(`no method ${p.strings[name]} to call (${this.ins.where})`)
-		} else if (this.ins.nominal(slot.t) == decl.Class) {
-			const d = this.ins.member(slot.t, name)
+		} else if (d >= 0 && p.decls[d].kind == decl.Function) {
 			// Each param the call leaves out, defaulted, as Missing, as lower passes it to a callee it knows.
 			const ps = p.items(p.subst(p.decls[d].type, p.b(slot.t)))
 			for (const t of ps.slice(n, ps.length)) {
