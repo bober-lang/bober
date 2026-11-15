@@ -2025,7 +2025,8 @@ class Gen {
 					if (fs.kind != "array") {
 						this.expr(fs)
 					} else if (fs.parts.some(q => q.type != f)) {
-						throw this.fail(p, "racing futures of different types")
+						this.race(fs.parts, t)
+						return id
 					} else {
 						this.spread(op.Array, Type.array(f), fs.parts, (q: Node, i: i32) => this.value(q, f))
 					}
@@ -2037,6 +2038,47 @@ class Gen {
 			default: throw this.fail(p, p.t.kind)
 		}
 		return id
+	}
+
+	/// Pushes [i, v] of racing futures fs of different types, of type t: the index of the one taken, raced as a union of
+	/// them, then that one's result as t has it.
+	private race(fs: Node[], t: Type) {
+		const ls = fs.map(q => {
+			const l = this.temp(this.ty(q.type!))
+			this.expr(q)
+			this.op(op.SetLocal, l)
+			return l
+		})
+		const u = this.prog.union(ls.map(l => this.code.locals[l].type))
+		for (const l of ls) {
+			this.op(op.Local, l)
+			this.cast(this.code.locals[l].type, u)
+		}
+		this.op(op.Array, this.prog.type(kind.Array, u), ls.length, this.code.list([]))
+		this.callBuiltin("pick", this.prog.list([u]))
+		const i = this.temp(kind.I32)
+		this.op(op.SetLocal, i)
+		this.op(op.Local, i)
+		const v = this.ty(t.types[1])
+		const wait = (k: i32) => {
+			const r = fs[k].type!.base!
+			this.op(op.Local, ls[k])
+			this.callBuiltin("wait", this.u.list([r], false, this))
+			this.cast(this.ty(r), v)
+		}
+		for (const k of 0 ... fs.length - 2) {
+			this.op(op.Local, i)
+			this.int(kind.I32, k)
+			this.op(op.Eq)
+			this.op(op.If, v)
+			wait(k)
+			this.op(op.Else)
+		}
+		wait(fs.length - 1)
+		for (const _ of 1 ... fs.length - 1) {
+			this.op(op.End)
+		}
+		this.op(op.Array, this.ty(t), 2, this.code.list([]))
 	}
 
 	private binary(p: Node): i32 {
