@@ -3,7 +3,8 @@
 //!
 //! Names are C's, which the files have after a `_`, and a library is named by its install name. Code unwinds
 //! by the DWARF call frame information of `__eh_frame` alone, which objects compiled with
-//! `-femit-dwarf-unwind=dwarf-only` have of every function; their compact unwind is dropped, as are debug sections.
+//! `-femit-dwarf-unwind=dwarf-only` have of every function; of others', arm64's compact unwind of each function with
+//! a frame record is made its FDE (frames). The rest of compact unwind is dropped, as are debug sections.
 //! A thread-local is reached through its descriptor, of `__thread_vars`: a function dyld sets, which finds the
 //! thread's copy, a key of dyld's, and the offset in the copy, which the writer sets.
 
@@ -124,7 +125,8 @@ const BIND_SYMBOL_FLAGS_WEAK_IMPORT: u8 = 1
 const id = "image.dylib"
 
 /// The relocatable object bytes, read from the file name, as an Object of its sections but the debug ones and those
-/// for ld64 alone, as `__LD,__compact_unwind`. A section's name is without its segment.
+/// for ld64 alone, as `__LD,__compact_unwind`, of which arm64's is made FDEs (frames). A section's name is without its
+/// segment.
 function read(name: string, bytes: string): Object throws CompileError {
 	const cmds = commands(name, bytes, MH_OBJECT)
 	const cpu = u(bytes, 4, 4)
@@ -151,12 +153,13 @@ function read(name: string, bytes: string): Object throws CompileError {
 		const seg = name16(bytes, shdrs[i] + 16)
 		const flags = sh(i, 64, 4)
 		const st = flags & 0xff
-		if (seg == "__DWARF" || seg == "__LD" || (flags & S_ATTR_DEBUG) != 0) {
+		const sect = name16(bytes, shdrs[i])
+		const compact = !x64 && seg == "__LD" && sect == "__compact_unwind"
+		if (!compact && (seg == "__DWARF" || seg == "__LD" || (flags & S_ATTR_DEBUG) != 0)) {
 			index.push(-1)
 			continue
 		}
 		const zero = st == S_ZEROFILL || st == S_GB_ZEROFILL || st == S_THREAD_LOCAL_ZEROFILL
-		const sect = name16(bytes, shdrs[i])
 		const s = new Section(sect, kindOf(seg, sect, st, flags))
 		// Pointers and stubs only ld64 makes, and functions run on unload or to initialize a thread-local, are not linked.
 		const unlinked = st >= S_NON_LAZY_SYMBOL_POINTERS && st <= S_SYMBOL_STUBS || st == S_MOD_TERM_FUNC_POINTERS ||
@@ -272,9 +275,75 @@ function read(name: string, bytes: string): Object throws CompileError {
 		}
 		if (x64 && sec.kind == Unwind) {
 			fdes(o, bytes, shdrs, index, base, i)
+		} else if (sec.name == "__compact_unwind") {
+			o.sections[k] = frames(sec)
 		}
 	}
 	return o
+}
+
+/// The FDEs of arm64's compact unwind cu, as read, an Unwind section: of each entry of mode FRAME, with the rules
+/// libunwind's stepWithCompactEncodingFrame follows, that the CFA is x29 + 16, below it x30 and x29, then the pairs
+/// of registers the encoding names; each personality's CIE comes before its first FDE. An entry of mode DWARF has its
+/// FDE in `__eh_frame`, and one FRAMELESS is of a leaf, which nothing unwinds through.
+function frames(cu: Section): Section {
+	const fixups = new HashMap[u64, Fixup]()
+	for (const f of cu.fixups) {
+		fixups.set(f.at, f)
+	}
+	const s = new Section("__eh_frame", Unwind)
+	s.align = 8
+	// Of each personality's symbol, -1 for none, where its CIE is.
+	const cies = new HashMap[i32, i32]()
+	// A CIE or FDE of body, after its length, padded by DW_CFA_nop to 8 bytes, as the writer's CIEs of holes need.
+	const entry = (body: string) => {
+		const n = alignUp(body.length + 4, 8) - 4
+		s.bytes += le(n as u64, 4) + body + zeros(n - body.length)
+	}
+	// DW_CFA_offset_extended: register r saved at the CFA - 8 * slot.
+	const rule = (r: i32, slot: i32) => "\x05" + le(r as u64, 1) + le(slot as u64, 1)
+	for (const e of 0 ... cu.bytes.length / 32 - 1) {
+		// An entry: its function's address, length and encoding, and the addresses of its personality and LSDA.
+		const at = 32 * e
+		const start = fixups.get(at as u64)
+		const encoding = u(cu.bytes, at + 12, 4)
+		if (start == null || (encoding & 0x0f000000) != 0x04000000) {
+			continue
+		}
+		const personality = fixups.get((at + 16) as u64)?.symbol ?? -1
+		if (!cies.has(personality)) {
+			// Version 1, the augmentation, code alignment 1, data alignment -8, return address x30, and the
+			// augmentation's data: the personality's slot, 4 bytes pc-relative, and the encoding of the LSDA; then
+			// that of the code, 8 bytes pc-relative, and the CFA, sp.
+			cies.set(personality, s.bytes.length)
+			if (personality >= 0) {
+				s.fixups.push(new Fixup((s.bytes.length + 19) as u64, SlotRel32, personality, 0))
+			}
+			entry(le(0, 4) + "\x01" + (if (personality < 0) "zR\x00\x01\x78\x1e\x01"
+				else "zPLR\x00\x01\x78\x1e\x07\x9b" + le(0, 4) + "\x10") + "\x10\x0c\x1f\x00")
+		}
+		const fde = s.bytes.length
+		s.fixups.push(new Fixup((fde + 8) as u64, Rel64, start.symbol, start.addend))
+		const lsda = fixups.get((at + 24) as u64)
+		if (personality >= 0 && lsda != null) {
+			s.fixups.push(new Fixup((fde + 25) as u64, Rel64, lsda.symbol, lsda.addend))
+		}
+		// DW_CFA_def_cfa x29, 16; then the pairs, of bits 0 to 4 x19 and x20 to x27 and x28, of bits 8 to 11 d8 and d9
+		// to d14 and d15, which DWARF numbers 72 to 79.
+		let rules = "\x0c\x1d\x10" + rule(30, 1) + rule(29, 2)
+		let slot = 3
+		for (const b of [0, 1, 2, 3, 4, 8, 9, 10, 11]) {
+			if ((encoding >> b & 1) != 0) {
+				const r = if (b < 8) 19 + 2 * b else 56 + 2 * b
+				rules += rule(r, slot) + rule(r + 1, slot + 1)
+				slot += 2
+			}
+		}
+		entry(le((fde + 4 - cies.get(personality)!) as u64, 4) + zeros(8) + le(u(cu.bytes, at + 8, 4), 8)
+			+ (if (personality < 0) "\x00" else "\x08" + zeros(8)) + rules)
+	}
+	s.size = s.bytes.length as u64
+	return s
 }
 
 /// A relocation as read: the offset it sets, its type, whether it is relative, its size in bytes, whether it is extern,
