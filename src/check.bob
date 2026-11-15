@@ -21,7 +21,7 @@ import { Parser, Syntax, Tree } from "./parse"
 import { builtin, builtinPath, root } from "./root"
 import {
 	Array as Arrays, Bool, Empty, Field, I32, Kind as TypeKind, Null, String, String16, String32, Type, U8, UntypedFloat,
-	UntypedInt, bases, basics, elementOf, fillWith, members, membersOf, readonlyOf, setOf,
+	UntypedInt, bases, basics, elementOf, fillWith, members, membersOf, readonlyOf, setOf, spells,
 } from "./type"
 
 /// The modules of builtin/ every module outside builtin/ and C's loads first: those declaring the classes of a string's
@@ -3363,7 +3363,8 @@ class Checker {
 	/// `x instanceof T`, `x` of union, object or interface type, is true if the type of its tag fits `T`. Some member
 	/// of `x`'s type shall fit `T`, and `x` narrows to those members; or `T` shall fit an object or interface member,
 	/// and `x` narrows to `T` (§6.11). A type that is no union is its only member, and a type set's parameter has the
-	/// members of its set.
+	/// members of its set. `x instanceof T`, `x` a `string` and `T` string literal types, is true if `x` spells one of
+	/// them, and `x` narrows to `T`.
 	///
 	/// ```
 	/// let x: i32 = 1 + 2 * 3           // 7
@@ -3378,6 +3379,7 @@ class Checker {
 	/// let e = -1; 2 ** e               // traps
 	/// f == g                           // error: functions do not compare
 	/// let u: i32 | i64 = 7; u + 1      // error: not of one type
+	/// let w: string = "else"; w instanceof "if" | "else"   // true, w then "if" | "else"
 	/// ```
 	private binary(n: Node, want: Type | null): Type {
 		const a = n.parts[0]
@@ -3556,7 +3558,7 @@ class Checker {
 			const l = this.expr(x, null)
 			const t = this.typeExpr(p.parts[1])
 			const b = this.place(x)
-			if (!this.narrows(l, t)) {
+			if (!spells(l, t) && !this.narrows(l, t)) {
 				throw this.error(p.t.loc, `${show(l)} is never ${show(t)}`)
 			}
 			if (b == null) {

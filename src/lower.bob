@@ -20,7 +20,7 @@
 //! of …)` over a tuple or an array an Each of a Readonly local.
 
 import { bits } from "../builtin/math"
-import { endsWith, indexOf, sortBy, startsWith } from "../std/algo"
+import { endsWith, indexOf, sortBy, startsWith, unique } from "../std/algo"
 import { digit, isAlphabetic, lf, minus, o, underscore, x, zero } from "../std/ascii"
 import { HashMap } from "../std/collections/hashmap"
 import { ScopedMap } from "../std/collections/scopedmap"
@@ -40,7 +40,7 @@ import { Tok } from "./lex"
 import { Lift } from "./lift"
 import { holdsType } from "./resolve"
 import { builtinPath } from "./root"
-import { Bool, Field, Null, String, Type, basics, members } from "./type"
+import { Bool, Field, Null, String, Type, basics, members, spells } from "./type"
 import { strtod } from "stdlib.h"
 
 /// The modules at paths and those they import, checked and lowered into one Program, but those linked from the files
@@ -1127,6 +1127,66 @@ class Gen {
 				this.op(op.Or)
 			}
 			n++
+		}
+	}
+
+	/// Pushes whether string p spells one of string literal types t, testing its length, then comparing it with each of
+	/// that length; where p is a local or a member, the one it spells is stored there, so that p narrowed to t holds the
+	/// program's one value of it (§4.2); a local so stored to is not Readonly, lest mono take the last for what it holds.
+	private spelled(p: Node, t: Type): i32 {
+		const local = p.kind == "token" && p.symbol == "" && this.find(this.text(p)) != null
+		const at = if (local || p.kind == "member") this.place(p, true) else null
+		if (local) {
+			this.code.locals[at!.a].mods &= ~decl.Readonly
+		}
+		if (at == null) {
+			this.expr(p)
+		} else {
+			this.load(at!)
+		}
+		const s = this.ty(String)
+		const v = this.temp(s)
+		this.op(op.SetLocal, v)
+		this.op(op.Local, v)
+		this.op(op.Field, this.prog.intern("length"))
+		const n = this.temp(kind.I32)
+		this.op(op.SetLocal, n)
+		const ls = t.alternatives().map(m => unquoted(m.text))
+		const all = ls.map(l => l.length)
+		sortBy(all, (a, b) => a < b)
+		const lens = unique(all)
+		for (const len of lens) {
+			this.op(op.Local, n)
+			this.int(kind.I32, len)
+			this.op(op.Eq)
+			this.open(op.If, kind.Bool)
+			const same = ls.filter(l => l.length == len)
+			for (const l of same) {
+				this.op(op.Local, v)
+				this.op(op.Str, this.prog.intern(l))
+				this.op(op.Eq)
+				this.open(op.If, kind.Bool)
+				if (at != null && at!.store != op.SetGlobal) {
+					this.parts(at!)
+					this.op(op.Str, this.prog.intern(l))
+					this.cast(s, at!.type)
+					this.op(at!.store, at!.a, at!.b)
+				}
+				this.op(op.True)
+				this.op(op.Else)
+			}
+			this.ends(same.length)
+			this.op(op.Else)
+		}
+		this.ends(lens.length)
+		return kind.Bool
+	}
+
+	/// Ends n Ifs, each false in its last Else.
+	private ends(n: i32) {
+		this.op(op.False)
+		for (const _ of 0 ... n - 1) {
+			this.op(op.End)
 		}
 	}
 
@@ -2254,6 +2314,9 @@ class Gen {
 				return this.chain(p)
 			case "<", ">", "<=", ">=": return this.chain(p)
 			case "instanceof":
+				if (spells(a.type!, b.type!)) {
+					return this.spelled(a, b.type!)
+				}
 				this.expr(a)
 				if (b.type!.alternatives().every(m => m.kind != "literal")) {
 					this.op(op.Is, this.ty(b.type!))
