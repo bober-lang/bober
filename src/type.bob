@@ -191,7 +191,7 @@ export class Type {
 	/// no type.
 	///
 	/// Elements are invariant, so `Square[]` does not fit `Shape[]`, but a literal's untyped constants fit as they would
-	/// alone: `[1, 2]` fits `i64[]`.
+	/// alone: `[1, 2]` fits `i64[]`, and `["a", 1]` wanted as a tuple `[string, i64]`.
 	fits(t: Type): bool {
 		const s = this
 		if (s == t || s.kind == "param" && origin(s) == origin(t) || memberOf(s, t)) {
@@ -219,7 +219,16 @@ export class Type {
 			case "float": return t.kind == "float" && (s.n == 0 || t.n > s.n)
 			case "async": return t.kind == "async" && s.base!.fits(t.base!)
 			case "array": return t.kind == "array" && s.isLoose() && s.params[0].fits(t.params[0])
-			case "tuple": return t.kind == "tuple" && s.rest == t.rest && s.types.equals(t.types)
+			case "tuple":
+				if (t.kind != "tuple" || s.rest != t.rest || s.types.length != t.types.length) {
+					return false
+				}
+				for (const i of 0 ... s.types.length - 1) {
+					if (s.types[i] != t.types[i] && !(s.types[i].isLoose() && s.types[i].fits(t.types[i]))) {
+						return false
+					}
+				}
+				return true
 			case "function":
 				const r = s.base
 				if (t.kind != "function" || s.types.length < t.types.length || s.n > t.n
