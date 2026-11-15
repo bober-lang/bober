@@ -2420,6 +2420,13 @@ class Emitter {
 		if (this.boxed(f) || this.boxed(t)) {
 			// Boxed with the descriptor of its type, or unboxed, converted if a number.
 			if (!this.boxed(f)) {
+				if (fk == kind.Union && t != this.any && !this.unbound(t)) {
+					// Checked as a member's is (§6.6), by the tag alone if the other is null, as of x!.
+					const others = this.p.members(f).filter(m => !this.holds(t, m))
+					const nullOnly = others.length == 1 && this.p.kind(others[0]) == kind.Null
+					const ok = if (nullOnly) this.ir().icmp("ne", this.tagOf(v.v), this.tag(others[0])) else this.isa(v, t)
+					this.check(ok, "cast to a type that is not the value's")
+				}
 				return if (fk == kind.Union) v.v else this.unionOf(this.desc(f), v.v, f)
 			} else if (this.boxed(t) || tk == kind.Union) {
 				return v.v
