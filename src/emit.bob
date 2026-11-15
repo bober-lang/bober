@@ -233,6 +233,10 @@ class Emitter {
 	private homes = new HashMap[Value, Value]()
 	/// That place of each string local in the frame, by the local's own, which put keeps up to date.
 	private words = new HashMap[Value, Value]()
+	/// The function's free scratch slots by pool and type, and those the ops being emitted hold, each with the list it
+	/// goes back to.
+	private free = [new HashMap[IrType, Value[]](), new HashMap[IrType, Value[]](), new HashMap[IrType, Value[]]()]
+	private busy: [Value[], Value][] = []
 	private entry: Block = 0
 	private dead = true
 	private stack: V[] = []
@@ -711,7 +715,9 @@ class Emitter {
 	private ops(i: i32, end: i32) {
 		let at = i
 		while (at < end) {
+			const held = this.busy.length
 			at = this.op(at) + 1
+			this.release(held)
 		}
 	}
 
@@ -1456,14 +1462,14 @@ class Emitter {
 		// Self as the place that has the method, an embedded field where it is promoted.
 		const at = this.spill(self, this.unionTy)
 		const fn = this.rt("method_on", [at, this.cstr(name), this.i64Const(name.length)], false)
-		const r = this.slot(this.unionTy)
+		const r = this.scratch(this.unionTy, promoted)
 		const yes = this.label()
 		const no = this.label()
 		const done = this.label()
 		this.condBr(this.ir().icmp("ne", this.ir().cast("ptrtoint", fn, this.i64), this.i64Const(0)), yes, no)
 		this.start(yes)
 		const mine = this.ir().load(this.unionTy, at, false)
-		const argv = this.slot(this.b.array(this.unionTy, args.length as u64))
+		const argv = this.scratch(this.b.array(this.unionTy, args.length as u64))
 		for (const k of 0 ... args.length - 1) {
 			this.ir().store(args[k], this.ir().gep(this.unionTy, argv, [this.i64Const(k)]), false)
 		}
@@ -1602,7 +1608,7 @@ class Emitter {
 	/// new thunk.
 	private makeOf(t: i32) {
 		const d = this.desc(t)
-		const r = this.slot(this.unionTy)
+		const r = this.scratch(this.unionTy, promoted)
 		const [array, tuple, instance, done] = [this.label(), this.label(), this.label(), this.label()]
 		this.ir().switch(this.word(d, kindAt), [6, 8], [array, tuple], instance)
 		this.dead = true
@@ -1695,8 +1701,9 @@ class Emitter {
 					// Its ref, or the address of a copy of its bits.
 					const u = this.pop().v
 					const r = this.ir().cast("ptrtoint", this.refOf(u), this.i64)
-					const bits = this.ir().cast("ptrtoint", this.spill(this.bitsOf(u), this.i64), this.i64)
-					this.push(this.ir().select(this.ir().icmp("eq", r, this.i64Const(0)), bits, r), ret)
+					const bits = this.spill(this.bitsOf(u), this.i64, this.slot(this.i64))
+					const at = this.ir().cast("ptrtoint", bits, this.i64)
+					this.push(this.ir().select(this.ir().icmp("eq", r, this.i64Const(0)), at, r), ret)
 				case "load": this.push(this.read(this.ir().cast("inttoptr", this.pop().v, this.ptr), t), ret)
 				case "store":
 					const v = this.pop()
@@ -1726,7 +1733,7 @@ class Emitter {
 			case "addr":
 				const v = this.pop()
 				this.touch(v.t) // by identity
-				const q = if (this.ll(t) == this.ref) v.v else this.spill(v.v, this.ll(t))
+				const q = if (this.ll(t) == this.ref) v.v else this.spill(v.v, this.ll(t), this.slot(this.ll(t)))
 				this.push(this.ir().cast("ptrtoint", q, this.i64), ret)
 			default: throw new CompileError(`emit: ${name} is not an intrinsic`)
 		}
@@ -1760,7 +1767,7 @@ class Emitter {
 			return this.returned(this.call(f.type, f.fn, args, unwinds), f.ret)
 		}
 		const n = this.norm(f.ret)
-		const out = this.slot(this.struct(n))
+		const out = this.scratch(this.struct(n), results)
 		this.ir().lifetime(out, true)
 		this.call(f.type, f.fn, [...args, out], unwinds)
 		const v = this.unbox(out, n)
@@ -1796,9 +1803,9 @@ class Emitter {
 		return this.call(this.b.valueType(f), f, args, unwinds)
 	}
 
-	/// v, of type t, in a place of its own.
-	private spill(v: Value, t: IrType): Value {
-		const q = this.slot(t)
+	/// v, of type t, stored at at, or if 0, in a scratch slot.
+	private spill(v: Value, t: IrType, at: Value = 0): Value {
+		const q = if (at == 0) this.scratch(t) else at
 		this.ir().store(v, q, false)
 		return q
 	}
@@ -1859,7 +1866,7 @@ class Emitter {
 	/// Where the bytes of string s are: after its length in place if short, else at its second word's offset into its
 	/// third, a buffer, or from 0 if null.
 	private strBytes(s: Value): Value {
-		const at = this.homes.get(s) ?? this.keep(s, this.slot(this.stringTy))
+		const at = this.homes.get(s) ?? this.keep(s, this.scratch(this.stringTy))
 		const here = this.gc(this.ir().gep(this.b.int(8), at, [this.i64Const(1)]))
 		const far = this.ir().gep(this.b.int(8), this.ir().extract(s, 2), [this.ir().extract(s, 1)])
 		return this.ir().select(this.strHead(s)[1], far, here)
@@ -1994,6 +2001,8 @@ class Emitter {
 		const scoped = this.scope
 		const descs = this.descs
 		const formed = this.formed
+		const free = this.free
+		const busy = this.busy
 		this.fn = fn
 		this.unwind = 0
 		this.enter(scope, [])
@@ -2006,6 +2015,8 @@ class Emitter {
 		this.scope = scoped
 		this.descs = descs
 		this.formed = formed
+		this.free = free
+		this.busy = busy
 	}
 
 	// Values.
@@ -2019,7 +2030,8 @@ class Emitter {
 				if (slots[i].name == name) {
 					const x = this.ir().extract(held.v, i as u32)
 					const t = slots[i].t
-					this.push(if (this.packed(t)) this.unpack(this.spill(x, this.stored(t)), t) else x, t)
+					const p = this.stored(t)
+					this.push(if (this.packed(t)) this.unpack(this.spill(x, p, this.scratch(p, promoted)), t) else x, t)
 					return
 				}
 			}
@@ -2146,7 +2158,9 @@ class Emitter {
 				i => this.copy({ v: this.unbits(src.v, ms[i]), t: ms[i] }, dst))
 			return
 		}
+		const held = this.busy.length
 		for (const s of this.layout(dst.t)) {
+			this.release(held) // each field's, as an object can have hundreds
 			const r = if (this.boxed(u)) this.dynFind(src, s.name) else this.find(src, s.name)
 			if (r == null) {
 				continue // a field a spread does not give, or a method of a class spread, which gives only its fields
@@ -2207,7 +2221,7 @@ class Emitter {
 			for (const i of 0 ... vs.length - 1) {
 				const s = slots[i].t
 				if (this.packed(s)) {
-					const q = this.slot(this.stored(s))
+					const q = this.scratch(this.stored(s), promoted)
 					this.pack(q, vs[i], s)
 					x = this.ir().insert(x, this.ir().load(this.stored(s), q, false), i as u32)
 				} else {
@@ -2251,7 +2265,7 @@ class Emitter {
 		const slots = if (fixed) [] else this.layout(n)
 		// A T[n] is copied where stored, so one holding no refs, which would have the collector find it, is in the frame.
 		const r = if (!fixed) this.instance(n)
-			else if (!this.b.holdsRef(st)) this.gc(this.spill(this.zero(n), st))
+			else if (!this.b.holdsRef(st)) this.gc(this.spill(this.zero(n), st, this.slot(st)))
 			else this.alloc(st)
 		let f = 0
 		for (const j of 0 ... vs.length - 1) {
@@ -2599,7 +2613,7 @@ class Emitter {
 		}
 		const tag = this.ir().cast("zext",
 			this.ir().load(this.b.int(8), this.ir().gep(this.b.int(8), q, [this.i64Const(at)]), false), this.i64)
-		const u = this.slot(this.unionTy)
+		const u = this.scratch(this.unionTy, promoted)
 		this.cases(ms.length, i => this.ir().icmp("eq", tag, this.i64Const(this.tagByte(n, i))), i => {
 			const boxed = this.inlined(ms[i])
 			const p = this.ir().gep(this.b.int(8), q, [this.i64Const(this.placed(r, ms[i]))])
@@ -3320,6 +3334,26 @@ class Emitter {
 		return s
 	}
 
+	/// A slot of t for the op being emitted alone, which the ops after it reuse, so that a frame, and its stack maps at
+	/// each call, hold only one op's scratch refs. Its pool keeps apart the slots only loaded and stored, which LLVM's
+	/// sroa promotes, as statepoints relocate no ref in memory, and the results calls return in, which lifetime markers
+	/// bound, from those other uses.
+	private scratch(t: IrType, pool = addressed): Value {
+		const m = this.free[pool]
+		const free = m.get(t) ?? put(m, t, [])
+		const s = if (free.length > 0) free.pop() else this.slot(t)
+		this.busy.push([free, s])
+		return s
+	}
+
+	/// Frees the scratch slots taken since held of them were, for those after to reuse.
+	private release(held: i32) {
+		while (this.busy.length > held) {
+			const [free, s] = this.busy.pop()
+			free.push(s)
+		}
+	}
+
 	/// The integer, bool or Type v extended to an i64.
 	private ext(v: V): Value {
 		return if (this.b.typeOf(v.v) == this.i64) v.v
@@ -3428,6 +3462,8 @@ class Emitter {
 		this.scope = scope
 		this.descs = descs
 		this.formed = new HashMap[i32, Value]()
+		this.free = [new HashMap[IrType, Value[]](), new HashMap[IrType, Value[]](), new HashMap[IrType, Value[]]()]
+		this.busy = []
 		this.entry = this.b.block(this.fn)
 		this.start(this.entry)
 	}
@@ -3680,7 +3716,7 @@ class Emitter {
 	/// union rt.c loads.
 	private load(d: Value, q0: Value): Value {
 		const q = this.gc(q0) // which the alloc may move
-		const u = this.slot(this.unionTy)
+		const u = this.scratch(this.unionTy)
 		const size = this.rt("load", [d, this.raw(q), u], false)
 		const box = this.label()
 		const done = this.label()
@@ -3711,7 +3747,7 @@ class Emitter {
 	/// says; traps if it has none.
 	private dynPlace(obj: V, name: Value): [Value, Value] {
 		const u = this.cast(obj, this.any)
-		const t = this.slot(this.i64)
+		const t = this.scratch(this.i64)
 		const at = this.rt("field_of", [this.tagOf(u), this.raw(this.strBytes(name)), this.strLen(name), t], false)
 		this.check(this.ir().icmp("sge", at, this.i64Const(0)), "no such field")
 		return [this.ir().gep(this.b.int(8), this.refOf(u), [at]), this.ir().load(this.i64, t, false)]
@@ -3719,7 +3755,7 @@ class Emitter {
 
 	/// The place of element k of the array or fixed array that arr holds as a union, and its type's descriptor.
 	private dynElement(arr: V, k: V): [Value, Value] {
-		const t = this.slot(this.i64)
+		const t = this.scratch(this.i64)
 		const q = this.rt("element",
 			[this.spill(this.cast(arr, this.any), this.unionTy), this.ext(k), t, ...this.site()], false)
 		return [this.gc(q), this.ir().load(this.i64, t, false)]
@@ -3920,7 +3956,7 @@ class Emitter {
 		const k = this.p.kind(n)
 		if (this.unbound(n) && (this.boxed(n) || k == kind.Union)) {
 			// Its type's, which its descriptor says, as src/type.c makes it.
-			const u = this.slot(this.unionTy)
+			const u = this.scratch(this.unionTy)
 			this.rt("zero", [this.desc(n), u], false)
 			return this.ir().load(this.unionTy, u, false)
 		}
@@ -3986,6 +4022,10 @@ export function listed(p: Program, m: i32): i32[] {
 }
 
 /// The words of rt.h's bober_type that code reads.
+/// The scratch pools: slots a call takes the address of, slots only loaded and stored, and the results calls return in.
+const addressed = 0
+const promoted = 1
+const results = 2
 const kindAt = 1
 const elemAt = 14
 const partsAt = 21
