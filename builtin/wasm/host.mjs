@@ -31,7 +31,7 @@ class Trap extends Error {}
 let depth = 0 // of the tests and subtests running
 let testFile = null
 let testAt = -1
-/// Where each box thrown was thrown: its file and byte.
+/// The function showing each box thrown, and where it was thrown: its file and byte.
 const sites = new WeakMap()
 
 /// The line and column of byte at of file, or null.
@@ -61,41 +61,13 @@ const trap = (what, file, at) => {
 	process.exit(1)
 }
 
-/// C's %g.
-const g = x => {
-	if (!isFinite(x)) return isNaN(x) ? "nan" : x > 0 ? "inf" : "-inf"
-	const e = x == 0 ? 0 : Number(x.toExponential(5).split("e")[1])
-	const trim = m => m.includes(".") ? m.replace(/\.?0+$/, "") : m
-	if (e < -4 || e >= 6) {
-		const [m, p] = x.toExponential(5).split("e")
-		return `${trim(m)}e${p[0] == "-" ? "-" : "+"}${p.replace(/^[+-]/, "").padStart(2, "0")}`
-	}
-	return trim(x.toFixed(5 - e))
-}
-
-/// A value thrown and not caught, a box, as text, as bober_uncaught shows it.
-const shown = box => {
-	const [kind, bits] = [ex.boxTag(box), ex.boxBits(box)]
-	const f = new DataView(new ArrayBuffer(8))
-	f.setBigInt64(0, bits, true)
-	switch (kind) {
-		case 1: return "null"
-		case 2: return bits & 1n ? "true" : "false"
-		case 3: case 4: case 5: case 6: return `${BigInt.asIntN(64, bits)}`
-		case 7: case 8: case 9: case 10: return `${BigInt.asUintN(64, bits)}`
-		case 11: return g(f.getFloat32(0, true))
-		case 12: return g(f.getFloat64(0, true))
-		case 13: return str(ex.boxRef(box))
-		default: return "<value>"
-	}
-}
-
 /// What e, which code threw, prints: a trap's message, or of a throw not caught.
 const failure = e => {
 	if (e instanceof Trap) return e.message
 	if (e instanceof WebAssembly.Exception && e.is(ex.bober)) {
 		const box = e.getArg(ex.bober, 0)
-		return trapped(`uncaught throw: ${shown(box)}`, ...sites.get(box))
+		const [show, ...site] = sites.get(box)
+		return trapped(`uncaught throw: ${str(show(box))}`, ...site)
 	}
 	// Of the engine: a stack overflow, else what checks bober's code does not make, as of a null.
 	if (e instanceof RangeError && /call stack/.test(e.message)) return trapped("stack overflow", null, -1)
@@ -233,7 +205,7 @@ reset()
 
 const host = {
 	trap: (what, file, at) => trap(str(what), str(file), at),
-	thrown: (box, file, at) => { sites.set(box, [str(file), at]) },
+	thrown: (box, show, file, at) => { sites.set(box, [show, str(file), at]) },
 	test: suspending(async (name, file, f) => {
 		seed = STONEWALL
 		testFile = str(file)

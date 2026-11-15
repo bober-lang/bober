@@ -353,10 +353,9 @@ class Wasm {
 		BinaryenAddFunctionExport(this.m, "start", "start")
 	}
 
-	/// The exports the host makes and reads strings and reads boxes by, and calls a closure () => null by.
+	/// The exports the host makes and reads strings by, and calls a closure () => null by.
 	private exports() {
 		const s = this.strType()
-		const box = this.boxType()
 		const arg = (l: u32, t: u64) => BinaryenLocalGet(this.m, l, t)
 		const exported = (name: string, ps: u64[], r: u64, body: u64) => {
 			this.function(name, ps, r, [], body)
@@ -368,9 +367,6 @@ class Wasm {
 		exported("strNew", [this.i32], s, this.newStr(0))
 		exported("strSet", [s, this.i32, this.i32], this.none,
 			BinaryenArraySet(this.m, this.bytes(arg(0, s)), arg(1, this.i32), arg(2, this.i32)))
-		exported("boxTag", [box], this.i32, BinaryenStructGet(this.m, 0, arg(0, box), this.i32, false))
-		exported("boxBits", [box], this.i64, BinaryenStructGet(this.m, 1, arg(0, box), this.i64, false))
-		exported("boxRef", [box], this.eqref, BinaryenStructGet(this.m, 2, arg(0, box), this.eqref, false))
 		const f = this.p.type(kind.Func, this.p.list([]), kind.Null)
 		this.begin([this.val(f)], 0)
 		this.emit(this.callClosure({ l: 0, t: f }, []))
@@ -556,8 +552,9 @@ class Wasm {
 			case op.Finally: this.finally()
 			case op.Throw:
 				const box: V = { l: this.spill(this.cast(this.pop(), this.any), this.boxType()), t: this.any }
-				this.emit(this.host("thrown", [this.get(box), this.str(this.path), this.i32c(this.pos)],
-					[this.boxType(), this.strType(), this.i32], this.none))
+				this.emit(this.host("thrown",
+					[this.get(box), this.showing(n), this.str(this.path), this.i32c(this.pos)],
+					[this.boxType(), BinaryenTypeFuncref(), this.strType(), this.i32], this.none))
 				this.emit(BinaryenThrow(this.m, "bober", [this.get(box)], 1))
 				this.dead = true
 			case op.Br: this.branch(n)
@@ -1060,6 +1057,26 @@ class Wasm {
 	private closure(name: string, t: i32, env: u64): u64 {
 		const code = BinaryenRefFunc(this.m, name, this.codeSig(t))
 		return BinaryenStructNew(this.m, [code, env], 2, this.heap(t))
+	}
+
+	/// A function (box) => string showing a box thrown as `${}` does, by show's instance d of its type, which the host
+	/// calls if nothing catches it.
+	private showing(d: i32): u64 {
+		const name = `shown#${d}`
+		const sig = this.sigHeap([this.boxType()], this.strType())
+		if (!this.made.has(name)) {
+			this.made.set(name, true)
+			const m = this.mod
+			this.pending.push(() => {
+				this.begin([this.boxType()], m)
+				this.ret = kind.String
+				this.pushCall(this.fn(d), [this.cast({ l: 0, t: this.any }, this.p.items(this.p.decls[d].type)[0])],
+					kind.String)
+				this.return()
+				this.finish(name, this.strType())
+			})
+		}
+		return BinaryenRefFunc(this.m, name, sig)
 	}
 
 	/// The function value of function d, a Global's: its code a thunk ignoring its env.
