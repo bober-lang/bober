@@ -11,6 +11,7 @@ import { HashMap } from "../std/collections/hashmap"
 import { Rest, Unknown, decode, quoted } from "../std/encoding/json"
 import { stdin, stdout } from "../std/io"
 import { ParseError, parseInt } from "../std/string"
+import { escape, unescape } from "../std/url"
 import { Checked, Node, check, operands, patternNames, show } from "./check"
 import { format } from "./format"
 import { Loc, SyntaxError } from "./lex"
@@ -209,11 +210,13 @@ class Server implements Checked {
 
 	/// The path of a file's uri, relative to the directory the server runs in, as the checker's paths are.
 	private path(uri: string): string {
-		const p = if (startsWith(uri, "file://")) uri.slice(7, uri.length) else uri
+		const p = unescape(if (startsWith(uri, "file://")) uri.slice(7, uri.length) else uri, true)
 		return if (startsWith(p, this.root)) p.slice(this.root.length, p.length) else p
 	}
 
-	private uri(path: string): string { return "file://" + (if (startsWith(path, "/")) "" else this.root) + path }
+	private uri(path: string): string {
+		return "file://" + escape((if (startsWith(path, "/")) "" else this.root) + path, true)
+	}
 }
 
 /// The innermost of n and its parts whose token covers at and that has what it takes.
