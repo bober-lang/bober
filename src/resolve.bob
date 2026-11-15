@@ -342,7 +342,7 @@ export class Instances {
 		}
 		const d = this.memberOf(this.owner(t, name), name)
 		if (d >= 0) {
-			return if (p.decls[d].kind == decl.Function) p.decls[d].type else -1
+			return if (p.kind(p.decls[d].type) == kind.Func) p.decls[d].type else -1
 		}
 		const f = if (p.kind(t) == kind.Object && p.field(t, name) >= 0) this.fieldType(t, name) else 0
 		return if (p.kind(f) == kind.Func) f else -1
@@ -465,6 +465,35 @@ export function embedded(p: Program, d: i32): bool { return (p.decls[d].mods & d
 export function bases(p: Program, d: i32): i32[] {
 	const ts = p.decls[d].members.filter(m => embedded(p, m)).map(m => p.decls[m].type)
 	return [...ts, ...p.lists[p.decls[d].supers].filter(t => p.kind(t) == kind.Named)]
+}
+
+/// The type of member name, a Str, of object type, class or interface t, or of one it embeds or extends, of a member of
+/// union t, or of type param t's constraint; else 0.
+export function fieldOf(p: Program, t: i32, name: i32): i32 {
+	if (p.kind(t) == kind.Param) {
+		return fieldOf(p, p.decls[p.a(t)].params[p.b(t)].constraint, name)
+	}
+	if (p.kind(t) == kind.Union) {
+		return p.items(t).map(m => fieldOf(p, m, name)).find(f => f != 0) ?? 0
+	}
+	if (p.kind(t) == kind.Object) {
+		const i = p.field(t, name)
+		return if (i >= 0) p.items(t)[i] else 0
+	}
+	if (p.kind(t) != kind.Named || ![decl.Interface, decl.Class].includes(p.decls[p.a(t)].kind)) {
+		return 0
+	}
+	const m = p.member(p.a(t), name)
+	if (m >= 0) {
+		return p.subst(p.decls[m].type, p.b(t))
+	}
+	for (const b of bases(p, p.a(t))) {
+		const f = fieldOf(p, p.subst(b, p.b(t)), name)
+		if (f != 0) {
+			return f
+		}
+	}
+	return 0
 }
 
 /// Function type f as called at run time: without the params holding a Type, whose args are known, and of no result
