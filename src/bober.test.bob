@@ -25,6 +25,7 @@ function built(files: [string, string][], level = "", main = "main.bob"): string
 	const f = new Compile()
 	f.O1 = level == "-O1"
 	f.O2 = level == "-O2"
+	f.release = level == "-release"
 	dir = `${home}/build`
 	try {
 		process.run(build(`${home}/${main}`, false, f, false), `${home}/out`)
@@ -152,6 +153,30 @@ test "a union cast to an interface at -O0 traps if the value does not fit" {
 	anew()
 	const main = "interface HasSide { side: f64 }\nfunction side(n: HasSide | null): f64 { return n!.side }\nfunction main() { side(null) }\n"
 	assert built([["main.bob", main]]) == `${home}/main.bob:2:49: trap: cast to a type that is not the value's\n`
+}
+
+test "a union of more than 256 classes, which a tag byte does not tell apart, holds each at every level" {
+	let classes = ""
+	const names: string[] = []
+	for (const i of 0 ... 256) {
+		classes += `class C${i} { n(): i32 { return ${i} } }\n`
+		names.push(`C${i}`)
+	}
+	const big = names.join(" | ")
+	const main = `${classes}\ninterface N { n(): i32 }\n
+class Held[T] {\n\tv: T\n\n\tconstructor(v: T) { this.v = v }\n}\n
+function main() {
+	const xs: (${big})[] = [${names.map(c => `new ${c}()`).join(", ")}]
+	let wrong = 0
+	for (const i of 0 ... 256) {
+		const x: N = new Held[${big}](xs[i]).v
+		wrong += if (x.n() == i) 0 else 1
+	}
+	print(\`\${wrong}\`)
+}\n`
+	for (const level of ["", "-O1", "-O2", "-release"]) {
+		assert built([["main.bob", main]], level) == "0\n"
+	}
 }
 
 test "-O2 has LLVM compile each monomorphized module, an edited one TPDE until it is unchanged, which -O1 keeps" {

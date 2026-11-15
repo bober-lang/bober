@@ -2654,12 +2654,13 @@ class Emitter {
 		return r
 	}
 
-	/// Whether a value of t is a union packed in memory (§4.4): not boxed, nor with a T[n] member, nor in a program as
-	/// lowered of a member whose layout a type param decides.
+	/// Whether a value of t is a union packed in memory (§4.4): not boxed, nor of more than 256 members, which its tag
+	/// byte tells apart, nor with a T[n] member, nor in a program as lowered of a member whose layout a type param decides.
 	private packed(t: i32): bool {
 		const n = this.norm(t)
-		return this.p.kind(n) == kind.Union && n != this.any && !this.boxed(n) && !this.unbound(n)
-			&& !this.p.members(n).some(m => this.boxed(m) || this.p.kind(m) == kind.FixedArray)
+		const ms = this.p.members(n)
+		return this.p.kind(n) == kind.Union && n != this.any && !this.boxed(n) && !this.unbound(n) && ms.length <= 256
+			&& !ms.some(m => this.boxed(m) || this.p.kind(m) == kind.FixedArray)
 	}
 
 	/// The byte packed union n's tag is in, -1 if its members are null and a ref, which null is the zero of; the word its
