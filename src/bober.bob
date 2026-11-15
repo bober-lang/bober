@@ -442,7 +442,7 @@ function hasTests(path: string): bool {
 
 /// Compiles the program of main into the executable build/<name>, or with tests build/<name>.test, all as one,
 /// monomorphized, by LLVM, optimized, if release, else into the image, each module by TPDE, fast to compile: as
-/// lowered, or at -O1 monomorphized for the program, and at -O2 so by LLVM once unchanged (image); -O2 counts over -O0,
+/// lowered, or at -O1 monomorphized of its package, and at -O2 so by LLVM once unchanged (image); -O2 counts over -O0,
 /// -O0 over -O1. Returns the command that runs it, or its tests: the executable, or the launcher on the image's entry,
 /// named with the program's version, run by the C library's loader where it is the sysroot's, the image as image has
 /// it if pin. Throws the errors, or what failed, as a CompileError or IoError.
@@ -450,23 +450,25 @@ export function build(main: string, tests: bool, f: Compile, pin: bool): string[
 	if (f.wasm) {
 		return toWasm(main, tests, f.headers.I)
 	}
-	const p = lowered([main], f.headers.I)
+	const dyn = !f.O2 && (!f.O1 || f.O0)
+	const p = lowered(if (f.release || dyn) [main] else world(main), f.headers.I)
 	const m = p.module(normal(main))
-	const [files, cxx] = linked(p, tests, f.headers.I)
 	if (!f.release) {
-		const o = { main: -1, tests: false, dyn: !f.O2 && (!f.O1 || f.O0) }
+		const o = { main: -1, tests: false, dyn: dyn }
 		if (!o.dyn) {
 			for (const x of 0 ... p.modules.length - 1) {
 				p.modules[x].bc = if (p.modules[x].bc != "") p.modules[x].bc else write(p, x, compilerId())
 			}
 			mono(p, m, true)
 		}
+		const [files, cxx] = linked(p, program(p, [m], dyn), tests, f.headers.I)
 		const [at, version] = image(p, [m], files, cxx, pin, o, f.O2)
 		return [...(if (mac) [] else [`${sysroot}/usr/lib/libc.so`]),
 			if (packaged()) join(root, "lib/launch.c.exe") else launcher(dir), at,
 			`${entry(p.modules[m].path, tests)}${if (o.dyn) "" else monoSuffix}@${version}`]
 	}
 	const exe = `${dir}/${name(main)}${if (tests) ".test" else ""}`
+	const [files, cxx] = linked(p, program(p, [m], true), tests, f.headers.I)
 	const o = { main: m, tests: tests, dyn: false }
 	mono(p, m)
 	const whole = new LLVM(main, 2, !f.baseline) // which alone makes code, of all linked into it
@@ -513,8 +515,38 @@ function buildPackage(includes: string[]) {
 	}
 	const mains = sources(home!)
 	const p = lowered(mains, includes)
-	const [files, cxx] = linked(p, true, includes)
+	const [files, cxx] = linked(p, program(p, [], true), true, includes)
 	image(p, mains.map(m => p.module(normal(m))), files, cxx, false, debug)
+}
+
+/// The files the program of main is monomorphized with, which make it the same in each: those buildPackage links of
+/// main's package, if main is one, else main alone.
+function world(main: string): string[] {
+	const d = nearest(main)
+	const all = if (d == null) [] else sources(d)
+	return if (all.includes(normal(main))) all else [main]
+}
+
+/// The modules the program of p's modules mains links: all, as lowered, where a type may name any; else, monomorphized,
+/// mains, builtin/'s, and the deps and uses of each.
+function program(p: Program, mains: i32[], all: bool): i32[] {
+	const ms = [...mains]
+	for (const m of 0 ... p.modules.length - 1) {
+		if ((all || builtin(p.modules[m].path)) && !ms.includes(m)) {
+			ms.push(m)
+		}
+	}
+	let i = 0
+	while (i < ms.length) {
+		const m = p.modules[ms[i]]
+		i++
+		for (const d of [...m.deps, ...m.uses]) {
+			if (!ms.includes(d)) {
+				ms.push(d)
+			}
+		}
+	}
+	return ms
 }
 
 /// The .bob files of d and below that buildPackage links.
@@ -587,10 +619,10 @@ function lowered(mains: string[], includes: string[]): Program {
 /// compiled by pack.
 function packaged(): bool { return exists(join(root, "lib/std.bobc")) }
 
-/// What p links besides its modules, compiled where not yet: the C of p's modules (cObjects), and the run time, with
+/// What p links besides its modules ms, compiled where not yet: the C of these (cObjects), and the run time, with
 /// tests their network; and whether one is C++.
-function linked(p: Program, tests: bool, includes: string[]): [string[], bool] {
-	const [cs, cxx] = cObjects(p, includes)
+function linked(p: Program, ms: i32[], tests: bool, includes: string[]): [string[], bool] {
+	const [cs, cxx] = cObjects(p, ms, includes)
 	return [[...cs, ...(if (packaged()) glob(join(root, "lib/*.[ao]")) else runtime(dir)),
 		...(if (!tests) [] else if (packaged()) glob(join(root, "lib/net/*.o")) else network(dir))], cxx]
 }
@@ -615,6 +647,8 @@ let decoded: [u64, Linker, Bytes] | null = null
 /// image cannot take the link, or an archive it holds changed, all is linked anew, fresh. The image is written in place
 /// where no other process has it, else under a name of its own, then renamed, as a running program may have the old
 /// one mapped, or another build be reading it.
+/// Of p's modules, those of the program of mains are linked (program); another is held as its bytecode alone,
+/// `<path>^bc@<version>`, that no build checks it again.
 /// Returns its path, or if pin that of a link to it of this process's, which the launcher removes, by which what the
 /// process runs loads this build's image though another build replaces it; and the version of p's program, the hash of
 /// the names of what it is linked from, TPDE's for LLVM's.
@@ -665,12 +699,20 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	const compiler = compilerId()
 	// Of each module's unit, <path>@<source>.<version>, or monomorphized <path>^O1@<source>.<version>, which names
 	// LLVM's of its code too, <path>^O2@...; and the unit the program is linked from.
-	const names: string[] = []
-	const wanted: string[] = []
+	const ms = program(p, mains, o.dyn)
+	const parts: string[] = []
 	for (const m of 0 ... p.modules.length - 1) {
 		const path = p.modules[m].path
 		const bc = if (p.modules[m].bc != "") p.modules[m].bc else write(p, m, compiler)
 		const b = bound.get(path)?.bytes(path) ?? ""
+		if (!ms.includes(m)) {
+			// Not the program's: what a build links it from alone, <path>^bc@<version>, rather than check it again.
+			const name = `${path}^bc@${fnv(bc + b)}`
+			if (lacks(name)) {
+				l.add(cached(new Object(name, machine.arch), bc, b))
+			}
+			continue
+		}
 		// Monomorphized, its code names what the ABIs its bytecode has do not cover: its signatures too.
 		const version = `@${p.modules[m].source}.${fnv(bc + b
 			+ (if (o.dyn) "" else `${write(p, m, compiler)}${signatures(p, m)}`))}`
@@ -679,14 +721,13 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		// module's; else TPDE's, as after an edit.
 		const llvm = !o.dyn && (held.includes(opt)
 			|| o2 && (held.includes(fast) || !held.some(h => startsWith(h, `${path}^O`))))
-		names.push(if (o.dyn) `${path}${version}` else fast)
-		wanted.push(if (llvm) opt else names[m])
+		parts.push(if (o.dyn) `${path}${version}` else fast)
+		const wanted = if (llvm) opt else parts[parts.length - 1]
 		// Monomorphized, the others of either backend, which define the same symbols.
-		if (lacks(wanted[m], if (o.dyn) `${path}@` else `${path}^O`)) {
-			l.add(unit(p, m, wanted[m], o, bc, b, llvm))
+		if (lacks(wanted, if (o.dyn) `${path}@` else `${path}^O`)) {
+			l.add(unit(p, m, wanted, o, bc, b, llvm))
 		}
 	}
-	const parts = [...names]
 	const cxxs: string[] = if (cxx) [`${lib}/libc++.a`, `${lib}/libc++abi.a`] else []
 	const archives: string[] = []
 	let added = false // an archive the image did not look in
@@ -789,14 +830,7 @@ function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: s
 	for (const s of x.sections) {
 		s.group = "" // LLVM's of the personality's pointer, each object's own, as a kept image cannot move it
 	}
-	for (const [n, bytes] of [["bober_bc", bc], ["bober_bind", bound]]) {
-		if (bytes != "") {
-			const s = new Section(n, Kept)
-			s.bytes = bytes
-			s.size = bytes.length as u64
-			x.sections.push(s)
-		}
-	}
+	cached(x, bc, bound)
 	x.sections.push(new Section(".rodata", Const))
 	x.symbols.push(new Symbol(abiSymbol(p, m), Global, x.sections.length - 1))
 	for (const d of 0 ... p.modules.length - 1) {
@@ -811,20 +845,33 @@ function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: s
 	return x
 }
 
+/// x, holding a module's bytecode as lowered bc in section bober_bc, and its Bound, if any, in bober_bind.
+function cached(x: Object, bc: string, bound: string): Object {
+	for (const [n, bytes] of [["bober_bc", bc], ["bober_bind", bound]]) {
+		if (bytes != "") {
+			const s = new Section(n, Kept)
+			s.bytes = bytes
+			s.size = bytes.length as u64
+			x.sections.push(s)
+		}
+	}
+	return x
+}
+
 /// What the names of a monomorphized unit end in (unit).
 const monoSuffix = "^mono"
 
 /// The symbol named by the ABI of p's module m.
 function abiSymbol(p: Program, m: i32): string { return `bober.abi.${p.modules[m].path}.${abi(p, m)}` }
 
-/// The objects of the glue of p's modules of C headers but the bundle's, of source hash 0, compiled with includes and
-/// those of the packages of its modules, and all C libraries of each package one of whose headers it imports,
+/// The objects of the glue of p's modules ms of C headers but the bundle's, of source hash 0, compiled with includes
+/// and those of the packages of these modules, and all C libraries of each package one of whose headers it imports,
 /// which lld takes in any order, and of which it links what it uses; and whether one is CMake's, and so C++.
-function cObjects(p: Program, includes: string[]): [string[], bool] {
+function cObjects(p: Program, ms: i32[], includes: string[]): [string[], bool] {
 	const packages: [string, string[]][] = []
 	const headers: string[] = []
 	const cIncludes = includes.slice(0, includes.length)
-	for (const m of p.modules.filter(m => m.source != 0)) {
+	for (const m of ms.map(m => p.modules[m]).filter(m => m.source != 0)) {
 		const path = split(m.path, ": ")[0]
 		if (startsWith(path, `${sysroot}/`)) {
 			continue
@@ -840,7 +887,7 @@ function cObjects(p: Program, includes: string[]): [string[], bool] {
 	}
 	const libs: string[] = []
 	let cxx = false
-	for (const m of 0 ... p.modules.length - 1) {
+	for (const m of ms) {
 		const c = if (p.modules[m].source == 0) null else glued(p, m, cIncludes)
 		if (c != null) {
 			libs.push(c)
@@ -875,7 +922,7 @@ function pack(lib: string) {
 	runtime(lib)
 	network(lib)
 	launcher(lib)
-	const cs = cObjects(p, [])[0]
+	const cs = cObjects(p, program(p, [], true), [])[0]
 	run(["ar", "rcs", join(lib, "std.a"), ...cs.filter(c => endsWith(c, ".o"))])
 	for (const a of cs.filter(c => endsWith(c, ".a"))) {
 		save(join(lib, base(a)), readFile(a))

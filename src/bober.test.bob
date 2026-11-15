@@ -218,6 +218,18 @@ function main() {
 	assert units.filter(o => both.indexOf(o) < 0) == [] && built([], "-O1", "a.bob") == a && held() == both
 }
 
+test "programs of a package, each with a class of a module's interface, link the same units, its one for both" {
+	const lib = `export interface Named { name(): string }\n\nexport function named(x: Named): string { return x.name() }\n`
+	const main = (c: string) => `import { named } from "./lib"\n\nclass ${c} { name(): string { return "${c}" } }\n
+function main() { print(named(new ${c}())) }\n`
+	anew()
+	mkdirAll(`${home}/pkg`)
+	const a = built([["pkg/bober.pkg", `{ "name": "@test/pkg" }\n`], ["pkg/lib.bob", lib], ["pkg/a.bob", main("A")],
+		["pkg/b.bob", main("B")]], "-O1", "pkg/a.bob")
+	const units = held()
+	assert a == "A\n" && built([], "-O1", "pkg/b.bob") == "B\n" && held() == units
+}
+
 test "a class changed, a generic of another module instanced of it is compiled anew, monomorphized" {
 	const lib = `export interface HasV { v: i32 }\n\nexport function v[T extends HasV](x: T): i32 { return x.v }\n`
 	const main = (q: string) => `import { v } from "./lib"\n\nclass Q {${q}\n\tv = 1\n}\n

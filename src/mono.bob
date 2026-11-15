@@ -5,9 +5,10 @@
 //! each instance's types and code are lowered onto those unions, member access on them becoming calls of dispatch
 //! functions that switch on the tag, and each module lists its instances.
 //!
-//! For a module's unit of its own (src/bober.bob's image), the same in each program that has the module, a module
-//! lists only what is the same in every program, and as its copies what else its code reaches, as C++ does templates:
-//! the instances, dispatch functions and classes mono makes, each defined in every module that lists it.
+//! For a module's unit of its own (src/bober.bob's image), the same in each program that has the module, the Program
+//! being of all its package's files, which fixes what each union holds, a module lists only what is its own, and as
+//! its copies what else its code reaches, as C++ does templates: the instances, dispatch functions and classes mono
+//! makes, each defined in every module that lists it.
 //!
 //! A dispatch function is a decl of the module using it named `.f[T]` for reading field f of T, `.f=[T]` for writing
 //! it and `.f()[T]` for calling method f. An intrinsic, a function of builtin/ without a body, is called as itself with
@@ -20,7 +21,7 @@ import * as decl from "./bc/decl"
 import * as kind from "./bc/kind"
 import * as op from "./bc/op"
 import { Imm } from "./bc/op"
-import { Code, Program, pair } from "./bc/program"
+import { Code, Module, Program, pair } from "./bc/program"
 import { qualified, showType } from "./bc/show"
 import { CompileError } from "./error"
 import { Instances, bases, embedded, runtime, takesType } from "./resolve"
@@ -32,7 +33,8 @@ import { builtin, builtinPath } from "./root"
 /// Each module's decls and inits become their instances, its dispatch functions after its decls, and each instance's
 /// members those of its members' instances it owns, those of one decl in the order of their hashes, the same however p
 /// is read; its ABI hash, which mono changes, forgotten. If units, a module's decls are its roots and vars, and the
-/// statics of instances of its classes, which are one per program, and its copies the others its code reaches.
+/// statics of instances of its classes, which are one per program, its copies the others its code reaches, and its
+/// uses the modules of what else it names.
 export function mono(p: Program, main: i32, units = false) throws CompileError { new Mono(p, units).run(main) }
 
 class Mono {
@@ -290,7 +292,7 @@ class Mono {
 			if (this.units) {
 				m.decls = [...m.decls.filter(d => this.own.has(d)),
 					...byHash(statics.filter(k => p.decls[k].module == mi))]
-				m.copies = this.copies(m.decls)
+				m.copies = this.copies(m)
 			} else {
 				m.decls = [...instances(m.decls), ...byHash(this.dispatches.filter(d => p.decls[d].module == mi))]
 			}
@@ -310,18 +312,20 @@ class Mono {
 		return if (o < 0 || !this.held(k)) k else this.top(o)
 	}
 
-	/// The decls kept that the code of decls ds, and of what they hold, names, but those modules list as their own, each
-	/// in the order reached, with what it holds: a module's copies. Of a class, also its constructor, which emit finds by
-	/// name.
-	private copies(ds: i32[]): i32[] {
+	/// The decls kept that the code of m's decls, and of what they hold, names, but those modules list as their own,
+	/// each in the order reached, with what it holds: a module's copies; the modules of those, m's uses. Of a class,
+	/// also its constructor, which emit finds by name.
+	private copies(m: Module): i32[] {
 		const p = this.p
 		const out: i32[] = []
-		const todo = ds.slice(0, ds.length)
+		const todo = m.decls.slice(0, m.decls.length)
 		const seen = new HashMap[i32, bool]()
 		const types = new HashMap[i32, bool]()
 		const reach = (d: i32) => {
 			const t = this.top(d)
-			if (this.keep.has(t) && !this.own.has(t) && !seen.has(t)) {
+			if (this.own.has(t) && !m.uses.includes(p.decls[t].module)) {
+				m.uses.push(p.decls[t].module)
+			} else if (this.keep.has(t) && !this.own.has(t) && !seen.has(t)) {
 				seen.set(t, true)
 				out.push(t)
 				todo.push(t)
@@ -337,7 +341,7 @@ class Mono {
 			i++
 			todo.append(x.members)
 			const c = x.code ?? new Code()
-			for (const t of [x.type, ...c.locals.map(l => l.type)]) {
+			for (const t of [x.type, ...p.lists[x.tags], ...c.locals.map(l => l.type)]) {
 				this.named(t, types, reach)
 			}
 			for (const j of 0 ... c.ops.length - 1) {
