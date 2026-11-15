@@ -266,7 +266,9 @@ function command(c: Command): i32 {
 			if (c.args.length == 0) {
 				return testAll(c.compile)
 			}
-			const [status, report] = runTests(c.args[0], c.args.slice(1, c.args.length), c.compile)
+			const main = c.args[0]
+			const f = c.compile
+			const [status, report] = runTests(main, c.args.slice(1, c.args.length), () => build(main, true, f, true))
 			stdout.write(yamlOf(report))
 			return status
 		case Build:
@@ -379,9 +381,12 @@ function init(name: string) {
 }
 
 /// Runs the tests of testFiles(".") as test without main.bob prints them; 0 if all passed. A failed file's YAML starts
-/// with a line for each of its directories, of which those the last failed file printed are left out.
+/// with a line for each of its directories, of which those the last failed file printed are left out. Monomorphized,
+/// the files of a package are compiled as one, once (programs).
 function testAll(f: Compile): i32 {
 	const files = testFiles(".")
+	const one = !f.wasm && !f.release && (f.O2 || f.O1 && !f.O0)
+	const commands = new HashMap[string, (main: string) => string[]]() // of the files compiled so
 	const clear = if (isatty(1) != 0) "\r\x1b[K" else ""
 	let dirs: string[] = [] // of the last failed file
 	let failed = 0
@@ -389,7 +394,20 @@ function testAll(f: Compile): i32 {
 		if (clear != "") {
 			stdout.write(`${clear}[${i + 1}/${files.length}] ${files[i]}`)
 		}
-		const [s, report] = runTests(files[i], [], f)
+		const [s, report] = runTests(files[i], [], () => {
+			if (!one) {
+				return build(files[i], true, f, true)
+			}
+			if (!commands.has(files[i])) {
+				const w = world(files[i])
+				const g = files.filter(x => x == files[i] || w.includes(normal(x)))
+				const c = programs(g, true, f, true)
+				for (const x of g) {
+					commands.set(x, c)
+				}
+			}
+			return commands.get(files[i])!(files[i])
+		})
 		if (s != 0) {
 			const parts = split(files[i], "/")
 			const lines = split(yamlOf(parts.map(p => `{${quoted(p)}:`).join("") + report
@@ -447,13 +465,13 @@ class TestCache {
 	files: [string, string][] = []
 }
 
-/// Builds the program of main with its tests and runs them with args, unless their report is kept: its exit status,
-/// and its report, the JSON object src/rt.c prints, ended by the exit status if a crash cut it off, or else what failed
-/// as a JSON string.
-function runTests(main: string, args: string[], f: Compile): [i32, string] {
+/// Runs main's tests by the command command gives, building them, with args, unless their report is kept: its exit
+/// status, and its report, the JSON object src/rt.c prints, ended by the exit status if a crash cut it off, or else what
+/// failed as a JSON string.
+function runTests(main: string, args: string[], command: () => string[]): [i32, string] {
 	try {
 		const out = `${dir}/${name(main)}.test.log`
-		const cmd = [...build(main, true, f, true), ...args]
+		const cmd = [...command(), ...args]
 		const flat = replace(normal(main), "/", "_")
 		const file = `${dir}/kept/${flat}`
 		const code = if (built == "") "" else `${built} ${args.map(quoted).join(" ")}`
@@ -531,24 +549,12 @@ export function build(main: string, tests: bool, f: Compile, pin: bool): string[
 	if (f.wasm) {
 		return toWasm(main, tests, f.headers.I)
 	}
-	const dyn = !f.O2 && (!f.O1 || f.O0)
-	const p = lowered(if (f.release || dyn) [main] else world(main), f.headers.I)
+	if (!f.release) {
+		return programs([main], tests, f, pin)(main)
+	}
+	const p = lowered([main], f.headers.I)
 	const m = p.module(normal(main))
 	built = if (tests) code(p, m, f.headers.I) else ""
-	if (!f.release) {
-		const o = { main: -1, tests: false, dyn: dyn }
-		if (!o.dyn) {
-			for (const x of 0 ... p.modules.length - 1) {
-				p.modules[x].bc = if (p.modules[x].bc != "") p.modules[x].bc else write(p, x, compilerId())
-			}
-			mono(p, m, true)
-		}
-		const [files, cxx] = linked(p, program(p, [m], dyn), tests, f.headers.I)
-		const [at, version] = image(p, [m], files, cxx, pin, o, f.O2)
-		return [...(if (mac) [] else [`${sysroot}/usr/lib/libc.so`]),
-			if (packaged()) join(root, "lib/launch.c.exe") else launcher(dir), at,
-			`${entry(p.modules[m].path, tests)}${if (o.dyn) "" else monoSuffix}@${version}`]
-	}
 	const exe = `${dir}/${name(main)}${if (tests) ".test" else ""}`
 	const [files, cxx] = linked(p, program(p, [m], true), tests, f.headers.I)
 	const o = { main: m, tests: tests, dyn: false }
@@ -590,6 +596,29 @@ function code(p: Program, main: i32, includes: string[]): string {
 		hashes.push(`${path} ${fnv(p.modules[m].bc + (bound.get(path)?.bytes(path) ?? ""))}`)
 	}
 	return `${fnv(hashes.join("\n"))}`
+}
+
+/// Compiles the programs of mains into the image as build does, at -O1 and -O2 monomorphized as one of their package;
+/// returns what gives the command of one of them, linking the image again only where another build wrote it (done).
+function programs(mains: string[], tests: bool, f: Compile, pin: bool): (main: string) => string[] {
+	const dyn = !f.O2 && (!f.O1 || f.O0)
+	const p = lowered(if (dyn) mains else world(mains[0]), f.headers.I)
+	const ms = mains.map(m => p.module(normal(m)))
+	const o = { main: -1, tests: false, dyn: dyn }
+	if (!o.dyn) {
+		for (const x of 0 ... p.modules.length - 1) {
+			p.modules[x].bc = if (p.modules[x].bc != "") p.modules[x].bc else write(p, x, compilerId())
+		}
+		mono(p, ms[0], true)
+	}
+	const [files, cxx] = linked(p, program(p, ms, dyn), tests, f.headers.I)
+	return main => {
+		built = if (tests) code(p, p.module(normal(main)), f.headers.I) else ""
+		const [at, version] = image(p, ms, files, cxx, pin, o, f.O2)
+		return [...(if (mac) [] else [`${sysroot}/usr/lib/libc.so`]),
+			if (packaged()) join(root, "lib/launch.c.exe") else launcher(dir), at,
+			`${entry(normal(main), tests)}${if (o.dyn) "" else monoSuffix}@${version}`]
+	}
 }
 
 /// Compiles the program of main into file, by default build/<name>.wasm, or with tests build/<name>.test.wasm,
@@ -741,6 +770,9 @@ const debug = { main: -1, tests: false, dyn: true }
 /// Of build/image.so as lowered read it, the stamp, its linker and bytes; each store of it has a new random stamp, so
 /// a file of the same stamp is the one decoded, which relink then continues.
 let decoded: [u64, Linker, Bytes] | null = null
+/// The Program relink last linked, the stamp of the image it left, and the program's version: a file of that stamp
+/// holds all of it, which linking it again only pins.
+let done: [Program, u64, u64] | null = null
 
 /// Links p's modules, each compiled as o says, the objects and archives files, if cxx the sysroot's libc++,
 /// and the C library's libunwind and compiler builtins into build/image.so, the one image of all that is built there,
@@ -785,7 +817,12 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	const d = decoded
 	decoded = null
 	const mapped = new Bytes(if (old != null) old.map() else "")
-	const unchanged = old != null && d != null && stamp(mapped, format.headers) == d[0]
+	let left = if (old != null) stamp(mapped, format.headers) else 0 as u64 // the stamp of the image as this leaves it
+	const tmp = `${out}.${getpid()}`
+	if (old != null && done != null && done![0] == p && done![1] == left) {
+		return [if (pin) pinned(out, `${tmp}.run`) else out, done![2]]
+	}
+	const unchanged = old != null && d != null && left == d[0]
 	const kept = if (unchanged) d![2] else mapped
 	const l = if (unchanged) d![1] else new Linker(machine, format, kept)
 	const held = l.objects()
@@ -866,7 +903,6 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		l.export(entry(p.modules[m].path, true) + (if (o.dyn) "" else monoSuffix))
 	}
 	const changed = l.changed()
-	const tmp = `${out}.${getpid()}`
 	let at = out // where the image is written
 	if (changed) {
 		// The archives' members, listed once a name is looked for in them that the image did not look for; at once if an
@@ -887,6 +923,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		try {
 			const linked = l.link()
 			stamped(linked.bytes, format.headers)
+			left = stamp(linked.bytes, format.headers)
 			format.write(linked)
 			const continued = linked.bytes == kept
 			at = if (continued && alone) out else tmp
@@ -899,19 +936,23 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			return image(p, mains, files, cxx, pin, o, o2, true)
 		}
 	}
-	const own = `${tmp}.run`
-	if (pin) {
-		if (exists(own)) {
-			remove(own) // which a process of this ID left, whose launcher never ran
-		}
-		if (hardLink(at, own) != 0) {
-			throw new CompileError(`cannot link ${own}`)
-		}
-	}
+	const own = if (pin) pinned(at, `${tmp}.run`) else out
 	if (at != out) {
 		rename(tmp, out)
 	}
-	return [if (pin) own else out, fnv(parts.join(" "))]
+	done = [p, left, fnv(parts.join(" "))]
+	return [own, done![2]]
+}
+
+/// own, made a link to the image at: a run's own, which the launcher removes.
+function pinned(at: string, own: string): string {
+	if (exists(own)) {
+		remove(own) // which a process of this ID left, whose launcher never ran
+	}
+	if (hardLink(at, own) != 0) {
+		throw new CompileError(`cannot link ${own}`)
+	}
+	return own
 }
 
 /// Module m of p, compiled by TPDE, or if llvm by LLVM, as o says, as the object name. It defines a symbol named by
