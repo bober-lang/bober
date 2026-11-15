@@ -1887,8 +1887,10 @@ class Gen {
 		this.value(after(q, ":") ?? q, q.type!)
 	}
 
-	/// Pushes ps, each as item pushes it but a spread's value as it is, then op o, which makes them one value of type t.
+	/// Pushes ps, each as item pushes it but a spread's value as it is, then op o, which makes them one value of type t;
+	/// each followed by an Init if none is spread.
 	private spread(o: Opcode, t: Type, ps: Node[], item: (q: Node, i: i32) => void) {
+		const init = !ps.some(q => q.kind == "unary" && q.t.kind == "...")
 		const spreads: i32[] = []
 		for (const i of 0 ... ps.length - 1) {
 			const q = ps[i]
@@ -1897,6 +1899,9 @@ class Gen {
 				spreads.push(i)
 			} else {
 				item(q, i)
+				if (init) {
+					this.op(op.Init, this.ty(t), i, ps.length)
+				}
 			}
 		}
 		this.op(o, this.ty(t), ps.length, this.code.list(spreads))

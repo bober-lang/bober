@@ -96,6 +96,9 @@ type V = { v: Value, t: i32 }
 /// A field of a class instance, object or tuple; an embedded one is held in place. Its mods and decl, -1 for an
 /// object's or tuple's, are for reflection.
 type Slot = { name: i32, t: i32, embed: bool, mods: i32, decl: i32 }
+/// A literal of type t, of n values its Inits fill, filled so far: r its ref, or 0 if held by value, which its op makes
+/// of them.
+type Lit = { t: i32, n: i32, filled: i32, r: Value }
 
 /// An open block.
 class Frame {
@@ -240,6 +243,7 @@ class Emitter {
 	private entry: Block = 0
 	private dead = true
 	private stack: V[] = []
+	private lits: Lit[] = []
 	private frames: Frame[] = []
 	/// The type params whose descriptors the function takes, those descriptors, and those it formed, by type.
 	private scope: i32[] = []
@@ -593,6 +597,7 @@ class Emitter {
 		this.owned = new HashMap[Value, i32]()
 		this.dead = true
 		this.stack = []
+		this.lits = []
 		this.frames = []
 		this.unwind = 0
 		this.locals = []
@@ -896,7 +901,27 @@ class Emitter {
 					this.check(this.ir().icmp("sge", this.arrLen(arr.v), this.i64Const(n)),
 						"array pattern longer than array")
 				}
-			case op.Array, op.Object: this.array(n, this.popN(c.b(i)), c.items(c.c(i)))
+			case op.Init:
+				if (c.b(i) == 0) {
+					const held = this.facts.phase == "learned" && this.holdable(n)
+					this.lits.push(if (held) ({ t: n, n: c.c(i), filled: 0, r: 0 }) else this.literal(n, c.c(i)))
+				}
+				const l = this.lits[this.lits.length - 1]
+				l.filled++
+				if (l.r != 0) {
+					this.fill(l, c.b(i), this.pop())
+					this.push(0, kind.None) // a stand-in, which the literal's op drops
+				}
+			case op.Array, op.Object:
+				// That of the literal whose last Init is right before, as the ops between Inits make whole values.
+				const top = this.lits.length - 1
+				const l = if (top >= 0 && this.lits[top].filled == this.lits[top].n) this.lits.pop() else null
+				if (l != null && l.r != 0) {
+					this.stack = this.stack.slice(0, this.stack.length - l.n) // the Inits' stand-ins
+					this.finish(l)
+				} else {
+					this.array(n, this.popN(c.b(i)), c.items(c.c(i)))
+				}
 			case op.New: this.make(n)
 			case op.Closure:
 				const list = c.items(c.c(i))
@@ -2231,7 +2256,7 @@ class Emitter {
 			this.push(x, t)
 			return
 		}
-		if (k == kind.Array) {
+		if (k == kind.Array && spreads.length > 0) {
 			// The elements, each converted, in a block of the length, which the spreads' lengths make up.
 			const e = this.p.a(n)
 			let len = this.i64Const(vs.length - spreads.length)
@@ -2257,27 +2282,52 @@ class Emitter {
 			this.push(r, t)
 			return
 		}
-		const fixed = k == kind.FixedArray
-		if (this.dyn && this.unbound(n) && fixed) {
-			throw new CompileError(`emit: ${showType(this.p, n)} of a type param`)
-		}
-		const st = if (fixed) this.mem(n) else 0
-		const slots = if (fixed) [] else this.layout(n)
-		// A T[n] is copied where stored, so one holding no refs, which would have the collector find it, is in the frame.
-		const r = if (!fixed) this.instance(n)
-			else if (!this.b.holdsRef(st)) this.gc(this.spill(this.zero(n), st, this.slot(st)))
-			else this.alloc(st)
+		const l = this.literal(t, vs.length - spreads.length)
 		let f = 0
 		for (const j of 0 ... vs.length - 1) {
 			if (spreads.includes(j)) {
-				this.copy(vs[j], { v: r, t: n })
+				this.copy(vs[j], { v: l.r, t: n })
 			} else {
-				const q = if (fixed) this.ir().gep(st, r, [this.i64Const(0), this.i64Const(f)]) else this.gep(r, n, f)
-				this.write(q, vs[j], if (fixed) this.p.a(n) else slots[f].t)
+				this.fill(l, f, vs[j])
 				f++
 			}
 		}
-		this.push(if (this.boxed(n)) this.union(this.desc(n), this.i64Const(0), r) else r, t)
+		this.finish(l)
+	}
+
+	/// A literal of type t of n values but those spread, to place them in.
+	private literal(t: i32, n: i32): Lit {
+		const u = this.norm(t)
+		const k = this.p.kind(u)
+		if (this.dyn && this.unbound(u) && k == kind.FixedArray) {
+			throw new CompileError(`emit: ${showType(this.p, u)} of a type param`)
+		}
+		const st = if (k == kind.FixedArray) this.mem(u) else 0
+		// A T[n] is copied where stored, so one holding no refs, which would have the collector find it, is in the frame.
+		const r = if (k == kind.Array) this.cellOf(this.p.a(u), this.i64Const(n))
+			else if (k != kind.FixedArray) this.instance(u)
+			else if (!this.b.holdsRef(st)) this.gc(this.spill(this.zero(u), st, this.slot(st)))
+			else this.alloc(st)
+		return { t, n, filled: 0, r }
+	}
+
+	/// Stores v as value j of literal l but those spread.
+	private fill(l: Lit, j: i32, v: V) {
+		const u = this.norm(l.t)
+		const e = this.p.a(u)
+		switch (this.p.kind(u)) {
+			case kind.Array:
+				const at = this.ir().gep(this.arrayTy, l.r, [this.i64Const(1)])
+				this.write(this.at(at, e, this.i64Const(j)), v, e)
+			case kind.FixedArray: this.write(this.ir().gep(this.mem(u), l.r, [this.i64Const(0), this.i64Const(j)]), v, e)
+			default: this.write(this.gep(l.r, u, j), v, this.layout(u)[j].t)
+		}
+	}
+
+	/// Pushes literal l, its values placed.
+	private finish(l: Lit) {
+		const u = this.norm(l.t)
+		this.push(if (this.boxed(u)) this.union(this.desc(u), this.i64Const(0), l.r) else l.r, l.t)
 	}
 
 	/// New: a class instance, its constructor called.
