@@ -93,6 +93,8 @@ export class Compile @optarg.Cc {
 	O0: bool @optarg.Verbose = false
 	/// compile to WebAssembly GC, run by node
 	wasm: bool = false
+	/// -release for the first x86-64 CPUs, not x86-64-v2, those since about 2009
+	baseline: bool @optarg.Verbose = false
 }
 
 /// build a program and run it
@@ -246,7 +248,7 @@ function command(c: Command): i32 {
 			} else if (c.compile.wasm) {
 				toWasm(c.args[0], false, c.compile.headers.I, c.o)
 			} else {
-				inspect(c.args[0], c.o, c.compile.headers.I, c.compile.release)
+				inspect(c.args[0], c.o, c.compile)
 			}
 			return 0
 		case Run: if (c.args.length > 0) {
@@ -448,7 +450,7 @@ export function build(main: string, tests: bool, f: Compile, pin: bool): string[
 	const exe = `${dir}/${name(main)}${if (tests) ".test" else ""}`
 	const o = { main: m, tests: tests, dyn: false }
 	mono(p, m)
-	const whole = new LLVM(main)
+	const whole = new LLVM(main, 2, !f.baseline) // which alone makes code, of all linked into it
 	const facts = learn(p, o, m => new LLVM(p.modules[m].path))
 	for (const m of 0 ... p.modules.length - 1) {
 		const b = new LLVM(p.modules[m].path)
@@ -516,17 +518,17 @@ function sources(d: string): string[] {
 /// or if release by LLVM at -O2, monomorphized from what is not generic in it, without what a whole program's emission
 /// learns (learn), and without the generics, but with its bytecode as lowered (src/bc/file.bob), which has them, in
 /// section bober_bc.
-function inspect(path: string, out: string, includes: string[], release: bool) {
-	const p = lowered([path], includes)
+function inspect(path: string, out: string, f: Compile) {
+	const p = lowered([path], f.headers.I)
 	const m = p.module(normal(path))
-	if (!release) {
+	if (!f.release) {
 		const b = new Tpde(path)
 		emit(p, m, b, debug)
 		b.verify()
 		b.emit(out, false)
 		return
 	}
-	const b = new LLVM(path)
+	const b = new LLVM(path, 2, !f.baseline)
 	b.data(write(p, m, compilerId()), "bober_bc")
 	mono(p, m, true)
 	emit(p, m, b, { main: -1, tests: false, dyn: false })
