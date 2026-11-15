@@ -256,7 +256,7 @@ export class Instances {
 		return if (m < 0 || this.p.decls[m].params.length > 0) -1 else m
 	}
 
-	/// The instance of member(t, name), or -1; of an interface, also of those it embeds.
+	/// The instance of member(t, name), or -1; of an interface, also of its bases.
 	memberOf(t: i32, name: i32): i32 throws CompileError {
 		const p = this.p
 		const m = this.member(t, name)
@@ -264,8 +264,8 @@ export class Instances {
 			return this.instance(m, p.b(t))
 		}
 		if (this.nominal(t) == decl.Interface) {
-			for (const e of p.decls[p.a(t)].members.filter(e => embedded(p, e))) {
-				const r = this.memberOf(p.subst(p.decls[e].type, p.b(t)), name)
+			for (const b of bases(p, p.a(t))) {
+				const r = this.memberOf(p.subst(b, p.b(t)), name)
 				if (r >= 0) {
 					return r
 				}
@@ -445,6 +445,12 @@ function source(p: Program, k: i32): i32 { return if (p.decls[k].generic < 0) k 
 
 /// Whether member d embeds its type.
 export function embedded(p: Program, d: i32): bool { return (p.decls[d].mods & decl.Embed) != 0 }
+
+/// The types whose members class or interface decl d has as its own: those it embeds, and those it extends or implements.
+export function bases(p: Program, d: i32): i32[] {
+	const ts = p.decls[d].members.filter(m => embedded(p, m)).map(m => p.decls[m].type)
+	return [...ts, ...p.lists[p.decls[d].supers].filter(t => p.kind(t) == kind.Named)]
+}
 
 /// Function type f as called at run time: without the params holding a Type, whose args are known, and of no result
 /// where it holds one, which is known.
