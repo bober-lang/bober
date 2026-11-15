@@ -16,9 +16,8 @@ function files(n: i32): [string, string][] {
 	return [["types.bob", types], ["own.bob", own], ["lib.bob", lib], ["main.bob", program(n)]]
 }
 
-/// What main prints, built in home at level, as lowered if "", with the files written first; and the objects of
-/// lib.bob's instances and overlays its image holds.
-function built(files: [string, string][], level = "", main = "main.bob"): [string, string[]] {
+/// What main prints, built in home at level, as lowered if "", with the files written first.
+function built(files: [string, string][], level = "", main = "main.bob"): string {
 	mkdirAll(home)
 	for (const [name, src] of files) {
 		writeFile(`${home}/${name}`, src)
@@ -32,7 +31,7 @@ function built(files: [string, string][], level = "", main = "main.bob"): [strin
 	} finally {
 		dir = "build"
 	}
-	return [readFile(`${home}/out`)!, held().filter(o => indexOf(o, "lib.bob~") >= 0 || indexOf(o, "lib.bob^O2@") >= 0)]
+	return readFile(`${home}/out`)!
 }
 
 /// The objects home's image holds.
@@ -140,92 +139,40 @@ ${sizes}	const b = new Box[i32](2)
 /// What main.bob prints, size summed to k.
 function printed(k: i32): string { return `${k} 2 1 1 p1,p1 18 1\nbad true i32\n` }
 
-/// Those of held, built's, of lib.bob's instances.
-function instances(held: string[]): string[] { return held.filter(o => indexOf(o, "lib.bob~") >= 0) }
-
-test "an edit of a generic's body unlinks its instances, the build running the new body" {
-	built(files(1), "-O2")
-	const [out, held] = built([["lib.bob", replace(lib, "return 1", "return 2")]])
-	assert out == printed(2) && held.length == 0
-}
-
-test "a change of the layout of a type arg's class unlinks the instances of it, its module's export or not" {
-	for (const [file, src, from] of [["types.bob", types, "x = 1"], ["own.bob", own, "v = 1"]]) {
-		built(files(1), "-O2")
-		const [out, held] = built([[file, replace(src, from, `y = 5\n\t${from}`)]])
-		assert out == printed(1) && instances(held).length == 0
-	}
-}
-
-test "a new instance compiles one bucket anew" {
-	const before = instances(built(files(150), "-O2")[1])
-	const [out, held] = built([["main.bob", program(151)]], "-O2")
-	const after = instances(held)
-	assert before.length == 4 && after.length == 4 && after.filter(o => !before.includes(o)).length == 1
-	assert out == printed(151)
-}
-
-test "-O2 compiles by LLVM the instances and each module's functions over their code, which a build without keeps" {
-	const [out, held] = built(files(1), "-O2")
-	assert out == printed(1) && held.some(o => indexOf(o, "lib.bob^O2@") >= 0) && held.every(o => indexOf(o, "^O2@") >= 0)
-	const [again, kept] = built([["main.bob", replace(program(1), "let k = 0", "let k = 1")]])
-	assert again == printed(2) && kept == held
-	assert built([], "-O2") == [printed(2), held]
-}
-
-test "an edit of a module unlinks its overlay, the build running the new code" {
-	built(files(1), "-O2")
-	const [out, held] = built([["lib.bob", replace(lib, "return f(i32)", "return f(i64)")]])
-	assert out == `1 2 1 1 p1,p1 18 1\nbad true i64\n` && held.length == 0
-}
-
-test "an edited module runs on its base code, the first -O2 build that finds it unchanged optimises it again" {
-	const overlays = (held: string[]) => held.filter(o => indexOf(o, "lib.bob^O2@") >= 0).length
-	anew()
-	const [_, held] = built(files(1), "-O2")
-	const [out, kept] = built([["main.bob", replace(program(1), "let k = 0", "let k = 1")]], "-O2")
-	assert overlays(held) == 1 && out == printed(2) && kept == held
-	for (const t of ["i64", "i16"]) {
-		const [edited, base] = built([["lib.bob", replace(lib, "return f(i32)", `return f(${t})`)]], "-O2")
-		assert edited == `2 2 1 1 p1,p1 18 1\nbad true ${t}\n` && overlays(base) == 0
-	}
-	const [again, back] = built([], "-O2")
-	assert again == `2 2 1 1 p1,p1 18 1\nbad true i16\n` && overlays(back) == 1
-}
-
 test "a trap in -O2's code shows its line, after an edit above it" {
 	const lib = "export function at(xs: i32[]): i32 { return xs[1] }\n"
 	const main = `import { at } from "./lib"\nfunction main() { at([]) }\n`
 	anew()
-	const out = built([["lib.bob", lib], ["main.bob", main]], "-O2")[0]
-	built([["lib.bob", `\n${lib}`]], "-O2") // its base code
-	const again = built([], "-O2")[0]
+	const out = built([["lib.bob", lib], ["main.bob", main]], "-O2")
+	built([["lib.bob", `\n${lib}`]], "-O2") // by TPDE
+	const again = built([], "-O2")
 	assert indexOf(out, "lib.bob:1:47: trap") >= 0 && indexOf(again, "lib.bob:2:47: trap") >= 0
 }
 
 test "a union cast to an interface at -O0 traps if the value does not fit" {
 	anew()
 	const main = "interface HasSide { side: f64 }\nfunction side(n: HasSide | null): f64 { return n!.side }\nfunction main() { side(null) }\n"
-	assert built([["main.bob", main]], false)[0] == `${home}/main.bob:2:49: trap: cast to a type that is not the value's\n`
+	assert built([["main.bob", main]]) == `${home}/main.bob:2:49: trap: cast to a type that is not the value's\n`
 }
 
-test "an export added to a module keeps the code of one that imports it, a change of what it names does not" {
-	const dep = "export function one(): i32 { return 1 }\n"
-	const lib = `import { one } from "./dep"\nexport function two(): i32 { return one() + 1 }\n`
-	const main = `import { two } from "./lib"\nfunction main() { print(\`\${two()}\`) }\n`
+test "-O2 has LLVM compile each monomorphized module, an edited one TPDE until it is unchanged, which -O1 keeps" {
+	const units = () => held().filter(o => indexOf(o, "^O") >= 0)
 	anew()
-	const [out, held] = built([["dep.bob", dep], ["lib.bob", lib], ["main.bob", main]], "-O2")
-	const [again, kept] = built([["dep.bob", `${dep}export function three(): i32 { return 3 }\n`]], "-O2")
-	assert out == "2\n" && again == out && held.length > 0 && kept == held
-	const [changed, anew] = built([["dep.bob", "export function one(x = 2): i32 { return x }\n"]], "-O2")
-	assert changed == "3\n" && anew.length > 0 && !anew.some(o => held.includes(o))
+	const out = built(files(1), "-O2")
+	const fresh = units()
+	assert out == printed(1) && fresh.length > 0 && fresh.every(o => indexOf(o, "^O2@") >= 0)
+	const edited = built([["lib.bob", replace(lib, "return f(i32)", "return f(i64)")]], "-O2")
+	assert edited == replace(out, "true i32", "true i64") && units().some(o => startsWith(o, `${home}/lib.bob^O1@`))
+	const again = built([], "-O2")
+	const opt = units()
+	assert again == edited && opt.every(o => indexOf(o, "^O2@") >= 0) && built([], "-O1") == edited && units() == opt
 }
 
 test "a program is launched as its entry and the version of what it is linked from, which an edit of a module changes" {
 	const main = `import { name } from "../../std/process"\nimport { one } from "./dep"\n
 function main() { print(\`\${name()} \${one()}\`) }\n`
 	const run = (one: string) => built([["dep.bob", `export function one(): i32 { return ${one} }\n`],
-		["main.bob", main]])[0]
+		["main.bob", main]])
 	const [out, again, edited] = [run("1"), run("1"), run("2")]
 	assert startsWith(out, `bober.main.${home}/main.bob@`) && again == out
 	assert edited != replace(out, " 1", " 2") && endsWith(edited, " 2\n")
@@ -233,9 +180,9 @@ function main() { print(\`\${name()} \${one()}\`) }\n`
 
 test "a module's unit as lowered and monomorphized are held side by side, each build linking its own" {
 	anew()
-	const [out, mono] = [built(files(1))[0], built([], "-O1")[0]]
+	const [out, mono] = [built(files(1)), built([], "-O1")]
 	const both = held()
-	assert out == printed(1) && mono == out && built([])[0] == out && held() == both
+	assert out == printed(1) && mono == out && built([]) == out && held() == both
 	assert both.some(o => startsWith(o, `${home}/lib.bob@`)) && both.some(o => startsWith(o, `${home}/lib.bob^O1@`))
 }
 
@@ -247,8 +194,8 @@ class ${c} { name(): string { return "${c}" } }\n
 function main() { print(\`\${new Box[${t}](${v}).v} \${named(new ${c}())}\`) }\n`
 	anew()
 	const a = built([["lib.bob", lib], ["a.bob", main("A", "i32", "1")], ["b.bob", main("B", "string", `"s"`)]], "-O1",
-		"a.bob")[0]
-	assert a == "1 A\n" && built([], "-O1", "b.bob")[0] == "s B\n" && built([], "-O1", "a.bob")[0] == a
+		"a.bob")
+	assert a == "1 A\n" && built([], "-O1", "b.bob") == "s B\n" && built([], "-O1", "a.bob") == a
 }
 
 test "a C library's toolchain file includes its own, of a package found by a rooted path or not" {
