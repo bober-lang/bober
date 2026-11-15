@@ -140,12 +140,12 @@ _Noreturn void bober_fail(const uint8_t *how, const char *file, int32_t at) {
   bober_trap(what, file, at);
 }
 
-/// Where the value last thrown was first thrown, for bober_uncaught.
-static const char *thrownFile;
-static int32_t thrownAt;
+/// Where the value last thrown was first thrown, for bober_uncaught, and for builtin/fiber.bob's Thrown to keep.
+const char *bober_thrown_file;
+int32_t bober_thrown_at;
 
 void bober_throw(int64_t tag, int64_t bits, void *ref, const char *file, int32_t at) {
-  if (file) thrownFile = file, thrownAt = at;
+  if (file) bober_thrown_file = file, bober_thrown_at = at;
   free(caught), caught = 0;  // A landing pad loads what it caught at once, so the last throw's is done with.
   Thrown *e = bober_malloc(sizeof(Thrown));
   *e = (Thrown){.tag = tag, .bits = bits, .ref = ref};
@@ -156,7 +156,7 @@ void bober_throw(int64_t tag, int64_t bits, void *ref, const char *file, int32_t
 _Noreturn void bober_uncaught(int64_t tag, int64_t bits, void *ref, const uint8_t *shown) {
   char what[2048] = "uncaught throw: ";
   show(what + 16, sizeof what - 16, shown ? 13 : *(const int64_t *)tag, bits, shown ? shown : ref);
-  bober_trap(what, thrownFile, thrownAt);
+  bober_trap(what, bober_thrown_file, bober_thrown_at);
 }
 
 /// Reads a value of the language-specific data: a uleb128, or a udata4, the two encodings LLVM uses for call sites.
