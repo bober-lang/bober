@@ -128,9 +128,10 @@ static int64_t placed(const bober_type *t, int64_t i) {
 }
 
 /// Lays out union t, its members completed, as src/emit.bob's shape does (§4.4): packed, each member at its offset,
-/// its tag's byte in length, -1 if its members are null and a ref, which null is the zero of. False if a member is
-/// held as any or in place, as t is then.
+/// its tag's byte in length, -1 if its members are null and a ref, which null is the zero of. False if it has more than
+/// 256 members, which the byte does not tell apart, or a member is held as any or in place, as t is then.
 static bool pack(bober_type *t) {
+  if (t->nparts > 256) return false;
   int64_t end = 0, align = 1;  // set last, as complete stops at a type with its align set
   for (int64_t i = 0; i < t->nparts; i++) {
     bober_type *m = (bober_type *)t->parts[i];
