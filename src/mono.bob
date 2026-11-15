@@ -3,7 +3,8 @@
 //! (src/resolve.bob) makes each decl reached from the roots an instance per env and copies its code. Then the types
 //! converted into each interface and object type are collected program-wide, making it the union of them (§4.7). Last,
 //! each instance's types and code are lowered onto those unions, member access on them becoming calls of dispatch
-//! functions that switch on the tag, and each module lists its instances.
+//! functions that switch on the tag, and each module lists its instances; the program whole, its unions' members are
+//! numbered for their tags.
 //!
 //! For a module's unit of its own (src/bober.bob's image), the same in each program that has the module, the Program
 //! being of all its package's files, which fixes what each union holds, a module lists only what is its own, and as
@@ -98,6 +99,24 @@ class Mono {
 		for (const m of p.modules) {
 			m.abi = 0
 		}
+		if (!this.units) {
+			this.number()
+		}
+	}
+
+	/// Numbers the members of the unions values have at run time for their tags, those of the largest first, so that
+	/// its are consecutive.
+	private number() {
+		const p = this.p
+		const tags = new HashMap[i32, i32]()
+		const us = this.lows.values().filter(t => p.kind(t) == kind.Union)
+		stableSort(us, (a, b) => p.members(a).length > p.members(b).length)
+		for (const u of us) {
+			for (const m of p.members(u).filter(m => !tags.has(m))) {
+				tags.set(m, tags.size)
+			}
+		}
+		p.tags = tags
 	}
 
 	/// Whether decl d of module m is a root.
