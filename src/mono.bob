@@ -227,7 +227,7 @@ class Mono {
 		}
 		for (const [t, name] of this.reached.values()) {
 			for (const m of this.ins.flat(t)) {
-				this.ins.memberOf(this.owner(m, name), name)
+				this.ins.memberOf(this.ins.owner(m, name), name)
 			}
 		}
 		return end
@@ -443,7 +443,7 @@ class Mono {
 				c.add(op.If, kind.None)
 			}
 			// Of the class it is promoted from, which emit reaches in mt's place.
-			const o = this.owner(mt, name)
+			const o = ins.owner(mt, name)
 			const d = ins.memberOf(o, name)
 			const method = how == "()" && d >= 0 && p.decls[d].kind == decl.Function
 			const [takes, gives] = shape(p, how, if (method) p.decls[d].type else ins.fieldType(o, name))
@@ -489,21 +489,6 @@ class Mono {
 		this.made.set([m, t, name, how], k)
 		this.dispatches.push(k)
 		return k
-	}
-
-	/// The class embedded in class t, its type args bound, that t's member name is promoted from (5.3), else t.
-	private owner(t: i32, name: i32): i32 {
-		const p = this.p
-		if (this.ins.nominal(t) != decl.Class || this.ins.member(t, name) >= 0) {
-			return t
-		}
-		for (const e of p.decls[p.a(t)].members.filter(e => embedded(p, e))) {
-			const o = this.owner(p.subst(p.decls[e].type, p.b(t)), name)
-			if (this.ins.member(o, name) >= 0) {
-				return o
-			}
-		}
-		return t
 	}
 }
 
