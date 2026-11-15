@@ -46,6 +46,22 @@ test "of several finished, a race takes the lowest index" {
 	assert await ...[async now(1), async now(2)] == [0, 1]
 }
 
+/// s, once go wakes.
+function named(go: Signal, s: string): string {
+	go.wait()
+	return s
+}
+
+test "futures of different types race as one of their results, each taken once" {
+	const go = new Signal()
+	const a = async later(go, 1)
+	const b = async named(go, "b")
+	assert await ...[async now(2), b] == [0, 2]
+	go.wake()
+	const first = await ...[a, b]
+	assert first == [0, 1] && await ...[a, b] == [1, "b"] && await a == 1
+}
+
 test "a race rethrows what the future it takes threw" {
 	const go = new Signal()
 	const jobs = [async later(go, 1), async failing(go)]
