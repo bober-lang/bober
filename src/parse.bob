@@ -1,6 +1,6 @@
 //! Recursive descent with Pratt expressions, into a tree of constructs.
 
-import { isBlank, lf, space } from "../std/ascii"
+import { comma, isBlank, isSpace, lf, semicolon, space } from "../std/ascii"
 import { partitionPoint, startsWith } from "../std/algo"
 import { Kind, Lexer, Loc, SyntaxError, Tok, assigns, keyword, prec } from "./lex"
 
@@ -43,6 +43,8 @@ export class Parser {
 	private result = false
 	/// The comments, in order. They are not in the tree.
 	comments: Tok[] = []
+	/// Whether each of comments is a doc comment doc took.
+	private taken: bool[] = []
 	private src: string
 	private header: bool
 	/// Whether only imports have come so far.
@@ -56,24 +58,63 @@ export class Parser {
 		this.header = header
 	}
 
-	/// The doc comment of the construct at pos, once parsed: the `///` comments on the lines right before it, each alone
-	/// on its line, without `///` and a space after.
-	doc(pos: i32): string {
+	/// The doc comment of the construct from pos to end, once parsed: the `///` comments on the lines right before it,
+	/// each alone on its line and among plain ones, then one ending the line it ends on, after a `,` or `;` at most;
+	/// without `///` and a space after.
+	doc(pos: i32, end: i32): string {
 		let i = partitionPoint(this.comments, c => c.loc.pos >= pos) as i32
 		let line = this.lineCol(pos)[0]
-		let doc = ""
-		while (i > 0) {
-			const c = this.comments[i - 1]
-			const text = this.l.text(c)
-			if (!startsWith(text, "///") || this.lineCol(c.loc.pos)[0] != line - 1 || !leads(this.src, c.loc.pos)) {
-				break
+		const lines: string[] = []
+		while (i > 0 && this.lineCol(this.comments[i - 1].loc.pos)[0] == line - 1
+			&& leads(this.src, this.comments[i - 1].loc.pos)) {
+			if (this.isDoc(i - 1)) {
+				lines.push(this.take(i - 1))
 			}
-			const body = text.slice(if (text.length > 3 && text[3] == space) 4 else 3, text.length)
-			doc = if (doc == "") body else body + "\n" + doc
 			line--
 			i--
 		}
-		return doc.copy() // as it outlives the source
+		lines.reverse()
+		let j = partitionPoint(this.comments, c => c.loc.pos >= end) as i32
+		if (j < this.comments.length && this.isDoc(j)) {
+			let k = end
+			while (k < this.comments[j].loc.pos && (isBlank(this.src[k]) || this.src[k] == comma || this.src[k] == semicolon)) {
+				k++
+			}
+			if (k == this.comments[j].loc.pos) {
+				lines.push(this.take(j))
+			}
+		}
+		return lines.join("\n").copy() // as it outlives the source
+	}
+
+	/// Reports the doc comments doc did not take, as warnings, and the module docs after the first token.
+	strays(report: (at: Loc, msg: string, warning: bool) => void) {
+		let at = 0 // where the comments up to here end, if no token is before them
+		for (const i of 0 ... this.comments.length - 1) {
+			const c = this.comments[i]
+			while (at >= 0 && at < c.loc.pos && isSpace(this.src[at])) {
+				at++
+			}
+			at = if (at == c.loc.pos) c.loc.end() else -1
+			if (this.isDoc(i) && !this.taken[i]) {
+				report(c.loc, "a doc comment documents what follows it or the line it ends", true)
+			} else if (at < 0 && startsWith(this.l.text(c), "//!")) {
+				report(c.loc, "a module doc comes before the first token", false)
+			}
+		}
+	}
+
+	/// Whether comments[i] is a doc comment: `///`, but not `////`, as a line of them separates.
+	private isDoc(i: i32): bool {
+		const text = this.l.text(this.comments[i])
+		return startsWith(text, "///") && !startsWith(text, "////")
+	}
+
+	/// The text of comments[i], a doc comment, taken.
+	private take(i: i32): string {
+		this.taken[i] = true
+		const text = this.l.text(this.comments[i])
+		return text.slice(if (text.length > 3 && text[3] == space) 4 else 3, text.length)
 	}
 
 	/// The next of the file's imports and then declarations, or null at its end.
@@ -95,6 +136,7 @@ export class Parser {
 	private peek(want: Kind = "ident"): Tok {
 		while (this.l.peek().kind == "comment") {
 			this.comments.push(this.l.next())
+			this.taken.push(false)
 		}
 		return this.l.peek(want)
 	}
