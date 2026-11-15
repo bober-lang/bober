@@ -24,9 +24,10 @@ import { endsWith, indexOf, sortBy, startsWith, unique } from "../std/algo"
 import { digit, isAlphabetic, lf, minus, o, underscore, x, zero } from "../std/ascii"
 import { HashMap } from "../std/collections/hashmap"
 import { ScopedMap } from "../std/collections/scopedmap"
+import { parseFloat } from "../std/float"
 import { join } from "../std/fs/path"
-import { min } from "../std/math"
-import { codePoint, unquoted } from "../std/string"
+import { inf, min } from "../std/math"
+import { ParseError, codePoint, unquoted } from "../std/string"
 import * as decl from "./bc/decl"
 import * as kind from "./bc/kind"
 import * as op from "./bc/op"
@@ -42,7 +43,6 @@ import { Lift } from "./lift"
 import { holdsType } from "./resolve"
 import { builtinPath, root } from "./root"
 import { Bool, Field, Null, String, Type, basics, members, spells } from "./type"
-import { strtod } from "stdlib.h"
 
 /// The modules at paths and those they import, checked and lowered into one Program, but those linked from the files
 /// cache (Lift.cached); checked again without them on an import cycle, which they may let it report through another
@@ -2529,7 +2529,7 @@ function integer(s: string): i64 {
 	return v
 }
 
-/// The value of float literal s, rounded as C's strtod does.
+/// The value of float literal s; infinity if too large.
 function float(s: string): f64 {
 	let digits = ""
 	for (const c of s) {
@@ -2537,5 +2537,9 @@ function float(s: string): f64 {
 			digits += chr(c)
 		}
 	}
-	return strtod(digits, 0)
+	try {
+		return parseFloat(digits)
+	} catch (e: ParseError) {
+		return inf
+	}
 }
