@@ -4,11 +4,14 @@
 //! compiled in lib/.
 
 import { startsWith } from "../std/algo"
+import { fromCString } from "../std/c"
 import { exists } from "../std/fs"
-import { dir, join } from "../std/fs/path"
+import { dir, isLocal, join, rel } from "../std/fs/path"
 import { executable } from "../std/process"
+import { getcwd } from "unistd.h"
 
-/// The directory of bober's files: "." in the repo, so that their paths stay relative.
+/// The directory of bober's files: relative in the repo and below it, so that their paths stay relative, as imports of
+/// them by a relative path are.
 export let root = find()
 let builtins = join(root, "builtin") + "/"
 
@@ -25,7 +28,8 @@ function find(): string {
 	try {
 		const d = dir(dir(executable()))
 		if (readFile(join(d, "builtin/array.bob")) != null || exists(join(d, "lib/std.bobc"))) {
-			return d
+			const cwd = fromCString(getcwd(0, 0))
+			return if (isLocal(rel(d, cwd)!)) rel(cwd, d)! else d
 		}
 	} catch (e: IoError) {}
 	print("bober: finds no builtin/ here nor beside the directory holding it")

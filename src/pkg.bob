@@ -2,7 +2,7 @@
 //! next bober.pkg.
 
 import { Mapping, Rest, Unknown, decode } from "../std/encoding/json"
-import { dir, join } from "../std/fs/path"
+import { dir as parent, join } from "../std/fs/path"
 import { ParseError } from "../std/string"
 import { CompileError } from "./error"
 
@@ -48,17 +48,22 @@ export class Preset {
 	fields: Unknown[] @Rest = []
 }
 
-/// Where a C library of the package is built, and a CMake project installed.
-export function out(pkg: Identity, lib: string): Dir { return join("build", pkg, lib) }
+/// The directory of the bober.pkg nearest above cwd, relative to it, if any: the package home bober runs in.
+export let home: Dir | null = null
+/// Where bober builds, wherever under home it runs: home's build/, else cwd's.
+export let dir = "build"
 
-/// The directory of the bober.pkg nearest above path, or null if there is none.
+/// Where a C library of the package is built, and a CMake project installed.
+export function out(pkg: Identity, lib: string): Dir { return join(dir, pkg, lib) }
+
+/// The directory of the bober.pkg nearest above path, or null if there is none; above cwd, home.
 export function nearest(path: string, read: (path: string) => string | null = p => readFile(p)): Dir | null {
-	let d = dir(path)
+	let d = parent(path)
 	while (read(join(d, "bober.pkg")) == null) {
-		if (dir(d) == d) {
-			return null
+		if (parent(d) == d) {
+			return if (d == ".") home else null
 		}
-		d = dir(d)
+		d = parent(d)
 	}
 	return d
 }

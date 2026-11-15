@@ -56,7 +56,7 @@ import { serve } from "./lsp"
 import { mono, specialize } from "./mono"
 import { Parser } from "./parse"
 import { builtin, root } from "./root"
-import { CLib, Package, load, nearest, out } from "./pkg"
+import { CLib, Package, dir, home, load, nearest, out } from "./pkg"
 import { wasm } from "./wasm"
 import * as process from "../std/process"
 import { kill } from "signal.h"
@@ -169,7 +169,6 @@ function usage(c: Command | null, verbose: bool): string {
 	return `usage: bober <command> [args]\n${optarg.help[Command](verbose)}\noptions:\n${optarg.help[Flags](verbose)}`
 }
 
-export let dir = "build"
 /// The machine and the format of the images src/link writes here; TPDE's objects are ELF everywhere.
 export const machine = if (arch == "arm64") arm64 else x64
 const mac = os == "macos"
@@ -185,7 +184,7 @@ export function ld(args: string[], out: string) {
 }
 
 /// p, which is rooted or under cwd, rooted.
-const under = (cwd: string, p: string) => if (isAbs(p)) p else `${cwd}/${p}`
+const under = (cwd: string, p: string) => if (isAbs(p)) p else join(cwd, p)
 
 /// The CMake toolchain file of C library c, built in cwd: bober's defaults for the target, its triple, the sysroot and on
 /// ELF static executables, with the compilers CMake finds, run by ccache if found with paths under cwd made relative,
@@ -222,6 +221,12 @@ function main(): i32 {
 		return 2
 	}
 	try {
+		const cwd = fromCString(getcwd(0, 0))
+		const h = nearest(join(cwd, "bober.pkg"))
+		if (h != null) {
+			home = rel(cwd, h)
+			dir = join(home!, "build")
+		}
 		return command(c)
 	} catch (e: CompileError | IoError) {
 		print(if (e instanceof IoError) e.message() else e.msg)
@@ -486,15 +491,14 @@ function wasmSource(path: string): string | null {
 	return if (exists(at)) readFile(at) else null
 }
 
-/// The build command on no file: in the nearest bober.pkg's directory, links the modules of it and below, but those of
-/// build/, hidden directories, builtin/ and other packages, into the image, with their tests' network, exporting their
-/// entries; so that run and test of one there link little.
+/// The build command on no file: links the modules of home and below, but those of build/, hidden directories, builtin/
+/// and other packages, into the image, with their tests' network, exporting their entries; so that run and test of one
+/// there link little.
 function buildPackage(includes: string[]) {
-	const home = nearest(join(fromCString(getcwd(0, 0)), "bober.pkg"))
-	if (home == null || chdir(home!) != 0) {
+	if (home == null) {
 		throw new CompileError("no bober.pkg here or above")
 	}
-	const mains = sources(".")
+	const mains = sources(home!)
 	const p = lowered(mains, includes)
 	const [files, cxx] = linked(p, true, includes)
 	image(p, mains.map(m => p.module(normal(m))), files, cxx, false, debug)
@@ -542,9 +546,9 @@ function inspect(path: string, out: string, f: Compile) {
 /// bytecode build/image.so holds, of the Bound each holds if any (unit), with the build directory made; its linker kept
 /// for relink.
 function lowered(mains: string[], includes: string[]): Program {
-	const home = nearest(mains[0])
-	if (home != null) {
-		cmake(load(home))
+	const h = nearest(mains[0])
+	if (h != null) {
+		cmake(h)
 	}
 	const image = `${dir}/image.so`
 	// Mapped of one descriptor, lest another build replace it, and read shared, lest one write it in place, which it may
@@ -901,7 +905,8 @@ function cObjects(p: Program, includes: string[]): [string[], bool] {
 		for (const [name, c] of p.c) {
 			if (c.cmake.version > 0) {
 				cxx = true
-				libs.push(...split(readFile(`${out(p.name, name)}/libs`), "\n").filter(l => l != ""))
+				const listed = split(readFile(`${out(p.name, name)}/libs`), "\n").filter(l => l != "")
+				libs.push(...listed.map(l => join(home ?? ".", l))) // under home, where cmake builds it
 			} else if (c.sources.length > 0) {
 				libs.push(archive(c, out(p.name, name), join(d, "bober.pkg"), dirs))
 			}
@@ -1001,14 +1006,20 @@ function archive(c: CLib, out: string, pkg: string, includes: string[]): string 
 	return a
 }
 
-/// Builds and installs each CMake project of p into its out, listing the static libraries it installs in out/libs,
+/// Builds and installs each CMake project of the package p in h into its out, at home as if bober ran there, so that
+/// its stamps hold the same paths wherever bober runs, listing the static libraries it installs in out/libs,
 /// unless its stamp is what it was last: its entry in p, its patches and toolchain files, the stamps of those of p
 /// before it and the files of its src if a directory, by their contents, not times, which a checkout or a cache resets;
 /// a file's hash taken from o/hashes where its time and size are as recorded there and older than it, as git's index.
 /// Its src, copied or fetched with its hash checked to out/src, patched, and configured afresh with its preset "bober"
 /// and toolchain file, finding those of p before it, in out/build, which is kept, as the archive fetched.
-function cmake(p: Package) {
-	const cwd = fromCString(getcwd(0, 0))
+function cmake(h: string) {
+	const [here, at, sys] = [fromCString(getcwd(0, 0)), dir, sysroot]
+	const cwd = join(here, home ?? ".")
+	chdir(cwd)
+	dir = "build"
+	sysroot = under(here, sys)
+	const p = load(rel(cwd, under(here, h))!)
 	const before: string[] = []
 	for (const [name, c] of p.c) {
 		if (c.cmake.version == 0) {
@@ -1084,6 +1095,9 @@ file(ARCHIVE_EXTRACT INPUT "${o}/src.tar" DESTINATION "${o}/fetch")`)
 		save(`${o}/libs`, installed(o).join("\n"))
 		save(`${o}/stamp`, entry)
 	}
+	chdir(here)
+	dir = at
+	sysroot = sys
 }
 
 /// A target of a CMake project, as its file API describes it.
