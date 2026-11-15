@@ -30,7 +30,7 @@ import { Program } from "./bc/program"
 import { show } from "./bc/show"
 import { glue, includesOf, sysroot } from "./c/bind"
 import { link, object } from "./c/bobcc"
-import { doc, spec } from "./doc"
+import { doc } from "./doc"
 import { Options, emit, entry, learn } from "./emit"
 import { check, lowered as always, normal } from "./check"
 import { CompileError } from "./error"
@@ -168,8 +168,6 @@ class Lower @optarg.Cc @optarg.Verbose {
 
 /// print a module's docs, as std/fs, or list a directory's modules, as std
 class Doc @optarg.Cc {
-	/// print the spec in files' doc comments instead
-	spec: bool @optarg.Verbose = false
 	args: string[] @optarg.Rest = []
 }
 
@@ -310,7 +308,7 @@ function command(c: Command): i32 {
 			return status
 		}
 		case Doc: if (c.args.length > 0) {
-			stdout.write(if (c.spec) spec(c.args) else c.args.map(doc).join("\n"))
+			stdout.write(c.args.map(doc).join("\n"))
 			return 0
 		}
 		case Skill:
@@ -1072,9 +1070,9 @@ function cObjects(p: Program, ms: i32[], includes: string[]): [string[], bool] {
 }
 
 /// The bundle command, which dist.sh runs in the repo: writes the bundle of builtin/'s and std/'s modules, lowered
-/// from source, to lib/std.bobc (src/lift.bob), and so for WebAssembly to lib/wasm.bobc, which all must check for, with
-/// its host, lib/host.mjs; and compiles the C they link into lib: the run time's objects, the archive std.a of their
-/// glue, and their C libraries' archives.
+/// from source, each with its docs (src/doc.bob), to lib/std.bobc (src/lift.bob), and so for WebAssembly to
+/// lib/wasm.bobc, which all must check for, with its host, lib/host.mjs; and compiles the C they link into lib: the run
+/// time's objects, the archive std.a of their glue, and their C libraries' archives.
 function pack(lib: string) {
 	const paths = [...glob("std/**/*.bob"), ...glob("builtin/*.bob")].filter(f => !endsWith(f, ".test.bob"))
 	const p = lower(paths)
@@ -1086,6 +1084,9 @@ function pack(lib: string) {
 	run(["ar", "rcs", join(lib, "std.a"), ...cs.filter(c => endsWith(c, ".o"))])
 	for (const a of cs.filter(c => endsWith(c, ".a"))) {
 		save(join(lib, base(a)), readFile(a))
+	}
+	for (const x of p.modules.filter(x => endsWith(x.path, ".bob"))) {
+		x.doc = p.intern(doc(x.path))
 	}
 	save(join(lib, "std.bobc"), bundle(p, compilerId()))
 	save(join(lib, "wasm.bobc"), bundle(lower(paths, [], [], wasmSource), compilerId()))
