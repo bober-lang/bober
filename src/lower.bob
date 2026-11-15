@@ -24,6 +24,7 @@ import { endsWith, indexOf, sortBy, startsWith } from "../std/algo"
 import { digit, isAlphabetic, lf, minus, o, underscore, x, zero } from "../std/ascii"
 import { HashMap } from "../std/collections/hashmap"
 import { ScopedMap } from "../std/collections/scopedmap"
+import { min } from "../std/math"
 import { codePoint, unquoted } from "../std/string"
 import * as decl from "./bc/decl"
 import * as kind from "./bc/kind"
@@ -577,6 +578,9 @@ function primitive(t: Type): i32 {
 		}
 	}
 }
+
+/// How many values of a literal an Outlined function sets.
+const chunk = 64
 
 const operators: [string, Opcode][] = [["+", op.Add], ["-", op.Sub], ["*", op.Mul], ["/", op.Div], ["%", op.Rem],
 	["**", op.Pow], ["&", op.And], ["|", op.Or], ["^", op.Xor], ["<<", op.Shl], [">>", op.Shr], ["==", op.Eq], ["!=", op.Ne],
@@ -1888,9 +1892,14 @@ class Gen {
 	}
 
 	/// Pushes ps, each as item pushes it but a spread's value as it is, then op o, which makes them one value of type t;
-	/// each followed by an Init if none is spread.
+	/// each followed by an Init if none is spread. An array or object of more than a chunk, none spread, is outlined, but
+	/// one holding Types, which is known when compiling.
 	private spread(o: Opcode, t: Type, ps: Node[], item: (q: Node, i: i32) => void) {
 		const init = !ps.some(q => q.kind == "unary" && q.t.kind == "...")
+		if (init && ps.length > chunk && (t.kind == "array" || t.kind == "object") && !holdsType(this.prog, this.ty(t))) {
+			this.outline(t, ps)
+			return
+		}
 		const spreads: i32[] = []
 		for (const i of 0 ... ps.length - 1) {
 			const q = ps[i]
@@ -1905,6 +1914,58 @@ class Gen {
 			}
 		}
 		this.op(o, this.ty(t), ps.length, this.code.list(spreads))
+	}
+
+	/// Pushes array or object t of ps, made zero, then filled, as LLVM takes long on a block of a big literal; an object
+	/// by New, as an Object of none stores each zero.
+	private outline(t: Type, ps: Node[]) {
+		if (t.kind == "array") {
+			this.int(kind.I32, ps.length)
+			this.callBuiltin("newArray", this.u.list(t.params, false, this))
+		} else {
+			this.op(op.New, this.ty(t))
+		}
+		const r = this.temp(this.ty(t))
+		this.op(op.SetLocal, r)
+		this.fill(r, t, ps, 0, ps.length)
+		this.op(op.Local, r)
+	}
+
+	/// Sets values lo until hi of literal t of ps on local l: here if a chunk, else by an Outlined function per part, of a
+	/// chunk of parts at most, so that no code has more than a chunk of values or of calls.
+	private fill(l: i32, t: Type, ps: Node[], lo: i32, hi: i32) {
+		const array = t.kind == "array"
+		if (hi - lo <= chunk) {
+			for (const i of lo ... hi - 1) {
+				this.op(op.Local, l)
+				if (array) {
+					this.int(kind.I32, i)
+					this.value(ps[i], t.params[0])
+					this.op(op.SetSubscript)
+				} else {
+					this.prop(ps[i])
+					this.op(op.SetField, this.prog.intern(this.key(ps[i].t)))
+				}
+			}
+			return
+		}
+		let part = chunk
+		while (part * chunk < hi - lo) {
+			part *= chunk
+		}
+		for (const k of 0 ... (hi - lo - 1) / part) {
+			const at = lo + k * part
+			const pos = ps[at].t.loc.pos
+			this.nested(`${pos}`, Type.function([t], Null), decl.Outlined, pos, g => {
+				// Typed once a local, as params are, so that the locals typing it captures follow it.
+				const p = g.local("", kind.None)
+				g.code.locals[p].type = g.ty(t)
+				g.fill(p, t, ps, at, min(hi, at + part))
+			})
+			this.op(op.Local, l)
+			this.op(op.CallRef, 1)
+			this.op(op.Drop)
+		}
 	}
 
 	/// The list of the type args of generic decl d's use p, of type inst, 0 if d is not generic.
@@ -1980,20 +2041,27 @@ class Gen {
 
 	/// Pushes the closure of a nested function or arrow of type t, a decl in this one's.
 	private closure(name: string, t: Type, params: Node, body: Node) {
-		const d = this.u.l.newDecl(this.u.m, this.owner, name, decl.Function, 0, t)
+		this.nested(name, t, 0, body.t.loc.pos, g => {
+			g.params(params, t)
+			if (body.kind == "block") {
+				g.block(body)
+			} else if (t.base!.kind == "null") {
+				g.expr(body)
+				g.op(op.Drop)
+			} else {
+				g.value(body, t.base!)
+				g.op(op.Return)
+			}
+		})
+	}
+
+	/// Pushes the closure of a function of type t with mods, a decl in this one's, whose code body lowers, at pos.
+	private nested(name: string, t: Type, mods: i32, pos: i32, body: (g: Gen) => void) {
+		const d = this.u.l.newDecl(this.u.m, this.owner, name, decl.Function, mods, t)
 		this.u.depend(this.owner, d)
 		const g = new Gen(this.u, d, t.base!, this, this.typeParams)
-		g.code.at = body.t.loc.pos
-		g.params(params, t)
-		if (body.kind == "block") {
-			g.block(body)
-		} else if (t.base!.kind == "null") {
-			g.expr(body)
-			g.op(op.Drop)
-		} else {
-			g.value(body, t.base!)
-			g.op(op.Return)
-		}
+		g.code.at = pos
+		body(g)
 		this.prog.decls[d].type = this.u.fn(t, null, g)
 		this.prog.decls[d].code = g.end()
 		this.op(op.Closure, d, this.u.list(this.typeParams, false, this), this.code.list(g.captures))
