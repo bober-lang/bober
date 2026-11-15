@@ -12,12 +12,12 @@
 //! it points to. A string is 24 bytes held in place, as builtin/ lays them out; an array is a ref to
 //! { i64 len, i64 cap, ref data }, a tuple, object or class instance one to a struct of its fields, an embedded one a
 //! ref into it; a T[n] is held in place and handled by a ref to it, its place, which is copied where stored. A union
-//! value is { i64 tag, i64 bits, ref }, the tag the address of the member's type's descriptor, which is one per type in
-//! the program, so that a tag means the same in every union; a ref member, or a boxed string or T[n], is in ref and any
-//! other in bits, so that a word is a ref by its type alone. In a field or element it is packed (§4.4, stored), its
-//! members' refs sharing a word, where the collector may find a number, but below 2^32, so no ref. A function value
-//! is a ref to { ptr code, captures... }, its code taking it first. A thrown value is held as a union of any type: the
-//! union without members, which as a type no value has, so that the two meanings never meet.
+//! value is { i64 tag, i64 bits, ref }, the tag the member's type's: as lowered the address of its descriptor, one per
+//! type in the program, else its id, so that a tag means the same in every union; a ref member, or a boxed string or
+//! T[n], is in ref and any other in bits, so that a word is a ref by its type alone. In a field or element it is packed
+//! (§4.4, stored), its members' refs sharing a word, where the collector may find a number, but below 2^32, so no ref.
+//! A function value is a ref to { ptr code, captures... }, its code taking it first. A thrown value is held as a union
+//! of any type: the union without members, which as a type no value has, so that the two meanings never meet.
 //!
 //! Types are the Program's ids, compared by id once norm has made them as their values are held; what emit computes
 //! of a type, its key, members, layout and struct, it computes once per id.
@@ -112,8 +112,8 @@ class Frame {
 	slot: Value = 0
 	/// Where br to a Loop or Each jumps.
 	head: Block = 0
-	/// An If's else, until its Else.
-	other: Block = 0
+	/// An If's else, or a Match's arms after the first, until their Else.
+	others: Block[] = []
 	/// A Default's param.
 	local = 0
 	/// A Try's: the unwind block outside it and the landing pad of its body, then of its handler if it has a
@@ -763,15 +763,20 @@ class Emitter {
 			case op.If:
 				const yes = this.cond()
 				const f = this.open(o, n, i)
-				f.other = this.label()
+				f.others = [this.label()]
 				const then = this.label()
-				this.condBr(yes, then, f.other)
+				this.condBr(yes, then, f.others[0])
 				this.start(then)
+			case op.Match:
+				const u = this.pop()
+				const f = this.open(o, kind.None, i)
+				f.others = p.lists[n].map(_ => this.label())
+				this.branchTag(this.tagOf(u.v), p.lists[n].map(t => p.members(t)), f.others)
+				this.start(f.others.remove(0))
 			case op.Else:
 				const f = this.frames[this.frames.length - 1]
 				this.leaveBlock(f)
-				this.start(f.other)
-				f.other = 0
+				this.start(f.others.remove(0))
 			case op.Default:
 				const f = this.open(o, kind.None, i)
 				f.local = n
@@ -1030,8 +1035,8 @@ class Emitter {
 			this.unwind = f.outer
 		} else {
 			this.leaveBlock(f)
-			if (f.other != 0) {
-				this.start(f.other)
+			if (f.others.length > 0) {
+				this.start(f.others[0])
 				this.jump(f.exit)
 			}
 		}
@@ -1670,8 +1675,7 @@ class Emitter {
 		const d = this.desc(t)
 		const r = this.scratch(this.unionTy, promoted)
 		const [array, tuple, instance, done] = [this.label(), this.label(), this.label(), this.label()]
-		this.ir().switch(this.word(d, kindAt), [6, 8], [array, tuple], instance)
-		this.dead = true
+		this.switch(this.word(d, kindAt), [6, 8], [array, tuple, instance])
 		this.start(array)
 		const e = this.word(d, elemAt)
 		this.ir().store(this.union(d, this.i64Const(0),
@@ -2223,7 +2227,7 @@ class Emitter {
 		const u = src.t
 		if (this.p.kind(u) == kind.Union) {
 			const ms = this.p.members(u)
-			this.cases(ms.length, i => this.ir().icmp("eq", this.tagOf(src.v), this.tag(ms[i])),
+			this.cases(ms.length, to => this.branchTag(this.tagOf(src.v), ms.map(m => [m]), to),
 				i => this.copy({ v: this.unbits(src.v, ms[i]), t: ms[i] }, dst))
 			return
 		}
@@ -2562,19 +2566,12 @@ class Emitter {
 		return this.ir().insert(this.ir().insert(this.ir().insert(this.b.undef(this.unionTy), tag, 0), bits, 1), ref, 2)
 	}
 
-	/// The tag of a union holding a value of type t: the address of t's descriptor, which holds t's id if a primitive's,
-	/// else 0, for rt.c to show a value nothing caught. Descriptors are told apart by address, so they must not be
-	/// merged, as the linker's --icf would if each had its own section.
-	private tag(t: i32): Value {
-		if (this.dyn) {
-			return this.desc(t)
-		}
-		const n = this.norm(t)
-		const name = `bober.type.${this.key(n)}`
-		const found = this.b.named(name)
-		const d = if (found != 0) found else this.b.literal(name, this.i64Const(if (kind.isPrimitive(n)) n else 0))
-		return this.b.constCast("ptrtoint", d, this.i64)
-	}
+	/// The tag of a union holding a value of type t: as lowered the address of t's descriptor, else t's id.
+	private tag(t: i32): Value { return if (this.dyn) this.desc(t) else this.i64Const(this.id(this.norm(t))) }
+
+	/// What tells normed type n apart in a switch on a tag: its hash, which its descriptor holds too and no two types
+	/// share.
+	private id(n: i32): i64 { return this.p.hash(n) as i64 }
 
 	/// Whether union u holds a value of type t: has it as a member, or is the union of any type.
 	private holds(u: i32, t: i32): bool { return u == this.any || this.p.members(u).includes(this.norm(t)) }
@@ -2645,8 +2642,13 @@ class Emitter {
 		return this.tagIn(this.tagOf(v.v), ts)
 	}
 
-	/// Whether tag is that of one of the types: an or of the tests.
+	/// Whether tag is that of one of the types: an or of the tests, of more than a few as branchTag finds it.
 	private tagIn(tag: Value, ts: i32[]): Value {
+		if (ts.length > few) {
+			const is = this.slot(this.i1)
+			this.cases(2, to => this.branchTag(tag, [ts, []], to), i => this.ir().store(this.bool(i == 0), is, false))
+			return this.ir().load(this.i1, is, false)
+		}
 		let r = this.bool(false)
 		for (const t of ts) {
 			r = this.ir().binary("or", r, this.ir().icmp("eq", tag, this.tag(t)))
@@ -2715,7 +2717,11 @@ class Emitter {
 		const tag = this.ir().cast("zext",
 			this.ir().load(this.b.int(8), this.ir().gep(this.b.int(8), q, [this.i64Const(at)]), false), this.i64)
 		const u = this.scratch(this.unionTy, promoted)
-		this.cases(ms.length, i => this.ir().icmp("eq", tag, this.i64Const(this.tagByte(n, i))), i => {
+		const bytes: i64[] = []
+		for (const i of 0 ... ms.length - 2) {
+			bytes.push(this.tagByte(n, i))
+		}
+		this.cases(ms.length, to => this.switch(tag, bytes, to), i => {
 			const boxed = this.inlined(ms[i])
 			const p = this.ir().gep(this.b.int(8), q, [this.i64Const(this.placed(r, ms[i]))])
 			let x = if (boxed) this.ir().load(this.ref, p, false) else this.fetch(p, ms[i])
@@ -2756,7 +2762,7 @@ class Emitter {
 			return
 		}
 		const u = this.cast(v, t)
-		this.cases(ms.length, i => this.ir().icmp("eq", this.tagOf(u), this.tag(ms[i])), i => {
+		this.cases(ms.length, to => this.branchTag(this.tagOf(u), ms.map(m => [m]), to), i => {
 			if (this.inlined(ms[i])) {
 				store(i, { v: u, t: n }) // its box
 			} else {
@@ -2773,23 +2779,74 @@ class Emitter {
 		return ((i - z + ms.length) % ms.length) as i64
 	}
 
-	/// Emits each(i) where holds(i) first does, of i from 0 to n - 1, the last untested.
-	private cases(n: i32, holds: (i: i32) => Value, each: (i: i32) => void) {
+	/// Emits each(i) in block i of the n that branch branches to, which then join.
+	private cases(n: i32, branch: (to: Block[]) => void, each: (i: i32) => void) {
+		const to: Block[] = []
+		for (const _ of 1 ... n) {
+			to.push(this.label())
+		}
 		const done = this.label()
+		branch(to)
 		for (const i of 0 ... n - 1) {
-			if (i < n - 1) {
-				const [yes, no] = [this.label(), this.label()]
-				this.condBr(holds(i), yes, no)
-				this.start(yes)
-				each(i)
-				this.jump(done)
-				this.start(no)
-			} else {
-				each(i)
-				this.jump(done)
-			}
+			this.start(to[i])
+			each(i)
+			this.jump(done)
 		}
 		this.start(done)
+	}
+
+	/// Branches to the block of to where v is the key at its index, else to the last.
+	private switch(v: Value, keys: i64[], to: Block[]) {
+		this.ir().switch(v, keys, to.slice(0, keys.length), to[to.length - 1])
+		this.dead = true
+	}
+
+	/// Branches to the block of to of the first list of types ts whose member tag is of, else to the last: of a few
+	/// types or one a type param decides, by comparing tag with each one's; else by a switch on the top bits of its id,
+	/// then comparing it with the ids of those.
+	private branchTag(tag: Value, ts: i32[][], to: Block[]) {
+		const types: i32[] = []
+		const targets: Block[] = []
+		for (const i of 0 ... ts.length - 2) {
+			for (const t of ts[i].map(t => this.norm(t))) {
+				if (!types.includes(t)) {
+					types.push(t)
+					targets.push(to[i])
+				}
+			}
+		}
+		const other = to[ts.length - 1]
+		// Branches to the target of the first of the types that v is the value of, else to other.
+		const compare = (v: Value, of: i32[], value: (t: i32) => Value) => {
+			for (const t of of) {
+				const no = this.label()
+				this.condBr(this.ir().icmp("eq", v, value(t)), targets[types.indexOf(t)], no)
+				this.start(no)
+			}
+			this.jump(other)
+		}
+		if (types.length <= few || types.some(t => this.unbound(t))) {
+			compare(tag, types, t => this.tag(t))
+			return
+		}
+		const id = if (this.dyn) this.word(tag, hashAt) else tag
+		let shift = 63 as u64 // to the top bits of a hash, of twice as many values as there are types
+		while (((1 as u64) << (64 - shift)) < 2 * (types.length as u64)) {
+			shift--
+		}
+		const top = (t: i32) => (this.p.hash(t) >> shift) as i64
+		const keys: i64[] = []
+		for (const t of types) {
+			if (!keys.includes(top(t))) {
+				keys.push(top(t))
+			}
+		}
+		const buckets = keys.map(_ => this.label())
+		this.switch(this.ir().binary("lshr", id, this.i64Const(shift as i64)), keys, [...buckets, other])
+		for (const k of 0 ... keys.length - 1) {
+			this.start(buckets[k])
+			compare(id, types.filter(t => top(t) == keys[k]), t => this.i64Const(this.id(t)))
+		}
 	}
 
 	/// The tag, the bits, and the ref of union value u.
@@ -4150,6 +4207,9 @@ const ssizeAt = 29
 const layoutAt = 30
 const slayoutAt = 31
 const canonAt = 34
+const hashAt = 35
+/// The most types branchTag compares a tag with one by one.
+const few = 4
 
 /// The names of the kinds from Array on, as keys name them.
 const rows = ["Array", "Optional", "Rest", "Embed", "FixedArray", "Tuple", "Union", "Object", "Func", "Named", "Param",

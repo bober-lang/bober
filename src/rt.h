@@ -65,12 +65,12 @@ typedef struct { uint64_t head; const char *bytes; void *ref; } bober_string;
 typedef struct { bober_string name, doc; const struct bober_type *type; int64_t mods, offset, ntags; const struct bober_type **tags; } bober_field;
 /// A method by name, called by a thunk of its receiver, args and result each as a union holds them (src/emit.bob).
 typedef struct { bober_string name; void *fn; } bober_method;
-/// A type's descriptor (§4.11), whose address is a union's tag. emit makes one for each type a module names, a weak
-/// global listed in section bober_types, and bober_type_of those a generic's code forms, so that a type has one. Its
-/// kind is Type.kind's index in builtin/type.bob; elem a fixed array's, array's or literal's; parts a union's members,
-/// a function's params and result, or an instance's type args; a tuple's elements are its fields. How a value of it is
-/// held (held, size, align and layout) and the struct one refers to (ssize, slayout and the fields' offsets) are
-/// completed from those.
+/// A type's descriptor (§4.11), whose address is a union's tag as lowered. emit makes one for each type a module names,
+/// a weak global listed in section bober_types, and bober_type_of those a generic's code forms, so that a type has one.
+/// Its kind is Type.kind's index in builtin/type.bob; elem a fixed array's, array's or literal's; parts a union's
+/// members, a function's params and result, or an instance's type args; a tuple's elements are its fields. How a value
+/// of it is held (held, size, align and layout) and the struct one refers to (ssize, slayout and the fields' offsets)
+/// are completed from those.
 typedef struct bober_type {
   int64_t id;  // the TypeId of a primitive, else 0
   int64_t kind;
@@ -92,7 +92,8 @@ typedef struct bober_type {
   const struct bober_type *canon;  // the type a value of it is held and tagged as, its literals their base; emit's, or complete's of one formed
   uint64_t hash, head;  // src/bc/program.bob's: its hash, and that of its kind and data, which with its parts' makes it
 } bober_type;
-/// A value as a union holds it: the address of its type's descriptor, its bits, and its ref.
+/// A value as a union holds it: its type's tag, as lowered its descriptor's address, else what src/emit.bob's id
+/// gives; its bits; and its ref.
 typedef struct { const struct bober_type *tag; uint64_t bits; void *ref; } bober_union;
 /// Completes the descriptors emit made, which bober_start does first.
 void bober_types_complete(void);

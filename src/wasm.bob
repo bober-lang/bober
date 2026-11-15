@@ -115,6 +115,9 @@ class Frame {
 	/// A Try's Finally, or -1; what runs: "body", "catch" or "finally".
 	fin = -1
 	phase = "body"
+	/// A Match's conditions of its arms but the last, and the code of those before the one it is in.
+	conds: u64[] = []
+	arms: u64[][] = []
 }
 
 class Wasm {
@@ -536,10 +539,20 @@ class Wasm {
 			case op.If:
 				const yes = this.cond()
 				this.open(o, n).cond = yes
+			case op.Match:
+				const u = this.pop()
+				const ts = p.lists[n]
+				this.open(o, kind.None).conds = ts.slice(0, ts.length - 1).map(t => this.isa(u, t))
 			case op.Else:
 				const f = this.frames[this.frames.length - 1]
 				this.leaveBlock(f)
-				this.out = f.other
+				if (f.o == op.Match) {
+					f.arms.push(f.body)
+					f.body = []
+					this.out = f.body
+				} else {
+					this.out = f.other
+				}
 				this.dead = false
 			case op.Default:
 				const f = this.open(o, kind.None)
@@ -710,6 +723,7 @@ class Wasm {
 			case op.Loop: BinaryenLoop(this.m, f.label, this.block(f.body))
 			case op.If: this.labeled(f.label, [BinaryenIf(this.m, f.cond, this.block(f.body), this.block(f.other))])
 			case op.Default: this.labeled(f.label, [BinaryenIf(this.m, f.cond, this.block(f.body), 0)])
+			case op.Match: this.labeled(f.label, [this.match(f)])
 			case op.Try: this.labeled(f.label, if (f.phase == "catch") [this.labeled(f.exit, f.other)] else f.body)
 			default: if (f.exit == "") this.labeled(f.label, f.body)
 				else this.labeled(f.exit,
@@ -1238,6 +1252,16 @@ class Wasm {
 	}
 
 	private emit(x: u64) { this.out.push(x) }
+
+	/// The code of Match f: an If of each arm's condition, else the next's, the last arm's.
+	private match(f: Frame): u64 {
+		let x = this.block(f.body)
+		while (f.arms.length > 0) {
+			x = BinaryenIf(this.m, f.conds.pop(), this.block(f.arms.pop()), x)
+		}
+		return x
+	}
+
 	private block(xs: u64[]): u64 { return BinaryenBlock(this.m, 0, xs, xs.length as u32, this.none) }
 
 	private labeled(label: string, xs: u64[]): u64 {
