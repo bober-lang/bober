@@ -1486,18 +1486,24 @@ class Wasm {
 			this.push(BinaryenArrayNewFixed(this.m, this.heap(n), xs, xs.length as u32), n)
 		} else {
 			const slots = this.layout(n)
-			const r: V = { l: this.spill(BinaryenStructNew(this.m, 0, 0, this.heap(n)), this.val(n)), t: n }
+			const r: V = { l: this.spill(this.blank(n), this.val(n)), t: n }
 			let f = 0
 			for (const i of 0 ... vs.length - 1) {
 				if (spreads.includes(i)) {
 					this.copy(vs[i], r)
 				} else {
-					this.emit(BinaryenStructSet(this.m, f as u32, this.get(r), this.put(vs[i], slots[f].t)))
+					this.setField(r, slots[f].name, vs[i])
 					f++
 				}
 			}
 			this.stack.push(r)
 		}
+	}
+
+	/// A struct of type n of zero fields, an embedded one a blank struct of its own.
+	private blank(n: i32): u64 {
+		const xs = this.layout(n).map(s => if (s.embed) this.blank(this.norm(s.t)) else this.zero(s.t))
+		return BinaryenStructNew(this.m, xs, xs.length as u32, this.heap(n))
 	}
 
 	/// Runs f on each element of xs, an array, fixed array, string or tuple.
@@ -2052,8 +2058,7 @@ class Wasm {
 				[this.i32c(m), this.i64c(0), if (this.isRef(this.val(m))) this.zero(m) else this.nullRef()], 3,
 				this.boxHeap())
 		} else if (k == kind.Tuple || k == kind.Object) {
-			const xs = this.layout(n).map(s => this.zero(s.t))
-			return BinaryenStructNew(this.m, xs, xs.length as u32, this.heap(n))
+			return this.blank(n)
 		} else if (k == kind.FixedArray) {
 			const e = p.a(n)
 			const ek = this.kindOf(e)
