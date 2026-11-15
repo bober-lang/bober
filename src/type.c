@@ -394,11 +394,25 @@ int64_t bober_field_of(const bober_type *t, const char *name, int64_t n, const b
   return -1;
 }
 
-void *bober_method_of(const bober_type *t, const char *name, int64_t n) {
+/// The thunk of t's method name, or of the class embedded in t it is promoted from (§5.3), self then that place.
+static void *method(const bober_type *t, const char *name, int64_t n, bober_union *self) {
   for (int64_t i = 0; i < t->nmethods; i++)
-    if (len(t->methods[i].name) == n && !memcmp(t->methods[i].name.bytes, name, n)) return t->methods[i].fn;
+    if (len(t->methods[i].name) == n && !memcmp(t->methods[i].name.bytes, name, n)) {
+      if (self) self->tag = t;
+      return t->methods[i].fn;
+    }
+  for (int64_t i = 0; i < t->nfields; i++) {
+    const bober_field *f = &t->fields[i];
+    void *fn = inPlace(f) ? method(f->type, name, n, self) : 0;
+    if (fn && self) self->ref = (char *)self->ref + f->offset;
+    if (fn) return fn;
+  }
   return 0;
 }
+
+void *bober_method_of(const bober_type *t, const char *name, int64_t n) { return method(t, name, n, 0); }
+
+void *bober_method_on(bober_union *self, const char *name, int64_t n) { return method(self->tag, name, n, self); }
 
 // Values of a type known at run time.
 
