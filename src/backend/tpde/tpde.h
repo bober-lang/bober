@@ -75,7 +75,6 @@ TpdeValueRef TpdeAddExternal(TpdeModuleRef m, const char *name, TpdeTypeRef t);
 void TpdeDefineGlobal(TpdeModuleRef m, TpdeValueRef g, TpdeValueRef init, int local, unsigned align);
 /// Attributes as LLVM names them; byval, sret, zeroext and signext change the code, others are ignored.
 void TpdeAddAttributeAtIndex(TpdeModuleRef m, TpdeValueRef fn, int index, const char *name, TpdeTypeRef t);
-int TpdeIsDeclaration(TpdeModuleRef m, TpdeValueRef g);
 /// Puts the function or global by in old's place, with its uses and name, and deletes old.
 void TpdeReplace(TpdeModuleRef m, TpdeValueRef old, TpdeValueRef by);
 void TpdeDeleteFunction(TpdeModuleRef m, TpdeValueRef fn);
