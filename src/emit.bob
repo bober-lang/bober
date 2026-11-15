@@ -1296,8 +1296,12 @@ class Emitter {
 	/// Decl d as a function of type t, in this module or declared; one nested in a function local.
 	private function(d: i32, t: IrType): Value {
 		const x = this.p.decls[d]
-		return this.b.function(this.symbol(d), t,
+		const f = this.b.function(this.symbol(d), t,
 			x.module == this.m && x.owner >= 0 && this.p.classOf(d) < 0 && (x.mods & decl.Export) == 0)
+		if ((x.mods & decl.Outlined) != 0) {
+			this.b.attr(f, -1, "noinline", 0)
+		}
+		return f
 	}
 
 	/// C's function name, called through a local function of type ft, bober's convention, which makes the call as C's ABI
@@ -2330,9 +2334,13 @@ class Emitter {
 		this.push(if (this.boxed(u)) this.union(this.desc(u), this.i64Const(0), l.r) else l.r, l.t)
 	}
 
-	/// New: a class instance, its constructor called.
+	/// New: a class instance, its constructor called; or a zero object.
 	private make(t: i32) {
 		const n = this.norm(t)
+		if (this.p.kind(n) == kind.Object) {
+			this.finish(this.literal(t, 0))
+			return
+		}
 		if (this.boxed(n)) {
 			this.makeOf(n)
 			return
