@@ -2111,9 +2111,19 @@ class Checker {
 			} else {
 				this.fit(v, want, init)
 			}
+			if (f.embedded) {
+				this.embeds(init)
+			}
 		})
 		this.user = user
 		return ok
+	}
+
+	/// Reports value, given an embedded field, unless an object literal, which is copied into place (5.3).
+	private embeds(value: Node) {
+		if (value.kind != "object") {
+			this.report(start(value), "an embedded field takes an object literal: write {...v}")
+		}
 	}
 
 	/// Checks what a class's type leaves out: that it implements its interfaces, its methods' bodies, and its annotated
@@ -2150,6 +2160,10 @@ class Checker {
 				this.apart(() => { this.function(m, null, true, a.errors, builds) })
 			} else if (fs.length == ms.length && after(m, ":") != null && after(m, "=") != null && a.state == "typed") {
 				this.initializer(m, fs[i], t)
+			}
+			const h = if (fs.length == ms.length) placed(fs[i]) else null
+			if (h != null && within(h, t)) {
+				this.report(m.t.loc, `${show(t)} holds itself in place`)
 			}
 		}
 		this.user = user
@@ -2762,6 +2776,9 @@ class Checker {
 			throw this.error(n.t.loc, `${op} needs a number, got ${show(now)}`)
 		}
 		const v = if (value == null) now else this.expr(value, if (op == "??=") t.nonNull() else t)
+		if (target.kind == "member" && fieldOf(target.parts[0].type!, this.text(target.parts[1].t))?.embedded == true) {
+			this.embeds(value ?? target)
+		}
 		const r = switch (op) {
 			case "=": v
 			case "++", "--": this.single(now, n.t)
@@ -4544,6 +4561,37 @@ class Checker {
 
 /// Function type f with result and the type params ps.
 function returning(f: Type, result: Type | null, ps: Type[] = []): Type { return Type.function(f.types, result, f.n, f.rest, ps) }
+
+/// The class a field f holds in place: the class it embeds, or its T[n]'s elements' (5.3).
+function placed(f: Field): Type | null {
+	let t = f.type
+	while (t.kind == "fixed") {
+		t = t.base!
+	}
+	return if (!f.static && t.kind == "class" && (f.embedded || f.type.kind == "fixed")) t else null
+}
+
+/// Whether class c is class t, or holds one in place, through what its fields hold in place.
+function within(c: Type, t: Type): bool {
+	const todo = [c]
+	const seen: Type[] = []
+	while (todo.length > 0) {
+		const h = todo.pop()!
+		if ((h.generic ?? h) == (t.generic ?? t)) {
+			return true
+		}
+		if (!seen.includes(h.generic ?? h)) {
+			seen.push(h.generic ?? h)
+			for (const f of members(h)) {
+				const p = placed(f)
+				if (p != null) {
+					todo.push(p)
+				}
+			}
+		}
+	}
+	return false
+}
 
 /// The object literal an embedded class t takes: its fields, not its methods (5.3).
 function embedding(t: Type): Type {
