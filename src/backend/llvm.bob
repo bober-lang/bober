@@ -113,15 +113,17 @@ export class LLVM implements Backend {
 	/// The access tags of an array's header and of its elements, once aliasing made them.
 	private tbaa: u64[] = []
 
-	/// The module name, for this machine, to be optimized at level, from 0 to 3 as -O takes.
-	constructor(name: string, level: u32 = 2) {
+	/// The module name, for this machine, to be optimized at level, from 0 to 3 as -O takes; on x86-64 for its first
+	/// CPUs, as TPDE's code and C are, or if v2 for x86-64-v2, those since about 2009.
+	constructor(name: string, level: u32 = 2, v2 = false) {
 		this.m = LLVMModuleCreateWithNameInContext(name, this.ctx)
 		this.b = LLVMCreateBuilderInContext(this.ctx)
 		this.level = level
 		native()
 		const t = [0 as u64]
 		checked(err => LLVMGetTargetFromTriple(triple, t, err) as u64)
-		this.tm = LLVMCreateTargetMachine(t[0], triple, "", "", level, LLVMRelocPIC as u32, LLVMCodeModelDefault as u32)
+		const cpu = if (v2 && arch == "x86_64") "x86-64-v2" else ""
+		this.tm = LLVMCreateTargetMachine(t[0], triple, cpu, "", level, LLVMRelocPIC as u32, LLVMCodeModelDefault as u32)
 		LLVMSetTarget(this.m, triple)
 		this.td = LLVMCreateTargetDataLayout(this.tm)
 		LLVMSetModuleDataLayout(this.m, this.td)
@@ -744,7 +746,7 @@ export class LLVM implements Backend {
 	/// Once optimized, marks the card of each place a ref is stored at (src/gc.c): before, a barrier would keep LLVM
 	/// from dropping a store or the object stored to. None where the ref is a constant, or the place is in the frame
 	/// or a global, which every collection scans, or in the object the block's last call allocated, so young.
-	/// A masked store or scatter of refs it would not see: the target has none, as tm names no CPU features.
+	/// A masked store or scatter of refs it would not see: the target has none, as tm's CPU has none.
 	private barriers() {
 		const alloc = this.named("bober_alloc")
 		const have = this.named("bober_heap")
