@@ -1,0 +1,27 @@
+//! Tests of src/wasm.bob: test files of what it supports compiled to WebAssembly GC, each module valid as Binaryen
+//! checks it, and their tests run where there is a node that runs them.
+
+import { run } from "../std/process"
+import { Compile, build } from "./bober"
+import { dir } from "./pkg"
+
+/// Whether there is a node of WebAssembly GC and exnref, from version 24.
+function node(): bool {
+	try {
+		return run(["node", "-e", "process.exit(parseInt(process.versions.node) < 24 ? 1 : 0)"]) == 0
+	} catch (e: IoError) {
+		return false
+	}
+}
+
+test "a test file is a valid module, whose tests pass where there is node" {
+	const f = new Compile()
+	f.wasm = true
+	const runs = node()
+	for (const name of ["arrays", "classes", "control", "exceptions", "functions", "objects", "strings"]) {
+		test `${name}` {
+			const cmd = build(`tests/${name}.bob`, true, f, false)
+			assert !runs || run(cmd, `${dir}/${name}.wasm.out`) == 0
+		}
+	}
+}

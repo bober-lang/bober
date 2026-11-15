@@ -39,7 +39,7 @@ import { CompileError } from "./error"
 import { formatFile } from "./format"
 import { LLVM, triple } from "./backend/llvm"
 import { Tpde } from "./backend/tpde"
-import { Bound, bound, bundle, compilerId } from "./lift"
+import { Bound, bound, bundle, bundleName, compilerId } from "./lift"
 import { members } from "./link/ar"
 import { arm64 } from "./link/arm64"
 import { elf } from "./link/elf"
@@ -57,6 +57,7 @@ import { mono, specialize } from "./mono"
 import { Parser } from "./parse"
 import { builtin, root } from "./root"
 import { CLib, Package, load, nearest, out } from "./pkg"
+import { wasm } from "./wasm"
 import * as process from "../std/process"
 import { chdir, getcwd, getpid, isatty, link as hardLink } from "unistd.h"
 
@@ -90,6 +91,8 @@ export class Compile @optarg.Cc {
 	O2: bool @optarg.Verbose = false
 	/// each module as it is, fastest to compile, though CI is set; -O2 counts over it
 	O0: bool @optarg.Verbose = false
+	/// compile to WebAssembly GC, run by node
+	wasm: bool = false
 }
 
 /// build a program and run it
@@ -123,10 +126,10 @@ class Init @optarg.Cc {
 /// print help
 class Help {}
 
-/// link the package's image, or with -o one module's object; for CI
+/// link the package's image, or with -o one module's object, or with -wasm the program's WebAssembly; for CI but -wasm
 class Build @optarg.Cc @optarg.Verbose {
 	compile: ...Compile
-	/// the object to write
+	/// the object, or with -wasm the program, to write
 	o: string = ""
 	args: string[] @optarg.Rest = []
 }
@@ -233,13 +236,15 @@ function command(c: Command): i32 {
 			stdout.write(yamlOf(report))
 			return status
 		case Build:
-			if (process.env("CI") == null) {
+			if (process.env("CI") == null && !c.compile.wasm) {
 				stderr.write("warning: build is for CI; run and test build what they need\n")
 			}
 			if (c.args.length == 0) {
 				buildPackage(c.compile.headers.I)
 			} else if (c.o == "") {
 				throw new CompileError("build <file.bob> takes -o <out>")
+			} else if (c.compile.wasm) {
+				toWasm(c.args[0], false, c.compile.headers.I, c.o)
 			} else {
 				inspect(c.args[0], c.o, c.compile.headers.I, c.compile.release)
 			}
@@ -424,6 +429,9 @@ function hasTests(path: string): bool {
 /// C library's loader where it is the sysroot's, the image as image has it if pin. Throws the errors, or what failed,
 /// as a CompileError or IoError.
 export function build(main: string, tests: bool, f: Compile, pin: bool): string[] {
+	if (f.wasm) {
+		return toWasm(main, tests, f.headers.I)
+	}
 	const p = lowered([main], f.headers.I)
 	const m = p.module(normal(main))
 	const [files, cxx] = linked(p, tests, f.headers.I)
@@ -451,6 +459,27 @@ export function build(main: string, tests: bool, f: Compile, pin: bool): string[
 	whole.emit(`${exe}.o`, false)
 	ld([`${exe}.o`, ...files], exe)
 	return [exe]
+}
+
+/// Compiles the program of main into file, by default build/<name>.wasm, or with tests build/<name>.test.wasm,
+/// monomorphized, of builtin/'s modules builtin/wasm/'s where it has one (wasmSource), or in the package those of
+/// lib/wasm.bobc; returns the command that runs it.
+function toWasm(main: string, tests: bool, includes: string[],
+	file = `${dir}/${name(main)}${if (tests) ".test" else ""}.wasm`): string[] {
+	bundleName = "wasm"
+	const p = lower([main], includes, [], wasmSource)
+	const m = p.module(normal(main))
+	mono(p, m)
+	mkdirAll(parent(file))
+	wasm(p, m, tests, file)
+	return ["node", join(root, if (packaged()) "lib/host.mjs" else "builtin/wasm/host.mjs"), file]
+}
+
+/// The source of the module at path for WebAssembly: of builtin/'s, builtin/wasm/'s where it has one.
+function wasmSource(path: string): string | null {
+	const variant = join(root, "builtin/wasm", base(path))
+	const at = if (builtin(path) && exists(variant)) variant else path
+	return if (exists(at)) readFile(at) else null
 }
 
 /// The build command on no file: in the nearest bober.pkg's directory, links the modules of it and below, but those of
@@ -870,10 +899,12 @@ function cObjects(p: Program, includes: string[]): [string[], bool] {
 }
 
 /// The bundle command, which dist.sh runs in the repo: writes the bundle of builtin/'s and std/'s modules, lowered
-/// from source, to lib/std.bobc (src/lift.bob), and compiles the C they link into lib: the run time's objects, the
-/// archive std.a of their glue, and their C libraries' archives.
+/// from source, to lib/std.bobc (src/lift.bob), and so for WebAssembly to lib/wasm.bobc, which all must check for, with
+/// its host, lib/host.mjs; and compiles the C they link into lib: the run time's objects, the archive std.a of their
+/// glue, and their C libraries' archives.
 function pack(lib: string) {
-	const p = lower([...glob("std/**/*.bob"), ...glob("builtin/*.bob")].filter(f => !endsWith(f, ".test.bob")))
+	const paths = [...glob("std/**/*.bob"), ...glob("builtin/*.bob")].filter(f => !endsWith(f, ".test.bob"))
+	const p = lower(paths)
 	mkdirAll(lib)
 	runtime(lib)
 	network(lib)
@@ -884,6 +915,8 @@ function pack(lib: string) {
 		save(join(lib, base(a)), readFile(a))
 	}
 	save(join(lib, "std.bobc"), bundle(p, compilerId()))
+	save(join(lib, "wasm.bobc"), bundle(lower(paths, [], [], wasmSource), compilerId()))
+	save(join(lib, "host.mjs"), readFile("builtin/wasm/host.mjs"))
 }
 
 /// The run time's objects, src/rt.c's, src/gc.c's, src/fiber.c's, src/io.c's and src/type.c's of bober's root, compiled
