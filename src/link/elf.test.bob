@@ -89,3 +89,23 @@ test "a stack map's fixup names its own function, though another object's defini
 	const def = o.symbols.find(s => s.name == "f")!
 	assert own.binding == Local && own.section == def.section && own.value == def.value
 }
+
+test "a call's stack map leaves out the refs whose definition does not dominate it" {
+	const b = new Tpde("m")
+	b.collected()
+	const r = b.ref()
+	const make = b.function("make", b.fn(r, []), false)
+	const f = b.function("f", b.fn(r, [b.int(1)]), false)
+	// Made in this order, TPDE lays the blocks out as entry, def, other, use.
+	const [entry, other, def, use] = [b.block(f), b.block(f), b.block(f), b.block(f)]
+	b.at(entry)
+	b.condBr(b.param(f, 0), other, def)
+	b.at(def)
+	const v = b.call(b.fn(r, []), make, [])
+	b.condBr(b.param(f, 0), use, other)
+	b.at(other)
+	b.ret(b.call(b.fn(r, []), make, []))
+	b.at(use)
+	b.ret(v)
+	assert elf.read("m.o", b.object()).sections.every(s => s.name != ".llvm_stackmaps")
+}

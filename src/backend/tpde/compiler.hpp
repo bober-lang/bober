@@ -22,8 +22,9 @@ struct Adaptor {
 	Module *m;
 	u32 cur = 0;
 	std::vector<u32> fns, allocas;
-	/// If collected, the current function's parameters, instructions and allocas that hold refs.
-	std::vector<u32> refs;
+	/// If collected, the current function's parameters, instructions and allocas that hold refs, each with the block it
+	/// is defined in, the entry for the parameters and allocas.
+	std::vector<std::pair<u32, u32>> refs;
 	/// Whether the current function calls, so that refs may need to be found in its frame.
 	bool calls = false;
 	/// Whether the current function has invokes or stack allocations, which need the frame pointer.
@@ -112,7 +113,7 @@ struct Adaptor {
 		auto holdsRef = [&](u32 t) { return std::ranges::any_of(m->parts(m->types[t]), &Part::ref); };
 		for (u32 a : cur_args()) {
 			if (m->collected && holdsRef(m->vals[a].type)) {
-				refs.push_back(a);
+				refs.push_back({a, cur_entry_block()});
 			}
 		}
 		for (u32 b : m->blocksOf(sym())) {
@@ -122,7 +123,7 @@ struct Adaptor {
 					allocas.push_back(i);
 				}
 				if (m->collected && holdsRef(v.op == Op::Alloca ? v.imm : v.type)) {
-					refs.push_back(i);
+					refs.push_back({i, v.op == Op::Alloca ? cur_entry_block() : b});
 				}
 				dynamic |= v.op == Op::Invoke || v.op == Op::StackAlloc;
 				calls |= v.op == Op::Call || v.op == Op::Invoke;
@@ -161,6 +162,12 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 	std::vector<std::pair<tpde::Label, std::vector<i32>>> sites;
 	/// Where the last call made returns to, which the code restoring the stack pointer after it may follow.
 	u32 returned = 0;
+	/// By index in TPDE's layout, each block's immediate dominator, and the blocks dominating the last call's, marked
+	/// with mark.
+	std::vector<u32> idom, marks;
+	/// By index in TPDE's layout, each block's predecessors.
+	std::vector<std::vector<u32>> preds;
+	u32 mark = 0;
 
 	explicit Base(Adaptor *a) : B(a), syms(a->m->syms.size()) {}
 
@@ -281,14 +288,61 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 		return it->second;
 	}
 
+	/// Finds the immediate dominators, by Cooper, Harvey and Kennedy's "A Simple, Fast Dominance Algorithm", in TPDE's
+	/// layout, which puts a block of a reducible graph after those dominating it, if refs may live across a call.
+	void analysis_end() {
+		if (this->adaptor->refs.empty() || !this->adaptor->calls) {
+			return;
+		}
+		const auto &layout = this->analyzer.block_layout;
+		preds.resize(layout.size());
+		for (auto &p : preds) {
+			p.clear();
+		}
+		for (u32 b = 0; b < layout.size(); b++) {
+			for (u32 s : m().succs(layout[b])) {
+				preds[u32(this->analyzer.block_idx(s))].push_back(b);
+			}
+		}
+		idom.assign(layout.size(), ~0u), marks.assign(layout.size(), 0), idom[0] = 0;
+		for (bool changed = true; changed;) {
+			changed = false;
+			for (u32 b = 1; b < layout.size(); b++) {
+				u32 d = ~0u;
+				for (u32 p : preds[b]) {
+					if (idom[p] == ~0u) {
+						continue;
+					}
+					if (d == ~0u) {
+						d = p;
+					}
+					while (p != d) {
+						while (p > d) p = idom[p];
+						while (d > p) d = idom[d];
+					}
+				}
+				changed |= idom[b] != d, idom[b] = d;
+			}
+		}
+		for (u32 b = 1; b < layout.size(); b++) {
+			assert(idom[b] < b);
+		}
+	}
+
 	/// Notes where the refs live across call are, which was just made: in the slots of the allocas, and those the
-	/// values were spilled to, as no register is callee-saved in a collected module.
+	/// values were spilled to, as no register is callee-saved in a collected module. A ref is live only where its
+	/// definition dominates, though TPDE keeps its slot over the blocks between it and its last use: a path to the call
+	/// past them may have left another value's in it.
 	void live(u32 call) {
+		mark++;
+		for (u32 b = u32(this->cur_block_idx); marks[b] != mark; b = idom[b]) {
+			marks[b] = mark;
+		}
 		std::vector<i32> at;
-		for (u32 v : this->adaptor->refs) {
+		for (auto [v, def] : this->adaptor->refs) {
 			tpde::ValueAssignment *va = this->val_assignment(this->val_idx(v));
 			// One past its last use but not yet freed is still reported, as its block may loop back to a use.
-			if (!va || v == call) {
+			if (!va || v == call || marks[u32(this->analyzer.block_idx(def))] != mark) {
 				continue;
 			}
 			if (va->variable_ref) {
@@ -779,7 +833,7 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 			ValueRef target = this->val_ref(callee);
 			derived()->generate_call(target.part(0), args, res ? &*res : nullptr, variadic);
 		}
-		if (m().collected) {
+		if (!this->adaptor->refs.empty()) {
 			live(i);
 		}
 		return true;
