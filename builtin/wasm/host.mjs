@@ -31,8 +31,8 @@ class Trap extends Error {}
 let depth = 0 // of the tests and subtests running
 let testFile = null
 let testAt = -1
-let thrownFile = null
-let thrownAt = -1
+/// Where each box thrown was thrown: its file and byte.
+const sites = new WeakMap()
 
 /// The line and column of byte at of file, or null.
 const position = (file, at) => {
@@ -94,7 +94,8 @@ const shown = box => {
 const failure = e => {
 	if (e instanceof Trap) return e.message
 	if (e instanceof WebAssembly.Exception && e.is(ex.bober)) {
-		return trapped(`uncaught throw: ${shown(e.getArg(ex.bober, 0))}`, thrownFile, thrownAt)
+		const box = e.getArg(ex.bober, 0)
+		return trapped(`uncaught throw: ${shown(box)}`, ...sites.get(box))
 	}
 	// Of the engine: a stack overflow, else what checks bober's code does not make, as of a null.
 	if (e instanceof RangeError && /call stack/.test(e.message)) return trapped("stack overflow", null, -1)
@@ -232,7 +233,7 @@ reset()
 
 const host = {
 	trap: (what, file, at) => trap(str(what), str(file), at),
-	thrown: (file, at) => { [thrownFile, thrownAt] = [str(file), at] },
+	thrown: (box, file, at) => { sites.set(box, [str(file), at]) },
 	test: suspending(async (name, file, f) => {
 		seed = STONEWALL
 		testFile = str(file)
