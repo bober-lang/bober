@@ -16,7 +16,7 @@ import { Program } from "./bc/program"
 import { bind, located } from "./c/bind"
 import { CompileError } from "./error"
 import { Kind, Loc, SyntaxError, Tok, prec } from "./lex"
-import { Bound, Lift, bound, searched } from "./lift"
+import { Bound, Lift, bound, searched, source } from "./lift"
 import { Parser, Syntax, Tree } from "./parse"
 import { builtin, builtinPath, root } from "./root"
 import {
@@ -41,7 +41,7 @@ let lowered = [...first, ...["equal", "show", "math", "fiber"].map(builtinPath)]
 /// lift's bundle or cache holds is made from its decls instead.
 export function check(paths: string[], includes: string[] = [], read: (path: string) => string | null = p => readFile(p),
 	next: Checked = new Ignore(), lift = new Lift()): TypeError[] {
-	info = new HashMap[string, Member]()
+	info = new HashMap[i32, HashMap[string, Member]]()
 	fills = new HashMap[i32, () => void]()
 	fillWith(t => {
 		const f = fills.get(t.id)
@@ -53,7 +53,6 @@ export function check(paths: string[], includes: string[] = [], read: (path: str
 	})
 	deferred = []
 	visited = 0
-	tagTypes = new HashMap[string, Type]()
 	const ms = new Modules(includes, read, next, new Linked(lift))
 	for (const path of [...lowered, ...paths]) {
 		const m = ms.load(normal(path))
@@ -80,27 +79,28 @@ function nameOf(t: Type): string | null {
 
 /// The names of the classes, interfaces and type params declared, as show writes them.
 const names = new HashMap[Type, string, ById]()
-/// What is known of each member of a class, interface or namespace beyond its type, by about's key.
-let info = new HashMap[string, Member]()
+/// What is known of each member of a class, interface or namespace beyond its type, by its id and about's key.
+let info = new HashMap[i32, HashMap[string, Member]]()
 /// How to fill in each class and interface declared that is not yet, by its id, how many are being filled in, and the
 /// checks put off until the declaration being checked is done, as they ask for members not declared yet (satisfying).
 let fills = new HashMap[i32, () => void]()
 let filling = 0
 let deferred: (() => void)[] = []
 /// The classes of builtin/tag.bob, by name.
-let tagTypes = new HashMap[string, Type]()
+const tagTypes = new HashMap[string, Type]()
 /// builtin/type.bob's Type, of any type as a value (4.11).
 let Meta = Empty
 /// builtin/'s classes and interfaces, by path and name, made once for every program.
 const builtins = new HashMap[string, Type]()
 
 /// Class or interface name of the module at path, new, of the type params ps makes; builtin/'s made once for every
-/// program, and then filled anew each check, as fill also records the members' info.
+/// program, and then filled anew each check that checks or links them, as fill also records the members' info.
 function nominalOf(path: string, name: string, k: TypeKind, ps: () => Type[]): Type {
 	const key = `${path}:${name}`
 	const made = builtins.get(key)
 	if (made != null) {
 		made.fields = []
+		kept = new HashMap[string, Module]() // as the modules kept use them, imported or not (special)
 		return made
 	}
 	const t = new Type(k)
@@ -161,7 +161,8 @@ class Member {
 /// What a function or method may throw (7.5): the types it lists, else those inferred from its body's sites.
 class Errors {
 	types: Type[]
-	/// Whether types are listed, not inferred: as it lists them, or is exported or main and lists none.
+	/// Whether types are listed, not inferred: as it lists them, or is exported or main and lists none, or once its
+	/// module's inferred them.
 	listed = false
 	/// The throws and calls in its body, and the sites calling it.
 	sites: Site[] = []
@@ -215,9 +216,12 @@ function add(ts: Type[], t: Type): bool {
 
 /// What is known of member name of t, or its static member if static: an instance's are its generic's.
 function about(t: Type, name: string, static = false): Member {
-	const k = `${(t.generic ?? t).id}${if (static) ":" else "."}${name}`
-	const m = info.get(k) ?? new Member()
-	info.set(k, m)
+	const g = (t.generic ?? t).id
+	const ms = info.get(g) ?? new HashMap[string, Member]()
+	info.set(g, ms)
+	const k = if (static) `:${name}` else name
+	const m = ms.get(k) ?? new Member()
+	ms.set(k, m)
 	return m
 }
 
@@ -382,7 +386,7 @@ export class TypeError {
 /// Statements are not allowed at the top level: `g()` and `assert` outside a function or test are errors.
 class Modules {
 	errors: TypeError[] = []
-	next: Checked
+	private next: Checked
 	/// Whether an error is reported, after which nothing more is handed on to next, whose work would be dropped.
 	failed = false
 	private includes: string[]
@@ -403,9 +407,9 @@ class Modules {
 		if (m != null) {
 			return if (m.done) m else `import cycle through ${path}`
 		}
-		const b = this.bundled(path)
-		if (b != null) {
-			return b
+		const k = this.bundled(path) ?? this.reused(path)
+		if (k != null) {
+			return k
 		}
 		const src = this.read(path)
 		return if (src == null) `cannot read ${path}` else this.checked(path, src, false)
@@ -417,7 +421,7 @@ class Modules {
 		const user = bound.get(importer) ?? new Bound(includes)
 		bound.set(importer, user)
 		const key = `${located(importer, spec, this.includes, user.reader(this.read))}: ${names.join(" ")}`
-		const m = this.loaded.get(key) ?? this.bundled(key)
+		const m = this.loaded.get(key) ?? this.bundled(key) ?? this.reused(key)
 		if (m != null) {
 			return m
 		}
@@ -447,6 +451,46 @@ class Modules {
 		}
 	}
 
+	/// The module at path kept from a check before while its source and the modules it imports, loaded as checking it
+	/// would, are as they were, handing on again what checking it did.
+	private reused(path: string): Module | null {
+		const m = kept.get(path)
+		if (m == null || m.src != source(path, searched(this.includes), this.read)) {
+			return null
+		}
+		// As being checked, so that a cycle through an import is reported as checking it does; a header's module not
+		// kept is not read but bound, by checking it.
+		this.loaded.set(path, new Module(path))
+		if (m.imports.some(i => this.load(i.path) != i)) {
+			this.loaded.delete(path)
+			return null
+		}
+		this.loaded.set(path, m)
+		for (const [id, ms] of m.info) {
+			info.set(id, ms)
+		}
+		if (!this.failed) {
+			for (const h of m.handed) {
+				h(this.next)
+			}
+		}
+		this.errors.push(...m.warnings)
+		return m
+	}
+
+	decl(n: Node, path: string, src: string) { this.handOn(path, c => c.decl(n, path, src)) }
+
+	declare(n: Node, path: string, src: string) { this.handOn(path, c => c.declare(n, path, src)) }
+
+	/// Hands on to next what checking the module at path does, unless an error is reported, and notes it for the checks
+	/// that reuse the module.
+	private handOn(path: string, h: (next: Checked) => void) {
+		this.loaded.get(path)!.handed.push(h)
+		if (!this.failed) {
+			h(this.next)
+		}
+	}
+
 	private checked(path: string, src: string, header: bool): Module {
 		if (!header) {
 			bound.delete(path) // as header locates the headers it imports anew
@@ -457,9 +501,7 @@ class Modules {
 		const c = new Checker(m, src, p, this)
 		c.check()
 		m.done = true
-		if (!this.failed) {
-			this.next.done(path)
-		}
+		this.handOn(path, n => n.done(path))
 		stableSort(c.errors, (a, b) => a.loc.pos < b.loc.pos)
 		for (const e of c.errors) {
 			const [line, col] = p.lineCol(e.loc.pos)
@@ -467,9 +509,20 @@ class Modules {
 			e.col = col
 			this.errors.push(e)
 		}
+		if (c.errors.every(e => e.warning) && !m.info.some(i => fills.has(i[0]))) {
+			m.src = src
+			m.warnings = c.errors
+			kept.set(path, m)
+		} else {
+			kept.delete(path)
+		}
 		return m
 	}
 }
+
+/// The modules checked without errors, by path, each to reuse while its source and those it imports are as they were;
+/// none of those that import one linked, as each check links it anew.
+let kept = new HashMap[string, Module]()
 
 /// A module checked, or being checked, the names it exports, and all its top-level declarations, for tests.
 class Module {
@@ -478,6 +531,13 @@ class Module {
 	exports = new HashMap[string, Binding]()
 	tops = new HashMap[string, Binding]()
 	done = false
+	/// Its source, of a header's module as bind made it, the modules it imports, what is known of the members of the
+	/// classes and interfaces it declares by their ids (about), what checking it handed on, and its warnings.
+	src = ""
+	imports: Module[] = []
+	info: [i32, HashMap[string, Member]][] = []
+	handed: ((next: Checked) => void)[] = []
+	warnings: TypeError[] = []
 
 	constructor(path: string) { this.path = path }
 }
@@ -969,6 +1029,7 @@ class Checker {
 		for (const p of if (builtin(m.path) || indexOf(m.path, ": ") >= 0) [] else first) {
 			const loaded = modules.load(p)
 			if (loaded instanceof Module) {
+				m.imports.push(loaded)
 				for (const name of prelude) {
 					const b = loaded.exports.get(name)
 					if (b != null) {
@@ -1024,6 +1085,7 @@ class Checker {
 
 	/// Infers the errors of the functions that do not list theirs, then warns of each type another lets escape but does
 	/// not list, once, where it first escapes; it is not added to its errors, so no caller is warned of it again (7.5).
+	/// Then all are listed, so that no module checked after notes its calls of them (thrown).
 	private escapes() {
 		for (const e of this.throwing.filter(e => !e.listed)) {
 			for (const s of e.sites) {
@@ -1041,6 +1103,9 @@ class Checker {
 					}
 				}
 			}
+		}
+		for (const e of this.throwing) {
+			e.listed = true
 		}
 	}
 
@@ -1152,6 +1217,7 @@ class Checker {
 		if (m instanceof string) {
 			return this.report(s.loc, m)
 		}
+		this.m.imports.push(m)
 		if (listed) {
 			const tests = endsWith(this.m.path, ".test.bob")
 			const visible = if (tests) m.tops else m.exports
@@ -1193,6 +1259,9 @@ class Checker {
 		const name = this.text(operands(n)[0].t)
 		const k: TypeKind = if (n.t.kind == "class") "class" else "interface"
 		const t = nominalOf(this.m.path, name, k, () => this.paramsOf(n))
+		const ms = new HashMap[string, Member]()
+		info.set(t.id, ms)
+		this.m.info.push([t.id, ms])
 		// A local class sees the block's types (5.1).
 		const locals = this.locals
 		const wall = if (locals.level > 0) this.depth else -1
@@ -1268,9 +1337,7 @@ class Checker {
 			i++
 		}
 		for (const d of this.settled) {
-			if (!this.modules.failed) {
-				this.modules.next.decl(d.node!, this.m.path, this.src)
-			}
+			this.modules.decl(d.node!, this.m.path, this.src)
 			d.node = null
 		}
 		this.settled = []
@@ -1294,9 +1361,7 @@ class Checker {
 	private ahead(d: Decl) {
 		if (!d.ahead && d.kind != "test") {
 			d.ahead = true
-			if (!this.modules.failed) {
-				this.modules.next.declare(d.node!, this.m.path, this.src)
-			}
+			this.modules.declare(d.node!, this.m.path, this.src)
 		}
 	}
 
@@ -3922,7 +3987,9 @@ class Checker {
 		if (e != null && from != null) {
 			const s = new Site(at, from, e)
 			e.sites.push(s)
-			from.callers.push(s)
+			if (!from.listed) {
+				from.callers.push(s) // escape reads only those of errors inferred
+			}
 		}
 	}
 
