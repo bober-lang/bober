@@ -56,6 +56,7 @@ import { mono } from "./mono"
 import { Parser } from "./parse"
 import { builtin, root } from "./root"
 import { CLib, Package, dir, home, load, nearest, out } from "./pkg"
+import { notice, update, version } from "./update"
 import { wasm } from "./wasm"
 import * as process from "../std/process"
 import { chdir, getcwd, getpid, isatty, link as hardLink } from "unistd.h"
@@ -71,7 +72,7 @@ class Flags @optarg.Cc {
 	command: Command | null @optarg.Rest = null
 }
 
-type Command = Run | Test | Check | Format | Init | Help | Build | Bundle | Lower | Doc | Lsp
+type Command = Run | Test | Check | Format | Init | Help | Version | Update | Build | Bundle | Lower | Doc | Lsp
 
 /// The options of the commands that read C headers.
 class Headers @optarg.Cc {
@@ -128,6 +129,12 @@ class Init @optarg.Cc {
 
 /// print help
 class Help {}
+
+/// print the build of bober, for a bug report
+class Version {}
+
+/// replace bober's package by the latest edge
+class Update {}
 
 /// link the package's image, or with -o one module's object, or with -wasm the program's WebAssembly; for CI but -wasm
 class Build @optarg.Cc @optarg.Verbose {
@@ -221,6 +228,7 @@ function main(): i32 {
 		print(usage(null, false))
 		return 2
 	}
+	notice()
 	try {
 		const cwd = fromCString(getcwd(0, 0))
 		const h = nearest(join(cwd, "bober.pkg"))
@@ -298,6 +306,11 @@ function command(c: Command): i32 {
 		case Init:
 			init(if (c.args.length == 0) "" else c.args[0])
 			return 0
+		case Version:
+			print(version())
+			return 0
+		case Update:
+			return update()
 		case Bundle: if (c.args.length > 0) {
 			pack(c.args[0])
 			return 0
