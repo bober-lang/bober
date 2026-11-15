@@ -3669,6 +3669,9 @@ class Checker {
 		} else if (n.kind != "postfix" && o.hasNull()) {
 			throw this.error(start(a), `${if (a.kind == "token") this.text(a.t) else show(o)} may be null`)
 		}
+		if (assigned && this.held(a)) {
+			throw this.error(start(n), `${this.source(n)} is not assignable`)
+		}
 		const t = switch (n.kind) {
 			case "postfix": o.nonNull()
 			case "member": this.field(o, n.parts[1], assigned, isTok(a, "this"))
@@ -3681,6 +3684,31 @@ class Checker {
 		const b = if (n.kind == "member" && !assigned) this.place(n, t) else null
 		n.type = if (b == null) t else b.narrowed ?? t
 		return n.type!
+	}
+
+	/// Whether p is a const's `T[n]`, or a readonly field's but on this in its class's constructor, or one in an element
+	/// of it, whose elements and their fields are not assignable.
+	private held(p: Node): bool {
+		if (p.kind == "index" && p.parts[0].type!.kind == "fixed") {
+			return this.held(p.parts[0])
+		} else if (p.type!.kind != "fixed") {
+			return false
+		} else if (p.kind == "token") {
+			return !(this.find(this.text(p.t))?.mutable ?? true)
+		} else if (p.kind != "member") {
+			return (p.kind == "postfix" || p.kind == "paren") && this.held(p.parts[0])
+		}
+		const k = this.text(p.parts[1].t)
+		const space = this.namespace(p)
+		if (space != null) {
+			return !space.exports!.get(k)!.mutable
+		}
+		const o = p.parts[0].type!.nonNull()
+		const s = standsFor(o)
+		const c = s ?? o.methods() ?? o
+		const w = declarer(c, k, s != null) ?? c
+		const own = isTok(p.parts[0], "this") && this.fn?.builds == (w.generic ?? w)
+		return about(w, k, s != null).readonly && !own || this.held(p.parts[0])
 	}
 
 	/// The namespace import whose member member link n reads, if it is one.
