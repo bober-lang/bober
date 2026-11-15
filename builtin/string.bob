@@ -161,12 +161,17 @@ export function mapped(fd: i32, n: i64): string | i64 {
 	return if (r < 0) r else shared(buf, at as u64, n)
 }
 
-/// a == b.
+/// a == b: by their words alone, unless one is long and their lengths match, as a short one's unused bytes are 0.
 export function strEq(a: string, b: string): bool {
 	const pa = addr(a)
 	const pb = addr(b)
-	const n = lenAt(pa)
-	return n == lenAt(pb) && memcmp(bytesAt(pa), bytesAt(pb), n as u64) == 0
+	const ha = load[u64](pa)
+	const hb = load[u64](pb)
+	if (ha == hb && load[u64](pa + 8) == load[u64](pb + 8) && load[u64](pa + 16) == load[u64](pb + 16)) {
+		return true
+	}
+	return ((ha & 0xff) == 0xff || (hb & 0xff) == 0xff) && lenAt(pa) == lenAt(pb)
+		&& memcmp(bytesAt(pa), bytesAt(pb), lenAt(pa) as u64) == 0
 }
 
 /// Below, at or above 0 as a is before, equal to or after b, by code units.
