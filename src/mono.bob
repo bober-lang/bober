@@ -11,6 +11,7 @@
 
 import { stableSort } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
+import { min } from "../std/math"
 import * as decl from "./bc/decl"
 import * as kind from "./bc/kind"
 import * as op from "./bc/op"
@@ -216,6 +217,9 @@ class Mono {
 		let changed = true
 		while (changed) {
 			changed = false
+			for (const [t, name] of this.reached.values()) {
+				this.dispatched(t, name)
+			}
 			for (const x of this.abstracts) {
 				const ss = this.sources.get(x)!.map(s => if (s != x && this.ins.abstract(s)) p.union(this.ins.flat(s)) else s)
 				const u = p.union(ss)
@@ -231,6 +235,26 @@ class Mono {
 			}
 		}
 		return end
+	}
+
+	/// Notes what a dispatch function of member name of t converts, of each type a value of t is: the result of the
+	/// method it calls or the field it reads into t's, and the args or the field it writes from t's.
+	private dispatched(t: i32, name: i32) throws CompileError {
+		const p = this.p
+		const ins = this.ins
+		const f = ins.methodType(t, name)
+		for (const m of ins.flat(t)) {
+			const g = if (f >= 0) ins.methodType(m, name) else -1
+			if (g >= 0) {
+				this.convert(p.b(g), p.b(f))
+				for (const i of 0 ... min(p.items(f).length, p.items(g).length) - 1) {
+					this.convert(p.items(f)[i], p.items(g)[i])
+				}
+			} else if (f < 0) {
+				this.convert(ins.fieldType(m, name), ins.fieldType(t, name))
+				this.convert(ins.fieldType(t, name), ins.fieldType(m, name))
+			}
+		}
 	}
 
 	/// Notes the members of src that a Cast into to puts into one of its interfaces or object types: each class,

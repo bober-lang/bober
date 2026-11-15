@@ -135,3 +135,20 @@ test "a function field of an interface is called, as is an object literal's for 
 	const c: Calls = { f: () => 1, g: (a: i32) => a + 1 }
 	assert c.f() == 1 && c.g(1) == 2 && both(c) == 3 && both(new CallsField()) == 3
 }
+
+class Made { v = 2 }
+
+interface HasM { v: i32 }
+
+interface Maker { make(): HasM; take(m: Made): i32; f: HasM }
+
+class Factory {
+	f = new Made()
+	make(): Made { return new Made() }
+	take(m: HasM): i32 { return m.v }
+}
+
+test "a member of a narrower type, or a method of wider params, converts through an interface" {
+	const m: Maker = new Factory()
+	assert m.make().v == 2 && m.take(new Made()) == 2 && m.f.v == 2
+}
