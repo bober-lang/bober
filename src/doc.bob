@@ -1,15 +1,101 @@
-//! bober doc: the spec, gathered from doc comments. A doc comment's Markdown heading, a line of `#`s and a space, starts a
-//! section, which runs to the comment's end or its next heading; the lines before it document the declaration as usual.
-//! Each section has one place, the declaration that does what it says, or a module's doc. The sections print as
-//! Markdown in the order of the files and their lines, each followed by where it is: `bober doc src/*.bob src/c/bind.bob
+//! bober doc: the docs of a module, or of the modules below a directory, as Markdown, from their doc comments; with
+//! -spec, the spec gathered from them. A doc comment's Markdown heading, a line of `#`s and a space, starts a section,
+//! which runs to the comment's end or its next heading; the lines before it document the declaration as usual. Each
+//! section has one place, the declaration that does what it says, or a module's doc. The sections print as Markdown in
+//! the order of the files and their lines, each followed by where it is: `bober doc -spec src/*.bob src/c/bind.bob
 //! builtin/*.bob` prints the spec of the language and its bytecode.
 
-import { startsWith } from "../std/algo"
+import { endsWith, indexOf, startsWith } from "../std/algo"
 import { hash, space } from "../std/ascii"
-import { trim } from "../std/string"
+import { exists, glob } from "../std/fs"
+import { join, rel } from "../std/fs/path"
+import { replace, split, trim } from "../std/string"
 import { CompileError } from "./error"
-import { SyntaxError } from "./lex"
-import { Parser, leads } from "./parse"
+import { SyntaxError, Tok } from "./lex"
+import { Parser, Tree, leads } from "./parse"
+import { root } from "./root"
+
+/// The docs of the module at, named as an import names it or by its path, or else the list of the modules below the
+/// directory at, each with its doc's first sentence; at is looked up here, then in bober's root, so that `bober doc
+/// std` prints the same anywhere.
+export function doc(at: string): string throws CompileError | IoError {
+	const name = if (endsWith(at, ".bob")) at.slice(0, at.length - 4) else at
+	for (const path of [name, join(root, name)]) {
+		if (exists(`${path}.bob`)) {
+			return reference(name, `${path}.bob`, read(`${path}.bob`))
+		}
+		const fs = glob(`${path}/**/*.bob`).filter(f => !endsWith(f, ".test.bob"))
+		if (fs.length > 0) {
+			return fs.map(f => {
+				const m = join(name, rel(path, f)!)
+				const src = read(f)
+				const s = summary(moduleDoc(parse(f, src)[0], src))
+				return `- \`${m.slice(0, m.length - 4)}\`${if (s == "") "" else ": " + s}\n`
+			}).join("")
+		}
+	}
+	throw new CompileError(`${at}: no module or directory here nor in bober's root`)
+}
+
+/// The docs of module name, src: its doc, then each exported declaration as written up to its body, a class's
+/// members but private ones within it, and below it its doc; those next to each other without one share a block.
+export function reference(name: string, path: string, src: string): string throws CompileError {
+	const [p, trees] = parse(path, src)
+	let out = `# ${name}\n${paragraph(moduleDoc(p, src))}`
+	let bare = false // whether the last export has no doc, so that one without shares its block
+	for (const t of trees) {
+		const x = t.parts.at(0)
+		if (x instanceof Tok && x.kind == "export") {
+			let code = signature(src, t)
+			const ms = t.parts.at(t.parts.length - 1)
+			if (t.kind == "class" && ms instanceof Tree) {
+				let body = ""
+				for (const m of ms.parts) {
+					if (m instanceof Tree
+						&& !m.parts.some(y => y instanceof Tok && src.slice(y.loc.pos, y.loc.end()) == "private")) {
+						const d = if (leads(src, start(m))) p.doc(start(m), stop(m)) else "" // not the class's
+						for (const l of if (d == "") [] else split(d, "\n")) {
+							body += `\n\t///${if (l == "") "" else " " + l}`
+						}
+						body += `\n\t${signature(src, m)}`
+					}
+				}
+				code += if (body == "") " {}" else ` {${body}\n}`
+			}
+			const d = paragraph(p.doc(start(t), stop(t)))
+			out = (if (bare && d == "") out.slice(0, out.length - 4) else out + "\n```bober\n") + code + "\n```\n" + d
+			bare = d == ""
+		}
+	}
+	return out
+}
+
+/// The source of t up to its body, or of a var spanning lines up to its value.
+function signature(src: string, t: Tree): string {
+	let end = stop(t)
+	for (const x of t.parts) {
+		if (x instanceof Tree && (x.kind == "block" || x.kind == "members")
+			|| t.kind == "var" && x instanceof Tok && x.kind == "=" && indexOf(src.slice(start(t), end), "\n") >= 0) {
+			end = start(x)
+		}
+	}
+	return trim(src.slice(start(t), end))
+}
+
+/// The text of the module doc of src, parsed by p.
+function moduleDoc(p: Parser, src: string): string {
+	return p.comments.map(c => src.slice(c.loc.pos, c.loc.end())).filter(c => startsWith(c, "//!")).map(body).join("\n")
+}
+
+/// text after a blank line, if any.
+function paragraph(text: string): string { return if (trim(text) == "") "" else `\n${trim(text)}\n` }
+
+/// The first sentence of doc's first paragraph.
+function summary(doc: string): string {
+	const s = replace(split(doc, "\n\n")[0], "\n", " ")
+	const i = indexOf(s, ". ")
+	return if (i < 0) s else s.slice(0, i + 1)
+}
 
 export class Section {
 	/// Its heading line.
@@ -21,27 +107,17 @@ export class Section {
 }
 
 /// The spec in the files at paths, as Markdown; throws a file that cannot be read or parsed as a CompileError.
-export function doc(paths: string[]): string throws CompileError {
+export function spec(paths: string[]): string throws CompileError {
 	const all: Section[] = []
 	for (const path of paths) {
-		const src = readFile(path)
-		if (src == null) {
-			throw new CompileError(`${path}: cannot read`)
-		}
-		all.push(...sections(path, src))
+		all.push(...sections(path, read(path)))
 	}
 	return markdown(all)
 }
 
 /// The sections in the doc comments of src, the file at path.
 export function sections(path: string, src: string): Section[] throws CompileError {
-	const p = new Parser(src, true) // builtin/ has functions without a body
-	try {
-		while (p.parse() != null) {}
-	} catch (e: SyntaxError) {
-		const [line, col] = p.lineCol(e.loc.pos)
-		throw new CompileError(`${path}:${line}:${col}: ${e.msg}`)
-	}
+	const [p, _] = parse(path, src)
 	const out: Section[] = []
 	let s: Section | null = null
 	let last = 0
@@ -56,14 +132,13 @@ export function sections(path: string, src: string): Section[] throws CompileErr
 			s = null
 		}
 		last = line
-		const body = text.slice(if (text.length > 3 && text[3] == space) 4 else 3, text.length)
-		if (heading(body)) {
+		if (heading(body(text))) {
 			s = new Section()
-			s.head = body
+			s.head = body(text)
 			s.at = `${path}:${line}`
 			out.push(s)
 		} else if (s != null) {
-			s.text += body + "\n"
+			s.text += body(text) + "\n"
 		}
 	}
 	return out
@@ -77,6 +152,59 @@ export function markdown(all: Section[]): string {
 		out += `${s.head}\n\n${if (text == "") "" else text + "\n\n"}*${s.at}*\n\n`
 	}
 	return out
+}
+
+/// The file at path.
+function read(path: string): string throws CompileError {
+	const src = readFile(path)
+	if (src == null) {
+		throw new CompileError(`${path}: cannot read`)
+	}
+	return src!
+}
+
+/// The top-level constructs of src, the file at path, and the parser, which holds its comments.
+function parse(path: string, src: string): [Parser, Tree[]] throws CompileError {
+	const p = new Parser(src, true) // builtin/ has functions without a body
+	const trees: Tree[] = []
+	try {
+		let t = p.parse()
+		while (t != null) {
+			trees.push(t!)
+			t = p.parse()
+		}
+	} catch (e: SyntaxError) {
+		const [line, col] = p.lineCol(e.loc.pos)
+		throw new CompileError(`${path}:${line}:${col}: ${e.msg}`)
+	}
+	return [p, trees]
+}
+
+/// Doc comment text without its `///` or `//!` and a space after.
+function body(text: string): string {
+	return text.slice(if (text.length > 3 && text[3] == space) 4 else 3, text.length)
+}
+
+/// Where p's source starts.
+function start(p: Tree | Tok): i32 {
+	if (p instanceof Tok) {
+		return p.loc.pos
+	}
+	const first = if (p.parts.length > 0) start(p.parts[0]) else p.t.loc.pos
+	return if (first < p.t.loc.pos) first else p.t.loc.pos
+}
+
+/// Where p's source ends, after its closing token if it has one.
+function stop(p: Tree | Tok): i32 {
+	if (p instanceof Tok) {
+		return p.loc.end()
+	}
+	let end = if (p.end > p.t.loc.pos) p.end + 1 else p.t.loc.end()
+	for (const q of p.parts) {
+		const e = stop(q)
+		end = if (e > end) e else end
+	}
+	return end
 }
 
 /// Whether line is a Markdown heading: `#`s, then a space.

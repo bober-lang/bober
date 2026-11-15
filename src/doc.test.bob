@@ -1,4 +1,4 @@
-import { markdown, sections } from "./doc"
+import { markdown, reference, sections } from "./doc"
 import { CompileError } from "./error"
 
 const src = `//! The module.
@@ -35,4 +35,58 @@ test "a file that fails to parse is a CompileError at where it fails" {
 		msg = e.msg
 	}
 	assert msg == "a.bob:2:11: unexpected character"
+}
+
+const lib = `//! Shapes. Of two kinds.
+
+/// The area of s.
+export function area(s: Shape): f64 { return s.area() }
+
+function hidden() {}
+
+/// A class that new makes without arguments.
+export interface New { constructor() }
+
+export class Square {
+	/// Its side.
+	side = 1.0
+	private cache = 0
+	area(): f64 { return this.side * this.side }
+}
+
+export const sides: i32[] = [
+	1, 2,
+]
+`
+
+test "a module's docs: each export as written up to its body, a class's members but private ones, and its doc" {
+	const f = "```"
+	assert reference("lib", "lib.bob", lib)
+		== `# lib
+
+Shapes. Of two kinds.
+
+${f}bober
+export function area(s: Shape): f64
+${f}
+
+The area of s.
+
+${f}bober
+export interface New {
+	constructor()
+}
+${f}
+
+A class that new makes without arguments.
+
+${f}bober
+export class Square {
+	/// Its side.
+	side = 1.0
+	area(): f64
+}
+export const sides: i32[]
+${f}
+`
 }
