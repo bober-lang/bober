@@ -24,6 +24,7 @@ import { endsWith, indexOf, sortBy, startsWith, unique } from "../std/algo"
 import { digit, isAlphabetic, lf, minus, o, underscore, x, zero } from "../std/ascii"
 import { HashMap } from "../std/collections/hashmap"
 import { ScopedMap } from "../std/collections/scopedmap"
+import { join } from "../std/fs/path"
 import { min } from "../std/math"
 import { codePoint, unquoted } from "../std/string"
 import * as decl from "./bc/decl"
@@ -39,7 +40,7 @@ import { CompileError } from "./error"
 import { Tok } from "./lex"
 import { Lift } from "./lift"
 import { holdsType } from "./resolve"
-import { builtinPath } from "./root"
+import { builtinPath, root } from "./root"
 import { Bool, Field, Null, String, Type, basics, members, spells } from "./type"
 import { strtod } from "stdlib.h"
 
@@ -61,6 +62,9 @@ export function lower(paths: string[], dirs: string[] = [], cache: string[] = []
 	const p = l.finish()
 	return if (l.lift.current()) p else lower(paths, dirs, [], read)
 }
+
+/// The module path of an import of src/rt.h, up to its names.
+let rtH = `${join(root, "src/rt.h")}: `
 
 /// The stage after the checker: lowers each module's declarations as they are handed on.
 export class Lower implements Checked {
@@ -149,7 +153,7 @@ export class Lower implements Checked {
 	/// yet lowered.
 	builtin(name: string): i32 {
 		const file = switch (name) {
-			case "zero", "subtest", "mark": "mem"
+			case "zero", "subtest", "mark", "taint": "mem"
 			case "equal", "literal": "equal"
 			case "show", "item", "diff": "show"
 			case "newArray": "array"
@@ -1809,6 +1813,9 @@ class Gen {
 			this.op(op.Type, if (generic) this.prog.type(kind.Named, this.u.l.nominal(c!)) else this.ty(c!))
 			return kind.Type
 		}
+		if (t.kind == "function") {
+			this.taint(d!)
+		}
 		this.op(op.Global, this.ref(d!), this.typeArgs(d!, t, p))
 		return if (this.prog.decls[d!].kind == decl.Var) this.ty(this.u.l.lift.types.get(d!)!) else this.ty(t)
 	}
@@ -1908,6 +1915,7 @@ class Gen {
 		const d = this.global(named)
 		const l = if (isTok(named, "ident") && named.symbol == "") this.find(this.text(named)) else null
 		if (d != null && this.prog.decls[d!].kind != decl.Var) {
+			this.taint(d!)
 			this.args(f, args)
 			this.op(op.Call, this.ref(d!), this.typeArgs(d!, f, callee))
 			return r
@@ -2080,6 +2088,18 @@ class Gen {
 
 	/// A call of builtin/'s function name with type args ts.
 	private callBuiltin(name: string, ts: i32) { this.op(op.Call, this.ref(this.u.l.builtin(name)), ts) }
+
+	/// Before a call of function d, or taking it as a value, keeps the tests from being cached where d is C's, of an
+	/// import not @Deterministic, nor of src/rt.h, whose functions tell the run time themselves; unless here is C,
+	/// whose calls its caller's stand for. In any build, as all share the bytecode.
+	private taint(d: i32) {
+		const path = this.prog.modules[this.prog.decls[d].module].path
+		if (indexOf(path, ": ") >= 0 && indexOf(this.u.path(), ": ") < 0 && !endsWith(path, " @Deterministic")
+			&& !startsWith(path, rtH)) {
+			this.callBuiltin("taint", 0)
+			this.op(op.Drop)
+		}
+	}
 
 	/// The type args of the generic function d that its instantiation inst at p has, given or inferred, defaults filling
 	/// in.

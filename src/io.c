@@ -40,6 +40,39 @@ struct bober_net __attribute__((weak)) bober_net;
 /// Whether fd is a socket of that network.
 #define NET(fd) (NETWORK && bober_net.ready(fd, 0) >= 0)
 
+/// Of the tests, which src/rt.c reports: the running one's directory, where it does as it likes, "" if none; the
+/// regular files outside it that they read, each path ended by a NUL; and whether they did what else their results
+/// may depend on.
+char bober_tmp[PATH_MAX];
+char *bober_reads;
+long bober_nreads;
+int bober_tainted;
+
+void bober_taint(void) { bober_tainted = 1; }
+
+/// Whether path is outside the running test's directory, as every path is when none runs.
+static int outside(const char *path) {
+  size_t n = strlen(bober_tmp);
+  return !n || strncmp(path, bober_tmp, n) || (path[n] && path[n] != '/') || strstr(path + n, "/..");
+}
+
+/// Taints the tests where path is outside the running one's directory.
+static void reach(const char *path) { bober_tainted |= outside(path); }
+
+/// Notes, in tests, that the running test read the file at path, which is regular or none.
+static void note(const char *path) {
+  char cwd[PATH_MAX] = "";
+  if (path[0] != '/' && !getcwd(cwd, sizeof cwd)) {
+    bober_tainted = 1;
+    return;
+  }
+  size_t a = strlen(cwd), b = strlen(path) + 1;
+  bober_reads = realloc(bober_reads, bober_nreads + a + 1 + b);
+  memcpy(bober_reads + bober_nreads, cwd, a), bober_nreads += a;
+  if (a) bober_reads[bober_nreads++] = '/';
+  memcpy(bober_reads + bober_nreads, path, b), bober_nreads += b;
+}
+
 int64_t bober_mono(void) {
   struct timespec t;
   return bober_logical >= 0 ? bober_logical : (clock_gettime(CLOCK_MONOTONIC, &t), t.tv_sec * 1000000000 + t.tv_nsec);
@@ -234,7 +267,12 @@ const char *bober_io_kind(long r) {
 long bober_io_open(const char *path, const char *mode) {
   int flags = mode[1] == '+' ? O_RDWR : mode[0] == 'r' ? O_RDONLY : O_WRONLY;
   flags |= mode[0] == 'w' ? O_CREAT | O_TRUNC : mode[0] == 'a' ? O_CREAT | O_APPEND : mode[0] == 'x' ? O_CREAT | O_EXCL : 0;
-  return result(open(path, flags | O_CLOEXEC, 0666));
+  long fd = result(open(path, flags | O_CLOEXEC, 0666));
+  if (bober_logical < 0 || !outside(path)) return fd;
+  struct stat s;
+  if (strcmp(mode, "r") || (fd >= 0 && (fstat(fd, &s) || !S_ISREG(s.st_mode)))) bober_tainted = 1;
+  else note(path);
+  return fd;
 }
 
 /// Wakes what waits on fd, ended or closed, at once: before the peer's answer to it, and another descriptor's number.
@@ -252,6 +290,7 @@ long bober_io_close(int fd) {
   return result(close(fd));
 }
 long bober_io_read(int fd, void *buf, unsigned long n) {
+  bober_tainted |= fd == 0;
   return NET(fd) ? bober_net.read(fd, buf, n) : result_on(fd, 0, read(fd, buf, n));
 }
 long bober_io_map(int fd, void *at, unsigned long n) {
@@ -292,6 +331,7 @@ static int replicate(int fd, int to) {
 }
 
 long bober_io_copy(int fd, const char *path, unsigned long n) {
+  reach(path);
   unlink(path);
 #ifdef __APPLE__
   int fclonefileat(int, int, const char *, uint32_t);  // of <sys/clonefile.h>
@@ -313,12 +353,15 @@ long bober_io_lock(int fd, int shared, int wait) {
   if (flock(fd, (shared ? LOCK_SH : LOCK_EX) | (wait ? 0 : LOCK_NB)) == 0) return 1;
   return errno == EWOULDBLOCK ? 0 : result(-1);
 }
-long bober_io_mkdir(const char *path) { return result(mkdir(path, 0777)); }
-long bober_io_rename(const char *from, const char *to) { return result(rename(from, to)); }
+long bober_io_mkdir(const char *path) { return reach(path), result(mkdir(path, 0777)); }
+long bober_io_rename(const char *from, const char *to) { return reach(from), reach(to), result(rename(from, to)); }
 
-long bober_io_readlink(const char *path, void *buf, unsigned long n) { return result(readlink(path, buf, n)); }
+long bober_io_readlink(const char *path, void *buf, unsigned long n) {
+  return reach(path), result(readlink(path, buf, n));
+}
 
 long bober_io_exe(char *buf) {
+  bober_tainted = 1;
 #ifdef __APPLE__
   int _NSGetExecutablePath(char *buf, uint32_t *size);  // of <mach-o/dyld.h>
   char path[PATH_MAX] = "";
@@ -332,6 +375,7 @@ long bober_io_exe(char *buf) {
 
 long bober_io_remove(const char *path) {
   struct stat s;
+  reach(path);
   return result(lstat(path, &s) ? -1 : S_ISDIR(s.st_mode) ? rmdir(path) : unlink(path));
 }
 
@@ -342,6 +386,7 @@ static const char *kind(unsigned mode) {
 static long ns(long s, long n) { return s * 1000000000 + n; }
 
 bober_stat bober_io_stat(const char *path, int follow) {
+  reach(path);
 #if defined(__linux__)  // only statx tells when a file was born
   struct statx x;
   if (statx(AT_FDCWD, path, follow ? 0 : AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS | STATX_BTIME, &x)) return (bober_stat){-errno};
@@ -361,6 +406,7 @@ bober_stat bober_io_stat(const char *path, int follow) {
 }
 
 long bober_io_list(const char *path, char *buf, unsigned long n) {
+  reach(path);
   DIR *d = opendir(path);
   if (!d) return -errno;
   unsigned long at = 0;
@@ -428,6 +474,7 @@ long bober_io_dial(const char *net, const char *host, int port) {
   socklen_t n = address(host, port, &sa);
   if (!n) return -EINVAL;
   if (NETWORK && sa.ss_family != AF_UNIX) return bober_net.dial(net, host, port);
+  bober_tainted = 1;
   long fd = unblocked(socket(sa.ss_family, strcmp(net, "udp") ? SOCK_STREAM : SOCK_DGRAM, 0));
   return fd >= 0 && connect(fd, (void *)&sa, n) && errno != EINPROGRESS ? failed(fd) : fd;
 }
@@ -445,6 +492,7 @@ long bober_io_listen(const char *net, const char *host, int port, int backlog) {
   if (!n) return -EINVAL;
   int stream = strcmp(net, "udp"), ip = sa.ss_family != AF_UNIX, on = 1, off = 0;
   if (NETWORK && ip) return bober_net.listen(net, host, port);
+  bober_tainted = 1;
   long fd = unblocked(socket(sa.ss_family, stream ? SOCK_STREAM : SOCK_DGRAM, 0));
   // A v6 socket takes v4 too, whatever net.ipv6.bindv6only says. SO_REUSEADDR on UDP would let any user share the
   // port, so only a stream listener has it. SO_REUSEPORT lets the user's sockets share a port, so it is only for one
@@ -524,6 +572,7 @@ void bober_io_ip_text(const unsigned char *ip, int n, char *text) {
 
 long bober_io_run(const char *file, char *const *argv, const char *out) {
   extern char **environ;
+  bober_tainted = 1;
   posix_spawn_file_actions_t fa;
   posix_spawn_file_actions_init(&fa);
   if (out)

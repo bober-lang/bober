@@ -7,6 +7,7 @@
 #define _GNU_SOURCE  // REG_RSP
 #include "rt.h"
 #include <errno.h>
+#include <limits.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -15,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/random.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <sys/ucontext.h>  // <ucontext.h> is an #error on macOS without _XOPEN_SOURCE
 #include <unistd.h>
@@ -38,6 +40,11 @@ static jmp_buf *test;          // where a trap in the running test or subtest go
 static const char *testFile;  // the running test's source
 static int32_t testAt;        // where in it the statement running is, -1 before the first
 static int cap = -1, saved[2] = {1, 2};  // in tests, the file the output and errors go to, and where they went
+static const char *tmp;  // in tests, the directory in which each gets one of its own, by number, if any: BOBER_TMP
+/// What src/io.c knows of the tests: the running one's directory, the files they read and whether they are tainted.
+extern char bober_tmp[], *bober_reads;
+extern long bober_nreads;
+extern int bober_tainted;
 /// Reserves the heap (src/gc.c), before any code runs that may store to it.
 void bober_gc_start(void);
 /// Drops every fiber but the first (src/fiber.c), as once a trap jumped back to it.
@@ -187,6 +194,8 @@ void bober_start(int argc, char **argv, int32_t tested) {
     FILE *f = tmpfile();
     seed = STONEWALL, bober_logical = 1, cap = f ? fileno(f) : -1, saved[0] = dup(1), saved[1] = dup(2);
     dup2(cap, 1), dup2(cap, 2);
+    tmp = getenv("BOBER_TMP") ? realpath(getenv("BOBER_TMP"), 0) : 0;
+    unsetenv("BOBER_TMP");  // not for the programs tests run
   } else getentropy(&seed, sizeof seed);
   signal(SIGPIPE, SIG_IGN);  // a write to a socket the peer closed fails with EPIPE instead
   // fault runs on a stack of its own, as the faulting one is full.
@@ -199,7 +208,9 @@ void bober_start(int argc, char **argv, int32_t tested) {
 
 const char *bober_arg(int32_t i) { return i < argc_ ? argv_[i] : 0; }
 
-const char *bober_env(const char *name) { return getenv(name); }
+const char *bober_env(const char *name) {
+  return !tests ? getenv(name) : !strcmp(name, "TMPDIR") && *bober_tmp ? bober_tmp : 0;
+}
 
 /// A test or subtest running, or the tests: its children's entries in the report so far, members of a JSON object,
 /// whether one failed, and where its output starts in cap.
@@ -264,8 +275,10 @@ static void run(const char *name, void (*f)(void *), void *env) {
 }
 
 void bober_test(const char *name, const char *file, void (*f)(void)) {
+  static int n;  // tests so far
   seed = STONEWALL, testFile = file, testAt = -1;
   if (!all.n) put(saved[0], "{", 1);  // not before, as a trap in initializing prints instead
+  if (tmp) snprintf(bober_tmp, PATH_MAX, "%s/%d", tmp, ++n), mkdir(bober_tmp, 0777);
   run(name, (void (*)(void *))f, 0);
   ftruncate(cap, 0), lseek(cap, 0, SEEK_SET);
 }
@@ -274,9 +287,16 @@ void bober_subtest(const char *name, uint64_t f) { run(name, *(void (**)(void *)
 
 void bober_mark(int32_t at) { testAt = at; }
 
-/// Ends the report of the tests, a JSON object of their entries; whether one failed.
+/// Ends the report of the tests, a JSON object of their entries, and adds a line of the files they read, a JSON array,
+/// null if they did what else their results may depend on (src/io.c); whether one failed.
 int32_t bober_tested(void) {
   put(saved[0], all.n ? "}\n" : "{}\n", all.n ? 2 : 3);
+  Level reads = {0};
+  raw(&reads, bober_tainted ? "null" : "[");
+  for (long i = 0; !bober_tainted && i < bober_nreads; i += strlen(bober_reads + i) + 1)
+    raw(&reads, i ? ",\"" : "\""), add(&reads, bober_reads + i, strlen(bober_reads + i), true), raw(&reads, "\"");
+  raw(&reads, bober_tainted ? "\n" : "]\n");
+  put(saved[0], reads.kids, reads.n);
   return all.failed;
 }
 

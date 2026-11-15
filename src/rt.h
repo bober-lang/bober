@@ -135,6 +135,9 @@ void bober_subtest(const char *name, uint64_t f);
 /// Notes that the running test is at the statement at its source position at, which a trap elsewhere says it was called
 /// at.
 void bober_mark(int32_t at);
+/// Notes that the tests did what else their results may depend on than their code and the regular files they read, as
+/// call C whose import is not @Deterministic (src/lower.bob), so that they are run again (src/io.c, which does so too).
+void bober_taint(void);
 /// Raises a value as a union holds it, its tag, bits and ref, noting where it was first thrown and the code showing it;
 /// returns if nothing catches it, for the thrower to call bober_uncaught.
 void bober_throw(int64_t tag, int64_t bits, void *ref, const char *file, int32_t at, void *show);
@@ -143,7 +146,7 @@ _Noreturn void bober_uncaught(const uint8_t *shown);
 
 /// The program's argument i, 0 its name, null past the last.
 const char *bober_arg(int32_t i);
-/// The value of the environment variable name, null if it is unset.
+/// The value of the environment variable name, null if it is unset; in tests none but TMPDIR, the test's directory.
 const char *bober_env(const char *name);
 
 // Fibers (src/fiber.c), each on a stack of its own, taking turns: one runs until it parks. builtin/fiber.bob builds

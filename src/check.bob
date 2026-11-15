@@ -34,7 +34,7 @@ const prelude = ["print", "readFile", "writeFile", "args", "targetOs", "targetAr
 /// The constructs a doc comment documents.
 const documented: Syntax[] = ["test", "var", "function", "class", "type", "method", "prop", "param", "typeParam"]
 /// What the compiler lowers the builtin types and the prelude to, which every program holds.
-let lowered = [...first, ...["equal", "show", "math", "fiber"].map(builtinPath)]
+export let lowered = [...first, ...["equal", "show", "math", "fiber"].map(builtinPath)]
 
 /// The errors of the modules at paths and of those they import, each checked once and handed on to next, after
 /// builtin/'s lowered ones, so that those are done before lift compares a module's ABI hash, which may reach them; one
@@ -307,7 +307,7 @@ export class TypeError {
 ///
 /// ```grammar
 /// File       = {Import Term} {Decl Term}
-/// Import     = "import" [ImportList "from"] String
+/// Import     = "import" [ImportList "from"] String {Tag}
 /// ImportList = "{" [Ident ["as" Ident] {"," Ident ["as" Ident]} [","]] "}" | "*" ["as" Ident]
 /// Decl       = Test | ["export"] (Function | Class | Interface | TypeAlias | Var)
 /// Term       = ";" | newline (§2.2)
@@ -321,6 +321,9 @@ export class TypeError {
 /// identifier. Only `export`ed declarations are visible to other modules, and an exported declaration's type shall name
 /// only exported or imported declarations; but a test file, one named `*.test.bob`, may import any top-level declaration
 /// by name.
+///
+/// The one tag of an import, of a C header's or C file's alone, is `@Deterministic` (builtin/tag.bob): what its
+/// functions give depends on their arguments alone, so a test may call them and still be cached (Tests and assertions).
 ///
 /// Top-level declarations may appear in any order and may refer to each other. A variable's *dependencies* are what
 /// running its initializer may run, found lexically, whether reached at run time or not: the functions and variables
@@ -416,11 +419,13 @@ class Modules {
 	}
 
 	/// The module of names from C header spec, as importer includes it, or why there is none (3.1).
-	header(importer: string, spec: string, names: string[]): Module | string {
+	/// Tagged @Deterministic, it is a module of its own, its key ending so, which lowering knows it by.
+	header(importer: string, spec: string, names: string[], deterministic: bool): Module | string {
 		const includes = searched(this.includes)
 		const user = bound.get(importer) ?? new Bound(includes)
 		bound.set(importer, user)
-		const key = `${located(importer, spec, this.includes, user.reader(this.read))}: ${names.join(" ")}`
+		const tag = if (deterministic) " @Deterministic" else ""
+		const key = `${located(importer, spec, this.includes, user.reader(this.read))}: ${names.join(" ")}${tag}`
 		const m = this.loaded.get(key) ?? this.bundled(key) ?? this.reused(key)
 		if (m != null) {
 			return m
@@ -1196,8 +1201,15 @@ class Checker {
 
 	/// Declares the names import n names (3).
 	private imports(n: Node) {
-		const s = n.parts[n.parts.length - 1].t
+		const ts = tags(n)
+		const s = n.parts[n.parts.length - 1 - 2 * ts.length].t
 		const spec = this.key(s)
+		const c = endsWith(spec, ".h") || endsWith(spec, ".c")
+		for (const e of ts) {
+			if (!c || this.source(e) != "Deterministic") {
+				this.report(start(e), "an import's one tag is @Deterministic, of a C import")
+			}
+		}
 		const what = n.parts[0]
 		const listed = what.kind == "object"
 		const names: Tok[] = []
@@ -1207,10 +1219,10 @@ class Checker {
 			texts.push(this.text(names[names.length - 1]))
 		}
 		let m: Module | string = ""
-		if (!endsWith(spec, ".h") && !endsWith(spec, ".c")) {
+		if (!c) {
 			m = this.modules.load(resolve(this.m.path, if (endsWith(spec, ".bob")) spec else spec + ".bob"))
 		} else if (listed) {
-			m = this.modules.header(this.m.path, spec, texts)
+			m = this.modules.header(this.m.path, spec, texts, ts.length > 0)
 		} else {
 			m = "a C header's names are imported by name"
 		}
@@ -1442,6 +1454,11 @@ class Checker {
 	/// evaluated after; a value of another type propagates. Tests and assertions exist only in test and debug builds;
 	/// in other builds they are not compiled, so they shall have no side effects a program relies on. No two top-level
 	/// tests of a module share a name.
+	///
+	/// A test sees no environment, logical time and random numbers seeded alike, its own empty directory as `TMPDIR`,
+	/// and a network inside its process. A program's tests that all passed are not run again while its code is the same
+	/// and the regular files outside their directories that they read are as they were; unless one called a C function
+	/// whose import has no `@Deterministic` (but src/rt.h's), or reached outside its directory otherwise.
 	///
 	/// ```
 	/// test "patterns" {
