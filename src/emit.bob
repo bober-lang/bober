@@ -166,8 +166,10 @@ class Emitter {
 	/// Whether the program is as lowered, each generic's code once, taking its type args' descriptors.
 	dyn: bool
 	facts: Facts
-	/// The module's decls, members and nested ones included.
+	/// The module's decls, members and nested ones included, then its copies, defined local.
 	private decls: i32[] = []
+	private here = new HashMap[i32, bool]()
+	private copies = new HashMap[i32, bool]()
 	/// The runtime's functions, and its heap's start, by name, without bober_.
 	private rts = new HashMap[string, Value]()
 	/// By type id, what the functions of their names make of it in this module's backend, as learned or not.
@@ -262,7 +264,14 @@ class Emitter {
 		this.dyn = o.dyn
 		this.facts = facts
 		this.any = p.type(kind.Union)
-		this.decls = listed(p, m)
+		const copies = listed(p, p.modules[m].copies)
+		this.decls = [...listed(p, p.modules[m].decls), ...copies]
+		for (const d of this.decls) {
+			this.here.set(d, true)
+		}
+		for (const d of copies) {
+			this.copies.set(d, true)
+		}
 		this.i1 = b.int(1)
 		this.i32 = b.int(32)
 		this.i64 = b.int(64)
@@ -1257,7 +1266,7 @@ class Emitter {
 		const ret = p.b(x.type)
 		const params = p.items(x.type)
 		const self = p.method(d)
-		const env = x.module == this.m && this.envOf(d) != null
+		const env = this.here.has(d) && this.envOf(d) != null
 		const scope = this.scopeOf(d)
 		const first: IrType[] = if (env) [this.ref] else scope.map(_ => this.i64)
 		if (self) {
@@ -1293,11 +1302,11 @@ class Emitter {
 	/// Whether a function value's code takes an arg of type t as a union of any type (see codeType).
 	private anyOf(t: i32): bool { return this.dyn && this.kindOf(t) != kind.Optional }
 
-	/// Decl d as a function of type t, in this module or declared; one nested in a function local.
+	/// Decl d as a function of type t, in this module or declared; a copy or one nested in a function local.
 	private function(d: i32, t: IrType): Value {
 		const x = this.p.decls[d]
 		const f = this.b.function(this.symbol(d), t,
-			x.module == this.m && x.owner >= 0 && this.p.classOf(d) < 0 && (x.mods & decl.Export) == 0)
+			this.copies.has(d) || this.here.has(d) && x.owner >= 0 && this.p.classOf(d) < 0 && (x.mods & decl.Export) == 0)
 		if ((x.mods & decl.Outlined) != 0) {
 			this.b.attr(f, -1, "noinline", 0)
 		}
@@ -1441,10 +1450,10 @@ class Emitter {
 			return have
 		}
 		const x = this.p.decls[d]
-		if (x.module != this.m) {
+		if (!this.here.has(d)) {
 			return this.b.extern(sym, this.mem(x.type))
 		}
-		const g = this.b.global(sym, this.zero(x.type), x.owner >= 0 && this.p.classOf(d) < 0, 0)
+		const g = this.b.global(sym, this.zero(x.type), this.copies.has(d) || x.owner >= 0 && this.p.classOf(d) < 0, 0)
 		this.b.root(g)
 		return g
 	}
@@ -1563,7 +1572,7 @@ class Emitter {
 	private thunk(d: i32): Value {
 		const f = this.callee(d)
 		const fn = this.b.function(`${f.sym}.thunk`, this.b.fn(this.unionTy, [this.unionTy, this.ptr, this.i64]), false)
-		if (this.p.decls[d].module != this.m) {
+		if (!this.here.has(d)) {
 			return fn
 		}
 		const start = this.startThunk(fn, f.scope)
@@ -1601,8 +1610,8 @@ class Emitter {
 	/// The thunk of new of class decl c, in its descriptor's methods, of which new T() of a type param T calls: an
 	/// instance as a union, its constructor called without args.
 	private construction(c: i32): Value {
-		const fn = this.b.function(`${this.symbol(c)}.new`, this.b.fn(this.unionTy, [this.unionTy]), false)
-		if (this.p.decls[c].module != this.m) {
+		const fn = this.b.function(`${this.symbol(c)}.new`, this.b.fn(this.unionTy, [this.unionTy]), this.copies.has(c))
+		if (!this.here.has(c)) {
 			return fn
 		}
 		const start = this.startThunk(fn, this.scopeOf(c))
@@ -2364,11 +2373,11 @@ class Emitter {
 		return this.rt("alloc", [this.word(d, ssizeAt), this.layoutOf(d, true)], false)
 	}
 
-	/// The function initializing an instance of class decl c in place, defined in its module.
+	/// The function initializing an instance of class decl c in place, defined where c is listed.
 	private initializer(c: i32): Value {
 		const ps = [...this.scopeOf(c).map(_ => this.i64), this.ref]
 		return this.b.function(this.symbol(c) + ":init", this.b.fn(this.void, ps),
-			this.p.decls[c].module == this.m && this.p.decls[c].owner >= 0)
+			this.copies.has(c) || this.here.has(c) && this.p.decls[c].owner >= 0)
 	}
 
 	/// Runs the initializers of class n on the instance at refers to, then its constructor, if it has one, with args.
@@ -2996,7 +3005,7 @@ class Emitter {
 		const closures = new HashMap[i32, bool]()
 		const fns: i32[] = []
 		for (const m of 0 ... p.modules.length - 1) {
-			for (const d of listed(p, m)) {
+			for (const d of listed(p, p.modules[m].decls)) {
 				const x = p.decls[d]
 				const c = x.code
 				if (c == null) {
@@ -4081,9 +4090,9 @@ class Emitter {
 	}
 }
 
-/// The decls of module m of p: its top-level decls and those they own, in a release build those mono keeps.
-export function listed(p: Program, m: i32): i32[] {
-	const r = p.modules[m].decls.slice(0, p.modules[m].decls.length)
+/// Decls ds of p, a module's, and those they own, in a release build those mono keeps.
+export function listed(p: Program, ds: i32[]): i32[] {
+	const r = ds.slice(0, ds.length)
 	let i = 0
 	while (i < r.length) {
 		r.append(p.decls[r[i]].members)
