@@ -334,9 +334,6 @@ void TpdeAddAttributeAtIndex(TpdeModuleRef m, TpdeValueRef fn, int index, const 
 		}
 	}
 }
-int TpdeIsDeclaration(TpdeModuleRef m, TpdeValueRef g) {
-	return m->vals[g].op == Op::Function ? m->sym(g).blocks.n == 0 : m->sym(g).init == 0;
-}
 void TpdeReplace(TpdeModuleRef m, TpdeValueRef old, TpdeValueRef by) {
 	std::replace(m->opList.begin(), m->opList.end(), u32(old), u32(by));
 	for (Sym &s : m->syms) {
