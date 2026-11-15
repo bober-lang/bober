@@ -36,7 +36,7 @@ import { check, normal } from "./check"
 import { CompileError } from "./error"
 import { formatFile } from "./format"
 import { Backend } from "./backend/backend"
-import { LLVM, triple } from "./backend/llvm"
+import { LLVM, options, shutdown, triple } from "./backend/llvm"
 import { Tpde } from "./backend/tpde"
 import { Bound, bound, bundle, bundleName, compilerId } from "./lift"
 import { members } from "./link/ar"
@@ -94,6 +94,8 @@ export class Compile @optarg.Cc {
 	wasm: bool = false
 	/// -release for the first x86-64 CPUs, not x86-64-v2, those since about 2009
 	baseline: bool @optarg.Verbose = false
+	/// pass an option to LLVM, as clang's -mllvm
+	mllvm: string[] @optarg.Verbose = []
 }
 
 /// build a program and run it
@@ -132,6 +134,8 @@ class Build @optarg.Cc @optarg.Verbose {
 	compile: ...Compile
 	/// the object, or with -wasm the program, to write
 	o: string = ""
+	/// with -o, write the file's LLVM IR, as LLVM gets it, instead
+	emitLLVM: bool @optarg.Name["emit-llvm"] @optarg.Verbose = false
 	args: string[] @optarg.Rest = []
 }
 
@@ -224,7 +228,13 @@ function main(): i32 {
 			home = rel(cwd, h)
 			dir = join(home!, "build")
 		}
-		return command(c)
+		const mllvm = if (c instanceof Run || c instanceof Test || c instanceof Build) c.compile.mllvm else []
+		options(mllvm)
+		const status = command(c)
+		if (mllvm.length > 0) {
+			shutdown()
+		}
+		return status
 	} catch (e: CompileError | IoError) {
 		print(if (e instanceof IoError) e.message() else e.msg)
 		return 1
@@ -252,7 +262,7 @@ function command(c: Command): i32 {
 			} else if (c.compile.wasm) {
 				toWasm(c.args[0], false, c.compile.headers.I, c.o)
 			} else {
-				inspect(c.args[0], c.o, c.compile)
+				inspect(c.args[0], c.o, c.compile, c.emitLLVM)
 			}
 			return 0
 		case Run: if (c.args.length > 0) {
@@ -523,11 +533,11 @@ function sources(d: string): string[] {
 /// The build command on a file: compiles the module of path alone into the object out, to inspect: by TPDE as lowered,
 /// or if release by LLVM at -O2, monomorphized from what is not generic in it, without what a whole program's emission
 /// learns (learn), and without the generics, but with its bytecode as lowered (src/bc/file.bob), which has them, in
-/// section bober_bc.
-function inspect(path: string, out: string, f: Compile) {
+/// section bober_bc; or if ir, LLVM's module of it, as LLVM gets it, unoptimized, as text.
+function inspect(path: string, out: string, f: Compile, ir: bool) {
 	const p = lowered([path], f.headers.I)
 	const m = p.module(normal(path))
-	if (!f.release) {
+	if (!f.release && !ir) {
 		const b = new Tpde(path)
 		emit(p, m, b, debug)
 		b.verify()
@@ -539,7 +549,11 @@ function inspect(path: string, out: string, f: Compile) {
 	mono(p, m, true)
 	emit(p, m, b, { main: -1, tests: false, dyn: false })
 	b.verify()
-	b.emit(out, false)
+	if (ir) {
+		save(out, b.text())
+	} else {
+		b.emit(out, false)
+	}
 }
 
 /// Program p of mains, lowered after the CMake projects of main's package are built, but the modules linked from the
