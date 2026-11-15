@@ -855,15 +855,20 @@ class Gen {
 				const ro = p.t.kind == "const"
 				// Declared from its start, for a function in its initializer to capture (§3).
 				const l = if (name.kind == "token") this.declare(this.text(name), this.ty(p.type!), if (ro) decl.Readonly else 0) else -1
-				if (init == null) {
-					this.zero(p.type!)
+				const temps = if (init == null) [] else this.elements(name, init!)
+				if (temps.length > 0) {
+					this.bind(name, ro, temps)
 				} else {
-					this.value(init!, p.type!)
-				}
-				if (l >= 0) {
-					this.op(op.SetLocal, l)
-				} else {
-					this.bind(name, ro)
+					if (init == null) {
+						this.zero(p.type!)
+					} else {
+						this.value(init!, p.type!)
+					}
+					if (l >= 0) {
+						this.op(op.SetLocal, l)
+					} else {
+						this.bind(name, ro)
+					}
 				}
 			case "function":
 				const name = operands(p)[0]
@@ -1286,16 +1291,19 @@ class Gen {
 		}
 	}
 
-	/// Stores the value on the stack into the locals pattern p binds, of its type (5.1).
-	private bind(p: Node, ro: bool = false) {
+	/// Stores the value on the stack into the locals pattern p binds, of its type (5.1); or, with temps, the elements
+	/// they hold.
+	private bind(p: Node, ro: bool = false, temps: i32[] = []) {
 		const t = this.ty(p.type!)
 		if (p.kind == "token" || p.kind == "prop") {
 			return this.op(op.SetLocal, this.declare(this.text(p), t, if (ro) decl.Readonly else 0))
 		}
-		const tmp = this.temp(t)
-		this.op(op.SetLocal, tmp)
+		const tmp = if (temps.length > 0) -1 else this.temp(t)
 		const pt = p.type!
-		if (p.kind == "array" && pt.kind != "tuple") {
+		if (tmp >= 0) {
+			this.op(op.SetLocal, tmp)
+		}
+		if (tmp >= 0 && p.kind == "array" && pt.kind != "tuple") {
 			let n = 0
 			for (const q of p.parts) {
 				n += if (q.kind == "unary") 0 else 1
@@ -1306,7 +1314,7 @@ class Gen {
 		}
 		for (const i of 0 ... p.parts.length - 1) {
 			const q = p.parts[i]
-			this.op(op.Local, tmp)
+			this.op(op.Local, if (tmp >= 0) tmp else temps[i])
 			if (q.kind == "unary" && pt.kind == "array") {
 				this.int(kind.I32, i)
 				this.op(op.Local, tmp)
@@ -1331,7 +1339,9 @@ class Gen {
 				this.bind(q.parts[0], ro)
 			} else if (p.kind == "array") {
 				const e = element(pt, i)!
-				this.read(pt, `${i}`, e, true)
+				if (tmp >= 0) {
+					this.read(pt, `${i}`, e, true)
+				}
 				const d = if (q.kind == "binary") q.parts[1] else null
 				if (d != null) {
 					this.orElse(e, () => this.value(d!, e.nonNull()), e.nonNull())
@@ -1396,8 +1406,11 @@ class Gen {
 		const target = p.parts[0]
 		const how = p.t.kind
 		if (target.kind == "array") {
-			this.to(p.parts[1], this.ty(target.type!))
-			return this.unpack(target)
+			const temps = this.elements(target, p.parts[1])
+			if (temps.length == 0) {
+				this.to(p.parts[1], this.ty(target.type!))
+			}
+			return this.unpack(target, temps)
 		}
 		const at = this.place(target, how != "=")
 		if (how == "=") {
@@ -1428,19 +1441,22 @@ class Gen {
 		this.op(at.store, at.a, at.b)
 	}
 
-	/// Stores the tuple on the stack into the places array pattern p lists, each assigned in order.
-	private unpack(p: Node) {
+	/// Stores the tuple on the stack, or the elements temps hold, into the places array pattern p lists, each assigned
+	/// in order.
+	private unpack(p: Node, temps: i32[] = []) {
 		const t = p.type!
-		const tmp = this.temp(this.ty(t))
-		this.op(op.SetLocal, tmp)
+		const tmp = if (temps.length > 0) -1 else this.temp(this.ty(t))
+		if (tmp >= 0) {
+			this.op(op.SetLocal, tmp)
+		}
 		for (const i of 0 ... p.parts.length - 1) {
 			const q = p.parts[i]
 			if (q.kind == "unary") {
 				throw this.fail(q, "a rest in an assignment")
 			}
 			const at = if (q.kind == "array") null else this.place(q, false)
-			this.op(op.Local, tmp)
-			const e = this.read(t, `${i}`, element(t, i)!)
+			this.op(op.Local, if (tmp >= 0) tmp else temps[i])
+			const e = if (tmp >= 0) this.read(t, `${i}`, element(t, i)!) else this.ty(element(t, i)!)
 			if (at == null) {
 				this.unpack(q)
 			} else {
@@ -1448,6 +1464,23 @@ class Gen {
 				this.op(at!.store, at!.a, at!.b)
 			}
 		}
+	}
+
+	/// The elements of array literal v, each kept in a temp as one of array pattern p's type, for bind or unpack to take
+	/// in place of the array, which is then not made; none unless v has an element for each of p's and no spread.
+	private elements(p: Node, v: Node): i32[] {
+		const temps: i32[] = []
+		if (p.kind != "array" || v.kind != "array" || v.parts.length != p.parts.length
+			|| p.parts.some(q => q.kind == "unary") || v.parts.some(e => e.kind == "unary" && e.t.kind == "...")) {
+			return temps
+		}
+		for (const i of 0 ... v.parts.length - 1) {
+			const e = element(p.type!, i)!
+			this.value(v.parts[i], e)
+			temps.push(this.temp(this.ty(e)))
+			this.op(op.SetLocal, temps[i])
+		}
+		return temps
 	}
 
 	/// Where assignment target p is, with its object and index pushed, or if saved kept in temps for parts to push.
