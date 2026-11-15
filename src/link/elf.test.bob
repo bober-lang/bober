@@ -6,7 +6,7 @@ import { arm64 } from "./arm64"
 import { Bytes, le, mapped, zeros } from "./bytes"
 import { elf } from "./elf"
 import { Linker } from "./link"
-import { Code, Global, Local, Object, Section, Symbol, Unwind } from "./object"
+import { Code, Fixup, Global, Local, Object, Rel32, Section, Symbol, Unwind } from "./object"
 
 /// The file of the image l links.
 function file(l: Linker): Bytes throws CompileError {
@@ -71,6 +71,27 @@ test "a symbol's entry is in the section its header says, of a kept image too, w
 	again.add(u)
 	const [names, _] = symbols(file(again))
 	assert names == "f"
+}
+
+test "the unwinder's table leaves out an empty function's FDE, which would hide the next one's at its address" {
+	const code = text("g")
+	// A CIE of pcs pcrel sdata4, and the FDEs of g, its 8 bytes, and of f, empty, at its address.
+	const fde = (at: u64, range: u64) => le(16, 4) + le(at + 4, 4) + zeros(4) + le(range, 4) + zeros(4)
+	const eh = new Section(".eh_frame", Unwind)
+	eh.bytes = le(16, 4) + zeros(4) + "\x01zR\0\x01\x7c\x1e\x01\x1b\0\0\0" + fde(20, 8) + fde(40, 0)
+	eh.size = 60
+	eh.fixups = [new Fixup(28, Rel32, 0, 0), new Fixup(48, Rel32, 1, 0)]
+	code.sections.push(eh)
+	code.symbols.push(new Symbol("f", Global, 0))
+	const l = new Linker(arm64, elf, new Bytes())
+	l.add(code)
+	const d = file(l)
+	let ph = d.get(32, 8)
+	while (d.get(ph, 4) != 0x6474e550) {
+		ph += 56
+	}
+	const fdes = d.get(d.get(ph + 8, 8) + 8, 4) // in the eh_frame_hdr's table
+	assert fdes == 1
 }
 
 test "a stack map's fixup names its own function, though another object's definition takes the name" {
