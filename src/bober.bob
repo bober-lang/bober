@@ -113,13 +113,13 @@ class Test @optarg.Cc {
 	args: string[] @optarg.Rest = []
 }
 
-/// report type errors and lint
+/// report type errors and lint in files, directories or, with none, the package
 class Check @optarg.Cc {
 	headers: ...Headers
 	args: string[] @optarg.Rest = []
 }
 
-/// rewrite files in their one layout
+/// rewrite files, directories or, with none, the package in their one layout
 class Format @optarg.Cc {
 	args: string[] @optarg.Rest = []
 }
@@ -288,17 +288,17 @@ function command(c: Command): i32 {
 		case Run: if (c.args.length > 0) {
 			return process.run([...build(c.args[0], false, c.compile, true), ...c.args.slice(1, c.args.length)])
 		}
-		case Check: if (c.args.length > 0) {
+		case Check: if (c.args.length > 0 || home != null) {
 			let status = 0
-			for (const e of check(c.args, c.headers.I)) {
+			for (const e of check(sourcesOf(c.args), c.headers.I)) {
 				print(`${e.path}:${e.line}:${e.col}: ${if (e.warning) "warning: " else ""}${e.msg}`)
 				status = if (e.warning) status else 1
 			}
 			return status
 		}
-		case Format: if (c.args.length > 0) {
+		case Format: if (c.args.length > 0 || home != null) {
 			let status = 0
-			for (const path of c.args) {
+			for (const path of sourcesOf(c.args)) {
 				try {
 					formatFile(path)
 				} catch (e: CompileError) {
@@ -686,10 +686,12 @@ function program(p: Program, mains: i32[], all: bool): i32[] {
 	return ms
 }
 
-/// The .bob files of d and below that buildPackage links.
+/// The .bob files of d and below that buildPackage links, by name.
 function sources(d: string): string[] {
 	const files: string[] = []
-	for (const e of readDir(d)) {
+	const es = readDir(d)
+	sortBy(es, (a, b) => a.name < b.name)
+	for (const e of es) {
 		const p = join(d, e.name)
 		if (!e.isDirectory) {
 			if (endsWith(e.name, ".bob") && !builtin(p)) {
@@ -698,6 +700,15 @@ function sources(d: string): string[] {
 		} else if (e.name != "build" && !startsWith(e.name, ".") && !exists(join(p, "bober.pkg"))) {
 			files.push(...sources(p))
 		}
+	}
+	return files
+}
+
+/// The .bob files that check and format take of args, files and directories, a directory's its sources; of none, home's.
+function sourcesOf(args: string[]): string[] {
+	const files: string[] = []
+	for (const a of if (args.length == 0) [home!] else args) {
+		files.push(...if (exists(a) && stat(a).isDirectory) sources(a) else [a])
 	}
 	return files
 }
