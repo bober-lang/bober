@@ -49,7 +49,7 @@ import { x64 } from "./link/x64"
 import { Bytes, store } from "./link/bytes"
 import { stamp, stamped } from "./link/keep"
 import { Linker, Stale } from "./link/link"
-import { Code, Const, Global, Kept, Object, Over, Section, Symbol } from "./link/object"
+import { Code, Const, Global, Kept, Local, Object, Over, Section, Symbol } from "./link/object"
 import { SyntaxError } from "./lex"
 import { lower } from "./lower"
 import { serve } from "./lsp"
@@ -447,12 +447,15 @@ export function build(main: string, tests: bool, f: Compile, pin: bool): string[
 	if (!f.release) {
 		const o = { main: -1, tests: false, dyn: !f.O1 || f.O2 || f.O0 }
 		if (!o.dyn) {
+			for (const x of 0 ... p.modules.length - 1) {
+				p.modules[x].bc = if (p.modules[x].bc != "") p.modules[x].bc else write(p, x, compilerId())
+			}
 			mono(p, m)
 		}
 		const [at, version] = image(p, [m], files, cxx, pin, o, if (f.O2) specialize(p) else null)
 		return [...(if (mac) [] else [`${sysroot}/usr/lib/libc.so`]),
 			if (packaged()) join(root, "lib/launch.c.exe") else launcher(dir), at,
-			`${entry(p.modules[m].path, tests)}@${version}`]
+			`${entry(p.modules[m].path, tests)}${if (o.dyn) "" else monoSuffix}@${version}`]
 	}
 	const exe = `${dir}/${name(main)}${if (tests) ".test" else ""}`
 	const o = { main: m, tests: tests, dyn: false }
@@ -588,19 +591,19 @@ let decoded: [u64, Linker, Bytes] | null = null
 /// Links p's modules, each compiled by TPDE as o says, the objects and archives files, if cxx the sysroot's libc++,
 /// and the C library's libunwind and compiler builtins into build/image.so, the one image of all that is built there,
 /// which loads the C library, on macOS the system's with those and libc++ in it, and exports the entries of p's modules
-/// mains; a monomorphized program's is build/image.mono.so. The image is kept
-/// (src/link/link.bob), and a build links only what it does not hold: each object is named by what it is made of,
-/// `<what>@<version>`, a module by its bytecode, which has the ABIs of the modules it imports, and its Bound; a file by
-/// its bytes; an archive, which is linked for good, by its size and when it was written. An image that holds all and
-/// exports the entries is left as it is. Where the image cannot take the link, or an archive it holds changed, all is
-/// linked anew, fresh. The image is written in place where no other process has it, else under a name of its own, then
-/// renamed, as a running program may have the old one mapped, or another build be reading it. Returns its path, or if
-/// pin that of a link to it of this process's, which the launcher removes, by which what the process runs loads this
-/// build's image though another build replaces it; and the version of p's program, the hash of the names of what it is
-/// linked from but -O2's.
+/// mains. The image is kept (src/link/link.bob), and a build links only what it does not hold: each object is named
+/// by what it is made of, `<what>@<version>`, a module by its bytecode, which has the ABIs of the modules it imports,
+/// and its Bound, and monomorphized, `<path>^O1@`, by its bytecode as such too, beside the one as lowered, its symbols
+/// its own (unit), of one program at a time; a file by its bytes; an archive, which is linked for good, by its size
+/// and when it was written. An image that holds all and exports the entries is left as it is. Where the image cannot
+/// take the link, or an archive it holds changed, all is linked anew, fresh. The image is written in place where no
+/// other process has it, else under a name of its own, then renamed, as a running program may have the old one mapped,
+/// or another build be reading it. Returns its path, or if pin that of a link to it of this process's, which the
+/// launcher removes, by which what the process runs loads this build's image though another build replaces it; and
+/// the version of p's program, the hash of the names of what it is linked from but -O2's.
 function image(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool, o: Options, o2: i32[][][] | null = null,
 	fresh = false): [string, u64] {
-	const out = `${dir}/image${if (o.dyn) "" else ".mono"}.so`
+	const out = `${dir}/image.so`
 	// What a process gone left, a copy <out>.<pid> or a pin <out>.<pid>.<n>.run, which keeps the image from being
 	// written in place, is removed, unless another build was first; another name is of pid 0, kept.
 	for (const f of glob(`${out}.*`)) {
@@ -653,16 +656,20 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	for (const m of 0 ... p.modules.length - 1) {
 		const bc = if (p.modules[m].bc != "") p.modules[m].bc else write(p, m, compiler)
 		const b = bound.get(p.modules[m].path)?.bytes(p.modules[m].path) ?? ""
-		const own = `${p.modules[m].path}@${p.modules[m].source}.`
+		const own = `${p.modules[m].path}${if (o.dyn) "" else "^O1"}@${p.modules[m].source}.`
 		const was = held.find(h => startsWith(h, `${p.modules[m].path}@`))
 		edited.push(was != null && !startsWith(was!, own))
-		names.push(`${own}${fnv(bc + b)}`)
+		names.push(`${own}${fnv(bc + b + (if (o.dyn) "" else write(p, m, compiler)))}`)
 		const rebuilt = lacks(names[m])
 		const [v, others] = if (o2 != null || rebuilt) version(p, m, bc, signatures) else [0 as u64, []]
 		versions.push([`bober.o2.${p.modules[m].path}@${combine(v, fnv(b))}`, others])
 		if (rebuilt) {
 			l.add(unit(p, m, names[m], o, bc, b, versions[m][0]))
 		}
+	}
+	// The monomorphized units of another program, of layouts of its own, which its build makes anew.
+	for (const h of held.filter(h => !o.dyn && indexOf(h, "^O1@") >= 0 && !names.includes(h))) {
+		l.remove(h)
 	}
 	// -O2's instances, o2 (src/mono.bob's specialize), an object per bucket of each module's, named
 	// `<path>~<bucket>^O2@<version>`, and its overlays of the code of each group's, `<path>^O2@<version>`, but those
@@ -732,8 +739,8 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		l.library(name, format.exports(file, readFile(file)))
 	}
 	for (const m of mains) {
-		l.export(entry(p.modules[m].path, false))
-		l.export(entry(p.modules[m].path, true))
+		l.export(entry(p.modules[m].path, false) + (if (o.dyn) "" else monoSuffix))
+		l.export(entry(p.modules[m].path, true) + (if (o.dyn) "" else monoSuffix))
 	}
 	const changed = l.changed()
 	const tmp = `${out}.${getpid()}`
@@ -788,15 +795,17 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 /// bober.code.<name>, which -O2's instances of its generics name, and one versioned, which its overlay of its code
 /// names (relink), and names those of the modules it imports and of builtin/'s, whose functions the compiler calls
 /// unasked, so that a kept image unlinks it once one of them has another: an object another program left there, or
-/// after a change of builtin/, which no bytecode names. As lowered, it holds bc, its bytecode, in section bober_bc,
+/// after a change of builtin/, which no bytecode names. It holds bc, its bytecode as lowered, in section bober_bc,
 /// which a build links rather than checks the module of (lowered), and its Bound, if any (src/lift.bob), in bober_bind.
+/// Monomorphized, its names but local ones end in monoSuffix, as the module as lowered has the same ones of other
+/// layouts and calling conventions: bober's, which have a . or :, unlike C's.
 function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: string, versioned: string): Object {
 	const b = new Tpde(p.modules[m].path)
 	emit(p, m, b, o)
 	b.verify()
 	const x = elf.read(name, b.object())
 	for (const [n, bytes] of [["bober_bc", bc], ["bober_bind", bound]]) {
-		if (o.dyn && bytes != "") {
+		if (bytes != "") {
 			const s = new Section(n, Kept)
 			s.bytes = bytes
 			s.size = bytes.length as u64
@@ -812,8 +821,15 @@ function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: s
 			x.symbols.push(new Symbol(abiSymbol(p, d), Global, -1))
 		}
 	}
+	for (const s of x.symbols.filter(s => !o.dyn && s.binding != Local && (indexOf(s.name, ".") >= 0
+		|| indexOf(s.name, ":") >= 0))) {
+		s.name += monoSuffix
+	}
 	return x
 }
+
+/// What the names of a monomorphized unit end in (unit).
+const monoSuffix = "^mono"
 
 /// The symbol named by the ABI of p's module m.
 function abiSymbol(p: Program, m: i32): string { return `bober.abi.${p.modules[m].path}.${abi(p, m)}` }
