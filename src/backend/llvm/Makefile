@@ -1,13 +1,20 @@
 # Builds the sysroot that bober links its programs against, statically, in build/musl: musl with the host's Linux
 # headers, then libunwind, libc++abi and libc++ built against it by the system's clang, from the LLVM of bober.pkg,
 # position-independent, as images link them too, and that clang's compiler-rt builtins, since bobcc links against the
-# sysroot alone. Run as make -C src/backend/llvm.
+# sysroot alone; and mimalloc, which executables link for musl's malloc, as fast as musl's is small. Run as
+# make -C src/backend/llvm.
 root := $(abspath ../../..)
 out := $(root)/build
 sysroot := $(out)/musl
 src := $(out)/llvm-runtimes
 triple := $(shell uname -m)-linux-musl
 llvm := https://github.com/llvm/llvm-project/archive/6989f0e555cb9ba5bf85858934063b1a08b8324a.tar.gz
+
+all: $(sysroot)/usr/lib/libc++.a $(sysroot)/usr/lib/mimalloc.o
+
+$(sysroot)/usr/lib/mimalloc.o: $(sysroot)/usr/lib/libc.a
+	clang --target=$(triple) --sysroot=$(sysroot) -O3 -DNDEBUG -DMI_MALLOC_OVERRIDE -DMI_LIBC_MUSL=1 -fno-builtin-malloc \
+		-I$(root)/vendor/mimalloc/include -c -o $@ $(root)/vendor/mimalloc/src/static.c
 
 $(sysroot)/usr/lib/libc++.a: $(sysroot)/usr/lib/libc.a
 	mkdir -p $(src) && curl -sSL $(llvm) | tar xz -C $(src) --strip-components=1
