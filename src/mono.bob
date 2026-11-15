@@ -5,6 +5,10 @@
 //! each instance's types and code are lowered onto those unions, member access on them becoming calls of dispatch
 //! functions that switch on the tag, and each module lists its instances.
 //!
+//! For a module's unit of its own (src/bober.bob's image), the same in each program that has the module, a module
+//! lists only what is the same in every program, and as its copies what else its code reaches, as C++ does templates:
+//! the instances, dispatch functions and classes mono makes, each defined in every module that lists it.
+//!
 //! A dispatch function is a decl of the module using it named `.f[T]` for reading field f of T, `.f=[T]` for writing
 //! it and `.f()[T]` for calling method f. An intrinsic, a function of builtin/ without a body, is called as itself with
 //! its type args, for emit.
@@ -22,12 +26,14 @@ import { CompileError } from "./error"
 import { Instances, bases, embedded, runtime, takesType } from "./resolve"
 import { builtin, builtinPath } from "./root"
 
-/// Monomorphizes p, whose module main holds the main function and tests: those, or if whole all of main's functions
-/// and classes that are neither generic nor take a Type, every module's typed vars and builtin/'s plain exported
-/// functions are the roots, and only decls they reach are kept. Each module's decls and inits become their instances,
-/// its dispatch functions after its decls, and each instance's members those of its members' instances it owns, those
-/// of one decl in the order of their hashes, the same however p is read; its ABI hash, which mono changes, forgotten.
-export function mono(p: Program, main: i32, whole = false) throws CompileError { new Mono(p).run(main, whole) }
+/// Monomorphizes p, whose module main holds the main function and tests: those, or if units every module's but
+/// builtin/type.bob's tests, and functions, classes and their methods that are neither generic nor take a Type, every
+/// module's typed vars and builtin/'s plain exported functions are the roots, and only decls they reach are kept.
+/// Each module's decls and inits become their instances, its dispatch functions after its decls, and each instance's
+/// members those of its members' instances it owns, those of one decl in the order of their hashes, the same however p
+/// is read; its ABI hash, which mono changes, forgotten. If units, a module's decls are its roots and vars, and the
+/// statics of instances of its classes, which are one per program, and its copies the others its code reaches.
+export function mono(p: Program, main: i32, units = false) throws CompileError { new Mono(p, units).run(main) }
 
 class Mono {
 	p: Program
@@ -42,6 +48,10 @@ class Mono {
 	/// Per object type, as conc holds it; 0 while its fields are lowered.
 	private structs = new HashMap[i32, i32]()
 	private main = 0
+	private units: bool
+	/// The instances kept, and the dispatch functions and classes made; the decls listed as their module's own, if units.
+	private keep = new HashMap[i32, bool]()
+	private own = new HashMap[i32, bool]()
 	/// Per module, type, member and access, the dispatch function made there.
 	private made = new HashMap[[i32, i32, i32, string], i32]()
 	/// The dispatch functions and classes made.
@@ -51,33 +61,27 @@ class Mono {
 	private caught: i32[] = []
 	private reached = new HashMap[i64, [i32, i32]]()
 
-	constructor(p: Program) {
+	constructor(p: Program, units: bool) {
 		this.p = p
 		this.ins = new Instances(p)
+		this.units = units
 	}
 
-	run(main: i32, whole: bool) throws CompileError {
+	run(main: i32) throws CompileError {
 		const p = this.p
 		this.main = main
-		for (const d of p.modules[main].decls) {
-			const x = p.decls[d]
-			const plain = x.params.length == 0 && (x.kind == decl.Class || x.kind == decl.Function && !takesType(p, d))
-			if (x.kind == decl.Test || x.kind == decl.Function && p.strings[x.name] == "main" || whole && plain) {
-				this.ins.instance(d, 0)
-			}
-		}
-		for (const m of p.modules) {
-			for (const d of m.inits) {
+		for (const m of 0 ... p.modules.length - 1) {
+			for (const d of p.modules[m].inits) {
 				if (!kind.untyped(p.decls[d].type) && p.identity(d).length == 0) {
-					this.ins.instance(d, 0)
+					this.own.set(this.ins.instance(d, 0), true)
 				}
 			}
-			for (const d of m.decls) {
-				const x = p.decls[d]
-				// Emit calls builtin/'s plain exports itself, so they are roots too, but type.bob's, of Types as lowered.
-				if (builtin(m.path) && m.path != builtinPath("type") && x.kind == decl.Function && (x.mods & decl.Export) != 0
-					&& x.params.length == 0) {
-					this.ins.instance(d, 0)
+			for (const d of p.modules[m].decls.filter(d => this.root(m, d))) {
+				this.own.set(this.ins.instance(d, 0), true)
+				// If units, the plain methods of a class of builtin/ too, instanced else only where named.
+				for (const k of p.decls[d].members.filter(k => this.units && p.decls[k].kind == decl.Function
+					&& this.plain(k))) {
+					this.ins.instance(k, 0)
 				}
 			}
 		}
@@ -91,6 +95,27 @@ class Mono {
 		for (const m of p.modules) {
 			m.abi = 0
 		}
+	}
+
+	/// Whether decl d of module m is a root.
+	private root(m: i32, d: i32): bool {
+		const p = this.p
+		const x = p.decls[d]
+		const path = p.modules[m].path
+		if (m == this.main && (x.kind == decl.Test || x.kind == decl.Function && p.strings[x.name] == "main")) {
+			return true
+		} else if (builtin(path)) {
+			// Emit calls builtin/'s plain exports itself, but type.bob's, of Types as lowered.
+			return path != builtinPath("type") && (this.units && this.plain(d)
+				|| x.kind == decl.Function && (x.mods & decl.Export) != 0 && x.params.length == 0)
+		}
+		return this.units && (x.kind == decl.Test || this.plain(d))
+	}
+
+	/// Whether decl d is a class or function neither generic nor taking a Type.
+	private plain(d: i32): bool {
+		const x = this.p.decls[d]
+		return x.params.length == 0 && (x.kind == decl.Class || x.kind == decl.Function && !takesType(this.p, d))
 	}
 
 	// Interfaces and object types.
@@ -220,9 +245,14 @@ class Mono {
 			add(of, if (x.generic < 0) k else x.generic, k)
 			kept.push(k)
 		}
+		// The statics of class instances, one per program.
+		const statics = kept.filter(k => p.decls[k].kind == decl.Var && !this.held(k))
+		for (const k of statics) {
+			this.own.set(k, true)
+		}
 		// Per instance kept, its members kept, in source order, the generic methods instanced for it included.
 		const owned = new HashMap[i32, i32[]]()
-		for (const k of kept.filter(k => p.decls[k].owner >= 0)) {
+		for (const k of kept.filter(k => p.decls[k].owner >= 0 && this.held(k))) {
 			add(owned, p.decls[k].owner, k)
 		}
 		const source = (d: i32) => if (p.decls[d].generic < 0) d else p.decls[d].generic
@@ -250,10 +280,92 @@ class Mono {
 			}
 			return out
 		}
+		for (const k of [...kept, ...this.dispatches]) {
+			this.keep.set(k, true)
+		}
 		for (const mi of 0 ... p.modules.length - 1) {
 			const m = p.modules[mi]
-			m.decls = [...instances(m.decls), ...byHash(this.dispatches.filter(d => p.decls[d].module == mi))]
+			if (this.units) {
+				m.decls = [...m.decls.filter(d => this.own.has(d)),
+					...byHash(statics.filter(k => p.decls[k].module == mi))]
+				m.copies = this.copies(m.decls)
+			} else {
+				m.decls = [...instances(m.decls), ...byHash(this.dispatches.filter(d => p.decls[d].module == mi))]
+			}
 			m.inits = instances(m.inits)
+		}
+	}
+
+	/// Whether the members of the owner of instance k hold it: if units, of a class, not an instance but a field.
+	private held(k: i32): bool {
+		const x = this.p.decls[k]
+		return !this.units || this.p.classOf(k) < 0 || x.kind == decl.Var && (x.mods & decl.Static) == 0 || x.generic < 0
+	}
+
+	/// The decl that k is listed with: itself, or what holds it.
+	private top(k: i32): i32 {
+		const o = this.p.decls[k].owner
+		return if (o < 0 || !this.held(k)) k else this.top(o)
+	}
+
+	/// The decls kept that the code of decls ds, and of what they hold, names, but those modules list as their own, each
+	/// in the order reached, with what it holds: a module's copies. Of a class, also its constructor, which emit finds by
+	/// name.
+	private copies(ds: i32[]): i32[] {
+		const p = this.p
+		const out: i32[] = []
+		const todo = ds.slice(0, ds.length)
+		const seen = new HashMap[i32, bool]()
+		const types = new HashMap[i32, bool]()
+		const reach = (d: i32) => {
+			const t = this.top(d)
+			if (this.keep.has(t) && !this.own.has(t) && !seen.has(t)) {
+				seen.set(t, true)
+				out.push(t)
+				todo.push(t)
+			}
+		}
+		let i = 0
+		while (i < todo.length) {
+			const x = p.decls[todo[i]]
+			const ctor = if (x.kind == decl.Class) p.member(todo[i], p.intern("constructor")) else -1
+			if (ctor >= 0) {
+				reach(ctor)
+			}
+			i++
+			todo.append(x.members)
+			const c = x.code ?? new Code()
+			for (const t of [x.type, ...c.locals.map(l => l.type)]) {
+				this.named(t, types, reach)
+			}
+			for (const j of 0 ... c.ops.length - 1) {
+				const s = op.shape[c.ops[j]]
+				for (const k of 0 ... s.length - 1) {
+					const v = c.imm(j, k)
+					if (s[k] == op.DeclId) {
+						reach(v)
+					} else if (s[k] == op.TypeId || s[k] == op.TypeList) {
+						for (const t of if (s[k] == op.TypeId) [v] else p.lists[v]) {
+							this.named(t, types, reach)
+						}
+					}
+				}
+			}
+		}
+		return out
+	}
+
+	/// Calls reach of each decl that type t and its parts name, once per type, as seen says.
+	private named(t: i32, seen: HashMap[i32, bool], reach: (d: i32) => void) {
+		if (seen.has(t)) {
+			return
+		}
+		seen.set(t, true)
+		if (this.p.kind(t) == kind.Named) {
+			reach(this.p.a(t))
+		}
+		for (const x of this.p.parts(t)) {
+			this.named(x, seen, reach)
 		}
 	}
 
@@ -282,7 +394,8 @@ class Mono {
 	}
 
 	/// A type a value is held as at run time: an object type as the struct its literals make, but one its fields hold
-	/// again as a class of them, made in module main, as a structural type cannot be cyclic in the type table.
+	/// again as a class of them, made in builtin/type.bob, the same in every program, as a structural type cannot be
+	/// cyclic in the type table.
 	private conc(t: i32): i32 throws CompileError {
 		const p = this.p
 		if (p.kind(t) != kind.Object) {
@@ -290,10 +403,11 @@ class Mono {
 		}
 		const found = this.structs.get(t)
 		if (found == 0) { // a field holds it again: a class, its fields' types set once they are lowered
-			const c = p.decl(this.main, -1, showType(p, t), decl.Class)
+			const m = p.module(builtinPath("type"))
+			const c = p.decl(m, -1, showType(p, t), decl.Class)
 			const names = p.names[p.b(t)]
 			for (const i of 0 ... p.items(t).length - 1) {
-				p.decls[p.decl(this.main, c, p.strings[names[2 * i]], decl.Var)].mods = names[2 * i + 1]
+				p.decls[p.decl(m, c, p.strings[names[2 * i]], decl.Var)].mods = names[2 * i + 1]
 			}
 			this.dispatches.push(c)
 			this.structs.set(t, p.type(kind.Named, c, 0))
@@ -417,6 +531,9 @@ class Mono {
 				c.add(op.Field, name)
 				pass()
 				c.add(op.CallRef, takes.length)
+			} else if (how == "" && d >= 0 && p.decls[d].kind == decl.Function) {
+				recv()
+				c.add(op.Member, d)
 			} else {
 				recv()
 				pass()

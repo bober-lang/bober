@@ -198,6 +198,26 @@ function main() { print(\`\${new Box[${t}](${v}).v} \${named(new ${c}())}\`) }\n
 	assert a == "1 A\n" && built([], "-O1", "b.bob") == "s B\n" && built([], "-O1", "a.bob") == a
 }
 
+test "programs that share a module keep its unit, one for both, though each instances its generic of its own" {
+	const lib = `export class Box[T] {\n\tv: T\n\n\tconstructor(v: T) { this.v = v }\n}\n
+export class Made[T] {\n\tstatic made = 0\n\n\tconstructor() { Made[T].made++ }\n
+	count(): i32 { return Made[T].made }\n}\n
+export function made(): i32 { return new Box[Made[i32]](new Made[i32]()).v.count() }\n
+export interface Rose { v: i32; kids: Rose[] }\n
+export function sum(r: Rose): i32 { return r.v + (if (r.kids.length == 0) 0 else sum(r.kids[0])) }\n`
+	const main = (t: string, v: string) => `import { Box, Made, made, sum } from "./lib"\n
+function main() {
+	new Made[i32]()
+	print(\`\${new Box[${t}](${v}).v} \${made()} \${Made[i32].made} \${sum({ v: 1, kids: [{ v: 2, kids: [] }] })}\`)
+}\n`
+	anew()
+	const a = built([["lib.bob", lib], ["a.bob", main("i32", "1")], ["b.bob", main("string", `"s"`)]], "-O1", "a.bob")
+	const units = held()
+	assert a == "1 2 2 3\n" && built([], "-O1", "b.bob") == "s 2 2 3\n"
+	const both = held()
+	assert units.filter(o => both.indexOf(o) < 0) == [] && built([], "-O1", "a.bob") == a && held() == both
+}
+
 test "a class changed, a generic of another module instanced of it is compiled anew, monomorphized" {
 	const lib = `export interface HasV { v: i32 }\n\nexport function v[T extends HasV](x: T): i32 { return x.v }\n`
 	const main = (q: string) => `import { v } from "./lib"\n\nclass Q {${q}\n\tv = 1\n}\n

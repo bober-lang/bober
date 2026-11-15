@@ -457,7 +457,7 @@ export function build(main: string, tests: bool, f: Compile, pin: bool): string[
 			for (const x of 0 ... p.modules.length - 1) {
 				p.modules[x].bc = if (p.modules[x].bc != "") p.modules[x].bc else write(p, x, compilerId())
 			}
-			mono(p, m)
+			mono(p, m, true)
 		}
 		const [at, version] = image(p, [m], files, cxx, pin, o, f.O2)
 		return [...(if (mac) [] else [`${sysroot}/usr/lib/libc.so`]),
@@ -532,9 +532,9 @@ function sources(d: string): string[] {
 }
 
 /// The build command on a file: compiles the module of path alone into the object out, to inspect: by TPDE as lowered,
-/// or if release by LLVM at -O2, monomorphized from what is not generic in it, without what a whole program's emission
-/// learns (learn), and without the generics, but with its bytecode as lowered (src/bc/file.bob), which has them, in
-/// section bober_bc; or if ir, LLVM's module of it, as LLVM gets it, unoptimized, as text.
+/// or if release by LLVM at -O2, monomorphized as for its unit (image), without what a whole program's emission learns
+/// (learn), and with its bytecode as lowered (src/bc/file.bob), which has its generics, in section bober_bc; or if ir,
+/// LLVM's module of it, as LLVM gets it, unoptimized, as text.
 function inspect(path: string, out: string, f: Compile, ir: bool) {
 	const p = lowered([path], f.headers.I)
 	const m = p.module(normal(path))
@@ -606,12 +606,13 @@ let decoded: [u64, Linker, Bytes] | null = null
 /// mains. The image is kept (src/link/link.bob), and a build links only what it does not hold: each object is named
 /// by what it is made of, `<what>@<version>`, a module by its bytecode, which has the ABIs of the modules it imports,
 /// and its Bound, and monomorphized, `<path>^O1@`, by its bytecode as such too, beside the one as lowered, its symbols
-/// its own (unit), of one program at a time; a file by its bytes; an archive, which is linked for good, by its size
-/// and when it was written. A monomorphized module is compiled by TPDE, or by LLVM as `<path>^O2@` of the same version,
-/// which any build keeps, at -O2 where the image holds TPDE's, a build finding it unchanged, or none of it. An image
-/// that holds all and exports the entries is left as it is. Where the image cannot take the link, or an archive it
-/// holds changed, all is linked anew, fresh. The image is written in place where no other process has it, else under a
-/// name of its own, then renamed, as a running program may have the old one mapped, or another build be reading it.
+/// its own (unit), what it instances its local copies, so that programs share it; a file by its bytes; an archive,
+/// which is linked for good, by its size and when it was written. A monomorphized module is compiled by TPDE, or by
+/// LLVM as `<path>^O2@` of the same version, which any build keeps, at -O2 where the image holds TPDE's, a build
+/// finding it unchanged, or none of it. An image that holds all and exports the entries is left as it is. Where the
+/// image cannot take the link, or an archive it holds changed, all is linked anew, fresh. The image is written in place
+/// where no other process has it, else under a name of its own, then renamed, as a running program may have the old
+/// one mapped, or another build be reading it.
 /// Returns its path, or if pin that of a link to it of this process's, which the launcher removes, by which what the
 /// process runs loads this build's image though another build replaces it; and the version of p's program, the hash of
 /// the names of what it is linked from, TPDE's for LLVM's.
@@ -644,9 +645,8 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	const kept = if (unchanged) d![2] else mapped
 	const l = if (unchanged) d![1] else new Linker(machine, format, kept)
 	const held = l.objects()
-	// Whether the image lacks the object name; another version of it is unlinked.
-	const lacks = (name: string) => {
-		const what = name.slice(0, lastIndexOf(name, "@") + 1)
+	// Whether the image lacks the object name; the others of what, by default another version of it, are unlinked.
+	const lacks = (name: string, what = name.slice(0, lastIndexOf(name, "@") + 1)) => {
 		for (const h of held.filter(h => h != name && startsWith(h, what))) {
 			l.remove(h)
 		}
@@ -671,14 +671,10 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			|| o2 && (held.includes(fast) || !held.some(h => startsWith(h, `${path}^O`))))
 		names.push(if (o.dyn) `${path}${version}` else fast)
 		wanted.push(if (llvm) opt else names[m])
-		if (lacks(wanted[m])) {
+		// Monomorphized, the others of either backend, which define the same symbols.
+		if (lacks(wanted[m], if (o.dyn) `${path}@` else `${path}^O`)) {
 			l.add(unit(p, m, wanted[m], o, bc, b, llvm))
 		}
-	}
-	// The monomorphized units of another program, of layouts of its own, which its build makes anew, or of another
-	// backend.
-	for (const h of held.filter(h => !o.dyn && indexOf(h, "^O") >= 0 && !wanted.includes(h))) {
-		l.remove(h)
 	}
 	const parts = [...names]
 	const cxxs: string[] = if (cxx) [`${lib}/libc++.a`, `${lib}/libc++abi.a`] else []
