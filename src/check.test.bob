@@ -314,6 +314,11 @@ test "names" {
 	assert errors("test \"t\" {}\ntest \"t\" {}\ntest \"s\" {}") == "17: test \"t\" is declared twice"
 	assert errors("function f() {\n\tconst a = 1\n\ta = 2\n}") == "29: a is not assignable"
 	assert errors("const a = 1\nfunction f() { a = 2 }") == "27: a is not assignable"
+	assert errors("class C {\n\tb: u8[2] = [0, 0]\n}\nconst f: C[1] = [new C()]\nfunction g(h: u8[2], c: C) {\n\th[0] = 1\n\tc.b[0] = 1\n\tf[0].b[0]++\n}") == "109: f[0].b[0] is not assignable"
+	assert errors("import \"m.bob\"\nclass C {\n\treadonly r: u8[2] = [0, 0]\n\tstatic readonly s: u8[2] = [0, 0]\n\tconstructor() { this.r[0] = 1 }\n}\nfunction g(c: C) {\n\tc.r[1] = 2\n\tC.s[0] = 1\n\tm.k[0] = 1\n}", ["m.bob", "export const k: u8[2] = [0, 0]"])
+		== "143: c.r[1] is not assignable; 155: C.s[0] is not assignable; 167: m.k[0] is not assignable"
+	assert errors("class C {\n\treadonly b: u8[2] | null = null\n}\nconst k: u8[2] = [0, 0]\nfunction m(): u8[2] { return k }\nfunction g(c: C, a: u8[2][]) {\n\t(k)[0] = 1\n\tc.b![0] = 1\n\tm()[0] = 1\n\ta[0][1] = 1\n}")
+		== "134: (k)[0] is not assignable"
 	assert errors("class C {\n\tf(): i32 { return 1 }\n\tf(): i32 { return 2 }\n}") == "34: f is declared twice"
 	assert errors("class C {\n\tstatic n = 1\n\tn(): i32 { return C.n }\n}") == "25: n is declared twice"
 	assert errors("interface I {\n\tx: i32\n\tx: string\n}") == "23: x is declared twice"
