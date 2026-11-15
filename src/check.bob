@@ -19,28 +19,32 @@ import { Kind, Loc, SyntaxError, Tok } from "./lex"
 import { Bound, Lift, bound, searched, source } from "./lift"
 import { Parser, Shape, Syntax, Tree, prec } from "./parse"
 import { builtin, builtinPath, root } from "./root"
-import {
-	Array as Arrays, Bool, Empty, Field, I32, Kind as TypeKind, Null, String, String16, String32, Type, U8, UntypedFloat,
-	UntypedInt, bases, basics, elementOf, fillWith, members, membersOf, readonlyOf, setOf, spells,
-} from "./type"
+
+import { Array as Arrays, Bool, Empty, Field, I32, Kind as TypeKind, Null, String, String16, String32, Type, U8,
+	UntypedFloat, UntypedInt, bases, basics, elementOf, fillWith, members, membersOf, readonlyOf, setOf,
+	spells } from "./type"
 
 /// The modules of builtin/ every module outside builtin/ and C's loads first: those declaring the classes of a string's
 /// and an array's methods, then those exporting the prelude's names. A module one of them imports sees only the exports
 /// of those before it, so io.bob, which imports show.bob, comes last.
 let first = ["array", "string", "type", "c", "tag", "error", "io"].map(builtinPath)
+
 /// The exports of first that every module sees without importing them.
 const prelude = ["print", "readFile", "writeFile", "args", "targetOs", "targetArch", "now", "random", "idOf", "chr",
 	"fromBytes", "fromC", "Deprecated", "Experimental", "Type", "IoError"]
+
 /// The constructs a doc comment documents.
 const documented: Syntax[] = ["test", "var", "function", "class", "type", "method", "prop", "param", "typeParam"]
+
 /// What the compiler lowers the builtin types and the prelude to, which every program holds.
 export let lowered = [...first, ...["equal", "show", "math", "fiber"].map(builtinPath)]
 
 /// The errors of the modules at paths and of those they import, each checked once and handed on to next, after
 /// builtin/'s lowered ones, so that those are done before lift compares a module's ABI hash, which may reach them; one
 /// lift's bundle or cache holds is made from its decls instead.
-export function check(paths: string[], includes: string[] = [], read: (path: string) => string | null = p => readFile(p),
-	next: Checked = new Ignore(), lift = new Lift()): TypeError[] {
+export function check(paths: string[], includes: string[] = [],
+	read: (path: string) => string | null = p => readFile(p), next: Checked = new Ignore(),
+	lift = new Lift()): TypeError[] {
 	info = new HashMap[i32, HashMap[string, Member]]()
 	fills = new HashMap[i32, () => void]()
 	fillWith(t => {
@@ -48,7 +52,11 @@ export function check(paths: string[], includes: string[] = [], read: (path: str
 		if (f != null) {
 			fills.delete(t.id)
 			filling++
-			try { f() } finally { filling-- }
+			try {
+				f()
+			} finally {
+				filling--
+			}
 		}
 	})
 	deferred = []
@@ -79,6 +87,7 @@ function nameOf(t: Type): string | null {
 
 /// The names of the classes, interfaces and type params declared, as show writes them.
 const names = new HashMap[Type, string, ById]()
+
 /// What is known of each member of a class, interface or namespace beyond its type, by its id and about's key.
 let info = new HashMap[i32, HashMap[string, Member]]()
 /// How to fill in each class and interface declared that is not yet, by its id, how many are being filled in, and the
@@ -86,10 +95,13 @@ let info = new HashMap[i32, HashMap[string, Member]]()
 let fills = new HashMap[i32, () => void]()
 let filling = 0
 let deferred: (() => void)[] = []
+
 /// The classes of builtin/tag.bob, by name.
 const tagTypes = new HashMap[string, Type]()
+
 /// builtin/type.bob's Type, of any type as a value (4.11).
 let Meta = Empty
+
 /// builtin/'s classes and interfaces, by path and name, made once for every program.
 const builtins = new HashMap[string, Type]()
 
@@ -168,9 +180,7 @@ class Errors {
 	sites: Site[] = []
 	callers: Site[] = []
 
-	constructor(types: Type[] = []) {
-		this.types = types
-	}
+	constructor(types: Type[] = []) { this.types = types }
 }
 
 /// A throw or call.
@@ -191,7 +201,6 @@ class Site {
 
 	/// The types it lets escape.
 	escaping(): Type[] { return this.from.types.filter(t => this.passes(t)) }
-
 	/// Whether it lets t escape; a type param's are unchecked, as what it stands for is not known here.
 	passes(t: Type): bool { return t.kind != "param" && !this.caught.some(c => c == null || t.fits(c)) }
 }
@@ -277,7 +286,6 @@ export class Node {
 		this.t = t
 	}
 }
-
 
 export class TypeError {
 	path: string
@@ -484,7 +492,6 @@ class Modules {
 	}
 
 	decl(n: Node, path: string, src: string) { this.handOn(path, c => c.decl(n, path, src)) }
-
 	declare(n: Node, path: string, src: string) { this.handOn(path, c => c.declare(n, path, src)) }
 
 	/// Hands on to next what checking the module at path does, unless an error is reported, and notes it for the checks
@@ -597,7 +604,8 @@ class Linked {
 		if (x.kind == decl.Var && readonly) {
 			const v = if (t == UntypedInt) this.value(d) else null
 			b.literal = if (v != null) Type.literal(v!, I32)
-				else if (t.kind == "literal" && (t.base!.kind == "int" || t.base!.kind == "string")) t else null
+				else if (t.kind == "literal" && (t.base!.kind == "int" || t.base!.kind == "string")) t
+				else null
 		} else if (x.kind == decl.Class) {
 			about(t, "constructor").decl = b.decl
 		}
@@ -1306,7 +1314,9 @@ class Checker {
 		} else if (n.kind == "function" && declaresType(n)) {
 			d.state = "busy"
 			try {
-				this.within(d, () => this.apart(() => { this.function(n, this.top.get(this.text(operands(n)[0].t)), false, d.errors) }))
+				this.within(d, () => this.apart(() => {
+					this.function(n, this.top.get(this.text(operands(n)[0].t)), false, d.errors)
+				}))
 			} finally {
 				d.state = "new"
 			}
@@ -1501,7 +1511,8 @@ class Checker {
 				f.type = this.function(n, f, true, f.decl?.errors ?? null)
 				name.type = f.type
 				const r = f.type.base!
-				if (this.locals.level == 0 && this.text(name.t) == "main" && (f.type.types.length > 0 || r != Null && r != I32)) {
+				if (this.locals.level == 0 && this.text(name.t) == "main"
+					&& (f.type.types.length > 0 || r != Null && r != I32)) {
 					this.report(name.t.loc, "main takes no parameters and returns an i32 or nothing")
 				}
 			case "class":
@@ -1606,7 +1617,8 @@ class Checker {
 				this.fit(v, declared, init)
 				t = literal ?? declared
 			} else {
-				const w = if (n.t.kind == "const" && v.isUntyped() && isConstant(init)) v else v.widen(n.t.kind == "let")
+				const w = if (n.t.kind == "const" && v.isUntyped() && isConstant(init)) v
+					else v.widen(n.t.kind == "let")
 				this.convert(init, w)
 				t = if (v.isUntyped()) w else literal ?? w
 			}
@@ -1679,7 +1691,8 @@ class Checker {
 				}
 				if (q.kind == "unary") {
 					const tuple = t.kind == "tuple" && !t.rest
-					this.bind(q.parts[0], if (tuple) Type.tuple(t.types.slice(i, t.types.length), false) else Type.array(e), mutable)
+					this.bind(q.parts[0],
+						if (tuple) Type.tuple(t.types.slice(i, t.types.length), false) else Type.array(e), mutable)
 				} else if (q.kind == "binary") {
 					this.bindPart(q.parts[0], e, q.parts[1], mutable)
 				} else {
@@ -1744,7 +1757,8 @@ class Checker {
 	/// function f(n: i32) { return f(n) }   // error: result type needed
 	/// function g(...xs: i32) {}            // error: a rest param is an array
 	/// ```
-	private function(n: Node, b: Binding | null, bodies: bool, errors: Errors | null = null, builds: Type | null = null): Type {
+	private function(n: Node, b: Binding | null, bodies: bool, errors: Errors | null = null,
+		builds: Type | null = null): Type {
 		const [paths, mark] = this.open()
 		const ps = this.paramsOf(n)
 		this.typeParams(n, ps, true)
@@ -1802,7 +1816,9 @@ class Checker {
 				required = i + 1
 			}
 			let pt = Empty
-			const typed = this.apart(() => { pt = this.param(p, i, want, defaults, ps) })
+			const typed = this.apart(() => {
+				pt = this.param(p, i, want, defaults, ps)
+			})
 			p.type = pt
 			types.push(pt)
 			if (typed) {
@@ -1821,8 +1837,10 @@ class Checker {
 		const init = after(p, "=")
 		const rest = p.parts[0].kind == "unary"
 		let pt = if (ann != null && ps != null && this.isReadonly(ann)) this.readonly(ann, ps)
-			else if (ann != null) this.annotation(ann) else if (want == null) null
-			else if (rest && want.rest) want.types[want.types.length - 1] else element(want, i)
+			else if (ann != null) this.annotation(ann)
+			else if (want == null) null
+			else if (rest && want.rest) want.types[want.types.length - 1]
+			else element(want, i)
 		if (init != null && (pt == null || defaults)) {
 			const v = this.expr(init, pt)
 			if (pt == null) {
@@ -1853,7 +1871,10 @@ class Checker {
 	}
 
 	/// Whether type expression n is `T[readonly]`.
-	private isReadonly(n: Node): bool { return n.kind == "index" && n.parts.length == 2 && isTok(n.parts[1], "ident") && this.text(n.parts[1].t) == "readonly" }
+	private isReadonly(n: Node): bool {
+		return n.kind == "index" && n.parts.length == 2 && isTok(n.parts[1], "ident")
+			&& this.text(n.parts[1].t) == "readonly"
+	}
 
 	/// The type params n declares, without their constraints and defaults yet.
 	private paramsOf(n: Node): Type[] {
@@ -2061,7 +2082,9 @@ class Checker {
 			const f = new Field(this.key(m.t).copy(), Empty, false, has(m, "static"))
 			this.apart(() => this.tagged(m))
 			let state: "typed" | "pending" | "failed" = "failed"
-			this.apart(() => { state = this.declareMember(m, f, t, constructs) })
+			this.apart(() => {
+				state = this.declareMember(m, f, t, constructs)
+			})
 			const a = about(t, f.name, f.static)
 			a.hidden = has(m, "private")
 			a.readonly = has(m, "readonly")
@@ -2083,15 +2106,14 @@ class Checker {
 			}
 		}
 		for (const i of 0 ... inits.length - 1) {
-			about(t, fields[i].name, fields[i].static).state = if (this.initializer(inits[i], fields[i], t)) "typed" else "failed"
+			about(t, fields[i].name,
+				fields[i].static).state = if (this.initializer(inits[i], fields[i], t)) "typed" else "failed"
 		}
 		this.locals.leave()
 	}
 
 	/// Types the tags of declaration or member n.
-	private tagged(n: Node) {
-		n.tags = tags(n).map(e => this.typeExpr(e))
-	}
+	private tagged(n: Node) { n.tags = tags(n).map(e => this.typeExpr(e)) }
 
 	/// What a use of n from another module is warned of, by its typed tags.
 	private warning(n: Node): Warning | null {
@@ -2242,7 +2264,9 @@ class Checker {
 				this.self = if (static) null else selfOf(t)
 				this.user = a.decl ?? user
 				const builds = if (!static && this.key(m.t) == "constructor") t else null
-				this.apart(() => { this.function(m, null, true, a.errors, builds) })
+				this.apart(() => {
+					this.function(m, null, true, a.errors, builds)
+				})
 			} else if (fs.length == ms.length && after(m, ":") != null && after(m, "=") != null && a.state == "typed") {
 				this.initializer(m, fs[i], t)
 			}
@@ -2301,7 +2325,9 @@ class Checker {
 	/// used, and its end is reachable unless it was to jump.
 	private stmt(p: Node): bool {
 		let open = true
-		if (this.apart(() => { open = this.statement(p) })) {
+		if (this.apart(() => {
+			open = this.statement(p)
+		})) {
 			return open
 		}
 		this.fail(p)
@@ -2338,7 +2364,9 @@ class Checker {
 	/// What condition p narrows, or nothing where it fails.
 	private facts(p: Node): Facts {
 		let f = new Facts([], [])
-		this.apart(() => { f = this.cond(p) })
+		this.apart(() => {
+			f = this.cond(p)
+		})
 		return f
 	}
 
@@ -2619,7 +2647,9 @@ class Checker {
 	private cases(n: Node, body: (p: Node, at: Tok) => void): bool {
 		const s = n.parts[0]
 		let subject: Type | null = null
-		this.apart(() => { subject = this.own(s, this.expr(s, null)) })
+		this.apart(() => {
+			subject = this.own(s, this.expr(s, null))
+		})
 		const b = this.place(s)
 		const k = this.kindOf(s)
 		let all = false
@@ -2647,7 +2677,8 @@ class Checker {
 			body(c.parts[c.parts.length - 1], c.t)
 			this.restore(mark)
 		}
-		return all || subject != null && subject!.alternatives().every(m => named.includes(m) || named.includes(bases(m)))
+		return all
+			|| subject != null && subject!.alternatives().every(m => named.includes(m) || named.includes(bases(m)))
 	}
 
 	/// Whether p is static and its value depends on a type param (4.11).
@@ -2687,9 +2718,11 @@ class Checker {
 			const f = t.member("type")
 			if (one && isTypeValue(t) || of?.kind == "param" && (t == Meta || f == Meta)) {
 				// Its own, not made once, as each binding's stands for another type.
-				const d: Type = { ...new Type("param"), text: member, params: [of!], base: if (one) of else partOf(of!, member) }
+				const d: Type = { ...new Type("param"), text: member, params: [of!],
+					base: if (one) of else partOf(of!, member) }
 				names.set(d, this.text(pattern.t))
-				b.type = if (isTypeValue(t)) meta(d) else Type.object(t.fields.map(x => new Field(x.name, if (x.name == "type") meta(d) else x.type)))
+				b.type = if (isTypeValue(t)) meta(d)
+					else Type.object(t.fields.map(x => new Field(x.name, if (x.name == "type") meta(d) else x.type)))
 				pattern.type = b.type
 			}
 		}
@@ -2843,10 +2876,9 @@ class Checker {
 					this.report(n.t.loc, "break outside a loop")
 				}
 				f.broke = true
-			case "continue":
-				if (!f.inLoop) {
-					this.report(n.t.loc, "continue outside a loop")
-				}
+			case "continue": if (!f.inLoop) {
+				this.report(n.t.loc, "continue outside a loop")
+			}
 		}
 		return false
 	}
@@ -3214,7 +3246,9 @@ class Checker {
 		}
 	}
 
-	private find(name: string): Binding | null { return this.locals.get(name) ?? this.top.get(name) ?? this.prelude.get(name) }
+	private find(name: string): Binding | null {
+		return this.locals.get(name) ?? this.top.get(name) ?? this.prelude.get(name)
+	}
 
 	/// The type of b, checking its declaration if it is not yet.
 	private typeOf(b: Binding, at: Tok): Type {
@@ -3266,7 +3300,8 @@ class Checker {
 			case "-", "~":
 				const t = this.expr(x, operand(want))
 				if (!(if (op == "-") t.isNumber() else t.isInt())) {
-					throw this.error(n.t.loc, `${op} needs ${if (op == "-") "a number" else "an integer"}, got ${show(t)}`)
+					throw this.error(n.t.loc,
+						`${op} needs ${if (op == "-") "a number" else "an integer"}, got ${show(t)}`)
 				}
 				return this.single(t, n.t)
 			case "typeof": return meta(this.expr(x, null))
@@ -3416,14 +3451,11 @@ class Checker {
 				this.convert(a, t.nullable())
 				this.convert(b, t)
 				return t
-			case "|":
-				if (this.isType(a)) {
-					return meta(this.typeExpr(n))
-				}
-			case "...":
-				throw this.error(n.t.loc, "a range is only in a for or case")
-			case "=":
-				throw this.error(n.t.loc, "a default is only in a pattern")
+			case "|": if (this.isType(a)) {
+				return meta(this.typeExpr(n))
+			}
+			case "...": throw this.error(n.t.loc, "a range is only in a for or case")
+			case "=": throw this.error(n.t.loc, "a default is only in a pattern")
 		}
 		// An untyped operand is in the other operand's context, else in the operation's (§4.1): literals on the left
 		// are checked after the right, to take its type.
@@ -3447,7 +3479,8 @@ class Checker {
 		}
 		const ints = op != "+" && op != "-" && op != "*" && op != "/" && op != "%" && op != "**"
 		if (!l.isNumber() || !r.isNumber() || ints && (!l.isInt() || !r.isInt())) {
-			throw this.error(at.loc, `${op} needs ${if (ints) "integers" else "numbers"}, got ${show(l)} and ${show(r)}`)
+			throw this.error(at.loc,
+				`${op} needs ${if (ints) "integers" else "numbers"}, got ${show(l)} and ${show(r)}`)
 		}
 		this.single(l, at)
 		this.single(r, at)
@@ -3516,7 +3549,8 @@ class Checker {
 				this.single(l, n.t)
 				this.single(r, n.t)
 			}
-			const t = if (l.isUntyped() && r.isUntyped() && l.kind == r.kind) l.widen(false) else this.common(bases(l), bases(r), null, n.t)
+			const t = if (l.isUntyped() && r.isUntyped() && l.kind == r.kind) l.widen(false)
+				else this.common(bases(l), bases(r), null, n.t)
 			this.convert(if (n.kind == "chain") a.parts[1] else a, t)
 			this.convert(b, t)
 		}
@@ -3540,7 +3574,8 @@ class Checker {
 			this.narrow(if (op == "&&") a.yes else a.no)
 			const b = this.facts(p.parts[1])
 			this.restore(mark)
-			return if (op == "&&") new Facts([...a.yes, ...b.yes], either(a.no, b.no)) else new Facts(either(a.yes, b.yes), [...a.no, ...b.no])
+			return if (op == "&&") new Facts([...a.yes, ...b.yes], either(a.no, b.no))
+				else new Facts(either(a.yes, b.yes), [...a.no, ...b.no])
 		}
 		if (p.kind == "binary" && (op == "==" || op == "!=")) {
 			this.compare(p)
@@ -3586,7 +3621,8 @@ class Checker {
 			for (const m of l.alternatives()) {
 				(if (m.fits(t)) yes else no).push(m)
 			}
-			return new Facts([new Narrowing(b, if (yes.length == 0) t else Type.union(yes))], [new Narrowing(b, Type.union(no))])
+			return new Facts([new Narrowing(b, if (yes.length == 0) t else Type.union(yes))],
+				[new Narrowing(b, Type.union(no))])
 		}
 		this.fit(this.expr(p, Bool), Bool, p)
 		return new Facts([], [])
@@ -3786,7 +3822,8 @@ class Checker {
 		const checked = if (isLink(a)) this.link(a, false) else this.linked(a, null)
 		let o = if (n.kind == "member") this.own(a, checked) else checked // a subscript's converts with its result
 		if (n.t.kind == "?." && o == Null) {
-			throw this.error(n.t.loc, `${if (a.kind == "token") this.text(a.t) else "the value before ?."} is always null`)
+			throw this.error(n.t.loc,
+				`${if (a.kind == "token") this.text(a.t) else "the value before ?."} is always null`)
 		} else if (n.t.kind == "?.") {
 			o = o.nonNull()
 		} else if (n.kind != "postfix" && o.hasNull()) {
@@ -3933,7 +3970,9 @@ class Checker {
 			return m
 		}
 		const t = this.value(i)
-		const f = if (i.kind == "member" && this.text(i.parts[1].t) == "name") standsFor((i.parts[0].type!).member("type") ?? Null) else null
+		const f = if (i.kind == "member"
+			&& this.text(i.parts[1].t) == "name") standsFor((i.parts[0].type!).member("type") ?? Null)
+			else null
 		if (o.kind == "param" && f?.kind == "param" && f!.text == "fields") {
 			return f! // the field of each of T.fields by its name (4.11)
 		}
@@ -3984,8 +4023,9 @@ class Checker {
 
 	/// Whether callee(args) is xs.push(...ys), which appends the elements of ys (4.5).
 	private appends(callee: Node, args: Node[]): bool {
-		return callee.kind == "member" && callee.parts[0].type!.kind == "array" && this.text(callee.parts[1].t) == "push"
-			&& args.length == 1 && args[0].kind == "unary" && args[0].t.kind == "..."
+		return callee.kind == "member" && callee.parts[0].type!.kind == "array"
+			&& this.text(callee.parts[1].t) == "push" && args.length == 1 && args[0].kind == "unary"
+			&& args[0].t.kind == "..."
 	}
 
 	/// The errors of callee where it names a top-level function or a method, else null: a function value's are unchecked.
@@ -4098,7 +4138,8 @@ class Checker {
 			return null
 		}
 		const c = g.member("constructor")
-		const f = this.infer(returning(if (c?.kind == "function") c! else Type.function([], Null), g, ps), args, n.t, known, want)
+		const f = this.infer(returning(if (c?.kind == "function") c! else Type.function([], Null), g, ps), args, n.t,
+			known, want)
 		p.type = g.instantiate(f.base!.params)
 		return p.type
 	}
@@ -4129,7 +4170,8 @@ class Checker {
 			} else if (tuple) {
 				ts.push(based(t))
 			} else {
-				elem = if (elem == null || t == elem || t.fits(elem)) elem ?? t else this.joined(elem, t, null, start(e))
+				elem = if (elem == null || t == elem || t.fits(elem)) elem ?? t
+					else this.joined(elem, t, null, start(e))
 			}
 		}
 		if (shaped || n.parts.length == 0 && w != null && !w.mentions(this.inferring)) {
@@ -4183,7 +4225,9 @@ class Checker {
 			const name = this.key(q.t)
 			const ft = if (cls != null) this.fieldType(cls, name, q) else if (w == null) null else w.member(name)
 			const v = after(q, ":")
-			const t = if (q.kind == "method") this.function(q, null, true) else if (v == null) this.name(q) else this.expr(v, ft)
+			const t = if (q.kind == "method") this.function(q, null, true)
+				else if (v == null) this.name(q)
+				else this.expr(v, ft)
 			if (ft != null) {
 				this.fit(t, ft, v ?? q)
 			}
@@ -4307,15 +4351,15 @@ class Checker {
 				}
 				throw this.error(p.t.loc, `expected a type, got ${p.t.kind}`)
 			case "paren": return this.typeExpr(a)
-			case "binary":
-				if (p.t.kind == "|") {
-					return Type.union([this.typeExpr(a), this.typeExpr(p.parts[1])])
-				}
+			case "binary": if (p.t.kind == "|") {
+				return Type.union([this.typeExpr(a), this.typeExpr(p.parts[1])])
+			}
 			case "index":
 				if (this.isReadonly(p)) {
 					throw this.error(start(p), "T[readonly] is only a declared function's param type")
 				}
-				const [base, ps] = if (isTok(a, "ident") || a.kind == "member") this.named(a) else [this.typeExpr(a), []]
+				const [base,
+					ps] = if (isTok(a, "ident") || a.kind == "member") this.named(a) else [this.typeExpr(a), []]
 				a.type = base
 				if (p.parts.length == 1) {
 					return Type.array(this.applied(base, ps, [], a))
@@ -4363,12 +4407,11 @@ class Checker {
 				a.type = t
 				this.locals.leave()
 				return t
-			case "unary":
-				switch (p.t.kind) {
-					case "typeof": return this.expr(a, null)
-					case "async": return Type.async(this.typeExpr(a))
-					case "...": return this.typeExpr(a)
-				}
+			case "unary": switch (p.t.kind) {
+				case "typeof": return this.expr(a, null)
+				case "async": return Type.async(this.typeExpr(a))
+				case "...": return this.typeExpr(a)
+			}
 			case "member":
 				const [t, ps] = this.named(p)
 				return this.applied(t, ps, [], p)
@@ -4447,7 +4490,9 @@ class Checker {
 				f.base!.unify(want.nonNull(), ps, wanted)
 				for (const i of 0 ... ps.length - 1) {
 					const [a, w] = [found[i], wanted[i]]
-					found[i] = if (a == null) w else if (a.isLoose() && w != null && a.fits(w.widen(true))) taken(a, w) else a
+					found[i] = if (a == null) w
+						else if (a.isLoose() && w != null && a.fits(w.widen(true))) taken(a, w)
+						else a
 				}
 			}
 			for (const i of 0 ... args.length - 1) {
@@ -4456,11 +4501,13 @@ class Checker {
 				if (p == null || phaseOf(a) != phase || a.t.kind == "...") {
 					continue
 				}
-				const w = if (phase == 0) null else this.partly(p, ps, found, phase == 1 && (a.kind == "array" || a.kind == "object"))
+				const w = if (phase == 0) null
+					else this.partly(p, ps, found, phase == 1 && (a.kind == "array" || a.kind == "object"))
 				const inferring = this.inferring
 				this.inferring = ps
 				try {
-					known[i] = this.expr(a, if (w != null && (a.kind == "arrow" || a.kind == "array" || !w.mentions(ps))) w else null)
+					known[i] = this.expr(a,
+						if (w != null && (a.kind == "arrow" || a.kind == "array" || !w.mentions(ps))) w else null)
 				} finally {
 					this.inferring = inferring
 				}
@@ -4473,7 +4520,8 @@ class Checker {
 			const t = found[i]
 			const w = if (i < wanted.length) wanted[i] else null
 			const a = if (t == null) this.byDefault(ps, i, targs, at.loc)
-				else if (w != null && !t.isLoose() && t.fits(w) && !t.widen(true).fits(w)) w else t.widen(true)
+				else if (w != null && !t.isLoose() && t.fits(w) && !t.widen(true).fits(w)) w
+				else t.widen(true)
 			if (a == null) {
 				throw this.error(at.loc, `cannot infer ${show(ps[i])}`)
 			}
@@ -4529,7 +4577,8 @@ class Checker {
 		const e = readonlyOf(p)
 		const t = if (e == null) null else substitute(e!, ps.slice(0, args.length), args)
 		const fits = () => if (t == null) a.fits(c!) else elementOf(a) == t
-		const msg = if (t == null) `${show(a)} does not fit ${show(p)}'s constraint ${show(c)}` else `expected ${show(t)}[readonly], got ${show(a)}`
+		const msg = if (t == null) `${show(a)} does not fit ${show(p)}'s constraint ${show(c)}`
+			else `expected ${show(t)}[readonly], got ${show(a)}`
 		if (filling > 0 && !inferred) {
 			deferred.push(() => {
 				if (!fits()) {
@@ -4548,7 +4597,8 @@ class Checker {
 			const b = if (p.t.kind == "ident") this.find(this.text(p.t)) else null
 			return b != null && b.isType
 		}
-		return (p.kind == "paren" || p.kind == "index" || p.kind == "binary" && p.t.kind == "|") && this.isType(p.parts[0])
+		return (p.kind == "paren" || p.kind == "index" || p.kind == "binary" && p.t.kind == "|")
+			&& this.isType(p.parts[0])
 	}
 
 	/// Reports v not fitting want, or an integer constant not representable in it.
@@ -4581,39 +4631,36 @@ class Checker {
 		const m = taken(u, t)
 		// An object literal with a member t lacks keeps its own members, converting to t as one of typed values does.
 		const own = p.kind == "object" && u.kind == "object" && u.fields.some(f => m.member(f.name) == null)
-		const c = if (own) Type.object(u.fields.map(f => new Field(f.name, m.member(f.name) ?? f.type.widen(true)))) else m
+		const c = if (own) Type.object(u.fields.map(f => new Field(f.name, m.member(f.name) ?? f.type.widen(true))))
+			else m
 		p.type = c
 		if (checked) {
 			this.representable(p, c)
 		}
 		switch (p.kind) {
-			case "array":
-				for (const i of 0 ... p.parts.length - 1) {
-					const e = element(c, i)
-					if (e != null) {
-						this.convert(p.parts[i], e)
-					}
+			case "array": for (const i of 0 ... p.parts.length - 1) {
+				const e = element(c, i)
+				if (e != null) {
+					this.convert(p.parts[i], e)
 				}
-			case "object":
-				for (const q of p.parts) {
-					const m = if (q.kind == "prop") c.member(this.key(q.t)) else null
-					if (m != null) {
-						this.convert(q, m)
-					}
+			}
+			case "object": for (const q of p.parts) {
+				const m = if (q.kind == "prop") c.member(this.key(q.t)) else null
+				if (m != null) {
+					this.convert(q, m)
 				}
-			case "switchExpr":
-				for (const k of p.parts.slice(1, p.parts.length)) {
-					this.convert(k.parts[k.parts.length - 1], c)
-				}
+			}
+			case "switchExpr": for (const k of p.parts.slice(1, p.parts.length)) {
+				this.convert(k.parts[k.parts.length - 1], c)
+			}
 			case "ifExpr":
 				this.convert(p.parts[1], c)
 				this.convert(p.parts[2], c)
 			case "index": this.convert(p.parts[0], Type.array(c))
-			case "prop", "paren", "unary", "binary":
-				for (const q of p.parts) {
-					const nullable = q == p.parts[0] && p.t.kind == "??" // ?? reads its left operand as nullable
-					this.convert(q, if (nullable) c.nullable() else c, !isConstant(p)) // a constant's value is checked whole, with its sign
-				}
+			case "prop", "paren", "unary", "binary": for (const q of p.parts) {
+				const nullable = q == p.parts[0] && p.t.kind == "??" // ?? reads its left operand as nullable
+				this.convert(q, if (nullable) c.nullable() else c, !isConstant(p)) // a constant's value is checked whole, with its sign
+			}
 		}
 	}
 
@@ -4669,7 +4716,6 @@ class Checker {
 	}
 
 	private text(t: Tok): string { return this.src.slice(t.loc.pos, t.loc.end()) }
-
 	private source(p: Node): string { return sourceOf(this.src, p) }
 
 	private key(t: Tok): string {
@@ -4679,7 +4725,9 @@ class Checker {
 }
 
 /// Function type f with result and the type params ps.
-function returning(f: Type, result: Type | null, ps: Type[] = []): Type { return Type.function(f.types, result, f.n, f.rest, ps) }
+function returning(f: Type, result: Type | null, ps: Type[] = []): Type {
+	return Type.function(f.types, result, f.n, f.rest, ps)
+}
 
 /// The class a field f holds in place: the class it embeds, or its T[n]'s elements' (5.3).
 function placed(f: Field): Type | null {
@@ -4743,13 +4791,17 @@ function fieldOf(t: Type, name: string): Field | null {
 }
 
 /// What this is in the methods of class t: t, but a string or T[] in builtin/'s.
-export function selfOf(t: Type): Type { return if (t == String.base) String else if (t == Arrays.base) Type.array(t.params[0]) else t }
+export function selfOf(t: Type): Type {
+	return if (t == String.base) String else if (t == Arrays.base) Type.array(t.params[0]) else t
+}
 
 /// The type of t used as a value (4.11), and of a namespace import's generic, its params.
 function meta(t: Type, ps: Type[] = []): Type { return Type.literal("", Meta, [t, ...ps]) }
 
 /// The type a Type value of type t stands for, null where t is not that or the type is not known.
-export function standsFor(t: Type): Type | null { return if (t.kind == "literal" && t.base == Meta) t.params[0] else null }
+export function standsFor(t: Type): Type | null {
+	return if (t.kind == "literal" && t.base == Meta) t.params[0] else null
+}
 
 /// Whether a value of type t is a Type.
 export function isTypeValue(t: Type): bool { return t == Meta || standsFor(t) != null }
@@ -4768,19 +4820,22 @@ function reflected(t: Type, name: string): Type | null {
 
 /// Whether t is a type set (4.9).
 function isSet(t: Type): bool { return setOf(t) != null }
-
 /// The type set that holds ts.
 function typeSet(ts: Type[]): Type { return Type.interface(Type.union(ts)) }
 
 /// t, or the union of the type set constraining param t.
-function opened(t: Type): Type { return if (t.kind == "param" && t.base != null && isSet(t.base!)) t.base!.base! else t }
+function opened(t: Type): Type {
+	return if (t.kind == "param" && t.base != null && isSet(t.base!)) t.base!.base! else t
+}
 
 /// The type a and b compare as (6.5): their join, else that of a type set param's union in place of the param; null if
 /// they do not compare.
 export function compared(a: Type, b: Type): Type | null { return a.join(b) ?? opened(a).join(opened(b)) }
 
 /// t with each of params in it replaced by the arg at its index.
-export function substitute(t: Type, params: Type[], args: Type[]): Type { return t.in({ ...new Type("class"), params: params }, args) }
+export function substitute(t: Type, params: Type[], args: Type[]): Type {
+	return t.in({ ...new Type("class"), params: params }, args)
+}
 
 /// Whether t, or one of its int members, holds integer constant v; true of other types.
 function holds(t: Type, v: string): bool {
@@ -4886,7 +4941,9 @@ function chain(k: string): i32 {
 	}
 }
 
-export function isLink(n: Node): bool { return n.kind == "member" || n.kind == "index" || n.kind == "call" || n.kind == "postfix" }
+export function isLink(n: Node): bool {
+	return n.kind == "member" || n.kind == "index" || n.kind == "call" || n.kind == "postfix"
+}
 
 export function isTok(p: Node, kind: Kind): bool { return p.kind == "token" && p.t.kind == kind }
 
@@ -4936,7 +4993,6 @@ export function tags(n: Node): Node[] {
 
 /// The body of arrow n, after its params and result type.
 export function arrowBody(n: Node): Node { return n.parts[if (isTok(n.parts[1], ":")) 3 else 1] }
-
 /// Whether function n declares its type without its body: it has a result type or no body.
 function declaresType(n: Node): bool { return after(n, ":") != null || bodyOf(n) == null }
 
@@ -4983,7 +5039,9 @@ function operand(want: Type | null): Type | null {
 }
 
 /// The number type t gives the other operand of an operation as its context: none if t is untyped or no number.
-function context(t: Type | null): Type | null { return if (t != null && t.isNumber() && !t.isUntyped()) bases(t) else null }
+function context(t: Type | null): Type | null {
+	return if (t != null && t.isNumber() && !t.isUntyped()) bases(t) else null
+}
 
 /// Whether p is number literals, alone or in arithmetic or bitwise operations, so untyped (§4.1).
 function literals(p: Node): bool {
@@ -5016,14 +5074,13 @@ function decimal(s: string): string {
 
 /// Integer constant v negated.
 function negated(v: string): string { return if (v[0] == minus) v.slice(1, v.length) else decimal(`-${v}`) }
-
 /// Integer constant v as an index or a count: an i32 if it is one, not negative.
 function small(v: string): i32 | null { return if (v[0] != minus && holds(I32, v)) magnitude(v)! as i32 else null }
 
 /// Whether p is a constant, so that an untyped one initializes an untyped const (4.1).
 function isConstant(p: Node): bool {
-	return p.kind == "token" || p.kind == "member" || (p.kind == "paren" || p.kind == "unary" && p.t.kind == "-")
-		&& isConstant(p.parts[0])
+	return p.kind == "token" || p.kind == "member"
+		|| (p.kind == "paren" || p.kind == "unary" && p.t.kind == "-") && isConstant(p.parts[0])
 }
 
 /// t, or if a literal of a value, its base: the type a literal's element or member is of where no type is wanted.
@@ -5079,7 +5136,9 @@ function ofKind(p: Type, k: string): Type | null {
 }
 
 /// The scalars of kind k, as reflection names them (4.11), or none for another kind.
-function scalars(k: string): Type[] { return if (k == "string") [String] else [Null, ...basics].filter(t => t.kind == k) }
+function scalars(k: string): Type[] {
+	return if (k == "string") [String] else [Null, ...basics].filter(t => t.kind == k)
+}
 
 /// The type set constraining the param standing for member of param p (4.11), from p's: each field or union member
 /// of a type in it is in it, and each elem is in the elems of its arrays; else null.
@@ -5112,7 +5171,9 @@ function ofKnown(p: Type, k: string): Type | null {
 }
 
 /// The types of type set t, or null for none, that have a zero value (5.1), as a type set.
-function zeros(t: Type | null): Type | null { return if (t == null) null else typeSet(t.base!.alternatives().filter(m => m.hasZero())) }
+function zeros(t: Type | null): Type | null {
+	return if (t == null) null else typeSet(t.base!.alternatives().filter(m => m.hasZero()))
+}
 
 /// The type of element i of an array, fixed array or tuple t, or of param i of function t, or null if it has none.
 export function element(t: Type, i: i32): Type | null {
@@ -5143,6 +5204,7 @@ function aim(want: Type | null, kinds: TypeKind[]): Type | null {
 /// How many declarations the searches of uses visited, and those visited whose strongly connected uses are not all
 /// found yet.
 let visited = 0
+
 const pending: Decl[] = []
 
 /// Finds the strongly connected uses of d and of all it uses (Tarjan's), each marked as it is found with whether they

@@ -247,16 +247,14 @@ export function object(sysroot: string, src: string, out: string, dirs: string[]
 /// such as Binaryen's overflows; returns its exit status.
 export function link(sysroot: string, args: string[], out: string, kind: "static" | "pie" | "shared" = "static"): i32 {
 	const lib = sysroot + "/usr/lib" // musl's
-	const argv = if (os == "macos") [
-		"ld64.lld", if (kind == "shared") "-dylib" else "-execute", "-arch", arch, "-platform_version", "macos", "14.0",
-		"14.0", "-syslibroot", sysroot, "-o", out, ...args, "-lSystem",
-	] else [
-		"ld.lld", ...(if (kind == "shared") ["-shared"]
-			else if (kind == "pie") ["-pie", `${lib}/Scrt1.o`, `${lib}/mimalloc.o`]
-			else ["-static", `${lib}/crt1.o`, `${lib}/mimalloc.o`]), "--eh-frame-hdr", "-z", "stack-size=8388608",
-		"-o", out, `${lib}/crti.o`, ...args, `-L${lib}`, "--start-group", "-lc", "-lunwind",
-		`${lib}/libclang_rt.builtins.a`, "--end-group", `${lib}/crtn.o`,
-	]
+	const argv = if (os == "macos") ["ld64.lld", if (kind == "shared") "-dylib" else "-execute", "-arch", arch,
+		"-platform_version", "macos", "14.0", "14.0", "-syslibroot", sysroot, "-o", out, ...args, "-lSystem"]
+		else ["ld.lld",
+		...(if (kind == "shared") ["-shared"]
+		else if (kind == "pie") ["-pie", `${lib}/Scrt1.o`, `${lib}/mimalloc.o`]
+		else ["-static", `${lib}/crt1.o`, `${lib}/mimalloc.o`]), "--eh-frame-hdr", "-z", "stack-size=8388608", "-o",
+		out, `${lib}/crti.o`, ...args, `-L${lib}`, "--start-group", "-lc", "-lunwind", `${lib}/libclang_rt.builtins.a`,
+		"--end-group", `${lib}/crtn.o`]
 	return bober_lld(argv.length, argv)
 }
 
@@ -282,6 +280,4 @@ function preprocessor(o: Options, macros: [string, string | null][], src: string
 }
 
 /// The time, as ctime has it.
-function date(): string {
-	return c.fromCString(ctime([now() / 1000000000]))
-}
+function date(): string { return c.fromCString(ctime([now() / 1000000000])) }

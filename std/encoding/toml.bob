@@ -9,8 +9,10 @@
 import * as ascii from "../ascii"
 import * as encoding from "../encoding"
 import { startsWith } from "../algo"
+
 import { apostrophe, backslash, digit, dot, equal, hash, isAlphanumeric, isControl, isDigit, lbrace, lbracket, lf,
 	minus, nul, plus, quote, rbrace, rbracket, space, tab, underscore, zero } from "../ascii"
+
 import { parseFloat } from "../float"
 import { inf, isFinite, isNaN, nan } from "../math"
 import { quoted, Unknown } from "./json"
@@ -33,9 +35,7 @@ export class EncodeError {
 	constructor(path: string) { this.path = path }
 }
 
-export function encode[T](v: T): string throws EncodeError {
-	return table(v, "")
-}
+export function encode[T](v: T): string throws EncodeError { return table(v, "") }
 
 export function decode[T extends Decodable](s: string): T throws ParseError {
 	const d = new Decoder(s)
@@ -72,16 +72,15 @@ function table[T](v: T, path: string): string throws EncodeError {
 	const keys: string[] = []
 	const tables: string[] = []
 	switch (t.kind) {
-		case "class", "object", "interface":
-			for (const f of t.fields) {
-				if (has(f.tags, Rest) && f.type == Unknown[]) {
-					for (const [k, text] of v[f.name]) {
-						keys.push(`${k} = ${text}\n`)
-					}
-				} else if (!encoding.omits(f.tags, Skip, OmitEmpty, v[f.name])) {
-					field(keys, tables, path, encoding.key(f.tags, Name, f.name), v[f.name])
+		case "class", "object", "interface": for (const f of t.fields) {
+			if (has(f.tags, Rest) && f.type == Unknown[]) {
+				for (const [k, text] of v[f.name]) {
+					keys.push(`${k} = ${text}\n`)
 				}
+			} else if (!encoding.omits(f.tags, Skip, OmitEmpty, v[f.name])) {
+				field(keys, tables, path, encoding.key(f.tags, Name, f.name), v[f.name])
 			}
+		}
 		default: throw new EncodeError(path)
 	}
 	let out = keys.join("")
@@ -97,12 +96,11 @@ function field[T](keys: string[], tables: string[], path: string, name: string, 
 	const p = path + key(name)
 	switch (t.kind) {
 		case "null": return
-		case "union":
-			for (const M of t.members) {
-				if (v instanceof M) {
-					field(keys, tables, path, name, v)
-				}
+		case "union": for (const M of t.members) {
+			if (v instanceof M) {
+				field(keys, tables, path, name, v)
 			}
+		}
 		case "class", "object", "interface": tables.push(`[${p}]\n${table(v, `${p}.`)}`)
 		case "array":
 			if (t.elem.kind == "class" || t.elem.kind == "object" || t.elem.kind == "interface") {
@@ -205,42 +203,41 @@ class Decoder {
 	}
 
 	/// v with the value, table or new element of an array of tables at path[i…] set, or a ParseError at at.
-	walk[T extends Decodable](v: T, path: string[], i: i32, leaf: "value" | "table" | "array", at: i32): T throws ParseError {
+	walk[T extends Decodable](v: T, path: string[], i: i32, leaf: "value" | "table" | "array",
+		at: i32): T throws ParseError {
 		if (i == path.length && leaf == "value") {
 			return this.value[T]()
 		}
 		switch (T.kind) {
-			case "union":
-				for (const M of T.members) {
-					if (M.kind == "class") {
-						return this.walk[M](if (v instanceof M) v else new M(), path, i, leaf, at)
-					}
+			case "union": for (const M of T.members) {
+				if (M.kind == "class") {
+					return this.walk[M](if (v instanceof M) v else new M(), path, i, leaf, at)
 				}
-			case "class":
-				if (i == path.length) {
-					if (leaf == "table") {
+			}
+			case "class": if (i == path.length) {
+				if (leaf == "table") {
+					return v
+				}
+			} else {
+				for (const f of T.fields) {
+					if (path[i] == encoding.key(f.tags, Name, f.name) && !encoding.skips(f.tags, Skip)
+						&& !has(f.tags, Rest)) {
+						v[f.name] = this.walk[f.type](v[f.name], path, i + 1, leaf, at)
 						return v
 					}
-				} else {
-					for (const f of T.fields) {
-						if (path[i] == encoding.key(f.tags, Name, f.name)
-								&& !encoding.skips(f.tags, Skip) && !has(f.tags, Rest)) {
-							v[f.name] = this.walk[f.type](v[f.name], path, i + 1, leaf, at)
-							return v
+				}
+				for (const f of T.fields) {
+					if (has(f.tags, Rest) && f.type == Unknown[]) {
+						if (leaf == "value") {
+							const start = this.i
+							this.skip()
+							const rest: Unknown[] = v[f.name]
+							rest.push([path.slice(i, path.length).map(key).join("."), this.s.slice(start, this.i)])
 						}
-					}
-					for (const f of T.fields) {
-						if (has(f.tags, Rest) && f.type == Unknown[]) {
-							if (leaf == "value") {
-								const start = this.i
-								this.skip()
-								const rest: Unknown[] = v[f.name]
-								rest.push([path.slice(i, path.length).map(key).join("."), this.s.slice(start, this.i)])
-							}
-							return v
-						}
+						return v
 					}
 				}
+			}
 			case "array":
 				if (i < path.length && v.length > 0) {
 					v[v.length - 1] = this.walk[T.elem](v[v.length - 1], path, i, leaf, at)
@@ -382,7 +379,12 @@ class Decoder {
 		const sign = this.sign()
 		let radix = 10
 		if (this.i == at && this.peek() == zero) {
-			radix = switch (this.peek(1)) { case ascii.x: 16; case ascii.o: 8; case ascii.b: 2; default: 10 }
+			radix = switch (this.peek(1)) {
+				case ascii.x: 16
+				case ascii.o: 8
+				case ascii.b: 2
+				default: 10
+			}
 			if (radix != 10) {
 				this.i += 2
 			}
@@ -624,10 +626,7 @@ class Decoder {
 		return this.eat(lf)
 	}
 
-	space() {
-		while (this.eat(space) || this.eat(tab)) {}
-	}
-
+	space() { while (this.eat(space) || this.eat(tab)) {} }
 	ahead(t: string): bool { return this.i + t.length <= this.s.length && this.s.slice(this.i, this.i + t.length) == t }
 
 	word(w: string) {

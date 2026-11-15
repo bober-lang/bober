@@ -14,12 +14,13 @@
 //! they read back as they are, else quoted, and text with line breaks as a literal block scalar.
 
 // Ported from eemeli/yaml (ISC, github.com/eemeli/yaml).
-
 import * as ascii from "../ascii"
 import { endsWith, indexOf, startsWith } from "../algo"
+
 import { ampersand, apostrophe, backslash, backtick, colon, comma, cr, digit, dot, exclamation, greater, hash, isDigit,
 	isHexDigit, lbrace, lbracket, less, lf, minus, nine, percent, pipe, plus, question, quote, rbrace, rbracket, seven,
 	slash, space, star, tab, tilde, underscore, zero } from "../ascii"
+
 import { HashMap } from "../collections/hashmap"
 import { formatFloat, parseFloat } from "../float"
 import { inf, isFinite, isNaN, max, nan } from "../math"
@@ -253,14 +254,14 @@ function plainKind(v: string): ScalarKind {
 	// Only these start what is not a string, or nothing does.
 	const c = byte(v, 0)
 	if (c != -1 && !isDigit(c as u8) && c != minus && c != plus && c != dot && c != tilde && (c | 0x20) != ascii.n
-			&& (c | 0x20) != ascii.t && (c | 0x20) != ascii.f) {
+		&& (c | 0x20) != ascii.t && (c | 0x20) != ascii.f) {
 		return "str"
 	}
 	switch (v) {
 		case "", "~", "null", "Null", "NULL": return "null"
 		case "true", "True", "TRUE", "false", "False", "FALSE": return "bool"
-		case ".nan", ".NaN", ".NAN", ".inf", ".Inf", ".INF", "+.inf", "+.Inf", "+.INF", "-.inf", "-.Inf", "-.INF":
-			return "float"
+		case ".nan", ".NaN", ".NAN", ".inf", ".Inf", ".INF", "+.inf", "+.Inf", "+.INF", "-.inf", "-.Inf",
+			"-.INF": return "float"
 	}
 	if (v.length > 2 && v[0] == zero && (v[1] == ascii.o || v[1] == ascii.x)) {
 		const hex = v[1] == ascii.x
@@ -542,7 +543,7 @@ class Composer {
 		const value = t.value
 		const props = this.props(new Props(), start, kind.docStart, value, t.at, 0, true, false)
 		if (props.found != -1 && value != null && (value.kind == kind.blockMap || value.kind == kind.blockSeq)
-				&& !props.hasNewline) {
+			&& !props.hasNewline) {
 			throw this.fail(props.end)
 		}
 		const root = if (value != null) this.node(value, props) else this.empty(props.end, start, props)
@@ -554,7 +555,7 @@ class Composer {
 
 	/// The tags and anchor of a node and the indicator and other tokens before it, as resolveProps checks them, in p.
 	props(p: Props, ts: i32, indicator: Kind, next: Tok | null, offset: i32, parentIndent: i32, startOnNewline: bool,
-			flow: bool): Props throws ParseError {
+		flow: bool): Props throws ParseError {
 		const c = this.c
 		p.reset(offset)
 		let atNewline = startOnNewline
@@ -594,8 +595,9 @@ class Composer {
 			switch (k) {
 				case kind.space:
 					// At the document level, tabs at the start of a line may be white space before a flow node.
-					if (!flow && (indicator != kind.docStart || next == null || next.kind == kind.blockMap
-							|| next.kind == kind.blockSeq) && hasTab(this.s, at, c.end[t])) {
+					if (!flow
+						&& (indicator != kind.docStart || next == null || next.kind == kind.blockMap
+						|| next.kind == kind.blockSeq) && hasTab(this.s, at, c.end[t])) {
 						tab = t
 						separates = before == indicator
 					}
@@ -643,11 +645,12 @@ class Composer {
 			}
 		}
 		if (reqSpace && next != null && next.kind != kind.space && next.kind != kind.newline && next.kind != kind.comma
-				&& !(next.kind == kind.scalar && next.at == next.end)) {
+			&& !(next.kind == kind.scalar && next.at == next.end)) {
 			throw this.fail(next.at)
 		}
-		if (tab != -1 && (atNewline && c.indent[tab] <= parentIndent || next != null
-				&& (next.kind == kind.blockMap || next.kind == kind.blockSeq))) {
+		if (tab != -1
+			&& (atNewline && c.indent[tab] <= parentIndent
+			|| next != null && (next.kind == kind.blockMap || next.kind == kind.blockSeq))) {
 			throw this.fail(c.at[tab])
 		}
 		if (p.start == -1) {
@@ -664,10 +667,9 @@ class Composer {
 		for (const t of c.from(ts) + skip ... c.to(ts) - 1) {
 			switch (c.kind[t]) {
 				case kind.space, kind.newline: hasSpace = true
-				case kind.comment:
-					if (reqSpace && !hasSpace) {
-						throw this.fail(c.at[t])
-					}
+				case kind.comment: if (reqSpace && !hasSpace) {
+					throw this.fail(c.at[t])
+				}
 				default: throw this.fail(c.at[t])
 			}
 			this.end += c.end[t] - c.at[t]
@@ -704,7 +706,8 @@ class Composer {
 		const scalar = name == "str" || name == "null" || name == "bool" || name == "int" || name == "float"
 		if (n instanceof Scalar) {
 			const k = plainKind(n.value)
-			if (name == "seq" || name == "map" || scalar && name != "str" && k != name && !(name == "float" && k == "int")) {
+			if (name == "seq" || name == "map"
+				|| scalar && name != "str" && k != name && !(name == "float" && k == "int")) {
 				throw this.fail(n.at)
 			}
 		} else if (scalar || name == "seq" && n instanceof Map || name == "map" && n instanceof Seq) {
@@ -718,7 +721,8 @@ class Composer {
 		let at = offset
 		// After the last token that is not white space or a comment, and the spaces after that.
 		let i = c.to(before) - 1
-		while (i >= c.from(before) && (c.kind[i] == kind.space || c.kind[i] == kind.comment || c.kind[i] == kind.newline)) {
+		while (i >= c.from(before)
+			&& (c.kind[i] == kind.space || c.kind[i] == kind.comment || c.kind[i] == kind.newline)) {
 			at -= c.end[i] - c.at[i]
 			i--
 		}
@@ -917,7 +921,8 @@ class Composer {
 					i += n
 					// A high surrogate joins the low one escaped after it; any other is no character.
 					if (cp >= 0xd800 && cp < 0xe000) {
-						const lo = if (cp < 0xdc00 && s[i + 1] == backslash && s[i + 2] == ascii.u) hexAt(s, i + 3, 4, end - 1)
+						const lo = if (cp < 0xdc00 && s[i + 1] == backslash
+							&& s[i + 2] == ascii.u) hexAt(s, i + 3, 4, end - 1)
 							else -1
 						if (lo < 0xdc00 || lo >= 0xe000) {
 							throw this.fail(esc)
@@ -970,10 +975,9 @@ class Composer {
 			switch (c.kind[i]) {
 				case kind.space: hasSpace = true
 				case kind.newline: {}
-				case kind.comment:
-					if (!hasSpace) {
-						throw this.fail(c.at[i])
-					}
+				case kind.comment: if (!hasSpace) {
+					throw this.fail(c.at[i])
+				}
 				default: throw this.fail(c.at[i])
 			}
 		}
@@ -1001,7 +1005,8 @@ class Composer {
 		// With an explicit indentation, the spaces of a line more indented than it are content.
 		const blank = (i: i32) => {
 			const j = starts[i] + indent(i)
-			return (j == lineEnd(i) || j + 1 == lineEnd(i) && s[j] == cr) && (explicit == 0 || indent(i) <= t.indent + explicit)
+			return (j == lineEnd(i) || j + 1 == lineEnd(i) && s[j] == cr)
+				&& (explicit == 0 || indent(i) <= t.indent + explicit)
 		}
 		let chompStart = n
 		while (chompStart > 0 && blank(chompStart - 1)) {
@@ -1133,8 +1138,8 @@ class Composer {
 		for (const it of t.items!) {
 			const key = it.key
 			const sep = it.sep
-			const kp = this.props(keyProps, it.start, kind.explicitKeyInd, key ?? this.first(sep), offset, t.indent, true,
-				false)
+			const kp = this.props(keyProps, it.start, kind.explicitKeyInd, key ?? this.first(sep), offset, t.indent,
+				true, false)
 			const implicit = kp.found == -1
 			if (implicit) {
 				if (key != null && (key.kind == kind.blockSeq || key.indent != t.indent)) {
@@ -1160,7 +1165,7 @@ class Composer {
 			if (vp.found != -1) {
 				if (implicit) {
 					if (it.value != null && it.value!.kind == kind.blockMap && !vp.hasNewline
-							|| kp.start < c.at[vp.found] - maxKey) {
+						|| kp.start < c.at[vp.found] - maxKey) {
 						throw this.fail(offset)
 					}
 				}
@@ -1374,7 +1379,7 @@ function isUri(s: string, prefix: bool): bool {
 		if (c == percent && i + 2 < s.length && isHexDigit(s[i + 1]) && isHexDigit(s[i + 2])) {
 			i += 3
 		} else if (ascii.isAlphanumeric(c) || isTagChar(c)
-				|| (i > 0 || !prefix) && (c == comma || c == ascii.lbracket || c == ascii.rbracket)) {
+			|| (i > 0 || !prefix) && (c == comma || c == ascii.lbracket || c == ascii.rbracket)) {
 			i++
 		} else {
 			return false
@@ -1432,7 +1437,7 @@ function hasNewline(c: Cst, s: string, t: Tok | null): bool {
 		case kind.flowCollection:
 			for (const it of t.items!) {
 				if (c.includes(it.start, kind.newline) || c.includes(it.sep, kind.newline) || hasNewline(c, s, it.key)
-						|| hasNewline(c, s, it.value)) {
+					|| hasNewline(c, s, it.value)) {
 					return true
 				}
 			}
@@ -1628,7 +1633,7 @@ class Decoder {
 					let known = false
 					for (const f of T.fields) {
 						if (!encoding.skips(f.tags, Skip) && !has(f.tags, Rest)
-								&& name == encoding.key(f.tags, Name, f.name)) {
+							&& name == encoding.key(f.tags, Name, f.name)) {
 							r[f.name] = if (has(f.tags, Mapping)) this.entries[f.type](v) else this.value[f.type](v)
 							known = true
 						}
@@ -1861,7 +1866,9 @@ function toNode[T](v: T): Node throws EncodeError {
 	switch (t.kind) {
 		case "null": return word("null")
 		case "bool", "int": return word(`${v}`)
-		case "float": return word(if (isNaN(v)) ".nan" else if (!isFinite(v)) (if (v > 0.0) ".inf" else "-.inf") else `${v}`)
+		case "float": return word(if (isNaN(v)) ".nan"
+			else if (!isFinite(v)) (if (v > 0.0) ".inf" else "-.inf")
+			else `${v}`)
 		case "string": return new Scalar(v, "single", null, 0)
 		case "literal": return toNode[string | bool | null](t.value)
 		case "union":
@@ -2098,9 +2105,8 @@ function isPlain(v: string): bool {
 		case minus: if (v.length == 1 || v[1] == space) {
 			return false
 		}
-		case space, question, colon, comma, lbracket, rbracket, lbrace, rbrace, hash, ampersand, star, exclamation, pipe,
-			greater, apostrophe, quote, percent, ascii.at, backtick:
-			return false
+		case space, question, colon, comma, lbracket, rbracket, lbrace, rbrace, hash, ampersand, star, exclamation,
+			pipe, greater, apostrophe, quote, percent, ascii.at, backtick: return false
 	}
 	return indexOf(v, ": ") < 0 && indexOf(v, " #") < 0
 }
@@ -2148,7 +2154,9 @@ function double(v: string): string {
 				case 0x85: "\\N"
 				case 0x2028: "\\L"
 				case 0x2029: "\\P"
-				default: if (cp < 0x100) `\\x${hex(cp, 2)}` else if (cp < 0x10000) `\\u${hex(cp, 4)}` else `\\U${hex(cp, 8)}`
+				default: if (cp < 0x100) `\\x${hex(cp, 2)}`
+					else if (cp < 0x10000) `\\u${hex(cp, 4)}`
+					else `\\U${hex(cp, 8)}`
 			}
 		}
 		if (e != "") {

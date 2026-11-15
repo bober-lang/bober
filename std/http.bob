@@ -475,8 +475,10 @@ export class Client {
 			answer = h.request([[":method", req.method], [":scheme", req.url.scheme], [":authority", authority],
 				[":path", target], ...pairs], if (sent == "") null else if (sent != null) new Body(sent) else req.body)
 		} catch (e: IoError) {
-			if (again && sent != null && (e.op == "write" && e.what == "goaway" || e.what == "reset 7" || h.closed
-				&& idempotent.includes(req.method) && (e.kind == "ConnectionReset" || e.kind == "BrokenPipe"))) {
+			if (again && sent != null
+				&& (e.op == "write" && e.what == "goaway" || e.what == "reset 7"
+				|| h.closed && idempotent.includes(req.method)
+				&& (e.kind == "ConnectionReset" || e.kind == "BrokenPipe"))) {
 				return null
 			}
 			throw e
@@ -925,7 +927,8 @@ export class Server {
 		const version = versionOf(parts[2])
 		// An HTTP/1.0 request may have none, its host then the connection's (RFC 9112 §3.3).
 		const host = if (hosts.length == 0 && version == "HTTP/1.0") local
-			else if (hosts.length == 1) hosts[0] else null
+			else if (hosts.length == 1) hosts[0]
+			else null
 		if (!isToken(parts[0]) || !isTarget(parts[1]) || host == null || !isHost(host) || version == null) {
 			throw new IoError("Protocol", "read", parts.join(" "))
 		}
@@ -966,7 +969,8 @@ export class Server {
 	private respond(c: Stream, method: string, got: Response, last: bool, version: Version): Response throws IoError {
 		try {
 			const [res, prepared, bare] = this.prepare(got, method, version)
-			const pairs = if (last) [...prepared.filter(p => p[0] != "connection"), ["connection", "close"]] else prepared
+			const pairs = if (last) [...prepared.filter(p => p[0] != "connection"), ["connection", "close"]]
+				else prepared
 			const start = head(`HTTP/1.1 ${res.status} `, pairs)
 			const body = res.body
 			if (bare) {

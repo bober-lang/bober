@@ -39,7 +39,8 @@ test "constant expressions fold while compiling" {
 
 test "static initializers hold address constants and designated members" {
 	const ir = compile("int g[4]; struct { char c; int *p; char s[4]; } s = { .p = &g[2], \"abc\", .s[1] = 122 };")
-	assert has(ir, "@s = global <{ [8 x i8], ptr, [4 x i8], [4 x i8] }> <{ [8 x i8] zeroinitializer, "
+	assert has(ir,
+		"@s = global <{ [8 x i8], ptr, [4 x i8], [4 x i8] }> <{ [8 x i8] zeroinitializer, "
 		+ "ptr getelementptr (i8, ptr @g, i64 8), [4 x i8] c\"azc\\00\", [4 x i8] zeroinitializer }>, align 8")
 }
 
@@ -106,8 +107,8 @@ test "char, signed char and unsigned char are three types; signed char computes 
 test "asm statements become inline asm; a + operand is also an input, tied to its output" {
 	const ir = compile("int f(int x, long y) { __asm__ volatile(\"add %w0, %w0, %w1 // $%%\" : \"+r\"(x) : \"r\"(y)"
 		+ " : \"memory\"); return x; }")
-	assert has(ir, "%8 = call i32 asm sideeffect \"add ${0:w}, ${0:w}, ${1:w} // $$%\", \"=r,r,0,~{memory}\""
-		+ "(i64 %6, i32 %7)")
+	assert has(ir,
+		"%8 = call i32 asm sideeffect \"add ${0:w}, ${0:w}, ${1:w} // $$%\", \"=r,r,0,~{memory}\"" + "(i64 %6, i32 %7)")
 }
 
 test "asm operands may be named, as %[name] or with a modifier as %w[name]" {
@@ -271,14 +272,16 @@ test "a label is defined once in its function; in code that is not run, labels a
 // Configure scripts probe types with code that must fail to compile, as Tcl's does with case (sizeof(long long) == 8).
 test "a switch's cases differ, and a local's type is complete" {
 	assert error("void f(int x) { switch (x) { case 1: case 2 - 1: ; } }") == "t.c:1:38: duplicate case value"
-	assert error("void f(int x) { switch (x) { default: default: ; } }") == "t.c:1:39: multiple default labels in one switch"
+	assert error("void f(int x) { switch (x) { default: default: ; } }")
+		== "t.c:1:39: multiple default labels in one switch"
 	assert error("struct s; void f(void) { struct s v; }") == "t.c:1:36: v has an incomplete type"
 	assert error("struct s; void f(void) { extern struct s v; struct s *p; }") == ""
 	assert error("struct s; void f(void) { struct s v[2]; }") == "t.c:1:39: v has an incomplete type"
 }
 
 test "a declaration agrees with the others of its name, and a call with its prototype" {
-	assert error("extern int a[]; int a[3]; int f(); int f(int x) { return x; } int x; int x = 1; int g(void) { return f(1); }") == ""
+	assert error("extern int a[]; int a[3]; int f(); int f(int x) { return x; } int x; int x = 1; int g(void) { return f(1); }")
+		== ""
 	assert error("int f(void); long *f(void);") == "t.c:1:27: conflicting types for f"
 	assert error("int x = 1; int x = 2;") == "t.c:1:20: redefinition of x"
 	assert error("char a[1 - 2 * (sizeof(int) == 4)];") == "t.c:1:8: array size is negative"
@@ -287,7 +290,8 @@ test "a declaration agrees with the others of its name, and a call with its prot
 }
 
 test "an ignored attribute warns once, where it is first seen" {
-	const p = new Parser(new Lexer(new File("t.c", "__attribute__((constructor)) void f(void);\n[[gnu::__constructor__]] void g(void);")), new Nothing())
+	const p = new Parser(new Lexer(new File("t.c",
+		"__attribute__((constructor)) void f(void);\n[[gnu::__constructor__]] void g(void);")), new Nothing())
 	p.unit()
 	assert p.warnings.length == 1 && p.warnings[0].toString() == "t.c:1:16: ignored attribute constructor"
 }

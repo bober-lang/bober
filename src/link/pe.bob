@@ -8,17 +8,16 @@ import { CompileError } from "../error"
 import { addend } from "./arm64"
 import { decimal, le, pad, str, u } from "./bytes"
 import { Format, Image } from "./link"
+
 import { Abs64, Call, Code, Const, Data, Fixup, Global, Image32, Init, Local, Object, Page, PageOff, Rel32, Section,
 	SlotPage, SlotPageOff, SlotRel32, Symbol, Unwind, Weak, Zero, own } from "./object"
 
 /// The room the writer needs before the first linked address: a page of the largest the linker uses, as a section
 /// starts at a page and the headers are less.
 const headers: u64 = 0x10000
-
 /// The COFF header's machine of x86-64 and of arm64.
 const AMD64: u64 = 0x8664
 const ARM64: u64 = 0xaa64
-
 /// Section characteristics: code, zeros, information and bytes not linked, of more relocations than their count holds,
 /// discardable, run, read, written; and initialized data, which the writer's data sections are.
 const SCN_CNT_CODE: u64 = 0x20
@@ -31,7 +30,6 @@ const SCN_MEM_DISCARDABLE: u64 = 0x02000000
 const SCN_MEM_EXECUTE: u64 = 0x20000000
 const SCN_MEM_READ: u64 = 0x40000000
 const SCN_MEM_WRITE: u64 = 0x80000000
-
 /// A symbol's storage class: seen by all objects, seen in its object, a label there, a weak external.
 const EXTERNAL: u64 = 2
 const STATIC: u64 = 3
@@ -39,7 +37,6 @@ const LABEL: u64 = 6
 const WEAK_EXTERNAL: u64 = 105
 /// The COMDAT selection of a section dropped with the section it is associated with.
 const ASSOCIATIVE: u64 = 5
-
 /// x86-64's relocation types: none, S + A of 8 bytes, of 4 bytes from the image, and of 4 bytes from 4 to 9 bytes on.
 const AMD64_ABSOLUTE: u64 = 0
 const AMD64_ADDR64: u64 = 1
@@ -55,7 +52,6 @@ const ARM64_PAGEOFFSET_12A: u64 = 6
 const ARM64_PAGEOFFSET_12L: u64 = 7
 const ARM64_ADDR64: u64 = 14
 const ARM64_REL32: u64 = 17
-
 /// Where a DLL is loaded unless taken: above 4 GiB, so that a pointer not rebased is not one.
 const IMAGE_BASE: u64 = 0x180000000
 /// The COFF header's characteristics of an image: run, of addresses over 2 GiB, a DLL.
@@ -114,7 +110,6 @@ function read(name: string, bytes: string): Object throws CompileError {
 		index.push(o.sections.length)
 		o.sections.push(s)
 	}
-
 	// Per record of the symbol table, the index of its symbol in o; -1 for an auxiliary record and for those no fixup
 	// may refer to: a file's name, an absolute value as `@feat.00`, debug information.
 	const syms: i32[] = []
@@ -148,8 +143,8 @@ function read(name: string, bytes: string): Object throws CompileError {
 			if (own) {
 				selection[number] = bytes[p + 32] as u64
 				associate[number] = u(bytes, p + 30, 2) as i32
-			} else if (section >= 0 && selection[number] > 1 && selection[number] != ASSOCIATIVE &&
-				o.sections[section].group == "") {
+			} else if (section >= 0 && selection[number] > 1 && selection[number] != ASSOCIATIVE
+				&& o.sections[section].group == "") {
 				o.sections[section].group = sym
 			}
 		} else {
@@ -174,7 +169,6 @@ function read(name: string, bytes: string): Object throws CompileError {
 			o.sections[index[i]].group = o.sections[index[a]].group
 		}
 	}
-
 	for (const i of 1 ... count) {
 		if (index[i] < 0) {
 			continue
@@ -224,9 +218,12 @@ function read(name: string, bytes: string): Object throws CompileError {
 /// The kind of a section of name full and characteristics flags: the function table of `.pdata`, which is the
 /// unwinder's; and the pointers to C++'s initializers, which those of `.CRT$XC` are.
 function kindOf(full: string, flags: u64): u8 {
-	return if (full == ".pdata") Unwind else if (startsWith(full, ".CRT$XC")) Init
-		else if ((flags & SCN_MEM_EXECUTE) != 0) Code else if ((flags & SCN_CNT_UNINITIALIZED_DATA) != 0) Zero
-		else if ((flags & SCN_MEM_WRITE) != 0) Data else Const
+	return if (full == ".pdata") Unwind
+		else if (startsWith(full, ".CRT$XC")) Init
+		else if ((flags & SCN_MEM_EXECUTE) != 0) Code
+		else if ((flags & SCN_CNT_UNINITIALIZED_DATA) != 0) Zero
+		else if ((flags & SCN_MEM_WRITE) != 0) Data
+		else Const
 }
 
 /// The kind of fixup of relocation type rt of x86-64 or arm64, and its addend, which the bytes b at at hold; kind 255
@@ -237,7 +234,8 @@ function fixup(x64: bool, rt: u64, b: string, at: i32): [i32, i64] {
 	const word = (w as i32) as i64
 	const wide = if (at + 8 <= b.length) u(b, at, 8) as i64 else 0
 	if (x64) {
-		return if (rt == AMD64_ABSOLUTE) [255, 0] else if (rt == AMD64_ADDR64) [Abs64, wide]
+		return if (rt == AMD64_ABSOLUTE) [255, 0]
+			else if (rt == AMD64_ADDR64) [Abs64, wide]
 			else if (rt == AMD64_ADDR32NB) [Image32, word]
 			else if (rt >= AMD64_REL32 && rt <= AMD64_REL32_5) [Rel32, word - ((rt - AMD64_REL32 + 4) as i64)]
 			else [-1, 0]
@@ -258,8 +256,8 @@ function fixup(x64: bool, rt: u64, b: string, at: i32): [i32, i64] {
 /// The names the DLL bytes, read from the file name, exports, by its export directory.
 function exports(name: string, bytes: string): string[] throws CompileError {
 	const pe = if (bytes.length < 64) 0 else u(bytes, 60, 4) as i32
-	if (pe == 0 || pe + 24 + 240 > bytes.length || bytes.slice(pe, pe + 4) != "PE\x00\x00" ||
-		u(bytes, pe + 24, 2) != PE32_PLUS) {
+	if (pe == 0 || pe + 24 + 240 > bytes.length || bytes.slice(pe, pe + 4) != "PE\x00\x00"
+		|| u(bytes, pe + 24, 2) != PE32_PLUS) {
 		throw new CompileError(`${name}: not a PE32+ image`)
 	}
 	// The optional header is after the COFF header's 24 bytes and is 240; the export directory's address is at 112.
@@ -305,7 +303,6 @@ function write(image: Image) {
 		tail = pad(tail, alignUp(tail.length, 8)) + s
 		return base + ((tail.length - s.length) as u64)
 	}
-
 	const exported = image.exports.slice(0, image.exports.length)
 	sortBy(exported, (a, b) => a[0] < b[0])
 	let addresses = ""
@@ -325,9 +322,8 @@ function write(image: Image) {
 		le(n, 4), // names
 		le(place(addresses), 4),
 		le(place(names), 4),
-		le(place(ordinals), 4),
+		le(place(ordinals), 4)
 	].join(""))
-
 	// A descriptor of the lookup table, the library's name and the slots the loader sets; each slot and its entry in
 	// the lookup table hold the address of the name. A weak bind has no form here, and is a plain one.
 	let descriptors = ""
@@ -336,8 +332,8 @@ function write(image: Image) {
 		const first = image.binds[i]
 		let lookup = ""
 		let j = i
-		while (j < image.binds.length && image.binds[j].library == first.library &&
-			image.binds[j].at == first.at + 8 * ((j - i) as u64)) {
+		while (j < image.binds.length && image.binds[j].library == first.library
+			&& image.binds[j].at == first.at + 8 * ((j - i) as u64)) {
 			const hint = place(le(0, 2) + image.binds[j].name + "\x00")
 			lookup += le(hint, 8)
 			image.bytes.put(image.binds[j].at, hint, 8)
@@ -352,7 +348,6 @@ function write(image: Image) {
 	for (const b of image.binds) {
 		slots = [if (slots[1] == 0 || b.at < slots[0]) b.at else slots[0], max(slots[1], b.at + 8)]
 	}
-
 	// A block of base relocations per 4 KiB page, of 2 bytes per pointer, padded to 4; and the pointers they add the
 	// image's address less IMAGE_BASE to as the address they were linked at.
 	const rebases = image.rebases
@@ -370,7 +365,6 @@ function write(image: Image) {
 		relocs += le(at, 4) + le((8 + block.length) as u64, 4) + block
 	}
 	const relocAt = place(relocs)
-
 	// The function table, sorted by the address of each function, as the unwinder searches it. No row is of a
 	// function in a dropped section: a COMDAT function's `.pdata` is a section associative to it, dropped with it.
 	if (image.unwinds.length > 1) {
@@ -384,11 +378,10 @@ function write(image: Image) {
 	}
 	sortBy(rows, (a, b) => u(a, 0, 4) < u(b, 0, 4))
 	image.bytes.set(from, rows.join(""))
-
 	let sections = ""
 	for (const s of segs) {
-		const flags = SCN_MEM_READ | (if (s.exec) SCN_CNT_CODE | SCN_MEM_EXECUTE else SCN_CNT_INITIALIZED_DATA) |
-			(if (s.write) SCN_MEM_WRITE else 0)
+		const flags = SCN_MEM_READ | (if (s.exec) SCN_CNT_CODE | SCN_MEM_EXECUTE else SCN_CNT_INITIALIZED_DATA)
+			| (if (s.write) SCN_MEM_WRITE else 0)
 		sections += section(if (s.exec) ".text" else if (s.write) ".data" else ".rdata", s.size + s.zero, s.address,
 			alignUp(s.size, page), if (s.size > 0) s.address else 0, flags)
 	}
@@ -424,7 +417,7 @@ function write(image: Image) {
 		dir(relocAt, relocs.length as u64),
 		le(0, 48), // debug, architecture, global pointer, TLS, load configuration, bound imports
 		dir(slots[0], slots[1] - slots[0]),
-		le(0, 24), // delayed imports, .NET, reserved
+		le(0, 24) // delayed imports, .NET, reserved
 	].join("")
 	const head = [
 		"MZ",
@@ -437,7 +430,7 @@ function write(image: Image) {
 		le(optional.length as u64, 2),
 		le(DLL, 2),
 		optional,
-		sections,
+		sections
 	].join("")
 	image.bytes.set(0, head)
 	image.bytes.set(file, pad(tail, alignUp(size, page) as i32))

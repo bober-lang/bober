@@ -105,7 +105,8 @@ function shaped(b: Backend, s: string, callee: bool, sum: i64) {
 	const r = b.call(ft, f, args)
 	const want = b.constInt(i64, sum)
 	const off = b.binary("or", b.binary("xor", b.extract(r, 0), want),
-		b.binary("or", b.binary("add", b.extract(r, 1), want), b.binary("xor", b.cast("ptrtoint", b.extract(r, 2), i64), want)))
+		b.binary("or", b.binary("add", b.extract(r, 1), want),
+		b.binary("xor", b.cast("ptrtoint", b.extract(r, 2), i64), want)))
 	b.ret(b.cast("zext", b.icmp("ne", off, b.constInt(i64, 0)), b.int(32)))
 }
 
@@ -115,14 +116,16 @@ test "TPDE and LLVM pass each other's args and results where the other takes the
 	}
 	const out = `/tmp/bober-abi${getpid()}`
 	for (const s of ["i i i i i i i i i", "i i i i i iip w ii ib i", "i i i i i i i iip w ii ib", "i i i i i i ii w b",
-		"i i i i i i i ii iip", "f f f f f f f fff f f", "i i i i i i i i fi f f f f f f ff", "i i i i i i i i w w b w i p"]) {
+		"i i i i i i i ii iip", "f f f f f f f fff f f", "i i i i i i i i fi f f f f f f ff",
+		"i i i i i i i i w w b w i p"]) {
 		let sum: i64 = 0
 		let n = 0
 		for (const c of letters(s).filter(c => c != " ")) {
 			n++
 			sum += n * (if (c == "b") n % 2 else 100 + n)
 		}
-		for (const llvm of [false, true]) { // the callee's backend; the caller's is the other
+		for (const llvm of [false, true]) {
+			// the callee's backend; the caller's is the other
 			for (const callee of [true, false]) {
 				const b: Backend = if (llvm == callee) new LLVM("m") else new Tpde("m")
 				shaped(b, s, callee, sum)

@@ -70,7 +70,7 @@ function app(req: Request): Response throws IoError | ParseError {
 				released++
 			})
 			return held
-		// 64 MiB, past what a peer that reads none of it lets through.
+			// 64 MiB, past what a peer that reads none of it lets through.
 		case "/huge":
 			let mib = "x"
 			while (mib.length < 1 << 20) {
@@ -253,8 +253,8 @@ test "limits and bad messages" {
 	}
 	// The scheme not served, userinfo, a bad host, not one Host, as HTTP/1.1 must have, or a fragment.
 	for (const head of ["/hello#x HTTP/1.1\r\nHost: x", "https://x/hello HTTP/1.1\r\nHost: x",
-		"http://u@x/hello HTTP/1.1\r\nHost: x",
-		"http://@x/hello HTTP/1.1\r\nHost: x", "http://a{b}/hello HTTP/1.1\r\nHost: x", "http://x/hello HTTP/1.1",
+		"http://u@x/hello HTTP/1.1\r\nHost: x", "http://@x/hello HTTP/1.1\r\nHost: x",
+		"http://a{b}/hello HTTP/1.1\r\nHost: x", "http://x/hello HTTP/1.1",
 		"http://x/hello HTTP/1.1\r\nHost: x\r\nHost: x"]) {
 		const other = dial(s.addr)
 		other.write(`GET ${head}\r\n\r\n`)
@@ -668,8 +668,9 @@ test "https" {
 	const t = server()
 	t.tls = s.tls
 	const next = async t.serve(app)
-	assert c.send(new Request("GET", `https://localhost${t.addr.slice(indexOf(t.addr, ":"), t.addr.length)}/hello`))
-		.body.text() == "hello" && c.h2.length == 1
+	assert c.send(new Request("GET",
+		`https://localhost${t.addr.slice(indexOf(t.addr, ":"), t.addr.length)}/hello`)).body.text() == "hello"
+		&& c.h2.length == 1
 	t.close()
 	await next
 }
@@ -696,8 +697,8 @@ test "close returns at once, though an HTTP/2 peer reads none of a response" {
 	}
 	s.close()
 	// A stream opened after, refused, though the GOAWAY waits on the write.
-	const after: [string, string][] = [[":method", "GET"], [":scheme", "https"], [":authority", "x"],
-		[":path", "/late"]]
+	const after: [string,
+		string][] = [[":method", "GET"], [":scheme", "https"], [":authority", "x"], [":path", "/late"]]
 	t.write(frame(1, 5, 3, new Encoder().encode(after)))
 	while (t.read(1 << 16) != null) {}
 	t.close()
@@ -784,7 +785,8 @@ test "an HTTP/2 request expecting 100 Continue has it before a response that str
 	const s = h2server()
 	const job = async s.serve(app)
 	// The first HEADERS on the stream, as the body is held back for it.
-	assert h2head(s, [[":method", "POST"], [":scheme", "https"], [":path", "/echo"], [":authority", "localhost"],
+	assert h2head(s,
+		[[":method", "POST"], [":scheme", "https"], [":path", "/echo"], [":authority", "localhost"],
 		["expect", "100-continue"]]) == [[":status", "100"]]
 	s.close()
 	await job
@@ -793,8 +795,8 @@ test "an HTTP/2 request expecting 100 Continue has it before a response that str
 test "an HTTP/2 request has one Host, from :authority or else Host, and is malformed if they differ" {
 	const s = h2server()
 	const job = async s.serve(app)
-	const host = (more: [string, string][]) => h2head(s, [[":method", "GET"], [":scheme", "https"], [":path", "/host"],
-		...more])
+	const host = (more: [string,
+		string][]) => h2head(s, [[":method", "GET"], [":scheme", "https"], [":path", "/host"], ...more])
 	assert host([[":authority", "localhost"], ["host", "LocalHost"]])[1] == ["x-host", "localhost"]
 	assert host([["host", "localhost"]])[1] == ["x-host", "localhost"]
 	assert host([[":authority", "localhost"], ["host", "evil"]])[0] == [":status", "400"]
@@ -810,8 +812,8 @@ test "an HTTP/2 request's cookie fields are joined, however many fields come bef
 	const s = h2server()
 	s.maxHeaders = 1 << 22
 	const job = async s.serve(app)
-	const head: [string, string][] = [[":method", "GET"], [":scheme", "https"], [":path", "/hello"],
-		[":authority", "localhost"]]
+	const head: [string,
+		string][] = [[":method", "GET"], [":scheme", "https"], [":path", "/hello"], [":authority", "localhost"]]
 	for (const _ of 1 ... 8000) {
 		head.push(["a", ""])
 	}
@@ -833,8 +835,8 @@ test "timeouts past what the clock can count are waited out, not up at once" {
 	c.headerTimeout = maxOf[i64]()
 	c.idleTimeout = maxOf[i64]()
 	for (const _ of 1 ... 2) {
-		assert c.send(new Request("GET", `https://localhost${s.addr.slice(indexOf(s.addr, ":"), s.addr.length)}/hello`))
-			.body.text() == "hello"
+		assert c.send(new Request("GET",
+			`https://localhost${s.addr.slice(indexOf(s.addr, ":"), s.addr.length)}/hello`)).body.text() == "hello"
 	}
 	s.close()
 	await job

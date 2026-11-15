@@ -12,8 +12,10 @@
 //! Gregorian, locales or strftime's patterns, whose text depends on them, or zone abbreviations, which are ambiguous.
 
 import { indexOf, occurs, startsWith } from "./algo"
+
 import { J, M, T, Z, colon, comma, dot, greater, isAlphabetic, isAlphanumeric, isDigit, less, lf, minus, plus, slash,
 	space, t as lowerT, z as lowerZ, zero } from "./ascii"
+
 import { env, monotonic as mono, tz as localTz } from "../builtin/sys"
 import { open, readLink } from "./fs"
 import { maxOf, minOf } from "./limits"
@@ -37,8 +39,8 @@ export function formatDuration(d: i64): string {
 	const u = if (d < 0) 0 - (d as u64) else d as u64
 	const sign = if (d < 0) "-" else ""
 	if (u < 1_000_000_000) {
-		const [unit, size]: [string, u64] = if (u < 1_000) ["ns", 1] else if (u < 1_000_000) ["µs", 1_000]
-			else ["ms", 1_000_000]
+		const [unit, size]: [string,
+			u64] = if (u < 1_000) ["ns", 1] else if (u < 1_000_000) ["µs", 1_000] else ["ms", 1_000_000]
 		return if (u == 0) "0s" else `${sign}${decimal(u, size)}${unit}`
 	}
 	const [h, m] = [u / 3_600_000_000_000, u / 60_000_000_000 % 60]
@@ -60,7 +62,6 @@ function decimal(n: u64, size: u64): string {
 
 /// ns since a fixed point in the past, which nothing sets back or forward: for deadlines and elapsed times, not dates.
 export function monotonic(): i64 { return mono() }
-
 /// Parks the fiber for ns of monotonic().
 export function sleep(ns: i64) { bober_io_sleep(ns) }
 
@@ -100,10 +101,8 @@ export class Date {
 
 	/// Days since 1970-01-01, negative before.
 	days(): i64 { return daysOf(this.year, this.month, this.day) }
-
 	/// 1 for Monday to 7 for Sunday, as ISO 8601 numbers them.
 	weekday(): i32 { return weekdayOf(this.days()) }
-
 	/// The date n days later, or earlier for n < 0; traps past the years a Date spans.
 	addDays(n: i64): Date { return dateOf(this.days() + n) }
 
@@ -170,10 +169,7 @@ export class DateTime {
 }
 
 /// dt's seconds since 1970-01-01T00:00 on a wall clock.
-function localSeconds(dt: DateTime): i64 {
-	return dt.date.days() * 86400 + (secondOfDay(dt) as i64)
-}
-
+function localSeconds(dt: DateTime): i64 { return dt.date.days() * 86400 + (secondOfDay(dt) as i64) }
 function secondOfDay(dt: DateTime): i32 { return (dt.hour * 60 + dt.minute) * 60 + dt.second }
 
 /// How Zone.instant picks among the instants at which a wall clock reads a time: in a fold, where it is set back and
@@ -205,7 +201,6 @@ export class Zone {
 
 	/// Seconds east of UTC at instant t.
 	offset(t: i64): i32 { return this.offsetAt(secondsOf(t)) }
-
 	/// What a wall clock here reads at instant t.
 	civil(t: i64): DateTime { return civilAt(t, this.offset(t)) }
 
@@ -231,7 +226,8 @@ export class Zone {
 		}
 		const [r, early, late] = this.readings(local)
 		const t = if (r.length == 0) (if (pick == "earlier") early else late)
-			else if (pick == "later") r[r.length - 1] else r[0]
+			else if (pick == "later") r[r.length - 1]
+			else r[0]
 		return instantOf(t, dt.nanosecond as i64)
 	}
 
@@ -262,14 +258,17 @@ export class Zone {
 	/// The offset at s seconds since the epoch.
 	private offsetAt(s: i64): i32 {
 		const i = this.index(s)
-		return if (i == this.times.length - 1 && this.rule != null) this.rule!.offset(s) else if (i < 0) this.initial
+		return if (i == this.times.length - 1 && this.rule != null) this.rule!.offset(s)
+			else if (i < 0) this.initial
 			else this.offsets[i]
 	}
 
 	/// The first transition after s seconds since the epoch, or the largest i64 if none is.
 	private next(s: i64): i64 {
 		const i = this.index(s)
-		return if (i < this.times.length - 1) this.times[i + 1] else if (this.rule != null) this.rule!.next(s) else never
+		return if (i < this.times.length - 1) this.times[i + 1]
+			else if (this.rule != null) this.rule!.next(s)
+			else never
 	}
 
 	/// The index of the last transition by s seconds since the epoch, -1 before the first, by binary search without
@@ -328,7 +327,9 @@ export function local(): Zone {
 		const tz = localTz() ?? ":/etc/localtime"
 		const path = if (startsWith(tz, ":")) tz.slice(1, tz.length) else tz
 		try {
-			localZone = if (startsWith(path, "/")) tzif(zoneName(path), head(path)) else if (tz == "") utc else load(path)
+			localZone = if (startsWith(path, "/")) tzif(zoneName(path), head(path))
+				else if (tz == "") utc
+				else load(path)
 		} catch {
 			try {
 				localZone = posix(tz)
@@ -617,7 +618,6 @@ function number(s: string, from: i32, to: i32): i32 {
 // The calendar in days since 1970-01-01, after Neri and Schneider: days are counted in u32 from 82 400-year eras
 // before it, in years that start in March so that February's length matters last, and each step is a multiplication
 // and shift without branches. It is exact over the years -32 799 to 2 906 944, past those a Date spans.
-
 const eras: u32 = 82
 const yearShift: u32 = 400 * eras
 const dayShift: u32 = 719468 + 146097 * eras
@@ -652,14 +652,12 @@ function weekdayOf(days: i64): i32 { return ((days + (dayShift as i64) + 2) % 7 
 
 /// The latest instant, and the s of no transition.
 const never = maxOf[i64]()
-
 // Instants' span in s, and the ns of the instant ending each.
 const maxSeconds: i64 = 9_223_372_036
 const minSeconds: i64 = -9_223_372_037
 
 /// t's whole seconds since the epoch, rounded down.
 function secondsOf(t: i64): i64 { return floorDiv(t, second) }
-
 function floorDiv(a: i64, b: i64): i64 { return a / b - ((a % b < 0) as i64) }
 
 /// The instant s seconds and ns ns past the epoch, saturated at the ends of instants' span.
@@ -686,7 +684,6 @@ function civilAt(t: i64, offset: i32): DateTime {
 function sign(n: i64): i32 { return ((n > 0) as i32) - ((n < 0) as i32) }
 
 // The text of dates and times.
-
 /// v, at least 0 and of at most n digits, in n digits, 0s before it.
 function pad(v: i32, n: i32): string {
 	const s = `${v}`
@@ -700,7 +697,6 @@ function hms(s: i32, seconds: bool): string {
 }
 
 // RFC 8536's TZif files and POSIX's TZ rules.
-
 /// A TZ rule's offsets, east of UTC, and when DST starts and ends, in standard time and DST.
 class Rule {
 	std: i32
@@ -827,8 +823,9 @@ class TzScan {
 		const quoted = this.s.at(this.i) == less
 		const from = this.i + (quoted as i32)
 		this.i = from
-		while (this.i < this.s.length && (if (quoted) isAlphanumeric(this.s[this.i]) || this.s[this.i] == plus
-			|| this.s[this.i] == minus else isAlphabetic(this.s[this.i]))) {
+		while (this.i < this.s.length
+			&& (if (quoted) isAlphanumeric(this.s[this.i]) || this.s[this.i] == plus || this.s[this.i] == minus
+			else isAlphabetic(this.s[this.i]))) {
 			this.i++
 		}
 		if (this.i - from < 3 || quoted && this.s.at(this.i) != greater) {

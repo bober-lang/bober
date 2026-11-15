@@ -472,8 +472,8 @@ test "DATA or a head on a stream after the peer ended it resets it with STREAM_C
 	const t = raw(l)
 	const enc = new Encoder()
 	hold = true
-	t.write(frame(1, 5, 1, enc.encode(get("/wait"))) + frame(0, 0, 1, "x")
-		+ frame(1, 5, 3, enc.encode(get("/wait"))) + frame(1, 4, 3, enc.encode([["x-trailer", "1"]])))
+	t.write(frame(1, 5, 1, enc.encode(get("/wait"))) + frame(0, 0, 1, "x") + frame(1, 5, 3, enc.encode(get("/wait")))
+		+ frame(1, 4, 3, enc.encode([["x-trailer", "1"]])))
 	assert until(t, 3, 0, 1) && num(found, 0, 4) == 5 && until(t, 3, 0, 3) && num(found, 0, 4) == 5
 	release()
 	t.close()
@@ -901,8 +901,8 @@ test "a DATA that waits behind the connection's WINDOW_UPDATE is not reset, thou
 	const enc = new Encoder()
 	const post: Head = [[":method", "POST"], [":scheme", "https"], [":path", "/whole"], [":authority", "localhost"]]
 	// Frames to 4.5 MiB: /whole's 10 MiB, its request left open, go in three, the first filling the socket.
-	t.write(frame(4, 0, 0, fromBytes([0, 4, 1, 0, 0, 0, 0, 5, 0, 72, 0, 0]))
-		+ frame(8, 0, 0, fromBytes([64, 0, 0, 0])) + frame(1, 4, 1, enc.encode(post)))
+	t.write(frame(4, 0, 0, fromBytes([0, 4, 1, 0, 0, 0, 0, 5, 0, 72, 0, 0])) + frame(8, 0, 0, fromBytes([64, 0, 0, 0]))
+		+ frame(1, 4, 1, enc.encode(post)))
 	pause(100 * millisecond)
 	// 8 MiB on a stream reset free half the connection's window: its WINDOW_UPDATE goes between the first two frames.
 	let flood = frame(1, 5, 3, enc.encode(get("/hello"))) + frame(3, 0, 3, fromBytes([0, 0, 0, 8]))
@@ -1199,8 +1199,8 @@ test "an interim response that ends the stream, data after it, a Content-Length 
 	const low = new Encoder().encode([[":status", "099"]])
 	const switching = new Encoder().encode([[":status", "101"]])
 	for (const frames of [frame(1, 5, 1, head), frame(1, 4, 1, head) + frame(0, 1, 1, ""), frame(1, 5, 1, sized),
-		frame(1, 5, 1, asking), frame(1, 5, 1, long), frame(1, 5, 1, odd),
-		frame(1, 5, 1, low), frame(1, 4, 1, switching)]) {
+		frame(1, 5, 1, asking), frame(1, 5, 1, long), frame(1, 5, 1, odd), frame(1, 5, 1, low),
+		frame(1, 4, 1, switching)]) {
 		const l = net.listen("127.0.0.1:0")
 		const job = async peer(l, frames)
 		const [c, t] = connect(l)
@@ -1326,7 +1326,8 @@ test "a HEAD's response, a 204 or a 304 has no body, whatever its Content-Length
 			const l = net.listen("127.0.0.1:0")
 			const enc = new Encoder()
 			const early = frame(1, 4, 1, enc.encode([[":status", "103"], ["content-length", "7"]]))
-			const job = async peer(l, early + frame(1, 4, 1, enc.encode([[":status", status], ["content-length", "5"]]))
+			const job = async peer(l,
+				early + frame(1, 4, 1, enc.encode([[":status", status], ["content-length", "5"]]))
 				+ frame(0, 1, 1, sent))
 			const [c, t] = connect(l)
 			const head: Head = [[":method", method], [":scheme", "https"], [":path", "/"], [":authority", "localhost"]]
@@ -1485,8 +1486,8 @@ test "the connection's window opens again once half of what streams do not hold 
 	hold = true
 	const enc = new Encoder()
 	// 9 MiB held unread, 7 MiB read: never half of the whole window free, the window shut.
-	const streams: [i64, string, i32][] = [[1, "/wait", 256], [3, "/wait", 256], [5, "/wait", 64], [7, "/count", 256],
-		[9, "/count", 192]]
+	const streams: [i64, string,
+		i32][] = [[1, "/wait", 256], [3, "/wait", 256], [5, "/wait", 64], [7, "/count", 256], [9, "/count", 192]]
 	for (const [id, path, n] of streams) {
 		let frames = frame(1, 4, id, enc.encode(get(path)))
 		for (const i of 1 ... n) {

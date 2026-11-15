@@ -73,12 +73,10 @@ export class Type {
 	/// A param's default.
 	fallback: Type | null = null
 
-	constructor(kind: Kind) {
-		this.kind = kind
-	}
-
+	constructor(kind: Kind) { this.kind = kind }
 	/// A union's members, or this alone.
 	alternatives(): Type[] { return if (this.kind == "union") this.types else [this] }
+
 	/// The type its values are of: a param's constraint's, null if it has none; what a type set (4.9) extends; else
 	/// itself.
 	underlying(): Type | null {
@@ -92,7 +90,10 @@ export class Type {
 	/// Whether f holds for each alternative of its underlying type.
 	each(f: (m: Type) => bool): bool { return this.underlying()?.alternatives().every(f) ?? false }
 
-	isNumber(): bool { return this.each(m => m.kind == "int" || m.kind == "float" || m.kind == "literal" && m.base!.kind == "int") }
+	isNumber(): bool {
+		return this.each(m => m.kind == "int" || m.kind == "float" || m.kind == "literal" && m.base!.kind == "int")
+	}
+
 	isInt(): bool { return this.each(m => m.kind == "int" || m.kind == "literal" && m.base!.kind == "int") }
 	isString(): bool { return this.each(m => m.kind == "string" || m.kind == "literal" && m.base!.kind == "string") }
 	isOrdered(): bool { return this.each(m => m.isNumber() || m.isString()) }
@@ -136,9 +137,10 @@ export class Type {
 			case "literal": return this.base!.member(name, static)
 			case "string", "array": return this.methods()?.member(name, static)
 			case "fixed": return if (name == "length" && !static) I32 else null
-			case "tuple":
-				return if (static) null else if (name == "length" && !this.rest) I32
-					else if (name == "constructor") Type.function([], Null) else null
+			case "tuple": return if (static) null
+				else if (name == "length" && !this.rest) I32
+				else if (name == "constructor") Type.function([], Null)
+				else null
 			case "param": return this.underlying()?.member(name, static)
 			case "union":
 				const ts: Type[] = []
@@ -231,8 +233,8 @@ export class Type {
 				return true
 			case "function":
 				const r = s.base
-				if (t.kind != "function" || s.types.length < t.types.length || s.n > t.n
-					|| s.rest != t.rest || r != null && t.base != null && !r.fits(t.base!)) {
+				if (t.kind != "function" || s.types.length < t.types.length || s.n > t.n || s.rest != t.rest
+					|| r != null && t.base != null && !r.fits(t.base!)) {
 					return false
 				}
 				for (const i of 0 ... t.types.length - 1) {
@@ -241,7 +243,8 @@ export class Type {
 					}
 				}
 				return true
-			case "object", "class", "interface": return (t.kind == "object" || t.kind == "interface") && fitsRecursive(s, t)
+			case "object", "class",
+				"interface": return (t.kind == "object" || t.kind == "interface") && fitsRecursive(s, t)
 		}
 		return false
 	}
@@ -256,8 +259,10 @@ export class Type {
 		}
 		const x = bases(this)
 		const y = bases(b)
-		return if (x.fits(y)) y else if (y.fits(x)) x
-			else if (x.hasNull() != y.hasNull()) x.nonNull().join(y.nonNull())?.nullable() else null
+		return if (x.fits(y)) y
+			else if (y.fits(x)) x
+			else if (x.hasNull() != y.hasNull()) x.nonNull().join(y.nonNull())?.nullable()
+			else null
 	}
 
 	/// This with untyped constants in it as i32 and f64, and if literals, a literal as its base type; the literal types
@@ -293,7 +298,8 @@ export class Type {
 			case "array": return Type.array(f(this.params[0]))
 			case "fixed": return Type.fixed(f(this.base!), this.n)
 			case "async": return Type.async(f(this.base!))
-			case "literal": return if (this.params.length == 0) this else Type.literal("", this.base!, [f(this.params[0])])
+			case "literal": return if (this.params.length == 0) this
+				else Type.literal("", this.base!, [f(this.params[0])])
 			case "tuple": return Type.tuple(this.types.map(f), this.rest)
 			case "union": return Type.union(this.types.map(f))
 			case "object": return Type.object(this.fields.map(x => new Field(x.name, f(x.type), x.embedded, x.static)))
@@ -345,7 +351,8 @@ export class Type {
 	/// function h[T extends i8 | i16](x: T) {}   // error: a union constraint; name a type set
 	/// ```
 	instantiate(args: Type[]): Type {
-		if (this.kind == "function") { // rebuilt even for its own params, so the instance has none left to infer
+		if (this.kind == "function") {
+			// rebuilt even for its own params, so the instance has none left to infer
 			return Type.function(this.types.map(p => p.in(this, args)), this.base?.in(this, args), this.n, this.rest)
 		}
 		if (args.equals(this.params)) {
@@ -386,21 +393,21 @@ export class Type {
 				if (e != null) {
 					r!.unify(e, params, found)
 				}
-			case "object", "interface":
-				if (this.kind == "interface" && v.kind == "interface" && (v.generic == this.generic || v.generic == this)) {
-					unifyAll(this.parts(), v.parts(), params, found)
-				} else if (!unifying.some(k => k[0] == this && k[1] == v)) {
-					// by the members v has of this, and by v what this embeds, as v fits this by them, but not again within,
-					// as a member may be this
-					unifying.push([this, v])
-					for (const f of members(this)) {
-						const m = if (f.embedded) v else if (f.static) null else v.member(f.name)
-						if (m != null) {
-							f.type.unify(m, params, found)
-						}
+			case "object", "interface": if (this.kind == "interface" && v.kind == "interface"
+				&& (v.generic == this.generic || v.generic == this)) {
+				unifyAll(this.parts(), v.parts(), params, found)
+			} else if (!unifying.some(k => k[0] == this && k[1] == v)) {
+				// by the members v has of this, and by v what this embeds, as v fits this by them, but not again within,
+				// as a member may be this
+				unifying.push([this, v])
+				for (const f of members(this)) {
+					const m = if (f.embedded) v else if (f.static) null else v.member(f.name)
+					if (m != null) {
+						f.type.unify(m, params, found)
 					}
-					unifying.pop()
 				}
+				unifying.pop()
+			}
 			case "union":
 				const bare = this.types.filter(m => m.kind == "param")
 				const open = if (bare.length > 0) bare else this.types.filter(m => m.mentions(params))
@@ -452,6 +459,7 @@ export class Type {
 
 	/// The type set that extends t.
 	static interface(t: Type): Type { return intern({ ...new Type("interface"), base: t }) }
+
 	/// ## Literal types
 	///
 	/// A string, `true`, `false` or `null` literal in a type denotes the type holding only that value, and so does the
@@ -482,10 +490,12 @@ export class Type {
 	static literal(text: string, base: Type, params: Type[] = []): Type {
 		return intern({ ...new Type("literal"), text: text, base: base, params: params })
 	}
+
 	/// A param standing for member of param p, or for p itself where member is "", constrained by c (4.11): made once.
 	static derived(p: Type, member: string, c: Type | null): Type {
 		return intern({ ...new Type("param"), text: member, params: [p], base: c })
 	}
+
 	/// An array of t.
 	///
 	/// ## Arrays and tuples
@@ -531,7 +541,6 @@ export class Type {
 	static async(t: Type): Type { return intern({ ...new Type("async"), base: t }) }
 	static fixed(t: Type, len: i32): Type { return intern({ ...new Type("fixed"), base: t, n: len }) }
 	static tuple(ts: Type[], rest: bool): Type { return intern({ ...new Type("tuple"), types: ts, rest: rest }) }
-
 	/// An object type of fields.
 	///
 	/// ## Objects and interfaces
@@ -561,7 +570,7 @@ export class Type {
 	///
 	/// ```
 	/// interface ReadWriter { ...Reader, ...Writer }
-	/// class File implements ReadWriter {} 
+	/// class File implements ReadWriter {}
 	/// ```
 	///
 	/// ## Classes
@@ -704,7 +713,9 @@ export let Array: Type = new Type("array")
 export let basics: Type[] = [Bool, I8, I16, I32, I64, U8, U16, U32, U64, F32, F64, String, String16, String32]
 
 /// The param that param t narrows, through those narrowing it, else t (4.11).
-function origin(t: Type): Type { return if (t.kind == "param" && t.params.length > 0 && t.text == "") origin(t.params[0]) else t }
+function origin(t: Type): Type {
+	return if (t.kind == "param" && t.params.length > 0 && t.text == "") origin(t.params[0]) else t
+}
 
 /// Whether `instanceof t` tests a value of type l by what it spells: l a string and t string literal types (6.5).
 export function spells(l: Type, t: Type): bool {
@@ -726,7 +737,9 @@ export function memberOf(s: Type, t: Type): bool {
 /// The T of p, a `T[readonly]` param: a function's type param of its own, constrained by `T[] | string`, which no
 /// constraint written is, as it is a union (4.9); else null.
 export function readonlyOf(p: Type): Type | null {
-	return if (p.kind == "param" && p.base?.kind == "union") p.base!.types.find(m => m.kind == "array")?.params[0] ?? null else null
+	return if (p.kind == "param"
+		&& p.base?.kind == "union") p.base!.types.find(m => m.kind == "array")?.params[0] ?? null
+		else null
 }
 
 /// The element type of t as a `T[readonly]` argument: an array's or fixed array's, a string's u8, or a `T[readonly]`'s
@@ -751,11 +764,9 @@ function among(t: Type, ts: Type[]): bool {
 let fill = (t: Type) => {}
 
 export function fillWith(f: (t: Type) => void) { fill = f }
-
 /// The members of t, its class or interface filled in first if it is not yet, and an instance's taken from its
 /// generic's where those have grown or been typed since they were last taken.
 export function members(t: Type): Field[] { return filled(t).fields }
-
 /// The type set (4.9) interface t holds, null if it holds members, or if t is not an interface.
 export function setOf(t: Type): Type | null { return if (t.kind == "interface") filled(t).base else null }
 
@@ -767,7 +778,8 @@ function filled(t: Type): Type {
 	while (tried.length > n) {
 		fitted.delete(tried.pop())
 	}
-	if (g != t && (t.fields.length != g.fields.length || t.base == null && g.base != null || behind(t.fields, g.fields))) {
+	if (g != t
+		&& (t.fields.length != g.fields.length || t.base == null && g.base != null || behind(t.fields, g.fields))) {
 		t.fields = g.fields.map(f => new Field(f.name, f.type.in(g, t.params), f.embedded, f.static))
 		t.base = g.base?.in(g, t.params)
 	}
@@ -836,8 +848,8 @@ function inInterface(s: Type, t: Type): bool {
 			else if (m.rest && m.types.length == 1 && m.types[0].kind == "array") m.types[0].params[0]
 			else null
 		switch (m.kind) {
-			case "object",
-				"interface": if (s.fits(m) && members(s).every(f => f.static || f.type.kind == "function" || f.type.fits(t))) {
+			case "object", "interface": if (s.fits(m)
+				&& members(s).every(f => f.static || f.type.kind == "function" || f.type.fits(t))) {
 				return true
 			}
 			case "array": if (s.kind == "array" && s.params[0].fits(e!)
@@ -853,7 +865,9 @@ function inInterface(s: Type, t: Type): bool {
 }
 
 /// The types t holds that have a zero value (5.1), as a type set.
-function zeros(t: Type): Type { return Type.interface(Type.union((t.underlying() ?? t).alternatives().filter(m => m.hasZero()))) }
+function zeros(t: Type): Type {
+	return Type.interface(Type.union((t.underlying() ?? t).alternatives().filter(m => m.hasZero())))
+}
 
 /// t with literals as their base types.
 export function bases(t: Type): Type {
@@ -924,8 +938,7 @@ class Structure {
 		if (a.generic != null || b.generic != null) {
 			return a.generic == b.generic && a.params.equals(b.params)
 		}
-		return a.kind == b.kind && a.text == b.text && a.base == b.base && a.n == b.n && a.signed == b.signed && a.rest == b.rest
-			&& a.params.equals(b.params)
-			&& a.types.equals(b.types) && a.fields.equals(b.fields)
+		return a.kind == b.kind && a.text == b.text && a.base == b.base && a.n == b.n && a.signed == b.signed
+			&& a.rest == b.rest && a.params.equals(b.params) && a.types.equals(b.types) && a.fields.equals(b.fields)
 	}
 }

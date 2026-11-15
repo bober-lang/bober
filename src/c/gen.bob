@@ -89,12 +89,9 @@ export class Gen implements abi.Frame {
 	private scratches = 0
 
 	constructor(b: Backend) { this.b = b }
-
 	fn(): Func { return this.f! }
-
 	/// The back end type t is held as.
 	ty(t: Type): Held { return abi.held(this.b, t) }
-
 	/// A private constant of the bytes s.
 	bytes(s: string): Value { return this.b.constant(this.b.constBytes(s)) }
 
@@ -125,7 +122,6 @@ export class Gen implements abi.Frame {
 
 	/// An aggregate held as its coerced type is aligned to 8, as the registers it is loaded for are.
 	alloca(t: Type, held: Held): Value { return this.temp(t, held, if (held == 0) 1 else 8).v }
-
 	// Blocks
 	/// A new block of the function being defined, which start opens.
 	label(): Block { return this.b.block(this.fn().v) }
@@ -235,7 +231,6 @@ export class Gen implements abi.Frame {
 
 	/// Loads a t from addr, a volatile one as such.
 	private load(t: Type, addr: Value): Value { return this.b.load(this.ty(t), addr, isVolatile(t)) }
-
 	copy(dst: Val, src: Val, size: i64) { this.b.copy(this.addr(dst), this.addr(src), size) }
 	zero(dst: Val, size: i64) { this.b.zero(this.addr(dst), size) }
 
@@ -279,10 +274,12 @@ export class Gen implements abi.Frame {
 			return new Val(t, this.b.cast("zext", this.cond(v), this.b.int(8)))
 		}
 		if (v.known == "int" && exact(v, t)) {
-			return if (t.kind == "float") float(if (isUnsigned(s)) (v.n as u64) as f64 else v.n as f64, t) else int(v.n, t)
+			return if (t.kind == "float") float(if (isUnsigned(s)) (v.n as u64) as f64 else v.n as f64, t)
+				else int(v.n, t)
 		}
 		if (v.known == "float" && exact(v, t)) {
-			return if (t.kind == "float") float(v.x, t) else int(if (isUnsigned(t)) (v.x as u64) as i64 else v.x as i64, t)
+			return if (t.kind == "float") float(v.x, t)
+				else int(if (isUnsigned(t)) (v.x as u64) as i64 else v.x as i64, t)
 		}
 		if (isInt(s) && t.kind == "int" && s.size == t.size || v.known == "addr" && t.size == 8) {
 			return retype(v, t)
@@ -398,7 +395,8 @@ export class Gen implements abi.Frame {
 			return int((a.off - b.off) / size, Long)
 		}
 		const i64 = this.b.int(64)
-		const d = this.b.binary("sub", this.b.cast("ptrtoint", this.op(a), i64), this.b.cast("ptrtoint", this.op(b), i64))
+		const d = this.b.binary("sub", this.b.cast("ptrtoint", this.op(a), i64),
+			this.b.cast("ptrtoint", this.op(b), i64))
 		return new Val(Long, this.b.binary("sdiv", d, this.b.constInt(i64, size)))
 	}
 
@@ -500,7 +498,9 @@ export class Gen implements abi.Frame {
 	ret(v: Val | null) {
 		const f = this.fn()
 		const r = f.ty.result
-		const x = if (v == null || r.kind == "void") 0 else if (r instanceof Record) this.addr(v) else this.op(this.cast(this.rv(v), r))
+		const x = if (v == null || r.kind == "void") 0
+			else if (r instanceof Record) this.addr(v)
+			else this.op(this.cast(this.rv(v), r))
 		this.end(() => abi.ret(this.b, this, f.v, f.ty, x))
 	}
 
@@ -586,7 +586,6 @@ export class Gen implements abi.Frame {
 	/// The address of the va_list ap, which but on Apple arm64 is an array and as a parameter has decayed
 	/// to a pointer to it.
 	private list(ap: Val): Value { return if (abi.vaList instanceof Arr) this.op(this.rv(ap)) else this.addr(ap) }
-
 	vaStart(ap: Val) { this.b.vaStart(this.list(ap)) }
 
 	vaCopy(to: Val, from: Val) {
@@ -690,7 +689,8 @@ function floatPredicate(op: string): FCmp {
 /// Whether folding v's value, kept in 64 bits, as a t is exact: not as a long double, which the back end
 /// folds, nor where an unsigned value past 2^63 is or becomes 128 bits wide.
 function exact(v: Val, t: Type): bool {
-	return !(t.kind == "float" && t.size == 16 || isUnsigned(v.ty) && v.n < 0 && (t.size == 16 || v.ty.size == 16 && t.kind == "float"))
+	return !(t.kind == "float" && t.size == 16
+		|| isUnsigned(v.ty) && v.n < 0 && (t.size == 16 || v.ty.size == 16 && t.kind == "float"))
 }
 
 function foldInt(op: string, a: i64, b: i64, unsigned: bool): i64 {

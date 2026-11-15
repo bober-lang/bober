@@ -2,8 +2,10 @@ import { indexOf } from "../algo"
 import { inf, isNaN, nan } from "../math"
 import { ParseError, utf8 } from "../string"
 import * as encoding from "../encoding"
+
 import { Alias, boolOf, decode, decodeAll, documents, emit, encode, EncodeError, events, floatOf, intOf, kindOf, Map,
 	Mapping, maxDepth, maxExpansion, Name, Node, OmitEmpty, Rest, Scalar, Seq, Skip } from "./yaml"
+
 import { Unknown } from "./json"
 
 function root(s: string): Node throws ParseError { return documents(s)[0].root }
@@ -46,15 +48,17 @@ test "tags resolve through %TAG" {
 
 test "kindOf reads the core schema" {
 	const kinds = [["", "null"], ["~", "null"], ["NULL", "null"], ["nULL", "str"], ["True", "bool"], ["yes", "str"],
-		["0", "int"], ["-12", "int"], ["+12", "int"], ["0o17", "int"], ["0x1F", "int"], ["0b1", "str"], ["1_000", "str"],
-		["1.5", "float"], [".5", "float"], ["1.", "float"], ["1e3", "float"], ["-1.5E-3", "float"], [".inf", "float"],
-		["-.Inf", "float"], [".NaN", "float"], ["e3", "str"], ["1.2.3", "str"], ["0x", "str"], ["-x", "str"]]
+		["0", "int"], ["-12", "int"], ["+12", "int"], ["0o17", "int"], ["0x1F", "int"], ["0b1", "str"],
+		["1_000", "str"], ["1.5", "float"], [".5", "float"], ["1.", "float"], ["1e3", "float"], ["-1.5E-3", "float"],
+		[".inf", "float"], ["-.Inf", "float"], [".NaN", "float"], ["e3", "str"], ["1.2.3", "str"], ["0x", "str"],
+		["-x", "str"]]
 	for (const [text, kind] of kinds) {
 		assert kindOf(scalar(`--- ${text}`)) == kind
 	}
 	assert kindOf(scalar("'1'")) == "str" && kindOf(scalar("!!int '1'")) == "int" && kindOf(scalar("!!str 1")) == "str"
 	assert kindOf(scalar("!!float 1")) == "float" && kindOf(scalar("!x 1")) == "str"
-	assert !boolOf(scalar("FALSE")) && boolOf(scalar("!!bool true")) && boolOf(scalar("x")) throws new ParseError("syntax", 0)
+	assert !boolOf(scalar("FALSE")) && boolOf(scalar("!!bool true"))
+		&& boolOf(scalar("x")) throws new ParseError("syntax", 0)
 }
 
 test "core tags fit their nodes in documents" {
@@ -180,7 +184,8 @@ test "fuzz regressions" {
 	// A comma on the line after a ? or props ends their item, as after a space.
 	assert events("{?\n,}") == events("{? ,}") && events("[!t\n,]") == events("[!t ,]")
 	// A block scalar ends its key's line, so a flow collection on the next may be a key.
-	assert events("k: |\n[a]: b") == "+STR\n+DOC\n+MAP\n=VAL :k\n=VAL |\n+SEQ []\n=VAL :a\n-SEQ\n=VAL :b\n-MAP\n-DOC\n-STR\n"
+	assert events("k: |\n[a]: b")
+		== "+STR\n+DOC\n+MAP\n=VAL :k\n=VAL |\n+SEQ []\n=VAL :a\n-SEQ\n=VAL :b\n-MAP\n-DOC\n-STR\n"
 	// Document markers are three of one kind; a mix is a plain scalar.
 	assert events("-.-") == "+STR\n+DOC\n=VAL :-.-\n-DOC\n-STR\n"
 	// Only a comment may follow a block scalar header on its line.
@@ -204,7 +209,8 @@ test "fuzz regressions" {
 	// A verbatim tag cut short by a space is too short to hold its <>.
 	assert events("!< x>") throws new ParseError("syntax", 0)
 	// Props on an explicit value's line, before a :, are an empty key's, as after a -.
-	assert events("? k\n: &a !t : v") == "+STR\n+DOC\n+MAP\n=VAL :k\n+MAP\n=VAL &a <!t> :\n=VAL :v\n-MAP\n-MAP\n-DOC\n-STR\n"
+	assert events("? k\n: &a !t : v")
+		== "+STR\n+DOC\n+MAP\n=VAL :k\n+MAP\n=VAL &a <!t> :\n=VAL :v\n-MAP\n-MAP\n-DOC\n-STR\n"
 }
 
 class Point {
@@ -431,7 +437,8 @@ test "encode writes block YAML" {
 	s.tags = ["a"]
 	c.server = s
 	c.points = [new Point(), new Point()]
-	assert encode(c) == `title: demo
+	assert encode(c)
+		== `title: demo
 mode: fast
 origin:
   x: 0
@@ -461,18 +468,16 @@ matrix:
 }
 
 test "encode quotes what would read back otherwise" {
-	const cases: [string, string][] = [
-		["plain", "plain"], ["é ü", "é ü"], ["it's", "it's"], ["a#b", "a#b"], ["-1x", "-1x"], ["[a]x", "'[a]x'"],
-		["null", "'null'"], ["~", "'~'"], ["true", "'true'"], ["False", "'False'"], ["1", "'1'"], ["-1e3", "'-1e3'"],
-		[".inf", "'.inf'"], ["0x1F", "'0x1F'"], ["", "''"], ["- a", "'- a'"], ["-", "'-'"], ["a: b", "'a: b'"],
-		["a #b", "'a #b'"], [" a", "' a'"], ["a ", "'a '"], ["a:", "'a:'"], ["#x", "'#x'"], ["'x", "'''x'"],
-		["&a", "'&a'"], ["*a", "'*a'"], ["!t", "'!t'"], ["%x", "'%x'"], ["@x", "'@x'"], ["`x", "'`x'"],
-		["? x", "'? x'"], [": x", "': x'"], ["---", "'---'"], ["...", "'...'"], ["x\ty", "'x\ty'"],
+	const cases: [string, string][] = [["plain", "plain"], ["é ü", "é ü"], ["it's", "it's"], ["a#b", "a#b"],
+		["-1x", "-1x"], ["[a]x", "'[a]x'"], ["null", "'null'"], ["~", "'~'"], ["true", "'true'"], ["False", "'False'"],
+		["1", "'1'"], ["-1e3", "'-1e3'"], [".inf", "'.inf'"], ["0x1F", "'0x1F'"], ["", "''"], ["- a", "'- a'"],
+		["-", "'-'"], ["a: b", "'a: b'"], ["a #b", "'a #b'"], [" a", "' a'"], ["a ", "'a '"], ["a:", "'a:'"],
+		["#x", "'#x'"], ["'x", "'''x'"], ["&a", "'&a'"], ["*a", "'*a'"], ["!t", "'!t'"], ["%x", "'%x'"], ["@x", "'@x'"],
+		["`x", "'`x'"], ["? x", "'? x'"], [": x", "': x'"], ["---", "'---'"], ["...", "'...'"], ["x\ty", "'x\ty'"],
 		["\x01", "\"\\x01\""], ["a" + utf8(0x2028) + "b", "\"a\\Lb\""], [utf8(0x85), "\"\\N\""],
 		[utf8(0xfeff), "\"\\uFEFF\""], ["\x7f", "\"\\x7F\""], ["a\\b\"c", "a\\b\"c"], ["'\"", "'''\"'"],
 		["a\nb", "|-\n  a\n  b"], ["a\n", "|\n  a"], ["a\n\n", "|+\n  a\n"], ["\na", "|-\n\n  a"],
-		[" a\nb", "\" a\\nb\""], ["a \nb", "\"a \\nb\""], ["\n\n", "\"\\n\\n\""], ["a\r\nb", "\"a\\r\\nb\""],
-	]
+		[" a\nb", "\" a\\nb\""], ["a \nb", "\"a \\nb\""], ["\n\n", "\"\\n\\n\""], ["a\r\nb", "\"a\\r\\nb\""]]
 	for (const [v, want] of cases) {
 		const t = new Text()
 		t.v = v
@@ -498,7 +503,8 @@ c: !<tag:example.com,2000:a> v
 --- &r
 - !!binary x
 `
-	assert emit(documents(src)) == `a: &x !t
+	assert emit(documents(src))
+		== `a: &x !t
   - 1
 b: *x
 ? - k

@@ -124,7 +124,7 @@ D [0-9][0-9_]*
 %%
 
 static const int ender[] = {IDENT, INT, FLOAT, STR, TPL, TEND, ')', ']', '}', '!', INC, DEC, THIS, NUL, TRUE, FALSE, -1};
-static const int joiner[] = {')', ']', '}', ',', '.', ELLIPSIS, QDOT, ARROW, '=', ASSIGNOP, QQ, OROR, ANDAND,
+static const int joiner[] = {')', ']', '}', ',', '.', QDOT, ARROW, '=', ASSIGNOP, QQ, OROR, ANDAND,
   CMP, INSTANCEOF, '|', '^', '&', SHL, SHR, '+', '-', '*', '/', '%', POW,
   ELSE, CATCH, FINALLY, 0, -1};
 
