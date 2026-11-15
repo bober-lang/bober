@@ -5,6 +5,7 @@ import { LLVM } from "./backend/llvm"
 import { CompileError } from "./error"
 import { lower } from "./lower"
 import { mono } from "./mono"
+import { endsWith } from "../std/algo"
 import { appendFile, mkdirAll } from "../std/fs"
 import * as process from "../std/process"
 import { ld, runtime } from "./bober"
@@ -416,8 +417,30 @@ test "identity" {
 	assert !same
 }
 `, "", true) == `{"values":"ok","identity":"ok"}
+[]
 exit 0
 `
+}
+
+test "the tests' report is followed by the regular files they read, null if they may depend on more" {
+	writeFile(`${dir}/read.txt`, "x")
+	const src = `import { readFile, writeFile } from "../../std/fs"
+import { env } from "../../std/process"
+import { bober_self } from "../../src/rt.h"
+import { rand } from "stdlib.h"
+import { strlen } from "string.h" @Deterministic
+
+test "reads" { assert readFile("${dir}/read.txt") == "x" && env("HOME") == null }
+test "pure" {
+	bober_self()
+	assert strlen("ab") == 2
+}
+`
+	assert endsWith(run("reads", src, "", true), `read.txt"]\nexit 0\n`)
+	for (const t of [`test "calls" { rand() }`, `test "takes" { assert [rand].length == 1 }`,
+		`test "writes" { writeFile("${dir}/written.txt", "y") }`]) {
+		assert endsWith(run("reads", src + t, "", true), "}\nnull\nexit 0\n")
+	}
 }
 
 test "a type's and its fields' doc comments, by reflection" {

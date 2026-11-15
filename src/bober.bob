@@ -13,7 +13,7 @@
 //! can catch. *implementation-defined* behavior is chosen by the implementation; a program shall not depend on
 //! implementation-defined behavior.
 
-import { endsWith, indexOf, lastIndexOf, sortBy, startsWith } from "../std/algo"
+import { endsWith, indexOf, lastIndexOf, sortBy, startsWith, unique } from "../std/algo"
 import { fromCString } from "../std/c"
 import { Keys, Rest, Unknown, decode as decodeJson, encode, quoted } from "../std/encoding/json"
 import * as yaml from "../std/encoding/yaml"
@@ -24,7 +24,7 @@ import { HashMap } from "../std/collections/hashmap"
 import { fnv } from "../std/hash"
 import { File, stderr, stdin, stdout } from "../std/io"
 import { arch, os } from "../std/os"
-import { ParseError, codePoint, split, trim, utf8 } from "../std/string"
+import { ParseError, codePoint, replace, split, trim, utf8 } from "../std/string"
 import { abi, signatures, write } from "./bc/file"
 import { Program } from "./bc/program"
 import { show } from "./bc/show"
@@ -32,7 +32,7 @@ import { glue, includesOf, sysroot } from "./c/bind"
 import { link, object } from "./c/bobcc"
 import { doc, spec } from "./doc"
 import { Options, emit, entry, learn } from "./emit"
-import { check, normal } from "./check"
+import { check, lowered as always, normal } from "./check"
 import { CompileError } from "./error"
 import { formatFile } from "./format"
 import { Backend } from "./backend/backend"
@@ -59,6 +59,7 @@ import { CLib, Package, dir, home, load, nearest, out } from "./pkg"
 import { notice, update, version } from "./update"
 import { wasm } from "./wasm"
 import * as process from "../std/process"
+import { setenv } from "stdlib.h"
 import { chdir, getcwd, getpid, isatty, link as hardLink } from "unistd.h"
 
 /// What a command line gives bober, spelled as a C compiler's: these options anywhere on it, a command's after the
@@ -441,23 +442,70 @@ function yamlOf(report: string): string {
 	}
 }
 
-/// Builds the program of main with its tests and runs them with args: its exit status, and its report, the JSON object
-/// src/rt.c prints, ended by the exit status if a crash cut it off, or else what failed as a JSON string.
+/// The report of a program's tests kept (runTests), by the code they ran and their args, while the files they read
+/// are as hashed.
+class TestCache {
+	code = ""
+	report = ""
+	files: [string, string][] = []
+}
+
+/// Builds the program of main with its tests and runs them with args, unless their report is kept: its exit status,
+/// and its report, the JSON object src/rt.c prints, ended by the exit status if a crash cut it off, or else what failed
+/// as a JSON string.
 function runTests(main: string, args: string[], f: Compile): [i32, string] {
 	try {
 		const out = `${dir}/${name(main)}.test.log`
-		const status = process.run([...build(main, true, f, true), ...args], out)
-		const report = trim(readFile(out))
-		// A crash cuts the report off after the key of the test it was in.
+		const cmd = [...build(main, true, f, true), ...args]
+		const flat = replace(normal(main), "/", "_")
+		const file = `${dir}/kept/${flat}`
+		const code = if (built == "") "" else `${built} ${args.map(quoted).join(" ")}`
+		try {
+			const k = decodeJson[TestCache](readFile(file))
+			if (code != "" && k.code == code && k.files.every(x => hashOf(x[0]) == x[1])) {
+				return [0, k.report]
+			}
+		} catch (e: IoError | ParseError) {}
+		const tmp = `${dir}/tmp/${flat}`
+		if (exists(tmp)) {
+			removeAll(tmp)
+		}
+		mkdirAll(tmp)
+		setenv("BOBER_TMP", tmp, 1)
+		const status = process.run(cmd, out)
+		// The report, which a crash cuts off after the key of the test it was in, then the files the tests read.
+		const text = trim(readFile(out))
+		const nl = indexOf(text, "\n")
+		const report = if (nl < 0) text else text.slice(0, nl)
 		for (const r of [report, `${report}${quoted(`exit ${status}`)}}`]) {
 			try {
 				decodeJson[Keys](r)
+				const reads = text.slice(nl + 1, text.length)
+				if (status == 0 && code != "" && nl >= 0 && reads != "null") {
+					const k = new TestCache()
+					k.code = code
+					k.report = r
+					const files = decodeJson[string[]](reads)
+					sortBy(files, (a, b) => a < b)
+					k.files = unique(files).map(x => [x, hashOf(x)])
+					mkdirAll(`${dir}/kept`)
+					save(file, encode(k))
+				}
 				return [status, r]
 			} catch (e: ParseError) {}
 		}
-		return [if (status == 0) 1 else status, quoted(trim(`${report}\nexit ${status}`))]
+		return [if (status == 0) 1 else status, quoted(trim(`${text}\nexit ${status}`))]
 	} catch (e: CompileError | IoError) {
 		return [1, quoted(if (e instanceof IoError) e.message() else e.msg)]
+	}
+}
+
+/// The hash of the bytes of the file at path, "" if there is none.
+function hashOf(path: string): string {
+	try {
+		return `${fnv(readFile(path))}`
+	} catch (e: IoError) {
+		return ""
 	}
 }
 
@@ -482,12 +530,14 @@ function hasTests(path: string): bool {
 /// named with the program's version, run by the C library's loader where it is the sysroot's, the image as image has
 /// it if pin. Throws the errors, or what failed, as a CompileError or IoError.
 export function build(main: string, tests: bool, f: Compile, pin: bool): string[] {
+	built = ""
 	if (f.wasm) {
 		return toWasm(main, tests, f.headers.I)
 	}
 	const dyn = !f.O2 && (!f.O1 || f.O0)
 	const p = lowered(if (f.release || dyn) [main] else world(main), f.headers.I)
 	const m = p.module(normal(main))
+	built = if (tests) code(p, m, f.headers.I) else ""
 	if (!f.release) {
 		const o = { main: -1, tests: false, dyn: dyn }
 		if (!o.dyn) {
@@ -517,6 +567,31 @@ export function build(main: string, tests: bool, f: Compile, pin: bool): string[
 	whole.emit(`${exe}.o`, false)
 	ld([`${exe}.o`, ...files], exe)
 	return [exe]
+}
+
+/// The code of the program build built last, natively, by which its tests' results are kept (runTests); "" if none.
+let built = ""
+
+/// What the tests of p's module main run, as any -O compiles them: the bytecode of main, of the modules it imports
+/// and of builtin/'s every program holds, however many more -O lowers, which this fills in, with their C's bindings,
+/// and the bytes of the files they link.
+function code(p: Program, main: i32, includes: string[]): string {
+	const ms = [main, ...always.map(b => p.module(b))]
+	let i = 0
+	while (i < ms.length) {
+		ms.push(...p.modules[ms[i]].deps.filter(d => !ms.includes(d)))
+		i++
+	}
+	const compiler = compilerId()
+	// An archive by when it was written, as image has it, as it may be large.
+	const hashes = [`${compiler}`, ...linked(p, ms, true, includes)[0].map(f => if (endsWith(f, ".a"))
+		`${stat(f).modified}.${stat(f).size}` else `${fnv(readFile(f))}`)]
+	for (const m of ms) {
+		const path = p.modules[m].path
+		p.modules[m].bc = if (p.modules[m].bc != "") p.modules[m].bc else write(p, m, compiler)
+		hashes.push(`${path} ${fnv(p.modules[m].bc + (bound.get(path)?.bytes(path) ?? ""))}`)
+	}
+	return `${fnv(hashes.join("\n"))}`
 }
 
 /// Compiles the program of main into file, by default build/<name>.wasm, or with tests build/<name>.test.wasm,
