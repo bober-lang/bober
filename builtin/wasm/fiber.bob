@@ -1,0 +1,124 @@
+//! builtin/fiber.bob for WebAssembly GC (src/wasm.bob), whose fibers the JS host runs (builtin/wasm/host.mjs).
+
+import { trap } from "./mem"
+
+/// What a call threw, its box (src/wasm.bob), for each await of its future to throw again.
+class Thrown {
+	box: i32 | null = null
+}
+
+/// Calls f, keeping what it throws in into; whether it threw. An intrinsic (src/wasm.bob).
+function catching(f: () => null, into: Thrown): bool
+/// Throws what from holds, where it was first thrown. An intrinsic (src/wasm.bob).
+function rethrow(from: Thrown)
+/// The host's, as src/rt.h's: runs f on a new fiber at once, and once that parks, the caller first.
+function bober_fiber(f: () => null)
+function bober_self(): u64
+function bober_park()
+function bober_wake(f: u64)
+
+/// The future of a call, an `async T`: once done, its result or what it threw.
+export class Future[T] {
+	done = false
+	result: T[] = []
+	thrown: Thrown | null = null
+	/// Whether a race took it.
+	taken = false
+	/// The fibers parked awaiting it.
+	waiters: u64[] = []
+}
+
+/// Runs f on a new fiber at once, until it parks: f's future.
+export function start[T](f: () => T): Future[T] {
+	const fut = new Future[T]()
+	bober_fiber(() => {
+		const into = new Thrown()
+		if (catching(() => {
+			fut.result.push(f())
+		}, into)) {
+			fut.thrown = into
+		}
+		fut.done = true
+		for (const w of fut.waiters) {
+			bober_wake(w)
+		}
+	})
+	return fut
+}
+
+/// What fibers wait on for a change.
+export class Signal {
+	private waiters: u64[] = []
+
+	/// Parks the caller until the next wake.
+	wait() {
+		this.waiters.push(bober_self())
+		bober_park()
+	}
+
+	/// Readies all waiting.
+	wake() {
+		const w = this.waiters
+		this.waiters = []
+		for (const f of w) {
+			bober_wake(f)
+		}
+	}
+}
+
+/// Parks until fut is done: its result, or throws what its call threw.
+export function wait[T](fut: Future[T]): T {
+	while (!fut.done) {
+		fut.waiters.push(bober_self())
+		bober_park()
+	}
+	if (fut.thrown != null) {
+		rethrow(fut.thrown!)
+	}
+	return fut.result[0]
+}
+
+/// Parks until a future of fs no race took is done, and takes the lowest such: its index and result, or throws what its
+/// call threw.
+export function race[T](fs: Future[T][]): [i32, T] {
+	const i = pick(fs)
+	return [i, wait(fs[i])]
+}
+
+/// What a race reads and marks of a future, whatever its result.
+interface Raced {
+	done: bool
+	taken: bool
+	waiters: u64[]
+}
+
+/// Parks until a future of fs no race took is done, and takes the lowest such: its index. Of futures of several types
+/// as a union of them, which src/lower.bob races so.
+export function pick[F extends Raced](fs: F[]): i32 {
+	const self = bober_self()
+	while (true) {
+		for (const i of 0 ... fs.length - 1) {
+			if (fs[i].done && !fs[i].taken) {
+				fs[i].taken = true
+				return i
+			}
+		}
+		// Each done is taken by now.
+		if (fs.every(f => f.done)) {
+			trap("a race of only taken futures")
+		}
+		for (const f of fs) {
+			if (!f.done) {
+				f.waiters.push(self)
+			}
+		}
+		bober_park()
+		// So that the others, once done, do not wake this fiber parked for something else.
+		for (const f of fs) {
+			const i = f.waiters.indexOf(self)
+			if (i >= 0) {
+				f.waiters.remove(i)
+			}
+		}
+	}
+}

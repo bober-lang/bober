@@ -1,6 +1,7 @@
 //! Deferred computation (§6.10): futures and races.
 
 import { Signal } from "../builtin/fiber"
+import { millisecond, monotonic, sleep } from "../std/time"
 
 class Oops {}
 
@@ -118,4 +119,21 @@ test "fibers racing one array each take a different future" {
 	assert await x == [1, 11]
 	go[0].wake()
 	assert await y == [0, 10]
+}
+
+/// Notes name in log once ms of monotonic time passed.
+function nap(ms: i64, log: string[], name: string) {
+	sleep(ms * millisecond)
+	log.push(name)
+}
+
+test "sleepers wake by their deadlines, those of one in the order of its heap, in tests' logical time" {
+	const log: string[] = []
+	const t = monotonic()
+	const jobs = [async nap(30, log, "c"), async nap(10, log, "a"), async nap(20, log, "b"), async nap(10, log, "a2"),
+		async nap(10, log, "a3")]
+	for (const _ of jobs) {
+		await ...jobs
+	}
+	assert log.join(" ") == "a a3 a2 b c" && monotonic() - t == 30 * millisecond
 }
