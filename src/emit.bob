@@ -3488,9 +3488,22 @@ class Emitter {
 	private i64Const(n: i64): Value { return this.b.constInt(this.i64, n) }
 	private not(v: Value): Value { return this.ir().binary("xor", v, this.bool(true)) }
 
-	/// The string literal s, made once, a constant: a long string of the program's one copy of its bytes, named by them,
-	/// so that equal literals are one value, whose words Same compares (§4.2); "" all zeros, as the zero string.
+	/// The string literal s, a constant: in place as a short string if it fits, else long.
 	private str(s: string): Value {
+		if (s.length > 15) {
+			return this.long(s)
+		}
+		const w = [s.length as i64, 0 as i64]
+		for (const i of 0 ... s.length - 1) {
+			w[(i + 1) >> 3] |= (s[i] as i64) << (8 * ((i + 1) & 7))
+		}
+		return this.b.constStruct([this.i64Const(w[0]), this.i64Const(w[1]), this.b.constZero(this.ref)])
+	}
+
+	/// s as a long string, made once, a constant, of the program's one copy of its bytes, named by them, so that equal
+	/// literals are one value, whose words Same compares (§4.2); "" all zeros, as the zero string. A descriptor's strings
+	/// are long, as src/type.c reads them.
+	private long(s: string): Value {
 		const have = this.strs.get(s)
 		if (have != null) {
 			return have
@@ -3677,12 +3690,12 @@ class Emitter {
 		let doc = ""
 		let ki = kindIndex(k)
 		let [elem, base, length] = [w(0), w(0), w(0)]
-		let value = this.str("")
+		let value = this.long("")
 		let tagged = tags(-1)
 		if (k == kind.Literal) {
 			elem = addr(this.describe(a))
 			if (a == kind.String) {
-				value = this.str(p.strings[y])
+				value = this.long(p.strings[y])
 			} else {
 				length = w(if (kind.isInt(a)) p.ints[y] else y)
 			}
@@ -3705,29 +3718,29 @@ class Emitter {
 		if (k == kind.Named || k == kind.Object || k == kind.Tuple) {
 			for (const s of this.layout(n)) {
 				const doc = if (s.decl < 0) "" else p.strings[p.decls[s.decl].doc]
-				fields.push(b.constStruct([this.str(p.strings[s.name]), this.str(doc),
+				fields.push(b.constStruct([this.long(p.strings[s.name]), this.long(doc),
 					addr(this.describe(this.kept(s.t))), w(s.mods), w(0), ...tags(s.decl)]))
 			}
 		}
 		const methods: Value[] = []
 		if (k == kind.Named && !this.isInterface(n)) {
-			methods.push(b.constStruct([this.str("new"), this.construction(a)]))
+			methods.push(b.constStruct([this.long("new"), this.construction(a)]))
 			for (const f of p.decls[a].members) {
 				if (this.dispatched(f)) {
-					methods.push(b.constStruct([this.str(this.name(f)), this.thunk(f)]))
+					methods.push(b.constStruct([this.long(this.name(f)), this.thunk(f)]))
 				}
 			}
 		} else if (k == kind.Named) {
 			// An interface's members by name alone, fields and those extended included, which a value is tested against (§4.7).
 			for (const name of this.memberNames(a)) {
-				methods.push(b.constStruct([this.str(name), b.constZero(this.ptr)]))
+				methods.push(b.constStruct([this.long(name), b.constZero(this.ptr)]))
 			}
 		}
 		const ps = (if (k == kind.Named || k == kind.Union || k == kind.Func) p.parts(n)
 			else []).map(t => addr(this.describe(t)))
-		const head = [w(if (kind.isPrimitive(n)) n else 0), w(ki), this.str(this.key(n)), this.str(showType(p, n)),
-			this.str(doc)]
-		return b.constStruct([...head, this.str(typeKinds[ki]), elem, base, length, value, w(ps.length),
+		const head = [w(if (kind.isPrimitive(n)) n else 0), w(ki), this.long(this.key(n)), this.long(showType(p, n)),
+			this.long(doc)]
+		return b.constStruct([...head, this.long(typeKinds[ki]), elem, base, length, value, w(ps.length),
 			list(this.i64, ps, false), w(fields.length), list(this.fieldTy, fields, true), w(methods.length),
 			list(b.struct([this.stringTy, this.ptr]), methods, false), w(0), w(0), w(0), w(0), w(0), w(0), ...tagged,
 			if (p.closed(n)) addr(this.describe(this.norm(n))) else w(0), w(p.hash(n) as i64), w(p.head(n) as i64)])
