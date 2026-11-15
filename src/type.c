@@ -477,6 +477,11 @@ int64_t bober_is(const bober_type *t, const bober_union *u) {
       if (!has(c, t->methods[i].name)) return 0;
     return 1;
   }
+  if (t->kind == KOBJECT && (u->tag->kind == KCLASS || u->tag->kind == KOBJECT)) {  // or by its fields, as a value
+    for (int64_t i = 0; i < t->nfields; i++)  // converted into it keeps its class's or object type's tag
+      if (!has(u->tag, t->fields[i].name)) return 0;
+    return 1;
+  }
   if (u->tag != t->canon) return 0;
   if (t->kind != KLITERAL) return 1;
   if (t->held != STRING) return u->bits == (uint64_t)t->length;

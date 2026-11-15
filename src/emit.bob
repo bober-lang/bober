@@ -2580,9 +2580,11 @@ class Emitter {
 	private isa(v: V, t: i32): Value {
 		const u = this.norm(t)
 		const ts = this.p.members(u)
-		if (this.unbound(u) || ts.some(m => this.p.kind(m) == kind.Named && this.isInterface(m))) {
-			// Which only its descriptor says, as reflected, so that a literal's value is tested too, and a class's
-			// members against an interface's (§4.7).
+		// Which only its descriptor says, as reflected, so that a literal's value is tested too, and a class's members
+		// against an interface's, or an object type's, as dyn keeps the tag of what converts into one (§4.7).
+		const reflected = ts.some(m => this.p.kind(m) == kind.Named && this.isInterface(m))
+			|| this.dyn && ts.some(m => this.p.kind(m) == kind.Object)
+		if (this.unbound(u) || reflected) {
 			const is = this.rt("is", [this.desc(t, true), this.spill(this.cast(v, this.any), this.unionTy)], false)
 			return this.ir().icmp("ne", is, this.i64Const(0))
 		}
