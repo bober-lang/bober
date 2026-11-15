@@ -233,6 +233,9 @@ test "a discriminating field narrows unions" {
 		== "181: A | B has no member n"
 	assert errors(ab + "function f(t: A | B | null): i32 { return if (t == null || t.kind == \"b\") 0 else t.n }") == ""
 	assert errors("function f(x: i32 | string | null): i32 { return if (x != null && x instanceof i32) x else x?.length ?? 0 }") == ""
+	assert errors("type T = { kind: \"a\"; n: i32 } | { kind: \"b\" }\nfunction g(t: T): T[] { return [t] }\n"
+		+ "function f(ts: T[]): i32 {\n\tconst t = ts[0]\n\tconst o = { kind: \"a\" }\n\to.kind = \"c\"\n\tfor (const u of ts) { g(u) }\n"
+		+ "\tconst h = () => ts[0]\n\tg(h())\n\tconst us: T[] = ts.map(u => u)\n\tconst p = { t, ts: [t] }\n\tg(p.ts[0])\n\treturn if (t.kind == \"a\") t.n else 0\n}") == ""
 }
 
 test "calls" {
