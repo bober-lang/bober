@@ -3406,10 +3406,14 @@ class Checker {
 			case "=":
 				throw this.error(n.t.loc, "a default is only in a pattern")
 		}
-		// An untyped operand is in the other operand's context, else in the operation's (§4.1).
+		// An untyped operand is in the other operand's context, else in the operation's (§4.1): literals on the left
+		// are checked after the right, to take its type.
 		const shift = n.t.kind == "<<" || n.t.kind == ">>"
-		const l = this.expr(a, operand(want))
-		const t = this.operate(n.t.kind, l, this.expr(b, if (!shift && l.isNumber() && !l.isUntyped()) bases(l) else operand(want)), want, n.t)
+		const w = operand(want)
+		const r0 = if (w == null && !shift && literals(a)) this.expr(b, null) else null
+		const l = this.expr(a, context(r0) ?? w)
+		const r = r0 ?? this.expr(b, (if (shift) null else context(l)) ?? w)
+		const t = this.operate(n.t.kind, l, r, want, n.t)
 		this.convert(a, t)
 		this.convert(b, t)
 		return t
@@ -3467,8 +3471,9 @@ class Checker {
 		n.type = Bool
 		const a = n.parts[0]
 		const b = n.parts[1]
-		const l = if (n.kind == "chain") this.compare(a) else this.expr(a, null)
-		const r = this.expr(b, l)
+		const r0 = if (literals(a)) this.expr(b, null) else null // as in binary
+		const l = if (n.kind == "chain") this.compare(a) else this.expr(a, context(r0))
+		const r = r0 ?? this.expr(b, l)
 		const op = n.t.kind
 		if (op == "==" || op == "!=") {
 			const j = compared(l, r)
@@ -4953,6 +4958,20 @@ function taken(u: Type, t: Type): Type {
 function operand(want: Type | null): Type | null {
 	const w = want?.nonNull()
 	return if (w?.kind == "union") null else w
+}
+
+/// The number type t gives the other operand of an operation as its context: none if t is untyped or no number.
+function context(t: Type | null): Type | null { return if (t != null && t.isNumber() && !t.isUntyped()) bases(t) else null }
+
+/// Whether p is number literals, alone or in arithmetic or bitwise operations, so untyped (§4.1).
+function literals(p: Node): bool {
+	return switch (p.kind) {
+		case "token": p.t.kind == "int" || p.t.kind == "float"
+		case "paren": literals(p.parts[0])
+		case "unary": (p.t.kind == "-" || p.t.kind == "~") && literals(p.parts[0])
+		case "binary": prec(p.t.kind) > 4 && literals(p.parts[0]) && literals(p.parts[1])
+		default: false
+	}
 }
 
 /// The phase infer checks arg p in.
