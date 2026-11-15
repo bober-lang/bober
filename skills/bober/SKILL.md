@@ -110,3 +110,16 @@ test "inc increments on every call" {
 ## Standard library
 
 `bober doc std` lists the modules; `bober doc std/fs` prints one module's exports with their docs. The methods of strings and arrays are in `bober doc builtin/string` and `bober doc builtin/array`. The sources lie beside the installed bober, in `std/` and `builtin/`.
+
+## Reporting
+
+Bober is young. When it gets in the way, report it instead of only working around it: a crash, or an error naming one of bober's own files (`src/…`); a correct program rejected or compiled wrong; an error message that did not help; something missing from the language or std; and anything slow, be it a build, a test run or the program.
+
+Reduce it to a small file, without code of the user's project that it does not need. `bober report` prints the issue, with bober's version and the file:
+
+```sh
+bober report "what happened, and what was expected" small.bob |
+    gh issue create -R bober-lang/bober -t "bug: …" -F -
+```
+
+The title starts with `bug:`, `slow:` or `wish:`. Issues are public: file it if the user lets you, else show them the report and https://github.com/bober-lang/bober/issues/new/choose. Then go on with a workaround and say what you reported.

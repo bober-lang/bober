@@ -74,7 +74,8 @@ class Flags @optarg.Cc {
 	command: Command | null @optarg.Rest = null
 }
 
-type Command = Run | Test | Check | Format | Init | Help | Version | Update | Skill | Build | Bundle | Lower | Doc | Lsp
+type Command = Run | Test | Check | Format | Init | Help | Version | Update | Report | Skill | Build | Bundle | Lower
+	| Doc | Lsp
 
 /// The options of the commands that read C headers.
 class Headers @optarg.Cc {
@@ -137,6 +138,11 @@ class Version {}
 
 /// replace bober's package by the latest edge
 class Update {}
+
+/// print an issue for bober's tracker: a bug, a slowness or a wish, and files that show it
+class Report {
+	args: string[] @optarg.Rest = []
+}
 
 /// print the agent skill for writing Bober
 class Skill {}
@@ -321,6 +327,16 @@ function command(c: Command): i32 {
 			return 0
 		case Update:
 			return update()
+		case Report: if (c.args.length > 0) {
+			let r = `${c.args[0]}\n\n${version()}, ${os} ${arch}\n`
+			for (const f of c.args.slice(1, c.args.length)) {
+				r += `\n${f}:\n\`\`\`bober\n${trim(readFile(f))}\n\`\`\`\n`
+			}
+			stdout.write(r)
+			stderr.write(`bober: file it by piping it into gh issue create -R bober-lang/bober -t "<bug|slow|wish>: <title>" -F -
+bober: or paste it at https://github.com/bober-lang/bober/issues/new/choose\n`)
+			return 0
+		}
 		case Bundle: if (c.args.length > 0) {
 			pack(c.args[0])
 			return 0
