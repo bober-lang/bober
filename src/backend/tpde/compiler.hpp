@@ -168,6 +168,10 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 	/// By index in TPDE's layout, each block's predecessors.
 	std::vector<std::vector<u32>> preds;
 	u32 mark = 0;
+	/// By local index, each slot's bit, else ~0u, and each call's offset into alive of the bits of the slots live across
+	/// it, as liveSlots finds them.
+	std::vector<u32> slots, aliveAt;
+	std::vector<u64> alive;
 
 	explicit Base(Adaptor *a) : B(a), syms(a->m->syms.size()) {}
 
@@ -327,12 +331,85 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 		for (u32 b = 1; b < layout.size(); b++) {
 			assert(idom[b] < b);
 		}
+		liveSlots();
 	}
 
-	/// Notes where the refs live across call are, which was just made: in the slots of the allocas, and those the
-	/// values were spilled to, as no register is callee-saved in a collected module. A ref is live only where its
-	/// definition dominates, though TPDE keeps its slot over the blocks between it and its last use: a path to the call
-	/// past them may have left another value's in it.
+	/// Finds which slots, allocas holding refs whose address is only loaded and stored through, are live across each
+	/// call: those a path from it loads before storing them whole, by a backward liveness over the blocks, as LLVM's
+	/// sroa leaves its statepoints only the refs live. One not live goes unreported, as nothing reads what it holds; one
+	/// live but not yet stored holds null, the prologue zeroing the frame.
+	void liveSlots() {
+		const auto &layout = this->analyzer.block_layout;
+		auto &vals = m().vals;
+		slots.assign(this->adaptor->sym().nlocal, ~0u), aliveAt.assign(slots.size(), ~0u), alive.clear();
+		for (auto [v, def] : this->adaptor->refs) {
+			if (vals[v].op == Op::Alloca) {
+				slots[vals[v].local] = 0;
+			}
+		}
+		// The slot an address is into, or 0.
+		auto into = [&](u32 p) {
+			while (vals[p].op == Op::Offset) {
+				p = m().ops(p)[0];
+			}
+			return vals[p].op == Op::Alloca && slots[vals[p].local] != ~0u ? p : 0;
+		};
+		for (u32 b : layout) {
+			for (u32 i : m().insts(b)) {
+				Op o = vals[i].op;
+				auto ops = m().ops(i);
+				for (u32 k = 0; k < ops.size(); k++) {
+					if (u32 a = into(ops[k]); a && !(o == Op::Load || o == Op::Offset ? k == 0 : o == Op::Store && k == 1)) {
+						slots[vals[a].local] = ~0u; // its address taken
+					}
+				}
+			}
+		}
+		u32 n = 0;
+		for (auto [v, def] : this->adaptor->refs) {
+			if (vals[v].op == Op::Alloca && slots[vals[v].local] != ~0u) {
+				slots[vals[v].local] = n++;
+			}
+		}
+		u32 w = (n + 63) / 64;
+		std::vector<u64> in(layout.size() * w), cur(w);
+		for (bool changed = n > 0; changed;) {
+			changed = false;
+			for (u32 b = layout.size(); b-- > 0;) {
+				std::ranges::fill(cur, 0);
+				for (u32 s : m().succs(layout[b])) {
+					for (u32 j = 0; j < w; j++) {
+						cur[j] |= in[u32(this->analyzer.block_idx(s)) * w + j];
+					}
+				}
+				auto insts = m().insts(layout[b]);
+				for (auto i = insts.rbegin(); i != insts.rend(); i++) {
+					const Value &v = vals[*i];
+					auto ops = m().ops(*i);
+					if (v.op == Op::Call || v.op == Op::Invoke) {
+						u32 &at = aliveAt[v.local];
+						if (at == ~0u) {
+							at = alive.size(), alive.resize(at + w);
+						}
+						std::ranges::copy(cur, alive.begin() + at);
+					} else if (u32 a = v.op == Op::Load ? into(ops[0]) : 0) {
+						u32 s = slots[vals[a].local];
+						cur[s / 64] |= u64{1} << s % 64;
+					} else if (v.op == Op::Store && into(ops[1]) == ops[1] && vals[ops[0]].type == vals[ops[1]].imm) {
+						u32 s = slots[vals[ops[1]].local];
+						cur[s / 64] &= ~(u64{1} << s % 64);
+					}
+				}
+				changed |= !std::ranges::equal(cur, std::span(in).subspan(b * w, w));
+				std::ranges::copy(cur, in.begin() + b * w);
+			}
+		}
+	}
+
+	/// Notes where the refs live across call are, which was just made: in the slots of the allocas live across it, and
+	/// those the values were spilled to, as no register is callee-saved in a collected module. A ref is live only where
+	/// its definition dominates, though TPDE keeps its slot over the blocks between it and its last use: a path to the
+	/// call past them may have left another value's in it.
 	void live(u32 call) {
 		mark++;
 		for (u32 b = u32(this->cur_block_idx); marks[b] != mark; b = idom[b]) {
@@ -346,6 +423,10 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 				continue;
 			}
 			if (va->variable_ref) {
+				u32 s = slots[m().vals[v].local];
+				if (s != ~0u && !(alive[aliveAt[m().vals[call].local] + s / 64] >> s % 64 & 1)) {
+					continue;
+				}
 				for (const Part &p : m().parts(m().types[m().vals[v].imm])) {
 					if (p.ref && va->stack_variable) {
 						at.push_back(va->frame_off + p.off);
