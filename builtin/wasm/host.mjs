@@ -1,0 +1,200 @@
+// What src/rt.c is natively for a module of src/wasm.bob, run by node: `node host.mjs x.wasm args…`, x.test.wasm its
+// tests. It gives the module's imports; one it lacks traps with its name. Strings cross as their bytes, one char each.
+
+import { readFileSync, writeFileSync, writeSync } from "node:fs"
+
+const [file, ...args] = process.argv.slice(2)
+const tests = file.endsWith(".test.wasm")
+// In tests, now is when Obergefell v. Hodges made same-sex marriage a right in all of the US, and random is seeded
+// with the day Stonewall began.
+const OBERGEFELL = 1435327200000000000n
+const STONEWALL = 0x19690628n
+let seed = tests ? STONEWALL : BigInt(Date.now()) ^ BigInt(Math.floor(Math.random() * 2 ** 52))
+let ex // the module's exports
+
+const str = s => {
+	if (s == null) return null
+	let r = ""
+	for (let i = 0, n = ex.strLen(s); i < n; i++) r += String.fromCharCode(ex.strAt(s, i))
+	return r
+}
+const make = s => {
+	const r = ex.strNew(s.length)
+	for (let i = 0; i < s.length; i++) ex.strSet(r, i, s.charCodeAt(i))
+	return r
+}
+const write = (fd, s) => writeSync(fd, Buffer.from(s, "latin1"))
+
+// Traps: a trap in a test fails just it, else it ends the program.
+class Trap extends Error {}
+let depth = 0 // of the tests and subtests running
+let testFile = null
+let testAt = -1
+let thrownFile = null
+let thrownAt = -1
+
+/// The line and column of byte at of file, or null.
+const position = (file, at) => {
+	if (file == null || at < 0) return null
+	let bytes
+	try { bytes = readFileSync(file) } catch { return null }
+	let [line, col] = [1, 1]
+	for (let i = 0; i < at && i < bytes.length; i++) bytes[i] == 10 ? (line++, col = 1) : col++
+	return [line, col]
+}
+
+/// What a trap with what at byte at of file prints, as bober_trap does.
+const trapped = (what, file, at) => {
+	const here = position(file, at)
+	const test = depth > 0 ? position(testFile, testAt) : null
+	const called = test && (file != testFile || here?.[0] != test[0]) ? ` (called at ${testFile}:${test[0]})` : ""
+	const where = here ? `${file}:${here[0]}:${here[1]}: ` : file ? `${file}: ` : ""
+	const first = what.indexOf("\n") < 0 ? what.length : what.indexOf("\n")
+	return `${where}trap: ${what.slice(0, first)}${called}${what.slice(first)}`
+}
+
+const trap = (what, file, at) => {
+	const msg = trapped(what, file, at)
+	if (depth > 0) throw new Trap(msg)
+	write(2, msg + "\n")
+	process.exit(1)
+}
+
+/// C's %g.
+const g = x => {
+	if (!isFinite(x)) return isNaN(x) ? "nan" : x > 0 ? "inf" : "-inf"
+	const e = x == 0 ? 0 : Number(x.toExponential(5).split("e")[1])
+	const trim = m => m.includes(".") ? m.replace(/\.?0+$/, "") : m
+	if (e < -4 || e >= 6) {
+		const [m, p] = x.toExponential(5).split("e")
+		return `${trim(m)}e${p[0] == "-" ? "-" : "+"}${p.replace(/^[+-]/, "").padStart(2, "0")}`
+	}
+	return trim(x.toFixed(5 - e))
+}
+
+/// A value thrown and not caught, a box, as text, as bober_uncaught shows it.
+const shown = box => {
+	const [kind, bits] = [ex.boxTag(box), ex.boxBits(box)]
+	const f = new DataView(new ArrayBuffer(8))
+	f.setBigInt64(0, bits, true)
+	switch (kind) {
+		case 1: return "null"
+		case 2: return bits & 1n ? "true" : "false"
+		case 3: case 4: case 5: case 6: return `${BigInt.asIntN(64, bits)}`
+		case 7: case 8: case 9: case 10: return `${BigInt.asUintN(64, bits)}`
+		case 11: return g(f.getFloat32(0, true))
+		case 12: return g(f.getFloat64(0, true))
+		case 13: return str(ex.boxRef(box))
+		default: return "<value>"
+	}
+}
+
+/// What e, which code threw, prints: a trap's message, or of a throw not caught.
+const failure = e => {
+	if (e instanceof Trap) return e.message
+	if (e instanceof WebAssembly.Exception && e.is(ex.bober)) {
+		return trapped(`uncaught throw: ${shown(e.getArg(ex.bober, 0))}`, thrownFile, thrownAt)
+	}
+	// Of the engine: a stack overflow, else what checks bober's code does not make, as of a null.
+	if (e instanceof RangeError && /call stack/.test(e.message)) return trapped("stack overflow", null, -1)
+	if (e instanceof WebAssembly.RuntimeError) return trapped(e.message, null, -1)
+	throw e
+}
+
+// Tests: a report as bober_tested's, of what each printed, captured.
+let cap = ""
+const all = { up: null, kids: "", failed: false, from: 0 }
+let level = all
+let sent = 0
+const esc = s => s.replace(/["\\\x00-\x1f]/g, c => c == '"' || c == "\\" ? `\\${c}` : c == "\n" ? "\\n" : c == "\t" ? "\\t"
+	: `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`)
+const key = (l, name) => { l.kids += `${l.kids ? ',"' : '"'}${esc(name)}":` }
+const flush = () => { write(1, all.kids.slice(sent)); sent = all.kids.length }
+
+/// Ends l, which failed with msg if not null.
+const end = (l, msg) => {
+	const up = l.up
+	if (msg != null) {
+		const to = l.failed ? (key(l, "trap"), l) : up
+		let b = cap.slice(l.from)
+		if (b.length > 4096) {
+			b = b.slice(-4096)
+			while (b && (b.charCodeAt(0) & 0xc0) == 0x80) b = b.slice(1)
+		}
+		to.kids += `"${esc(b)}${b && !b.endsWith("\n") ? "\\n" : ""}${esc(msg)}"`
+	}
+	if (l.failed) up.kids += `{${l.kids}}`
+	else if (msg == null) up.kids += '"ok"'
+	up.failed ||= l.failed || msg != null
+}
+
+const run = (name, f) => {
+	key(level, name)
+	flush()
+	const l = { up: level, kids: "", failed: false, from: cap.length }
+	level = l
+	depth++
+	let msg = null
+	try { f() } catch (e) { msg = failure(e) }
+	depth--
+	end(l, msg)
+	level = l.up
+	flush()
+}
+
+const host = {
+	trap: (what, file, at) => trap(str(what), str(file), at),
+	thrown: (file, at) => { [thrownFile, thrownAt] = [str(file), at] },
+	test: (name, file, f) => {
+		seed = STONEWALL
+		testFile = str(file)
+		testAt = -1
+		if (!all.kids) write(1, "{")
+		run(str(name), f)
+		cap = ""
+	},
+	subtest: (name, f) => run(str(name), () => ex.call(f)),
+	mark: at => { testAt = at },
+	tested: () => {
+		write(1, all.kids ? "}\n" : "{}\n")
+		return all.failed ? 1 : 0
+	},
+	put: (fd, s) => {
+		if (tests) cap += str(s)
+		else write(fd, str(s))
+		return 1
+	},
+	argc: () => 1 + args.length,
+	arg: i => make(i == 0 ? file : args[i - 1] ?? ""),
+	now: () => tests ? OBERGEFELL : BigInt(Date.now()) * 1000000n,
+	random: () => {
+		// SplitMix64.
+		let z = seed = BigInt.asUintN(64, seed + 0x9e3779b97f4a7c15n)
+		z = BigInt.asUintN(64, (z ^ z >> 30n) * 0xbf58476d1ce4e5b9n)
+		z = BigInt.asUintN(64, (z ^ z >> 27n) * 0x94d049bb133111ebn)
+		return BigInt.asIntN(64, z ^ z >> 31n)
+	},
+	readFile: path => {
+		try { return make(readFileSync(str(path), "latin1")) } catch { return null }
+	},
+	writeFile: (path, s) => {
+		try { writeFileSync(str(path), Buffer.from(str(s), "latin1")); return 1 } catch { return 0 }
+	},
+	idOf: (() => {
+		const ids = new WeakMap()
+		let next = 1n
+		return x => typeof x == "object" && x != null ? ids.get(x) ?? (ids.set(x, next), next++) : BigInt(x ?? 0)
+	})(),
+	fmod: (x, y) => x % y,
+	pow: Math.pow,
+}
+
+const imports = new Proxy(host, { get: (h, name) => h[name] ?? (() => trap(`${String(name)}: not on WebAssembly`, null, -1)) })
+const { instance } = await WebAssembly.instantiate(readFileSync(file), { bober: imports })
+ex = instance.exports
+try {
+	process.exitCode = ex.start()
+} catch (e) {
+	write(2, `${failure(e)}\n`)
+	process.exitCode = 1
+}

@@ -18,10 +18,14 @@ import { CompileError } from "./error"
 import { builtin, root } from "./root"
 import { Type } from "./type"
 
-/// lib/std.bobc, the package's bundle (src/root.bob), once read; empty in a repo, which has none, or if malformed. std
-/// imports its C headers relative to itself or from the sysroot, so that the package finds a header's module by the
-/// path the repo gave it.
-let std: HashMap[string, string] | null = null
+/// The package's bundles (src/root.bob) by name, each once read: std, lib/std.bobc, and wasm, lib/wasm.bobc, the same
+/// of builtin/wasm/'s modules where it has one; empty in a repo, which has none, or if malformed. std imports its C
+/// headers relative to itself or from the sysroot, so that the package finds a header's module by the path the repo
+/// gave it.
+const bundles = new HashMap[string, HashMap[string, string]]()
+
+/// The bundle a Lift links: wasm for WebAssembly, else std.
+export let bundleName = "std"
 
 export class Lift {
 	prog = new Program()
@@ -226,16 +230,18 @@ export function source(path: string, includes: string, read: (path: string) => s
 
 function hash(s: string | null): u64 { return if (s == null) 0 else fnv(s!) }
 
+/// The files of the bundle named bundleName by the path each holds.
 function stdBundle(): HashMap[string, string] {
-	if (std == null) {
+	if (!bundles.has(bundleName)) {
+		const file = join(root, `lib/${bundleName}.bobc`)
 		try {
-			std = unbundle(readFile(join(root, "lib/std.bobc")) ?? "")
+			bundles.set(bundleName, unbundle(readFile(file) ?? ""))
 		} catch (e: ParseError) {
-			print("bober: lib/std.bobc is malformed")
-			std = new HashMap[string, string]()
+			print(`bober: ${file} is malformed`)
+			bundles.set(bundleName, new HashMap[string, string]())
 		}
 	}
-	return std!
+	return bundles.get(bundleName)!
 }
 
 /// The bundle of the modules of p, made by the compiler whose hash is compiler, which drops their tests and source

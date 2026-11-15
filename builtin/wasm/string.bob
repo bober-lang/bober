@@ -1,0 +1,112 @@
+//! builtin/string.bob for WebAssembly GC (src/wasm.bob), where a string is its length and bytes, of which those after
+//! it may be free for one string to take, the one that ends where they are used.
+
+import { copyBytes, extend, newString, room, setByte, trap } from "./mem"
+
+/// The methods of a string, which is this.
+export class String {
+	/// How many code units it has.
+	readonly length: i32
+
+	/// The code unit at i, or null outside the string.
+	at(i: i32): u8 | null { return if (i >= 0 && i < this.length) this[i] else null }
+
+	/// Whether f holds for a code unit.
+	some(f: (x: u8) => bool): bool {
+		for (const i of 0 ... this.length - 1) {
+			if (f(this[i])) {
+				return true
+			}
+		}
+		return false
+	}
+
+	/// Whether f holds for each code unit.
+	every(f: (x: u8) => bool): bool { return !this.some(x => !f(x)) }
+	/// It, as its bytes are its own.
+	copy(): string { return this }
+
+	/// The code units from from up to to.
+	slice(from: i32, to: i32): string {
+		if (from < 0 || from > to || to > this.length) {
+			trap("slice out of range")
+		}
+		const r = newString(to - from)
+		copyBytes(r, 0, this, from, to - from)
+		return r
+	}
+}
+
+/// a + b: b put in the free bytes after a if it has the room, else a's and b's copied to new ones with as many free, so
+/// that a string grown by += takes amortized constant time per append.
+export function concat(a: string, b: string): string {
+	if (a.length == 0) {
+		return b
+	}
+	const n = a.length + b.length
+	let r = a
+	if (room(a) < b.length) {
+		r = newString(2 * n)
+		copyBytes(r, 0, a, 0, a.length)
+	}
+	r = extend(r, n)
+	copyBytes(r, a.length, b, 0, b.length)
+	return r
+}
+
+/// a == b.
+export function strEq(a: string, b: string): bool { return a.length == b.length && strCompare(a, b) == 0 }
+
+/// Below, at or above 0 as a is before, equal to or after b, by code units.
+export function strCompare(a: string, b: string): i32 {
+	const n = if (a.length < b.length) a.length else b.length
+	for (const i of 0 ... n - 1) {
+		if (a[i] != b[i]) {
+			return if (a[i] < b[i]) -1 else 1
+		}
+	}
+	return if (a.length < b.length) -1 else if (a.length > b.length) 1 else 0
+}
+
+/// The string of the code unit c.
+export function chr(c: u8): string {
+	const r = newString(1)
+	setByte(r, 0, c)
+	return r
+}
+
+/// The string of the bytes, copied; there are no addresses.
+export function fromBytes(bytes: u8[] | u64, n: u64 = 0): string {
+	if (bytes instanceof u64) {
+		trap("fromBytes of an address")
+	}
+	const xs = bytes as u8[]
+	const r = newString(xs.length)
+	for (const i of 0 ... xs.length - 1) {
+		setByte(r, i, xs[i])
+	}
+	return r
+}
+
+/// n in decimal.
+export function showUint(n: u64): string {
+	let k = 1
+	let v = n
+	while (v >= 10) {
+		v /= 10
+		k++
+	}
+	const r = newString(k)
+	v = n
+	while (k > 0) {
+		k--
+		setByte(r, k, ((v % 10) as u8) + 0x30)
+		v /= 10
+	}
+	return r
+}
+
+export function lenAt(p: u64): i64
+export function bytesAt(p: u64): u64
+export function copy(p: u64, n: i64): string
+export function mapped(fd: i32, n: i64): string | i64
