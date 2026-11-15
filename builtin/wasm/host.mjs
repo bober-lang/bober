@@ -1,11 +1,12 @@
-// What src/rt.c is natively for a module of src/wasm.bob, run by node: `node host.mjs x.wasm args…`, x.test.wasm its
-// tests. It gives the module's imports; one it lacks traps with its name. Strings cross as their bytes, one char each.
+// What src/rt.c is natively for a module of src/wasm.bob, run by node: `node --experimental-wasm-jspi host.mjs x.wasm
+// args…`, x.test.wasm its tests, its fibers parking by JS Promise Integration. It gives the module's imports; one it
+// lacks traps with its name. Strings cross as their bytes, one char each.
 
 import { readFileSync, writeFileSync, writeSync } from "node:fs"
 
 const [file, ...args] = process.argv.slice(2)
 const tests = file.endsWith(".test.wasm")
-// In tests, now is when Obergefell v. Hodges made same-sex marriage a right in all of the US, and random is seeded
+// In tests, now starts when Obergefell v. Hodges made same-sex marriage a right in all of the US, and random is seeded
 // with the day Stonewall began.
 const OBERGEFELL = 1435327200000000000n
 const STONEWALL = 0x19690628n
@@ -128,32 +129,119 @@ const end = (l, msg) => {
 	up.failed ||= l.failed || msg != null
 }
 
-const run = (name, f) => {
+/// Runs f, which gives the promise of a call into the module, as the test or subtest name, in the running one if any;
+/// it fails if the call or a fiber traps.
+const run = async (name, f) => {
 	key(level, name)
 	flush()
 	const l = { up: level, kids: "", failed: false, from: cap.length }
 	level = l
 	depth++
 	let msg = null
-	try { f() } catch (e) { msg = failure(e) }
+	try {
+		await Promise.race([new Promise((_, no) => { l.fail = no }), f()])
+	} catch (e) {
+		msg = failure(e)
+		reset()
+	}
 	depth--
 	end(l, msg)
 	level = l.up
 	flush()
 }
 
+// Fibers, as src/fiber.c's: each a promising call into the module, one running at a time until it parks by a
+// suspending import, whose promise resolves once it is the next ready, or ends; then the next ready runs. The first
+// runs start, and each test and subtest as a call of its own.
+let fibers, running, ready
+let made = 0n
+let call // the module's call of a closure () => null, which gives a promise
+const suspending = f => new WebAssembly.Suspending(f)
+
+/// A promise that resolves once the running fiber, which parks, runs again.
+const resumed = () => new Promise(r => { running.resume = r })
+
+/// Parks the running fiber: a promise that resolves once it runs again.
+const park = () => {
+	const p = resumed()
+	next()
+	return p
+}
+
+/// Readies fiber f, unless it is already or was dropped.
+const wake = f => { if (f && !f.queued) f.queued = true, ready.push(f) }
+
+// Sleepers, as src/io.c's: in a heap by deadline, the soonest first, which wakes those of one deadline in its order. In
+// tests the time is logical, as bober_mono's: it waits for nothing, but moves to the soonest deadline once no fiber is
+// ready.
+const MAX = 2n ** 63n - 1n // a deadline that never comes
+let heap
+let logical = tests ? 1n : -1n
+const mono = () => logical >= 0n ? logical : process.hrtime.bigint()
+
+/// Puts w at i in the heap and moves it up or down to where its deadline belongs.
+const sift = (w, i) => {
+	for (let up; i && heap[up = (i - 1) >> 1].deadline > w.deadline; i = up) heap[i] = heap[up]
+	for (let c; (c = 2 * i + 1) < heap.length; i = c) {
+		if (c + 1 < heap.length && heap[c + 1].deadline < heap[c].deadline) c++
+		if (heap[c].deadline >= w.deadline) break
+		heap[i] = heap[c]
+	}
+	heap[i] = w
+}
+
+/// Wakes the sleepers whose deadline passed.
+const expire = () => {
+	for (const t = mono(); heap.length && heap[0].deadline <= t;) {
+		const w = heap[0]
+		const last = heap.pop()
+		if (heap.length) sift(last, 0)
+		w.done = true
+		wake(w.fiber)
+	}
+}
+
+/// Runs the next fiber ready, once a sleeper's deadline passes if none is.
+const next = () => {
+	if (!ready.length && heap.length && heap[0].deadline < MAX) {
+		if (logical < 0n) {
+			const ms = Number((heap[0].deadline - mono()) / 1000000n) + 1
+			return void setTimeout(() => (expire(), next()), Math.min(ms, 2 ** 31 - 1))
+		}
+		logical = heap[0].deadline
+		expire()
+	}
+	const f = ready.shift()
+	if (!f) trap("every fiber is parked", null, -1)
+	f.queued = false
+	running = f
+	f.resume()
+}
+
+/// Fails the test running, or ends the program, as a fiber threw e.
+const fail = e => depth > 0 ? level.fail(e) : (write(2, `${failure(e)}\n`), process.exit(1))
+
+/// Drops every fiber but the first, which runs again, as once a test trapped.
+const reset = () => {
+	running = { id: 0n }
+	fibers = new Map([[0n, running]])
+	ready = []
+	heap = []
+}
+reset()
+
 const host = {
 	trap: (what, file, at) => trap(str(what), str(file), at),
 	thrown: (file, at) => { [thrownFile, thrownAt] = [str(file), at] },
-	test: (name, file, f) => {
+	test: suspending(async (name, file, f) => {
 		seed = STONEWALL
 		testFile = str(file)
 		testAt = -1
 		if (!all.kids) write(1, "{")
-		run(str(name), f)
+		await run(str(name), WebAssembly.promising(f))
 		cap = ""
-	},
-	subtest: (name, f) => run(str(name), () => ex.call(f)),
+	}),
+	subtest: suspending((name, f) => run(str(name), () => call(f))),
 	mark: at => { testAt = at },
 	tested: () => {
 		write(1, all.kids ? "}\n" : "{}\n")
@@ -166,7 +254,7 @@ const host = {
 	},
 	argc: () => 1 + args.length,
 	arg: i => make(i == 0 ? file : args[i - 1] ?? ""),
-	now: () => tests ? OBERGEFELL : BigInt(Date.now()) * 1000000n,
+	now: () => tests ? OBERGEFELL + logical : BigInt(Date.now()) * 1000000n,
 	random: () => {
 		// SplitMix64.
 		let z = seed = BigInt.asUintN(64, seed + 0x9e3779b97f4a7c15n)
@@ -185,6 +273,27 @@ const host = {
 		let next = 1n
 		return x => typeof x == "object" && x != null ? ids.get(x) ?? (ids.set(x, next), next++) : BigInt(x ?? 0)
 	})(),
+	bober_fiber: suspending(f => {
+		const p = resumed()
+		ready.unshift(running)
+		running.queued = true
+		const id = ++made
+		fibers.set(id, running = { id })
+		call(f).then(() => (fibers.delete(id), next())).catch(fail)
+		return p
+	}),
+	bober_self: () => running.id,
+	bober_park: suspending(park),
+	bober_wake: id => wake(fibers.get(id)),
+	bober_mono: mono,
+	bober_io_sleep: suspending(async ns => {
+		if (ns <= 0n) return
+		const t = mono()
+		const w = { fiber: running, deadline: ns > MAX - t ? MAX : t + ns }
+		heap.push(w)
+		sift(w, heap.length - 1)
+		while (!w.done) await park()
+	}),
 	fmod: (x, y) => x % y,
 	pow: Math.pow,
 }
@@ -192,9 +301,5 @@ const host = {
 const imports = new Proxy(host, { get: (h, name) => h[name] ?? (() => trap(`${String(name)}: not on WebAssembly`, null, -1)) })
 const { instance } = await WebAssembly.instantiate(readFileSync(file), { bober: imports })
 ex = instance.exports
-try {
-	process.exitCode = ex.start()
-} catch (e) {
-	write(2, `${failure(e)}\n`)
-	process.exitCode = 1
-}
+call = WebAssembly.promising(ex.call)
+WebAssembly.promising(ex.start)().then(r => { process.exitCode = r }, fail)

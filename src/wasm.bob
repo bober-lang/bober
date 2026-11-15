@@ -969,6 +969,20 @@ class Wasm {
 					BinaryenUnary(this.m, BinaryenWrapInt64(), x))
 					else BinaryenUnary(this.m, BinaryenReinterpretInt64(), x), t)
 			case "trap": this.pushResult(this.trapCall(this.get(this.pop()), false), ret)
+			case "catching":
+				// builtin/wasm/fiber.bob's: what a call throws, kept in a Thrown, whose one field is a box.
+				const into = this.get(this.pop())
+				const f = this.pop()
+				const threw = this.spill(this.i32c(0), this.i32)
+				const done = this.label()
+				const [box, caught] = this.caught(this.callClosure(f, []), done)
+				this.emit(this.labeled(done,
+					[caught, BinaryenStructSet(this.m, 0, into, this.get(box)),
+					BinaryenLocalSet(this.m, threw as u32, this.i32c(1))]))
+				this.stack.push({ l: threw, t: ret })
+			case "rethrow":
+				const box = BinaryenStructGet(this.m, 0, this.get(this.pop()), this.boxType(), false)
+				this.pushResult(BinaryenThrow(this.m, "bober", [box], 1), ret)
 			default: return false
 		}
 		return true
