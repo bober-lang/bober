@@ -108,8 +108,6 @@ export class LLVM implements Backend {
 	private tm: u64
 	private td: u64
 	private level: u32
-	/// Whether its functions keep their frame pointer though optimized, for profilers that walk frames.
-	framePointers = false
 	/// The debug info builder, its file, the subprogram of the function being appended to, and the debug types by
 	/// LLVM type, all 0 until source names one.
 	private di: u64 = 0
@@ -189,10 +187,8 @@ export class LLVM implements Backend {
 			return f
 		}
 		const fn = linkage(LLVMAddFunction(this.m, name, t), local)
-		// Unoptimized, a function keeps its frame pointer, as with clang, for debuggers and code that walks frames.
-		if (this.level == 0 || this.framePointers) {
-			LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex as u32, this.stringAttr("frame-pointer", "all"))
-		}
+		// Each keeps its frame pointer, by which the collector walks frames (src/gc.c), as debuggers and profilers do.
+		LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex as u32, this.stringAttr("frame-pointer", "all"))
 		return fn
 	}
 
