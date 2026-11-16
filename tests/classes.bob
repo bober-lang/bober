@@ -442,6 +442,34 @@ test "members promoted from an embedded class are reached through an interface, 
 	assert u.first() == "s" && u.v == m.v && firstThrough(m) == "s"
 }
 
+class Placed {
+	seen: ...Seen[string]
+}
+
+test "a field holding a class in place does not promote its members, as a mixin does" {
+	const ps: (Placed | Mixed)[] = [new Placed(), new Mixed()]
+	assert ps.map(p => p instanceof First) == [false, true]
+}
+
+class Both {
+	placed: ...Seen[string]
+
+	...Seen[string]
+}
+
+/// Of a type argument, as mono reads it.
+function firstOf[T extends First](x: T): string {
+	const first = x.first
+	return first()
+}
+
+test "a promoted method read as a value is the mixin's, not the field's" {
+	const b = new Both()
+	b.v = ["mixed"]
+	b.placed.v = ["placed"]
+	assert firstOf(b) == "mixed"
+}
+
 class Trio {
 	a: string
 	b: string

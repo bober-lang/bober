@@ -30,7 +30,7 @@ import { max, min } from "../std/math"
 import { Frame as AbiFrame, attrs, call as cCall, held as heldAs, signature } from "./backend/abi"
 import { Backend, Binary, Block, Cmp, FCmp, Type as IrType, Value, mark } from "./backend/backend"
 import * as decl from "./bc/decl"
-import { Embed, Extern, Static } from "./bc/decl"
+import { Embed, Extern, Mixin, Static } from "./bc/decl"
 import * as kind from "./bc/kind"
 import * as op from "./bc/op"
 import { Opcode } from "./bc/op"
@@ -2285,7 +2285,7 @@ class Emitter {
 			this.push(f, p.subst(p.decls[method].type, env))
 		} else {
 			// A method promoted from a class it embeds (§5.3), as lower reads one: through the field embedding it.
-			const via = this.layout(t).find(s => method < 0 && s.embed
+			const via = this.layout(t).find(s => method < 0 && (s.mods & Mixin) != 0
 				&& this.kindOf(fieldOf(p, this.norm(s.t), name)) == kind.Func)
 			if (via != null) {
 				this.field(obj, via.name)
@@ -2315,7 +2315,7 @@ class Emitter {
 			}
 		}
 		for (const i of 0 ... slots.length - 1) {
-			if (slots[i].embed) {
+			if ((slots[i].mods & Mixin) != 0) {
 				const r = this.find({ v: this.gep(obj.v, obj.t, i), t: this.norm(slots[i].t) }, name)
 				if (r != null) {
 					return r
@@ -2353,7 +2353,7 @@ class Emitter {
 		}
 		const slots = this.layout(n)
 		for (const i of 0 ... slots.length - 1) {
-			if (slots[i].embed) {
+			if ((slots[i].mods & Mixin) != 0) {
 				const q = this.upcast({ v: this.gep(obj.v, n, i), t: this.norm(slots[i].t) }, c)
 				if (q != 0) {
 					return q

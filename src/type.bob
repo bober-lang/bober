@@ -162,7 +162,7 @@ export class Type {
 					return Type.function([], Null)
 				}
 				for (const e of fs) {
-					const m = if (e.embedded) e.type.member(name, static) else null
+					const m = if (e.mixin) e.type.member(name, static) else null
 					if (m != null) {
 						return m
 					}
@@ -671,16 +671,19 @@ export class Type {
 export class Field {
 	name: string
 	type: Type
-	/// Whether its members are reachable on the type holding it (5.3).
+	/// Whether it holds its type in place (5.3).
 	embedded: bool
 	/// Whether it is the type's own, reached by its name, as `C.m`, rather than a value's.
 	static: bool
+	/// Whether it is a `...T`, whose members are also reachable on the type holding it (5.3).
+	mixin: bool
 
-	constructor(name: string, t: Type, embedded = false, static = false) {
+	constructor(name: string, t: Type, embedded = false, static = false, mixin = false) {
 		this.name = name
 		this.type = t
 		this.embedded = embedded
 		this.static = static
+		this.mixin = mixin
 	}
 }
 
@@ -807,7 +810,7 @@ function filled(t: Type): Type {
 	}
 	if (g != t
 		&& (t.fields.length != g.fields.length || t.base == null && g.base != null || behind(t.fields, g.fields))) {
-		t.fields = g.fields.map(f => new Field(f.name, f.type.in(g, t.params), f.embedded, f.static))
+		t.fields = g.fields.map(f => new Field(f.name, f.type.in(g, t.params), f.embedded, f.static, f.mixin))
 		t.base = g.base?.in(g, t.params)
 	}
 	return t

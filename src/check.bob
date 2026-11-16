@@ -701,7 +701,8 @@ class Linked {
 		for (const m of x.members) {
 			const y = this.p.decls[m]
 			const static = (y.mods & decl.Static) != 0
-			const f = new Field(this.p.strings[y.name], this.declared(m), (y.mods & decl.Embed) != 0, static)
+			const f = new Field(this.p.strings[y.name], this.declared(m), (y.mods & decl.Embed) != 0, static,
+				(y.mods & decl.Mixin) != 0)
 			const a = about(t, f.name, f.static)
 			a.hidden = (y.mods & decl.Private) != 0
 			a.readonly = (y.mods & decl.Readonly) != 0
@@ -2200,6 +2201,7 @@ class Checker {
 			f.type = this.typeExpr(m.parts[0])
 			f.name = nameOf(f.type.generic ?? f.type) ?? ""
 			f.embedded = true
+			f.mixin = true
 		} else if (m.kind == "method") {
 			if (t.kind == "class" && bodyOf(m) == null) {
 				this.report(m.t.loc, "a class's method needs a body")
@@ -4861,7 +4863,7 @@ function declarer(c: Type, k: string, static: bool): Type | null {
 	}
 	let o: Type | null = null
 	for (const f of fs) {
-		o = o ?? (if (f.embedded) declarer(f.type, k, static) else null)
+		o = o ?? (if (f.mixin) declarer(f.type, k, static) else null)
 	}
 	return o
 }

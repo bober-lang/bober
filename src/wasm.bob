@@ -88,7 +88,7 @@ export function wasm(p: Program, main: i32, tests: bool, path: string) throws Co
 /// it was given in the local after.
 type V = { l: i32, t: i32 }
 /// A field of a class instance, object or tuple; an embedded one a ref to its own struct.
-type Slot = { name: i32, t: i32, embed: bool, decl: i32 }
+type Slot = { name: i32, t: i32, embed: bool, mixin: bool, decl: i32 }
 /// Field k of the struct v holds.
 type Place = { v: V, k: i32, s: Slot }
 
@@ -1351,7 +1351,7 @@ class Wasm {
 			this.push(this.bound(d, held), p.decls[d].type)
 		} else {
 			// A method promoted from a class it embeds (§5.3), as lower reads one: through the field embedding it.
-			const via = this.layout(t).find(s => d < 0 && s.embed
+			const via = this.layout(t).find(s => d < 0 && s.mixin
 				&& this.kindOf(fieldOf(p, this.norm(s.t), name)) == kind.Func)
 			if (via != null) {
 				this.field(held, via.name)
@@ -1390,7 +1390,7 @@ class Wasm {
 			}
 		}
 		for (const i of 0 ... slots.length - 1) {
-			if (slots[i].embed) {
+			if (slots[i].mixin) {
 				const r = this.find(this.embedded(obj, i, slots[i]), name)
 				if (r != null) {
 					return r
@@ -1423,7 +1423,7 @@ class Wasm {
 		}
 		const slots = this.layout(obj.t)
 		for (const i of 0 ... slots.length - 1) {
-			if (slots[i].embed) {
+			if (slots[i].mixin) {
 				const r = this.upcast(this.embedded(obj, i, slots[i]), c)
 				if (r != null) {
 					return r
@@ -2069,7 +2069,8 @@ class Wasm {
 			for (const f of p.decls[p.a(t)].members) {
 				const d = p.decls[f]
 				if (d.kind == decl.Var && (d.mods & decl.Static) == 0) {
-					slots.push({ name: d.name, t: p.subst(d.type, p.b(t)), embed: (d.mods & decl.Embed) != 0, decl: f })
+					slots.push({ name: d.name, t: p.subst(d.type, p.b(t)), embed: (d.mods & decl.Embed) != 0,
+						mixin: (d.mods & decl.Mixin) != 0, decl: f })
 				}
 			}
 		} else if (k == kind.Object || k == kind.Tuple) {
@@ -2078,7 +2079,7 @@ class Wasm {
 				const object = k == kind.Object
 				const mods = if (object) p.names[p.b(t)][2 * i + 1] else 0
 				const name = if (object) p.names[p.b(t)][2 * i] else p.elementName(i)
-				slots.push({ name: name, t: ts[i], embed: (mods & decl.Embed) != 0, decl: -1 })
+				slots.push({ name: name, t: ts[i], embed: (mods & decl.Embed) != 0, mixin: false, decl: -1 })
 			}
 		} else {
 			throw new CompileError(`wasm: fields of ${showType(p, t)}`)
