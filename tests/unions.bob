@@ -134,6 +134,33 @@ test "an object literal nested in a tagged union takes the member its tag select
 	assert e.k == "neg" && e.a.k == "neg" && e.a.a.k == "leaf" && e.a.a.v == 7
 }
 
+interface Num {
+	k: "num"
+	v: i32
+}
+
+interface Var {
+	k: "var"
+	name: string
+}
+
+interface Ret {
+	k: "ret"
+	v: Num | Var | Ret
+}
+
+/// Of a Ret, which no test makes, so that mono holds n.v as Num's, an i32, cast into Num | Var.
+function depth(n: Num | Var | Ret): i32 {
+	return switch (n.k) {
+		case "ret": depth(n.v) + 1
+		default: 0
+	}
+}
+
+test "a case no value reaches compiles, its field read as of the types held" {
+	assert depth({ k: "num", v: 1 }) + depth({ k: "var", name: "a" }) == 0
+}
+
 test "an object literal of a union of interfaces is an object of the one it fits" {
 	const x: HasV | HasW = { v: 3 }
 	assert x instanceof HasV && x.v == 3
