@@ -264,6 +264,9 @@ function builtin(name: string): string | null {
 	}
 }
 
+/// The types an attribute list declares by name, besides an enumeration.
+const attTypes = ["CDATA", "ID", "IDREF", "IDREFS", "ENTITY", "ENTITIES", "NMTOKEN", "NMTOKENS", "NOTATION"]
+
 class Parser {
 	s: string
 	i = 0
@@ -341,7 +344,12 @@ class Parser {
 			first = false
 			this.equals()
 			const v = this.literal()
-			if (n == "encoding" && lower(v) != "utf-8" && lower(v) != "us-ascii") {
+			const ok = switch (n) {
+				case "version": v.length > 2 && startsWith(v, "1.") && v.slice(2, v.length).every(isDigit)
+				case "encoding": lower(v) == "utf-8" || lower(v) == "us-ascii"
+				default: v == "yes" || v == "no"
+			}
+			if (!ok) {
 				throw new ParseError("syntax", at)
 			}
 		}
@@ -522,7 +530,11 @@ class Parser {
 			}
 			const name = this.name()
 			this.required()
+			const at = this.i
 			const kind = if (this.looking("(")) "" else this.name()
+			if (kind != "" && !attTypes.includes(kind)) {
+				throw new ParseError("syntax", at)
+			}
 			if (kind == "NOTATION") {
 				this.required()
 			}
@@ -546,7 +558,7 @@ class Parser {
 		}
 	}
 
-	/// The replacement text of an entity's quoted text: its character references expanded.
+	/// The replacement text of an entity's quoted text: its character references expanded, its entity references kept.
 	entityValue(): string {
 		const q = chr(this.opening())
 		let out = ""
@@ -554,6 +566,12 @@ class Parser {
 			if (this.looking("&#")) {
 				this.i++
 				out += this.charRef()
+			} else if (this.peek() == amp) {
+				const from = this.i
+				this.i++
+				this.name()
+				this.expect(";")
+				out += this.s.slice(from, this.i)
 			} else {
 				if (this.peek() == ascii.percent) {
 					this.dtd.partial = true
