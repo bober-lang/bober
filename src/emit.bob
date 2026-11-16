@@ -2207,6 +2207,14 @@ class Emitter {
 			const f = this.closure(this.value(method, true), [this.taken(obj).v], this.envDescs(env))
 			this.push(f, p.subst(p.decls[method].type, env))
 		} else {
+			// A method promoted from a class it embeds (§5.3), as lower reads one: through the field embedding it.
+			const via = this.layout(t).find(s => method < 0 && s.embed
+				&& this.kindOf(fieldOf(p, this.norm(s.t), name)) == kind.Func)
+			if (via != null) {
+				this.field(obj, via.name)
+				this.field(this.pop(), name)
+				return
+			}
 			const [q, s] = this.place(obj, name)
 			this.push(if (s.embed) q else this.read(q, s.t), s.t)
 		}
