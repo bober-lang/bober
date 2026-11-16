@@ -4205,7 +4205,8 @@ class Checker {
 	}
 
 	/// An object literal's type: the class a spread of one gives it, whose other parts shall be its fields (4.8),
-	/// else the object of its parts, a spread's being those of its type, or a type param's constraint's.
+	/// else the object of its parts, a spread's being those of its type, or a type param's constraint's; a part naming a
+	/// field one before gave sets that field, of its type.
 	private object(n: Node, want: Type | null): Type {
 		const spreads: Type[] = []
 		let cls: Type | null = null
@@ -4236,7 +4237,11 @@ class Checker {
 				continue
 			}
 			const name = this.key(q.t)
-			const ft = if (cls != null) this.fieldType(cls, name, q) else if (w == null) null else w.member(name)
+			const had = fs.find(f => f.name == name)
+			const ft = if (cls != null) this.fieldType(cls, name, q)
+				else if (had != null) had.type
+				else if (w == null) null
+				else w.member(name)
 			const v = after(q, ":")
 			const t = if (q.kind == "method") this.function(q, null, true)
 				else if (v == null) this.name(q)
@@ -4245,7 +4250,9 @@ class Checker {
 				this.fit(t, ft, v ?? q)
 			}
 			q.type = ft ?? t
-			fs.push(new Field(name, ft ?? (if (want == null) based(t) else t))) // as an array literal's elements
+			if (had == null) {
+				fs.push(new Field(name, ft ?? (if (want == null) based(t) else t))) // as an array literal's elements
+			}
 		}
 		return cls ?? Type.object(fs)
 	}

@@ -676,7 +676,8 @@ class Emitter {
 				continue // an untyped catch's local holds nothing
 			}
 			const arg = if (i < np) b.param(f, (i + first) as u32) else 0
-			const p = if (this.boxes && i < np && this.anyOf(declared[i])) this.fromAny(arg, t) else arg
+			const p = if (!this.boxes || i >= np) arg
+				else this.fromAny(arg, if (this.kindOf(declared[i]) == kind.Optional) declared[i] else t)
 			if (i == 0 && np > 0 && params[first] == this.ref && this.inlined(t)) {
 				this.self = p // a constructor's or initializer's this
 				this.locals[i] = p
@@ -1322,15 +1323,11 @@ class Emitter {
 	}
 
 	/// The type of the code of a function value of result ret and params ps, which takes its env first; in a program as
-	/// lowered, of args and a result each a union of any type (see value), but the optional params.
+	/// lowered, of args and a result each a union of any type (see value).
 	private codeType(ret: i32, ps: i32[]): IrType {
-		return if (this.dyn) this.b.fn(this.unionTy,
-			[this.ref, ...ps.map(t => if (this.anyOf(t)) this.unionTy else this.ll(t))])
+		return if (this.dyn) this.b.fn(this.unionTy, [this.ref, ...ps.map(_ => this.unionTy)])
 			else this.fnType(ret, [this.ref], ps)
 	}
-
-	/// Whether a function value's code takes an arg of type t as a union of any type (see codeType).
-	private anyOf(t: i32): bool { return this.dyn && this.kindOf(t) != kind.Optional }
 
 	/// Decl d as a function of type t, in this module or declared; a copy or one nested in a function local.
 	private function(d: i32, t: IrType): Value {
@@ -1572,8 +1569,8 @@ class Emitter {
 		const ft = this.codeType(res, ps)
 		const code = if (via < 0) this.captured(f.v, 0, this.ptr) else this.function(via, ft)
 		const args = this.args(xs, ps)
-		for (const k of 0 ... args.length - 1) {
-			if (this.anyOf(ps[k])) {
+		if (this.dyn) {
+			for (const k of 0 ... args.length - 1) {
 				args[k] = this.cast({ v: args[k], t: this.norm(ps[k]) }, this.any)
 			}
 		}
@@ -1963,8 +1960,8 @@ class Emitter {
 
 	/// A function d as a value: its closure, a constant { thunk } calling it, or the thunk of a generic's { thunk, ...its
 	/// type args' descriptors }, or bound to an object { thunk, this, ...its class's }. In a program as lowered, it takes
-	/// the args but the optional ones and gives the result each as a union of any type, as a closure's code does, so that
-	/// closed and generic code call a function value alike, however they type it and wherever it is held.
+	/// the args and gives the result each as a union of any type, one left out none (see fromAny), as a closure's code
+	/// does, so that closed and generic code call a function value alike, however they type it and wherever it is held.
 	private value(d: i32, bound: bool): Value {
 		const b = this.b
 		const f = this.callee(d)
@@ -1986,7 +1983,7 @@ class Emitter {
 			}
 			for (const i of 0 ... f.params.length - 1) {
 				const x = b.param(thunk, (i + 1) as u32)
-				args.push(if (this.anyOf(f.params[i])) this.fromAny(x, f.params[i]) else x)
+				args.push(if (this.dyn) this.fromAny(x, f.params[i]) else x)
 			}
 			const r = this.callByValue(f, args, false)
 			if (this.dyn) {
@@ -2026,8 +2023,10 @@ class Emitter {
 			const args = [g]
 			// Missing for each param from has past to's.
 			for (const i of 0 ... fps.length - 1) {
+				const missing = b.constZero(this.ll(fps[i]))
 				args.push(if (i < tps.length) this.through(b.param(code, (i + 1) as u32), tps[i], fps[i])
-					else b.constZero(this.ll(fps[i])))
+					else if (this.dyn) this.cast({ v: missing, t: fps[i] }, this.any)
+					else missing)
 			}
 			const r = this.call(this.codeType(fr, fps), this.captured(g, 0, this.ptr), args)
 			if (this.dyn) {
@@ -2064,14 +2063,10 @@ class Emitter {
 			for (const k of 0 ... ps.length - 1) {
 				const x = b.param(code, (k + 1) as u32)
 				const at = this.ir().gep(this.unionTy, argv, [this.i64Const(k)])
-				if (this.anyOf(ps[k])) {
-					this.ir().store(x, at, false)
-					n = this.ir().binary("add", n, this.i64Const(1))
-				} else {
-					const v = this.cast({ v: this.ir().extract(x, 0), t: this.norm(this.p.a(ps[k])) }, this.any)
-					this.ir().store(v, at, false)
-					n = this.ir().binary("add", n, this.ir().cast("zext", this.ir().extract(x, 1), this.i64))
-				}
+				this.ir().store(x, at, false)
+				const given = if (this.kindOf(ps[k]) != kind.Optional) this.bool(true)
+					else this.ir().icmp("ne", this.tagOf(x), this.i64Const(0))
+				n = this.ir().binary("add", n, this.ir().cast("zext", given, this.i64))
 			}
 			const thunk = this.captured(env, 1, this.ptr)
 			this.ir().ret(this.call(b.fn(this.unionTy, [this.unionTy, this.ptr, this.i64]), thunk,
@@ -2085,8 +2080,8 @@ class Emitter {
 	/// Value x of type from cast to to; in a program as lowered, each a union of any type, as a function value's code
 	/// takes and gives them (see value).
 	private through(x: Value, from: i32, to: i32): Value {
-		const v = this.cast({ v: if (this.anyOf(from)) this.fromAny(x, from) else x, t: this.norm(from) }, to)
-		return if (this.anyOf(to)) this.cast({ v: v, t: this.norm(to) }, this.any) else v
+		const v = this.cast({ v: if (this.dyn) this.fromAny(x, from) else x, t: this.norm(from) }, to)
+		return if (this.dyn) this.cast({ v: v, t: this.norm(to) }, this.any) else v
 	}
 
 	/// Whether a value of type f converts to t it fits other than as is: a number to a wider one (§4.1), also as a
@@ -2539,6 +2534,11 @@ class Emitter {
 			const given = if (opt) this.ir().extract(v.v, 1) else this.bool(true)
 			return this.ir().insert(this.ir().insert(this.b.undef(this.ll(t)), x, 0), given, 1)
 		}
+		if (fk == kind.Optional && t == this.any) {
+			// As a function value's code takes it (see fromAny): if not given, none, of tag 0, holding the zero value.
+			const x = this.cast({ v: this.ir().extract(v.v, 0), t: p.a(f) }, t)
+			return this.ir().insert(x, this.ir().select(this.ir().extract(v.v, 1), this.tagOf(x), this.i64Const(0)), 0)
+		}
 		if (this.boxed(f) || this.boxed(t)) {
 			// Boxed with the descriptor of its type, or unboxed, converted if a number.
 			if (!this.boxed(f)) {
@@ -2557,8 +2557,9 @@ class Emitter {
 				const bits = this.rt("convert", [this.desc(t), this.tagOf(v.v), this.bitsOf(v.v)], false)
 				return this.unbits(this.union(this.desc(t), bits, this.b.constZero(this.ref)), t)
 			} else if (!this.unbound(t)) {
-				this.check(this.ir().icmp("eq", this.tagOf(v.v), this.desc(t)),
-					"cast to a type that is not the value's")
+				// A function's of another type that fits too, as an object converted into an interface keeps its tag (§4.7).
+				const ok = if (tk == kind.Func) this.isa(v, t) else this.ir().icmp("eq", this.tagOf(v.v), this.desc(t))
+				this.check(ok, "cast to a type that is not the value's")
 			}
 			return this.unbits(v.v, t)
 		}
@@ -2698,10 +2699,15 @@ class Emitter {
 	}
 
 	/// The value of type t union u of any type holds, as a function value's code is given its args and gives its result
-	/// (see value), of a type that fits t: a narrower number's widened (§4.1), as its bits are an integer's already.
+	/// (see value), of a type that fits t: a narrower number's widened (§4.1), as its bits are an integer's already; of an
+	/// optional, given unless u is none, of tag 0, as a left-out arg is (see cast).
 	private fromAny(u: Value, t: i32): Value {
 		const n = this.norm(t)
-		if (this.p.kind(n) == kind.Union) {
+		if (this.p.kind(n) == kind.Optional) {
+			const given = this.ir().icmp("ne", this.tagOf(u), this.i64Const(0))
+			return this.ir().insert(this.ir().insert(this.b.undef(this.ll(n)), this.fromAny(u, this.p.a(n)), 0), given,
+				1)
+		} else if (this.p.kind(n) == kind.Union) {
 			const narrow: i32[] = [kind.I8, kind.I16, kind.I32, kind.U8, kind.U16, kind.U32, kind.F32]
 			return this.widen(u,
 				narrow.filter(m => !this.holds(n, m) && this.p.members(n).some(x => kind.widens(m, x))), n)
@@ -2730,9 +2736,9 @@ class Emitter {
 		const u = this.norm(t)
 		const ts = this.p.members(u)
 		// Which only its descriptor says, as reflected, so that a literal's value is tested too, and a class's members
-		// against an interface's, or an object type's, as dyn keeps the tag of what converts into one (§4.7).
+		// against an interface's, an object type's or a function's, as dyn keeps the tag of what converts into one (§4.7).
 		const reflected = ts.some(m => this.p.kind(m) == kind.Named && this.isInterface(m))
-			|| this.dyn && ts.some(m => this.p.kind(m) == kind.Object)
+			|| this.dyn && ts.some(m => this.p.kind(m) == kind.Object || this.p.kind(m) == kind.Func)
 		if (this.unbound(u) || reflected) {
 			const is = this.rt("is", [this.desc(t, true), this.spill(this.cast(v, this.any), this.unionTy)], false)
 			return this.ir().icmp("ne", is, this.i64Const(0))
@@ -3577,7 +3583,8 @@ class Emitter {
 		const words = [...captures, ...descs]
 		if (words.length == 0) {
 			const b = this.b
-			return b.constCast("inttoptr", b.constCast("ptrtoint", b.constant(b.constStruct([code])), this.i64), this.ref)
+			return b.constCast("inttoptr", b.constCast("ptrtoint", b.constant(b.constStruct([code])), this.i64),
+				this.ref)
 		}
 		const t = this.b.struct([this.ptr, ...words.map(v => this.b.typeOf(v))])
 		const env = this.alloc(t)
