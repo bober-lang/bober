@@ -67,9 +67,9 @@ An area, declared in source order though lowered first.
 `
 }
 
-test "a signature reads back as written: aliases, param names, throws, union order, void, defaults, supers, imports" {
+test "a signature reads back as written" {
 	const f = "```"
-	const src = `import { Key as K } from "./ids"
+	const src = `import { Key as K, Pair } from "./ids"
 import * as ids from "./ids"
 
 export type Id = i32
@@ -93,12 +93,23 @@ export const one = 1
 export const b = -1 as i64
 export const c = "A" as u8
 export const d = (1 + 2) as u16
+export const g = (one as i64) + 1
 export const xs = [1 as u8, 2]
 export const s = \`a\${1}\`
+export type Ab = "b" | "a"
+function name(): string { return "a" }
+export const ab = name() as Ab
+export const nul = "\\0" as u8
+export const mask: u32 = 0xff | 0o17 | 0b1010
+export const neg = -0x10 as i64
+export const e = -(one as i64)
+export const big = 0xffffffffffffffff as u64
+export const pair = new Pair(1)
+export const pairs = [new Pair[i64](1)]
 `
 	const p = lower(["lib.bob"], [], [], path => switch (path) {
 		case "lib.bob": src
-		case "ids.bob": "export type Key = string\nexport class Code {}\n"
+		case "ids.bob": "export type Key = string\nexport class Code {}\nexport class Pair[T] { constructor(a: T) {} }\n"
 		default: readFile(path)
 	})
 	assert reference("lib", p, p.module("lib.bob"))
@@ -111,18 +122,28 @@ export interface Named extends { name: Id, key: K } {}
 export class C implements Named {
 	name: Id = 0
 	key: K = ""
-	code: ids.Code = new ids.Code()
+	code = new ids.Code()
 }
 export function code(k: K): ids.Code
 export type Ks = K[]
 export function ro(a: string[][readonly]): i32
 export type Obj = { readonly a: Id, k: K }
 export const one = 1
-export const b: i64 = -1
-export const c: u8 = 65
-export const d: u16 = 1 + 2
-export const xs: u8[] = [1, 2]
+export const b = -1 as i64
+export const c = "A" as u8
+export const d = (1 + 2) as u16
+export const g: i64 = (one as i64) + 1
+export const xs: u8[] = [1 as u8, 2]
 export const s: string
+export type Ab = "b" | "a"
+export const ab = name() as Ab
+export const nul = "\\x00" as u8
+export const mask: u32 = 0xff | 0o17 | 0b1010
+export const neg = -0x10 as i64
+export const e: i64 = -(one as i64)
+export const big = 0xffffffffffffffff as u64
+export const pair = new Pair(1)
+export const pairs: Pair[i64][] = [new Pair[i64](1)]
 ${f}
 `
 }

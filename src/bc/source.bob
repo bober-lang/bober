@@ -5,7 +5,7 @@
 import { fromBits } from "../../builtin/math"
 import { endsWith, indexOf } from "../../std/algo"
 import { minus } from "../../std/ascii"
-import { quoted } from "../../std/string"
+import { formatInt, quoted, utf8 } from "../../std/string"
 import { CompileError } from "../error"
 import { Shape, prec } from "../parse"
 import * as decl from "./decl"
@@ -47,9 +47,9 @@ export function signature(p: Program, d: i32, value = true): string throws Compi
 				return `...${showType(p, x.type, at)}${tags}`
 			}
 			const v = if (value && x.code != null) expr(p, x.code!, 0, x.code!.ops.length - 1, at) else ""
-			// Its type as written, else as resolved, a const's of one value its base, but of a lone literal of it.
+			// Its type as written, else as resolved, a const's of one value its base, but of a value that says it.
 			const r = if (p.kind(x.type) == kind.Literal) p.a(x.type) else x.type
-			const t = if (s != 0) s else if (v != "" && lone(x.code!, r)) 0 else r
+			const t = if (s != 0) s else if (v != "" && says(x.code!, r)) 0 else r
 			out += (if (top) (if ((x.mods & decl.Readonly) != 0) "const " else "let ") else "") + name
 				+ (if (t == 0) "" else `: ${showType(p, t, at)}`) + tags
 			return out + (if (v == "") "" else ` = ${v}`)
@@ -61,9 +61,15 @@ export function signature(p: Program, d: i32, value = true): string throws Compi
 	return out + tags
 }
 
-/// Whether code c is a lone literal of type t, a string's, an i32's, an f64's or a bool's, or an untyped constant's.
-function lone(c: Code, t: i32): bool {
-	return switch (if (c.ops.length == 2) c.ops[0] else op.End) {
+/// Whether code c's value says its type t: is a written `as` or a `new`, or a lone literal of t, a string's, an i32's,
+/// an f64's or a bool's, or an untyped constant's.
+function says(c: Code, t: i32): bool {
+	const n = c.ops.length - 2 // the op that leaves it
+	const f = c.forms
+	if (c.ops[n] == op.New || f.length > 0 && f[f.length - 3] == n && f[f.length - 2] == op.As) {
+		return true
+	}
+	return switch (if (n == 0) c.ops[0] else op.End) {
 		case op.Str: t == kind.String
 		case op.Int: t == kind.I32 || t == kind.Int
 		case op.Float: t == kind.F64 || t == kind.Float
@@ -92,8 +98,9 @@ function fallback(p: Program, d: i32, i: i32): string throws CompileError {
 	return ""
 }
 
-/// The value ops from up to to of c leave, as source; "" unless they are straight-line: literals, locals, globals,
-/// fields, calls, new, array and object literals and operators, a Cast dropped, a call of literal the `as` it is.
+/// The value ops from up to to of c leave, as source, as written where c's marks (Code.forms) say; "" unless they are
+/// straight-line: literals, locals, globals, fields, calls, new, array and object literals and operators, a Cast
+/// dropped.
 export function expr(p: Program, c: Code, from: i32, to: i32, at: i32): string throws CompileError {
 	const atom = 14 // how tightly a name, literal, call or member binds, as parse's Member
 	const stack: [string, i32][] = []
@@ -110,23 +117,21 @@ export function expr(p: Program, c: Code, from: i32, to: i32, at: i32): string t
 		const [e, level] = stack.pop()
 		return if (level < min) `(${e})` else e
 	}
+	let k = 0 // the next of c's marks
+	while (k < c.forms.length && c.forms[k] < from) {
+		k += 3
+	}
 	for (const i of from ... to - 1) {
 		const o = c.ops[i]
 		const a = c.a(i)
 		const b = c.b(i)
-		const sym = op.operators.find(x => x[1] == o)
-		if (o == op.Cast || o == op.Init) {
-			continue
-		}
-		if (sym != null) {
-			const level = prec(sym[0] as Shape)
-			const r = operand(level + 1)
-			stack.push([`${operand(level)} ${sym[0]} ${r}`, level])
-			continue
-		}
+		// How op i is written, if its first mark says.
+		const form = if (k < c.forms.length && c.forms[k] == i) c.forms[k + 1] else 0
 		switch (o) {
-			case op.Int: stack.push([if (a == kind.U64) `${p.ints[b] as u64}` else `${p.ints[b]}`,
-				if (p.ints[b] < 0) 12 else atom])
+			case op.Cast, op.Init: {}
+			case op.Int:
+				const n = if (form == op.Char) quoted(utf8(p.ints[b])) else digits(p.ints[b], a, form)
+				stack.push([n, if (n[0] == minus) 12 else atom])
 			case op.Float:
 				const f = `${fromBits[f64](p.ints[b] as u64)}`
 				stack.push([if (indexOf(f, ".") < 0 && indexOf(f, "e") < 0 && indexOf(f, "n") < 0) f + ".0" else f,
@@ -141,18 +146,17 @@ export function expr(p: Program, c: Code, from: i32, to: i32, at: i32): string t
 			case op.Global: stack.push([qualified(p, a, at), atom])
 			case op.Member: stack.push([`${operand(atom)}.${p.strings[p.decls[a].name]}`, atom])
 			case op.Field: stack.push([`${operand(atom)}.${p.strings[a]}`, atom])
-			case op.Neg, op.Not: stack.push([`${if (o == op.Neg) "-" else "!"}${operand(12)}`, 12])
+			case op.Neg, op.Not: stack.push([`${if (o == op.Neg) "-" else "!"}${operand(13)}`, 12])
 			case op.Call:
 				if (a == p.lang("show")) {
 					return "" // of a template, which it cannot name
 				}
-				if (a == p.lang("literal")) {
-					stack.push([`${operand(13)} as ${showType(p, p.lists[b][0], at)}`, 12])
-					continue
+				// A call of literal is an `as`, which its mark prints.
+				if (a != p.lang("literal")) {
+					const args = take(p.items(p.decls[a].type).length)
+					stack.push([if (p.method(a)) `${operand(atom)}.${p.strings[p.decls[a].name]}(${args})`
+						else `${qualified(p, a, at)}(${args})`, atom])
 				}
-				const args = take(p.items(p.decls[a].type).length)
-				stack.push([if (p.method(a)) `${operand(atom)}.${p.strings[p.decls[a].name]}(${args})`
-					else `${qualified(p, a, at)}(${args})`, atom])
 			case op.CallMethod:
 				const args = take(b)
 				stack.push([`${operand(atom)}.${p.strings[a]}(${args})`, atom])
@@ -165,7 +169,7 @@ export function expr(p: Program, c: Code, from: i32, to: i32, at: i32): string t
 				}
 				const ctor = p.find(p.decls[p.a(a)].module, p.a(a), "constructor")
 				const args = take(if (ctor < 0) 0 else p.items(p.decls[ctor].type).length)
-				stack.push([`new ${showType(p, a, at)}(${args})`, atom])
+				stack.push([`new ${showType(p, if (form == op.Spelled) c.forms[k + 2] else a, at)}(${args})`, atom])
 			case op.Array:
 				const spread = c.items(c.c(i))
 				const n = stack.length - b
@@ -183,8 +187,34 @@ export function expr(p: Program, c: Code, from: i32, to: i32, at: i32): string t
 					stack[n + k] = [`${p.strings[ns[2 * k]]}: ${stack[n + k][0]}`, atom]
 				}
 				stack.push([`{ ${take(b)} }`, atom])
-			default: return ""
+			default:
+				const sym = op.operators.find(x => x[1] == o)
+				if (sym == null) {
+					return ""
+				}
+				const level = prec(sym[0] as Shape)
+				const r = operand(level + 1)
+				stack.push([`${operand(level)} ${sym[0]} ${r}`, level])
+		}
+		while (k < c.forms.length && c.forms[k] == i) {
+			if (c.forms[k + 1] == op.As) {
+				// Parenthesized as the operand of any operator, as 6.5 has it among binary ones.
+				stack.push([`${operand(12)} as ${showType(p, c.forms[k + 2], at)}`, 0])
+			}
+			k += 3
 		}
 	}
 	return if (stack.length == 1) stack[0][0] else ""
+}
+
+/// Int v of type t as source, in the radix form says, a Hex, Octal or Binary, else in decimal.
+function digits(v: i64, t: i32, form: i32): string {
+	const [prefix, radix]: [string, i32] = switch (form) {
+		case op.Hex: ["0x", 16]
+		case op.Octal: ["0o", 8]
+		case op.Binary: ["0b", 2]
+		default: ["", 10]
+	}
+	const s = if (t == kind.U64) formatInt(v as u64, radix) else formatInt(v, radix)
+	return if (s[0] == minus) `-${prefix}${s.slice(1, s.length)}` else prefix + s
 }

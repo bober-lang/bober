@@ -5,7 +5,7 @@ import { lower } from "../lower"
 import * as decl from "./decl"
 import { abi, read, write } from "./file"
 import * as kind from "./kind"
-import { Import, Program } from "./program"
+import { Code, Import, Program } from "./program"
 import { showDecl, showType } from "./show"
 
 /// The modules of main.bob of source src, where it imports lib.bob of source lib.
@@ -33,9 +33,19 @@ function comments(p: Program, m: i32): string {
 	return p.modules[m].comments.map(c => `${c.pos}${if (c.trails) " trails" else ""} ${owner(c.owner)} //${c.text}\n`).join("")
 }
 
-/// The decls ds of p shown, each with its type as spelled before those it owns.
+/// The decls ds of p shown, each with its type as spelled and its code's marks before those it owns.
 function owned(p: Program, ds: i32[]): string {
-	return ds.map(d => `${showDecl(p, d)}${showType(p, p.decls[d].spelled)}\n${owned(p, p.decls[d].members)}`).join("")
+	return ds.map(d => `${showDecl(p, d)}${showType(p, p.decls[d].spelled)}${marks(p, p.decls[d].code)}\n${owned(p, p.decls[d].members)}`).join("")
+}
+
+/// The marks of code c of p, each its op, form and type.
+function marks(p: Program, c: Code | null): string {
+	const fs = c?.forms ?? []
+	let s = ""
+	for (const k of 0 ... fs.length / 3 - 1) {
+		s += ` ${fs[3 * k]}:${fs[3 * k + 1]} ${showType(p, fs[3 * k + 2])}`
+	}
+	return s
 }
 
 /// Writes each module of p, reads them all into a new Program, and asserts each reads back as it was written, of the
@@ -75,7 +85,8 @@ export function f(b: Box[i32]): i32 { return twice(b.v) + g[i32](1) }
 function g[T](x: T): T { return (() => x)() }
 export function h(p: Two[i32] | "x", f: (n: i32) => void throws string, b: lib.Box[i32]) {}
 export const k: "a" | "b" = "a" /// Which one.
-test "f" { assert f(new Box[i32](2)) == 5 }`,
+const c = ("A" as u8) + 0x1
+test "f" { assert f(new Box(2)) == 5 }`,
 		`export class Box[T] {
 	/// The value,
 	///
@@ -91,6 +102,7 @@ export type Pair[T] = [T, T]`)
 	assert comments(p, lib) == "23 v /// The value,\n39 v ///\n44 v ///boxed.\n60 trails - // and not a doc\n"
 	assert p.strings[p.decls[p.find(lib, p.find(lib, -1, "Box"), "v")].doc] == "The value,\n\nboxed."
 	assert imports(p, main) == "21 ./lib lib.bob  [Box , Pair Two, twice ]\n69 ./lib lib.bob lib []\n"
+	assert marks(p, p.decls[p.find(main, -1, "c")].code) == " 0:2 none 0:1 u8 1:3 none"
 	roundTrip(p)
 }
 

@@ -395,7 +395,7 @@ class Unit {
 	/// The type annotation n stands for as written, of src/bc/kind.bob's kinds after Member too; what it names in
 	/// `async T`, `typeof x` and `T.elem` as resolved, and `T[readonly]` as its type param, named after T resolved, as it
 	/// has no T to hold T as written.
-	private spell(n: Node): i32 {
+	spell(n: Node): i32 {
 		const p = this.prog
 		const r = this.ty(n.type!, true)
 		const a = n.parts.at(0)
@@ -841,6 +841,19 @@ class Gen {
 		return level
 	}
 
+	/// Marks the op added last with form f of type t (Code.forms), unless the code is unreachable there.
+	private mark(f: u8, t: i32 = 0) {
+		if (this.dead == 0) {
+			this.code.form(this.code.ops.length - 1, f, t)
+		}
+	}
+
+	/// The type annotation n stands for as written (Unit.spell), but as resolved where a local holds a type of it.
+	private written(n: Node): i32 {
+		const r = this.ty(n.type!)
+		return if (this.prog.reflected(r)) r else this.u.spell(n)
+	}
+
 	private br(o: Opcode, level: i32) { this.op(o, this.depth - 1 - level) }
 	private int(t: i32, v: i64) { this.op(op.Int, t, this.prog.int(v)) }
 	private real(t: i32, f: f64) { this.op(op.Float, t, this.prog.int(bits(f) as i64)) }
@@ -963,6 +976,9 @@ class Gen {
 	expr(p: Node) {
 		const pos = this.at(p)
 		this.cast(this.raw(p), this.ty(p.type!))
+		if (p.kind == "binary" && p.t.kind == "as") {
+			this.mark(op.As, this.written(p.parts[1]))
+		}
 		const i = this.shown.indexOf(p)
 		if (i >= 0) {
 			this.kept[i] = if (this.kept[i] < 0) this.temp(this.ty(p.type!)) else this.kept[i]
@@ -1978,6 +1994,9 @@ class Gen {
 		} else {
 			const v = integer(s)
 			this.int(this.ty(t), if (negate) -v else v)
+			if (s.length > 2 && s[0] == zero && isAlphabetic(s[1])) {
+				this.mark(if (s[1] == x) op.Hex else if (s[1] == o) op.Octal else op.Binary)
+			}
 		}
 	}
 
@@ -2368,6 +2387,10 @@ class Gen {
 			return this.ty(t)
 		}
 		this.op(op.New, this.ty(t))
+		const s = this.written(p.parts[0])
+		if (s != this.ty(t)) {
+			this.mark(op.Spelled, s)
+		}
 		return this.ty(t)
 	}
 
@@ -2494,6 +2517,7 @@ class Gen {
 			case "as":
 				if (isTok(a, "string") && t.kind == "int") {
 					this.int(this.ty(t), codePoint(unquoted(this.text(a)), 0)[0])
+					this.mark(op.Char)
 					return this.ty(t)
 				}
 				this.expr(a)
