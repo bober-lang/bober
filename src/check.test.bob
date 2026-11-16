@@ -509,6 +509,10 @@ test "generics" {
 		== "117: expected bool, got () => i64"
 	assert errors("function f[T](xs: T[], ys: T[]): T[] { return xs }\nfunction g[T](a: T, b: T): T { return a }\nconst x: i64 = 1\nconst a = f([], [1])\nconst b = f([1], [x])\nconst c = g(if (true) 1 else 2, x)\nconst d: i64[] = f([1], [])\nconst e = g(1 + 2, x)\nconst h = g({ a: 1 }, { a: x })")
 		== ""
+	// A number cast's target is no want for a call's type args.
+	assert errors("interface Float extends f32 | f64 {}\nfunction fl[T extends Float](x: T): T { return x }\n"
+		+ "function id[T](x: T): T { return x }\nconst w = 0.5 as f64\n"
+		+ "const a = (fl(w * 2.0) as i32) + (id(w - 1.0) as i32)") == ""
 	assert errors("function g[T](a: T, b: T): T { return a }\nconst K: u8 = 1\nconst a: bool = g(K, 3)\nconst b = g(K, 300)")
 		== "74: expected bool, got u8; 97: 300 is not representable as u8"
 	assert errors("function g[T](a: T, b: T): T { return a }\nfunction f(c: bool): i32 {\n\tconst a = g(1, if (c) 2 else null)\n\tconst b = g(if (c) 2 else null, 1)\n\tconst d: i64 | null = g(1, if (c) 2 else null)\n\tconst e: i64 | null = g(if (c) 1 else null, 2)\n\tconst h = g(if (c) 1 else null, 2 as i64)\n\tconst k: bool = g(1, null)\n\tconst l: bool = g(null, 1)\n\treturn 0\n}")
