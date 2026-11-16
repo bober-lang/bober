@@ -3,7 +3,8 @@
 //! version if given, first, by which the program knows the code it runs (src/lift.bob's compilerId). It is run through
 //! the C library's loader, `<sysroot>/usr/lib/libc.so launch ...`, so that it holds no path to one, but on macOS, whose
 //! loader is the system's. An image named `*.run` is a run's own link to it, removed once loaded. The image is locked
-//! shared while it runs, as a build writes one in place only if none has it (src/bober.bob).
+//! shared while it runs, as a build writes one in place only if none has it (src/bober.bob). On Linux its malloc,
+//! mimalloc, is the images' and the C library's, as it exports it.
 
 #include <dlfcn.h>
 #include <fcntl.h>
