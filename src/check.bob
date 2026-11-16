@@ -4648,8 +4648,10 @@ class Checker {
 			return this.convert(p.parts[0], Type.array(t)) // an array spread's elements convert to t
 		}
 		const m = taken(u, t)
-		// An object literal with a member t lacks keeps its own members, converting to t as one of typed values does.
-		const own = p.kind == "object" && u.kind == "object" && u.fields.some(f => m.member(f.name) == null)
+		// An object literal keeps an object of its own members where the member of t it takes is an interface or lacks
+		// one, converting to t as typed values do.
+		const own = p.kind == "object" && u.kind == "object"
+			&& (m.kind == "interface" || u.fields.some(f => m.member(f.name) == null))
 		const c = if (own) Type.object(u.fields.map(f => new Field(f.name, m.member(f.name) ?? f.type.widen(true))))
 			else m
 		p.type = c
