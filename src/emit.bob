@@ -1762,12 +1762,15 @@ class Emitter {
 		}
 		const t = this.p.lists[env][0]
 		if (name == "get" || name == "set") {
-			// Through x itself, a ref: of an array, its header, else the elements of one.
+			// Through x itself: of an array, its header, else the elements of one, or a copy of x held in place, which a
+			// constant i leaves a register.
 			const v = if (name == "set") this.pop() else null
 			const i = this.pop().v
 			const x = this.pop()
 			const head = this.kindOf(x.t) == kind.Array
-			const q = this.ir().gep(this.b.int(8), x.v, [i])
+			const ty = this.ll(x.t)
+			const at = if (ty == this.ref) x.v else this.spill(x.v, ty, this.scratch(ty, promoted))
+			const q = this.ir().gep(this.b.int(8), at, [i])
 			if (v == null) {
 				const r = this.read(q, t)
 				this.push(if (head) this.header(r) else r, ret)
