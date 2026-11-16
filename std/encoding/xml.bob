@@ -427,13 +427,20 @@ class Parser {
 				this.elementDecl()
 			} else if (this.eat("<!NOTATION")) {
 				this.required()
-				while (!this.eat(">")) {
-					if (this.peek() == quote || this.peek() == ascii.apostrophe) {
-						this.literal()
-					} else {
-						this.next()
-					}
+				this.name()
+				this.required()
+				const pub = this.eat("PUBLIC")
+				if (!pub) {
+					this.expect("SYSTEM")
 				}
+				this.required()
+				this.literal()
+				if (this.space() && pub && !this.looking(">")) {
+					// a notation's public ID needs no system one
+					this.literal()
+					this.space()
+				}
+				this.expect(">")
 			} else {
 				throw this.error()
 			}
