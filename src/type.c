@@ -216,7 +216,7 @@ static void complete(bober_type *t) {
     at = up(at, a), align = a > align ? a : align;
     f->offset = at, at += n;
   }
-  t->ssize = up(at, align);
+  t->ssize = up(at ? at : 1, align);  // a byte more if of none, as src/emit.bob's struct
   uint64_t *words = alloc((t->ssize / 512 + 1) * 8);
   for (int64_t i = 0; i < t->nfields; i++) {
     const bober_field *f = &t->fields[i];
