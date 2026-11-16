@@ -1830,6 +1830,17 @@ class Emitter {
 			this.push(this.bool(false), kind.Null)
 			return
 		}
+		if (name == "addr" && (this.dynamic(t) || this.kindOf(t) == kind.Union)) {
+			// Its ref, or the address of a copy of its bits.
+			const v = this.pop()
+			this.touch(v.t) // by identity
+			const u = v.v
+			const r = this.ir().cast("ptrtoint", this.refOf(u), this.i64)
+			const bits = this.spill(this.bitsOf(u), this.i64, this.slot(this.i64))
+			const at = this.ir().cast("ptrtoint", bits, this.i64)
+			this.push(this.ir().select(this.ir().icmp("eq", r, this.i64Const(0)), at, r), ret)
+			return
+		}
 		if (this.dynamic(t)) {
 			// Of a type known at run time, which its descriptor says how to hold.
 			const d = this.desc(t)
@@ -1839,13 +1850,6 @@ class Emitter {
 					[this.ir().binary("mul", this.pop().v, this.word(d, sizeAt)), this.layoutOf(d)], false), ret)
 				case "array": this.push(this.cellOf(t, this.pop().v), ret)
 				case "zero": this.push(this.zero(t), ret)
-				case "addr":
-					// Its ref, or the address of a copy of its bits.
-					const u = this.pop().v
-					const r = this.ir().cast("ptrtoint", this.refOf(u), this.i64)
-					const bits = this.spill(this.bitsOf(u), this.i64, this.slot(this.i64))
-					const at = this.ir().cast("ptrtoint", bits, this.i64)
-					this.push(this.ir().select(this.ir().icmp("eq", r, this.i64Const(0)), at, r), ret)
 				case "load": this.push(this.read(this.ir().cast("inttoptr", this.pop().v, this.ptr), t), ret)
 				case "store":
 					const v = this.pop()
