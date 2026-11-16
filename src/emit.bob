@@ -2911,6 +2911,17 @@ class Emitter {
 			this.ir().load(this.b.int(8), this.ir().gep(this.b.int(8), q, [this.i64Const(at)]), false), this.i64)
 		// A ref's tag taken off by the tag read, not each case's own, so that the cases are alike.
 		const off = this.ir().binary("sub", this.i64Const(0), this.ir().binary("shl", tag, this.i64Const(56)))
+		if (ms.every(m => m == kind.Null || this.spare(m) == 7)) {
+			// Of refs at word 0, null's 0 too: the ref loaded once, its type's id looked up by the tag, not switched on.
+			const ids = ms.map(_ => this.i64Const(0))
+			for (const i of 0 ... ms.length - 1) {
+				ids[this.tagByte(n, i)] = this.tag(ms[i])
+			}
+			const table = this.b.constant(this.b.constArray(this.i64, ids))
+			const id = this.ir().load(this.i64, this.ir().gep(this.i64, table, [tag]), false)
+			return this.union(id, this.i64Const(0),
+				this.ir().gep(this.b.int(8), this.ir().load(this.ref, q, false), [off]))
+		}
 		const u = this.scratch(this.unionTy, promoted)
 		const bytes: i64[] = []
 		for (const i of 0 ... ms.length - 2) {
