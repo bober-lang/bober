@@ -2,6 +2,7 @@
 
 import { endsWith, indexOf, startsWith } from "../std/algo"
 import { exists, mkdirAll, open, remove } from "../std/fs"
+import { base } from "../std/fs/path"
 import * as process from "../std/process"
 import { replace } from "../std/string"
 import { Compile, build, format, machine, toolchain } from "./bober"
@@ -9,7 +10,9 @@ import { Bytes } from "./link/bytes"
 import { Linker } from "./link/link"
 import { CLib, dir } from "./pkg"
 
-const home = "build/image-test"
+/// Where the running test builds, a directory of its own, by the number of its TMPDIR, that tests running at once do not
+/// build in each other's, and as deep in the package as the build directory, that "../../" is its root.
+function home(): string { return `build/image-test${base(process.env("TMPDIR")!)}` }
 
 /// The files of the program, main.bob's calling size of n types.
 function files(n: i32): [string, string][] {
@@ -18,35 +21,35 @@ function files(n: i32): [string, string][] {
 
 /// What main prints, built in home at level, as lowered if "", with the files written first.
 function built(files: [string, string][], level = "", main = "main.bob"): string {
-	mkdirAll(home)
+	mkdirAll(home())
 	for (const [name, src] of files) {
-		writeFile(`${home}/${name}`, src)
+		writeFile(`${home()}/${name}`, src)
 	}
 	const f = new Compile()
 	f.O1 = level == "-O1"
 	f.O2 = level == "-O2"
 	f.release = level == "-release"
-	dir = `${home}/build`
+	dir = `${home()}/build`
 	try {
-		process.run(build(`${home}/${main}`, false, f, false), `${home}/out`)
+		process.run(build(`${home()}/${main}`, false, f, false), `${home()}/out`)
 	} finally {
 		dir = "build"
 	}
-	return readFile(`${home}/out`)!
+	return readFile(`${home()}/out`)!
 }
 
 /// The objects home's image holds.
 function held(): string[] {
-	const image = open(`${home}/build/image.so`)
+	const image = open(`${home()}/build/image.so`)
 	const names = new Linker(machine, format, new Bytes(image.map())).objects().map(o => o.copy()) // not the image's, which a later build may write in place
 	image.close()
 	return names
 }
 
-/// Removes home's image, that the next build starts anew rather than as an edit of the last test's.
+/// Removes home's image, that the next build starts anew rather than as an edit of the last run's.
 function anew() {
-	if (exists(`${home}/build/image.so`)) {
-		remove(`${home}/build/image.so`)
+	if (exists(`${home()}/build/image.so`)) {
+		remove(`${home()}/build/image.so`)
 	}
 }
 
@@ -152,7 +155,7 @@ test "a trap in -O2's code shows its line, after an edit above it" {
 test "a union cast to an interface at -O0 traps if the value does not fit" {
 	anew()
 	const main = "interface HasSide { side: f64 }\nfunction side(n: HasSide | null): f64 { return n!.side }\nfunction main() { side(null) }\n"
-	assert built([["main.bob", main]]) == `${home}/main.bob:2:49: trap: cast to a type that is not the value's\n`
+	assert built([["main.bob", main]]) == `${home()}/main.bob:2:49: trap: cast to a type that is not the value's\n`
 }
 
 test "a union of more than 256 classes, which a tag byte does not tell apart, holds each at every level" {
@@ -186,7 +189,7 @@ test "-O2 has LLVM compile each monomorphized module, an edited one TPDE until i
 	const fresh = units()
 	assert out == printed(1) && fresh.length > 0 && fresh.every(o => indexOf(o, "^O2@") >= 0)
 	const edited = built([["lib.bob", replace(lib, "return f(i32)", "return f(i64)")]], "-O2")
-	assert edited == replace(out, "true i32", "true i64") && units().some(o => startsWith(o, `${home}/lib.bob^O1@`))
+	assert edited == replace(out, "true i32", "true i64") && units().some(o => startsWith(o, `${home()}/lib.bob^O1@`))
 	const again = built([], "-O2")
 	const opt = units()
 	assert again == edited && opt.every(o => indexOf(o, "^O2@") >= 0) && built([], "-O1") == edited && units() == opt
@@ -198,7 +201,7 @@ function main() { print(\`\${name()} \${one()}\`) }\n`
 	const run = (one: string) => built([["dep.bob", `export function one(): i32 { return ${one} }\n`],
 		["main.bob", main]])
 	const [out, again, edited] = [run("1"), run("1"), run("2")]
-	assert startsWith(out, `bober.main.${home}/main.bob@`) && again == out
+	assert startsWith(out, `bober.main.${home()}/main.bob@`) && again == out
 	assert edited != replace(out, " 1", " 2") && endsWith(edited, " 2\n")
 }
 
@@ -207,7 +210,7 @@ test "a module's unit as lowered and monomorphized are held side by side, each b
 	const [out, mono] = [built(files(1)), built([], "-O1")]
 	const both = held()
 	assert out == printed(1) && mono == out && built([]) == out && held() == both
-	assert both.some(o => startsWith(o, `${home}/lib.bob@`)) && both.some(o => startsWith(o, `${home}/lib.bob^O1@`))
+	assert both.some(o => startsWith(o, `${home()}/lib.bob@`)) && both.some(o => startsWith(o, `${home()}/lib.bob^O1@`))
 }
 
 test "programs that share a module, each of other instances of its generic and classes of its interface, built -O1" {
@@ -247,7 +250,7 @@ test "programs of a package, each with a class of a module's interface, link the
 	const main = (c: string) => `import { named } from "./lib"\n\nclass ${c} { name(): string { return "${c}" } }\n
 function main() { print(named(new ${c}())) }\n`
 	anew()
-	mkdirAll(`${home}/pkg`)
+	mkdirAll(`${home()}/pkg`)
 	const a = built([["pkg/bober.pkg", `{ "name": "@test/pkg" }\n`], ["pkg/lib.bob", lib], ["pkg/a.bob", main("A")],
 		["pkg/b.bob", main("B")]], "-O1", "pkg/a.bob")
 	const units = held()

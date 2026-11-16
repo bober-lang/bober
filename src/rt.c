@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <sys/ucontext.h>  // <ucontext.h> is an #error on macOS without _XOPEN_SOURCE
 #include <unistd.h>
@@ -109,6 +110,12 @@ _Noreturn void bober_trap(const char *what, const char *file, int32_t at) {
 
 /// Ends the process as an uncaught trap on a fault by a frame stepping off the end of its stack, onto the guard below,
 /// which may be in the C library holding its state; any other fault ends it as it would have without.
+/// Gives fault a stack of its own, as the faulting one is full, anew in a forked child, which macOS gives none.
+static void altStack(void) {
+  static char alt[1 << 16];
+  sigaltstack(&(stack_t){.ss_sp = alt, .ss_size = sizeof alt}, 0);
+}
+
 static void fault(int sig, siginfo_t *info, void *c) {
   uintptr_t sp = SP((ucontext_t *)c), at = (uintptr_t)info->si_addr;
   if (at - sp + (1 << 16) < 1 << 17) put(saved[1], "trap: stack overflow\n", 21), _exit(1);  // within a frame of sp
@@ -198,9 +205,7 @@ void bober_start(int argc, char **argv, int32_t tested) {
     unsetenv("BOBER_TMP");  // not for the programs tests run
   } else getentropy(&seed, sizeof seed);
   signal(SIGPIPE, SIG_IGN);  // a write to a socket the peer closed fails with EPIPE instead
-  // fault runs on a stack of its own, as the faulting one is full.
-  static char alt[1 << 16];
-  sigaltstack(&(stack_t){.ss_sp = alt, .ss_size = sizeof alt}, 0);
+  altStack();
   struct sigaction a = {.sa_sigaction = fault, .sa_flags = SA_SIGINFO | SA_ONSTACK};
   sigaction(SIGSEGV, &a, 0), sigaction(SIGBUS, &a, 0);
   bober_types_complete();
@@ -240,6 +245,17 @@ static void key(Level *l, const char *name) {
 /// Prints the entries of the tests not yet printed, so that a crash leaves those before it and the key of its test.
 static void flush(void) { put(saved[0], all.kids + sent, all.n - sent), sent = all.n; }
 
+/// Appends to l, escaped, at most the last 4 KiB of what file fd holds from byte from, and a newline if it ends none.
+static void tail(Level *l, int fd, long from) {
+  char buf[4096], *b = buf;
+  long at = lseek(fd, 0, SEEK_END);
+  bool cut = at - from > (long)sizeof buf;
+  long n = pread(fd, buf, sizeof buf, cut ? at - (long)sizeof buf : from);
+  while (cut && n > 0 && (*b & 0xC0) == 0x80) b++, n--;  // a character cut off
+  add(l, b, n > 0 ? n : 0, true);
+  if (n > 0 && b[n - 1] != '\n') raw(l, "\\n");
+}
+
 /// Ends l, which trapped with msg if trapped: adds its value to its parent's entries, "ok" if it and its subtests
 /// passed, else what it printed, at most the last 4 KiB and with its subtests' output, and msg, or if subtests failed
 /// their entries, and that as "trap", which a subtest may also be named.
@@ -247,14 +263,7 @@ static void end(Level *l, bool trapped) {
   Level *up = l->up;
   if (trapped) {
     Level *to = l->failed ? (key(l, "trap"), l) : up;
-    char buf[4096], *b = buf;
-    long at = lseek(cap, 0, SEEK_CUR);
-    bool cut = at - l->from > (long)sizeof buf;
-    long n = pread(cap, buf, sizeof buf, cut ? at - (long)sizeof buf : l->from);
-    while (cut && n > 0 && (*b & 0xC0) == 0x80) b++, n--;  // a character cut off
-    raw(to, "\""), add(to, b, n > 0 ? n : 0, true);
-    if (n > 0 && b[n - 1] != '\n') raw(to, "\\n");
-    add(to, msg, strlen(msg), true), raw(to, "\"");
+    raw(to, "\""), tail(to, cap, l->from), add(to, msg, strlen(msg), true), raw(to, "\"");
   }
   if (l->failed) raw(up, "{"), add(up, l->kids, l->n, false), raw(up, "}");
   else if (!trapped) raw(up, "\"ok\"");
@@ -274,23 +283,77 @@ static void run(const char *name, void (*f)(void *), void *env) {
   flush();
 }
 
+/// A test running in a process of its own: its name, the files its output and its result go to, and its entry of the
+/// report once it exited.
+typedef struct { pid_t pid; const char *name; FILE *out, *res; Level entry; } Child;
+static Child *children;
+static int nchildren, running;
+
+/// Waits for a child to exit, child i if i >= 0, else any, and takes its entry, its taint and the files it read, or if
+/// it exited without its entry, the end of its output and how it exited.
+static void reap(int i) {
+  int status;
+  pid_t pid;
+  while ((pid = waitpid(i < 0 ? -1 : children[i].pid, &status, 0)) < 0 && errno == EINTR) {}
+  if (pid < 0) bober_trap("cannot wait for a test", 0, -1);
+  Child *c = children;
+  while (c->pid != pid) c++;
+  long n = lseek(fileno(c->res), 0, SEEK_END);
+  char *r = bober_malloc(n);
+  n = pread(fileno(c->res), r, n, 0);
+  char *nl = n > 0 ? memchr(r, '\n', n) : 0;
+  if (nl && nl + 1 < r + n && WIFEXITED(status)) {
+    add(&c->entry, r, nl - r, false), bober_tainted |= nl[1] == '1';
+    long k = r + n - nl - 2;
+    bober_reads = bober_realloc(bober_reads, bober_nreads + k);
+    memcpy(bober_reads + bober_nreads, nl + 2, k), bober_nreads += k;
+    all.failed |= WEXITSTATUS(status) != 0;
+  } else {
+    char how[32];
+    snprintf(how, sizeof how, WIFEXITED(status) ? "exit %d" : "signal %d",
+             WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status));
+    key(&c->entry, c->name), raw(&c->entry, "\""), tail(&c->entry, fileno(c->out), 0);
+    raw(&c->entry, how), raw(&c->entry, "\""), all.failed = true;
+  }
+  free(r), fclose(c->out), fclose(c->res), c->pid = 0, running--;
+}
+
+/// Runs the test name in a child forked from this process as its module initialized it, so that each test sees that
+/// state and none another's, as many at once as there are processors. The child writes its entry of the report, then a
+/// line of whether it is tainted and the files it read (src/io.c), to a file of its own, which reap reads.
 void bober_test(const char *name, const char *file, void (*f)(void)) {
   static int n;  // tests so far
-  seed = STONEWALL, testFile = file, testAt = -1;
-  if (!all.n) put(saved[0], "{", 1);  // not before, as a trap in initializing prints instead
   if (tmp) snprintf(bober_tmp, PATH_MAX, "%s/%d", tmp, ++n), mkdir(bober_tmp, 0777);
-  run(name, (void (*)(void *))f, 0);
-  ftruncate(cap, 0), lseek(cap, 0, SEEK_SET);
+  while (running >= sysconf(_SC_NPROCESSORS_ONLN)) reap(-1);
+  Child c = {0, name, tmpfile(), tmpfile()};
+  if (!c.out || !c.res) bober_trap("cannot make a test's files", 0, -1);
+  fflush(0);
+  if ((c.pid = fork()) < 0) bober_trap("cannot fork a test", 0, -1);
+  if (!c.pid) {
+    seed = STONEWALL, testFile = file, testAt = -1, bober_nreads = 0;
+    altStack();
+    cap = saved[1] = fileno(c.out), saved[0] = fileno(c.res);
+    dup2(cap, 1), dup2(cap, 2);
+    run(name, (void (*)(void *))f, 0);
+    put(saved[0], bober_tainted ? "\n1" : "\n0", 2), put(saved[0], bober_reads, bober_nreads);
+    _exit(all.failed);
+  }
+  children = bober_realloc(children, ++nchildren * sizeof *children);
+  children[nchildren - 1] = c, running++;
 }
 
 void bober_subtest(const char *name, uint64_t f) { run(name, *(void (**)(void *))f, (void *)(uintptr_t)f); }
 
 void bober_mark(int32_t at) { testAt = at; }
 
-/// Ends the report of the tests, a JSON object of their entries, and adds a line of the files they read, a JSON array,
-/// null if they did what else their results may depend on (src/io.c); whether one failed.
+/// Prints the report of the tests, a JSON object of their entries, in their order, and a line of the files they read,
+/// a JSON array, null if they did what else their results may depend on (src/io.c); whether one failed.
 int32_t bober_tested(void) {
-  put(saved[0], all.n ? "}\n" : "{}\n", all.n ? 2 : 3);
+  for (int i = 0; i < nchildren; i++) {
+    if (children[i].pid) reap(i);
+    raw(&all, i ? "," : ""), add(&all, children[i].entry.kids, children[i].entry.n, false);
+  }
+  put(saved[0], "{", 1), flush(), put(saved[0], "}\n", 2);
   Level reads = {0};
   raw(&reads, bober_tainted ? "null" : "[");
   for (long i = 0; !bober_tainted && i < bober_nreads; i += strlen(bober_reads + i) + 1)
