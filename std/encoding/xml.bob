@@ -236,6 +236,8 @@ class Dtd {
 	/// Whether, not standalone, a parameter entity was left unread, after which XML 1.0 §5.1 has the entity and
 	/// attribute-list declarations not processed.
 	skipping = false
+	/// The general entities declared unparsed, by NDATA, which no reference may name.
+	unparsed: string[] = []
 	/// The bytes that references and attribute defaults have expanded to, which stop at limit against entities that
 	/// expand exponentially and defaults that expand quadratically.
 	expanded: i64 = 0
@@ -512,7 +514,8 @@ class Parser {
 			v = this.entityValue()
 		}
 		this.space()
-		if (v == null && this.eat("NDATA")) {
+		const ndata = v == null && !parameter && this.eat("NDATA")
+		if (ndata) {
 			this.required()
 			this.name()
 			this.space()
@@ -521,6 +524,9 @@ class Parser {
 		const entities = if (parameter) this.dtd.parameters else this.dtd.entities
 		if (!entities.has(name) && (parameter || builtin(name) == null) && !this.dtd.skipping) {
 			entities.set(name, v)
+			if (ndata) {
+				this.dtd.unparsed.push(name)
+			}
 		}
 	}
 
@@ -770,6 +776,9 @@ class Parser {
 		}
 		const v = this.expand(this.dtd.entities, name, at)
 		if (v == null) {
+			if (this.dtd.unparsed.includes(name)) {
+				throw new ParseError("syntax", at)
+			}
 			return
 		}
 		if (indexOf(v, "<") < 0 && indexOf(v, "&") < 0 && indexOf(v, "]]>") < 0) {
