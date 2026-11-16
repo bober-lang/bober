@@ -2169,11 +2169,11 @@ class Emitter {
 				this.push(this.ir().cast("trunc", n, this.i32), kind.I32)
 				return
 			}
-			const of = this.p.members(t)[0]
-			const s = if (p.kind(of) == kind.Object
-				|| p.kind(of) == kind.Named) this.layout(of).find(s => s.name == name)
-				else null
-			const ft = s?.t ?? fieldOf(p, t, name) // as fieldOf finds it: through a constraint, bases or embeds
+			// Of the type every member of t has it of, by its layout or as fieldOf finds it (through a constraint, bases or
+			// embeds), else any.
+			const laid = (m: i32) => if (p.kind(m) == kind.Object || p.kind(m) == kind.Named) this.layout(m) else []
+			const fts = p.members(t).map(m => laid(m).find(s => s.name == name)?.t ?? fieldOf(p, m, name))
+			const ft = if (fts.every(f => f == fts[0])) fts[0] else 0
 			if (this.kindOf(ft) == kind.Func) {
 				// Its method, as callMethod finds it, bound to it, else a function field.
 				const at = this.spill(u, this.unionTy)
