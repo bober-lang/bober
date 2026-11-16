@@ -2567,9 +2567,28 @@ class Emitter {
 			return this.unionOf(this.tag(f), v.v, f)
 		}
 		if (fk == kind.Union) {
-			// t may be no member, where a test of a class the union does not hold narrows to it.
+			// Of a member that converts to t, as a number widens or a function is called as one of fewer params, that
+			// converted; else t, which may be no member, where a test of a class the union does not hold narrows to it.
+			const ms = p.members(f).filter(m => this.converts(m, t) && (kind.widens(m, t) || p.kind(m) == kind.Func))
+			if (ms.length == 0) {
+				this.check(this.isa(v, t), "cast to a type that is not the value's")
+				return this.unbits(v.v, t)
+			}
+			const r = this.scratch(this.ll(t), promoted)
+			const done = this.label()
+			for (const m of ms) {
+				const [yes, no] = [this.label(), this.label()]
+				this.condBr(this.ir().icmp("eq", this.tagOf(v.v), this.tag(m)), yes, no)
+				this.start(yes)
+				this.ir().store(this.cast({ v: this.unbits(v.v, m), t: m }, t), r, false)
+				this.jump(done)
+				this.start(no)
+			}
 			this.check(this.isa(v, t), "cast to a type that is not the value's")
-			return this.unbits(v.v, t)
+			this.ir().store(this.unbits(v.v, t), r, false)
+			this.jump(done)
+			this.start(done)
+			return this.ir().load(this.ll(t), r, false)
 		}
 		if (fk == kind.Func && tk == kind.Func && (!this.dyn || this.converts(f, t))) {
 			return this.closure(this.adapter(f, t), [v.v])
