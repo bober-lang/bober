@@ -152,6 +152,30 @@ test "a trap in -O2's code shows its line, after an edit above it" {
 	assert indexOf(out, "lib.bob:1:47: trap") >= 0 && indexOf(again, "lib.bob:2:47: trap") >= 0
 }
 
+test "a class at -O0 embeds one laid out first, though one it refers to completes it" {
+	anew()
+	const main = `class Strand {
+	next: Bead | null = null
+}
+class Bead {
+	...Strand
+	k = 0
+}
+class Rope {
+	...Strand
+	last: ...Bead
+}
+function main() {
+	const r = new Rope()
+	const b = new Bead()
+	b.k = 5
+	r.last = { ...b }
+	print(\`\${r.last.k}\`)
+}
+`
+	assert built([["main.bob", main]]) == "5\n"
+}
+
 test "a union cast to an interface at -O0 traps if the value does not fit" {
 	anew()
 	const main = "interface HasSide { side: f64 }\nfunction side(n: HasSide | null): f64 { return n!.side }\nfunction main() { side(null) }\n"

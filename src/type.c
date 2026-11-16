@@ -177,6 +177,30 @@ static int64_t salign(const bober_type *t) {
   return a;
 }
 
+/// Lays out the struct a value of t, completed, refers to: its fields in order each at the next offset its alignment
+/// allows, an embedded one in place, laid out first, as a field of a type in completion may embed it.
+static void lay(bober_type *t) {
+  if (t->ssize || (t->kind != KCLASS && t->kind != KOBJECT && t->kind != KTUPLE)) return;
+  int64_t at = 0, align = 1;
+  for (int64_t i = 0; i < t->nfields; i++) {
+    bober_field *f = &t->fields[i];
+    bober_type *ft = (bober_type *)f->type;
+    complete(ft);
+    if (inPlace(f)) lay(ft);
+    int64_t a = inPlace(f) ? salign(ft) : ft->align, n = inPlace(f) ? ft->ssize : ft->size;
+    at = up(at, a), align = a > align ? a : align;
+    f->offset = at, at += n;
+  }
+  t->ssize = up(at ? at : 1, align);  // a byte more if of none, as src/emit.bob's struct
+  uint64_t *words = alloc((t->ssize / 512 + 1) * 8);
+  for (int64_t i = 0; i < t->nfields; i++) {
+    const bober_field *f = &t->fields[i];
+    mark(words, inPlace(f) ? f->type->slayout : f->type->layout, f->offset, 1, 0);
+  }
+  t->slayout = layout(t->ssize, words);
+  free(words);
+}
+
 static void complete(bober_type *t) {
   if (t->align) return;
   if (!t->base) t->base = t;
@@ -207,25 +231,7 @@ static void complete(bober_type *t) {
   } else {
     t->held = REF, t->size = t->align = 8, t->layout = (const bober_layout *)&ref;
   }
-  if (t->kind != KCLASS && t->kind != KOBJECT && t->kind != KTUPLE) return;
-  // The struct, its fields in order each at the next offset its alignment allows, an embedded one in place.
-  int64_t at = 0, align = 1;
-  for (int64_t i = 0; i < t->nfields; i++) {
-    bober_field *f = &t->fields[i];
-    bober_type *ft = (bober_type *)f->type;
-    complete(ft);
-    int64_t a = inPlace(f) ? salign(ft) : ft->align, n = inPlace(f) ? ft->ssize : ft->size;
-    at = up(at, a), align = a > align ? a : align;
-    f->offset = at, at += n;
-  }
-  t->ssize = up(at ? at : 1, align);  // a byte more if of none, as src/emit.bob's struct
-  uint64_t *words = alloc((t->ssize / 512 + 1) * 8);
-  for (int64_t i = 0; i < t->nfields; i++) {
-    const bober_field *f = &t->fields[i];
-    mark(words, inPlace(f) ? f->type->slayout : f->type->layout, f->offset, 1, 0);
-  }
-  t->slayout = layout(t->ssize, words);
-  free(words);
+  lay(t);
 }
 
 // Types formed at run time.
