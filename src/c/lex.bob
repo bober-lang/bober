@@ -5,7 +5,7 @@ import { endsWith, indexOf, upperBound } from "../../std/algo"
 import { Set } from "../../std/collections/set"
 import * from "../../std/ascii"
 import { split } from "../../std/string"
-import { values } from "../../std/types"
+import { min } from "../../std/math"
 import { number } from "./literal"
 import { Type } from "./type"
 
@@ -263,9 +263,17 @@ export class Lexer {
 
 	/// The longest punctuator ahead, or one character no token takes.
 	private punct(): Kind {
-		const p = punctuator([this.at(0), this.at(1), this.at(2)])
-		this.pos += p?.length ?? 1
-		return p ?? "other"
+		let n = min(3, this.src.length - this.pos)
+		while (n > 0) {
+			const s = this.src.slice(this.pos, this.pos + n)
+			if (s instanceof Punct) {
+				this.pos += n
+				return s
+			}
+			n--
+		}
+		this.pos++
+		return "other"
 	}
 
 	private at(i: i32): u8 { return this.src.at(this.pos + i) ?? nul }
@@ -275,20 +283,3 @@ export class Lexer {
 function isIdentStart(c: u8): bool { return isAlphabetic(c) || c == underscore || c == dollar || c >= 0x80 }
 function isIdentChar(c: u8): bool { return isIdentStart(c) || isDigit(c) }
 function isExponent(c: u8): bool { return c == e || c == E || c == p || c == P }
-
-const puncts = values[Punct]() // read once
-
-/// The longest punctuator that ahead starts with.
-function punctuator(ahead: u8[3]): Punct | null {
-	let p: Punct | null = null
-	for (const s of puncts) {
-		let i = 0
-		while (i < s.length && s[i] == ahead[i]) {
-			i++
-		}
-		if (i == s.length && s.length > (p?.length ?? 0)) {
-			p = s
-		}
-	}
-	return p
-}
