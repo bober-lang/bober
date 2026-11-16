@@ -2890,8 +2890,13 @@ class Emitter {
 			const m = if (ms[0] == kind.Null) ms[1] else ms[0]
 			return this.union(this.ir().select(none, this.tag(kind.Null), this.tag(m)), this.i64Const(0), x)
 		}
-		const tag = this.ir().cast("zext",
+		// The tag, read as the refs' word's top byte if there, so that taking it off a ref is a mask.
+		const tag = if (r >= 0) this.ir().binary("lshr",
+			this.ir().load(this.i64, this.ir().gep(this.b.int(8), q, [this.i64Const(r)]), false), this.i64Const(56))
+			else this.ir().cast("zext",
 			this.ir().load(this.b.int(8), this.ir().gep(this.b.int(8), q, [this.i64Const(at)]), false), this.i64)
+		// A ref's tag taken off by the tag read, not each case's own, so that the cases are alike.
+		const off = this.ir().binary("sub", this.i64Const(0), this.ir().binary("shl", tag, this.i64Const(56)))
 		const u = this.scratch(this.unionTy, promoted)
 		const bytes: i64[] = []
 		for (const i of 0 ... ms.length - 2) {
@@ -2905,7 +2910,7 @@ class Emitter {
 			if (k >= 0) {
 				// Without the tag, in the top byte of its ref: a pointer derived from it, which statepoints move with it.
 				const ref = if (k == 7) x else this.ir().extract(x, 2)
-				const bare = this.ir().gep(this.b.int(8), ref, [this.i64Const(-(this.tagByte(n, i) << 56))])
+				const bare = this.ir().gep(this.b.int(8), ref, [off])
 				x = if (k == 7) bare else this.ir().insert(x, bare, 2)
 			}
 			this.ir().store(if (boxed) this.union(this.tag(ms[i]), this.i64Const(0), x)
