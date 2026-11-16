@@ -118,23 +118,29 @@ export function append(a: string, b: string): string {
 }
 
 /// a + b in a's buffer, which a ends where it is used up to, with room r for b. A b held in place is copied by its two
-/// words if all 15 bytes fit, which takes no address of it and no call.
+/// words if all 15 bytes fit, which takes no address of it and no call. The sum is a with b's length added to its header,
+/// one add from it, as a loop that grows a string runs no faster than it makes each header from the last.
 function extended(a: string, b: string, r: i64): string {
-	const an = lenAt(addr(a))
+	const h = get[u64, string](a, 0) // 0xff and its length: a is long, as it has a buffer
 	const buf = get[Ref, string](a, 16)
 	const at = get[u64, string](a, 8)
-	const to = deref(buf) + at + (an as u64)
+	const end = at + (h >> 8)
+	const to = deref(buf) + end
 	const w = get[u64, string](b, 0)
-	let bn = (w & 0xff) as i64
+	let bn = w & 0xff
 	if (bn < 0xff && r >= 15) {
 		store[u64](to, w >> 8)
 		store[u64](to + 7, get[u64, string](b, 8))
 	} else {
-		bn = lenAt(addr(b))
-		memcpy(to, bytesAt(addr(b)), bn as u64)
+		bn = lenAt(addr(b)) as u64
+		memcpy(to, bytesAt(addr(b)), bn)
 	}
-	set[u64, Ref](buf, 8, at + ((an + bn) as u64) - 16)
-	return shared(buf, at, an + bn)
+	set[u64, Ref](buf, 8, end + bn - 16)
+	let s: u64[3]
+	s[0] = h + (bn << 8)
+	s[1] = at
+	set[Ref, u64[3]](s, 16, buf)
+	return load[string](addr(s))
 }
 
 /// a, with room after it in its buffer for n more bytes unless a and they fit in place: a's own if it has the room,
