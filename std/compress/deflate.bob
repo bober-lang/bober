@@ -107,8 +107,8 @@ export class Bits {
 class Huff {
 	private count = new i32[](16)
 	private symbol: i32[]
-	/// Whether the lengths claim more codes than fit.
-	readonly over: bool
+	/// Whether the lengths claim more codes than fit, or fewer, but for none or one of length 1, as zlib and Go take.
+	readonly bad: bool
 
 	constructor(lengths: i32[]) {
 		this.symbol = new i32[](lengths.length)
@@ -122,7 +122,7 @@ class Huff {
 			left = (left << 1) - this.count[l]
 			offs[l] = if (l == 1) 0 else offs[l - 1] + this.count[l - 1]
 		}
-		this.over = left < 0
+		this.bad = left != 0 && left != 1 << 15 && !(left == 1 << 14 && this.count[1] == 1)
 		for (const i of 0 ... lengths.length - 1) {
 			if (lengths[i] != 0) {
 				this.symbol[offs[lengths[i]]] = i
@@ -326,7 +326,7 @@ export class Inflater implements Reader {
 
 	private table(lengths: i32[]): Huff throws ParseError {
 		const h = new Huff(lengths)
-		if (h.over) {
+		if (h.bad) {
 			throw this.bad()
 		}
 		return h
