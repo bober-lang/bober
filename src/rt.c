@@ -51,8 +51,9 @@ static const char *tmp;  // in tests, the directory in which each gets one of it
 extern char bober_tmp[], *bober_reads;
 extern long bober_nreads;
 extern int bober_tainted;
-/// Reserves the heap (src/gc.c), before any code runs that may store to it.
-void bober_gc_start(void);
+/// Reserves the heap (src/gc.c), before any code runs that may store to it; at is the frame pointer of the program's
+/// entry, whose frames the collector walks up to.
+void bober_gc_start(void **at);
 /// Drops every fiber but the first (src/fiber.c), as once a trap jumped back to it.
 void bober_fibers_reset(void);
 static char msg[4096];
@@ -226,7 +227,7 @@ static void give(void) { put(jobs[1], "+", 1); }
 void *bober_caught(void) { return &caught->tag; }
 
 void bober_start(int argc, char **argv, int32_t tested) {
-  bober_gc_start();
+  bober_gc_start(*(void ***)__builtin_frame_address(0));  // the frame pointer of the entry, which calls this
   argc_ = argc, argv_ = argv, tests = tested;
   if (tests) {
     FILE *f = tmpfile();

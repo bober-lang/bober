@@ -1,7 +1,7 @@
 //! Fibers: each runs on a stack of its own and takes turns with the others, one running until it parks. A switch pushes
 //! the callee-saved registers onto the stack it leaves, keeps its stack pointer in the fiber, and pops them from the
-//! stack it enters. A fiber's first frame returns to 0, where unwinding, and so a throw or the collector, stops. Each
-//! fiber but the running one keeps where it parked as libunwind's context, from which the collector walks its frames.
+//! stack it enters. A fiber's first frame returns to 0, from frame pointer 0, where a throw's unwinding and the
+//! collector's walk stop. The collector walks each parked fiber's frames from the frame pointer its switch pushed.
 //! Each fiber is on one of two lists, of those that ran since the last collection and of the others, each doubly
 //! linked, so that a fiber resumed moves to the first and one that ends leaves either, at once. A minor collection
 //! walks only the frames of the first (src/gc.c), as the others hold no young ref.
@@ -9,7 +9,6 @@
 #ifndef BOBER_ARCH
 #include "rt.h"
 #endif
-#include <libunwind.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 
@@ -21,7 +20,6 @@ typedef struct Fiber {
   Link link;  // in ran or idle
   void *sp;
   char *stack;  // null for the first fiber, on the process's stack
-  unw_context_t parked;
   void *run;  // the function value a new fiber runs, until it starts
   struct Fiber *later;  // in the queue of those ready; 0 if not queued or last
   int dropped;          // by bober_fibers_reset; bober_wake ignores it
@@ -58,11 +56,13 @@ __asm__(".globl " SYM(bober_switch) "\n" SYM(bober_switch) ":\n"
         "  add sp, sp, #160\n  ret\n"
         // A new fiber's: calls x19 with a return address of 0.
         SYM(bober_enter) ":\n  mov x30, xzr\n  br x19\n");
+#define PUSHED_FP 10  // where among what it pushed x29 is
 #else
 __asm__(".globl " SYM(bober_switch) "\n" SYM(bober_switch) ":\n"
         "  push %rbp\n  push %rbx\n  push %r12\n  push %r13\n  push %r14\n  push %r15\n"
         "  mov %rsp, (%rdi)\n  mov %rsi, %rsp\n"
         "  pop %r15\n  pop %r14\n  pop %r13\n  pop %r12\n  pop %rbx\n  pop %rbp\n  ret\n");
+#define PUSHED_FP 5  // where among what it pushed rbp is
 #endif
 
 /// Runs fiber f, keeping where the running one parks; frees the stack of one that ended.
@@ -70,7 +70,6 @@ static void to(Fiber *f) {
   Fiber *self = running;
   running = f;
   off(f), onto(f, &ran);
-  unw_getcontext(&self->parked);
   bober_switch(&self->sp, f->sp);
   if (dead) munmap(dead->stack, STACK), free(dead), dead = 0;
 }
@@ -130,14 +129,17 @@ void bober_wake(uint64_t f) {
   last = w;
 }
 
-/// Calls visit with where each fiber but the running one parked, for the collector: those that ran since the last
-/// collection, or, if all, every one; they then count as not run since.
-void bober_parked(void (*visit)(unw_context_t *), int all) {
-  for (Link *l = idle.next; all && l != &idle; l = l->next) visit(&((Fiber *)l)->parked);
+/// The frame pointer of where f parked.
+static void **parked(Fiber *f) { return ((void ***)f->sp)[PUSHED_FP]; }
+
+/// Calls visit with the frame pointer of where each fiber but the running one parked, for the collector: those that ran
+/// since the last collection, or, if all, every one; they then count as not run since.
+void bober_parked(void (*visit)(void **), int all) {
+  for (Link *l = idle.next; all && l != &idle; l = l->next) visit(parked((Fiber *)l));
   for (Link *l = ran.next, *n; l != &ran; l = n) {
     Fiber *f = (Fiber *)l;
     n = l->next;
-    if (f != running) visit(&f->parked), off(f), onto(f, &idle);
+    if (f != running) visit(parked(f)), off(f), onto(f, &idle);
   }
 }
 

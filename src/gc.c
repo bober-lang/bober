@@ -52,6 +52,7 @@ static int64_t young, every = 32 << 20;  // what has been allocated since the la
 static int64_t olds, major = 64 << 20;   // the bytes of old objects, the dead since the last major too, and how many
                                          // make the next collection a major one
 static bool minor, verify, verifying;
+static void **bottom;  // the frame pointer of the program's entry, where a walk of the first fiber's frames stops
 static int64_t allocs, allocated, collections, majors;  // in all, for BOBER_GC_STATS
 
 /// A USDT probe bober:name of an int64_t, which perf and bpftrace can attach to: a nop until they do. Its ELF note says
@@ -96,8 +97,10 @@ static void stats(void) {
 }
 
 /// The 16 sizes up to 256 bytes, then 4 for each doubling, of up to SMALL; the heap's address space, its cards after,
-/// and one past them that the barrier marks for a place outside the heap; and its bits: bober_start's first (src/rt.c).
-void bober_gc_start(void) {
+/// and one past them that the barrier marks for a place outside the heap; and its bits: bober_start's first (src/rt.c),
+/// with the frame pointer of the program's entry.
+void bober_gc_start(void **at) {
+  bottom = at;
   for (int c = 0; c < CLASSES; c++)
     sizes[c] = sizes[c + CLASSES] = c < 16 ? 16 * (c + 1) : (64 << (c - 16) / 4) * (5 + (c - 16) % 4);
   for (int n = 0, c = 0; n <= SMALL / 16; n++) {
@@ -258,9 +261,9 @@ typedef struct { uint8_t type, reserved; uint16_t size, reg, reserved2; int32_t 
 typedef struct { uint64_t id; uint32_t offset; uint16_t reserved, locations; Location at[]; } Record;
 
 BOBER_SECTION(const uint8_t *const, bober_stackmaps);
-/// Calls visit with where each fiber but the running one parked: those that ran since the last collection, or, if
-/// all, every one (src/fiber.c).
-void bober_parked(void (*visit)(unw_context_t *), int all);
+/// Calls visit with the frame pointer of where each fiber but the running one parked: those that ran since the last
+/// collection, or, if all, every one (src/fiber.c).
+void bober_parked(void (*visit)(void **), int all);
 typedef struct { void *global; const bober_layout *layout; } Root;
 BOBER_SECTION(const Root, bober_roots);
 /// bober_static's places, each after its key, descriptor, size, layout and set word, chained by key and descriptor.
@@ -273,7 +276,9 @@ typedef struct Static {
 } Static;
 static Static *statics[1024];
 
-static struct Call { uintptr_t ret; const Record *r; } *calls;  // by return address, open addressed, half full
+/// A call's record and its frame's size, and how far below its frame pointer its stack pointer is, 0 until known, as
+/// never so for a frame with refs spilled; by return address, open addressed, half full.
+static struct Call { uintptr_t ret; const Record *r; int32_t size, below; } *calls;
 static uint64_t mask;
 
 /// The entry of return address ret, or where it goes.
@@ -298,7 +303,7 @@ static void records(void) {
       for (uint32_t f = 0; f < fns; f++)
         for (uint64_t k = 0; k < fn[3 * f + 2]; k++) {
           const Record *r = (const Record *)p;
-          if (pass) *call(fn[3 * f] + r->offset) = (struct Call){fn[3 * f] + r->offset, r};
+          if (pass) *call(fn[3 * f] + r->offset) = (struct Call){fn[3 * f] + r->offset, r, fn[3 * f + 1]};
           p = align8((const uint8_t *)&r->at[r->locations]);
           p = align8(p + 4 + 4 * *(uint16_t *)(p + 2));
         }
@@ -310,30 +315,59 @@ static void records(void) {
   }
 }
 
-/// The address of a ref spilled in the frame c is at, or null for a constant or a frame's address, which do not move.
-static void **spilled(unw_cursor_t *c, const Location *l) {
-  unw_word_t r;
-  if (l->type == 1) fputs("collect: a ref in a register\n", stderr), abort();
-  if (l->type != 3) return 0;
-  unw_get_reg(c, l->reg, &r);
-  return (void **)(r + l->offset);
+/// The DWARF numbers of the frame and the stack pointer, by which the stack maps place the refs of a frame: TPDE's by
+/// the frame pointer, which every function keeps (src/backend/llvm.bob), LLVM's by the stack pointer.
+#if defined(__aarch64__)
+#define FP 29
+#define SP 31
+#else
+#define FP 6
+#define SP 7
+#endif
+
+/// The stack pointer at call c, whose callee's frame pointer is fp: on x86 just past the return address; on arm64 the
+/// frame's size below its top, which libunwind finds once for each call.
+static char *sp(struct Call *c, void **fp) {
+#if defined(__aarch64__)
+  if (!c->below) {
+    unw_context_t ctx;
+    unw_cursor_t u;
+    unw_word_t top;
+    unw_getcontext(&ctx), unw_init_local(&u, &ctx);
+    unw_set_reg(&u, FP, (uintptr_t)*fp), unw_set_reg(&u, UNW_REG_IP, c->ret - 1);  // in the call, which may end it
+    if (unw_step(&u) <= 0) fputs("collect: a frame libunwind does not know\n", stderr), abort();
+    unw_get_reg(&u, UNW_REG_SP, &top);
+    c->below = (char *)*fp - ((char *)top - c->size);
+  }
+  return (char *)*fp - c->below;
+#else
+  return (char *)(fp + 2);
+#endif
 }
 
-/// Traces the refs each frame of a stack holds across its call, from where ctx is, each derived one moved with its
-/// base, a vector of them, as the SLP vectorizer makes, by each 8 bytes.
-static void frames(unw_context_t *ctx) {
-  unw_cursor_t c;
-  unw_init_local(&c, ctx);
-  while (unw_step(&c) > 0) {
-    unw_word_t ip;
-    unw_get_reg(&c, UNW_REG_IP, &ip);
-    const Record *r = call(ip)->r;
+/// The address of a ref spilled in the frame at call c, whose callee's frame pointer is fp, or null for a constant or a
+/// frame's address, which do not move.
+static void **spilled(struct Call *c, void **fp, const Location *l) {
+  if (l->type == 1 || (l->type == 3 && l->reg != FP && l->reg != SP))
+    fputs("collect: a ref in a register\n", stderr), abort();
+  if (l->type != 3) return 0;
+  return (void **)((l->reg == FP ? (char *)*fp : sp(c, fp)) + l->offset);
+}
+
+/// Traces the refs each frame of a stack holds across its call, each derived one moved with its base, a vector of them,
+/// as the SLP vectorizer makes, by each 8 bytes. From the frame of frame pointer fp, each frame's caller's is where its
+/// own points, with the return address into it after, up to the program's entry or a fiber's first frame, whose
+/// caller's is 0.
+static void frames(void **fp) {
+  for (; fp && fp != bottom; fp = *fp) {
+    struct Call *c = call((uintptr_t)fp[1]);
+    const Record *r = c->r;
     if (!r) continue;
     int from = 3 + r->at[2].offset, n = 0, m = 0;
     for (int i = from; i < r->locations; i++) n += r->at[i].size / 8;
     void **slots[n], *moved[n];
     for (int i = from; i + 1 < r->locations; i += 2) {
-      void **base = spilled(&c, &r->at[i]), **derived = base ? spilled(&c, &r->at[i + 1]) : 0;
+      void **base = spilled(c, fp, &r->at[i]), **derived = base ? spilled(c, fp, &r->at[i + 1]) : 0;
       for (int k = 0; base && k < r->at[i].size / 8; k++) {
         slots[m] = &base[k], moved[m] = traced(base[k]), m++;
         if (derived) slots[m] = &derived[k], moved[m] = (char *)moved[m - 1] + ((char *)derived[k] - (char *)base[k]), m++;
@@ -400,9 +434,7 @@ static void collect(void) {
   if (!calls) records();
   minor = olds <= major;
   memset(bumped, 0, sizeof bumped);
-  unw_context_t ctx;
-  unw_getcontext(&ctx);
-  frames(&ctx);
+  frames(__builtin_frame_address(0));
   bober_parked(frames, !minor);
   for (const Root *g = bober_roots; g < bober_roots_end; g++) root(g->global, g->layout->size, g->layout);
   for (int i = 0; i < 1024; i++)
