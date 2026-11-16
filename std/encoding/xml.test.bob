@@ -61,6 +61,9 @@ test "reject" {
 	const ext = "<!DOCTYPE r [<!ENTITY e SYSTEM 'e.xml'>]>"
 	assert parse(ext + "<r>&e;&f;</r>") throws new ParseError("syntax", 47)
 	assert parse(ext + "<r a='&e;'/>") throws new ParseError("syntax", 47)
+	const sa = "<?xml version='1.0' standalone='yes'?><!DOCTYPE r SYSTEM 'x'><r>&f;</r>"
+	assert parse(sa) throws new ParseError("syntax", 64)
+	assert parse("<!DOCTYPE r [<!ENTITY % p SYSTEM 'p'>]><r>&f;</r>") throws new ParseError("syntax", 42)
 	assert parse("<a></b>") throws new ParseError("syntax", 3)
 	assert parse("<a b='<'/>") throws new ParseError("syntax", 6)
 	assert parse("<a>&#0;</a>") throws new ParseError("syntax", 3)
@@ -76,6 +79,8 @@ test "reject" {
 	assert parse("<!DOCTYPE r [<!ENTITY a '&a;'>]><r>&a;</r>") throws new ParseError("range", 35)
 	assert parse("<!DOCTYPE r [<!ENTITY e 'ab'>]><r>&e;&e;</r>", 3) throws new ParseError("range", 37)
 	assert parse("<!DOCTYPE r [<!ATTLIST r x CDATA 'ab'>]><r/>", 3).children[1].attr("x") == "ab"
+	assert parse("<!DOCTYPE r [<!ENTITY % p ''>%p;%q;]><r>&f;</r>").children[1].children.length == 0
+	assert parse("<?xml version='1.0' standalone='yes'?><!DOCTYPE r [%q;]><r/>").children.length == 2
 	assert parse("<!DOCTYPE r [<!ATTLIST r x CDATA 'ab'>]><r/>", 2) throws new ParseError("range", 40)
 	assert parse("<!DOCTYPE r [<!ELEMENT r ( a, (b|c)*, d? )+><!ELEMENT a ( #PCDATA | b )*><!ELEMENT b ANY>]><r/>").children.length
 		== 2
