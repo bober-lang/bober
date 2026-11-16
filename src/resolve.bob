@@ -19,6 +19,7 @@
 import { bits, fromBits } from "../builtin/math"
 import { HashMap } from "../std/collections/hashmap"
 import { combine, fnv } from "../std/hash"
+import { min } from "../std/math"
 import * as decl from "./bc/decl"
 import * as kind from "./bc/kind"
 import * as op from "./bc/op"
@@ -340,8 +341,13 @@ export class Instances {
 			if (fs.length == 0 || fs.includes(-1)) {
 				return -1
 			}
+			// Of the params all take (as check calls a union of function types).
+			let n = p.items(fs[0]).length
+			for (const f of fs) {
+				n = min(n, p.items(f).length)
+			}
 			const ps: i32[] = []
-			for (const i of 0 ... p.items(fs[0]).length - 1) {
+			for (const i of 0 ... n - 1) {
 				ps.push(p.union(fs.map(f => p.items(f)[i])))
 			}
 			return p.type(kind.Func, p.list(ps), p.union(fs.map(f => p.b(f))))
