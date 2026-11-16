@@ -606,3 +606,26 @@ test "a class whose fields nest its type args ever deeper is an error, not endle
 	assert emit(p, p.module(main), new LLVM(main, 0),
 		o) throws new CompileError(`A[${deep}] | null nests type args ever deeper`)
 }
+
+test "a method whose type nests its class's type args ever deeper, or ever wider, is an error, not endless descriptors" {
+	mkdirAll(dir)
+	const main = `${dir}/deep.bob`
+	writeFile(main, "class P[T] {\n\tmany(): P[T[]] { return new P[T[]]() }\n}")
+	let p = lower([main])
+	let deep = "T"
+	for (const i of 1 ... 254) {
+		deep += "[]"
+	}
+	const o = { main: -1, tests: false, dyn: true }
+	assert emit(p, p.module(main), new LLVM(main, 0),
+		o) throws new CompileError(`() => P[${deep}] nests type args ever deeper`)
+	writeFile(main,
+		"interface Seq[T] {\n\tpairs(): Seq[[T, T]] | null\n}\nclass S[T] {\n\tpairs(): Seq[[T, T]] | null { return null }\n}")
+	p = lower([main])
+	let wide = "T"
+	for (const i of 1 ... 15) {
+		wide = `[${wide}, ${wide}]`
+	}
+	assert emit(p, p.module(main), new LLVM(main, 0),
+		o) throws new CompileError(`${`() => null | Seq[${wide}]`.slice(0, 1000)} … nests type args ever deeper`)
+}

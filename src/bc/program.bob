@@ -149,8 +149,9 @@ export class Program {
 	private substs = new HashMap[i64, i32]()
 	/// Per decl, its identity once made.
 	private identities = new HashMap[i32, i32[]]()
-	/// Per type, how deep its parts nest, 0 until known.
+	/// Per type, how deep its parts nest, and how many types it is made of, 0 until known.
 	private depths: i32[] = []
+	private sizes: i32[] = []
 	/// Per tuple element index, its name, a Str.
 	private elements: i32[] = []
 	private langs = new HashMap[string, i32]()
@@ -320,9 +321,9 @@ export class Program {
 		return r
 	}
 
-	/// Whether type t's parts nest deeper than a program's but one recurring without end does, as `f[T]` calling
-	/// `f[T[]]`.
-	endless(t: i32): bool { return this.depth(t) > 256 }
+	/// Whether type t's parts nest deeper, or it is made of more types, than a program's but one recurring without end
+	/// does, as `f[T]` calling `f[T[]]`, or `S[T]` naming `S[[T, T]]`.
+	endless(t: i32): bool { return this.depth(t) > 256 || this.size(t) > 65536 }
 
 	/// How deep type t's parts nest, 1 for none.
 	private depth(t: i32): i32 {
@@ -337,6 +338,21 @@ export class Program {
 			this.depths[t] = n + 1
 		}
 		return this.depths[t]
+	}
+
+	/// How many types t is made of, a part counted each time it occurs, up to 65537.
+	private size(t: i32): i32 {
+		while (this.sizes.length <= t) {
+			this.sizes.push(0)
+		}
+		if (this.sizes[t] == 0) {
+			let n = 1
+			for (const x of this.parts(t)) {
+				n = if (n + this.size(x) > 65537) 65537 else n + this.size(x)
+			}
+			this.sizes[t] = n
+		}
+		return this.sizes[t]
 	}
 
 	/// The types t lists: a function's params, a tuple's or object's parts, a union's members.

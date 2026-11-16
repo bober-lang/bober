@@ -25,7 +25,7 @@ import { Imm } from "./bc/op"
 import { Code, Module, Program, pair } from "./bc/program"
 import { qualified, showType } from "./bc/show"
 import { CompileError } from "./error"
-import { Instances, bases, embedded, runtime, takesType } from "./resolve"
+import { Instances, bases, embedded, fieldOf, runtime, takesType } from "./resolve"
 import { builtin, builtinPath } from "./root"
 
 /// Monomorphizes p, whose module main holds the main function and tests: those, or if units every module's but
@@ -190,7 +190,7 @@ class Mono {
 				this.dispatched(t, name)
 			}
 			for (const x of this.abstracts) {
-				const having = (s: i32) => p.union(this.ins.flat(s).filter(c => covers(p, c, x)))
+				const having = (s: i32) => p.union(this.ins.flat(s).filter(c => fits(p, c, x)))
 				const ss = this.sources.get(x)!.map(s => if (s != x && this.ins.abstract(s)) having(s) else s)
 				const u = p.union(ss)
 				if (u != (this.ins.held.get(x) ?? p.union([]))) {
@@ -252,7 +252,7 @@ class Mono {
 		const targets = p.members(to)
 		for (const x of targets.filter(x => ins.abstract(x))) {
 			for (const s of p.members(src)) {
-				if ((ins.abstract(s) || ins.nominal(s) == decl.Class && covers(p, s, x)) && !targets.includes(s)) {
+				if ((ins.abstract(s) || ins.nominal(s) == decl.Class && fits(p, s, x)) && !targets.includes(s)) {
 					this.source(x, s)
 				}
 			}
@@ -636,25 +636,50 @@ function add(m: HashMap[i32, i32[]], k: i32, v: i32) {
 	}
 }
 
-/// Whether class, interface or object type s has a field or method of each name interface or object type x has, its
-/// bases' counted as its own.
-function covers(p: Program, s: i32, x: i32): bool {
-	const has = (name: i32) => if (p.kind(s) == kind.Named) hasMember(p, p.a(s), name) else p.field(s, name) >= 0
-	if (p.kind(x) == kind.Named) {
-		return p.decls[p.a(x)].members.every(m => embedded(p, m) || has(p.decls[m].name))
-			&& bases(p, p.a(x)).every(b => covers(p, s, b))
-	}
-	for (const i of 0 ... p.items(x).length - 1) {
-		if (!has(p.names[p.b(x)][2 * i])) {
+/// Whether s fits t, as src/type.bob's fit does: a class, interface or object type fits an interface or object type by
+/// having each of its members, its bases' counted as its own, of a type that fits; a literal type also by its base, as
+/// an object's fields are typed without; a pair in seen, being worked out, is assumed to fit (§4.7). src/type.c's fits
+/// is the same at run time.
+function fits(p: Program, s: i32, t: i32, seen: i64[] = []): bool {
+	const [k, j] = [p.kind(s), p.kind(t)]
+	if (s == t || j == kind.Literal && s == p.a(t) || seen.includes(pair(s, t))) {
+		return true
+	} else if (k == kind.Union) {
+		return p.items(s).every(m => fits(p, m, t, seen))
+	} else if (j == kind.Union && p.items(t).some(m => fits(p, s, m, seen))) {
+		return true
+	} else if (k == kind.Literal) {
+		return fits(p, p.a(s), t, seen)
+	} else if (j == kind.Optional) {
+		return fits(p, if (k == j) p.a(s) else s, p.a(t), seen)
+	} else if (k == kind.Func && j == kind.Func) {
+		// Its params take t's args, its others are optional.
+		const [ss, ts] = [p.items(s), p.items(t)]
+		if (ss.length < ts.length || !fits(p, p.b(s), p.b(t), seen)) {
 			return false
 		}
+		for (const i of 0 ... ss.length - 1) {
+			if (if (i < ts.length) !fits(p, ts[i], ss[i], seen) else p.kind(ss[i]) != kind.Optional) {
+				return false
+			}
+		}
+		return true
+	} else if (j != kind.Object && !(j == kind.Named && p.decls[p.a(t)].kind == decl.Interface)
+		|| k != kind.Object && k != kind.Named) {
+		return kind.widens(s, t)
 	}
-	return true
-}
-
-/// Whether class or interface decl d has member name, a Str, or one of its bases has.
-function hasMember(p: Program, d: i32, name: i32): bool {
-	return p.member(d, name) >= 0 || bases(p, d).some(b => hasMember(p, p.a(b), name))
+	const up = [...seen, pair(s, t)]
+	const has = (name: i32, x: i32) => fits(p, fieldOf(p, s, name), x, up) // None, a member s lacks, fits nothing
+	if (j == kind.Object) {
+		for (const i of 0 ... p.items(t).length - 1) {
+			if (!has(p.names[p.b(t)][2 * i], p.items(t)[i])) {
+				return false
+			}
+		}
+		return true
+	}
+	return p.decls[p.a(t)].members.every(m => embedded(p, m) || has(p.decls[m].name, p.subst(p.decls[m].type, p.b(t))))
+		&& bases(p, p.a(t)).every(b => fits(p, s, p.subst(b, p.b(t)), up))
 }
 
 /// What a dispatch function's access how of a member of type ft takes after the receiver, and gives: nothing and the
