@@ -2508,8 +2508,11 @@ class Emitter {
 		if (fk == kind.Func && tk == kind.Func && (!this.dyn || this.converts(f, t))) {
 			return this.closure(this.adapter(f, t), [v.v])
 		}
-		if (fk == kind.Named && tk == kind.Named && (this.inlined(f) || this.inlined(t))) {
-			return this.b.constZero(this.ll(t)) // where a test of a class it is not narrows to it, never reached
+		if ((fk == kind.Named || fk == kind.Object) && tk == kind.Named && (fk != tk || p.a(f) != p.a(t))) {
+			// Of another class or an object, as mono holds an interface of one: a type param's value cast down, or after
+			// an instanceof that cannot hold.
+			this.check(this.bool(false), "cast to a type that is not the value's")
+			return this.b.constZero(this.ll(t))
 		}
 		if (!isNumber(fk) || !isNumber(tk)) {
 			return v.v
