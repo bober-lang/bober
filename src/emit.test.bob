@@ -573,6 +573,22 @@ exit 0
 `
 }
 
+test "a type nested deep keeps a short key, of a long part's hash, not one growing threefold a level" {
+	let src = "interface L0 { a: i32 }\n"
+	let lit = "{ a: 1 }"
+	for (const i of 1 ... 16) {
+		src += `interface L${i} { x: L${i - 1}; y: L${i - 1} | null; z: (p: L${i - 1}) => i32 }\n`
+		lit = `{ x: ${lit}, y: null, z: (p: L${i - 1}): i32 => ${i} }`
+	}
+	src += "function f(v: L16 | i32): i32 { return if (v instanceof i32) v else (v as L16).z(v.x) }\n"
+	src += `function main() {
+	const l: L16 = ${lit}
+	print(f(l))
+}
+`
+	assert run("nested", src) == "16\nexit 0\n"
+}
+
 test "a class whose fields nest its type args ever deeper is an error, not endless type descriptors" {
 	mkdirAll(dir)
 	const main = `${dir}/deep.bob`
