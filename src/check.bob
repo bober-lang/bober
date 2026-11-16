@@ -141,8 +141,20 @@ function special(path: string, name: string, t: Type) {
 	}
 }
 
-/// The members of t a value has: those not static.
-function fields(t: Type): Field[] { return members(t).filter(f => !f.static) }
+/// The members of t a value has: those not static, of an interface those of what it embeds in its place, but not
+/// those its own override.
+function fields(t: Type): Field[] {
+	const own = members(t).filter(f => !f.static)
+	const fs: Field[] = []
+	for (const f of own) {
+		if (f.embedded && t.kind == "interface") {
+			fs.push(...fields(f.type).filter(g => !own.some(o => o.name == g.name)))
+		} else {
+			fs.push(f)
+		}
+	}
+	return fs
+}
 
 function runDeferred() {
 	while (deferred.length > 0) {
