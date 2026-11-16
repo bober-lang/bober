@@ -132,8 +132,14 @@ uint64_t bober_convert(const bober_type *to, const bober_type *from, uint64_t bi
 _Noreturn void bober_trap(const char *what, const char *file, int32_t at);
 /// Traps as an assert that failed, with how, a string, saying how.
 _Noreturn void bober_fail(const uint8_t *how, const char *file, int32_t at);
+/// Whether this process runs the running test's next subtest, which it asks before evaluating its name: not if one of
+/// the processes running the test with it claimed it.
+int32_t bober_claim(void);
 /// Runs the function value f as the subtest name of the running test; a trap in it fails it and the test, which goes on.
 void bober_subtest(const char *name, uint64_t f);
+/// Makes the pool of tokens that the processes of the tests of programs started after share, one per processor, so
+/// that tested at once, as by bober test, they run no more at once than processors.
+void bober_jobs(void);
 /// Notes that the running test is at the statement at its source position at, which a trap elsewhere says it was called
 /// at.
 void bober_mark(int32_t at);

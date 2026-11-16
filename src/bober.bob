@@ -60,6 +60,7 @@ import { notice, update, version } from "./update"
 import { wasm } from "./wasm"
 import * as process from "../std/process"
 import { setenv } from "stdlib.h"
+import { bober_jobs } from "./rt.h"
 import { chdir, getcwd, getpid, isatty, link as hardLink } from "unistd.h"
 
 /// What a command line gives bober, spelled as a C compiler's: these options anywhere on it, a command's after the
@@ -271,7 +272,7 @@ function command(c: Command): i32 {
 			}
 			const main = c.args[0]
 			const f = c.compile
-			const [status, report] = runTests(main, c.args.slice(1, c.args.length), () => build(main, true, f, true))
+			const [status, report] = runTests(main, c.args.slice(1, c.args.length), () => build(main, true, f, true))()
 			stdout.write(yamlOf(report))
 			return status
 		case Build:
@@ -385,19 +386,22 @@ function init(name: string) {
 
 /// Runs the tests of testFiles(".") as test without main.bob prints them; 0 if all passed. A failed file's YAML starts
 /// with a line for each of its directories, of which those the last failed file printed are left out. Monomorphized,
-/// the files of a package are compiled as one, once (programs).
+/// the files of a package are compiled as one, once (programs). Each file starts once compiled, while those before run,
+/// all of their tests taking turns by the tokens of one pool (bober_jobs), and is reported once all are started.
 function testAll(f: Compile): i32 {
+	bober_jobs()
 	const files = testFiles(".")
 	const one = !f.wasm && !f.release && (f.O2 || f.O1 && !f.O0)
 	const commands = new HashMap[string, (main: string) => string[]]() // of the files compiled so
 	const clear = if (isatty(1) != 0) "\r\x1b[K" else ""
+	const started: (() => [i32, string])[] = [] // what waits for each file started, in order
 	let dirs: string[] = [] // of the last failed file
 	let failed = 0
 	for (const i of 0 ... files.length - 1) {
 		if (clear != "") {
 			stdout.write(`${clear}[${i + 1}/${files.length}] ${files[i]}`)
 		}
-		const [s, report] = runTests(files[i], [], () => {
+		started.push(runTests(files[i], [], () => {
 			if (!one) {
 				return build(files[i], true, f, true)
 			}
@@ -410,11 +414,14 @@ function testAll(f: Compile): i32 {
 				}
 			}
 			return commands.get(files[i])!(files[i])
-		})
+		}))
+	}
+	for (const i of 0 ... files.length - 1) {
+		const [s, r] = started[i]()
 		if (s != 0) {
 			const parts = split(files[i], "/")
-			const lines = split(yamlOf(parts.map(p => `{${quoted(p)}:`).join("") + report
-				+ parts.map(p => "}").join("")), "\n")
+			const lines = split(yamlOf(parts.map(p => `{${quoted(p)}:`).join("") + r + parts.map(p => "}").join("")),
+				"\n")
 			let k = 0
 			while (k < dirs.length && k < parts.length - 1 && dirs[k] == parts[k]) {
 				k++
@@ -468,20 +475,20 @@ class TestCache {
 	files: [string, string][] = []
 }
 
-/// Runs main's tests by the command command gives, building them, with args, unless their report is kept: its exit
-/// status, and its report, the JSON object src/rt.c prints, ended by the exit status if a crash cut it off, or else what
-/// failed as a JSON string.
-function runTests(main: string, args: string[], command: () => string[]): [i32, string] {
+/// Starts main's tests by the command command gives, building them, with args, unless their report is kept: what waits
+/// for them, giving their exit status and their report, the JSON object src/rt.c prints, ended by the exit status if a
+/// crash cut it off, or else what failed as a JSON string.
+function runTests(main: string, args: string[], command: () => string[]): () => [i32, string] {
 	try {
-		const out = `${dir}/${name(main)}.test.log`
 		const cmd = [...command(), ...args]
 		const flat = replace(normal(main), "/", "_")
+		const out = `${dir}/tmp/${flat}.log`
 		const file = `${dir}/kept/${flat}`
 		const code = if (built == "") "" else `${built} ${args.map(quoted).join(" ")}`
 		try {
 			const k = decodeJson[TestCache](readFile(file))
 			if (code != "" && k.code == code && k.files.every(x => hashOf(x[0]) == x[1])) {
-				return [0, k.report]
+				return () => [0, k.report]
 			}
 		} catch (e: IoError | ParseError) {}
 		const tmp = `${dir}/tmp/${flat}`
@@ -490,7 +497,17 @@ function runTests(main: string, args: string[], command: () => string[]): [i32, 
 		}
 		mkdirAll(tmp)
 		setenv("BOBER_TMP", tmp, 1)
-		const status = process.run(cmd, out)
+		const p = process.start(cmd, out)
+		return () => tested(p, out, code, file)
+	} catch (e: CompileError | IoError) {
+		return () => failure(e)
+	}
+}
+
+/// What runTests gives of the tests p runs, printing to out, kept by code in file unless code is "".
+function tested(p: process.Process, out: string, code: string, file: string): [i32, string] {
+	try {
+		const status = p.wait()
 		// The report, which a crash cuts off after the key of the test it was in, then the files the tests read.
 		const text = trim(readFile(out))
 		const nl = indexOf(text, "\n")
@@ -513,9 +530,14 @@ function runTests(main: string, args: string[], command: () => string[]): [i32, 
 			} catch (e: ParseError) {}
 		}
 		return [if (status == 0) 1 else status, quoted(trim(`${text}\nexit ${status}`))]
-	} catch (e: CompileError | IoError) {
-		return [1, quoted(if (e instanceof IoError) e.message() else e.msg)]
+	} catch (e: IoError) {
+		return failure(e)
 	}
+}
+
+/// What runTests gives of tests that could not run for e.
+function failure(e: CompileError | IoError): [i32, string] {
+	return [1, quoted(if (e instanceof IoError) e.message() else e.msg)]
 }
 
 /// The hash of the bytes of the file at path, "" if there is none.
@@ -835,7 +857,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	let left = if (old != null) stamp(mapped, format.headers) else 0 as u64 // the stamp of the image as this leaves it
 	const tmp = `${out}.${getpid()}`
 	if (old != null && done != null && done![0] == p && done![1] == left) {
-		return [if (pin) pinned(out, `${tmp}.run`) else out, done![2]]
+		return [if (pin) pinned(out, tmp) else out, done![2]]
 	}
 	const unchanged = old != null && d != null && left == d[0]
 	const kept = if (unchanged) d![2] else mapped
@@ -951,7 +973,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			return image(p, mains, files, cxx, pin, o, o2, true)
 		}
 	}
-	const own = if (pin) pinned(at, `${tmp}.run`) else out
+	const own = if (pin) pinned(at, tmp) else out
 	if (at != out) {
 		rename(tmp, out)
 	}
@@ -960,8 +982,13 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	return [own, done![2]]
 }
 
-/// own, made a link to the image at: a run's own, which the launcher removes.
-function pinned(at: string, own: string): string {
+let pins = 0 // made by pinned
+
+/// A link to the image at, tmp.<n>.run, a run's own, which the launcher removes, each of this process its own, as runs
+/// of it may be starting at once.
+function pinned(at: string, tmp: string): string {
+	pins++
+	const own = `${tmp}.${pins}.run`
 	if (exists(own)) {
 		remove(own) // which a process of this ID left, whose launcher never ran
 	}
