@@ -133,3 +133,57 @@ test "appending to a string of bytes leaves other strings be" {
 		assert other[i] == 0
 	}
 }
+
+test "a string grown by += leaves the others of its buffer be, and they it" {
+	let q = ""
+	let mid = ""
+	for (const i of 0 ... 199) {
+		q += chr((97 + i % 26) as u8)
+		if (i == 99) {
+			mid = q
+		}
+	}
+	assert q.length == 200 && mid == q.slice(0, 100)
+	for (const i of 0 ... 199) {
+		assert q[i] == ((97 + i % 26) as u8)
+	}
+	// Appended to past q in q's buffer, by one that ends where q does and by q's own +, then q again.
+	let p = q
+	p += "<>"
+	const t = q + "!"
+	q += "?"
+	q += `${p.length}` + "#"
+	assert t == q.slice(0, 200) + "!" && p == q.slice(0, 200) + "<>" && q.slice(200, 205) == "?202#"
+	// Itself, and more than one piece, appended.
+	q = mid
+	for (const i of 0 ... 2) {
+		q += q
+		q += "-" + chr((48 + i) as u8) + "-"
+	}
+	assert q.length == 821 && q.slice(0, 100) == mid && q.slice(200, 203) == "-0-" && q.slice(818, 821) == "-2-"
+	assert q.slice(203, 303) == mid && mid.length == 100
+	// Pieces of all the 15 bytes that the room is checked for.
+	let r = ""
+	for (const i of 0 ... 99) {
+		r += "0123456789abcde"
+	}
+	assert r.length == 1500 && r.slice(735, 750) == "0123456789abcde" && r.slice(1485, 1500) == "0123456789abcde"
+}
+
+test "a string stored to a local grown by += has its own room" {
+	let q = ""
+	for (const i of 0 ... 299) {
+		q += "x"
+	}
+	// One whose buffer is full, with another's after it.
+	const full = fromBytes(new u8[](48))
+	const next = fromBytes(new u8[](48))
+	q = full
+	for (const i of 0 ... 63) {
+		q += "y"
+	}
+	assert q.length == 112 && q.slice(0, 48) == full && q[48] == 121 && q[111] == 121
+	for (const i of 0 ... 47) {
+		assert next[i] == 0
+	}
+}

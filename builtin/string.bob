@@ -103,6 +103,22 @@ export function concat(a: string, b: string): string {
 		else append(reserve(a, lenAt(addr(b)), true), b)
 }
 
+/// a + b as concat gives it, for a the local that q += b appends to, with l a ref to its room: how many bytes its
+/// buffer has after it (after), or 0 while not known, which the compiler keeps beside the local (src/emit.bob). By it a
+/// short b where 15 bytes fit takes one check of all that concat makes: that a still ends where its buffer is used up
+/// to, which another string of that buffer may have been appended to past.
+export function grown(a: string, b: string, l: Ref): string {
+	const r = get[i64, Ref](l, 0)
+	const bn = get[u8, string](b, 0)
+	if (r >= 15 && bn < 0xff && last(a)) {
+		set[i64, Ref](l, 0, r - (bn as i64))
+		return extended(a, b, r)
+	}
+	const s = concat(a, b)
+	set[i64, Ref](l, 0, after(s))
+	return s
+}
+
 /// a + b, with room after a in its buffer, or none if they fit in place.
 export function append(a: string, b: string): string {
 	const an = lenAt(addr(a))
@@ -161,12 +177,23 @@ export function reserve(a: string, n: i64, twice: bool): string {
 	return shared(buf, 16, an)
 }
 
-/// How many bytes are free after a in its buffer if it ends where that is used up, else -1. Read of a itself, at no
-/// offset from its address, which the optimizer would not see through.
+/// How many bytes are free after a in its buffer if it ends where that is used up, else -1.
 function room(a: string): i64 {
+	const r = after(a)
+	return if (r >= 0 && last(a)) r else -1
+}
+
+/// How many bytes a's buffer has after a, free or not, or -1 if it has none. Read, as last reads, of a itself, at no
+/// offset from its address, which the optimizer would not see through.
+function after(a: string): i64 {
 	const buf = get[Ref, string](a, 16)
-	return if (deref(buf) != 0 && get[u64, string](a, 8) + (lenAt(addr(a)) as u64) == 16 + get[u64, Ref](buf, 8))
-		get[i64, Ref](buf, 0) - get[i64, Ref](buf, 8) else -1
+	return if (deref(buf) == 0) -1
+		else 16 + get[i64, Ref](buf, 0) - get[i64, string](a, 8) - (get[i64, string](a, 0) >> 8)
+}
+
+/// Whether a, which has a buffer, ends where that is used up to, so that the bytes after it are free.
+function last(a: string): bool {
+	return get[u64, string](a, 8) + (get[u64, string](a, 0) >> 8) == 16 + get[u64, Ref](get[Ref, string](a, 16), 8)
 }
 
 /// A buffer as concat's for n bytes, all used, for the caller to put at 16 on. Every long string's buffer is one,
