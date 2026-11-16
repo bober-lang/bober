@@ -243,15 +243,17 @@ export function object(sysroot: string, src: string, out: string, dirs: string[]
 
 /// Links args, objects and the linker's options, into out with the C library of sysroot, as ld.lld or on macOS ld64.lld
 /// does: an executable, static but on macOS, or one position-independent that loads the C library, either with mimalloc
-/// for musl's malloc, or a shared library; its threads' stacks 8 MiB, as glibc's, not musl's 128 KiB, which C++ code
-/// such as Binaryen's overflows; returns its exit status.
+/// for musl's malloc, which the position-independent one exports, by the names of musl's dynamic.list, that the C
+/// library and what it loads take it for theirs, or a shared library; its threads' stacks 8 MiB, as glibc's, not musl's
+/// 128 KiB, which C++ code such as Binaryen's overflows; returns its exit status.
 export function link(sysroot: string, args: string[], out: string, kind: "static" | "pie" | "shared" = "static"): i32 {
 	const lib = sysroot + "/usr/lib" // musl's
 	const argv = if (os == "macos") ["ld64.lld", if (kind == "shared") "-dylib" else "-execute", "-arch", arch,
 		"-platform_version", "macos", "14.0", "14.0", "-syslibroot", sysroot, "-o", out, ...args, "-lSystem"]
 		else ["ld.lld",
 		...(if (kind == "shared") ["-shared"]
-		else if (kind == "pie") ["-pie", `${lib}/Scrt1.o`, `${lib}/mimalloc.o`]
+		else if (kind == "pie") ["-pie", `${lib}/Scrt1.o`, `${lib}/mimalloc.o`, ...["malloc", "free", "calloc", "realloc",
+			"aligned_alloc", "posix_memalign", "memalign", "malloc_usable_size"].map(s => `--export-dynamic-symbol=${s}`)]
 		else ["-static", `${lib}/crt1.o`, `${lib}/mimalloc.o`]), "--eh-frame-hdr", "-z", "stack-size=8388608", "-o",
 		out, `${lib}/crti.o`, ...args, `-L${lib}`, "--start-group", "-lc", "-lunwind", `${lib}/libclang_rt.builtins.a`,
 		"--end-group", `${lib}/crtn.o`]
