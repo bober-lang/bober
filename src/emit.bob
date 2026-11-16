@@ -3562,10 +3562,13 @@ class Emitter {
 		return if (this.kindOf(t) == kind.FixedArray) this.gc(q) else this.ir().load(this.ll(t), q, false)
 	}
 
-	/// Stores v at place q of type t, an array's element if elem, copying a fixed array.
+	/// Stores v at place q of type t, an array's element if elem, copying a fixed array; one sized by rt.c, which marks
+	/// each card of it, as its size is not the IR's.
 	private put(q: Value, v: V, t: i32, elem = false) {
 		if (this.sized(t)) {
-			this.rt("memcpy", [this.raw(q), this.raw(this.cast(v, t)), this.word(this.desc(t), sizeAt)], false)
+			const d = this.desc(t)
+			this.rt("store",
+				[d, this.raw(q), this.spill(this.union(d, this.i64Const(0), this.cast(v, t)), this.unionTy)], false)
 		} else if (this.kindOf(t) == kind.FixedArray) {
 			this.ir().store(this.ir().load(this.mem(t), this.cast(v, t), false), q, false)
 		} else {
@@ -4054,7 +4057,7 @@ class Emitter {
 	/// Marks the card of place q, where a value of t was stored, if it holds a ref and the backend marks none itself.
 	private written(q: Value, t: IrType) {
 		if (this.b.holdsRef(t) && !this.b.marks()) {
-			mark(this.ir(), this.ir().load(this.i64, this.rts.get("heap")!, false), q)
+			mark(this.ir(), this.ir().load(this.i64, this.rts.get("heap")!, false), q, this.ir().bytes(t))
 		}
 	}
 

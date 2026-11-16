@@ -449,7 +449,8 @@ int64_t bober_load(const bober_type *t, const void *p, bober_union *u) {
 
 void bober_store(const bober_type *t, void *p, const bober_union *u) {
   t = t->canon;
-  bober_written(p);
+  int64_t n = t->held == EMBED ? t->elem->ssize : t->size;  // its bytes, each card of which it marks
+  for (int64_t o = 0; o < n + 511; o += 512) bober_written((char *)p + (o < n ? o : n - 1));
   if (t->held == PACKED) {
     int64_t i = 0;
     while (i < t->nparts - 1 && !bober_is(t->parts[i], u)) i++;

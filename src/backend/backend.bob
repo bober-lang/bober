@@ -377,16 +377,21 @@ export class Nothing implements Backend {
 	object(): string { return "" }
 }
 
-/// Marks with b the card of place q, for the next minor collection, which scans what overlaps a card marked
-/// (src/gc.c): the byte of its 512 bytes among those after the heap's 64 GiB, of which heap is the address, or the one
-/// after them for a place outside the heap, in a frame or global.
-export function mark(b: Backend, heap: Value, q: Value) {
-	const i64 = b.int(64)
-	const card = b.binary("lshr", b.binary("sub", b.cast("ptrtoint", q, i64), heap), b.constInt(i64, 9))
-	const n = b.constInt(i64, 0x8000000)
-	const at = b.binary("add", heap,
-		b.binary("add", b.select(b.icmp("ult", card, n), card, n), b.constInt(i64, 0x1000000000)))
-	b.store(b.constInt(b.int(8), 1), b.cast("inttoptr", at, b.ptr()), false)
+/// Marks with b the cards of the n bytes at q, where a value holding a ref was stored, for the next minor collection,
+/// which scans the refs on a card marked (src/gc.c): of each, the byte among those after the heap's 64 GiB, of which
+/// heap is the address, or the one after them for a place outside the heap, in a frame or global. The cards of its
+/// first byte, of each 512 on and of its last are all it is on, as a card is 512 bytes.
+export function mark(b: Backend, heap: Value, q: Value, n: u64) {
+	const word = b.int(64)
+	const max = b.constInt(word, 0x8000000)
+	for (const k of 0 ... if (n > 8) ((n - 1) / 512 + 1) as i32 else 0) {
+		const o = if ((k as u64) * 512 < n) (k as u64) * 512 else n - 1
+		const p = b.binary("add", b.cast("ptrtoint", q, word), b.constInt(word, o as i64))
+		const card = b.binary("lshr", b.binary("sub", p, heap), b.constInt(word, 9))
+		const at = b.binary("add", heap,
+			b.binary("add", b.select(b.icmp("ult", card, max), card, max), b.constInt(word, 0x1000000000)))
+		b.store(b.constInt(b.int(8), 1), b.cast("inttoptr", at, b.ptr()), false)
+	}
 }
 
 /// A generator's codes for the Backend's names, from the pairs of its table.
