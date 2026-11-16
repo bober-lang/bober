@@ -98,6 +98,8 @@ export class Compile @optarg.Cc {
 	wasm: bool = false
 	/// -release for the first x86-64 CPUs, not x86-64-v2, those since about 2009
 	baseline: bool @optarg.Verbose = false
+	/// with -release, keep frame pointers, as clang's
+	framePointers: bool @optarg.Name["fno-omit-frame-pointer"] @optarg.Verbose = false
 	/// pass an option to LLVM, as clang's -mllvm
 	mllvm: string[] @optarg.Verbose = []
 }
@@ -565,6 +567,7 @@ export function build(main: string, tests: bool, f: Compile, pin: bool): string[
 	const facts = learn(p, o, m => new LLVM(p.modules[m].path))
 	for (const m of 0 ... p.modules.length - 1) {
 		const b = new LLVM(p.modules[m].path)
+		b.framePointers = f.framePointers
 		emit(p, m, b, o, facts)
 		b.verify() // which also finishes it, before it is linked
 		whole.link(b)
