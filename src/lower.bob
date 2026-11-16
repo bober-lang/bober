@@ -1555,7 +1555,7 @@ class Gen {
 		}
 		const at = this.place(target, how != "=")
 		if (how == "=") {
-			this.to(p.parts[1], at.type)
+			this.to(this.copied(target, p.parts[1]), at.type)
 			return this.op(at.store, at.a, at.b)
 		}
 		if (how == "??=") {
@@ -1580,6 +1580,15 @@ class Gen {
 		}
 		this.arith(opcode(how.slice(0, if (step) 1 else how.length - 1)), t)
 		this.op(at.store, at.a, at.b)
+	}
+
+	/// What `target = p` stores: of `{...v}` into a field embedding v's class, v, which storing copies into place without
+	/// making the literal first (5.3); else p.
+	private copied(target: Node, p: Node): Node {
+		const o = if (target.kind == "member") target.parts[0].type! else null
+		const f = if (o?.kind == "class") members(o!).find(f => f.name == this.text(target.parts[1])) else null
+		const s = if (f?.embedded == true && p.kind == "object" && p.parts.length == 1) p.parts[0] else null
+		return if (s?.kind == "unary" && this.ty(f!.type) == this.ty(s!.parts[0].type!)) s!.parts[0] else p
 	}
 
 	/// Stores the tuple on the stack, or the elements temps hold, into the places array pattern p lists, each assigned
