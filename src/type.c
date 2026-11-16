@@ -249,6 +249,13 @@ static uint64_t list(const bober_type *const *ts, int64_t n) {
   return h;
 }
 
+/// t's key in another's: if long, its hash, as src/emit.bob's part.
+static void part(char **b, int64_t *size, int64_t *room, const bober_type *t) {
+  char h[24];
+  if (len(t->key) <= 64) put(b, size, room, t->key.bytes, len(t->key));
+  else put(b, size, room, h, snprintf(h, sizeof h, "#%llu", (unsigned long long)t->hash));
+}
+
 /// t's key, as src/emit.bob's key makes it: its shape's up to its ( or [, then its parts', fields' and elem's.
 static bober_string keyOf(const bober_type *t) {
   int64_t size = 0, room = 64;
@@ -261,7 +268,7 @@ static bober_string keyOf(const bober_type *t) {
   put(&b, &size, &room, nominal ? "[" : "(", 1);
   for (int64_t i = 0; i < t->nparts; i++) {
     if (i) put(&b, &size, &room, ",", 1);
-    put(&b, &size, &room, t->parts[i]->key.bytes, len(t->parts[i]->key));
+    part(&b, &size, &room, t->parts[i]);
   }
   for (int64_t i = 0; !nominal && i < t->nfields; i++) {
     const bober_field *f = &t->fields[i];
@@ -271,10 +278,10 @@ static bober_string keyOf(const bober_type *t) {
       if (f->mods) put(&b, &size, &room, m, snprintf(m, sizeof m, "%lld", (long long)f->mods));
       put(&b, &size, &room, f->name.bytes, len(f->name)), put(&b, &size, &room, ":", 1);
     }
-    put(&b, &size, &room, f->type->key.bytes, len(f->type->key));
+    part(&b, &size, &room, f->type);
   }
   if (t->elem) {
-    put(&b, &size, &room, t->elem->key.bytes, len(t->elem->key));
+    part(&b, &size, &room, t->elem);
     char n[24];
     put(&b, &size, &room, n, snprintf(n, sizeof n, ",%lld", (long long)t->length));
   }

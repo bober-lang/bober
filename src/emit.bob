@@ -4045,20 +4045,26 @@ class Emitter {
 		}
 		const p = this.p
 		const [k, a, b] = [p.kind(t), p.a(t), p.b(t)]
-		const keys = (ts: i32[]) => ts.map(x => this.key(x)).join(",")
+		const keys = (ts: i32[]) => ts.map(x => this.part(x)).join(",")
 		const r = if (kind.isPrimitive(t)) showType(p, t) else switch (k) {
 			case kind.Named: this.symbol(a) + (if (b == 0) "" else `[${keys(p.lists[b])}]`)
 			case kind.Param: `${this.symbol(a)}#${b}`
 			case kind.Literal: `Literal(${this.key(a)},${if (a == kind.String) hex(p.strings[b]) else if (kind.isInt(a)) `${p.ints[b]}` else `${b}`})`
 			case kind.Union, kind.Tuple: `${rows[k - kind.Array]}(${keys(p.parts(t))})`
 			case kind.Func: `Func(${keys(p.parts(t))})`
-			case kind.Object: `Object(${this.layout(t).map(s => `${if (s.mods == 0) "" else `${s.mods}`}${p.strings[s.name]}:${this.key(s.t)}`).join(",")})`
+			case kind.Object: `Object(${this.layout(t).map(s => `${if (s.mods == 0) "" else `${s.mods}`}${p.strings[s.name]}:${this.part(s.t)}`).join(",")})`
 			case kind.Of: `Of(${a},${p.strings[b]})`
-			case kind.Member: `Member(${this.key(a)},${p.strings[b]})`
-			default: `${rows[k - kind.Array]}(${this.key(a)},${b})`
+			case kind.Member: `Member(${this.part(a)},${p.strings[b]})`
+			default: `${rows[k - kind.Array]}(${this.part(a)},${b})`
 		}
 		this.facts.keys.set(t, r)
 		return r
+	}
+
+	/// t's key in another's: if long, its hash, as src/type.c's part, lest a key grow as its parts nest.
+	private part(t: i32): string {
+		const k = this.key(t)
+		return if (k.length <= 64) k else `#${this.p.hash(t)}`
 	}
 
 	/// The type of a value of t.
