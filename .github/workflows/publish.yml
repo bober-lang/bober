@@ -2,8 +2,8 @@
 # secrets, running no code of the repo's: signs macOS's package by the Developer ID, hardened, letting the launcher still
 # load the images bober links, signed ad hoc; has Apple notarize its executables, by their hashes, so that Gatekeeper
 # lets a download of them run (notarytool exits 0 on a rejection too); and uploads the packages to Backblaze's bucket
-# that dl.bober-lang.dev serves, then the line naming their build, edge/version, which bober update compares. Not
-# cancelled by a newer run, which waits.
+# that dl.bober-lang.dev serves, under builds/<commit>/, cached for good, then the line naming their build, edge/version,
+# which bober update compares. Not cancelled by a newer run, which waits.
 name: publish
 on: workflow_call
 
@@ -44,8 +44,11 @@ jobs:
           AWS_DEFAULT_REGION: eu-central-003
           AWS_REQUEST_CHECKSUM_CALCULATION: when_required
         run: |
+          tar -xzOf bober-Linux-X64/bober.tar.gz bober/lib/version > version
+          set -- $(cat version)
           for p in bober-*; do
+            aws s3 cp --cache-control "public, max-age=31536000, immutable" $p/bober.tar.gz s3://bober-releases/builds/$2/$p.tar.gz
+            # for bobers before builds/<commit>/
             aws s3 cp --cache-control no-cache $p/bober.tar.gz s3://bober-releases/edge/$p.tar.gz
           done
-          tar -xzOf bober-Linux-X64/bober.tar.gz bober/lib/version > version
           aws s3 cp --cache-control no-cache version s3://bober-releases/edge/version
