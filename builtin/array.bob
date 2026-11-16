@@ -2,7 +2,7 @@
 //! to its elements, which it is made with in one cell and which push moves to a block of their own once full
 //! (src/emit.bob).
 
-import { Ref, addr, alloc, array, deref, load, memcpy, sizeOf, store, trap, zero } from "./mem"
+import { Ref, addr, alloc, array, deref, get, load, memcpy, set, sizeOf, trap, zero } from "./mem"
 
 /// The methods of an array, which is this.
 export class Array[T] {
@@ -11,19 +11,17 @@ export class Array[T] {
 
 	/// x stored after the last element, the elements moved to a block of twice the room if full.
 	push(x: T) {
-		const n = load[i64](addr(this))
+		const n = get[i64, T[]](this, 0)
 		const size = sizeOf[T]()
-		if (n == load[i64](addr(this) + 8)) {
+		if (n == get[i64, T[]](this, 8)) {
 			const cap = 2 * n + 8
 			const data = alloc[T](cap)
-			const a = addr(this)
-			memcpy(deref(data), elements(a), (n * size) as u64)
-			store[Ref](a + 16, data)
-			store[i64](a + 8, cap)
+			memcpy(deref(data), elements(addr(this)), (n * size) as u64)
+			set[Ref, T[]](this, 16, data)
+			set[i64, T[]](this, 8, cap)
 		}
-		const a = addr(this)
-		store[T](elements(a) + ((n * size) as u64), x)
-		store[i64](a, n + 1)
+		set[T, Ref](get[Ref, T[]](this, 16), n * size, x)
+		set[i64, T[]](this, 0, n + 1)
 	}
 
 	/// push(...xs) of the elements xs has at the call, so xs.push(...xs) doubles xs.
@@ -35,13 +33,12 @@ export class Array[T] {
 
 	/// The last element, removed.
 	pop(): T {
-		const a = addr(this)
-		const n = load[i64](a) - 1
+		const n = get[i64, T[]](this, 0) - 1
 		if (n < 0) {
 			trap("pop of an empty array")
 		}
-		store[i64](a, n)
-		return load[T](elements(a) + ((n * sizeOf[T]()) as u64))
+		set[i64, T[]](this, 0, n)
+		return get[T, Ref](get[Ref, T[]](this, 16), n * sizeOf[T]())
 	}
 
 	/// v stored at i, the elements from i on moved up one.
