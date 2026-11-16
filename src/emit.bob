@@ -2621,12 +2621,9 @@ class Emitter {
 			// Boxed with the descriptor of its type, or unboxed, converted if a number.
 			if (!this.boxed(f)) {
 				if (fk == kind.Union && t != this.any && !this.unbound(t)) {
-					// Checked as a member's is (§6.6), by the tag alone if the other is null, as of x!.
-					const others = this.p.members(f).filter(m => !this.holds(t, m))
-					const nullOnly = others.length == 1 && this.p.kind(others[0]) == kind.Null
-					const ok = if (nullOnly) this.ir().icmp("ne", this.tagOf(v.v), this.tag(others[0]))
-						else this.isa(v, t)
-					this.check(ok, "cast to a type that is not the value's")
+					// Checked as a member's is (§6.6).
+					this.check(this.isaOf(v, this.p.members(f).filter(m => !this.holds(t, m)), t),
+						"cast to a type that is not the value's")
 				}
 				return if (fk == kind.Union) v.v else this.unionOf(this.desc(f), v.v, f)
 			} else if (this.boxed(t) || tk == kind.Union && this.unbound(t)) {
@@ -2649,7 +2646,7 @@ class Emitter {
 			const lacking = this.p.members(f).filter(m => !this.holds(t, m))
 			const widened = lacking.filter(m => this.p.members(t).some(x => kind.widens(m, x)))
 			if (lacking.length > widened.length) {
-				const ok = this.ir().binary("or", this.isa(v, t), this.tagIn(this.tagOf(v.v), widened))
+				const ok = this.ir().binary("or", this.isaOf(v, lacking, t), this.tagIn(this.tagOf(v.v), widened))
 				this.check(ok, "cast to a type that is not the value's")
 			}
 			return this.widen(v.v, widened, t)
@@ -2809,6 +2806,12 @@ class Emitter {
 				pick(this.refOf(w), this.refOf(r)))
 		}
 		return r
+	}
+
+	/// Whether union v, whose members t lacks are lacking, is of t: by the tag alone if those are null, as of x!.
+	private isaOf(v: V, lacking: i32[], t: i32): Value {
+		const nullOnly = lacking.length == 1 && lacking[0] == kind.Null && !this.unbound(t)
+		return if (nullOnly) this.ir().icmp("ne", this.tagOf(v.v), this.tag(kind.Null)) else this.isa(v, t)
 	}
 
 	/// Whether v's type, the type of its tag if a union, fits t.
