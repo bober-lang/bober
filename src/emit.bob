@@ -2969,6 +2969,16 @@ class Emitter {
 			return
 		}
 		const u = this.cast(v, t)
+		if (ms.every(m => m == kind.Null || this.spare(m) == 7)) {
+			// Of refs at word 0, null's 0 too: the ref stored once, then only its tag byte by the case of its type.
+			this.ir().store(this.refOf(u), q, false)
+			if (at >= 0) {
+				const tag = this.ir().gep(this.b.int(8), q, [this.i64Const(at)])
+				this.cases(ms.length, to => this.branchTag(this.tagOf(u), ms.map(m => [m]), to),
+					i => this.ir().store(this.b.constInt(this.b.int(8), this.tagByte(n, i)), tag, false))
+			}
+			return
+		}
 		this.cases(ms.length, to => this.branchTag(this.tagOf(u), ms.map(m => [m]), to), i => {
 			if (this.inlined(ms[i])) {
 				store(i, { v: u, t: n }) // its box
