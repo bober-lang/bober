@@ -131,6 +131,22 @@ function local(p: Program, d: i32) throws string {
 	}
 }
 
+/// Whether type t as written holds an integer literal, as a local const named as a type is, which only its name spells.
+function numbered(p: Program, t: i32): bool {
+	const k = p.kind(t)
+	if (k == kind.Literal) {
+		return kind.isInt(p.a(t))
+	}
+	const ts = switch (k) {
+		case kind.Alias: p.lists[p.b(t)]
+		case kind.Sum: p.lists[p.a(t)]
+		case kind.Sig: [p.a(t)]
+		case kind.Throws: [p.a(t), p.b(t)]
+		default: p.parts(t)
+	}
+	return ts.some(u => numbered(p, u))
+}
+
 /// What a Br to a block open around the op printed is: none of these, a break, a continue, or the end of a ?. chain.
 const Other = 0
 const Break = 1
@@ -306,7 +322,7 @@ class Printer {
 
 	/// Type t as source, parenthesized if tight and it is a union or function; throws where a local holds it.
 	private type(t: i32, tight = false): string throws string {
-		if (this.p.reflected(t)) {
+		if (this.p.reflected(t) || numbered(this.p, t)) {
 			throw "a type a local holds"
 		}
 		return if (tight) inner(this.p, t, this.at) else showType(this.p, t, this.at)
@@ -382,9 +398,10 @@ class Printer {
 			case op.Null: this.push("null", atom)
 			case op.Missing: this.push("", atom)
 			case op.Type:
-				// as written, or of a typeof: a tuple, object or function type there would read as a value
+				// as written, or of a typeof or local alias: a tuple, object, function or union there reads as a value
 				const k = p.kind(a)
-				if (this.marked(i, op.Spelled) < 0 && (k == kind.Tuple || k == kind.Object || k == kind.Func)) {
+				if (this.marked(i, op.Spelled) < 0
+					&& (k == kind.Tuple || k == kind.Object || k == kind.Func || k == kind.Union)) {
 					throw "a Type that reads as a value"
 				}
 				this.push(this.spelled(i, a), atom)
