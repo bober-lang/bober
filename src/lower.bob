@@ -1841,7 +1841,7 @@ class Gen {
 		const d = this.global(p)
 		if (d != null) {
 			const at = new Place(op.Global, op.SetGlobal, this.ref(d!), this.exact(this.ownerArgs(p)))
-			at.type = this.ty(this.u.l.lift.types.get(d!)!)
+			at.type = this.varType(d!, p)
 			return at
 		}
 		const r = p.parts[0]
@@ -2118,7 +2118,14 @@ class Gen {
 		}
 		this.op(op.Global, this.ref(d!), this.typeArgs(d!, t, p))
 		this.spellArgs(p)
-		return if (this.prog.decls[d!].kind == decl.Var) this.ty(this.u.l.lift.types.get(d!)!) else this.ty(t)
+		return if (this.prog.decls[d!].kind == decl.Var) this.varType(d!, p) else this.ty(t)
+	}
+
+	/// The type of var d that p names: of a static of a generic class, as the instance named has it.
+	private varType(d: i32, p: Node): i32 {
+		const c = if (p.kind == "member") standsFor(p.parts[0].type!) else null
+		const t = this.u.l.lift.types.get(d)!
+		return this.ty(if (c?.generic == null) t else t.in(c!.generic!, c!.params))
 	}
 
 	/// Pushes the value of link p of an access chain, which branches out of the block at level chain where it is null
