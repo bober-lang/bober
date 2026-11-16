@@ -176,10 +176,12 @@ function main() {
 	assert built([["main.bob", main]]) == "5\n"
 }
 
-test "a union cast to an interface at -O0 traps if the value does not fit" {
+test "a union cast to an interface or a type param at -O0 traps if the value does not fit" {
 	anew()
 	const main = "interface HasSide { side: f64 }\nfunction side(n: HasSide | null): f64 { return n!.side }\nfunction main() { side(null) }\n"
 	assert built([["main.bob", main]]) == `${home()}/main.bob:2:49: trap: cast to a type that is not the value's\n`
+	const zero = "class C {}\nfunction zero[T](): [T] {\n\tconst z: T | null = null\n\treturn [z as T]\n}\nfunction main() {\n\tzero[C | null]()\n\tprint(\"n\")\n\tzero[C]()\n}\n"
+	assert built([["main.bob", zero]]) == `n\n${home()}/main.bob:4:12: trap: cast to a type that is not the value's\n`
 }
 
 test "a generic class formed at run time at -O0 is laid out once its fields are" {

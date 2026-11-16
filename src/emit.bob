@@ -2621,10 +2621,19 @@ class Emitter {
 		if (this.boxed(f) || this.boxed(t)) {
 			// Boxed with the descriptor of its type, or unboxed, converted if a number.
 			if (!this.boxed(f)) {
-				if (fk == kind.Union && t != this.any && !this.unbound(t)) {
-					// Checked as a member's is (§6.6).
-					this.check(this.isaOf(v, this.p.members(f).filter(m => !this.holds(t, m)), t),
-						"cast to a type that is not the value's")
+				if (fk == kind.Union && t != this.any) {
+					// Checked as a member's is (§6.6); into a type of a param, only a null, which its arg may take.
+					const lacking = this.p.members(f).filter(m => !this.holds(t, m))
+					if (!this.unbound(t)) {
+						this.check(this.isaOf(v, lacking, t), "cast to a type that is not the value's")
+					} else if (lacking.length == 1 && lacking[0] == kind.Null) {
+						const [given, none] = [this.label(), this.label()]
+						this.condBr(this.ir().icmp("ne", this.tagOf(v.v), this.tag(kind.Null)), given, none)
+						this.start(none)
+						this.check(this.isa(v, t), "cast to a type that is not the value's")
+						this.jump(given)
+						this.start(given)
+					}
 				}
 				return if (fk == kind.Union) v.v else this.unionOf(this.desc(f), v.v, f)
 			} else if (this.boxed(t) || tk == kind.Union && this.unbound(t)) {
