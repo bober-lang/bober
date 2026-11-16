@@ -228,6 +228,10 @@ class Emitter {
 	/// Whether it takes its args and gives its result each as a union of any type (see codeType).
 	private boxes = false
 	private held: bool[] = []
+	/// Per local, where its room is kept if it is a string that a sum is stored to, as by q += e, else 0 (grown in
+	/// builtin/string.bob); and the value last loaded of it, which of one with a room is 0 once that is stored to.
+	private rooms: Value[] = []
+	private loaded: Value[] = []
 	/// The ref to the instance of a class held by value that a constructor or initializer initializes, else 0.
 	private self: Value = 0
 	/// Where each local is, and for a Default's param, whether it was given.
@@ -617,12 +621,16 @@ class Emitter {
 		this.unwind = 0
 		this.locals = []
 		this.given = []
+		this.rooms = c.locals.map(_ => 0 as Value)
+		this.loaded = c.locals.map(_ => 0 as Value)
 		this.homes = new HashMap[Value, Value]()
 		this.words = new HashMap[Value, Value]()
 		b.personality(f, this.rts.get("personality")!)
-		// Per local, whether a closure captures its cell, and whether a Fresh or Each makes that cell anew.
+		// Per local, whether a closure captures its cell, whether a Fresh or Each makes that cell anew, and whether what
+		// is stored to it is an Add's or Concat's, as q += e's is.
 		const cells = c.locals.map(_ => false)
 		const fresh = c.locals.map(_ => false)
+		const grown = c.locals.map(_ => false)
 		for (const i of 0 ... c.ops.length - 1) {
 			if (c.ops[i] == op.Closure) {
 				const list = c.items(c.c(i))
@@ -632,6 +640,8 @@ class Emitter {
 				}
 			} else if (c.ops[i] == op.Fresh || c.ops[i] == op.Each) {
 				fresh[c.a(i)] = true
+			} else if (c.ops[i] == op.SetLocal && (c.ops[i - 1] == op.Add || c.ops[i - 1] == op.Concat)) {
+				grown[c.a(i)] = true
 			}
 		}
 		for (const l of 0 ... fresh.length - 1) {
@@ -720,6 +730,10 @@ class Emitter {
 				}
 				if (!cell && k == kind.String) {
 					this.words.set(l, this.keep(b.load(mem, l, false), b.alloca(this.stringTy, 0)))
+					if (grown[i]) {
+						this.rooms[i] = b.alloca(this.i64, 0)
+						b.store(this.i64Const(0), this.rooms[i], false)
+					}
 				}
 				if (i < np && params[i + first] == mem) {
 					this.readable(p, l, t)
@@ -744,7 +758,8 @@ class Emitter {
 		}
 	}
 
-	/// Emits op i, and returns the last op it emitted: itself, or the End of an Each it unrolled.
+	/// Emits op i, and returns the last op it emitted: itself, the End of an Each it unrolled, or the SetLocal of a
+	/// q += e (grow).
 	private op(i: i32): i32 {
 		const c = this.code
 		const o = c.ops[i]
@@ -755,6 +770,9 @@ class Emitter {
 		if (this.pos >= 0) {
 			const [line, col] = this.lineCol(this.pos)
 			b.line(line, col)
+		}
+		if ((o == op.Add || o == op.Concat) && this.grow(i, if (o == op.Add) 2 else n)) {
+			return i + 1
 		}
 		switch (o) {
 			case op.End: this.end()
@@ -834,6 +852,7 @@ class Emitter {
 				} else if (this.newAt[n] >= 0) {
 					this.owned.set(v, n)
 				}
+				this.loaded[n] = v
 				this.push(v, t)
 			case op.SetLocal: this.setLocal(n, this.stack.pop())
 			case op.Fresh: this.renew(n)
@@ -1009,12 +1028,38 @@ class Emitter {
 		}
 	}
 
-	/// Stores v, of type t, at q, the place of local n, marking its card if that is a cell.
+	/// Stores v, of type t, at q, the place of local n, marking its card if that is a cell, and forgets its room, which
+	/// was of what it held.
 	private putLocal(n: i32, q: Value, v: V, t: i32) {
 		this.put(q, v, t)
 		if (this.cells[n]) {
 			this.written(q, this.mem(t))
 		}
+		if (this.rooms[n] != 0) {
+			this.ir().store(this.i64Const(0), this.rooms[n], false)
+			this.loaded[n] = 0
+		}
+	}
+
+	/// Whether op i, which adds the k values on top of the stack, is the append of a q += e: the first is local q's
+	/// value as last loaded, a string with its room kept, and the next op stores the sum to q. It emits both then, each
+	/// piece appended by grown, in place, which keeps the room as it does so.
+	private grow(i: i32, k: i32): bool {
+		const c = this.code
+		const n = c.a(i + 1)
+		if (c.ops[i + 1] != op.SetLocal || this.rooms[n] == 0
+			|| this.loaded[n] != this.stack[this.stack.length - k].v) {
+			return false
+		}
+		const xs = this.popN(k)
+		let r = xs[0].v
+		for (const x of xs.slice(1, k)) {
+			r = this.langCall("grown", [r, this.cast(x, kind.String), this.gc(this.rooms[n])])
+			this.b.attr(r, -1, "alwaysinline", 0)
+		}
+		this.loaded[n] = 0
+		this.put(this.local(n), { v: r, t: kind.String }, kind.String)
+		return true
 	}
 
 	// Control flow.
