@@ -73,7 +73,7 @@ export class Url {
 	/// empty // when the path starts with //, which would be taken for one; a path a:b with neither, as ./a:b.
 	toString(): string {
 		let s = if (this.scheme == "") "" else `${this.scheme}:`
-		if (this.user != null || this.host != "" || this.port != null || startsWith(this.path, "//")) {
+		if (this.hasAuthority() || startsWith(this.path, "//")) {
 			const user = if (this.user == null) "" else `${this.user}@`
 			s += `//${user}${this.host}${if (this.port == null) "" else `:${this.port}`}`
 		}
@@ -89,6 +89,9 @@ export class Url {
 		}
 		return if (this.fragment == null) s else `${s}#${this.fragment}`
 	}
+
+	/// Whether any of user, host and port is set.
+	private hasAuthority(): bool { return this.user != null || this.host != "" || this.port != null }
 
 	/// ref against this, as RFC 3986 §5.2 resolves it; what a redirect's Location means.
 	resolve(ref: string): Url throws ParseError {
@@ -115,7 +118,7 @@ export class Url {
 			}
 		} else if (startsWith(r.path, "/")) {
 			r.path = removeDots(r.path)
-		} else if (this.host != "" && this.path == "") {
+		} else if (this.hasAuthority() && this.path == "") {
 			r.path = removeDots(`/${r.path}`)
 		} else {
 			let cut = this.path.length
