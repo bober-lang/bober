@@ -197,6 +197,36 @@ test "a body that does not print as written throws why" {
 	}
 }
 
+test "optional calls and indexes, a while left by a break and statics of a generic class" {
+	const src = `function f(h: H, xs: i32[] | null): i32 {
+	const g = h.read?.()
+	const x = xs?.[0]
+	let i = 0
+	while (true) {
+		i += 1
+		if (i < 3) {
+			continue
+		}
+		break
+	}
+	Tally[string].n += 1
+	Tally[i32].seen = [i]
+	return Tally[i32].seen[0]
+}`
+	const decls = "class H { read: (() => i32) | null = null }\n"
+		+ "class Tally[T] {\n\tstatic n = 0\n\tstatic seen: T[] = []\n}\n"
+	assert printed(decls + src) == format(src)
+}
+
+test "a function declaring a type does not print" {
+	try {
+		printed("function f(): i32 {\n\tclass C {\n\t\tv = 1\n\t}\n\treturn new C().v\n}")
+		assert false
+	} catch (why: string) {
+		assert why == "a local type"
+	}
+}
+
 test "blocks, powers, conversions and literals" {
 	const src = `function f[T](x: i32, t: T, c: C): string {
 	{

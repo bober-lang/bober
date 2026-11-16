@@ -115,12 +115,20 @@ export function expr(p: Program, c: Code, from: i32, to: i32, at: i32): string t
 /// The statements of function or test d's code, one a line, but those of its params' defaults, which signature
 /// prints; throws why not where Printer cannot print them.
 export function body(p: Program, d: i32): string throws string | CompileError {
+	local(p, d)
 	const c = p.decls[d].code!
 	const w = new Printer(p, c, p.decls[d].module, p.items(p.decls[d].type).length + (if (p.method(d)) 1 else 0))
 	while (c.ops[w.i] == op.Default) {
 		w.i = c.next(w.i) + 1
 	}
 	return w.statements(c.ops.length - 1).join("\n")
+}
+
+/// Throws if function d declares a class or interface, which Printer does not print.
+function local(p: Program, d: i32) throws string {
+	if (p.decls[d].members.some(m => p.decls[m].kind != decl.Function)) {
+		throw "a local type"
+	}
 }
 
 /// What a Br to a block open around the op printed is: none of these, a break, a continue, or the end of a ?. chain.
@@ -174,7 +182,11 @@ function chars(s: string, tpl: bool): string {
 }
 
 /// Field name of x, as source: a tuple's by its index.
-function field(x: string, name: string): string { return if (isDigit(name[0])) `${x}[${name}]` else `${x}.${name}` }
+function field(x: string, name: string): string {
+	return if (isDigit(name[0])) suffix(x, `[${name}]`) else `${x}.${name}`
+}
+/// x followed by an index or args s, after a ?. chain's x? as x?.[k] and x?.(args).
+function suffix(x: string, s: string): string { return if (endsWith(x, "?")) `${x}.${s}` else x + s }
 /// Value v spread into an array or object literal.
 function spreading(v: [string, i32]): string throws string { return `...${paren(v, prefix)}` }
 /// Source s where a block could start, an object literal parenthesized.
@@ -306,6 +318,18 @@ class Printer {
 		return this.type(if (s < 0) t else s)
 	}
 
+	/// The decl op i names: a static of a generic class by the class's type args, which its list has first.
+	private named(i: i32): string throws string {
+		const p = this.p
+		const x = p.decls[this.c.a(i)]
+		const n = if (x.owner < 0 || p.decls[x.owner].kind != decl.Class) 0 else p.decls[x.owner].params.length
+		if (n == 0) {
+			return qualified(p, this.c.a(i), this.at)
+		}
+		const ts = p.lists[this.c.b(i)].slice(0, n).map(t => this.type(t))
+		return `${qualified(p, x.owner, this.at)}[${ts.join(", ")}].${p.strings[x.name]}`
+	}
+
 	/// The type args op i is written with, as f[T], else "".
 	private written(i: i32): string throws string {
 		const ts = this.marks(i, op.Spelled)
@@ -371,12 +395,12 @@ class Printer {
 			} else {
 				throw "a temporary"
 			}
-			case op.Global: this.push(qualified(p, a, at) + this.written(i), atom)
+			case op.Global: this.push(this.named(i) + this.written(i), atom)
 			case op.Member: this.push(`${this.pop(atom)}.${p.strings[p.decls[a].name]}`, atom)
 			case op.Field: this.push(field(this.pop(atom), p.strings[a]), atom)
 			case op.Subscript:
 				const k = this.pop(0)
-				this.push(`${this.pop(atom)}[${k}]`, atom)
+				this.push(suffix(this.pop(atom), `[${k}]`), atom)
 			case op.Neg, op.Not: this.push(`${if (o == op.Neg) "-" else "!"}${this.pop(prefix + 1)}`, prefix)
 			case op.Is:
 				const x = this.pop(5)
@@ -408,7 +432,7 @@ class Printer {
 						else `...${paren(v, prefix)}`, atom)
 				}
 				const args = this.take(ps.length)
-				this.push(`${if (p.method(a)) `${this.pop(atom)}.${p.strings[p.decls[a].name]}` else qualified(p, a, at)}${this.written(i)}(${args})`,
+				this.push(`${if (p.method(a)) `${this.pop(atom)}.${p.strings[p.decls[a].name]}` else this.named(i)}${this.written(i)}(${args})`,
 					atom)
 			}
 			case op.CallMethod:
@@ -420,7 +444,7 @@ class Printer {
 				}
 			case op.CallRef:
 				const args = this.take(a)
-				this.push(`${this.pop(atom)}(${args})`, atom)
+				this.push(suffix(this.pop(atom), `(${args})`), atom)
 			case op.New:
 				if (p.kind(a) != kind.Named) {
 					throw "a New of no class"
@@ -462,7 +486,7 @@ class Printer {
 					case op.SetMember: `${this.pop(atom)}.${p.strings[p.decls[a].name]}`
 					case op.SetField: field(this.pop(atom), p.strings[a])
 					case op.SetSubscript: `${this.pop(atom)}[${k}]`
-					default: qualified(p, a, at)
+					default: this.named(i)
 				}, v)
 			case op.Return:
 				// of a function of no result, null; one returning null may end with the return lower adds, left out
@@ -842,7 +866,8 @@ class Printer {
 			}
 			const cond = if (k == end - 2) "true" else text(this.value(k - 1))
 			this.i = if (k == end - 2) j + 1 else k + 1
-			const ls = this.statements(end - 2)
+			// to the Br back to its start, which lower leaves out after a break
+			const ls = this.statements(if (c.a(end - 2) == 0) end - 2 else end - 1)
 			this.blocks = this.blocks.slice(0, this.blocks.length - 2)
 			this.line(`while (${cond}) ${braced(ls)}`)
 			this.i = end + 1
@@ -925,6 +950,7 @@ class Printer {
 		if (f.spelled == 0) {
 			throw "a Closure of no signature"
 		}
+		local(p, d)
 		const sig = if (p.kind(f.spelled) == kind.Throws) p.a(f.spelled) else f.spelled
 		const ts = p.items(p.a(sig))
 		const ps: string[] = []
