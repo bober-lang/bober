@@ -323,8 +323,12 @@ const bober_type *bober_type_of(const bober_type *t, int64_t n, const bober_type
   return f->made;
 }
 
-/// t with each of the n params in it as the arg at its index, and if held, each literal as its base.
-static const bober_type *form(const bober_type *t, int64_t n, const bober_type *const *params, const bober_type *const *args, bool held) {
+/// The types formed, completed once no form is under way, as a layout may embed a class whose fields are being formed.
+static bober_type **pending;
+static int64_t npending, forming;
+
+/// form's t, its result pending.
+static const bober_type *shape(const bober_type *t, int64_t n, const bober_type *const *params, const bober_type *const *args, bool held) {
   if (t->kind == KPARAM) {
     for (int64_t i = 0; i < n; i++)
       if (params[i] == t) return args[i];
@@ -383,7 +387,16 @@ static const bober_type *form(const bober_type *t, int64_t n, const bober_type *
     for (int64_t i = 0; i < t->nmethods; i++)
       if (methods[i].type) methods[i].type = form(methods[i].type, n, params, args, held);
   }
-  complete(r);
+  pending = realloc(pending, (npending + 1) * sizeof *pending), pending[npending++] = r;
+  return r;
+}
+
+/// t with each of the n params in it as the arg at its index, and if held, each literal as its base.
+static const bober_type *form(const bober_type *t, int64_t n, const bober_type *const *params, const bober_type *const *args, bool held) {
+  forming++;
+  const bober_type *r = shape(t, n, params, args, held);
+  if (!--forming)
+    while (npending) complete(pending[--npending]);
   return r;
 }
 

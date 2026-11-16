@@ -182,6 +182,30 @@ test "a union cast to an interface at -O0 traps if the value does not fit" {
 	assert built([["main.bob", main]]) == `${home()}/main.bob:2:49: trap: cast to a type that is not the value's\n`
 }
 
+test "a generic class formed at run time at -O0 is laid out once its fields are" {
+	anew()
+	const main = `class Link[T] {
+	next: Bead[T] | null = null
+}
+class Bead[T] {
+	...Link[T]
+	v: T | null = null
+	w: i16 = 0
+}
+function bead[T](v: T): Bead[T] {
+	const b = new Bead[T]()
+	b.v = v
+	b.w = 2
+	return b
+}
+function main() {
+	const b = bead[bool](true)
+	print(\`\${b.v!} \${b.w}\`)
+}
+`
+	assert built([["main.bob", main]]) == "true 2\n"
+}
+
 test "a union of more than 256 classes, which a tag byte does not tell apart, holds each at every level" {
 	let classes = ""
 	const names: string[] = []
