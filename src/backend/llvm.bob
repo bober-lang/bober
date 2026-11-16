@@ -52,8 +52,8 @@ import { LLVMAdd, LLVMAddAttributeAtIndex, LLVMAddCallSiteAttribute, LLVMAddCase
 	LLVMSetUnnamedAddress, LLVMSetVisibility, LLVMSetValueName2, LLVMSetVolatile, LLVMSExt, LLVMShl, LLVMShutdown,
 	LLVMSIToFP, LLVMSizeOf, LLVMSRem, LLVMStructGetTypeAtIndex, LLVMStructTypeInContext, LLVMStructTypeKind, LLVMSub,
 	LLVMTokenTypeInContext, LLVMTrunc, LLVMTypeOf, LLVMUDiv, LLVMUIToFP, LLVMURem, LLVMValueAsMetadata,
-	LLVMVoidTypeInContext, LLVMWeakAnyLinkage, LLVMExternalWeakLinkage, LLVMWeakODRLinkage, LLVMXor,
-	LLVMZExt } from "llvm-c/Core.h"
+	LLVMVoidTypeInContext, LLVMWeakAnyLinkage, LLVMExternalWeakLinkage, LLVMWeakODRLinkage, LLVMXor, LLVMZExt,
+	LLVMConstAddrSpaceCast, LLVMGetConstOpcode, LLVMIsAConstantExpr } from "llvm-c/Core.h"
 
 import { LLVMReturnStatusAction, LLVMVerifyModule } from "llvm-c/Analysis.h"
 import { LLVMDisposeErrorMessage, LLVMGetErrorMessage } from "llvm-c/Error.h"
@@ -166,6 +166,12 @@ export class LLVM implements Backend {
 	}
 
 	constCast(op: Cast, v: Value, to: Type): Value {
+		if (this.gc && op == "inttoptr" && to == this.ref() && LLVMIsAConstantExpr(v) != 0
+			&& (LLVMGetConstOpcode(v) as i32) == LLVMPtrToInt) {
+			// A constant as a ref, by a cast LLVM sees through, unlike an inttoptr, so that it calls a constant closure's
+			// code directly; statepoints leaves it, as a constant is never relocated.
+			return LLVMConstAddrSpaceCast(LLVMGetOperand(v, 0), to)
+		}
 		return switch (op) {
 			case "trunc": LLVMConstTrunc(v, to)
 			case "ptrtoint": LLVMConstPtrToInt(v, to)

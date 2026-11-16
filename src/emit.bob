@@ -1997,9 +1997,7 @@ class Emitter {
 				b.ret(this.returning(r, f.ret))
 			}
 		})
-		const v = if (bound || f.scope.length > 0) thunk
-			else b.constCast("inttoptr", b.constCast("ptrtoint", b.constant(b.constStruct([thunk])), this.i64),
-			this.ref)
+		const v = if (bound || f.scope.length > 0) thunk else this.closure(thunk, [])
 		this.thunks.set(sym, v)
 		return v
 	}
@@ -3574,9 +3572,13 @@ class Emitter {
 	}
 
 	/// A closure: a new env { code, capture..., i64 × m } of code, the captures, each a cell's ref or copied in, and the
-	/// descriptors, stored once, as captured loads them.
+	/// descriptors, stored once, as captured loads them; of none, a constant { code }, no ref of the collector's.
 	private closure(code: Value, captures: Value[], descs: Value[] = []): Value {
 		const words = [...captures, ...descs]
+		if (words.length == 0) {
+			const b = this.b
+			return b.constCast("inttoptr", b.constCast("ptrtoint", b.constant(b.constStruct([code])), this.i64), this.ref)
+		}
 		const t = this.b.struct([this.ptr, ...words.map(v => this.b.typeOf(v))])
 		const env = this.alloc(t)
 		this.b.invariant(this.ir().store(code, env, false))
