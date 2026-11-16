@@ -1761,6 +1761,27 @@ class Emitter {
 			return
 		}
 		const t = this.p.lists[env][0]
+		if (name == "get" || name == "set") {
+			// Through x itself, a ref: of an array, its header, else the elements of one.
+			const v = if (name == "set") this.pop() else null
+			const i = this.pop().v
+			const x = this.pop()
+			const head = this.kindOf(x.t) == kind.Array
+			const q = this.ir().gep(this.b.int(8), x.v, [i])
+			if (v == null) {
+				const r = this.read(q, t)
+				this.push(if (head) this.header(r) else r, ret)
+				return
+			}
+			if (head) {
+				this.header(this.ir().store(this.cast(v, t), q, false))
+				this.written(q, this.stored(t))
+			} else {
+				this.write(q, v, t, true)
+			}
+			this.push(this.bool(false), kind.Null)
+			return
+		}
 		if (this.dynamic(t)) {
 			// Of a type known at run time, which its descriptor says how to hold.
 			const d = this.desc(t)
@@ -1904,7 +1925,7 @@ class Emitter {
 		return this.ir().binary("and", this.header(this.ir().load(this.i64, a, false)), this.i64Const(0x7fffffff))
 	}
 
-	/// Access, a load of an array's header, marked as such: see Backend.aliasing.
+	/// Access, a load or store of an array's header, marked as such: see Backend.aliasing.
 	private header(access: Value): Value {
 		this.b.aliasing(access, true)
 		return access
