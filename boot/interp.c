@@ -1546,11 +1546,14 @@ static Val bi_filter(Val self, Val *a, int n, Node *site) {
   return A(r);
 }
 
-/* Whether f holds for some element if any, else for every one. */
+/* Whether f holds for some element or byte if any, else for every one. */
 static Val test(Val self, Val *a, int n, Node *site, int any) {
   if (n != 1 || a[0].k != K_FN) trap(site, "some and every take a function");
-  for (int i = 0; i < self.a->len; i++)
-    if (!call(a[0].fn, NUL, &self.a->v[i], 1, site).i == !any) return B(any);
+  int len = self.k == K_STR ? self.s->len : self.a->len;
+  for (int i = 0; i < len; i++) {
+    Val x = self.k == K_STR ? I(K_U8, (uint8_t)self.s->p[i]) : self.a->v[i];
+    if (!call(a[0].fn, NUL, &x, 1, site).i == !any) return B(any);
+  }
   return B(!any);
 }
 
@@ -1646,6 +1649,7 @@ static void init(void) {
   builtin(strmethods, "slice", bi_slice);
   builtin(strmethods, "at", bi_at);
   builtin(strmethods, "copy", bi_copy);
+  builtin(strmethods, "some", bi_some);
   builtin(arrmethods, "slice", bi_slice);
   builtin(arrmethods, "at", bi_at);
   builtin(arrmethods, "push", bi_push);
