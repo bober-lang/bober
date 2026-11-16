@@ -3,9 +3,9 @@
 import { BOBER_IO_AGAIN, BOBER_IO_HOST, bober_arg, bober_entropy, bober_env, bober_io_accept, bober_io_close,
 	bober_io_connected, bober_io_copy, bober_io_dial, bober_io_exe, bober_io_idle, bober_io_ip, bober_io_ip_text,
 	bober_io_kind, bober_io_list, bober_io_listen, bober_io_lock, bober_io_mkdir, bober_io_name, bober_io_open,
-	bober_io_read, bober_io_readlink, bober_io_ready, bober_io_recvfrom, bober_io_remove, bober_io_rename,
-	bober_io_reset, bober_io_run, bober_io_sendto, bober_io_shutdown, bober_io_size, bober_io_stat, bober_io_sync,
-	bober_io_write, bober_io_write_at, bober_mono, bober_tz } from "../src/rt.h"
+	bober_io_read, bober_io_readlink, bober_io_ready, bober_io_reap, bober_io_recvfrom, bober_io_remove,
+	bober_io_rename, bober_io_reset, bober_io_sendto, bober_io_shutdown, bober_io_size, bober_io_start, bober_io_stat,
+	bober_io_sync, bober_io_write, bober_io_write_at, bober_mono, bober_tz } from "../src/rt.h"
 
 import { fromC } from "./c"
 import { IoError, Kind } from "./error"
@@ -335,17 +335,22 @@ export function exe(): string throws IoError {
 
 /// The name the running program was run by, its argv[0].
 export function name(): string { return fromC(bober_arg(0)) }
-
 /// Runs argv as std/process's run does.
-export function run(argv: string[], out: string | null = null): i32 throws IoError {
+export function run(argv: string[], out: string | null = null): i32 throws IoError { return wait(start(argv, out)) }
+
+/// Starts argv as std/process's start does: its pid.
+export function start(argv: string[], out: string | null = null): i64 throws IoError {
 	for (const a of argv) {
 		cPath("run", a)
 	}
 	if (out != null) {
 		cPath("run", out!)
 	}
-	return checked(bober_io_run(argv[0], argv, out ?? (0 as u64)), "run", argv[0]) as i32
+	return checked(bober_io_start(argv[0], argv, out ?? (0 as u64)), "run", argv[0])
 }
+
+/// Waits for the process pid as std/process's Process does.
+export function wait(pid: i64): i32 throws IoError { return checked(bober_io_reap(pid), "wait", `${pid}`) as i32 }
 
 /// The value of the environment variable name, null if it is unset.
 export function env(name: string): string | null {

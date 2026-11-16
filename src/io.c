@@ -570,7 +570,7 @@ void bober_io_ip_text(const unsigned char *ip, int n, char *text) {
   inet_ntop(n == 4 ? AF_INET : AF_INET6, ip, text, BOBER_IO_HOST);
 }
 
-long bober_io_run(const char *file, char *const *argv, const char *out) {
+long bober_io_start(const char *file, char *const *argv, const char *out) {
   extern char **environ;
   bober_tainted = 1;
   posix_spawn_file_actions_t fa;
@@ -579,10 +579,19 @@ long bober_io_run(const char *file, char *const *argv, const char *out) {
     posix_spawn_file_actions_addopen(&fa, 1, out, O_WRONLY | O_CREAT | O_TRUNC, 0666),
         posix_spawn_file_actions_adddup2(&fa, 1, 2);
   pid_t pid;
-  int err = posix_spawnp(&pid, file, &fa, 0, argv, environ), status;
+  int err = posix_spawnp(&pid, file, &fa, 0, argv, environ);
   posix_spawn_file_actions_destroy(&fa);
-  if (err) return -err;
+  return err ? -err : pid;
+}
+
+long bober_io_reap(long pid) {
+  int status;
   while (waitpid(pid, &status, 0) < 0)
     if (errno != EINTR) return -errno;
   return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+}
+
+long bober_io_run(const char *file, char *const *argv, const char *out) {
+  long pid = bober_io_start(file, argv, out);
+  return pid < 0 ? pid : bober_io_reap(pid);
 }

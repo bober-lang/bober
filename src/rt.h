@@ -273,7 +273,10 @@ long bober_io_name(int fd, int peer, char *host);
 int bober_io_ip(const char *text, unsigned char *ip);
 /// The text of the n, 4 or 16, bytes of an IP into text.
 void bober_io_ip_text(const unsigned char *ip, int n, char *text);
-/// Runs the program file, found in PATH unless it holds a /, with the null-ended argv and the process's environment,
-/// its output and errors to the file out unless it is null, and waits for it, blocking every fiber: its exit status,
-/// or 128 + the signal that ended it.
+/// Starts the program file, found in PATH unless it holds a /, with the null-ended argv and the process's environment,
+/// its output and errors to the file out unless it is null: its pid.
+long bober_io_start(const char *file, char *const *argv, const char *out);
+/// Waits for the process pid, blocking every fiber: its exit status, or 128 + the signal that ended it.
+long bober_io_reap(long pid);
+/// Waits for what bober_io_start starts, for boot/interp.c.
 long bober_io_run(const char *file, char *const *argv, const char *out);
