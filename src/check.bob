@@ -260,8 +260,8 @@ class Warning {
 
 /// The stage after the checker.
 export interface Checked {
-	/// A top-level declaration or test, once checked, of a module after those it imports, and after those it needs
-	/// checked first.
+	/// A top-level declaration, test or import, once checked, of a module after those it imports, and after those it
+	/// needs checked first.
 	decl(n: Node, path: string, src: string)
 	/// A top-level declaration of the module at path that one handed on before it refers to, typed but not yet checked
 	/// whole, so that the next stage knows it ahead of its decl.
@@ -1078,9 +1078,10 @@ class Checker {
 				const n = this.node(t)
 				if (n.kind != "import") {
 					ds.push(this.declare(n))
-				} else if (early) {
-					this.imports(n)
 				} else {
+					if (early) {
+						this.imports(n)
+					}
 					imports.push(n)
 				}
 				t = this.p.parse()
@@ -1089,8 +1090,12 @@ class Checker {
 		} catch (e: SyntaxError) {
 			this.report(e.loc, e.msg)
 		}
-		for (const n of imports) {
+		for (const n of if (early) [] else imports) {
 			this.imports(n)
+		}
+		for (const n of imports) {
+			// After all its imports are checked, so that its module follows theirs, as when read from the cache.
+			this.modules.decl(n, this.m.path, this.src)
 		}
 		for (const d of ds) {
 			this.signature(d)
@@ -1249,6 +1254,7 @@ class Checker {
 			return this.report(s.loc, m)
 		}
 		this.m.imports.push(m)
+		n.symbol = m.path + ":"
 		if (listed) {
 			const tests = endsWith(this.m.path, ".test.bob")
 			const visible = if (tests) m.tops else m.exports
@@ -4946,7 +4952,7 @@ export function normal(path: string): string {
 }
 
 /// The last segment of spec, without .bob.
-function segment(spec: string): string {
+export function segment(spec: string): string {
 	let s = spec
 	while (indexOf(s, "/") >= 0) {
 		s = s.slice(indexOf(s, "/") + 1, s.length)
