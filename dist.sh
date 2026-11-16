@@ -7,7 +7,6 @@
 # the host's of the sysroot's Linux headers. Runs in the repo.
 set -e
 notice() { printf '== %s\n\n' "$1"; shift; cat "$@"; echo; }
-build/bober run -release src/bober.bob help > /dev/null
 rm -rf build/dist
 mkdir -p build/dist/bober/bin
 cp build/bober build/dist/bober/bin/
