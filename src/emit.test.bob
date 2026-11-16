@@ -182,6 +182,38 @@ exit 1
 `
 }
 
+test "a type param's value cast into a class it is not traps" {
+	assert run("param",
+		`interface HasV { v: i32 }
+class P { v = 1 }
+class Q { v = 2 }
+
+function p[T extends HasV](x: T): i32 { return (x as P).v }
+
+function main(): i32 {
+	print(\`\${p(new P())}\`)
+	return p(new Q())
+}
+`) == `1
+${dir}/param.bob:5:51: trap: cast to a type that is not the value's
+exit 1
+`
+}
+
+test "an object held as an interface cast into a class traps" {
+	assert run("object",
+		`interface Any {}
+class C { v = 1 }
+
+function main(): i32 {
+	const x: Any = { v: 2 }
+	return (x as C).v
+}
+`) == `${dir}/object.bob:6:12: trap: cast to a type that is not the value's
+exit 1
+`
+}
+
 test "a string tests as the string literals it spells" {
 	assert run("spells",
 		`type K = "if" | "else"

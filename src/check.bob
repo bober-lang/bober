@@ -3414,9 +3414,9 @@ class Checker {
 	///
 	/// `x instanceof T`, `x` of union, object or interface type, is true if the type of its tag fits `T`. Some member
 	/// of `x`'s type shall fit `T`, and `x` narrows to those members; or `T` shall fit an object or interface member,
-	/// and `x` narrows to `T` (§6.11). A type that is no union is its only member, and a type set's parameter has the
-	/// members of its set. `x instanceof T`, `x` a `string` and `T` string literal types, is true if `x` spells one of
-	/// them, and `x` narrows to `T`.
+	/// and `x` narrows to `T` (§6.11). A type that is no union is its only member, a type set's parameter has the
+	/// members of its set, and another parameter is tested as the object type or interface it extends. `x instanceof T`,
+	/// `x` a `string` and `T` string literal types, is true if `x` spells one of them, and `x` narrows to `T`.
 	///
 	/// ```
 	/// let x: i32 = 1 + 2 * 3           // 7
@@ -3666,7 +3666,8 @@ class Checker {
 			return true
 		}
 		for (const m of opened(l).alternatives()) {
-			if (m.fits(t) || (m.kind == "object" || m.kind == "interface") && t.fits(m)) {
+			const u = constraint(m)
+			if (m.fits(t) || (u.kind == "object" || u.kind == "interface") && t.fits(u)) {
 				return true
 			}
 		}
@@ -3763,13 +3764,15 @@ class Checker {
 	/// to nearest; to `bool` is `!= 0`. Into a union: sets the tag. From a union to a member type: traps if the tag is
 	/// another type. A string to a string literal type: the literal it spells, which traps if none (§4.2). A string
 	/// constant of one code point casts to an integer type as that code point, below 0x80 for `u8`, so that it never
-	/// equals a byte of a longer encoding. Otherwise `x` shall fit `T`; in particular a literal shall be representable
-	/// in `T`.
+	/// equals a byte of a longer encoding. Otherwise `x` shall fit `T`, in particular a literal be representable in
+	/// `T`; or `T` fit `x`'s type, a parameter's by the object type or interface it extends, and cast down into a class
+	/// it traps if the value is of another type.
 	///
 	/// ```
 	/// let n: i32 = 300; (n as u8) == 44     let m = -1; (m as u32) == 4294967295
 	/// let f = 1e20; (f as i32) == 2147483647
 	/// (v as i32) + 1      // traps if v: i32 | string holds a string
+	/// s as Square         // s: T extends HasSide; traps if s holds another class
 	/// x as u8 as i32
 	/// 300 as u8           // error: not representable
 	/// ("a" as u8) == 97     ("\u{1F600}" as u32) == 0x1F600
@@ -3784,7 +3787,7 @@ class Checker {
 		if (char && !isChar(unquoted(this.text(x.t)), t)) {
 			throw this.error(start(x), `${this.text(x.t)} is not representable as ${show(t)}`)
 		}
-		if (!scalars && !char && !v.fits(t) && !t.fits(v)) {
+		if (!scalars && !char && !v.fits(t) && !t.fits(constraint(v))) {
 			throw this.error(n.t.loc, `cannot cast ${show(v)} to ${show(t)}`)
 		}
 		this.convert(x, if (v.fits(t)) t else v.widen(false))
@@ -4841,6 +4844,12 @@ function typeSet(ts: Type[]): Type { return Type.interface(Type.union(ts)) }
 /// t, or the union of the type set constraining param t.
 function opened(t: Type): Type {
 	return if (t.kind == "param" && t.base != null && isSet(t.base!)) t.base!.base! else t
+}
+
+/// t, or the object type or interface param t extends: what a test or cast down takes its value as.
+function constraint(t: Type): Type {
+	const u = t.underlying() ?? t
+	return if (u.kind == "object" || u.kind == "interface") u else t
 }
 
 /// The type a and b compare as (6.5): their join, else that of a type set param's union in place of the param; null if
