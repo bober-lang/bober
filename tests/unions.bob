@@ -25,6 +25,16 @@ interface HasSide {
 type Shape = Square | Circle
 type Ev = { kind: "key", code: i32 } | { kind: "move", x: i32, y: i32 }
 
+interface Leaf {
+	k: "leaf"
+	v: i32
+}
+
+interface Neg {
+	k: "neg"
+	a: Leaf | Neg
+}
+
 function area(s: Shape): f64 {
 	return switch (s) {
 		case Square: s.side * s.side
@@ -81,6 +91,11 @@ test "switch on type labels" {
 test "switch on a discriminating field" {
 	assert weight({ kind: "key", code: 4 }) == 4
 	assert weight({ kind: "move", x: 2, y: 3 }) == 5
+}
+
+test "an object literal nested in a tagged union takes the member its tag selects" {
+	const e: Leaf | Neg = { k: "neg", a: { k: "neg", a: { k: "leaf", v: 7 } } }
+	assert e.k == "neg" && e.a.k == "neg" && e.a.a.k == "leaf" && e.a.a.v == 7
 }
 
 test "?? and ??=" {

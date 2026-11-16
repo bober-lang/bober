@@ -4208,7 +4208,7 @@ class Checker {
 				spreads.push(t)
 			}
 		}
-		const w = cls ?? aim(want, ["object", "interface"])
+		const w = cls ?? aim(want, ["object", "interface"]) ?? this.byTags(n, want)
 		const fs: Field[] = []
 		let k = 0
 		for (const q of n.parts) {
@@ -4235,6 +4235,21 @@ class Checker {
 			fs.push(new Field(name, ft ?? (if (want == null) based(t) else t))) // as an array literal's elements
 		}
 		return cls ?? Type.object(fs)
+	}
+
+	/// The one object or interface of union want that has a field for each field literal n sets to a string, of a type
+	/// the string fits: the member its tags (§4.4) select; null if none or several.
+	private byTags(n: Node, want: Type | null): Type | null {
+		const alts = want?.alternatives() ?? []
+		const ms = alts.filter(m => (m.kind == "object" || m.kind == "interface") && n.parts.every(q => {
+			const v = if (q.kind == "unary") null else after(q, ":")
+			if (v == null || !isTok(v!, "string")) {
+				return true
+			}
+			const f = m.member(this.key(q.t))
+			return f != null && Type.literal(this.text(v!.t), String).fits(f!)
+		}))
+		return if (ms.length == 1) ms[0] else null
 	}
 
 	/// The type of the field name of class cls, as set by the literal at that copies one.
