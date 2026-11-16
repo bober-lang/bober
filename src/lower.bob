@@ -160,6 +160,7 @@ export class Lower implements Checked {
 			case "show", "item", "diff": "show"
 			case "newArray": "array"
 			case "pow": "math"
+			case "strWord", "strCompare": "string"
 			default: "fiber" // start, wait, race and Future
 		}
 		const path = builtinPath(file)
@@ -1153,9 +1154,11 @@ class Gen {
 		}
 	}
 
-	/// Pushes whether string p spells one of string literal types t, testing its length, then comparing it with each of
-	/// that length; where p is a local or a member, the one it spells is stored there, so that p narrowed to t holds the
-	/// program's one value of it (§4.2); a local so stored to is not Readonly, lest mono take the last for what it holds.
+	/// Pushes whether string p spells one of string literal types t: its words compared with those of each literal of
+	/// up to 15 bytes, a chain on the first that LLVM makes a compare tree, then its length with those of the longer
+	/// ones and a binary search of those of that length; where p is a local or a member, the one it spells is stored
+	/// there, so that p narrowed to t holds the program's one value of it (§4.2); a local so stored to is not Readonly,
+	/// lest mono take the last for what it holds.
 	private spelled(p: Node, t: Type): i32 {
 		const local = p.kind == "token" && p.symbol == "" && this.find(this.text(p)) != null
 		const at = if (local || p.kind == "member") this.place(p, true) else null
@@ -1167,42 +1170,90 @@ class Gen {
 		} else {
 			this.load(at!)
 		}
-		const s = this.ty(String)
-		const v = this.temp(s)
+		const v = this.temp(this.ty(String))
 		this.op(op.SetLocal, v)
-		this.op(op.Local, v)
-		this.op(op.Field, this.prog.intern("length"))
-		const n = this.temp(kind.I32)
-		this.op(op.SetLocal, n)
 		const ls = t.alternatives().map(m => unquoted(m.text))
-		const all = ls.map(l => l.length)
-		sortBy(all, (a, b) => a < b)
-		const lens = unique(all)
+		sortBy(ls, (a, b) => a.length < b.length || a.length == b.length && a < b)
+		const w = this.temp(kind.U64)
+		this.strWord(v, 0)
+		this.op(op.SetLocal, w)
+		const short = ls.filter(l => l.length <= 15)
+		for (const l of short) {
+			this.op(op.Local, w)
+			this.int(kind.U64, word(l, 0))
+			this.op(op.Eq)
+			if (l.length > 7) {
+				this.open(op.If, kind.Bool)
+				this.strWord(v, 1)
+				this.int(kind.U64, word(l, 1))
+				this.op(op.Eq)
+				this.op(op.Else)
+				this.op(op.False)
+				this.op(op.End)
+			}
+			this.open(op.If, kind.Bool)
+			this.found(at, l)
+		}
+		const long = ls.filter(l => l.length > 15)
+		const lens = unique(long.map(l => l.length))
 		for (const len of lens) {
-			this.op(op.Local, n)
+			this.op(op.Local, v)
+			this.op(op.Field, this.prog.intern("length"))
 			this.int(kind.I32, len)
 			this.op(op.Eq)
 			this.open(op.If, kind.Bool)
-			const same = ls.filter(l => l.length == len)
-			for (const l of same) {
-				this.op(op.Local, v)
-				this.op(op.Str, this.prog.intern(l))
-				this.op(op.Eq)
-				this.open(op.If, kind.Bool)
-				if (at != null && at!.store != op.SetGlobal) {
-					this.parts(at!)
-					this.op(op.Str, this.prog.intern(l))
-					this.cast(s, at!.type)
-					this.op(at!.store, at!.a, at!.b)
-				}
-				this.op(op.True)
-				this.op(op.Else)
-			}
-			this.ends(same.length)
+			this.search(v, long.filter(l => l.length == len), at)
 			this.op(op.Else)
 		}
-		this.ends(lens.length)
+		this.ends(short.length + lens.length)
 		return kind.Bool
+	}
+
+	/// Pushes word i of the string in local v as a short string holds it (builtin/string.bob).
+	private strWord(v: i32, i: i32) {
+		this.op(op.Local, v)
+		this.int(kind.U64, i)
+		this.callBuiltin("strWord", 0)
+	}
+
+	/// Pushes whether the string in local v is one of literals ls, sorted, by binary search, stored at at as spelled.
+	private search(v: i32, ls: string[], at: Place | null) {
+		if (ls.length == 0) {
+			this.op(op.False)
+			return
+		}
+		const mid = ls.length >> 1
+		const c = this.temp(kind.I32)
+		this.op(op.Local, v)
+		this.op(op.Str, this.prog.intern(ls[mid]))
+		this.callBuiltin("strCompare", 0)
+		this.op(op.SetLocal, c)
+		this.op(op.Local, c)
+		this.int(kind.I32, 0)
+		this.op(op.Eq)
+		this.open(op.If, kind.Bool)
+		this.found(at, ls[mid])
+		this.op(op.Local, c)
+		this.int(kind.I32, 0)
+		this.op(op.Lt)
+		this.open(op.If, kind.Bool)
+		this.search(v, ls.slice(0, mid), at)
+		this.op(op.Else)
+		this.search(v, ls.slice(mid + 1, ls.length), at)
+		this.op(op.End)
+		this.op(op.End)
+	}
+
+	/// Pushes true, after storing literal l at at as spelled, then Else.
+	private found(at: Place | null, l: string) {
+		if (at != null && at!.store != op.SetGlobal) {
+			this.parts(at!)
+			this.op(op.Str, this.prog.intern(l))
+			this.cast(this.ty(String), at!.type)
+			this.op(at!.store, at!.a, at!.b)
+		}
+		this.op(op.True)
+		this.op(op.Else)
 	}
 
 	/// Ends n Ifs, each false in its last Else.
@@ -2520,6 +2571,19 @@ function holdsTypes(t: Type): bool { return isTypeValue(t) || t.kind == "array" 
 /// Whether p names something, so that its value may be other than what its source spells; this, often large, alone is
 /// not shown.
 function names(p: Node): bool { return if (p.kind == "token") p.t.kind == "ident" else p.parts.some(names) }
+
+/// Word i, 0 or 1, of literal l of up to 15 bytes as a short string holds it (builtin/string.bob): its length, then
+/// its bytes, 8 to a word, little-endian.
+function word(l: string, i: i32): i64 {
+	let w: u64 = 0
+	for (const b of 0 ... 7) {
+		const j = 8 * i + b
+		const x: u64 = if (j == 0) l.length as u64 else if (j <= l.length) l[j - 1] as u64 else 0
+		w |= x << 8 * b
+	}
+	return w as i64
+}
+
 /// Whether a value of type t is text as is in a template: a string or a string literal.
 function textual(t: Type): bool { return t.kind == "string" || t.kind == "literal" && t.base!.kind == "string" }
 
