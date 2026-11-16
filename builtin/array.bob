@@ -2,7 +2,7 @@
 //! to its elements, which it is made with in one cell and which push moves to a block of their own once full
 //! (src/emit.bob).
 
-import { Ref, addr, alloc, array, deref, get, load, memcpy, set, sizeOf, trap, zero } from "./mem"
+import { Ref, addr, alloc, array, deref, get, load, memcpy, set, sizeOf, store, trap, zero } from "./mem"
 
 /// The methods of an array, which is this.
 export class Array[T] {
@@ -12,15 +12,10 @@ export class Array[T] {
 	/// x stored after the last element, the elements moved to a block of twice the room if full.
 	push(x: T) {
 		const n = get[i64, T[]](this, 0)
-		const size = sizeOf[T]()
 		if (n == get[i64, T[]](this, 8)) {
-			const cap = 2 * n + 8
-			const data = alloc[T](cap)
-			memcpy(deref(data), elements(addr(this)), (n * size) as u64)
-			set[Ref, T[]](this, 16, data)
-			set[i64, T[]](this, 8, cap)
+			grow[T](this, n)
 		}
-		set[T, Ref](get[Ref, T[]](this, 16), n * size, x)
+		set[T, Ref](get[Ref, T[]](this, 16), n * sizeOf[T](), x)
 		set[i64, T[]](this, 0, n + 1)
 	}
 
@@ -183,6 +178,23 @@ export function newArray[T](n: i32): T[] {
 		r[i] = z
 	}
 	return r
+}
+
+/// The n elements of a moved to a block of twice the room; those of a's own cell zeroed, lest the collector trace them
+/// still (src/gc.c).
+function grow[T](a: T[], n: i64) {
+	const size = sizeOf[T]()
+	const cap = 2 * n + 8
+	const data = alloc[T](cap)
+	const old = elements(addr(a))
+	memcpy(deref(data), old, (n * size) as u64)
+	if (old == addr(a) + 24) {
+		for (const i of 0 ... n - 1) {
+			store[T](old + ((i * size) as u64), zero[T]())
+		}
+	}
+	set[Ref, T[]](a, 16, data)
+	set[i64, T[]](a, 8, cap)
 }
 
 /// Where the elements of the array at a are.
