@@ -2039,6 +2039,45 @@ class Emitter {
 		return code
 	}
 
+	/// The code of a closure { code, thunk, self } of a method's thunk bound to self, as a function value of type t:
+	/// its args as the thunk takes them, those of optional params given only if present.
+	private bind(t: i32): Value {
+		const b = this.b
+		const sym = `bind.${this.key(t)}`
+		const have = this.thunks.get(sym)
+		if (have != null) {
+			return have
+		}
+		const ps = this.p.items(t)
+		const code = b.function(sym, this.codeType(this.p.b(t), ps), true)
+		this.thunks.set(sym, code)
+		this.aside(code, [], () => {
+			const env = b.param(code, 0)
+			const start = this.label()
+			this.start(start)
+			const argv = this.scratch(b.array(this.unionTy, ps.length as u64))
+			let n = this.i64Const(0)
+			for (const k of 0 ... ps.length - 1) {
+				const x = b.param(code, (k + 1) as u32)
+				const at = this.ir().gep(this.unionTy, argv, [this.i64Const(k)])
+				if (this.anyOf(ps[k])) {
+					this.ir().store(x, at, false)
+					n = this.ir().binary("add", n, this.i64Const(1))
+				} else {
+					const v = this.cast({ v: this.ir().extract(x, 0), t: this.norm(this.p.a(ps[k])) }, this.any)
+					this.ir().store(v, at, false)
+					n = this.ir().binary("add", n, this.ir().cast("zext", this.ir().extract(x, 1), this.i64))
+				}
+			}
+			const thunk = this.captured(env, 1, this.ptr)
+			this.ir().ret(this.call(b.fn(this.unionTy, [this.unionTy, this.ptr, this.i64]), thunk,
+				[this.captured(env, 2, this.unionTy), argv, n]))
+			b.at(this.entry)
+			b.br(start)
+		})
+		return code
+	}
+
 	/// Value x of type from cast to to; in a program as lowered, each a union of any type, as a function value's code
 	/// takes and gives them (see value).
 	private through(x: Value, from: i32, to: i32): Value {
@@ -2129,6 +2168,25 @@ class Emitter {
 				|| p.kind(of) == kind.Named) this.layout(of).find(s => s.name == name)
 				else null
 			const ft = s?.t ?? fieldOf(p, t, name) // as fieldOf finds it: through a constraint, bases or embeds
+			if (this.kindOf(ft) == kind.Func) {
+				// Its method, as callMethod finds it, bound to it, else a function field.
+				const at = this.spill(u, this.unionTy)
+				const fn = this.rt("method_on", [at, this.cstr(text), this.i64Const(text.length)], false)
+				const r = this.scratch(this.ref, promoted)
+				const [yes, no, done] = [this.label(), this.label(), this.label()]
+				this.condBr(this.ir().icmp("ne", this.ir().cast("ptrtoint", fn, this.i64), this.i64Const(0)), yes, no)
+				this.start(yes)
+				const self = this.ir().load(this.unionTy, at, false)
+				this.ir().store(this.closure(this.bind(ft), [fn, self]), r, false)
+				this.jump(done)
+				this.start(no)
+				const [q, d] = this.dynPlace({ v: u, t: this.any }, this.str(text))
+				this.ir().store(this.cast({ v: this.load(d, q), t: this.any }, ft), r, false)
+				this.jump(done)
+				this.start(done)
+				this.push(this.ir().load(this.ref, r, false), ft)
+				return
+			}
 			const [q, d] = this.dynPlace({ v: u, t: this.any }, this.str(text))
 			if (this.kindOf(ft) == kind.FixedArray) {
 				this.push(this.fetch(q, ft), ft) // its place, as a class's field's, not the copy load boxes
