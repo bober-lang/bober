@@ -3,16 +3,16 @@
 //! defaults and value.
 
 import { fromBits } from "../../builtin/math"
-import { endsWith, indexOf } from "../../std/algo"
-import { minus } from "../../std/ascii"
-import { formatInt, quoted, utf8 } from "../../std/string"
+import { endsWith, indexOf, startsWith } from "../../std/algo"
+import { backtick, dollar, isDigit, lbrace, minus, quote } from "../../std/ascii"
+import { codePoint, escape, formatInt, quoted, replace, utf8 } from "../../std/string"
 import { CompileError } from "../error"
 import { Shape, prec } from "../parse"
 import * as decl from "./decl"
 import * as kind from "./kind"
 import * as op from "./op"
 import { Code, Program } from "./program"
-import { param, qualified, showType } from "./show"
+import { inner, param, qualified, showType } from "./show"
 
 /// Decl d's signature on one line: its mods, keyword, name, type params, params with their defaults, result, throws, a
 /// var's type and, if value, its value, supertypes and tags; a var's type as resolved if neither type nor value is
@@ -46,7 +46,8 @@ export function signature(p: Program, d: i32, value = true): string throws Compi
 			if (s == 0 && (x.mods & decl.Embed) != 0) {
 				return `...${showType(p, x.type, at)}${tags}`
 			}
-			const v = if (value && x.code != null) expr(p, x.code!, 0, x.code!.ops.length - 1, at) else ""
+			const e = if (value && x.code != null) expr(p, x.code!, 0, x.code!.ops.length - 1, at) else ""
+			const v = if (indexOf(e, "\n") < 0) e else "" // but of more lines, as a closure's
 			// Its type as written, else as resolved, a const's of one value its base, but of a value that says it.
 			const r = if (p.kind(x.type) == kind.Literal) p.a(x.type) else x.type
 			const t = if (s != 0) s else if (v != "" && says(x.code!, r)) 0 else r
@@ -61,12 +62,13 @@ export function signature(p: Program, d: i32, value = true): string throws Compi
 	return out + tags
 }
 
-/// Whether code c's value says its type t: is a written `as` or a `new`, or a lone literal of t, a string's, an i32's,
-/// an f64's or a bool's, or an untyped constant's.
+/// Whether code c's value says its type t: is a written `as`, a `new` or a template, or a lone literal of t, a
+/// string's, an i32's, an f64's or a bool's, or an untyped constant's.
 function says(c: Code, t: i32): bool {
 	const n = c.ops.length - 2 // the op that leaves it
 	const f = c.forms
-	if (c.ops[n] == op.New || f.length > 0 && f[f.length - 3] == n && f[f.length - 2] == op.As) {
+	const form = if (f.length > 0 && f[f.length - 3] == n) f[f.length - 2] else 0 // its last mark's
+	if (c.ops[n] == op.New || form == op.As || form == op.Template) {
 		return true
 	}
 	return switch (if (n == 0) c.ops[0] else op.End) {
@@ -98,123 +100,860 @@ function fallback(p: Program, d: i32, i: i32): string throws CompileError {
 	return ""
 }
 
-/// The value ops from up to to of c leave, as source, as written where c's marks (Code.forms) say; "" unless they are
-/// straight-line: literals, locals, globals, fields, calls, new, array and object literals and operators, a Cast
-/// dropped.
+/// The value ops from up to to of c leave, as source, as written where c's marks (Code.forms) say; "" unless Printer
+/// prints them.
 export function expr(p: Program, c: Code, from: i32, to: i32, at: i32): string throws CompileError {
-	const atom = 14 // how tightly a name, literal, call or member binds, as parse's Member
-	const stack: [string, i32][] = []
-	// The values of the last n entries, popped, a Missing one dropped.
-	const take = (n: i32) => {
-		const xs = stack.slice(stack.length - n, stack.length).map(e => e[0]).filter(e => e != "")
-		for (const _ of 1 ... n) {
-			stack.pop()
+	try {
+		const w = new Printer(p, c, at, c.locals.length)
+		w.i = from
+		return text(w.value(to))
+	} catch (why: string) {
+		return ""
+	}
+}
+
+/// The statements of function or test d's code, one a line, but those of its params' defaults, which signature
+/// prints; throws why not where Printer cannot print them.
+export function body(p: Program, d: i32): string throws string | CompileError {
+	const c = p.decls[d].code!
+	const w = new Printer(p, c, p.decls[d].module, p.items(p.decls[d].type).length + (if (p.method(d)) 1 else 0))
+	while (c.ops[w.i] == op.Default) {
+		w.i = c.next(w.i) + 1
+	}
+	return w.statements(c.ops.length - 1).join("\n")
+}
+
+/// What a Br to a block open around the op printed is: none of these, a break, a continue, or the end of a ?. chain.
+const Other = 0
+const Break = 1
+const Continue = 2
+const Chain = 3
+/// How tightly an expression binds, as parse's prec has it for binary operators: a name, literal, call or member,
+/// and a prefix operator; an `if` expression, arrow function or `as` binds least. Above them, values not yet source: a
+/// string, a template's text, and a compound assignment's operator and operand.
+const atom = 14
+const prefix = 12
+const Lit = 15
+const Tpl = 16
+const Assigns = 17
+/// Per form of an Int, its prefix and radix, but decimal's, of none, last.
+const radices: [u8, string, i32][] = [[op.Hex, "0x", 16], [op.Octal, "0o", 8], [op.Binary, "0b", 2], [0, "", 10]]
+/// The builtin/ functions lower calls that print as no call of theirs, but where the module imports them.
+const lowered = ["diff", "item", "pick", "race", "start", "strCompare", "strWord", "subtest", "wait", "zero"]
+
+/// Value v as source.
+function text(v: [string, i32]): string throws string {
+	if (v[1] == Assigns) {
+		throw "an assignment in an expression"
+	}
+	return if (v[1] == Lit) `"${chars(v[0], false)}"` else if (v[1] == Tpl) `\`${v[0]}\`` else v[0]
+}
+
+/// Value v as source, parenthesized unless it binds at least min.
+function paren(v: [string, i32], min: i32): string throws string { return if (v[1] < min) `(${text(v)})` else text(v) }
+
+/// Value v as a piece of a template: its text, or `${v}`.
+function piece(v: [string, i32]): string throws string {
+	return if (v[1] == Tpl) v[0] else if (v[1] == Lit) chars(v[0], true) else `\${${text(v)}}`
+}
+
+/// String s as a literal's text, a template's if tpl: escaped as quoted does, ` and $ too, a non-UTF-8 byte as \xNN.
+function chars(s: string, tpl: bool): string {
+	let q = ""
+	let i = 0
+	while (i < s.length) {
+		const [cp, j] = codePoint(s, i)
+		q += if (j > i + 1) s.slice(i, j)
+			else if (cp == 0xfffd) `\\x${formatInt(s[i], 16)}`
+			else if (tpl && (s[i] == backtick || s[i] == dollar)) `\\${chr(s[i])}`
+			else if (tpl && s[i] == quote) "\""
+			else escape(s[i])
+		i = j
+	}
+	return q
+}
+
+/// Field name of x, as source: a tuple's by its index.
+function field(x: string, name: string): string { return if (isDigit(name[0])) `${x}[${name}]` else `${x}.${name}` }
+/// Value v spread into an array or object literal.
+function spreading(v: [string, i32]): string throws string { return `...${paren(v, prefix)}` }
+/// Source s where a block could start, an object literal parenthesized.
+function unblock(s: string): string { return if (s[0] == lbrace) `(${s})` else s }
+/// Lines as a block.
+function braced(lines: string[]): string { return `{\n${lines.join("\n")}\n}` }
+
+/// Value v as prop name of an object literal.
+function prop(name: string, v: [string, i32]): string throws string {
+	return if (text(v) == name) name else `${name}: ${text(v)}`
+}
+
+/// Prints a code's ops back as source: per value an op leaves an expression on the stack, and where the stack is
+/// empty again a statement; it throws why not where the ops do not say what the source does.
+class Printer {
+	p: Program
+	c: Code
+	at: i32
+	/// Per value, its source and how tightly it binds.
+	stack: [string, i32][] = []
+	/// The statements of the block printed.
+	lines: string[] = []
+	/// Per block open around the op printed, innermost last, what a Br to it is.
+	blocks: i32[] = []
+	/// Per local, whether it is declared: a param, a capture, or one whose declaration is printed.
+	declared: bool[] = []
+	/// Per temporary that keeps a compound assignment's object or index, that, else null.
+	held: ([string, i32] | null)[] = []
+	/// The op printed next.
+	i = 0
+
+	constructor(p: Program, c: Code, at: i32, params: i32) {
+		this.p = p
+		this.c = c
+		this.at = at
+		for (const l of 0 ... c.locals.length - 1) {
+			this.declared.push(l < params || c.captures.includes(l))
+			this.held.push(null)
 		}
-		return xs.join(", ")
 	}
-	// The top entry popped, parenthesized unless it binds at least min.
-	const operand = (min: i32) => {
-		const [e, level] = stack.pop()
-		return if (level < min) `(${e})` else e
+
+	/// The statements of the ops up to op to.
+	statements(to: i32): string[] throws string | CompileError {
+		const outer = this.lines
+		this.lines = []
+		while (this.i < to) {
+			this.step()
+		}
+		const lines = this.lines
+		this.lines = outer
+		return lines
 	}
-	let k = 0 // the next of c's marks
-	while (k < c.forms.length && c.forms[k] < from) {
-		k += 3
+
+	/// The value the ops up to op to leave, among which no statement is.
+	value(to: i32): [string, i32] throws string | CompileError {
+		this.stack.push(["", Other]) // under which a statement would pop it
+		const n = this.stack.length
+		while (this.i < to) {
+			this.step()
+		}
+		if (this.stack.length != n + 1) {
+			throw "not one value"
+		}
+		const v = this.stack.pop()
+		this.stack.pop()
+		return v
 	}
-	for (const i of from ... to - 1) {
-		const o = c.ops[i]
+
+	/// Adds statement s, where no value is left.
+	private line(s: string) throws string {
+		if (this.stack.length > 0) {
+			throw "a statement in an expression"
+		}
+		this.lines.push(s)
+	}
+
+	private push(s: string, level: i32) { this.stack.push([s, level]) }
+
+	/// The top value, popped.
+	private top(): [string, i32] throws string {
+		if (this.stack.length == 0) {
+			throw "no value"
+		}
+		return this.stack.pop()
+	}
+
+	/// The top value popped, as source parenthesized unless it binds at least min.
+	private pop(min: i32): string throws string { return paren(this.top(), min) }
+
+	/// The last n values popped, as args, a Missing one dropped.
+	private take(n: i32): string throws string {
+		if (this.stack.length < n) {
+			throw "no value"
+		}
+		const xs: string[] = []
+		for (const v of this.stack.slice(this.stack.length - n, this.stack.length)) {
+			xs.push(paren(v, 0))
+		}
+		this.stack = this.stack.slice(0, this.stack.length - n)
+		return xs.filter(x => x != "").join(", ")
+	}
+
+	/// The type of op i's first mark of form f, -1 for none.
+	private marked(i: i32, f: i32): i32 { return this.marks(i, f).at(0) ?? -1 }
+
+	/// The types of op i's marks of form f, in order.
+	private marks(i: i32, f: i32): i32[] {
+		const fs = this.c.forms
+		const ts: i32[] = []
+		for (const k of 0 ... fs.length / 3 - 1) {
+			if (fs[3 * k] == i && fs[3 * k + 1] == f) {
+				ts.push(fs[3 * k + 2])
+			}
+		}
+		return ts
+	}
+
+	/// Type t as source, parenthesized if tight and it is a union or function; throws where a local holds it.
+	private type(t: i32, tight = false): string throws string {
+		if (this.p.reflected(t)) {
+			throw "a type a local holds"
+		}
+		return if (tight) inner(this.p, t, this.at) else showType(this.p, t, this.at)
+	}
+
+	/// Type t of op i, as its Spelled mark has it, if any.
+	private spelled(i: i32, t: i32): string throws string {
+		const s = this.marked(i, op.Spelled)
+		return this.type(if (s < 0) t else s)
+	}
+
+	/// The type args op i is written with, as f[T], else "".
+	private written(i: i32): string throws string {
+		const ts = this.marks(i, op.Spelled)
+		return if (ts.length == 0) "" else `[${ts.map(t => this.type(t)).join(", ")}]`
+	}
+
+	/// The op that closes the block op j opens.
+	private close(j: i32): i32 {
+		let e = this.c.next(j)
+		while (this.c.ops[e] != op.End) {
+			e = this.c.next(e)
+		}
+		return e
+	}
+
+	/// Prints op i, or the construct it starts, and moves past it.
+	private step() throws string | CompileError {
+		const p = this.p
+		const c = this.c
+		const at = this.at
+		const i = this.i
+		// a power of integers is a call of builtin/'s pow, an assert's == of references one of its equal
+		const o = if (c.ops[i] != op.Call) c.ops[i]
+			else if (c.a(i) == p.lang("pow")) op.Pow
+			else if (c.a(i) == p.lang("equal")) op.Eq
+			else op.Call
 		const a = c.a(i)
 		const b = c.b(i)
-		// How op i is written, if its first mark says.
-		const form = if (k < c.forms.length && c.forms[k] == i) c.forms[k + 1] else 0
+		this.i++
 		switch (o) {
-			case op.Cast, op.Init: {}
+			case op.Cast: if (this.marked(i, op.NonNull) >= 0) {
+				this.push(`${this.pop(atom)}!`, atom)
+			}
+			case op.Init, op.Fresh: {}
 			case op.Int:
-				const n = if (form == op.Char) quoted(utf8(p.ints[b])) else digits(p.ints[b], a, form)
-				stack.push([n, if (n[0] == minus) 12 else atom])
+				const r = radices.find(r => r[2] == 10 || this.marked(i, r[0]) >= 0)!
+				const n = if (this.marked(i, op.Char) >= 0) quoted(utf8(p.ints[b])) else digits(p.ints[b], a, r)
+				this.push(n, if (n[0] == minus) prefix else atom)
 			case op.Float:
-				const f = `${fromBits[f64](p.ints[b] as u64)}`
-				stack.push([if (indexOf(f, ".") < 0 && indexOf(f, "e") < 0 && indexOf(f, "n") < 0) f + ".0" else f,
-					if (f[0] == minus) 12 else atom])
-			case op.Str: stack.push([quoted(p.strings[a]), atom])
-			case op.True: stack.push(["true", atom])
-			case op.False: stack.push(["false", atom])
-			case op.Null: stack.push(["null", atom])
-			case op.Missing: stack.push(["", atom])
-			case op.Type: stack.push([showType(p, a, at), atom])
-			case op.Local: stack.push([p.strings[c.locals[a].name], atom])
-			case op.Global: stack.push([qualified(p, a, at), atom])
-			case op.Member: stack.push([`${operand(atom)}.${p.strings[p.decls[a].name]}`, atom])
-			case op.Field: stack.push([`${operand(atom)}.${p.strings[a]}`, atom])
-			case op.Neg, op.Not: stack.push([`${if (o == op.Neg) "-" else "!"}${operand(13)}`, 12])
-			case op.Call:
-				if (a == p.lang("show")) {
-					return "" // of a template, which it cannot name
+				const f = replace(`${fromBits[f64](p.ints[b] as u64)}`, "Infinity", "1e999") // which no literal is NaN
+				this.push(if (indexOf(f, ".") < 0 && indexOf(f, "e") < 0) f + ".0" else f,
+					if (f[0] == minus) prefix else atom)
+			case op.Str:
+				this.push(p.strings[a], Lit)
+				if (this.marked(i, op.Template) >= 0) {
+					this.push(piece(this.top()), Tpl)
 				}
-				// A call of literal is an `as`, which its mark prints.
-				if (a != p.lang("literal")) {
-					const args = take(p.items(p.decls[a].type).length)
-					stack.push([if (p.method(a)) `${operand(atom)}.${p.strings[p.decls[a].name]}(${args})`
-						else `${qualified(p, a, at)}(${args})`, atom])
+			case op.True: this.push("true", atom)
+			case op.False: this.push("false", atom)
+			case op.Null: this.push("null", atom)
+			case op.Missing: this.push("", atom)
+			case op.Type:
+				// as written, or of a typeof: a tuple, object or function type there would read as a value
+				const k = p.kind(a)
+				if (this.marked(i, op.Spelled) < 0 && (k == kind.Tuple || k == kind.Object || k == kind.Func)) {
+					throw "a Type that reads as a value"
 				}
+				this.push(this.spelled(i, a), atom)
+			case op.Local: if (c.locals[a].name != 0) {
+				this.push(p.strings[c.locals[a].name], atom)
+			} else if (this.held[a] != null) {
+				this.stack.push(this.held[a]!)
+			} else {
+				throw "a temporary"
+			}
+			case op.Global: this.push(qualified(p, a, at) + this.written(i), atom)
+			case op.Member: this.push(`${this.pop(atom)}.${p.strings[p.decls[a].name]}`, atom)
+			case op.Field: this.push(field(this.pop(atom), p.strings[a]), atom)
+			case op.Subscript:
+				const k = this.pop(0)
+				this.push(`${this.pop(atom)}[${k}]`, atom)
+			case op.Neg, op.Not: this.push(`${if (o == op.Neg) "-" else "!"}${this.pop(prefix + 1)}`, prefix)
+			case op.Is:
+				const x = this.pop(5)
+				// x != null, but of x == null a while leaves by its negation
+				const not = a == kind.Null && c.ops[i + 1] == op.Not && c.ops[i + 2] != op.BrIf
+				this.i += if (not) 1 else 0
+				this.push(if (a != kind.Null) `${x} instanceof ${this.spelled(i, a)}`
+					else `${x} ${if (not) "!=" else "=="} null`, 4)
+			case op.Call: if (a == p.lang("mark") || a == p.lang("taint")) {
+				// where a test is, before each of its statements, and before a call of C's, dropped
+				this.take(p.items(p.decls[a].type).length)
+				this.i++
+			} else if (a == p.lang("show") || this.marked(i, op.Template) >= 0) {
+				// a template of just a value, or a piece's toString
+				this.push(piece(this.top()), Tpl)
+			} else if (lowered.some(n => a == p.lang(n)) && p.decls[a].module != at
+				&& !p.modules[at].imports.some(x => x.names.some(e => e[0] == a))) {
+				throw `a call of ${p.strings[p.decls[a].name]}, which lower makes`
+			} else if (a == p.lang("newArray")) {
+				this.push(`new ${this.type(p.lists[b][0], true)}[](${this.pop(0)})`, atom)
+			} else if (a != p.lang("literal")) {
+				// a call of literal is an `as`, which its mark prints
+				const ps = p.items(p.decls[a].type)
+				if (ps.length > 0 && p.kind(ps[ps.length - 1]) == kind.Rest) {
+					// a rest param's array, its elements as the args
+					const v = this.top()
+					this.push(if (c.ops[i - 1] == op.Array
+						&& this.marked(i - 1, op.As) < 0) v[0].slice(1, v[0].length - 1)
+						else `...${paren(v, prefix)}`, atom)
+				}
+				const args = this.take(ps.length)
+				this.push(`${if (p.method(a)) `${this.pop(atom)}.${p.strings[p.decls[a].name]}` else qualified(p, a, at)}${this.written(i)}(${args})`,
+					atom)
+			}
 			case op.CallMethod:
-				const args = take(b)
-				stack.push([`${operand(atom)}.${p.strings[a]}(${args})`, atom])
+				const args = this.take(b)
+				if (this.marked(i, op.Template) >= 0) {
+					this.push(piece(this.top()), Tpl) // a template's piece, by its toString
+				} else {
+					this.push(`${this.pop(atom)}.${p.strings[a]}(${args})`, atom)
+				}
 			case op.CallRef:
-				const args = take(a)
-				stack.push([`${operand(atom)}(${args})`, atom])
+				const args = this.take(a)
+				this.push(`${this.pop(atom)}(${args})`, atom)
 			case op.New:
 				if (p.kind(a) != kind.Named) {
-					return ""
+					throw "a New of no class"
 				}
 				const ctor = p.find(p.decls[p.a(a)].module, p.a(a), "constructor")
-				const args = take(if (ctor < 0) 0 else p.items(p.decls[ctor].type).length)
-				stack.push([`new ${showType(p, if (form == op.Spelled) c.forms[k + 2] else a, at)}(${args})`, atom])
+				const args = this.take(if (ctor < 0) 0 else p.items(p.decls[ctor].type).length)
+				this.push(`new ${this.spelled(i, a)}(${args})`, atom)
 			case op.Array:
 				const spread = c.items(c.c(i))
-				const n = stack.length - b
+				const n = this.stack.length - b
 				for (const k of spread) {
-					stack[n + k] = [`...${stack[n + k][0]}`, atom]
+					this.stack[n + k] = [spreading(this.stack[n + k]), atom]
 				}
-				stack.push([`[${take(b)}]`, atom])
+				this.push(`[${this.take(b)}]`, atom)
 			case op.Object:
-				if (p.kind(a) != kind.Object || c.items(c.c(i)).length > 0) {
-					return ""
+				// of props, or of spreads alone: lower makes one of a prop after a spread by a temporary
+				const spreads = c.items(c.c(i)).length
+				if (spreads > 0 && spreads < b || spreads == 0 && p.kind(a) != kind.Object) {
+					throw "an Object of a class's props, or of props and spreads"
 				}
-				const ns = p.names[p.b(a)]
-				const n = stack.length - b
+				const n = this.stack.length - b
 				for (const k of 0 ... b - 1) {
-					stack[n + k] = [`${p.strings[ns[2 * k]]}: ${stack[n + k][0]}`, atom]
+					const v = this.stack[n + k]
+					this.stack[n
+						+ k] = [if (spreads > 0) spreading(v) else prop(p.strings[p.names[p.b(a)][2 * k]], v), atom]
 				}
-				stack.push([`{ ${take(b)} }`, atom])
+				this.push(if (b == 0) "{}" else `{ ${this.take(b)} }`, atom)
+			case op.Closure: this.closure(a)
+			case op.Drop: this.line(this.pop(0))
+			case op.SetLocal: this.local(i, a)
+			case op.SetMember, op.SetField, op.SetSubscript, op.SetGlobal:
+				let v = this.top()
+				const k = if (o == op.SetSubscript) this.pop(0) else ""
+				// into a field embedding its class, a copy of v as written, which lower stores as v
+				if (o == op.SetMember && (p.decls[a].mods & decl.Embed) != 0 && v[1] != Assigns && v[0][0] != lbrace) {
+					v = [`{ ...${text(v)} }`, atom]
+				}
+				this.store(switch (o) {
+					case op.SetMember: `${this.pop(atom)}.${p.strings[p.decls[a].name]}`
+					case op.SetField: field(this.pop(atom), p.strings[a])
+					case op.SetSubscript: `${this.pop(atom)}[${k}]`
+					default: qualified(p, a, at)
+				}, v)
+			case op.Return:
+				// of a function of no result, null; one returning null may end with the return lower adds, left out
+				const v = this.pop(0)
+				if (v != "null" || i < c.ops.length - 2) {
+					this.line(if (v == "null" && c.ops[i - 1] == op.Null) "return" else `return ${v}`)
+				}
+			case op.Throw: this.line(`throw ${this.pop(0)}`)
+			case op.Unreachable: if (this.i != c.ops.length - 1) {
+				throw "an Unreachable" // but where a function that cannot ends, which lower adds
+			}
+			case op.Br:
+				const to = this.blocks[this.blocks.length - 1 - a]
+				if (to != Break && to != Continue) {
+					throw "a Br"
+				}
+				this.line(if (to == Break) "break" else "continue")
+			case op.BrNull:
+				if (this.blocks[this.blocks.length - 1 - a] != Chain) {
+					throw "a BrNull"
+				}
+				this.push(`${this.pop(atom)}?`, atom)
+			case op.If: this.branch(i, a)
+			case op.Block: this.loop(i, a)
+			case op.Try: this.attempt(i)
 			default:
 				const sym = op.operators.find(x => x[1] == o)
 				if (sym == null) {
-					return ""
+					throw `a${if (o == op.If || o == op.Unpack) "n" else ""} ${op.names[o]}`
 				}
 				const level = prec(sym[0] as Shape)
-				const r = operand(level + 1)
-				stack.push([`${operand(level)} ${sym[0]} ${r}`, level])
+				const r = this.top()
+				const l = this.top()
+				// a compound assignment's, which the store after any Cast prints
+				let j = this.i
+				while (c.ops[j] == op.Cast) {
+					j++
+				}
+				if (this.marked(i, op.Template) >= 0) {
+					this.push(piece(l) + piece(r), Tpl)
+				} else if (o == op.Xor && r[0] == "-1") {
+					this.push(`~${paren(l, prefix)}`, prefix) // as lower has ~x
+				} else if (this.marked(j, op.Step) >= 0) {
+					this.push(sym[0] + sym[0], Assigns)
+				} else if (this.marked(j, op.Compound) >= 0) {
+					this.push(` ${sym[0]}= ${text(r)}`, Assigns)
+				} else {
+					// a comparison's operands parenthesized unless shifts or tighter, which C would bind otherwise, and
+					// a power's left unless an atom, as 6.5 has it
+					const min = if (level == 4) 8 else if (level == 11) atom else level
+					this.push(`${paren(l, min)} ${sym[0]} ${paren(r, if (level == 4) min else level + 1)}`, level)
+				}
 		}
-		while (k < c.forms.length && c.forms[k] == i) {
-			if (c.forms[k + 1] == op.As) {
-				// Parenthesized as the operand of any operator, as 6.5 has it among binary ones.
-				stack.push([`${operand(12)} as ${showType(p, c.forms[k + 2], at)}`, 0])
-			}
-			k += 3
+		// The as written of the op ending what it printed, parenthesized as the operand of any operator, as 6.5 has it
+		// among binary ones.
+		for (const t of this.marks(this.i - 1, op.As)) {
+			this.push(`${this.pop(prefix)} as ${this.type(t, true)}`, 0)
 		}
 	}
-	return if (stack.length == 1) stack[0][0] else ""
+
+	/// Prints the store of v into target: an assignment, or a compound one.
+	private store(target: string, v: [string, i32]) throws string {
+		this.line(if (v[1] == Assigns) target + v[0] else `${target} = ${text(v)}`)
+	}
+
+	/// Prints SetLocal i of local l: a declaration, an assignment; of a temporary, a switch's subject, a destructuring's
+	/// value, a compound assignment's object or index, held for its loads, or of one loaded right after, as an assert
+	/// keeps its operands, nothing, but of a `??` its left.
+	private local(i: i32, l: i32) throws string | CompileError {
+		const p = this.p
+		const c = this.c
+		const x = c.locals[l]
+		if (x.name != 0) {
+			const v = this.top()
+			const name = p.strings[x.name]
+			if (this.declared[l]) {
+				return this.store(name, v)
+			}
+			const t = this.marked(i, op.Spelled)
+			return this.line(`${this.declare([l])}${name}` + (if (t < 0) "" else `: ${this.type(t)}`)
+				+ (if (this.marked(i, op.Unset) >= 0) "" else ` = ${text(v)}`))
+		}
+		switch ([op.Switch, op.Pattern, op.Spread, op.Kept].find(f => this.marked(i, f) >= 0) ?? 0) {
+			case op.Switch: this.cases(l)
+			case op.Pattern: this.destructure(i, l)
+			case op.Spread: this.spread(l)
+			case op.Kept: this.held[l] = this.top()
+			default:
+				if (c.ops[i + 1] != op.Local || c.a(i + 1) != l) {
+					throw "a temporary"
+				}
+				this.i++
+				if (c.ops[i + 2] == op.Is && c.a(i + 2) == kind.Null && c.ops[i + 3] == op.If
+					&& c.a(i + 3) != kind.None) {
+					this.coalesce(i + 3, l)
+				}
+		}
+	}
+
+	/// Pushes x ?? y of If j, its x on the stack and in temporary l: y if x is null, else x loaded again.
+	private coalesce(j: i32, l: i32) throws string | CompileError {
+		const c = this.c
+		const e = c.next(j)
+		const end = c.next(e)
+		if (c.ops[e] != op.Else || c.ops[e + 1] != op.Local || c.a(e + 1) != l
+			|| c.ops.slice(e + 2, end).some(o => o != op.Cast)) {
+			throw "an If of a null test"
+		}
+		const v = this.top()
+		this.i = j + 1
+		this.blocks.push(Other)
+		const alt = this.value(e)
+		this.blocks.pop()
+		// of no other binary operator, as 6.5 has it
+		this.push(`${if (v[1] == 1) text(v) else paren(v, prefix)} ?? ${paren(alt, prefix)}`, 1)
+		this.i = end + 1
+	}
+
+	/// Pushes the object literal temporary o is made of: the Object popped, each later part set on o or, a spread, made
+	/// anew of it, up to its marked load.
+	private spread(o: i32) throws string | CompileError {
+		const c = this.c
+		const made = text(this.top())
+		const parts = [made.slice(2, made.length - 2)]
+		while (this.marked(this.i, op.Spread) < 0) {
+			if (c.ops[this.i] != op.Local || c.a(this.i) != o) {
+				throw "a part of an object"
+			}
+			this.i++
+			const n = this.stack.length
+			const merge = (j: i32) => c.ops[j] == op.Object && c.ops[j + 1] == op.SetLocal && c.a(j + 1) == o
+			while (this.stack.length != n + 1 || c.ops[this.i] != op.SetField && !merge(this.i)) {
+				this.step()
+			}
+			const v = this.top()
+			parts.push(if (merge(this.i)) spreading(v) else prop(this.p.strings[c.a(this.i)], v))
+			this.i += if (merge(this.i)) 2 else 1
+		}
+		this.i++
+		this.push(`{ ${parts.join(", ")} }`, atom)
+	}
+
+	/// The keyword declaring locals ls, now declared, "const " or "let "; "" if all are declared already.
+	private declare(ls: i32[]): string throws string {
+		const fresh = ls.filter(l => !this.declared[l]).length
+		if (fresh != 0 && fresh != ls.length) {
+			throw "locals declared and not"
+		}
+		for (const l of ls) {
+			this.declared[l] = true
+		}
+		return if (fresh == 0) "" else if ((this.c.locals[ls[0]].mods & decl.Readonly) != 0) "const " else "let "
+	}
+
+	/// Prints the switch of subject s, on the stack: per case its labels, then the If of its arm, the cases after in its
+	/// Else; innermost the default, or of an expression of none, an Unreachable.
+	private cases(s: i32) throws string | CompileError {
+		const c = this.c
+		const subject = text(this.top())
+		const arms: string[] = []
+		let t: i32 = kind.None
+		let e = this.i // the innermost Else
+		while (c.ops[this.i] == op.Local && c.a(this.i) == s) {
+			const labels: string[] = []
+			while (c.ops[this.i] != op.If) {
+				labels.push(this.label())
+				this.i += if (c.ops[this.i] == op.Or) 1 else 0
+			}
+			t = c.a(this.i)
+			e = c.next(this.i)
+			this.i++
+			this.blocks.push(Other)
+			arms.push(`case ${labels.join(", ")}:${this.arm(e, t)}`)
+			this.i = e + 1
+		}
+		const n = arms.length
+		const end = c.next(e)
+		if (n == 0) {
+			throw "a switch of only a default"
+		}
+		if (this.i < end && !(c.ops[this.i] == op.Unreachable && this.i == end - 1)) {
+			arms.push(`default:${this.arm(end, t)}`)
+		}
+		this.blocks = this.blocks.slice(0, this.blocks.length - n)
+		this.i = end + n
+		const sw = `switch (${subject}) {\n${arms.join("\n")}\n}`
+		if (t == kind.None) {
+			return this.line(sw)
+		}
+		this.push(sw, 0)
+	}
+
+	/// The arm of a case, the ops up to to: a value if of type t, else statements.
+	private arm(to: i32, t: i32): string throws string | CompileError {
+		if (t != kind.None) {
+			return ` ${text(this.value(to))}`
+		}
+		const ls = this.statements(to)
+		return if (ls.length == 0) " {}" else `\n${ls.join("\n")}`
+	}
+
+	/// The case label tested from here to the next Case mark, of the subject loaded first: a type as the mark has it,
+	/// else a value its Eq compares; not a range's.
+	private label(): string throws string | CompileError {
+		const c = this.c
+		let e = this.i
+		while (e < c.ops.length && this.marked(e, op.Case) < 0) {
+			e++
+		}
+		const t = this.marked(e, op.Case) // none past the end, where dead after a part of it
+		if (t < 0 || c.ops[this.i] != op.Local || t == 0 && c.ops[e] != op.Eq) {
+			throw "a case label"
+		}
+		this.i += if (c.ops[this.i + 1] == op.Cast) 2 else 1
+		const s = if (t != 0) this.type(t) else text(this.value(e))
+		this.i = e + 1
+		return s
+	}
+
+	/// Prints the destructuring whose value op i stores into temporary l: a declaration, or of declared locals an
+	/// assignment; of an array literal of as many elements, each stored into a temporary of its own.
+	private destructure(i: i32, l: i32) throws string | CompileError {
+		const c = this.c
+		const ts = [l]
+		const vs = [text(this.top())]
+		while (c.ops[this.i] != op.Local || c.a(this.i) != l) {
+			if (this.marked(this.i, op.Pattern) >= 0) {
+				ts.push(c.a(this.i))
+				vs.push(text(this.top()))
+				this.i++
+			} else {
+				this.step()
+			}
+		}
+		const ls: i32[] = []
+		const s = this.pattern(ts, ls)
+		const t = this.marked(i, op.Pattern)
+		const v = if (ts.length == 1) vs[0] else `[${vs.join(", ")}]`
+		this.line(`${this.declare(ls)}${s}${if (t == 0) "" else `: ${this.type(t)}`} = ${v}`)
+	}
+
+	/// The pattern the ops from here bind from temporaries ts, each part a load of one, of just one the element or field
+	/// read, and a store into a local or a pattern of its own; ls gets the locals.
+	private pattern(ts: i32[], ls: i32[]): string throws string {
+		const p = this.p
+		const c = this.c
+		const n = if (c.ops[this.i + 1] == op.Unpack) c.a(this.i + 1) else -1
+		this.i += if (n < 0) 0 else 3 // an array's length checked
+		const parts: string[] = []
+		let object = false
+		while (c.ops[this.i] == op.Local && ts.includes(c.a(this.i))) {
+			const k = `${parts.length}`
+			const j = this.i + 1
+			const o = c.ops[j]
+			const key = if (ts.length > 1) (if (c.a(this.i) == ts[parts.length]) k else "")
+				else if (o == op.Field) p.strings[c.a(j)]
+				else if (o == op.Member) p.strings[p.decls[c.a(j)].name]
+				else if (o == op.Int && c.ops[j + 1] == op.Subscript) `${p.ints[c.b(j)]}`
+				else ""
+			if (key == "" || parts.length > 0 && object == isDigit(key[0]) || isDigit(key[0]) && key != k) {
+				throw "a part of a pattern" // a default or a rest
+			}
+			object = !isDigit(key[0])
+			this.i += if (ts.length > 1) 1 else if (o == op.Int) 3 else 2
+			while (c.ops[this.i] == op.Cast) {
+				this.i++
+			}
+			const x = this.target(ls)
+			parts.push(if (!object || key == x) x else `${key}: ${x}`)
+		}
+		if (parts.length == 0 || n >= 0 && n != parts.length) {
+			throw "a part of a pattern"
+		}
+		return if (object) `{ ${parts.join(", ")} }` else `[${parts.join(", ")}]`
+	}
+
+	/// The local or pattern op this.i stores into, made anew for each closure that captures it; ls gets the locals.
+	private target(ls: i32[]): string throws string {
+		const c = this.c
+		while (c.ops[this.i] == op.Fresh) {
+			this.i++
+		}
+		const i = this.i
+		const l = c.a(i)
+		this.i++
+		if (c.ops[i] == op.SetLocal && c.locals[l].name != 0) {
+			ls.push(l)
+			return this.p.strings[c.locals[l].name]
+		}
+		if (c.ops[i] != op.SetLocal || this.marked(i, op.Pattern) < 0) {
+			throw "a pattern"
+		}
+		return this.pattern([l], ls)
+	}
+
+	/// Prints the If at op i of result t, its condition on the stack: an `&&` or `||`, an `if` expression, an assert
+	/// or an `if` statement.
+	private branch(i: i32, t: i32) throws string | CompileError {
+		const c = this.c
+		const e = c.next(i)
+		const end = if (c.ops[e] == op.Else) c.next(e) else e
+		const cond = this.top()
+		this.blocks.push(Other)
+		if (t != kind.None) {
+			const x = this.value(e)
+			this.i = e + 1
+			const y = this.value(end)
+			const and = end == e + 2 && c.ops[e + 1] == op.False
+			if (and || e == i + 2 && c.ops[i + 1] == op.True) {
+				const level = if (and) 3 else 2
+				this.push(`${paren(cond, level)} ${if (and) "&&" else "||"} ${paren(if (and) x else y, level + 1)}`,
+					level)
+			} else {
+				this.push(`if (${text(cond)}) ${unblock(text(x))} else ${unblock(text(y))}`, 0)
+			}
+		} else if (e == i + 1 && end > e && c.ops[end - 1] == op.Fail) {
+			// whose Else fails, saying how: first by its condition's source, unless cut
+			const s = if (c.ops[e + 1] == op.Str) this.p.strings[c.a(e + 1)] else " …"
+			this.line(`assert ${if (endsWith(s, " …")) text(cond) else s}`)
+		} else if (this.marked(i, op.Compound) >= 0) {
+			// x ??= v: x tested for null, then v stored into it
+			const x = text(cond).slice(0, text(cond).length - " == null".length)
+			const ls = this.statements(e)
+			if (ls.length != 1 || !startsWith(ls[0], `${x} = `)) {
+				throw "a ??="
+			}
+			this.line(`${x} ??= ${ls[0].slice(x.length + 3, ls[0].length)}`)
+		} else {
+			const then = braced(this.statements(e))
+			this.i = e + 1
+			const ls = if (end == e) [] else this.statements(end)
+			this.line(`if (${text(cond)}) ${then}${if (end == e) "" else if (ls.length == 1 && startsWith(ls[0], "if (")) " else " + ls[0] else " else " + braced(ls)}`)
+		}
+		this.blocks.pop()
+		this.i = end + 1
+	}
+
+	/// Prints the Block at op i of result t: of a ?. chain, else of a loop: a while, or a for over a range, an array or
+	/// what an Each goes over, its element stored into a local or pattern.
+	private loop(i: i32, t: i32) throws string | CompileError {
+		const p = this.p
+		const c = this.c
+		const end = c.next(i)
+		if (t != kind.None) {
+			this.blocks.push(Chain)
+			const v = this.value(end) // before this.stack is read, which take replaces
+			this.stack.push(v)
+			this.blocks.pop()
+			this.i = end + 1
+			return
+		}
+		if (this.marked(i, op.Bare) >= 0) {
+			this.blocks.push(Other)
+			this.line(braced(this.statements(end)))
+			this.blocks.pop()
+			this.i = end + 1
+			return
+		}
+		// the Loop or Each, after what a for goes over
+		let j = i + 1
+		while (j < end && c.ops[j] != op.Loop && c.ops[j] != op.Each) {
+			j = if (op.opens[c.ops[j]]) this.close(j) + 1 else j + 1
+		}
+		if (j == end || this.close(j) != end - 1 || c.ops[end - 2] != op.Br && c.ops[j] == op.Loop) {
+			throw "a Block"
+		}
+		if (j == i + 1) {
+			// while: its condition negated to leave it, but of true
+			this.blocks.append([Break, Continue])
+			let k = j + 1
+			while (k < end - 2 && c.ops[k] != op.BrIf) {
+				k = if (op.opens[c.ops[k]]) this.close(k) + 1 else k + 1
+			}
+			this.i = j + 1
+			if (k < end - 2 && c.ops[k - 1] != op.Not) {
+				throw "a while"
+			}
+			const cond = if (k == end - 2) "true" else text(this.value(k - 1))
+			this.i = if (k == end - 2) j + 1 else k + 1
+			const ls = this.statements(end - 2)
+			this.blocks = this.blocks.slice(0, this.blocks.length - 2)
+			this.line(`while (${cond}) ${braced(ls)}`)
+			this.i = end + 1
+			return
+		}
+		let over = ""
+		let next = j // the block a continue leaves
+		let k = j + 1 // what stores the element
+		if (c.ops[j] == op.Each) {
+			over = text(this.value(j))
+		} else if (c.ops[j + 1] == op.Block) {
+			// from first to last: each kept, then if first > last, left
+			if (c.ops[j - 2] != op.Gt) {
+				throw "a for"
+			}
+			const first = c.a(j - 4)
+			let s = i + 1
+			while (s < j && (c.ops[s] != op.SetLocal || c.a(s) != first)) {
+				s++
+			}
+			over = paren(this.value(s), 1)
+			this.i = s + 1
+			over += ` ... ${paren(this.value(j - 5), 1)}`
+			next = j + 1
+			k = j + 3
+		} else {
+			// an array kept, and its index
+			if (c.ops[j + 9] != op.Subscript) {
+				throw "a for"
+			}
+			over = text(this.value(j - 3))
+			next = j + 6
+			k = j + 10
+		}
+		this.blocks.append(if (next == j) [Break, Continue] else [Break, Other, Continue])
+		const ls: i32[] = if (next == j) [c.a(j)] else []
+		this.i = k
+		const x = if (next == j) p.strings[c.locals[c.a(j)].name] else this.target(ls)
+		const kw = this.declare(ls)
+		const body = this.statements(this.close(next))
+		this.blocks = this.blocks.slice(0, this.blocks.length - (if (next == j) 2 else 3))
+		this.line(`for (${kw}${x} of ${over}) ${braced(body)}`)
+		this.i = end + 1
+	}
+
+	/// Prints the Try at op i: its body, then a catch, a finally or both.
+	private attempt(i: i32) throws string | CompileError {
+		const c = this.c
+		let s = "try"
+		let j = i
+		this.blocks.push(Other)
+		this.i = i + 1
+		while (c.ops[j] != op.End) {
+			const n = c.next(j)
+			if (c.ops[j] == op.Catch && c.a(j) != kind.None) {
+				// the value caught stored into the local the catch declares
+				if (c.ops[j + 1] != op.Local || c.a(j + 1) != c.b(j)) {
+					throw "a Catch"
+				}
+				this.i = j + 2
+				const ls: i32[] = []
+				s += ` catch (${this.target(ls)}: ${this.spelled(j, c.a(j))})`
+				this.declare(ls)
+			} else if (j > i) {
+				s += if (c.ops[j] == op.Catch) " catch" else " finally"
+			}
+			s += " " + braced(this.statements(n))
+			this.i = n + 1
+			j = n
+		}
+		this.blocks.pop()
+		this.line(s)
+	}
+
+	/// Prints the Closure of function d: an arrow function, or a function statement with the store into its local.
+	private closure(d: i32) throws string | CompileError {
+		const p = this.p
+		const f = p.decls[d]
+		const name = p.strings[f.name]
+		if (f.spelled == 0) {
+			throw "a Closure of no signature"
+		}
+		const sig = if (p.kind(f.spelled) == kind.Throws) p.a(f.spelled) else f.spelled
+		const ts = p.items(p.a(sig))
+		const ps: string[] = []
+		for (const k of 0 ... ts.length - 1) {
+			ps.push(p.strings[p.names[p.b(sig)][2 * k]] + (if (ts[k] == 0) "" else `: ${this.type(ts[k])}`))
+		}
+		const r = p.b(p.a(sig))
+		const bare = ps.length == 1 && ts[0] == 0 && r == 0 && sig == f.spelled
+		const head = `${if (bare) ps[0] else `(${ps.join(", ")})`}${if (r == 0) "" else `: ${this.type(r)}`}${if (sig == f.spelled) "" else ` throws ${this.type(p.b(f.spelled))}`}`
+		const w = new Printer(p, f.code!, this.at, ts.length)
+		const ls = w.statements(f.code!.ops.length - 1)
+		if (!isDigit(name[0])) {
+			// declared by name, as its store says
+			const l = this.c.a(this.i)
+			if (this.c.ops[this.i] != op.SetLocal || p.strings[this.c.locals[l].name] != name) {
+				throw "a Closure of a name"
+			}
+			this.declared[l] = true
+			this.i++
+			return this.line(`function ${name}${head} ${braced(ls)}`)
+		}
+		// of an expression, a return of it
+		const one = ls.length == 1 && startsWith(ls[0], "return ")
+		this.push(`${head} => ${if (one) unblock(ls[0].slice(7, ls[0].length)) else braced(ls)}`, 0)
+	}
 }
 
-/// Int v of type t as source, in the radix form says, a Hex, Octal or Binary, else in decimal.
-function digits(v: i64, t: i32, form: i32): string {
-	const [prefix, radix]: [string, i32] = switch (form) {
-		case op.Hex: ["0x", 16]
-		case op.Octal: ["0o", 8]
-		case op.Binary: ["0b", 2]
-		default: ["", 10]
-	}
-	const s = if (t == kind.U64) formatInt(v as u64, radix) else formatInt(v, radix)
-	return if (s[0] == minus) `-${prefix}${s.slice(1, s.length)}` else prefix + s
+/// Int v of type t as source in radix r of radices.
+function digits(v: i64, t: i32, r: [u8, string, i32]): string {
+	const s = if (t == kind.U64) formatInt(v as u64, r[2]) else formatInt(v, r[2])
+	return if (s[0] == minus) `-${r[1]}${s.slice(1, s.length)}` else r[1] + s
 }

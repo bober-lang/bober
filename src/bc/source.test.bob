@@ -1,0 +1,280 @@
+//! Tests of src/bc/source.bob: functions lowered and printed back as their source.
+
+import { isDigit } from "../../std/ascii"
+import { HashMap } from "../../std/collections/hashmap"
+import { split } from "../../std/string"
+import { CompileError } from "../error"
+import { format } from "../format"
+import { SyntaxError } from "../lex"
+import { lower } from "../lower"
+import { Parser, Tree } from "../parse"
+import * as decl from "./decl"
+import { Program } from "./program"
+import { showDecl } from "./show"
+import { body, signature } from "./source"
+
+/// The functions of main.bob of source src, each its signature and body printed, formatted.
+function printed(src: string): string throws string | SyntaxError {
+	const p = lower(["main.bob"], [], [], path => if (path == "main.bob") src else null)
+	const ds = p.modules[p.module("main.bob")].decls.filter(d => p.decls[d].kind == decl.Function)
+	return format(ds.map(d => `${signature(p, d)} {\n${body(p, d)}\n}`).join("\n\n"))
+}
+
+test "declarations, assignments and statements" {
+	const src = `function f(n: i32): i32 {
+	const a = n + 1
+	let b: i64 = a
+	let c: string
+	c = "x"
+	b += 2
+	b++
+	if (b > 3) {
+		throw "big"
+	}
+	print(c)
+	return a * 2
+}`
+	assert printed(src) == format(src)
+}
+
+test "ifs, loops, try and assert" {
+	const src = `function g(n: i32) throws string {
+	if (n == 1) {
+		throw "one"
+	} else if (n == 2) {
+		return
+	}
+	print(n)
+}
+
+function f(xs: i32[]): i32 {
+	let s = 0
+	for (const x of xs) {
+		if (x < 0) {
+			continue
+		} else if (x == 0) {
+			break
+		} else {
+			s += x
+		}
+	}
+	for (const i of 1 ... 3) {
+		const d = () => i
+		s -= d()
+	}
+	while (s > 10) {
+		s = s / 2
+	}
+	try {
+		g(s)
+	} catch (e: string) {
+		print(e)
+	} finally {
+		s = 0
+	}
+	assert s == 0
+	return s
+}`
+	assert printed(src) == format(src)
+}
+
+test "operators, closures and templates" {
+	const src = `function f(a: bool, b: bool, x: i32 | null, s: string[] | null): string {
+	const c = a && !b || b
+	const y = x ?? 0
+	const n = s?.length
+	const z = x!
+	const g = (k: i32) => k + y
+	const h = (k: i32) => k * 2
+	const ks = [1].map(k => k * 2)
+	function inc(k: i32): i32 {
+		return k + 1
+	}
+	const t = \`\${y} and \${g(z)} of \${h(inc(1))}\`
+	return if (c && n != null) t else \`none\`
+}`
+	assert printed(src) == format(src)
+}
+
+test "type args, rest args, arrays and tuples" {
+	const src = `function f(t: [i32, string]): i64 {
+	const xs = new i32[](t[0])
+	const y = id[i64](~t[0])
+	join("a", t[1])
+	return xs.length + y
+}
+
+function id[T](x: T): T {
+	return x
+}
+
+function join(...xs: string[]): string {
+	return xs.join("")
+}`
+	assert printed(src) == format(src)
+}
+
+test "switches" {
+	const src = `function f(x: i32, s: Ab | i32 | null): string {
+	switch (x) {
+		case 1: return "one"
+		case 2, 3:
+			print("few")
+			return "few"
+		default:
+			if (x < 0) {
+				throw "negative"
+			}
+	}
+	switch (s) {
+		case null: return "none"
+		case Ab: print(s)
+	}
+	return switch (x % 2) {
+		case 0: "even"
+		default: "odd"
+	}
+}`
+	assert printed(`type Ab = "a" | "b"\n${src}`) == format(src)
+}
+
+test "destructuring" {
+	const src = `function f(t: [i32, string], xs: i32[], ps: { a: i32, b: string }[]): i32 {
+	const [a, s] = t
+	let [b, c] = [a + 1, xs[0]]
+	const [d, e] = xs
+	[b, c] = [c, b]
+	for (const [k, v] of [t]) {
+		b += k
+	}
+	for (const { a, b: q } of ps) {
+		c += a
+	}
+	const g = () => a + d
+	return g() + b + c + e
+}`
+	assert printed(src) == format(src)
+}
+
+test "assignments of places" {
+	const src = `function f(c: C, i: i32): i32 {
+	c.xs[i + 1] += 2
+	g(c).xs[0]++
+	c.n ??= 1
+	g(c).n ??= 2
+	return c.xs[i]
+}
+
+function g(c: C): C {
+	return c
+}`
+	assert printed(`class C {\n\tn: i32 | null = null\n\txs: i32[] = []\n}\n${src}`) == format(src)
+}
+
+test "objects" {
+	const src = `function f(o: { x: i32, y: i32 }): { x: i32, y: i32 } {
+	const p = { ...o }
+	const x = p.y
+	const q = { ...p, x: 2, ...o }
+	return { x, y: q.y }
+}
+
+function g(): {} {
+	return {}
+}`
+	assert printed(src) == format(src)
+}
+
+test "a body that does not print as written throws why" {
+	try {
+		printed(`function f(xs: i32[]): i32 {
+	const [a, ...b] = xs
+	return a
+}`)
+		assert false
+	} catch (why: string) {
+		assert why == "a part of a pattern"
+	}
+}
+
+test "blocks, powers, conversions and literals" {
+	const src = `function f[T](x: i32, t: T, c: C): string {
+	{
+		const K = 2
+		print(K)
+	}
+	const k = () => {
+		print(K)
+	}
+	const y = ((-x) ** (2 ** K)) as (i32 | null)
+	return \`\\\${y}\${t}\${c}\${1e999}\\xff\`
+}`
+	assert printed(`const K = 1\nclass C { toString(): string { return "c" } }\n${src}`) == format(src)
+}
+
+/// The functions, methods and tests of tree t, in order.
+function functions(t: Tree): Tree[] {
+	if (["function", "method", "test"].includes(t.kind)) {
+		return [t]
+	}
+	const fs: Tree[] = []
+	for (const q of t.parts) {
+		if (q instanceof Tree) {
+			fs.append(functions(q))
+		}
+	}
+	return fs
+}
+
+/// Module path's source, the body of each function or test of it that prints replaced by what it prints.
+function spliced(p: Program, path: string): string throws CompileError | SyntaxError {
+	const src = readFile(path)!
+	const at = new HashMap[i32, i32]()
+	for (const d of 0 ... p.decls.length - 1) {
+		if (p.decls[d].module == p.module(path)) {
+			at.set(p.decls[d].pos, d)
+		}
+	}
+	const ps = new Parser(src)
+	let out = ""
+	let from = 0
+	let t = ps.parse()
+	while (t != null) {
+		for (const f of functions(t!)) {
+			const b = f.parts[f.parts.length - 1]
+			const d = at.get(f.t.loc.pos)
+			try {
+				if (d != null && b instanceof Tree && b.kind == "block") {
+					out += src.slice(from, b.t.loc.pos) + `{\n${body(p, d!)}\n}`
+					from = b.end + 1
+				}
+			} catch (why: string) {}
+		}
+		t = ps.parse()
+	}
+	return out + src.slice(from, src.length)
+}
+
+test "the functions of a module printed in place lower to the code they print" {
+	const files = ["src/bc/source.bob", "src/link/macho.bob"]
+	const p = lower(files)
+	const texts: string[] = []
+	for (const f of files) {
+		texts.push(spliced(p, f))
+	}
+	const q = lower(files, [], [], path => if (files.includes(path)) texts[files.indexOf(path)] else readFile(path))
+	// but the positions closures are named by
+	const unplaced = (s: string) => split(s, ".").map(x => {
+		let k = 0
+		while (k < x.length && isDigit(x[k])) {
+			k++
+		}
+		return x.slice(k, x.length)
+	}).join(".")
+	assert p.decls.length == q.decls.length
+	for (const d of 0 ... p.decls.length - 1) {
+		if (files.map(f => p.module(f)).includes(p.decls[d].module)) {
+			assert unplaced(showDecl(p, d)) == unplaced(showDecl(q, d))
+		}
+	}
+}

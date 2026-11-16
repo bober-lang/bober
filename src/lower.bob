@@ -362,9 +362,9 @@ class Unit {
 
 	/// The type declaration n's head spells (Decl.spelled): a function's Sig, a var's or member's annotation, an
 	/// alias's type, a class's or interface's supertypes; 0 for none.
-	private spelling(n: Node): i32 {
+	spelling(n: Node): i32 {
 		switch (n.kind) {
-			case "function", "method": return this.sig(child(n, "params")!, after(n, ":"), after(n, "throws"))
+			case "function", "method", "arrow": return this.sig(child(n, "params")!, after(n, ":"), after(n, "throws"))
 			case "type": return this.spell(n.parts[n.parts.length - 1])
 			case "class":
 				const s = supers(n)
@@ -397,7 +397,7 @@ class Unit {
 	/// has no T to hold T as written.
 	spell(n: Node): i32 {
 		const p = this.prog
-		const r = this.ty(n.type!, true)
+		const r = this.ty(standsFor(n.type!) ?? n.type!, true)
 		const a = n.parts.at(0)
 		switch (n.kind) {
 			case "paren": return this.spell(a!)
@@ -854,6 +854,30 @@ class Gen {
 		return if (this.prog.reflected(r)) r else this.u.spell(n)
 	}
 
+	/// Pushes Type t, which n writes in value position.
+	private typeOf(n: Node, t: i32): i32 {
+		this.op(op.Type, t)
+		this.annotate(n, t)
+		return kind.Type
+	}
+
+	/// Marks the op added last with type annotation n as written, a Spelled, unless it is t.
+	private annotate(n: Node, t: i32) {
+		const s = this.written(n)
+		if (s != t) {
+			this.mark(op.Spelled, s)
+		}
+	}
+
+	/// Marks the op added last with the type args function p is written with, as f[T], op.Spelled each.
+	private spellArgs(p: Node) {
+		if (p.kind == "index" && p.parts[0].type?.kind == "function") {
+			for (const t of p.parts.slice(1, p.parts.length)) {
+				this.mark(op.Spelled, this.written(t))
+			}
+		}
+	}
+
 	private br(o: Opcode, level: i32) { this.op(o, this.depth - 1 - level) }
 	private int(t: i32, v: i64) { this.op(op.Int, t, this.prog.int(v)) }
 	private real(t: i32, f: f64) { this.op(op.Float, t, this.prog.int(bits(f) as i64)) }
@@ -1019,7 +1043,12 @@ class Gen {
 
 	private statement(p: Node) {
 		switch (p.kind) {
-			case "block": this.block(p)
+			case "block":
+				// bare, its scope a Block's, marked so
+				this.open(op.Block, kind.None)
+				this.mark(op.Bare)
+				this.block(p)
+				this.op(op.End)
 			case "var":
 				const init = after(p, "=")
 				const name = operands(p)[0]
@@ -1028,9 +1057,11 @@ class Gen {
 				const l = if (name.kind
 					== "token") this.declare(this.text(name), this.ty(p.type!), if (ro) decl.Readonly else 0)
 					else -1
-				const temps = if (init == null) [] else this.elements(name, init!)
+				const ann = after(p, ":")
+				const s = if (ann == null || l >= 0) 0 else this.written(ann!) // a pattern's
+				const temps = if (init == null) [] else this.elements(name, init!, s)
 				if (temps.length > 0) {
-					this.bind(name, ro, temps)
+					this.bind(name, ro, temps, s)
 				} else {
 					if (init == null) {
 						this.zero(p.type!)
@@ -1039,14 +1070,20 @@ class Gen {
 					}
 					if (l >= 0) {
 						this.op(op.SetLocal, l)
+						if (ann != null) {
+							this.mark(op.Spelled, this.written(ann!))
+						}
+						if (init == null) {
+							this.mark(op.Unset)
+						}
 					} else {
-						this.bind(name, ro)
+						this.bind(name, ro, [], s)
 					}
 				}
 			case "function":
 				const name = operands(p)[0]
 				const l = this.declare(this.text(name), this.ty(name.type!))
-				this.closure(this.text(name), name.type!, child(p, "params")!, bodyOf(p)!)
+				this.closure(this.text(name), name.type!, child(p, "params")!, bodyOf(p)!, p)
 				this.op(op.SetLocal, l)
 			case "class": this.u.klass(p, "", this.text(operands(p)[0]), 0, this.owner, this.typeParams)
 			case "type": return
@@ -1057,7 +1094,11 @@ class Gen {
 				const e = after(p, "else")
 				if (e != null) {
 					this.op(op.Else)
-					this.stmt(e!)
+					if (e!.kind == "block") {
+						this.block(e!)
+					} else {
+						this.stmt(e!)
+					}
 				}
 				this.op(op.End)
 			case "while": this.whileStmt(p)
@@ -1220,6 +1261,7 @@ class Gen {
 		const subject = this.code.local(0, this.ty(s.type!), decl.Readonly)
 		this.expr(s)
 		this.op(op.SetLocal, subject)
+		this.mark(op.Switch)
 		let fallback: Node | null = null
 		let depth = 0
 		for (const c of p.parts.slice(1, p.parts.length)) {
@@ -1250,11 +1292,11 @@ class Gen {
 		}
 	}
 
-	/// Pushes whether case label l matches the subject, of type st, in local s (7.4).
+	/// Pushes whether case label l matches the subject, of type st, in local s (7.4), marked a Case.
 	private match(l: Node, st: Type, s: i32) {
 		if (isTok(l, "null") || this.isType(l) && !isTypeValue(st)) {
 			this.isOf(s, st, l.type!)
-			return
+			return this.mark(op.Case, this.written(l))
 		}
 		this.op(op.Local, s)
 		if (l.kind == "binary" && l.t.kind == "...") {
@@ -1273,6 +1315,7 @@ class Gen {
 			this.value(l, t)
 			this.op(op.Eq)
 		}
+		this.mark(op.Case)
 	}
 
 	/// Pushes whether the value in local s, of type st, is of type t: of a literal of t by value, as a literal is held
@@ -1453,6 +1496,7 @@ class Gen {
 			const l = this.temp(t)
 			this.op(op.Catch, t, l)
 			if (ann != null) {
+				this.annotate(ann!, t)
 				this.op(op.Local, l)
 				this.bind(c!.parts[0])
 			}
@@ -1579,8 +1623,8 @@ class Gen {
 	}
 
 	/// Stores the value on the stack into the locals pattern p binds, of its type (5.1); or, with temps, the elements
-	/// they hold.
-	private bind(p: Node, ro: bool = false, temps: i32[] = []) {
+	/// they hold; a Pattern of the type p is declared as, spelled.
+	private bind(p: Node, ro: bool = false, temps: i32[] = [], spelled = 0) {
 		const t = this.ty(p.type!)
 		if (p.kind == "token" || p.kind == "prop") {
 			return this.op(op.SetLocal, this.declare(this.text(p), t, if (ro) decl.Readonly else 0))
@@ -1589,6 +1633,7 @@ class Gen {
 		const pt = p.type!
 		if (tmp >= 0) {
 			this.op(op.SetLocal, tmp)
+			this.mark(op.Pattern, spelled)
 		}
 		if (tmp >= 0 && p.kind == "array" && pt.kind != "tuple") {
 			let n = 0
@@ -1708,6 +1753,7 @@ class Gen {
 			this.load(at)
 			this.op(op.Is, kind.Null)
 			this.open(op.If, kind.None)
+			this.mark(op.Compound)
 			this.parts(at)
 			this.to(p.parts[1], at.type)
 			this.op(at.store, at.a, at.b)
@@ -1726,6 +1772,7 @@ class Gen {
 		}
 		this.arith(opcode(how.slice(0, if (step) 1 else how.length - 1)), t)
 		this.op(at.store, at.a, at.b)
+		this.mark(if (step) op.Step else op.Compound)
 	}
 
 	/// What `target = p` stores: of `{...v}` into a field embedding v's class, v, which storing copies into place without
@@ -1744,6 +1791,7 @@ class Gen {
 		const tmp = if (temps.length > 0) -1 else this.temp(this.ty(t))
 		if (tmp >= 0) {
 			this.op(op.SetLocal, tmp)
+			this.mark(op.Pattern)
 		}
 		for (const i of 0 ... p.parts.length - 1) {
 			const q = p.parts[i]
@@ -1763,8 +1811,9 @@ class Gen {
 	}
 
 	/// The elements of array literal v, each kept in a temp as one of array pattern p's type, for bind or unpack to take
-	/// in place of the array, which is then not made; none unless v has an element for each of p's and no spread.
-	private elements(p: Node, v: Node): i32[] {
+	/// in place of the array, which is then not made, each a Pattern of spelled; none unless v has an element for each of
+	/// p's and no spread.
+	private elements(p: Node, v: Node, spelled = 0): i32[] {
 		const temps: i32[] = []
 		if (p.kind != "array" || v.kind != "array" || v.parts.length != p.parts.length
 			|| p.parts.some(q => q.kind == "unary") || v.parts.some(e => e.kind == "unary" && e.t.kind == "...")) {
@@ -1775,11 +1824,13 @@ class Gen {
 			this.value(v.parts[i], e)
 			temps.push(this.temp(this.ty(e)))
 			this.op(op.SetLocal, temps[i])
+			this.mark(op.Pattern, spelled)
 		}
 		return temps
 	}
 
-	/// Where assignment target p is, with its object and index pushed, or if saved kept in temps for parts to push.
+	/// Where assignment target p is, with its object and index pushed, or if saved kept in temps for parts to push,
+	/// each marked Kept.
 	private place(p: Node, saved: bool): Place {
 		const l = if (p.kind == "token" && p.symbol == "") this.find(this.text(p)) else null
 		if (l != null) {
@@ -1803,6 +1854,7 @@ class Gen {
 			this.expr(p.parts[1])
 			at.index = this.temp(this.ty(p.parts[1].type!))
 			this.op(op.SetLocal, at.index)
+			this.mark(op.Kept)
 			return at
 		}
 		// A local's member's object is the local, loaded again before the value, not kept in a temp; unless narrowed, as
@@ -1824,10 +1876,12 @@ class Gen {
 			if (key == null) {
 				at.index = this.temp(this.ty(i!.type!))
 				this.op(op.SetLocal, at.index)
+				this.mark(op.Kept)
 			}
 			at.obj = own ?? this.temp(this.ty(o))
 			if (own == null) {
 				this.op(op.SetLocal, at.obj)
+				this.mark(op.Kept)
 			}
 		}
 		return at
@@ -1900,7 +1954,8 @@ class Gen {
 				this.spread(op.Array, t, p.parts, (q: Node, i: i32) => this.value(q, element(t, i)!))
 			case "object":
 				// An Object op places props only before its spreads, so it makes the object of the parts up to the first
-				// prop after a spread; each later part, in source order, is set on it or, a spread, makes it anew.
+				// prop after a spread; each later part, in source order, is set on it or, a spread, makes it anew. Its
+				// temp's SetLocal and last load are marked a Spread.
 				let n = 0
 				while (n < p.parts.length && p.parts[n].kind != "unary") {
 					n++
@@ -1915,6 +1970,7 @@ class Gen {
 				const ot = this.ty(t)
 				const o = this.temp(ot)
 				this.op(op.SetLocal, o)
+				this.mark(op.Spread)
 				for (const q of p.parts.slice(n, p.parts.length)) {
 					this.op(op.Local, o)
 					if (q.kind == "unary") {
@@ -1927,7 +1983,8 @@ class Gen {
 					}
 				}
 				this.op(op.Local, o)
-			case "arrow": this.closure(`${p.t.loc.pos}`, t, p.parts[0], arrowBody(p))
+				this.mark(op.Spread)
+			case "arrow": this.closure(`${p.t.loc.pos}`, t, p.parts[0], arrowBody(p), p)
 			case "ifExpr":
 				this.cond(p.parts[0], this.ty(t))
 				this.value(p.parts[1], t)
@@ -1942,6 +1999,7 @@ class Gen {
 					n += pushed
 					if (n == 2) {
 						this.op(op.Add)
+						this.mark(op.Template)
 						n = 1
 					}
 				}
@@ -1980,7 +2038,11 @@ class Gen {
 		switch (p.t.kind) {
 			case "ident", "this": return this.named(p)
 			case "int", "float": this.number(p, t)
-			case "string", "template": this.op(op.Str, this.prog.intern(unquoted(this.text(p))))
+			case "string", "template":
+				this.op(op.Str, this.prog.intern(unquoted(this.text(p))))
+				if (p.t.kind == "template") {
+					this.mark(op.Template) // of no value
+				}
 			case "true": this.op(op.True)
 			case "false": this.op(op.False)
 			default: this.op(op.Null)
@@ -2049,13 +2111,13 @@ class Gen {
 		if (c != null && (d == null || this.names(d!))) {
 			// A generic class named without args is the generic itself, which its instances have as base (4.11).
 			const generic = d != null && c.kind == "class" && c.params.length > 0
-			this.op(op.Type, if (generic) this.prog.type(kind.Named, this.u.l.nominal(c!)) else this.ty(c!))
-			return kind.Type
+			return this.typeOf(p, if (generic) this.prog.type(kind.Named, this.u.l.nominal(c!)) else this.ty(c!))
 		}
 		if (t.kind == "function") {
 			this.taint(d!)
 		}
 		this.op(op.Global, this.ref(d!), this.typeArgs(d!, t, p))
+		this.spellArgs(p)
 		return if (this.prog.decls[d!].kind == decl.Var) this.ty(this.u.l.lift.types.get(d!)!) else this.ty(t)
 	}
 
@@ -2075,8 +2137,7 @@ class Gen {
 			case "index":
 				const known = standsFor(p.type!)
 				if (known != null) {
-					this.op(op.Type, this.ty(known!))
-					return kind.Type
+					return this.typeOf(p, this.ty(known!))
 				}
 				const a = p.parts[0]
 				const i = p.parts[1]
@@ -2093,6 +2154,7 @@ class Gen {
 			case "postfix":
 				this.receiver(p, chain)
 				this.op(op.Cast, this.ty(p.type!))
+				this.mark(op.NonNull)
 			default: return this.call(p, chain)
 		}
 		return this.ty(p.type!)
@@ -2158,6 +2220,7 @@ class Gen {
 			this.taint(d!)
 			this.args(f, args)
 			this.op(op.Call, this.ref(d!), this.typeArgs(d!, f, callee))
+			this.spellArgs(callee)
 			return r
 		}
 		if (d != null || l != null) {
@@ -2184,6 +2247,7 @@ class Gen {
 				} else {
 					this.args(f, args)
 					this.op(op.Call, this.ref(m!), this.exact([...this.u.args(c!), ...this.inferred(m!, f, callee)]))
+					this.spellArgs(callee)
 				}
 				return r
 			}
@@ -2390,16 +2454,16 @@ class Gen {
 			return this.ty(t)
 		}
 		this.op(op.New, this.ty(t))
-		const s = this.written(p.parts[0])
-		if (s != this.ty(t)) {
-			this.mark(op.Spelled, s)
-		}
+		this.annotate(p.parts[0], this.ty(t))
 		return this.ty(t)
 	}
 
-	/// Pushes the closure of a nested function or arrow of type t, a decl in this one's.
-	private closure(name: string, t: Type, params: Node, body: Node) {
+	/// Pushes the closure of a nested function or arrow of type t, a decl in this one's, its head as written that of
+	/// node head, but where a local holds a type of t.
+	private closure(name: string, t: Type, params: Node, body: Node, head: Node | null = null) {
+		const spelled = if (head == null || this.prog.reflected(this.ty(t))) 0 else this.u.spelling(head!)
 		this.nested(name, t, 0, body.t.loc.pos, g => {
+			this.prog.decls[g.owner].spelled = spelled
 			g.params(params, t)
 			if (body.kind == "block") {
 				g.block(body)
@@ -2587,6 +2651,7 @@ class Gen {
 				this.expr(a)
 				if (b.type!.alternatives().every(m => m.kind != "literal")) {
 					this.op(op.Is, this.ty(b.type!))
+					this.annotate(b, this.ty(b.type!))
 					return kind.Bool
 				}
 				const v = this.temp(this.ty(a.type!))
@@ -2598,8 +2663,7 @@ class Gen {
 				this.orElse(a.type!, () => this.value(b, t), t)
 				return this.ty(t)
 			case "|": if (standsFor(t) != null) {
-				this.op(op.Type, this.ty(standsFor(t)!))
-				return kind.Type
+				return this.typeOf(p, this.ty(standsFor(t)!))
 			}
 		}
 		this.value(a, t)
@@ -2628,10 +2692,11 @@ class Gen {
 		if (m != null && this.prog.decls[m!].kind == decl.Function) {
 			this.method(t, "toString")
 		} else if (t.kind != "param" && (t.kind != "interface" || isTypeValue(t)) && t.member("toString") == null) {
-			this.callBuiltin("show", this.u.list([t], false, this))
+			return this.callBuiltin("show", this.u.list([t], false, this))
 		} else {
 			this.op(op.CallMethod, this.prog.intern("toString"), 0)
 		}
+		this.mark(op.Template)
 	}
 
 	/// Compares the two values of type t on the stack by operator how; in an assert, == and != of references by value
