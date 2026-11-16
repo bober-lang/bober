@@ -231,6 +231,8 @@ class Dtd {
 	attlists = new HashMap[string, Declared[]]()
 	/// Whether declarations may be missing, which an external subset or parameter entity could have made.
 	partial = false
+	/// Whether the XML declaration says standalone="yes", which keeps an undeclared entity an error though partial.
+	standalone = false
 	/// The bytes that references and attribute defaults have expanded to, which stop at limit against entities that
 	/// expand exponentially and defaults that expand quadratically.
 	expanded: i64 = 0
@@ -353,6 +355,7 @@ class Parser {
 			if (!ok) {
 				throw new ParseError("syntax", at)
 			}
+			this.dtd.standalone = v == "yes"
 		}
 	}
 
@@ -399,7 +402,10 @@ class Parser {
 				continue
 			}
 			if (this.eat("%")) {
-				const v = this.expand(this.dtd.parameters, this.name(), at)
+				this.dtd.partial = true
+				const name = this.name()
+				const ps = this.dtd.parameters
+				const v = if (ps.has(name)) this.expand(ps, name, at) else null // undeclared, it is only invalid
 				this.expect(";")
 				if (v != null) {
 					this.nested(v, at, p => p.subset())
@@ -508,9 +514,6 @@ class Parser {
 		}
 		this.expect(">")
 		const entities = if (parameter) this.dtd.parameters else this.dtd.entities
-		if (v == null && parameter) {
-			this.dtd.partial = true
-		}
 		if (!entities.has(name) && (parameter || builtin(name) == null)) {
 			entities.set(name, v)
 		}
@@ -774,7 +777,7 @@ class Parser {
 
 	/// The replacement text of the entity name of entities, referred to at at, or null for one left out.
 	expand(entities: HashMap[string, string | null], name: string, at: i32): string | null {
-		if (!entities.has(name) && !this.dtd.partial) {
+		if (!entities.has(name) && (!this.dtd.partial || this.dtd.standalone)) {
 			throw new ParseError("syntax", at)
 		}
 		const v = entities.get(name)
