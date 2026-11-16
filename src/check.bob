@@ -896,9 +896,10 @@ class Binding {
 /// `!` and `if`/`else` combine as expected, and `x ?? d` and `x?.` remove `null`. A `switch` on `x` with type labels,
 /// or on `x.kind` with literal labels, narrows in each case. An assignment to `x` narrows it to the assigned value's
 /// type, and where branches meet, `x` has the union of their types. A loop or `try` loses the narrowing of the
-/// variables it assigns. Narrowing applies to a local, and to a member path from a local or `this`, as `a.b.c`, until a
-/// part of the path is assigned; a nested function narrows a captured variable afresh, until an `await`, and not at
-/// all once it or another assigns it.
+/// variables it assigns, and of the member paths if it calls. Narrowing applies to a local, and to a member path from a
+/// local or `this`, as `a.b.c`, until a part of the path is assigned or a call or an `await`, which may assign it, is
+/// made; a nested function narrows a captured variable afresh, until an `await`, and not at all once it or another
+/// assigns it.
 ///
 /// ```
 /// function label(s: Shape | null): string {
@@ -1034,6 +1035,8 @@ class Checker {
 	private holders: Binding[] = []
 	/// The bindings of the member paths narrowed (6.11) in the function being checked.
 	private paths: Binding[] = []
+	/// How many calls have been checked, each of which narrows the member paths to none.
+	private called = 0
 	/// Those of the functions and methods whose bodies are checked.
 	private throwing: Errors[] = []
 	/// The declarations settled and not yet handed on.
@@ -1526,15 +1529,16 @@ class Checker {
 			case "var": return this.variable(n)
 			case "function":
 				const f = this.declared(name, null, false)
-				f.type = this.function(n, f, true, f.decl?.errors ?? null)
-				name.type = f.type
+				const t = this.function(n, f, true, f.decl?.errors ?? null)
+				f.type = t
+				name.type = t
 				const thrown = after(n, "throws")
 				if (f.decl == null && thrown != null) {
 					this.typeExpr(thrown!) // resolved for Decl.spelled, as no errors list it
 				}
-				const r = f.type.base!
+				const r = t.base!
 				if (this.locals.level == 0 && this.text(name.t) == "main"
-					&& (f.type.types.length > 0 || r != Null && r != I32)) {
+					&& (t.types.length > 0 || r != Null && r != I32)) {
 					this.report(name.t.loc, "main takes no parameters and returns an i32 or nothing")
 				}
 			case "class":
@@ -2534,6 +2538,9 @@ class Checker {
 
 	/// Narrows to none the variables assigned in n, as a loop or try may get to any part of it after another.
 	private forget(n: Node) {
+		if (n.kind == "call" || n.kind == "new") {
+			this.calls()
+		}
 		if (n.kind == "assign") {
 			this.clobber(n.parts[0])
 			for (const b of this.places(n.parts[0])) {
@@ -3125,19 +3132,23 @@ class Checker {
 				const f = this.cond(p.parts[0])
 				const yes = p.parts[1]
 				const no = p.parts[2]
+				const called = this.called
 				const later = if (want == null && yes.kind == "array") this.branch(no, f.no, null) else null
 				const a = this.branch(yes, f.yes, want ?? later)
 				const b = later ?? this.branch(no, f.no, if (want == null && no.kind == "array") a else want)
+				this.kept(called)
 				const t = this.joined(a, b, want, p.t.loc)
 				this.convert(p.parts[1], t)
 				this.convert(p.parts[2], t)
 				return t
 			case "switchExpr":
 				const ts: Type[] = []
+				const called = this.called
 				const all = this.cases(p, (v: Node, at: Tok) => {
 					const u = this.expr(v, want)
 					ts.push(if (ts.length == 0) u else this.joined(ts[ts.length - 1], u, want, at.loc))
 				})
+				this.kept(called)
 				if (!all) {
 					this.report(p.t.loc, "a switch expression needs a default or a case for each value")
 				}
@@ -3155,6 +3166,7 @@ class Checker {
 					const t = if (isTok(q, "templateMid") || isTok(q, "templateTail")) null else this.value(q)
 					if (t != null) {
 						this.runs(t!, "toString", false)
+						this.calls()
 					}
 				}
 				return String
@@ -3335,6 +3347,7 @@ class Checker {
 			case "typeof": return meta(this.expr(x, null))
 			case "await":
 				this.suspend(true)
+				this.calls() // as other fibers run, which may assign them
 				if (x.kind == "unary" && x.t.kind == "...") {
 					const fs = x.parts[0]
 					const ts: Type[] = []
@@ -3599,11 +3612,15 @@ class Checker {
 		if (p.kind == "binary" && (op == "&&" || op == "||")) {
 			const a = this.facts(p.parts[0])
 			const mark = this.undo.length
+			const called = this.called
 			this.narrow(if (op == "&&") a.yes else a.no)
 			const b = this.facts(p.parts[1])
 			this.restore(mark)
-			return if (op == "&&") new Facts([...a.yes, ...b.yes], either(a.no, b.no))
-				else new Facts(either(a.yes, b.yes), [...a.no, ...b.no])
+			this.kept(called)
+			// What a holds of member paths holds after b only if b calls nothing.
+			const held = (ns: Narrowing[]) => ns.filter(n => this.called == called || n.b.path == "")
+			return if (op == "&&") new Facts([...held(a.yes), ...b.yes], either(a.no, b.no))
+				else new Facts(either(a.yes, b.yes), [...held(a.no), ...b.no])
 		}
 		if (p.kind == "binary" && (op == "==" || op == "!=")) {
 			this.compare(p)
@@ -4106,6 +4123,24 @@ class Checker {
 			const range = if (f.n == f.types.length) most else `${f.n} to ${if (most == "") "any" else most}`
 			throw this.error(at.loc, `expected ${range} arguments, got ${args.length}`)
 		}
+		this.calls()
+	}
+
+	/// Narrows to none the member paths, which a call may assign.
+	private calls() {
+		this.called++
+		for (const b of this.paths) {
+			if (b.narrowed != null) {
+				this.narrow([new Narrowing(b, null)])
+			}
+		}
+	}
+
+	/// Narrows to none the member paths again if a call was checked since the count called, in what was then restored.
+	private kept(called: i32) {
+		if (this.called != called) {
+			this.calls()
+		}
 	}
 
 	/// ## new
@@ -4150,6 +4185,7 @@ class Checker {
 					throw this.error(start(n.parts[0]), `${show(t)} has no new`)
 				}
 				this.runs(t, "constructor", false)
+				this.calls()
 			default: throw this.error(start(n.parts[0]), `${show(t)} has no new`)
 		}
 		return t

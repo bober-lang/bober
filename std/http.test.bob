@@ -148,6 +148,14 @@ function server(): Server {
 	return s
 }
 
+/// A config of the test certificate, for a server.
+function certified(): Config throws IoError {
+	const c = new Config()
+	c.cert = readFile("tests/tls/cert.pem")
+	c.key = readFile("tests/tls/key.pem")
+	return c
+}
+
 test "a handler is a function" {
 	const res = app(new Request("GET", "http://x/hello"))
 	assert res.status == 200 && res.body.text() == "hello"
@@ -629,13 +637,11 @@ test "middleware and upgrades" {
 
 test "https" {
 	const s = server()
-	s.tls = new Config()
-	s.tls.cert = readFile("tests/tls/cert.pem")
-	s.tls.key = readFile("tests/tls/key.pem")
+	s.tls = certified()
 	const job = async s.serve(app)
 	const base = `https://localhost${s.addr.slice(indexOf(s.addr, ":"), s.addr.length)}`
 	const c = new Client()
-	c.tls.roots = s.tls.cert
+	c.tls.roots = s.tls!.cert
 	assert c.send(new Request("GET", `${base}/version`)).body.text() == "HTTP/2"
 	assert c.send(new Request("GET", `${base}/scheme`)).body.text() == "https" && s.conns == 1
 	assert c.send(new Request("GET", `${base}/bye`)).body.text() == "x"
@@ -658,7 +664,7 @@ test "https" {
 	up.stream!.close()
 	// First requests at once all succeed, whichever connection wins.
 	const fresh = new Client()
-	fresh.tls.roots = s.tls.cert
+	fresh.tls.roots = s.tls!.cert
 	for (const j of [1, 2, 3].map(i => async fresh.send(new Request("GET", `${base}/hello`)))) {
 		assert (await j).body.text() == "hello"
 	}
@@ -677,14 +683,12 @@ test "https" {
 
 test "close returns at once, though an HTTP/2 peer reads none of a response" {
 	const s = server()
-	s.tls = new Config()
-	s.tls.cert = readFile("tests/tls/cert.pem")
-	s.tls.key = readFile("tests/tls/key.pem")
+	s.tls = certified()
 	s.timeout = 0
 	const job = async s.serve(app)
 	const before = released
 	const cfg = new Config()
-	cfg.roots = s.tls.cert
+	cfg.roots = s.tls!.cert
 	cfg.alpn = ["h2"]
 	const t = client(dial(s.addr), "localhost", cfg)
 	// Windows opened wide, so that the server's write parks on the socket.
@@ -774,9 +778,7 @@ function h2head(s: Server, head: [string, string][]): [string, string][] throws 
 /// An https server to run app on a free port, speaking HTTP/2 alone.
 function h2server(): Server {
 	const s = server()
-	s.tls = new Config()
-	s.tls.cert = readFile("tests/tls/cert.pem")
-	s.tls.key = readFile("tests/tls/key.pem")
+	s.tls = certified()
 	s.tls.alpn = ["h2"]
 	return s
 }
@@ -873,9 +875,7 @@ test "over HTTP/2 a burst of requests to a new origin keeps one connection, thos
 
 test "closing an https server waits for the HTTP/2 responses in flight to be written" {
 	const s = server()
-	s.tls = new Config()
-	s.tls.cert = readFile("tests/tls/cert.pem")
-	s.tls.key = readFile("tests/tls/key.pem")
+	s.tls = certified()
 	const started = new Signal()
 	const gate = new Signal()
 	const job = async s.serve(req => {
@@ -884,7 +884,7 @@ test "closing an https server waits for the HTTP/2 responses in flight to be wri
 		return text("late")
 	})
 	const c = new Client()
-	c.tls.roots = s.tls.cert
+	c.tls.roots = s.tls!.cert
 	const late = async c.send(new Request("GET",
 		`https://localhost${s.addr.slice(indexOf(s.addr, ":"), s.addr.length)}/`))
 	started.wait()

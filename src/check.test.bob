@@ -214,6 +214,22 @@ test "null is checked and narrowed" {
 	assert errors(member + "\ta = { b: null }\n\treturn a.b\n}") == "108: expected i32, got i32 | null"
 	assert errors(member + "\ta.b = null\n\treturn a.b\n}") == "103: expected i32, got null"
 	assert errors(member + "\twhile (c) {\n\t\ta.b = null\n\t}\n\treturn a.b\n}") == "120: expected i32, got i32 | null"
+	// A call may assign a member path, but not a local.
+	const g = "function g(): bool { return true }\n" + member
+	assert errors(g + "\tg()\n\treturn a.b\n}") == "131: expected i32, got i32 | null"
+	assert errors(g + "\twhile (c) {\n\t\tconst n: i32 = a.b\n\t\tg()\n\t}\n\treturn 0\n}")
+		== "148: expected i32, got i32 | null"
+	assert errors(g + "\tconst d = if (c) g() else c\n\treturn a.b\n}") == "155: expected i32, got i32 | null"
+	assert errors(g + "\tif (a.b != null && g()) {\n\t\treturn a.b\n\t}\n\treturn 0\n}")
+		== "154: expected i32, got i32 | null"
+	assert errors("function g(): bool { return true }\nfunction f(x: i32 | null): i32 {\n\tif (x == null) {\n\t\treturn 0\n\t}\n\tg()\n\treturn x\n}")
+		== ""
+	// So may other fibers in an await, a type param's constructor and a toString.
+	assert errors("function g(): bool { return true }\nfunction f(a: { b: i32 | null }): i32 {\n\tconst j = async g()\n\tif (a.b == null) {\n\t\treturn 0\n\t}\n\tawait j\n\treturn a.b\n}")
+		== "147: expected i32, got i32 | null"
+	assert errors("class C {}\nfunction f[T extends C](a: { b: i32 | null }): i32 {\n\tif (a.b == null) {\n\t\treturn 0\n\t}\n\tconst c = new T()\n\treturn a.b\n}")
+		== "125: expected i32, got i32 | null"
+	assert errors(member + "\tconst s = `${c}`\n\treturn a.b\n}") == "109: expected i32, got i32 | null"
 	assert errors(member + "\tconst g = () => a.b + 1\n\treturn 0\n}")
 		== "104: + needs numbers, got i32 | null and untyped int"
 	assert errors("function f(a: { v: i32 | string }): i32 { return if (a.v instanceof string) a.v.length else a.v }")
