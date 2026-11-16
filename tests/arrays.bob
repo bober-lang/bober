@@ -188,6 +188,13 @@ class Hist[T extends Small] {
 
 	set(i: i32, d: T) { this.counts[i] = d }
 
+	copy(): T[3] {
+		const c = this.counts
+		return c
+	}
+
+	put(c: T[3]) { this.counts = c }
+
 	sum(): i64 {
 		let s: i64 = 0
 		for (const c of this.counts) {
@@ -202,4 +209,32 @@ test "a generic class's T[n] has elements of its type arg's size" {
 	h.set(1, 5)
 	h.set(2, 6)
 	assert h.counts[1] == 5 && h.counts[2] == 6 && h.sum() == 11 && h.after == 7
+	const c = h.copy()
+	h.put([1, 2, 3])
+	assert c[1] == 5 && h.sum() == 6 && h.after == 7
+}
+
+class Cell {
+	v: i32
+
+	constructor(v: i32) { this.v = v }
+}
+
+function pair[T](a: T, b: T): T[2] {
+	const p: T[2] = [a, b]
+	const q = p
+	for (const i of 0 ... 299999) {
+		const junk = new Cell(i) // until a collection moves what q holds
+	}
+	return q
+}
+
+function grid[T](a: T, b: T): T[2][2] { return [[a, b], [b, a]] }
+
+test "a T[n] of a type param is made, copied and returned at its type arg's size" {
+	const p = pair(new Cell(1), new Cell(2))
+	const s = pair("a string longer than fifteen bytes", "b")
+	assert p[0].v + p[1].v == 3 && s[0] == "a string longer than fifteen bytes" && s[1] == "b"
+	const g = grid(1 as i32, 2)
+	assert g[1][0] == 2 && g[1][1] == 1 && g[0][1] == 2
 }
