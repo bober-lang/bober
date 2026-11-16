@@ -57,6 +57,21 @@ export function concat(a: string, b: string): string {
 /// a == b.
 export function strEq(a: string, b: string): bool { return a.length == b.length && strCompare(a, b) == 0 }
 
+/// Word i, 0 or 1, of s as a short string holds it natively (builtin/string.bob): of one of up to 15 bytes its length,
+/// then its bytes, 8 to a word, little-endian; of a longer one 0xff.
+export function strWord(s: string, i: u64): u64 {
+	if (s.length > 15) {
+		return 0xff
+	}
+	let w: u64 = 0
+	for (const b of 0 ... 7) {
+		const j = 8 * (i as i32) + b
+		const x: u64 = if (j == 0) s.length as u64 else if (j <= s.length) s[j - 1] as u64 else 0
+		w |= x << 8 * b
+	}
+	return w
+}
+
 /// Below, at or above 0 as a is before, equal to or after b, by code units.
 export function strCompare(a: string, b: string): i32 {
 	const n = if (a.length < b.length) a.length else b.length
