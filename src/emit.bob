@@ -510,7 +510,9 @@ class Emitter {
 			} else if (set) {
 				this.write(q, { v: init(), t: this.norm(s.t) }, s.t)
 			} else if (this.kindOf(s.t) == kind.FixedArray) {
-				this.ir().store(this.zero(s.t), q, false) // a constant, not held by address as write takes it
+				if (!this.sized(s.t)) {
+					this.ir().store(this.zero(s.t), q, false) // a constant, not held by address as write takes it
+				}
 			} else if (!this.packed(s.t)) {
 				// a packed union's zero is its zero bytes, as allocated (tagByte)
 				this.write(q, { v: this.zero(s.t), t: this.norm(s.t) }, s.t)
@@ -696,16 +698,18 @@ class Emitter {
 				const k = this.kindOf(t)
 				const cell = cells[i] || k == kind.FixedArray && this.b.holdsRef(mem)
 				cells[i] = cell
-				const l = if (cell) this.alloc(mem) else b.alloca(mem, 0)
+				const l = if (cell) this.fixed(t) else b.alloca(mem, 0)
 				this.locals[i] = l
 				if (c.locals[i].name != 0 && !cell) {
 					b.debugLocal(this.p.strings[c.locals[i].name], l, mem, line)
 				}
 				if (i >= np) {
-					// One of the Type a local holds, not yet set, holds none until stored to.
-					b.store(if (this.p.reflected(t)) b.constZero(mem) else this.zero(t), l, false)
+					if (!this.sized(t)) {
+						// One of the Type a local holds, not yet set, holds none until stored to.
+						b.store(if (this.p.reflected(t)) b.constZero(mem) else this.zero(t), l, false)
+					}
 				} else if (k == kind.FixedArray) {
-					b.store(b.load(mem, p, false), l, false)
+					this.put(l, { v: p, t }, t)
 				} else if (params[i + first] != mem) {
 					// An optional param: its value and, for Default, whether it was given.
 					b.store(b.extract(p, 0), l, false)
@@ -1016,7 +1020,7 @@ class Emitter {
 	private open(o: Opcode, t: i32, at: i32): Frame {
 		const f = new Frame(o, t, at, this.stack.length, this.label())
 		if (t != kind.None) {
-			f.slot = this.slot(this.mem(t))
+			f.slot = if (this.sized(t)) this.fixed(t) else this.slot(this.mem(t))
 		}
 		this.frames.push(f)
 		return f
@@ -1187,7 +1191,7 @@ class Emitter {
 	/// Makes local l a new variable, where a closure captures its cell (Fresh).
 	private renew(l: i32) {
 		if (this.fresh[l]) {
-			this.ir().store(this.alloc(this.mem(this.code.locals[l].type)), this.locals[l], false)
+			this.ir().store(this.fixed(this.code.locals[l].type), this.locals[l], false)
 		}
 	}
 
@@ -1791,8 +1795,10 @@ class Emitter {
 			case "array": this.push(this.cellOf(t, this.pop().v), ret)
 			case "zero": if (this.kindOf(t) == kind.FixedArray) {
 				// Held by address, as array makes one.
-				const q = this.alloc(this.mem(t))
-				this.ir().store(this.zero(t), q, false)
+				const q = this.fixed(t)
+				if (!this.sized(t)) {
+					this.ir().store(this.zero(t), q, false)
+				}
 				this.push(q, t)
 			} else {
 				this.push(this.zero(t), t)
@@ -2340,7 +2346,7 @@ class Emitter {
 
 	/// The place of element i of type e of those at q.
 	private at(q: Value, e: i32, i: Value): Value {
-		if (this.dynamic(e)) {
+		if (this.dynamic(e) || this.sized(e)) {
 			return this.ir().gep(this.b.int(8), q, [this.ir().binary("mul", i, this.word(this.desc(e), sizeAt))])
 		}
 		return this.ir().gep(this.stored(e), q, [i])
@@ -2418,15 +2424,12 @@ class Emitter {
 	private literal(t: i32, n: i32): Lit {
 		const u = this.norm(t)
 		const k = this.p.kind(u)
-		if (this.dyn && this.unbound(u) && k == kind.FixedArray) {
-			throw new CompileError(`emit: ${showType(this.p, u)} of a type param`)
-		}
 		const st = if (k == kind.FixedArray) this.mem(u) else 0
 		// A T[n] is copied where stored, so one holding no refs, which would have the collector find it, is in the frame.
 		const r = if (k == kind.Array) this.cellOf(this.p.a(u), this.i64Const(n))
 			else if (k != kind.FixedArray) this.instance(u)
 			else if (!this.b.holdsRef(st)) this.gc(this.spill(this.zero(u), st, this.slot(st)))
-			else this.alloc(st)
+			else this.fixed(u)
 		return { t, n, filled: 0, r }
 	}
 
@@ -2438,8 +2441,7 @@ class Emitter {
 			case kind.Array:
 				const at = this.ir().gep(this.arrayTy, l.r, [this.i64Const(1)])
 				this.write(this.at(at, e, this.i64Const(j)), v, e)
-			case kind.FixedArray: this.write(this.ir().gep(this.mem(u), l.r, [this.i64Const(0), this.i64Const(j)]), v,
-				e)
+			case kind.FixedArray: this.write(this.at(l.r, e, this.i64Const(j)), v, e)
 			default: this.write(this.gep(l.r, u, j), v, this.layout(u)[j].t)
 		}
 	}
@@ -3515,7 +3517,9 @@ class Emitter {
 
 	/// Stores v at place q of type t, an array's element if elem, copying a fixed array.
 	private put(q: Value, v: V, t: i32, elem = false) {
-		if (this.kindOf(t) == kind.FixedArray) {
+		if (this.sized(t)) {
+			this.rt("memcpy", [this.raw(q), this.raw(this.cast(v, t)), this.word(this.desc(t), sizeAt)], false)
+		} else if (this.kindOf(t) == kind.FixedArray) {
 			this.ir().store(this.ir().load(this.mem(t), this.cast(v, t), false), q, false)
 		} else {
 			const x = this.cast(v, t)
@@ -3535,9 +3539,21 @@ class Emitter {
 		if (this.kindOf(to) != kind.FixedArray) {
 			return this.cast(v, to)
 		}
-		const q = this.alloc(this.mem(to))
+		const q = this.fixed(to)
 		this.put(q, v, to)
 		return q
+	}
+
+	/// Whether t is a T[n] laid out at run time, as of a type param not bound: of its descriptor's size, not mem's.
+	private sized(t: i32): bool { return this.dyn && this.kindOf(t) == kind.FixedArray && this.unbound(t) }
+
+	/// A new cell of a value of t, of zero bytes; of a T[n] of a type param by its descriptor, as sized.
+	private fixed(t: i32): Value {
+		if (!this.sized(t)) {
+			return this.alloc(this.mem(t))
+		}
+		const d = this.desc(t)
+		return this.rt("alloc", [this.word(d, sizeAt), this.layoutOf(d)], false)
 	}
 
 	/// A ref to n new zero values of t, one if n is 0, in which the collector finds refs as t lays them out.
