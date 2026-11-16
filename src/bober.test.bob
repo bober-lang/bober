@@ -182,6 +182,20 @@ function main() {
 	}
 }
 
+test "-O2 keeps the refs of a function holding many over many calls in an object, which collections between move" {
+	let made = ""
+	let pushed = ""
+	for (const i of 0 ... 199) {
+		made += `\tconst p${i} = new P()\n\tp${i}.x = ${i}\n\tchurn()\n`
+		pushed += `\tps.push(p${i})\n`
+	}
+	const main = `class P {\n\tx: i64 = 0\n}\n
+let last: P[] = []\n\nfunction churn() {\n\tconst ps: P[] = []\n\tfor (const i of 0 ... 16383) {\n\t\tps.push(new P())\n\t}
+\tlast = ps\n}\n\nfunction made(): P[] {\n${made}\tconst ps: P[] = []\n${pushed}\treturn ps\n}\n
+function main() {\n\tlet sum: i64 = 0\n\tfor (const p of made()) {\n\t\tsum += p.x\n\t}\n\tprint(\`\${sum}\`)\n}\n`
+	assert built([["main.bob", main]], "-O2") == "19900\n"
+}
+
 test "-O2 has LLVM compile each monomorphized module, an edited one TPDE until it is unchanged, which -O1 keeps" {
 	const units = () => held().filter(o => indexOf(o, "^O") >= 0)
 	anew()
