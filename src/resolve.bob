@@ -15,6 +15,7 @@
 //! same known value, as one returning a Type must; a Return or Throw outside any branch taken at run time ends those it
 //! may run. A type of what a local holds, Of or Member, is resolved by those values, through a memo the copy owns that
 //! is reset when one changes. A known value no op makes, a Type or an array or record of them, is never at run time.
+//! Of two known strings, `+` folds to the one they make.
 
 import { bits, fromBits } from "../builtin/math"
 import { HashMap } from "../std/collections/hashmap"
@@ -1384,8 +1385,14 @@ class Copy {
 		}
 	}
 
-	/// A string Add, into one Concat with the Adds or Concats that made its operands, a and the top, if they did.
+	/// A string Add: of two known strings, the one they make; else into one Concat with the Adds or Concats that made
+	/// its operands, a and the top, if they did.
 	private concat(a: Slot) throws CompileError {
+		if (a.v?.op?.op == op.Str && this.top().v?.op?.op == op.Str) {
+			const b = this.p.strings[this.name(this.take())]
+			this.known(this.ins.str(this.p.strings[this.name(this.take())] + b))
+			return
+		}
 		const n = this.pieces(a) + this.pieces(this.top())
 		this.drop(2)
 		this.push(a.t, null, if (n == 2) this.emit(op.Add) else this.emit(op.Concat, n))
