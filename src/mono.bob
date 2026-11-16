@@ -196,6 +196,7 @@ class Mono {
 		for (const [t, name] of this.reached.values()) {
 			for (const m of this.ins.flat(t)) {
 				this.ins.memberOf(this.ins.owner(m, name), name)
+				this.shows(m, name)
 			}
 		}
 		return end
@@ -500,6 +501,15 @@ class Mono {
 		}
 	}
 
+	/// The instance of builtin/'s show that a dispatch of toString calls for m, which lacks one (§6.9), else -1.
+	private shows(m: i32, name: i32): i32 throws CompileError {
+		const p = this.p
+		if (p.strings[name] != "toString" || this.ins.methodType(m, name) >= 0) {
+			return -1
+		}
+		return this.ins.instance(p.lang("show"), p.list([m]))
+	}
+
 	/// The function of module m that reads (how ""), writes ("=") or calls ("()") member name, a Str, of a value of t by
 	/// a switch on its tag; it takes the value, then the value written or the args.
 	private dispatch(m: i32, t: i32, name: i32, how: string): i32 throws CompileError {
@@ -509,7 +519,8 @@ class Mono {
 		if (found != null) {
 			return found
 		}
-		const [ps, result] = shape(p, how, if (how == "()") ins.methodType(t, name) else ins.fieldType(t, name))
+		const tf = if (how == "()") ins.methodType(t, name) else ins.fieldType(t, name)
+		const [ps, result] = shape(p, how, tf)
 		const c = new Code()
 		const types = [this.low(t), ...ps.map(x => this.low(x))]
 		for (const i of 0 ... types.length - 1) {
@@ -534,7 +545,9 @@ class Mono {
 			const o = ins.owner(mt, name)
 			const d = ins.memberOf(o, name)
 			const method = how == "()" && d >= 0 && p.decls[d].kind == decl.Function
-			const [takes, gives] = shape(p, how, if (method) p.decls[d].type else ins.fieldType(o, name))
+			const shows = if (how == "()") this.shows(mt, name) else -1
+			const ft = if (shows >= 0) tf else if (method) p.decls[d].type else ins.fieldType(o, name)
+			const [takes, gives] = shape(p, how, ft)
 			const recv = () => {
 				c.add(op.Local, 0)
 				cast(t, ct)
@@ -550,7 +563,11 @@ class Mono {
 					}
 				}
 			}
-			if (method) {
+			if (shows >= 0) {
+				c.add(op.Local, 0)
+				cast(t, this.low(mt))
+				c.add(op.Call, shows)
+			} else if (method) {
 				recv()
 				pass()
 				c.add(op.Call, d)
