@@ -4298,12 +4298,18 @@ class Emitter {
 		return slots
 	}
 
-	/// The struct a class instance, object or tuple refers to, an embedded one's in place.
+	/// The struct a class instance, object or tuple refers to, an embedded one's in place; of no bytes a byte more, so
+	/// that a ref to one embedded last is not at its object's end, where the collector would take it for the next's
+	/// (src/gc.c).
 	private struct(t: i32): IrType {
 		const n = this.norm(t)
-		return this.structs.get(n)
-			?? put(this.structs, n,
-			this.b.struct(this.layout(n).map(s => if (s.embed) this.struct(s.t) else this.stored(s.t))))
+		const known = this.structs.get(n)
+		if (known != null) {
+			return known
+		}
+		const fields = this.layout(n).map(s => if (s.embed) this.struct(s.t) else this.stored(s.t))
+		const s = this.b.struct(fields)
+		return put(this.structs, n, if (this.b.bytes(s) == 0) this.b.struct([...fields, this.b.int(8)]) else s)
 	}
 
 	/// The size of an element of array type t, an i64 constant.
