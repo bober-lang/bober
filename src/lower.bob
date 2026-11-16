@@ -35,8 +35,7 @@ import { Opcode } from "./bc/op"
 import { Code, Program, TypeParam, sourceHash } from "./bc/program"
 
 import { Checked, Node, after, arrowBody, bodyOf, check, child, compared, element, has, isLink, isTok, isTypeValue,
-	operands, optional, segment, selfOf, show as showType, signature, sourceOf, standsFor, substitute,
-	supers } from "./check"
+	operands, optional, segment, selfOf, show as showType, sourceOf, standsFor, substitute, supers } from "./check"
 
 import { CompileError } from "./error"
 import { Tok } from "./lex"
@@ -354,6 +353,94 @@ class Unit {
 		return this.prog.list(if (t == null) [] else this.prog.members(this.ty(t)))
 	}
 
+	/// The type declaration n's head spells (Decl.spelled): a function's Sig, a var's or member's annotation, an
+	/// alias's type, a class's or interface's supertypes; 0 for none.
+	private spelling(n: Node): i32 {
+		switch (n.kind) {
+			case "function", "method": return this.sig(child(n, "params")!, after(n, ":"), after(n, "throws"))
+			case "type": return this.spell(n.parts[n.parts.length - 1])
+			case "class":
+				const s = supers(n)
+				return if (s.length == 0) 0 else this.spell(s[0])
+		}
+		const t = after(n, ":")
+		return if (t == null) 0 else this.spell(t!)
+	}
+
+	/// The Sig of params and result as written, 0 for none, in a Throws of thrown if it throws.
+	private sig(params: Node, result: Node | null, thrown: Node | null): i32 {
+		const p = this.prog
+		const ts: i32[] = []
+		const names: i32[] = []
+		for (const q of params.parts) {
+			const rest = q.parts[0].kind == "unary"
+			const t = after(q, ":")
+			const s = if (t == null) 0 else this.spell(t!)
+			ts.push(if (rest && s != 0) p.type(kind.Rest, s) else s)
+			names.push(p.intern(this.text((if (rest) q.parts[0].parts[0] else q.parts[0]).t)))
+			names.push(0)
+		}
+		const f = p.type(kind.Func, p.list(ts), if (result == null) 0 else this.spell(result!))
+		const sig = p.type(kind.Sig, f, p.nameList(names))
+		return if (thrown == null) sig else p.type(kind.Throws, sig, this.spell(thrown!))
+	}
+
+	/// The type annotation n stands for as written, of src/bc/kind.bob's kinds after Member too; what it names in
+	/// `async T`, `typeof x` and `T.elem` as resolved, and `T[readonly]` as its type param, named after T resolved, as it
+	/// has no T to hold T as written.
+	private spell(n: Node): i32 {
+		const p = this.prog
+		const r = this.ty(n.type!, true)
+		const a = n.parts.at(0)
+		switch (n.kind) {
+			case "paren": return this.spell(a!)
+			case "binary": if (n.t.kind == "|") {
+				return p.type(kind.Sum, p.list([...this.members(a!), ...this.members(n.parts[1])]))
+			}
+			case "array": return p.type(kind.Tuple,
+				p.list(n.parts.map(q => if (q.kind == "unary"
+				&& q.t.kind == "...") p.type(kind.Rest, this.spell(q.parts[0]))
+				else this.spell(q))))
+			case "arrow": return this.sig(a!, n.parts[1], after(n, "throws"))
+			case "unary": if (n.t.kind == "...") {
+				return p.type(kind.Embed, this.spell(a!))
+			}
+			case "index": return if (n.parts.length == 1) p.type(kind.Array, this.spell(a!))
+				else if (p.kind(r) == kind.FixedArray) p.type(kind.FixedArray, this.spell(a!), p.b(r))
+				else if (p.kind(r) == kind.Param) r
+				else this.spelledName(a!, n.parts.slice(1, n.parts.length), r) // T[readonly]
+			case "token", "member": return this.spelledName(n, [], r)
+			case "object":
+				const names: i32[] = []
+				for (const m of n.parts) {
+					names.push(p.intern(this.key(m.t)))
+					names.push(if (has(m, "readonly")) decl.Readonly else 0)
+				}
+				return p.type(kind.Object, p.list(n.parts.map(m => this.spelling(m))), p.nameList(names))
+		}
+		return r
+	}
+
+	/// The members of union n as written, in order.
+	private members(n: Node): i32[] {
+		return if (n.kind == "binary" && n.t.kind == "|") [...this.members(n.parts[0]), ...this.members(n.parts[1])]
+			else [this.spell(n)]
+	}
+
+	/// The type of name n with args as written, which stands for r: an Alias of an alias, or of a class or interface
+	/// whose args are not r's, as those left to their defaults; else r.
+	private spelledName(n: Node, args: Node[], r: i32): i32 {
+		const p = this.prog
+		const ns = n.parts.at(0)?.symbol ?? ""
+		const d = this.l.top(if (n.kind == "member" && endsWith(ns, ":")) ns + this.text(n.parts[1].t) else n.symbol)
+		if (d == null) {
+			return r
+		}
+		const written = p.list(args.map(q => this.spell(q)))
+		const alias = p.decls[d!].kind == decl.Alias || p.kind(r) == kind.Named && p.b(r) != written
+		return if (alias) p.type(kind.Alias, d!, written) else r
+	}
+
 	/// Drops the source, keeping its hash, where its lines end and its doc, then lists the module's top-level decls, and
 	/// its variables in the order they are initialized: consts, then lets, each after those it depends on (spec 3).
 	finish() {
@@ -539,7 +626,9 @@ class Unit {
 		if (n != null) {
 			this.prog.decls[d].pos = n.t.loc.pos
 			this.prog.decls[d].doc = this.prog.intern(n.doc)
-			this.prog.decls[d].signature = this.prog.intern(signature(this.src, n!))
+			this.later(() => {
+				this.prog.decls[d].spelled = this.spelling(n!)
+			})
 		}
 		if (this.listing) {
 			if (owner < 0) {
@@ -638,10 +727,6 @@ function primitive(t: Type): i32 {
 
 /// How many values of a literal an Outlined function sets.
 const chunk = 64
-
-const operators: [string, Opcode][] = [["+", op.Add], ["-", op.Sub], ["*", op.Mul], ["/", op.Div], ["%", op.Rem],
-	["**", op.Pow], ["&", op.And], ["|", op.Or], ["^", op.Xor], ["<<", op.Shl], [">>", op.Shr], ["==", op.Eq],
-	["!=", op.Ne], ["<", op.Lt], [">", op.Gt], ["<=", op.Le], [">=", op.Ge]]
 
 /// Where break and continue in a loop go: the levels of the blocks they branch out of.
 class Loop {
@@ -2632,7 +2717,7 @@ function word(l: string, i: i32): i64 {
 function textual(t: Type): bool { return t.kind == "string" || t.kind == "literal" && t.base!.kind == "string" }
 
 function opcode(s: string): Opcode {
-	for (const [x, o] of operators) {
+	for (const [x, o] of op.operators) {
 		if (x == s) {
 			return o
 		}

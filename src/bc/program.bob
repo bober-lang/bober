@@ -65,8 +65,9 @@ export class Decl {
 	pos = 0
 	/// Its doc comment, a Str.
 	doc = 0
-	/// Its source up to its body, or a var's spanning lines up to its value, a Str.
-	signature = 0
+	/// Its type as written, 0 for none: a function's Sig (in a Throws if it throws), a var's annotation, an alias's type,
+	/// a class's or interface's supertype.
+	spelled = 0
 	/// The list of its tags (§5.3).
 	tags = 0
 	/// The list of the types a function or method lists after throws (§5.2).
@@ -162,7 +163,7 @@ export class Program {
 	private langs = new HashMap[string, i32]()
 
 	constructor() {
-		for (const _ of 0 ... (kind.Member as i32)) {
+		for (const _ of 0 ... (kind.Throws as i32)) {
 			this.typeIds.push(new HashMap[i64, i32]())
 		}
 		this.intern("")
@@ -434,7 +435,8 @@ export class Program {
 		return switch (k) {
 			case kind.FixedArray: combine(h, b)
 			case kind.Object: combine(h, this.nameHashes[b])
-			case kind.Named: combine(h, this.decls[a].hash)
+			case kind.Named, kind.Alias: combine(h, this.decls[a].hash)
+			case kind.Sig: combine(h, this.nameHashes[b])
 			case kind.Param: combine(combine(h, this.decls[a].hash), b)
 			case kind.Literal: combine(combine(h, a),
 				if (a == kind.String) fnv(this.strings[b]) else if (kind.isInt(a)) this.ints[b] as u64 else b as u64)
@@ -463,11 +465,15 @@ export class Program {
 		}
 		switch (k) {
 			case kind.Array, kind.Optional, kind.Rest, kind.Embed, kind.FixedArray, kind.Literal, kind.Member: part(a)
-			case kind.Tuple, kind.Union, kind.Object: list(a)
+			case kind.Sig: part(a)
+			case kind.Tuple, kind.Union, kind.Object, kind.Sum: list(a)
 			case kind.Func:
 				list(a)
 				part(b)
-			case kind.Named: list(b)
+			case kind.Throws:
+				part(a)
+				part(b)
+			case kind.Named, kind.Alias: list(b)
 		}
 		this.kinds.push(k)
 		this.as.push(a)

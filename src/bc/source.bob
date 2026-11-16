@@ -1,0 +1,190 @@
+//! The source a Program's module says, printed back: a declaration's signature from its types as written
+//! (Decl.spelled), the decls of other modules named as the module imports them, and the straight-line code of its
+//! defaults and value.
+
+import { fromBits } from "../../builtin/math"
+import { endsWith, indexOf } from "../../std/algo"
+import { minus } from "../../std/ascii"
+import { quoted } from "../../std/string"
+import { CompileError } from "../error"
+import { Shape, prec } from "../parse"
+import * as decl from "./decl"
+import * as kind from "./kind"
+import * as op from "./op"
+import { Code, Program } from "./program"
+import { param, qualified, showType } from "./show"
+
+/// Decl d's signature on one line: its mods, keyword, name, type params, params with their defaults, result, throws, a
+/// var's type and, if value, its value, supertypes and tags; a var's type as resolved if neither type nor value is
+/// written.
+export function signature(p: Program, d: i32, value = true): string throws CompileError {
+	const x = p.decls[d]
+	const at = x.module
+	const s = x.spelled
+	const top = x.owner < 0
+	const flag = (m: i32, word: string) => if ((x.mods & m) != 0) word + " " else ""
+	const name = p.strings[x.name]
+	const tags = p.lists[x.tags].map(t => ` @${showType(p, t, at)}`).join("")
+	let out = if (top) flag(decl.Export, "export")
+		else flag(decl.Static, "static") + flag(decl.Private, "private") + flag(decl.Readonly, "readonly")
+	switch (x.kind) {
+		case decl.Function:
+			const sig = if (p.kind(s) == kind.Throws) p.a(s) else s
+			const f = p.a(sig)
+			const ts = p.items(f)
+			const resolved = p.items(x.type)
+			const ps: string[] = []
+			for (const i of 0 ... ts.length - 1) {
+				const v = if (p.kind(resolved[i]) == kind.Optional) fallback(p, d, i) else ""
+				ps.push(param(p, p.names[p.b(sig)][2 * i], if (ts[i] == 0 && v == "") p.a(resolved[i]) else ts[i], at)
+					+ (if (v == "") "" else ` = ${v}`))
+			}
+			out += `${if (top) "function " else ""}${name}${params(p, d)}(${ps.join(", ")})`
+			out += (if (p.b(f) == 0) "" else `: ${showType(p, p.b(f), at)}`)
+				+ (if (sig == s) "" else ` throws ${showType(p, p.b(s), at)}`)
+		case decl.Var:
+			if (s == 0 && (x.mods & decl.Embed) != 0) {
+				return `...${showType(p, x.type, at)}${tags}`
+			}
+			const v = if (value && x.code != null) expr(p, x.code!, 0, x.code!.ops.length - 1, at) else ""
+			// Its type as written, else as resolved, a const's of one value its base, but of a lone literal of it.
+			const r = if (p.kind(x.type) == kind.Literal) p.a(x.type) else x.type
+			const t = if (s != 0) s else if (v != "" && lone(x.code!, r)) 0 else r
+			out += (if (top) (if ((x.mods & decl.Readonly) != 0) "const " else "let ") else "") + name
+				+ (if (t == 0) "" else `: ${showType(p, t, at)}`) + tags
+			return out + (if (v == "") "" else ` = ${v}`)
+		case decl.Alias: return `${out}type ${name}${params(p, d)}${tags} = ${showType(p, s, at)}`
+		case decl.Class, decl.Interface:
+			out += `${decl.names[x.kind]} ${name}${params(p, d)}`
+			out += if (s == 0) "" else ` ${if (x.kind == decl.Class) "implements" else "extends"} ${showType(p, s, at)}`
+	}
+	return out + tags
+}
+
+/// Whether code c is a lone literal of type t, a string's, an i32's, an f64's or a bool's, or an untyped constant's.
+function lone(c: Code, t: i32): bool {
+	return switch (if (c.ops.length == 2) c.ops[0] else op.End) {
+		case op.Str: t == kind.String
+		case op.Int: t == kind.I32 || t == kind.Int
+		case op.Float: t == kind.F64 || t == kind.Float
+		case op.True, op.False: t == kind.Bool
+		default: false
+	}
+}
+
+/// Decl d's type params, but the `T[readonly]` ones the checker adds, with their constraints and defaults.
+function params(p: Program, d: i32): string {
+	const at = p.decls[d].module
+	const ps = p.decls[d].params.filter(x => !endsWith(p.strings[x.name], "[readonly]"))
+	return if (ps.length == 0) ""
+		else `[${ps.map(x => p.strings[x.name] + (if (x.constraint == 0) "" else ` extends ${showType(p, x.constraint, at)}`) + (if (x.fallback == 0) "" else ` = ${showType(p, x.fallback, at)}`)).join(", ")}]`
+}
+
+/// The default of param i of function d, as expr prints it.
+function fallback(p: Program, d: i32, i: i32): string throws CompileError {
+	const c = p.decls[d].code
+	const l = i + (if (p.method(d)) 1 else 0)
+	for (const j of 0 ... (c?.ops.length ?? 0) - 1) {
+		if (c!.ops[j] == op.Default && c!.a(j) == l) {
+			return expr(p, c!, j + 1, c!.next(j), p.decls[d].module)
+		}
+	}
+	return ""
+}
+
+/// The value ops from up to to of c leave, as source; "" unless they are straight-line: literals, locals, globals,
+/// fields, calls, new, array and object literals and operators, a Cast dropped, a call of literal the `as` it is.
+export function expr(p: Program, c: Code, from: i32, to: i32, at: i32): string throws CompileError {
+	const atom = 14 // how tightly a name, literal, call or member binds, as parse's Member
+	const stack: [string, i32][] = []
+	// The values of the last n entries, popped, a Missing one dropped.
+	const take = (n: i32) => {
+		const xs = stack.slice(stack.length - n, stack.length).map(e => e[0]).filter(e => e != "")
+		for (const _ of 1 ... n) {
+			stack.pop()
+		}
+		return xs.join(", ")
+	}
+	// The top entry popped, parenthesized unless it binds at least min.
+	const operand = (min: i32) => {
+		const [e, level] = stack.pop()
+		return if (level < min) `(${e})` else e
+	}
+	for (const i of from ... to - 1) {
+		const o = c.ops[i]
+		const a = c.a(i)
+		const b = c.b(i)
+		const sym = op.operators.find(x => x[1] == o)
+		if (o == op.Cast || o == op.Init) {
+			continue
+		}
+		if (sym != null) {
+			const level = prec(sym[0] as Shape)
+			const r = operand(level + 1)
+			stack.push([`${operand(level)} ${sym[0]} ${r}`, level])
+			continue
+		}
+		switch (o) {
+			case op.Int: stack.push([if (a == kind.U64) `${p.ints[b] as u64}` else `${p.ints[b]}`,
+				if (p.ints[b] < 0) 12 else atom])
+			case op.Float:
+				const f = `${fromBits[f64](p.ints[b] as u64)}`
+				stack.push([if (indexOf(f, ".") < 0 && indexOf(f, "e") < 0 && indexOf(f, "n") < 0) f + ".0" else f,
+					if (f[0] == minus) 12 else atom])
+			case op.Str: stack.push([quoted(p.strings[a]), atom])
+			case op.True: stack.push(["true", atom])
+			case op.False: stack.push(["false", atom])
+			case op.Null: stack.push(["null", atom])
+			case op.Missing: stack.push(["", atom])
+			case op.Type: stack.push([showType(p, a, at), atom])
+			case op.Local: stack.push([p.strings[c.locals[a].name], atom])
+			case op.Global: stack.push([qualified(p, a, at), atom])
+			case op.Member: stack.push([`${operand(atom)}.${p.strings[p.decls[a].name]}`, atom])
+			case op.Field: stack.push([`${operand(atom)}.${p.strings[a]}`, atom])
+			case op.Neg, op.Not: stack.push([`${if (o == op.Neg) "-" else "!"}${operand(12)}`, 12])
+			case op.Call:
+				if (a == p.lang("show")) {
+					return "" // of a template, which it cannot name
+				}
+				if (a == p.lang("literal")) {
+					stack.push([`${operand(13)} as ${showType(p, p.lists[b][0], at)}`, 12])
+					continue
+				}
+				const args = take(p.items(p.decls[a].type).length)
+				stack.push([if (p.method(a)) `${operand(atom)}.${p.strings[p.decls[a].name]}(${args})`
+					else `${qualified(p, a, at)}(${args})`, atom])
+			case op.CallMethod:
+				const args = take(b)
+				stack.push([`${operand(atom)}.${p.strings[a]}(${args})`, atom])
+			case op.CallRef:
+				const args = take(a)
+				stack.push([`${operand(atom)}(${args})`, atom])
+			case op.New:
+				if (p.kind(a) != kind.Named) {
+					return ""
+				}
+				const ctor = p.find(p.decls[p.a(a)].module, p.a(a), "constructor")
+				const args = take(if (ctor < 0) 0 else p.items(p.decls[ctor].type).length)
+				stack.push([`new ${showType(p, a, at)}(${args})`, atom])
+			case op.Array:
+				const spread = c.items(c.c(i))
+				const n = stack.length - b
+				for (const k of spread) {
+					stack[n + k] = [`...${stack[n + k][0]}`, atom]
+				}
+				stack.push([`[${take(b)}]`, atom])
+			case op.Object:
+				if (p.kind(a) != kind.Object || c.items(c.c(i)).length > 0) {
+					return ""
+				}
+				const ns = p.names[p.b(a)]
+				const n = stack.length - b
+				for (const k of 0 ... b - 1) {
+					stack[n + k] = [`${p.strings[ns[2 * k]]}: ${stack[n + k][0]}`, atom]
+				}
+				stack.push([`{ ${take(b)} }`, atom])
+			default: return ""
+		}
+	}
+	return if (stack.length == 1) stack[0][0] else ""
+}

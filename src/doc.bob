@@ -9,7 +9,10 @@ import { replace, split, trim } from "../std/string"
 import * as decl from "./bc/decl"
 import { head } from "./bc/file"
 import { Program } from "./bc/program"
+import { signature } from "./bc/source"
 import { CompileError } from "./error"
+import { format } from "./format"
+import { SyntaxError } from "./lex"
 import { stdBundle } from "./lift"
 import { lower } from "./lower"
 import { root } from "./root"
@@ -50,31 +53,46 @@ function below(dir: string): string[] throws IoError {
 	return fs
 }
 
-/// The docs of module m of p, named name: its doc, then each exported declaration as written up to its body, a
+/// The docs of module m of p, named name: its doc, then each exported declaration's signature (src/bc/source.bob), a
 /// class's members but private ones within it, and below it its doc; those next to each other without one share a
 /// block.
-export function reference(name: string, p: Program, m: i32): string {
+export function reference(name: string, p: Program, m: i32): string throws CompileError {
 	let out = `# ${name}\n${paragraph(p.strings[p.modules[m].doc])}`
 	let bare = false // whether the last export has no doc, so that one without shares its block
-	const exports = p.modules[m].decls.map(d => p.decls[d]).filter(x => (x.mods & decl.Export) != 0)
-	sortBy(exports, (a, b) => a.pos < b.pos) // as lowered, an alias is before the rest
-	for (const x of exports) {
-		let code = p.strings[x.signature]
+	const exports = p.modules[m].decls.filter(d => (p.decls[d].mods & decl.Export) != 0)
+	sortBy(exports, (a, b) => p.decls[a].pos < p.decls[b].pos) // as lowered, an alias is before the rest
+	for (const d of exports) {
+		const x = p.decls[d]
+		let code = signature(p, d)
 		if (x.kind == decl.Class || x.kind == decl.Interface) {
-			let body = ""
-			for (const y of x.members.map(d => p.decls[d]).filter(y => (y.mods & decl.Private) == 0)) {
-				for (const l of if (y.doc == 0) [] else split(p.strings[y.doc], "\n")) {
-					body += `\n\t///${if (l == "") "" else " " + l}`
+			code += " {"
+			for (const y of x.members.filter(y => (p.decls[y].mods & decl.Private) == 0)) {
+				for (const l of if (p.decls[y].doc == 0) [] else split(p.strings[p.decls[y].doc], "\n")) {
+					code += `\n\t///${if (l == "") "" else " " + l}`
 				}
-				body += `\n\t${p.strings[y.signature]}`
+				code += `\n\t${signature(p, y)}`
 			}
-			code += if (body == "") " {}" else ` {${body}\n}`
+			code += "\n}"
 		}
-		const d = paragraph(p.strings[x.doc])
-		out = (if (bare && d == "") out.slice(0, out.length - 4) else out + "\n```bober\n") + code + "\n```\n" + d
-		bare = d == ""
+		code = layout(code)
+		if (x.kind == decl.Var && indexOf(code, "\n") >= 0) {
+			code = layout(signature(p, d, false))
+		}
+		const about = paragraph(p.strings[x.doc])
+		out = (if (bare && about == "") out.slice(0, out.length - 4) else out + "\n```bober\n") + code + "\n```\n"
+			+ about
+		bare = about == ""
 	}
 	return out
+}
+
+/// Code as format lays it out, without blank lines.
+function layout(code: string): string throws CompileError {
+	try {
+		return split(trim(format(code)), "\n").filter(l => l != "").join("\n")
+	} catch (e: SyntaxError) {
+		throw new CompileError(`${code}: ${e.msg}`)
+	}
 }
 
 /// text after a blank line, if any.
