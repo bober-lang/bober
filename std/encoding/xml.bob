@@ -233,6 +233,9 @@ class Dtd {
 	partial = false
 	/// Whether the XML declaration says standalone="yes", which keeps an undeclared entity an error though partial.
 	standalone = false
+	/// Whether, not standalone, a parameter entity was left unread, after which XML 1.0 §5.1 has the entity and
+	/// attribute-list declarations not processed.
+	skipping = false
 	/// The bytes that references and attribute defaults have expanded to, which stop at limit against entities that
 	/// expand exponentially and defaults that expand quadratically.
 	expanded: i64 = 0
@@ -409,6 +412,8 @@ class Parser {
 				this.expect(";")
 				if (v != null) {
 					this.nested(v, at, p => p.subset())
+				} else if (!this.dtd.standalone) {
+					this.dtd.skipping = true
 				}
 			} else if (this.eat("<!ENTITY")) {
 				this.entity()
@@ -514,7 +519,7 @@ class Parser {
 		}
 		this.expect(">")
 		const entities = if (parameter) this.dtd.parameters else this.dtd.entities
-		if (!entities.has(name) && (parameter || builtin(name) == null)) {
+		if (!entities.has(name) && (parameter || builtin(name) == null) && !this.dtd.skipping) {
 			entities.set(name, v)
 		}
 	}
@@ -563,7 +568,7 @@ class Parser {
 				}
 				v = this.attrValue(this.opening())
 			}
-			if (!decls.some(d => d.name == name)) {
+			if (!decls.some(d => d.name == name) && !this.dtd.skipping) {
 				decls.push(new Declared(name, kind == "CDATA", v))
 			}
 		}
