@@ -34,7 +34,8 @@
 //! ```
 //!
 //! A code is its locals (Str name, type, mods), captures and code lists, then its op count and per op its source
-//! offset less the op before's, SLEB, its byte and its immediates by shape.
+//! offset less the op before's, SLEB, its byte and its immediates by shape, then its marks: per mark its op less the
+//! one before's, its form and type.
 //!
 //! A file is fresh while its compiler and source hashes are the current ones and the ABI hash it has of each dep is
 //! that dep's; reading a stale one is a miss. A changed compiler makes each stale, so the format has no version. The
@@ -308,6 +309,14 @@ class Out {
 				this.part(w, s[j], c.imm(i, j))
 			}
 		}
+		uleb(w, c.forms.length / 3)
+		let before = 0
+		for (const k of 0 ... c.forms.length / 3 - 1) {
+			uleb(w, c.forms[3 * k] - before)
+			before = c.forms[3 * k]
+			uleb(w, c.forms[3 * k + 1])
+			uleb(w, this.type(c.forms[3 * k + 2]))
+		}
 	}
 
 	/// Writes x, a part of kind k: a list of types inline, a number as it is, else the file's id of it.
@@ -536,6 +545,11 @@ export class In {
 			}
 			const s = op.shape[o]
 			c.add(o as op.Opcode, this.imm(s, 0), this.imm(s, 1), this.imm(s, 2))
+		}
+		let at = 0
+		for (const _ of 1 ... this.n()) {
+			at += this.n()
+			c.form(at, this.n(), this.type())
 		}
 		return c
 	}

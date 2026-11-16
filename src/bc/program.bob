@@ -631,6 +631,9 @@ export class Code {
 	at = -1
 	/// Of a closure's code, per local it captures, in the order its Closure lists them, the local here holding it.
 	captures: i32[] = []
+	/// Per mark of what the source says that the ops do not, its op, its form (src/bc/op.bob) and its type, 0 for none;
+	/// in op order, an op's in the order they apply. Only lower makes them, and src/bc/source.bob reads them.
+	forms: i32[] = []
 	/// Per op, its immediates a, b and c, as shape gives them, 0 where it has none.
 	private imms: i32[] = []
 	/// Per op opening or splitting a block, the op that next splits or ends it, made on first use.
@@ -652,6 +655,8 @@ export class Code {
 		return this.ops.length - 1
 	}
 
+	/// Marks op i with form f of type t.
+	form(i: i32, f: i32, t: i32) { this.forms.append([i, f, t]) }
 	a(i: i32): i32 { return this.imms[3 * i] }
 	b(i: i32): i32 { return this.imms[3 * i + 1] }
 	c(i: i32): i32 { return this.imms[3 * i + 2] }
@@ -689,10 +694,15 @@ export class Code {
 		return this.nexts![i]
 	}
 
-	/// Keeps only the ops keep gives true for, in order; keep sees each op before any after it moves.
+	/// Keeps only the ops keep gives true for, in order, and their marks; keep sees each op before any after it moves.
 	retain(keep: (i: i32) => bool) {
 		let n = 0
+		let k = 0 // the next mark
 		for (const i of 0 ... this.ops.length - 1) {
+			while (k < this.forms.length && this.forms[k] == i) {
+				this.forms[k] = n
+				k += 3
+			}
 			if (keep(i)) {
 				this.ops[n] = this.ops[i]
 				this.pos[n] = this.pos[i]
