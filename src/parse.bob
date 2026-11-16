@@ -1,8 +1,7 @@
 //! Recursive descent with Pratt expressions, into a tree of constructs.
 
-import { comma, isBlank, isSpace, lf, semicolon, space } from "../std/ascii"
-import { indexOf, partitionPoint, startsWith } from "../std/algo"
-import { trim } from "../std/string"
+import { comma, isBlank, isSpace, lf, semicolon } from "../std/ascii"
+import { partitionPoint, startsWith } from "../std/algo"
 import { Keyword, Kind, Lexer, Loc, SyntaxError, Tok, assigns } from "./lex"
 
 /// A construct, entered at its keyword, operator or opening bracket, at the name of a typeParam, prop
@@ -43,9 +42,9 @@ export class Parser {
 	private result = false
 	/// The comments, in order. They are not in the tree.
 	comments: Tok[] = []
-	/// Whether each of comments is a doc comment doc took.
-	private taken: bool[] = []
-	private src: string
+	/// Per comment, the position of the token of the construct doc took it for, else -1.
+	docs: i32[] = []
+	readonly src: string
 	private header: bool
 	/// Whether only imports have come so far.
 	private imports = true
@@ -59,22 +58,20 @@ export class Parser {
 		this.header = header
 	}
 
-	/// The doc comment of the construct from pos to end, once parsed: if it starts its line, the `///` comments on the
-	/// lines right before it, each alone on its line and among plain ones, then one ending the line it ends on, after a
-	/// `,` or `;` at most; without `///` and a space after.
-	doc(pos: i32, end: i32): string {
+	/// Takes the doc comment of the construct from pos to end, whose token is at at, once parsed: if it starts its line,
+	/// the `///` comments on the lines right before it, each alone on its line and among plain ones, then one ending the
+	/// line it ends on, after a `,` or `;` at most.
+	doc(pos: i32, end: i32, at: i32) {
 		let i = partitionPoint(this.comments, c => c.loc.pos >= pos) as i32
 		let line = this.lineCol(pos)[0]
-		const lines: string[] = []
 		while (leads(this.src, pos) && i > 0 && this.lineCol(this.comments[i - 1].loc.pos)[0] == line - 1
 			&& leads(this.src, this.comments[i - 1].loc.pos)) {
 			if (this.isDoc(i - 1)) {
-				lines.push(this.take(i - 1))
+				this.docs[i - 1] = at
 			}
 			line--
 			i--
 		}
-		lines.reverse()
 		let j = partitionPoint(this.comments, c => c.loc.pos >= end) as i32
 		if (j < this.comments.length && this.isDoc(j)) {
 			let k = end
@@ -83,10 +80,9 @@ export class Parser {
 				k++
 			}
 			if (k == this.comments[j].loc.pos) {
-				lines.push(this.take(j))
+				this.docs[j] = at
 			}
 		}
-		return lines.join("\n").copy() // as it outlives the source
 	}
 
 	/// Reports the doc comments doc did not take, as warnings, and the module docs after the first token.
@@ -98,7 +94,7 @@ export class Parser {
 				at++
 			}
 			at = if (at == c.loc.pos) c.loc.end() else -1
-			if (this.isDoc(i) && !this.taken[i]) {
+			if (this.isDoc(i) && this.docs[i] < 0) {
 				report(c.loc, "a doc comment documents what follows it or the line it ends", true)
 			} else if (at < 0 && startsWith(this.l.text(c), "//!")) {
 				report(c.loc, "a module doc comes before the first token", false)
@@ -110,12 +106,6 @@ export class Parser {
 	private isDoc(i: i32): bool {
 		const text = this.l.text(this.comments[i])
 		return startsWith(text, "///") && !startsWith(text, "////")
-	}
-
-	/// The text of comments[i], a doc comment, taken.
-	private take(i: i32): string {
-		this.taken[i] = true
-		return body(this.l.text(this.comments[i]))
 	}
 
 	/// The next of the file's imports and then declarations, or null at its end.
@@ -138,7 +128,7 @@ export class Parser {
 		let t = this.l.peek(want)
 		while (t.kind == "comment") {
 			this.comments.push(this.l.next())
-			this.taken.push(false)
+			this.docs.push(-1)
 			t = this.l.peek(want)
 		}
 		return t
@@ -875,30 +865,6 @@ function continues(t: Tok): bool {
 }
 
 function fail(t: Tok, want: string): SyntaxError { return new SyntaxError(t.loc, `expected ${want}, got ${t.kind}`) }
-
-/// Doc comment text without its `///` or `//!` and a space after.
-export function body(text: string): string {
-	return text.slice(if (text.length > 3 && text[3] == space) 4 else 3, text.length)
-}
-
-/// The module doc of src, its `//!` comments before its first token, without `//!` and a space after.
-export function moduleDoc(src: string): string {
-	const lines: string[] = []
-	let i = 0
-	while (i < src.length) {
-		const nl = indexOf(src, "\n", i)
-		const end = if (nl < 0) src.length else nl
-		const l = trim(src.slice(i, end))
-		if (l != "" && !startsWith(l, "//")) {
-			break
-		}
-		if (startsWith(l, "//!")) {
-			lines.push(body(l))
-		}
-		i = end + 1
-	}
-	return lines.join("\n")
-}
 
 /// Whether only blanks come before pos on its line.
 export function leads(src: string, pos: i32): bool {

@@ -26,6 +26,7 @@
 //! by its decl and env, and a class instance is its Named type, whose args are its env. subst substitutes an env.
 
 import { sort, sortBy } from "../../std/algo"
+import { space } from "../../std/ascii"
 import { HashMap } from "../../std/collections/hashmap"
 import { combine, fnv } from "../../std/hash"
 import { CompileError } from "../error"
@@ -39,6 +40,9 @@ export type TypeParam = { name: i32, constraint: i32, fallback: i32 }
 /// An import statement: its position, specifier (a Str), module, the namespace it names (a Str, 0 for none), and each
 /// decl it names with the name it imports it as (a Str, 0 if not renamed).
 export type Import = { pos: i32, spec: i32, module: i32, ns: i32, names: [i32, i32][] }
+/// A comment: where it is, whether code is before it on its line, its text after `//`, so a doc comment's starts with
+/// `/` and a module doc's with `!`, and the decl whose doc comment it is, -1 for none.
+export type Comment = { pos: i32, trails: bool, text: string, owner: i32 }
 
 /// What a declaration declares (src/bc/decl.bob).
 export class Decl {
@@ -63,7 +67,7 @@ export class Decl {
 	code: Code | null = null
 	/// Where its declaration is in its module's source, a byte offset.
 	pos = 0
-	/// Its doc comment, a Str.
+	/// Its doc, a Str, as document makes it of its module's comments.
 	doc = 0
 	/// Its type as written, 0 for none: a function's Sig (in a Throws if it throws), a var's annotation, an alias's type,
 	/// a class's or interface's supertype.
@@ -108,8 +112,8 @@ export class Module {
 	source: u64 = 0
 	/// The byte offsets of the line feeds in its source, ascending, which make a code's positions lines.
 	newlines: i32[] = []
-	/// Its `//!` doc comment, a Str.
-	doc = 0
+	/// The comments in its source, in order.
+	comments: Comment[] = []
 	/// Its file as linked from a build's cache (src/lift.bob), which is what write would make of it, or as written
 	/// before mono changed the program, else "".
 	bc = ""
@@ -511,6 +515,19 @@ export class Program {
 		return d
 	}
 
+	/// Gives each decl of module m the doc its comments make, of the bodies of its doc comments, a line each.
+	document(m: i32) {
+		const docs = new HashMap[i32, string]()
+		const owned = this.modules[m].comments.filter(c => c.owner >= 0)
+		for (const c of owned) {
+			const before = docs.get(c.owner)
+			docs.set(c.owner, (if (before == null) "" else before! + "\n") + body(c.text))
+		}
+		for (const c of owned) {
+			this.decls[c.owner].doc = this.intern(docs.get(c.owner)!)
+		}
+	}
+
 	/// The decl of module m in owner of the name, the last declared of those there are, or in an owner the nth, else -1.
 	find(m: i32, owner: i32, name: string, nth = -1): i32 {
 		const s = this.stringIds.get(name)
@@ -590,6 +607,12 @@ export class Program {
 
 /// The key of a and b, as one int.
 export function pair(a: i32, b: i32): i64 { return (a as i64) << 32 | ((b as i64) & 0xffffffff) }
+
+/// A doc comment's text without its `/` or `!` and a space after.
+export function body(text: string): string {
+	return text.slice(if (text.length > 1 && text[1] == space) 2 else 1, text.length)
+}
+
 /// The hash of the source src of the module at path.
 export function sourceHash(path: string, src: string): u64 { return combine(fnv(path), fnv(src)) }
 

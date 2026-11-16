@@ -266,14 +266,15 @@ export interface Checked {
 	/// A top-level declaration of the module at path that one handed on before it refers to, typed but not yet checked
 	/// whole, so that the next stage knows it ahead of its decl.
 	declare(n: Node, path: string, src: string)
-	/// The module at path checked, after the modules it imports: each of its declarations handed on, or failed.
-	done(path: string)
+	/// The module at path checked, after the modules it imports: each of its declarations handed on, or failed; p parsed
+	/// it, with its comments.
+	done(path: string, p: Parser)
 }
 
 class Ignore implements Checked {
 	decl(n: Node, path: string, src: string) {}
 	declare(n: Node, path: string, src: string) {}
-	done(path: string) {}
+	done(path: string, p: Parser) {}
 }
 
 /// A construct, or a token where kind is "token".
@@ -287,8 +288,6 @@ export class Node {
 	type: Type | null = null
 	/// A declaration's or member's tags (5.3), once typed.
 	tags: Type[] | null = null
-	/// A declaration's doc comment.
-	doc = ""
 	/// For the name of a top-level declaration, or a use of one, its module's path and its name, unique in the
 	/// program. A namespace's is its module's path and the colon.
 	symbol = ""
@@ -525,7 +524,7 @@ class Modules {
 		const c = new Checker(m, src, p, this)
 		c.check()
 		m.done = true
-		this.handOn(path, n => n.done(path))
+		this.handOn(path, n => n.done(path, p))
 		stableSort(c.errors, (a, b) => a.loc.pos < b.loc.pos)
 		for (const e of c.errors) {
 			const [line, col] = p.lineCol(e.loc.pos)
@@ -1161,7 +1160,7 @@ class Checker {
 			n.parts.push(if (p instanceof Tree) this.node(p) else new Node("token", p))
 		}
 		if (documented.includes(t.kind)) {
-			n.doc = this.p.doc(start(n).pos, stop(n))
+			this.p.doc(start(n).pos, stop(n), n.t.loc.pos)
 		}
 		if (n.kind == "binary" || n.kind == "chain") {
 			this.parens(n)

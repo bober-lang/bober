@@ -25,10 +25,12 @@
 //! decls    per decl of its own, in the order made: Str name, kind byte, owner
 //! imports  per decl of another module it uses: dep, owner, Str name, nth of that name in its owner
 //! types    per type, after its parts: kind byte, a and b as its kind says
-//! defs     per decl: mods, type params (Str name, constraint, default), type, supers, tags, throws, its position, Str
-//!          doc, type as spelled, 0 or 1 and its code; then the module's decls, inits and deps, its imports (position,
+//! defs     per decl: mods, type params (Str name, constraint, default), type, supers, tags, throws, its position,
+//!          type as spelled, 0 or 1 and its code; then the module's decls, inits and deps, its imports (position,
 //!          Str specifier, dep, Str namespace, the decls named with their Str names), and where its lines end,
-//!          each after the one before; then Str its doc
+//!          each after the one before
+//! comments per comment: its position less the one before's, 1 if code is before it on its line else 0, its text
+//!          after `//`, and the decl whose doc comment it is, as an owner; a decl's doc is made of these
 //! ```
 //!
 //! A code is its locals (Str name, type, mods), captures and code lists, then its op count and per op its source
@@ -227,7 +229,6 @@ class Out {
 			this.part(defs, op.TypeList, x.tags)
 			this.part(defs, op.TypeList, x.throws)
 			uleb(defs, x.pos)
-			uleb(defs, this.str(x.doc))
 			uleb(defs, this.type(x.spelled))
 			defs.u8(if (x.code == null) 0 else 1)
 			if (x.code != null) {
@@ -256,7 +257,16 @@ class Out {
 			line = n
 			return d
 		}))
-		uleb(defs, this.str(mod.doc))
+		const comments = new Writer()
+		uleb(comments, mod.comments.length)
+		let at = 0
+		for (const c of mod.comments) {
+			uleb(comments, c.pos - at)
+			at = c.pos
+			comments.u8(if (c.trails) 1 else 0)
+			text(comments, c.text)
+			uleb(comments, (this.own.get(c.owner) ?? -1) + 1) // none of a decl not written, as a test the bundle drops
+		}
 		const w = new Writer()
 		w.raw(magic)
 		w.fixed(compiler, 8)
@@ -264,7 +274,7 @@ class Out {
 		w.fixed(abi(p, this.m), 8)
 		text(w, mod.path)
 		for (const s of [this.deps.section(), this.strings.section(), this.ints.section(), this.names.section(),
-			decls.bytes, this.imports.section(), this.types.section(), defs.bytes]) {
+			decls.bytes, this.imports.section(), this.types.section(), defs.bytes, comments.bytes]) {
 			text(w, s)
 		}
 		return w.bytes
@@ -477,7 +487,6 @@ export class In {
 			x.tags = this.part(op.TypeList)
 			x.throws = this.part(op.TypeList)
 			x.pos = this.n()
-			x.doc = this.str()
 			x.spelled = this.type()
 			if (this.r.u8() == 1) {
 				x.code = this.code()
@@ -500,10 +509,16 @@ export class In {
 			line += this.n()
 			return line
 		})
-		mod.doc = this.str()
+		this.next()
+		let at = 0
+		for (const _ of 1 ... this.n()) {
+			at += this.n()
+			mod.comments.push({ pos: at, trails: this.r.u8() == 1, text: this.text(), owner: this.owner() })
+		}
 		if (this.r.pos != this.end || this.end != this.r.bytes.length) {
 			throw this.bad()
 		}
+		p.document(this.m)
 	}
 
 	private code(): Code throws ParseError {
