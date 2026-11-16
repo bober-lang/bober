@@ -3263,9 +3263,14 @@ class Checker {
 	}
 
 	/// Records a use of member k of t, or of each class param t stands for; a class's constructor is the class (3).
+	/// Fails if checking that member failed.
 	private runs(t: Type, k: string, static: bool) {
 		for (const c of if (t.kind == "param") t.underlying()?.alternatives() ?? [] else [t]) {
-			this.use(about(declarer(c, k, static) ?? c, k, static).decl)
+			const a = about(declarer(c, k, static) ?? c, k, static)
+			if (a.state == "failed") {
+				throw new Failed()
+			}
+			this.use(a.decl)
 		}
 	}
 
@@ -3954,11 +3959,7 @@ class Checker {
 			throw new Failed()
 		}
 		this.warn(a.warning, name.loc, k)
-		if (c.kind == "param") {
-			this.runs(c, k, s != null)
-		} else {
-			this.use(a.decl)
-		}
+		this.runs(c, k, s != null)
 		return t
 	}
 
@@ -4626,7 +4627,7 @@ class Checker {
 		// A `T[readonly]`'s arg has exactly T as its elements, a string only for u8.
 		const e = readonlyOf(p)
 		const t = if (e == null) null else substitute(e!, ps.slice(0, args.length), args)
-		const fits = () => if (t == null) a.fits(c!) else elementOf(a) == t
+		const fits = () => if (t == null) a.fits(c!) || failed(c!) else elementOf(a) == t
 		const msg = if (t == null) `${show(a)} does not fit ${show(p)}'s constraint ${show(c)}`
 			else `expected ${show(t)}[readonly], got ${show(a)}`
 		if (filling > 0 && !inferred) {
