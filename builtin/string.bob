@@ -93,10 +93,13 @@ export function shared(buf: Ref, at: u64, n: i64): string {
 	return load[string](addr(w))
 }
 
-/// a + b: in a's buffer if that has the room, else b if a is empty, else in place if they fit, else b appended to the
-/// buffer reserve gives a, with twice the room needed, so that a string grown by += takes amortized constant time per
-/// append.
+/// a + b: by their words if both are held in place and fit, else in a's buffer if that has the room, else b if a is
+/// empty, else in place if they fit, else b appended to the buffer reserve gives a, with twice the room needed, so that
+/// a string grown by += takes amortized constant time per append.
 export function concat(a: string, b: string): string {
+	if ((get[u64, string](a, 0) & 0xff) + (get[u64, string](b, 0) & 0xff) <= 15) {
+		return joined(a, b)
+	}
 	const r = room(a)
 	return if (r >= lenAt(addr(b))) extended(a, b, r)
 		else if (lenAt(addr(a)) == 0) b
@@ -131,6 +134,20 @@ export function append(a: string, b: string): string {
 		return copy(addr(w), an + bn)
 	}
 	return extended(a, b, r)
+}
+
+/// a + b in place, as both are and fit: b's two words stored after a's bytes, whose unused ones, 0, leave those of the
+/// sum 0 and its ref null; a fourth word takes what the second overhangs.
+function joined(a: string, b: string): string {
+	let w: u64[4]
+	w[0] = get[u64, string](a, 0)
+	w[1] = get[u64, string](a, 8)
+	const an = w[0] & 0xff
+	const bw = get[u64, string](b, 0)
+	store[u64](addr(w) + 1 + an, bw >> 8)
+	store[u64](addr(w) + 8 + an, get[u64, string](b, 8))
+	store[u8](addr(w), (an + (bw & 0xff)) as u8)
+	return load[string](addr(w))
 }
 
 /// a + b in a's buffer, which a ends where it is used up to, with room r for b. A b held in place is copied by its two
