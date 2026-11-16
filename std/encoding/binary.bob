@@ -40,7 +40,8 @@ export class Writer {
 	raw(s: string) { this.bytes += s }
 }
 
-/// Reads bytes from pos on; reading past their end is a syntax error at the end.
+/// Reads bytes from pos on; reading past their end is a syntax error at the end, a LEB128 past 64 bits a range error
+/// at its start.
 export class Reader {
 	bytes: string
 	/// Where the next read starts.
@@ -60,10 +61,14 @@ export class Reader {
 	}
 
 	uleb(): u64 throws ParseError {
+		const at = this.pos
 		let v: u64 = 0
 		let shift = 0
 		while (true) {
 			const b = this.u8()
+			if (shift == 63 && b > 1) {
+				throw new ParseError("range", at)
+			}
 			v = v | ((b & 0x7f) as u64) << shift
 			shift += 7
 			if (b < 0x80) {
@@ -73,10 +78,14 @@ export class Reader {
 	}
 
 	sleb(): i64 throws ParseError {
+		const at = this.pos
 		let v: i64 = 0
 		let shift = 0
 		while (true) {
 			const b = this.u8()
+			if (shift == 63 && b != 0 && b != 0x7f) {
+				throw new ParseError("range", at)
+			}
 			v = v | ((b & 0x7f) as i64) << shift
 			shift += 7
 			if (b < 0x80) {
