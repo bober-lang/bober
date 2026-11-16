@@ -375,7 +375,7 @@ test "private members are seen only in their class and in tests" {
 	assert errors(c) == ""
 	assert errors(c + "const a = new A().x\nconst b = A.n") == "103: x is private to A; 117: n is private to A"
 	assert errors(c + "test \"t\" {\n\tassert new A().x == A.n + 1\n}") == ""
-	assert errors(c + "class E {\n\ta: ...A = {x: 0}\n\n\tg(): i32 { return this.x }\n}\n") == "138: x is private to A"
+	assert errors(c + "class E {\n\t...A\n\n\tg(): i32 { return this.x }\n}\n") == "126: x is private to A"
 }
 
 test "readonly fields are assigned only by their initializer or, on this, by their class's constructor" {
@@ -385,8 +385,8 @@ test "readonly fields are assigned only by their initializer or, on this, by the
 	const d = "class P { x = 0 }\nclass B {\n\treadonly p: ...P = {x: 0}\n\n\tconstructor() {\n\t\tclass L { constructor() {} }\n\t\tthis.p = {x: 1}\n\t\tconst f = () => { this.p = {x: 2} }\n\t}\n\n\tm() { const o = { constructor() { this.p = {x: 3} } } }\n}\n"
 	assert errors(d + "function g(b: B) { b.p = {x: 3}; b.p.x = 4 }")
 		== "147: p is readonly; 204: p is readonly; 244: p is readonly"
-	assert errors("class Q {\n\treadonly x = 0\n}\nclass F {\n\tq: ...Q = {x: 0}\n\n\tconstructor() { this.x = 1 }\n}\nfunction h(f: F) { f.x = 2 }")
-		== "79: x is readonly; 110: x is readonly"
+	assert errors("class Q {\n\treadonly x = 0\n}\nclass F {\n\t...Q\n\n\tconstructor() { this.x = 1 }\n}\nfunction h(f: F) { f.x = 2 }")
+		== "67: x is readonly; 98: x is readonly"
 }
 
 test "a doc comment documents what follows it or the line it ends, a module doc comes first" {
@@ -754,6 +754,7 @@ test "statements" {
 		== "38: an embedded field takes an object literal: write {...v}; 97: an embedded field takes an object literal: write {...v}"
 	assert errors("class R { s: ...S }\nclass S { r: ...R }")
 		== "10: R holds itself in place; 30: S holds itself in place"
+	assert errors("class A { f() {} }\nclass B { a: ...A }\nconst b = new B().f()") == "57: B has no member f"
 	assert errors("function f(x: i32 | string): i32 {\n\tswitch (x) {\n\t\tcase string: return x.length\n\t\tcase i32: return x\n\t}\n\treturn 0\n}")
 		== ""
 }

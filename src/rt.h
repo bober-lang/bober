@@ -61,7 +61,7 @@ void bober_free(void *p);
 /// byte and its bytes at the address of its second word, its ref null.
 typedef struct { uint64_t head; const char *bytes; void *ref; } bober_string;
 /// A field of a class, object or tuple type, or of the struct a value of one refers to: its type's mods as bc's
-/// (Readonly 8, Embed 16) and its offset, which its type's completion sets.
+/// (Readonly 8, Embed 16, Mixin 128) and its offset, which its type's completion sets.
 typedef struct { bober_string name, doc; const struct bober_type *type; int64_t mods, offset, ntags; const struct bober_type **tags; } bober_field;
 /// A method by name, called by a thunk of its receiver, args and result each as a union holds them (src/emit.bob), and
 /// its type; an interface's has no thunk.

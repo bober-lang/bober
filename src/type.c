@@ -111,6 +111,8 @@ static int64_t up(int64_t n, int64_t align) { return (n + align - 1) / align * a
 static const bober_type *form(const bober_type *t, int64_t n, const bober_type *const *params, const bober_type *const *args, bool held);
 
 static bool inPlace(const bober_field *f) { return f->mods & 16 && f->type->kind == KCLASS; }
+/// Whether f is a `...T`, whose members are promoted (§5.3).
+static bool mixin(const bober_field *f) { return f->mods & 128; }
 
 /// The offset of the word the refs of union t's members share (§4.4): a string's third, else a ref's, -1 if none.
 static int64_t refs(const bober_type *t) {
@@ -403,7 +405,7 @@ int64_t bober_field_of(const bober_type *t, const char *name, int64_t n, const b
   }
   for (int64_t i = 0; i < t->nfields; i++) {
     const bober_field *f = &t->fields[i];
-    int64_t at = inPlace(f) ? bober_field_of(f->type, name, n, type) : -1;
+    int64_t at = mixin(f) ? bober_field_of(f->type, name, n, type) : -1;
     if (at >= 0) return f->offset + at;
   }
   return -1;
@@ -418,7 +420,7 @@ static const bober_method *method(const bober_type *t, const char *name, int64_t
     }
   for (int64_t i = 0; i < t->nfields; i++) {
     const bober_field *f = &t->fields[i];
-    const bober_method *m = inPlace(f) ? method(f->type, name, n, self) : 0;
+    const bober_method *m = mixin(f) ? method(f->type, name, n, self) : 0;
     if (m && self) self->ref = (char *)self->ref + f->offset;
     if (m) return m;
   }
