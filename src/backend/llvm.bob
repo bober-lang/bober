@@ -12,7 +12,7 @@ import { arch, os } from "../../std/os"
 import * as c from "../../std/c"
 
 import { LLVMAdd, LLVMAddAttributeAtIndex, LLVMAddCallSiteAttribute, LLVMAddCase, LLVMAddClause, LLVMAddDestination,
-	LLVMAddFunction, LLVMAddGlobal, LLVMAddModuleFlag, LLVMAnd, LLVMAppendBasicBlockInContext,
+	LLVMAddFunction, LLVMAddGlobal, LLVMAddModuleFlag, LLVMAddrSpaceCast, LLVMAnd, LLVMAppendBasicBlockInContext,
 	LLVMAppendModuleInlineAsm, LLVMAppendingLinkage, LLVMArrayType2, LLVMArrayTypeKind, LLVMAShr,
 	LLVMAtomicOrderingSequentiallyConsistent, LLVMAttributeFunctionIndex, LLVMAvailableExternallyLinkage, LLVMBitCast,
 	LLVMBlockAddress, LLVMBuildAlloca, LLVMBuildArrayAlloca, LLVMBuildBinOp, LLVMBuildBr, LLVMBuildCall2, LLVMBuildCast,
@@ -327,6 +327,14 @@ export class LLVM implements Backend {
 	fcmp(pred: FCmp, a: Value, b: Value): Value { return LLVMBuildFCmp(this.b, fcmps.get(pred)! as u32, a, b, "") }
 
 	cast(op: Cast, v: Value, to: Type): Value {
+		if (this.gc && op == "inttoptr" && to == this.ref() && isOp(v, LLVMPtrToInt)
+			&& LLVMIsAAllocaInst(whole(LLVMGetOperand(v, 0))) != 0) {
+			// A place in the frame as a ref, which LLVM sees through; statepoints, which does not, undoes it.
+			return LLVMBuildCast(this.b, LLVMAddrSpaceCast as u32, LLVMGetOperand(v, 0), to, "")
+		}
+		if (op == "ptrtoint" && isOp(v, LLVMAddrSpaceCast)) {
+			return this.cast(op, LLVMGetOperand(v, 0), to) // that place's address, no ref's
+		}
 		if (op == "ptrtoint" && this.gc && LLVMTypeOf(v) == this.ref()) {
 			return this.call(this.fn(this.int(64), [this.ref()]), this.address(), [v])
 		}
@@ -816,10 +824,7 @@ export class LLVM implements Backend {
 			} else if (isOp(i, LLVMStore) && holdsRef(LLVMTypeOf(LLVMGetOperand(i, 0)))
 				&& LLVMIsConstant(LLVMGetOperand(i, 0)) == 0) {
 				const q = LLVMGetOperand(i, 1)
-				let base = q
-				while (LLVMIsAGetElementPtrInst(base) != 0) {
-					base = LLVMGetOperand(base, 0)
-				}
+				const base = whole(q)
 				if (base != fresh && LLVMIsAAllocaInst(base) == 0 && LLVMIsConstant(base) == 0) {
 					LLVMPositionBuilderBefore(this.b, LLVMGetNextInstruction(i))
 					if (heap == 0) {
@@ -852,6 +857,14 @@ export class LLVM implements Backend {
 			}
 			f = LLVMGetNextFunction(f)
 		}
+		this.each(i => {
+			if (isOp(i, LLVMAddrSpaceCast)) {
+				LLVMPositionBuilderBefore(this.b, i)
+				const at = LLVMBuildCast(this.b, LLVMPtrToInt as u32, LLVMGetOperand(i, 0), this.int(64), "")
+				LLVMReplaceAllUsesWith(i, LLVMBuildCast(this.b, LLVMIntToPtr as u32, at, LLVMTypeOf(i), ""))
+				LLVMInstructionEraseFromParent(i)
+			}
+		})
 		failed(LLVMRunPasses(this.m, "function(sroa),rewrite-statepoints-for-gc", this.tm,
 			LLVMCreatePassBuilderOptions()))
 		LLVMSetModuleDataLayout(this.m, this.td) // the target's, which codegen and LTO take, now no ref is hidden
@@ -1073,7 +1086,9 @@ function isOp(i: Value, op: i32): bool {
 }
 
 /// 1 for an address made from an integer, as the load and store intrinsics take, which promises no alignment; else 0.
-function loose(p: Value): u32 { return if (isOp(p, LLVMIntToPtr)) 1 else 0 }
+function loose(p: Value): u32 { return if (isOp(p, LLVMIntToPtr) || isOp(p, LLVMAddrSpaceCast)) 1 else 0 }
+/// What place p is within: p less its geps.
+function whole(p: Value): Value { return if (LLVMIsAGetElementPtrInst(p) != 0) whole(LLVMGetOperand(p, 0)) else p }
 
 /// v aligned to align bytes, unless align is 0.
 function aligned(v: Value, align: u32): Value {
