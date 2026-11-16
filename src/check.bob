@@ -2238,16 +2238,6 @@ class Checker {
 	/// members' initializers.
 	private classBody(n: Node, t: Type) {
 		const fs = members(t) // one per member, or none if its type params failed
-		if (t.kind == "class") {
-			for (const s of supers(n)) {
-				this.apart(() => {
-					const i = this.typeExpr(s)
-					if (!t.fits(i) && !failed(i)) {
-						this.report(start(s), `${show(t)} does not implement ${show(i)}`)
-					}
-				})
-			}
-		}
 		const self = this.self
 		const host = this.host
 		const wall = this.wall
@@ -2256,6 +2246,16 @@ class Checker {
 		const user = this.user
 		this.locals.enter()
 		this.typeParams(n, t.params, false)
+		if (t.kind == "class") {
+			for (const s of supers(n)) {
+				this.apart(() => {
+					const i = this.typeExpr(s) // of the class's params, as I[T]
+					if (!t.fits(i) && !failed(i)) {
+						this.report(start(s), `${show(t)} does not implement ${show(i)}`)
+					}
+				})
+			}
+		}
 		const ms = child(n, "members")!.parts
 		for (const i of 0 ... ms.length - 1) {
 			const m = ms[i]
