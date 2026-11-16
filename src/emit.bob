@@ -2992,7 +2992,7 @@ class Emitter {
 		} else if (this.boxed(t)) {
 			r = this.boxedCompare(o, x, y)
 		} else if (k == kind.String && eqs || k == kind.Union) {
-			r = if (k == kind.String) this.langCall("strEq", [x, y]) else this.unionEq(x, y, t)
+			r = if (k == kind.String) this.strEq(x, y) else this.unionEq(x, y, t)
 			if (o == op.Ne) {
 				r = this.not(r)
 			}
@@ -3004,6 +3004,24 @@ class Emitter {
 			r = this.ir().icmp((if (eqs) m else `${if (kind.isSigned(k)) "s" else "u"}${m}`) as Cmp, x, y)
 		}
 		this.push(r, kind.Bool)
+	}
+
+	/// Whether strings x and y are equal, as builtin strEq: by their words, which LLVM folds with a literal's, calling
+	/// it only where they differ and one is long.
+	private strEq(x: Value, y: Value): Value {
+		const word = (i: u32) => this.ir().icmp("eq", this.ir().extract(x, i), this.ir().extract(y, i))
+		const same = this.ir().binary("and", word(0), this.ir().binary("and", word(1), word(2)))
+		const long = this.ir().binary("or", this.strHead(x)[1], this.strHead(y)[1])
+		const r = this.slot(this.i1)
+		this.ir().store(same, r, false)
+		const slow = this.label()
+		const join = this.label()
+		this.condBr(this.ir().binary("and", this.not(same), long), slow, join)
+		this.start(slow)
+		this.ir().store(this.langCall("strEq", [x, y]), r, false)
+		this.jump(join)
+		this.start(join)
+		return this.ir().load(this.i1, r, false)
 	}
 
 	/// Whether unions x and y hold one value: one tag, and one string or float by value, else the same bits and ref.
@@ -3028,7 +3046,7 @@ class Emitter {
 		const join = this.label()
 		this.condBr(this.ir().binary("and", same, this.tagIn(ta, [kind.String])), yes, join)
 		this.start(yes)
-		this.ir().store(this.langCall("strEq", [this.unbits(x, kind.String), this.unbits(y, kind.String)]), r, false)
+		this.ir().store(this.strEq(this.unbits(x, kind.String), this.unbits(y, kind.String)), r, false)
 		this.jump(join)
 		this.start(join)
 		return this.ir().load(this.i1, r, false)
