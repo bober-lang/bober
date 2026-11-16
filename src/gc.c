@@ -3,12 +3,14 @@
 //! object starts follows from any pointer into it. An object starts young, bumped to in a page of its size; a
 //! collection traces from the roots, moving each young object it reaches into an old page, and then frees the young
 //! pages. An object of over 8 KiB has pages of its own and never moves: it is new until its first collection, which
-//! marks it as an old one, and frees it if not reached. Each object has a header of 16 bytes: its layout, and its new
-//! place once moved or, if old, whether it is marked.
+//! marks it as an old one, and frees it if not reached. An object has no header: a bit for each word of the heap says
+//! where refs are, set from its layout when allocated; a bit for each 16 bytes, at an object's start, whether it is
+//! marked, or if young moved, its new place then in its first word. Objects without refs are in pages of their own,
+//! which no collection scans.
 //!
 //! A minor collection, once 32 MiB are allocated, neither marks nor frees what is old: its roots are the globals in
 //! section bober_roots, the refs the stack maps say the frames of the fibers that ran since the last collection hold
-//! (src/fiber.c), and the values of old objects on dirty cards. A card is 512 bytes of the heap, a byte after its 64
+//! (src/fiber.c), and the refs of old objects on dirty cards. A card is 512 bytes of the heap, a byte after its 64
 //! GiB, which the write barrier sets for each place a ref is stored to (src/backend/backend.bob); so an old object holds a ref
 //! to a young or new one only where its card is dirty, and a fiber that has not run since a collection none. A major
 //! collection, once the old objects take twice the bytes live after the last, and over 64 MiB, traces from every fiber
@@ -27,26 +29,25 @@
 #define PAGE BOBER_PAGE
 #define PAGES (1 << 20)  // of address space, 64 GiB
 #define CARD 9           // the bits of a card's size, as the write barrier has it
-#define SMALL 8192       // the size, its header in, of the largest object of a size class
-#define CLASSES 36
-#define MARKED 1
-#define SPARE 2  // an old slot on a free list
+#define SMALL 8192       // the size of the largest object of a size class
+#define CLASSES 36       // those of objects with refs; class c + CLASSES is c's size, of objects without
 
-typedef struct { const bober_layout *layout; uintptr_t moved; } Header;
 enum { FREE, YOUNG, OLD, BIG, REST };
-/// A page: its kind, its size class if young or old, the offset bumped to if young or whether new if big, and the
-/// pages of a big object if its first, or else how far back that is.
+/// A page: its kind, its size class if young or old, or if big whether with refs, the offset bumped to if young or
+/// whether new if big, and the pages of a big object if its first, or else how far back that is.
 typedef struct { uint8_t kind, class; uint32_t used, pages; } Page;
 
 char *bober_heap;  // as the write barrier finds it, and the cards after it
 #define heap bober_heap
 static uint8_t *cards;
+static uint64_t *refs;   // a bit for each word of the heap, set if it holds a ref
+static uint64_t *marks;  // a bit for each 16 bytes, set at an object's start if marked, or moved
 static Page pages[PAGES];
 static uint32_t top = 1;   // the pages ever used, from 1, so that 0 is no page
 static uint32_t hint = 1;  // where the first free page may be
-static uint32_t sizes[CLASSES], classOf[SMALL / 16 + 1];
-static uint32_t bumped[CLASSES];  // the young page of each class being bumped through
-static Header *spare[CLASSES];    // the old slots of each class free, through their layout
+static uint32_t sizes[2 * CLASSES], classOf[SMALL / 16 + 1];
+static uint32_t bumped[2 * CLASSES];  // the young page of each class being bumped through
+static char *spare[2 * CLASSES];      // the old slots of each class free, each linked through its first word
 static int64_t young, every = 32 << 20;  // what has been allocated since the last collection, and how much collects
 static int64_t olds, major = 64 << 20;   // the bytes of old objects, the dead since the last major too, and how many
                                          // make the next collection a major one
@@ -74,6 +75,19 @@ __asm__(".pushsection .stapsdt.base, \"axR\", \"progbits\"\n_.stapsdt.base: .spa
 #endif
 
 static char *at(uint32_t page) { return heap + (int64_t)page * PAGE; }
+/// The index of the word at p in refs, and of the 16 bytes at p in marks.
+static uint64_t word(char *p) { return (uint64_t)(p - heap) / 8; }
+static uint64_t cell(char *p) { return (uint64_t)(p - heap) / 16; }
+static bool bit(const uint64_t *map, uint64_t i) { return map[i / 64] >> i % 64 & 1; }
+static void put(uint64_t *map, uint64_t i, bool b) { map[i / 64] = (map[i / 64] & ~(1ull << i % 64)) | (uint64_t)b << i % 64; }
+/// The 64 bits of map from bit i on, and setting those of them set in b.
+static uint64_t get64(const uint64_t *map, uint64_t i) {
+  return map[i / 64] >> i % 64 | (i % 64 ? map[i / 64 + 1] << (64 - i % 64) : 0);
+}
+static void or64(uint64_t *map, uint64_t i, uint64_t b) {
+  map[i / 64] |= b << i % 64;
+  if (i % 64) map[i / 64 + 1] |= b >> (64 - i % 64);
+}
 
 /// What BOBER_GC_STATS=1 prints at exit: the objects and bytes allocated, the collections, and the heap at its peak.
 static void stats(void) {
@@ -81,19 +95,22 @@ static void stats(void) {
           (long long)(allocated + young) >> 20, (long long)collections, (long long)majors, (long long)top * PAGE >> 20);
 }
 
-/// The 16 sizes up to 256 bytes, then 4 for each doubling, of up to SMALL; and the heap's address space, its cards
-/// after, and one past them that the barrier marks for a place outside the heap: bober_start's first (src/rt.c).
+/// The 16 sizes up to 256 bytes, then 4 for each doubling, of up to SMALL; the heap's address space, its cards after,
+/// and one past them that the barrier marks for a place outside the heap; and its bits: bober_start's first (src/rt.c).
 void bober_gc_start(void) {
-  for (int c = 0; c < CLASSES; c++) sizes[c] = c < 16 ? 16 * (c + 1) : (64 << (c - 16) / 4) * (5 + (c - 16) % 4);
+  for (int c = 0; c < CLASSES; c++)
+    sizes[c] = sizes[c + CLASSES] = c < 16 ? 16 * (c + 1) : (64 << (c - 16) / 4) * (5 + (c - 16) % 4);
   for (int n = 0, c = 0; n <= SMALL / 16; n++) {
     while (16 * n > sizes[c]) c++;
     classOf[n] = c;
   }
-  heap = mmap(0, ((int64_t)PAGES * PAGE >> CARD) + ((int64_t)PAGES * PAGE) + 1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+  int64_t n = (int64_t)PAGES * PAGE;
+  heap = mmap(0, n + (n >> CARD) + 8 + n / 64 + n / 128, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
   if (heap == MAP_FAILED) fputs("out of memory\n", stderr), exit(1);
   // Above 4 GiB, so that a number below 2^32 a packed union holds in its refs' word is no ref (§4.4).
   if ((uintptr_t)heap >> 32 == 0) fputs("gc: the heap below 4 GiB\n", stderr), abort();
-  cards = (uint8_t *)heap + (int64_t)PAGES * PAGE;
+  cards = (uint8_t *)heap + n;
+  refs = (uint64_t *)(cards + (n >> CARD) + 8), marks = refs + n / 512;
   const char *e = getenv("BOBER_GC_EVERY");
   if (e) every = atoll(e);
   verify = getenv("BOBER_GC_VERIFY");
@@ -121,66 +138,69 @@ static uint32_t take(int n, int kind) {
   return p;
 }
 
-/// Frees n pages from p, zeroing them: several by mapping them anew (src/rt.h).
+/// Frees n pages from p, zeroing them and their bits: several by mapping them anew (src/rt.h).
 static void release(uint32_t p, int n) {
   if (n > 1) mmap(at(p), (int64_t)n * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED, -1, 0);
   else memset(at(p), 0, PAGE);
+  memset(&refs[word(at(p)) / 64], 0, (int64_t)n * PAGE / 64);
+  memset(&marks[cell(at(p)) / 64], 0, (int64_t)n * PAGE / 128);
   for (int i = 0; i < n; i++) pages[p + i].kind = FREE;
   if (p < hint) hint = p;
 }
 
-/// An old slot of class c, from its free list, which a new page refills.
-static Header *promoted(int c) {
+/// An old slot of class c, its bits 0, from its free list, which a new page refills.
+static char *promoted(int c) {
   if (!spare[c]) {
     uint32_t p = take(1, OLD);
     pages[p].class = c;
-    for (uint32_t o = 0; o + sizes[c] <= PAGE; o += sizes[c]) {
-      Header *h = (Header *)(at(p) + o);
-      *h = (Header){(const bober_layout *)spare[c], SPARE};
-      spare[c] = h;
-    }
+    for (char *h = at(p); h + sizes[c] <= at(p + 1); h += sizes[c]) *(char **)h = spare[c], spare[c] = h;
   }
-  Header *h = spare[c];
-  spare[c] = (Header *)h->layout;
+  char *h = spare[c];
+  spare[c] = *(char **)h;
   return h;
 }
 
 // Tracing.
 
-static Header **gray;
+static char **gray;
 static int64_t grays, grayCap;
 
-/// The header of the object p points into, and its page, or null if p is not into the heap, as into a frame, a
-/// constant or null. p is past its object's header, maybe at its end, as an empty object's or a slice's to the end is,
-/// so its last byte before p says which object it is.
-static Header *object(void *p, Page **page) {
-  uintptr_t a = (uintptr_t)p - (uintptr_t)heap - 1;
+/// The start of the object p points into, and its page, or null if p is not into the heap, as into a frame, a
+/// constant or null. p may be at its object's end, but that is short of its cell's: an array of no room is 24 bytes,
+/// and no struct is of none (src/emit.bob).
+static char *object(void *p, Page **page) {
+  uintptr_t a = (uintptr_t)p - (uintptr_t)heap;
   if (a >= (uintptr_t)top * PAGE) return 0;
   uint32_t i = a / PAGE;
   if (pages[i].kind == REST) i -= pages[i].pages;
   Page *g = *page = &pages[i];
-  return (Header *)(g->kind == BIG ? at(i) : at(i) + a % PAGE / sizes[g->class] * sizes[g->class]);
+  return g->kind == BIG ? at(i) : at(i) + a % PAGE / sizes[g->class] * sizes[g->class];
 }
 
 /// The place of what p points into once traced: a young object moved, an old one marked unless in a minor, where only
-/// a new one is, each first reached put on gray. p not into the heap stays.
+/// a new one is, each first reached with refs put on gray. p not into the heap stays.
 static void *trace(void *p) {
   Page *g;
-  Header *h = object(p, &g);
-  if (!h || g->kind != YOUNG && (minor && !g->used || h->moved == MARKED)) return p;
+  char *h = object(p, &g);
+  if (!h || g->kind != YOUNG && (minor && !g->used || bit(marks, cell(h)))) return p;
   if (verifying) fputs("gc: a young ref where a minor collection does not look\n", stderr), abort();
-  intptr_t into = (char *)p - (char *)h;
+  intptr_t into = (char *)p - h;
   if (g->kind == YOUNG) {
-    if (h->moved) return (char *)h->moved + into;
-    Header *n = promoted(g->class);
-    memcpy(n, h, sizes[g->class]);
-    h->moved = (uintptr_t)n;
-    h = n, olds += sizes[g->class];
+    if (bit(marks, cell(h))) return *(char **)h + into;
+    int64_t size = sizes[g->class];
+    char *n = promoted(g->class);
+    memcpy(n, h, size);
+    for (int64_t w = 0, k = size / 8; g->class < CLASSES && w < k; w += 64)
+      or64(refs, word(n) + w, get64(refs, word(h) + w) & (k - w < 64 ? (1ull << (k - w)) - 1 : ~0ull));
+    put(marks, cell(h), 1), *(char **)h = n;
+    h = n, olds += size;
   }
-  h->moved = minor && g->kind == YOUNG ? 0 : MARKED;
-  if (grays == grayCap && !(gray = realloc(gray, (grayCap = 2 * grayCap + 1024) * sizeof *gray))) abort();
-  gray[grays++] = h;
-  return (char *)h + into;
+  if (!minor || g->kind != YOUNG) put(marks, cell(h), 1);
+  if (g->class < CLASSES) {
+    if (grays == grayCap && !(gray = realloc(gray, (grayCap = 2 * grayCap + 1024) * sizeof *gray))) abort();
+    gray[grays++] = h;
+  }
+  return h + into;
 }
 
 /// trace of the ref in p's low 7 bytes, its top byte kept, where a packed union may keep its tag (§4.4).
@@ -189,17 +209,9 @@ static void *traced(void *p) {
   return (void *)((uintptr_t)trace((void *)((uintptr_t)p - top)) + top);
 }
 
-/// Traces the refs in the bytes at p, values laid out as l, of those that overlap the bytes from lo to hi; if l's low
-/// bit is set, an array's cell: its length, capacity and data, a ref, then its elements, unless push moved them out.
-static void scan(void **p, int64_t bytes, const bober_layout *l, char *lo, char *hi) {
-  if ((uintptr_t)l & 1) {
-    p[2] = traced(p[2]);
-    if (p[2] != p + 3) return;
-    p += 3, bytes -= 24, l = (const bober_layout *)((uintptr_t)l - 1);
-  }
-  if (!l) return;
-  for (int64_t v = lo > (char *)p ? (lo - (char *)p) / l->size * l->size : 0; v + l->size <= bytes && (char *)p + v < hi;
-       v += l->size)
+/// Traces the refs in the bytes at p, outside the heap, values laid out as l.
+static void root(void **p, int64_t bytes, const bober_layout *l) {
+  for (int64_t v = 0; l && v + l->size <= bytes; v += l->size)
     for (int64_t w = 0; w < l->size / 8; w += 64)
       for (uint64_t bits = l->refs[w / 64]; bits; bits &= bits - 1) {
         void **r = &p[v / 8 + w + __builtin_ctzll(bits)];
@@ -207,27 +219,32 @@ static void scan(void **p, int64_t bytes, const bober_layout *l, char *lo, char 
       }
 }
 
-#define WHOLE 0, (char *)UINTPTR_MAX  // the bounds of scan and values for all of the values
-
-/// Traces the refs of the values of object h that overlap the bytes from lo to hi.
-static void values(Header *h, char *lo, char *hi) {
-  Page *g = &pages[((char *)h - heap) / PAGE];
-  scan((void **)(h + 1), (g->kind == BIG ? (int64_t)g->pages * PAGE : sizes[g->class]) - sizeof *h, h->layout, lo, hi);
+/// Traces the refs of the heap from lo to hi.
+static void scan(char *lo, char *hi) {
+  for (uint64_t i = word(lo), end = word(hi); i < end; i = (i | 63) + 1) {
+    uint64_t bits = refs[i / 64] >> i % 64;
+    if (end - i < 64) bits &= (1ull << (end - i)) - 1;
+    for (; bits; bits &= bits - 1) {
+      void **r = (void **)heap + i + __builtin_ctzll(bits);
+      *r = traced(*r);
+    }
+  }
 }
 
-/// Traces the values of old objects that overlap a dirty card, or any card if all.
+/// Traces the refs of object h.
+static void values(char *h) {
+  Page *g = &pages[(h - heap) / PAGE];
+  scan(h, h + (g->kind == BIG ? (int64_t)g->pages * PAGE : sizes[g->class]));
+}
+
+/// Traces the refs of old objects on a dirty card, or on any card if all.
 static void dirty(bool all) {
   for (uint32_t p = 1; p < top; p++) {
     Page *g = &pages[p];
     uint32_t first = g->kind == REST ? p - g->pages : p;
     if (g->kind == FREE || g->kind == YOUNG || pages[first].used) continue;  // a new one is traced whole if reached
-    for (char *lo = at(p), *hi = lo + (1 << CARD); lo < at(p + 1); lo = hi, hi += 1 << CARD) {
-      if (!all && !cards[(lo - heap) >> CARD]) continue;
-      if (g->kind != OLD) values((Header *)at(first), lo, hi);
-      else
-        for (char *h = lo - (lo - at(p)) % sizes[g->class]; h < hi && h + sizes[g->class] <= at(p + 1); h += sizes[g->class])
-          if (((Header *)h)->moved != SPARE) values((Header *)h, lo, hi);
-    }
+    for (char *lo = at(p); lo < at(p + 1); lo += 1 << CARD)
+      if (all || cards[(lo - heap) >> CARD]) scan(lo, lo + (1 << CARD));
   }
 }
 
@@ -343,10 +360,11 @@ static Id *entry(void *p) {
 /// Where p points once traced, or null if what it points into was not reached.
 static void *survivor(void *p) {
   Page *g;
-  Header *h = object(p, &g);
+  char *h = object(p, &g);
   if (!h) return p;
-  if (g->kind != YOUNG) return minor && !g->used || h->moved == MARKED ? p : 0;
-  return h->moved ? (char *)h->moved + ((char *)p - (char *)h) : 0;
+  bool marked = bit(marks, cell(h));
+  if (g->kind != YOUNG) return minor && !g->used || marked ? p : 0;
+  return marked ? *(char **)h + ((char *)p - h) : 0;
 }
 
 /// Moves the ids into a table of n entries.
@@ -386,11 +404,11 @@ static void collect(void) {
   unw_getcontext(&ctx);
   frames(&ctx);
   bober_parked(frames, !minor);
-  for (const Root *g = bober_roots; g < bober_roots_end; g++) scan(g->global, g->layout->size, g->layout, WHOLE);
+  for (const Root *g = bober_roots; g < bober_roots_end; g++) root(g->global, g->layout->size, g->layout);
   for (int i = 0; i < 1024; i++)
-    for (Static *s = statics[i]; s; s = s->next) scan((void **)(s + 1), s->size, s->layout, WHOLE);
+    for (Static *s = statics[i]; s; s = s->next) root((void **)(s + 1), s->size, s->layout);
   if (minor) dirty(false);
-  while (grays) values(gray[--grays], WHOLE);
+  while (grays) values(gray[--grays]);
   if (minor && verify) verifying = true, bober_parked(frames, true), dirty(true), verifying = false;
   if (ids) survive();
   if (!minor) memset(spare, 0, sizeof spare);
@@ -402,23 +420,23 @@ static void collect(void) {
     } else if (minor && !(g->kind == BIG && g->used)) {
       continue;
     } else if (g->kind == BIG) {
-      Header *h = (Header *)at(p);
       g->used = 0;
-      if (h->moved) h->moved = 0, live += (int64_t)g->pages * PAGE;
+      if (bit(marks, cell(at(p)))) put(marks, cell(at(p)), 0), live += (int64_t)g->pages * PAGE;
       else release(p, g->pages);
     } else if (g->kind == OLD) {
-      int64_t n = 0;
-      for (uint32_t o = 0; o + sizes[g->class] <= PAGE; o += sizes[g->class]) n += ((Header *)(at(p) + o))->moved == MARKED;
+      int64_t n = 0, size = sizes[g->class];
+      for (char *h = at(p); h + size <= at(p + 1); h += size) n += bit(marks, cell(h));
       if (!n) {
         release(p, 1);
         continue;
       }
-      live += n * sizes[g->class];
-      for (uint32_t o = 0; o + sizes[g->class] <= PAGE; o += sizes[g->class]) {
-        Header *h = (Header *)(at(p) + o);
-        if (h->moved == MARKED) h->moved = 0;
-        else *h = (Header){(const bober_layout *)spare[g->class], SPARE}, spare[g->class] = h;
-      }
+      live += n * size;
+      for (char *h = at(p); h + size <= at(p + 1); h += size)
+        if (bit(marks, cell(h))) put(marks, cell(h), 0);
+        else {
+          for (int64_t w = 0; g->class < CLASSES && w < size / 8; w++) put(refs, word(h) + w, 0);
+          *(char **)h = spare[g->class], spare[g->class] = h;
+        }
     }
   }
   memset(cards, 0, (int64_t)top * PAGE >> CARD);
@@ -437,40 +455,60 @@ void *bober_static(const void *key, const void *t, int64_t size, const bober_lay
   return memset(s + 1, 0, size);
 }
 
+/// Sets the bits of the refs of the n bytes at p, values laid out as l, of which n is a multiple; if l's low bit is set,
+/// an array's cell: its length, capacity and data, a ref, then its elements, which push zeroes once it moves them
+/// (builtin/array.bob).
+__attribute__((noinline)) static void lay(char *p, int64_t n, const bober_layout *l) {
+  if ((uintptr_t)l & 1) put(refs, word(p) + 2, 1), p += 24, n -= 24, l = (const bober_layout *)((uintptr_t)l - 1);
+  if (!l) return;
+  uint64_t k = l->size / 8, i = word(p), end = word(p + n);  // the words of a value, and where they are
+  if (k > 64) {
+    for (; i < end; i += k)
+      for (uint64_t w = 0; w < k; w += 64) or64(refs, i + w, l->refs[w / 64]);
+    return;
+  }
+  // Each word of bits made in a register of the values that overlap it, which start every k bits from i.
+  for (uint64_t w = i / 64 * 64; w < end; w += 64) {
+    uint64_t bits = 0;
+    for (uint64_t s = w > i ? w - (w - i) % k : i; s < w + 64 && s < end; s += k)
+      bits |= s >= w ? l->refs[0] << (s - w) : l->refs[0] >> (w - s);
+    refs[w / 64] |= bits;
+  }
+}
+
 /// What bober_alloc does but bump: collects, and takes a page or a big object's pages, new.
-__attribute__((noinline, cold)) static void *slow(int64_t size, const bober_layout *l) {
+__attribute__((noinline, cold)) static void *slow(int64_t n, int64_t size, int c, const bober_layout *l) {
   if ((young += size) > every) collect();
-  Header *h;
+  char *h;
   if (size > SMALL) {
-    int64_t n = (size + PAGE - 1) / PAGE * PAGE;
-    uint32_t p = take(n / PAGE, BIG);
-    pages[p].used = 1, h = (Header *)at(p);
+    uint32_t p = take((size + PAGE - 1) / PAGE, BIG);
+    pages[p].used = 1, pages[p].class = l ? 0 : CLASSES, h = at(p);
   } else {
-    int c = classOf[size / 16];
     Page *g = &pages[bumped[c]];
     if (!bumped[c] || g->used + sizes[c] > PAGE) {
       bumped[c] = take(1, YOUNG);
       g = &pages[bumped[c]];
       g->class = c;
     }
-    h = (Header *)(at(bumped[c]) + g->used);
+    h = at(bumped[c]) + g->used;
     g->used += sizes[c];
   }
-  h->layout = l;
-  return h + 1;
+  if (l) lay(h, n, l);
+  return h;
 }
 
 /// Bumps through the young page of the size's class, which no page yet is before the first allocation.
 void *bober_alloc(int64_t n, const bober_layout *l) {
-  int64_t size = (n + sizeof(Header) + 15) & ~15;
+  int64_t size = (n + 15) & ~15;
   allocs++;
-  int c = size <= SMALL ? classOf[size / 16] : 0;
+  int c = size <= SMALL ? classOf[size / 16] + (l ? 0 : CLASSES) : 0;
   Page *g = &pages[bumped[c]];
   if (__builtin_expect(size > SMALL || young + size > every || !bumped[c] || g->used + sizes[c] > PAGE, 0))
-    return slow(size, l);
+    return slow(n, size, c, l);
   young += size;
-  Header *h = (Header *)(at(bumped[c]) + g->used);
+  char *h = at(bumped[c]) + g->used;
   g->used += sizes[c];
-  h->layout = l;
-  return h + 1;
+  if (l && !((uintptr_t)l & 1) && n == l->size && n <= 512) or64(refs, word(h), l->refs[0]);
+  else if (l) lay(h, n, l);
+  return h;
 }
