@@ -61,6 +61,14 @@ test "past the end" {
 	assert r.u8() throws new ParseError("syntax", 2)
 }
 
+test "a LEB128 past 64 bits" {
+	const r = new Reader("\0\xff\xff\xff\xff\xff\xff\xff\xff\xff\x81\0")
+	r.u8()
+	assert r.uleb() throws new ParseError("range", 1)
+	assert new Reader("\x80\x80\x80\x80\x80\x80\x80\x80\x80\x01").sleb() throws new ParseError("range", 0)
+	assert new Reader("\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7f").sleb() throws new ParseError("range", 0)
+}
+
 test "set puts a string's bytes into an array" {
 	const b = new u8[](6)
 	set(b, 2, "abc")
