@@ -13,18 +13,24 @@ function lowered(src: string, lib: string = ""): Program {
 	return lower(["main.bob"], [], [], path => if (path == "main.bob") src else if (path == "lib.bob") lib else null)
 }
 
-/// Module m of p shown, with its doc, top-level decls, inits, deps and imports; its decls as a file has them.
+/// Module m of p shown, with its comments, top-level decls, inits, deps and imports; its decls as a file has them.
 function shown(p: Program, m: i32): string {
 	const x = p.modules[m]
 	const names = (ds: i32[]) => ds.map(d => p.strings[p.decls[d].name]).join(", ")
 	const deps = x.deps.map(d => p.modules[d].path).join(", ")
-	return `${p.strings[x.doc]}\n[${names(x.decls)}] [${names(x.inits)}] [${deps}]\n${imports(p, m)}${owned(p, x.decls)}`
+	return `${comments(p, m)}[${names(x.decls)}] [${names(x.inits)}] [${deps}]\n${imports(p, m)}${owned(p, x.decls)}`
 }
 
 /// The imports of module m of p, one a line: where, specifier, module, namespace and names.
 function imports(p: Program, m: i32): string {
 	const names = (x: Import) => x.names.map(e => `${p.strings[p.decls[e[0]].name]} ${p.strings[e[1]]}`).join(", ")
 	return p.modules[m].imports.map(x => `${x.pos} ${p.strings[x.spec]} ${p.modules[x.module].path} ${p.strings[x.ns]} [${names(x)}]\n`).join("")
+}
+
+/// The comments of module m of p, one a line: where, whether it trails code, the decl whose doc it is, and its text.
+function comments(p: Program, m: i32): string {
+	const owner = (d: i32) => if (d < 0) "-" else p.strings[p.decls[d].name]
+	return p.modules[m].comments.map(c => `${c.pos}${if (c.trails) " trails" else ""} ${owner(c.owner)} //${c.text}\n`).join("")
 }
 
 /// The decls ds of p shown, each with its type as spelled before those it owns.
@@ -65,18 +71,26 @@ import { Box, Pair as Two, twice } from "./lib"
 import * as lib from "./lib"
 /// Doubles.
 export function f(b: Box[i32]): i32 { return twice(b.v) + g[i32](1) }
+// Not a doc.
 function g[T](x: T): T { return (() => x)() }
 export function h(p: Two[i32] | "x", f: (n: i32) => void throws string, b: lib.Box[i32]) {}
-export const k: "a" | "b" = "a"
+export const k: "a" | "b" = "a" /// Which one.
 test "f" { assert f(new Box[i32](2)) == 5 }`,
 		`export class Box[T] {
-	v: T
+	/// The value,
+	///
+	///boxed.
+	v: T // and not a doc
 	constructor(v: T) { this.v = v }
 }
 export function twice(x: i32): i32 throws string { return 2 * x }
 export type Pair[T] = [T, T]`)
-	assert p.strings[p.modules[p.module("main.bob")].doc] == "The main module."
-	assert imports(p, p.module("main.bob")) == "21 ./lib lib.bob  [Box , Pair Two, twice ]\n69 ./lib lib.bob lib []\n"
+	const [main, lib] = [p.module("main.bob"), p.module("lib.bob")]
+	assert comments(p, main)
+		== "0 - //! The main module.\n98 f /// Doubles.\n181 - // Not a doc.\n365 trails k /// Which one.\n"
+	assert comments(p, lib) == "23 v /// The value,\n39 v ///\n44 v ///boxed.\n60 trails - // and not a doc\n"
+	assert p.strings[p.decls[p.find(lib, p.find(lib, -1, "Box"), "v")].doc] == "The value,\n\nboxed."
+	assert imports(p, main) == "21 ./lib lib.bob  [Box , Pair Two, twice ]\n69 ./lib lib.bob lib []\n"
 	roundTrip(p)
 }
 

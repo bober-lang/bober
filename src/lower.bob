@@ -40,7 +40,7 @@ import { Checked, Node, after, arrowBody, bodyOf, check, child, compared, elemen
 import { CompileError } from "./error"
 import { Tok } from "./lex"
 import { Lift } from "./lift"
-import { moduleDoc } from "./parse"
+import { Parser, leads } from "./parse"
 import { holdsType } from "./resolve"
 import { builtinPath, root } from "./root"
 import { Bool, Field, Null, String, Type, basics, members, spells } from "./type"
@@ -96,7 +96,11 @@ export class Lower implements Checked {
 		})
 	}
 
-	done(path: string) { this.trying(() => this.unit(path).finish()) }
+	done(path: string, p: Parser) {
+		const u = this.unit(path)
+		u.src = p.src // which decl sets, unless the module declares nothing
+		this.trying(() => u.finish(p))
+	}
 
 	/// Runs f unless an earlier one failed, as what it lowers may rest on that; keeps what it throws for finish.
 	private trying(f: () => void) {
@@ -129,11 +133,10 @@ export class Lower implements Checked {
 	}
 
 	/// A new decl of module m, in owner, -1 for none, of the checker's type t.
-	newDecl(m: i32, owner: i32, name: string, k: decl.Kind, mods: i32, t: Type, doc: string = ""): i32 {
+	newDecl(m: i32, owner: i32, name: string, k: decl.Kind, mods: i32, t: Type): i32 {
 		const p = this.lift.prog
 		const d = p.decl(m, owner, name, k)
 		p.decls[d].mods = mods
-		p.decls[d].doc = p.intern(doc)
 		this.lift.types.set(d, t)
 		return d
 	}
@@ -195,6 +198,8 @@ class Unit {
 	private listing = false
 	/// What is left to lower of the declaration being declared.
 	private jobs: (() => void)[] = []
+	/// By where its node is, each decl declared by one, whose doc comments are those of the node.
+	private owners = new HashMap[i32, i32]()
 	/// Per decl, the decls of the module its code refers to or it owns, which a variable is initialized after.
 	private refs = new HashMap[i32, i32[]]()
 	/// By checker type id, the type params of the code a local class or interface is in, which its decl's owners have.
@@ -249,7 +254,8 @@ class Unit {
 		const ps = if (n.kind == "function") t.params else child(n, "typeParams")?.parts.map(p => p.type!) ?? []
 		switch (n.kind) {
 			case "test":
-				const d = this.l.newDecl(this.m, -1, unquoted(text), decl.Test, 0, t, n.doc)
+				const d = this.l.newDecl(this.m, -1, unquoted(text), decl.Test, 0, t)
+				this.owners.set(n.t.loc.pos, d)
 				this.tops.push(d)
 				this.later(() => this.define(d, this.fn(t), this.body(d, t, null, null, n.parts[1], [])))
 			case "function":
@@ -292,7 +298,8 @@ class Unit {
 		const k: decl.Kind = if (n.t.kind == "class") decl.Class else decl.Interface
 		// A local one is new, never declared ahead, though its function may have another of its name.
 		const d = if (owner < 0) this.entry(symbol, owner, name, k, mods, t, n, null)
-			else this.l.newDecl(this.m, owner, name, k, mods, t, n.doc)
+			else this.l.newDecl(this.m, owner, name, k, mods, t)
+		this.owners.set(n.t.loc.pos, d)
 		if (this.l.lift.nominals.get(t.id) == null) {
 			// not declared ahead
 			this.l.lift.nominals.set(t.id, d)
@@ -441,12 +448,18 @@ class Unit {
 		return if (alias) p.type(kind.Alias, d!, written) else r
 	}
 
-	/// Drops the source, keeping its hash, where its lines end and its doc, then lists the module's top-level decls, and
-	/// its variables in the order they are initialized: consts, then lets, each after those it depends on (spec 3).
-	finish() {
+	/// Drops the source, keeping its hash, where its lines end and its comments, which p parsed, then lists the module's
+	/// top-level decls, and its variables in the order they are initialized: consts, then lets, each after those it
+	/// depends on (spec 3).
+	finish(p: Parser) {
 		const m = this.prog.modules[this.m]
 		m.source = sourceHash(m.path, this.src)
-		m.doc = this.prog.intern(moduleDoc(this.src))
+		for (const i of 0 ... p.comments.length - 1) {
+			const c = p.comments[i].loc
+			m.comments.push({ pos: c.pos, trails: !leads(this.src, c.pos),
+				text: this.src.slice(c.pos + 2, c.end()).copy(), owner: this.owners.get(p.docs[i]) ?? -1 })
+		}
+		this.prog.document(this.m)
 		for (const i of 0 ... this.src.length - 1) {
 			if (this.src[i] == lf) {
 				m.newlines.push(i)
@@ -625,7 +638,7 @@ class Unit {
 		}
 		if (n != null) {
 			this.prog.decls[d].pos = n.t.loc.pos
-			this.prog.decls[d].doc = this.prog.intern(n.doc)
+			this.owners.set(n.t.loc.pos, d)
 			this.later(() => {
 				this.prog.decls[d].spelled = this.spelling(n!)
 			})
