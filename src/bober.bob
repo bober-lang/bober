@@ -192,9 +192,11 @@ const mac = os == "macos"
 export const format = if (mac) macho else if (os == "windows") pe else elf
 
 /// Links the objects and linker options args into the executable out by bobcc's link, with libc++ for C++ libraries:
-/// folding identical code, with a build ID on ELF (compilerId); throws a CompileError if it fails.
+/// folding identical code, on ELF with a build ID (compilerId) and each segment at the same distance from its offset in
+/// the file, as perf's DWARF unwinder takes it; throws a CompileError if it fails.
 export function ld(args: string[], out: string) {
-	const flags = if (os == "macos") ["-lc++"] else ["--build-id", "-lc++", "-lc++abi"]
+	const flags = if (os == "macos") ["-lc++"]
+		else ["--build-id", "-z", "separate-loadable-segments", "-lc++", "-lc++abi"]
 	if (link(sysroot, ["--icf=all", ...args, ...flags], out) != 0) {
 		throw new CompileError(`cannot link ${out}`)
 	}
