@@ -30,6 +30,7 @@ import { Code, Program } from "./bc/program"
 import { showType } from "./bc/show"
 import { listed } from "./emit"
 import { CompileError } from "./error"
+import { fieldOf } from "./resolve"
 import { builtin, builtinPath } from "./root"
 
 import { BinaryenAddFloat32, BinaryenAddFloat64, BinaryenAddFunctionExport, BinaryenAddFunctionImport,
@@ -1340,6 +1341,14 @@ class Wasm {
 		} else if (d >= 0 && p.decls[d].kind == decl.Function) {
 			this.push(this.bound(d, held), p.decls[d].type)
 		} else {
+			// A method promoted from a class it embeds (§5.3), as lower reads one: through the field embedding it.
+			const via = this.layout(t).find(s => d < 0 && s.embed
+				&& this.kindOf(fieldOf(p, this.norm(s.t), name)) == kind.Func)
+			if (via != null) {
+				this.field(held, via.name)
+				this.field(this.pop(), name)
+				return
+			}
 			const at = this.place(held, name)
 			this.push(this.read(at), at.s.t)
 		}
