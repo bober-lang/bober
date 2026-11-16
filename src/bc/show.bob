@@ -5,7 +5,7 @@ import { quoted } from "../../std/string"
 import * as decl from "./decl"
 import * as kind from "./kind"
 import * as op from "./op"
-import { Code, Program } from "./program"
+import { Code, Import, Program } from "./program"
 
 /// Module m of p: each decl of it in the order made.
 export function show(p: Program, m: i32): string {
@@ -70,26 +70,29 @@ export function showCode(p: Program, c: Code): string {
 	return s
 }
 
-/// Type t as text.
-export function showType(p: Program, t: i32): string {
+/// Type t as text, of module at's source if at is one (named).
+export function showType(p: Program, t: i32, at = -1): string {
 	const a = p.a(t)
 	const b = p.b(t)
 	return switch (p.kind(t)) {
-		case kind.Array: `${inner(p, a)}[]`
-		case kind.Optional: `optional ${inner(p, a)}`
-		case kind.Rest, kind.Embed: `...${inner(p, a)}` // a Rest is a Func's last param, an Embed an extern one's
-		case kind.FixedArray: `${inner(p, a)}[${b}]`
-		case kind.Tuple: `[${types(p, a, ", ")}]`
-		case kind.Union: types(p, a, " | ")
-		case kind.Object: fields(p, a, b)
-		case kind.Func: `(${types(p, a, ", ")}) => ${showType(p, b)}`
-		case kind.Named: qualified(p, a) + (if (b == 0) "" else `[${types(p, b, ", ")}]`)
+		case kind.Array: `${inner(p, a, at)}[]`
+		case kind.Optional: `optional ${inner(p, a, at)}`
+		case kind.Rest, kind.Embed: `...${inner(p, a, at)}` // a Rest is a Func's last param, an Embed an extern one's
+		case kind.FixedArray: `${inner(p, a, at)}[${b}]`
+		case kind.Tuple: `[${types(p, a, ", ", at)}]`
+		case kind.Union: types(p, a, " | ", at)
+		case kind.Object: fields(p, a, b, at)
+		case kind.Func: `(${types(p, a, ", ", at)}) => ${showType(p, b, at)}`
+		case kind.Named, kind.Alias: qualified(p, a, at) + args(p, t, at)
 		case kind.Param: if (b < p.decls[a].params.length) p.strings[p.decls[a].params[b].name] else `?${b}`
 		case kind.Literal: if (a == kind.String) quoted(p.strings[b])
 			else if (a == kind.Bool) `${b == 1}`
 			else `${p.ints[b]}`
 		case kind.Of: `Of ${a}${if (b == 0) "" else `.${p.strings[b]}`}`
-		case kind.Member: `${inner(p, a)}.${p.strings[b]}`
+		case kind.Member: `${inner(p, a, at)}.${p.strings[b]}`
+		case kind.Sum: p.lists[a].map(u => inner(p, u, at)).join(" | ")
+		case kind.Sig: `(${signed(p, t, at)}) => ${showType(p, p.b(a), at)}`
+		case kind.Throws: `${showType(p, a, at)} throws ${showType(p, b, at)}`
 		default: primitives[t]
 	}
 }
@@ -98,35 +101,80 @@ const primitives = ["none", "null", "bool", "i8", "i16", "i32", "i64", "u8", "u1
 	"string", "string16", "string32", "Type", "int", "float"]
 
 /// A type in a postfix or prefix position, parenthesized unless it binds tighter.
-function inner(p: Program, t: i32): string {
+function inner(p: Program, t: i32, at: i32): string {
 	const k = p.kind(t)
-	return if (k == kind.Union || k == kind.Func) `(${showType(p, t)})` else showType(p, t)
+	return if (k == kind.Union || k == kind.Func || k >= kind.Sum) `(${showType(p, t, at)})` else showType(p, t, at)
 }
 
-/// The types of the list from index from on, joined by sep.
-function types(p: Program, list: i32, sep: string, from: i32 = 0): string {
-	const ts = p.lists[list]
-	return ts.slice(from, ts.length).map(t => showType(p, t)).join(sep)
+/// The params of Sig t as written.
+function signed(p: Program, t: i32, at: i32): string {
+	const ts = p.items(p.a(t))
+	const out: string[] = []
+	for (const i of 0 ... ts.length - 1) {
+		out.push(param(p, p.names[p.b(t)][2 * i], ts[i], at))
+	}
+	return out.join(", ")
+}
+
+/// A param of name n, a Str, and type t as written, 0 for none: `...` before a rest one's.
+export function param(p: Program, n: i32, t: i32, at = -1): string {
+	const rest = p.kind(t) == kind.Rest
+	return (if (rest) "..." else "") + p.strings[n]
+		+ (if (t == 0) "" else `: ${showType(p, if (rest) p.a(t) else t, at)}`)
+}
+
+/// The types of the list, joined by sep.
+function types(p: Program, list: i32, sep: string, at = -1): string {
+	return p.lists[list].map(t => showType(p, t, at)).join(sep)
 }
 
 /// An object type of the list of field types and names entry.
-function fields(p: Program, list: i32, names: i32): string {
+function fields(p: Program, list: i32, names: i32, at: i32): string {
 	const ts = p.lists[list]
 	const ns = p.names[names]
 	const fs: string[] = []
 	for (const i of 0 ... ts.length - 1) {
-		fs.push(`${mods(ns[2 * i + 1])}${p.strings[ns[2 * i]]}: ${showType(p, ts[i])}`)
+		fs.push(`${mods(ns[2 * i + 1])}${p.strings[ns[2 * i]]}: ${showType(p, ts[i], at)}`)
 	}
 	return `{ ${fs.join(", ")} }`
 }
 
-/// Decl d's name after its owners', an instance's with its own args.
-export function qualified(p: Program, d: i32): string {
+/// The args of Named or Alias t, of a Named in module at's source if at is one but those its defaults give at its end.
+function args(p: Program, t: i32, at: i32): string {
+	const ts = p.lists[p.b(t)]
+	const ps = p.decls[p.a(t)].params
+	const own = ts.length - ps.length // after its owners'
+	let n = ts.length
+	while (at >= 0 && p.kind(t) == kind.Named && n > own && n > 0 && ps[n - 1 - own].fallback != 0
+		&& p.subst(ps[n - 1 - own].fallback, p.b(t)) == ts[n - 1]) {
+		n--
+	}
+	return if (n == 0) "" else `[${ts.slice(0, n).map(u => showType(p, u, at)).join(", ")}]`
+}
+
+/// Decl d's name after its owners', an instance's with its own args; of module at's source if at is one (named).
+export function qualified(p: Program, d: i32, at = -1): string {
 	const x = p.decls[d]
 	const args = if (x.generic < 0) [] as i32[] else p.lists[x.env]
 	const own = args.slice(args.length - (if (x.generic < 0) 0 else p.decls[x.generic].params.length), args.length)
-	return (if (x.owner < 0) "" else qualified(p, x.owner) + ".") + p.strings[x.name]
-		+ (if (own.length == 0) "" else `[${own.map(t => showType(p, t)).join(", ")}]`)
+	return (if (x.owner < 0) named(p, d, at) else `${qualified(p, x.owner, at)}.${p.strings[x.name]}`)
+		+ (if (own.length == 0) "" else `[${own.map(t => showType(p, t, at)).join(", ")}]`)
+}
+
+/// Top-level decl d's name, in module at's source if at is one as at imports it: by the name it imports it as, else in
+/// the namespace it imports its module as, else its own, of at or the prelude.
+function named(p: Program, d: i32, at: i32): string {
+	const name = p.strings[p.decls[d].name]
+	const imports = if (at < 0) [] as Import[] else p.modules[at].imports
+	for (const x of imports) {
+		for (const [e, n] of x.names) {
+			if (e == d) {
+				return if (n == 0) name else p.strings[n]
+			}
+		}
+	}
+	const ns = imports.find(x => x.ns != 0 && x.module == p.decls[d].module)
+	return if (ns == null) name else `${p.strings[ns!.ns]}.${name}`
 }
 
 /// Decl d's type params, if any.

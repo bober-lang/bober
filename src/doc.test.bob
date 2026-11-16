@@ -56,7 +56,7 @@ export class Square {
 	side = 1.0
 	area(): f64
 }
-export const sides: i32[]
+export const sides: i32[] = [1, 2]
 ${f}
 
 ${f}bober
@@ -64,5 +64,65 @@ export type Area = f64
 ${f}
 
 An area, declared in source order though lowered first.
+`
+}
+
+test "a signature reads back as written: aliases, param names, throws, union order, void, defaults, supers, imports" {
+	const f = "```"
+	const src = `import { Key as K } from "./ids"
+import * as ids from "./ids"
+
+export type Id = i32
+
+export function f(id: Id, g: (n: Id) => void throws string, u: string | Id | null = null, k: i32 = 2 * 3): void {}
+
+export interface Named extends { name: Id, key: K } {}
+
+export class C implements Named {
+	name: Id = 0
+	key: K = ""
+	code = new ids.Code()
+}
+
+export function code(k: K): ids.Code { return new ids.Code() }
+
+export type Ks = K[]
+export function ro(a: Ks[readonly]): i32 { return 0 }
+export type Obj = { readonly a: Id, k: K }
+export const one = 1
+export const b = -1 as i64
+export const c = "A" as u8
+export const d = (1 + 2) as u16
+export const xs = [1 as u8, 2]
+export const s = \`a\${1}\`
+`
+	const p = lower(["lib.bob"], [], [], path => switch (path) {
+		case "lib.bob": src
+		case "ids.bob": "export type Key = string\nexport class Code {}\n"
+		default: readFile(path)
+	})
+	assert reference("lib", p, p.module("lib.bob"))
+		== `# lib
+
+${f}bober
+export type Id = i32
+export function f(id: Id, g: (n: Id) => void throws string, u: string | Id | null = null, k: i32 = 2 * 3): void
+export interface Named extends { name: Id, key: K } {}
+export class C implements Named {
+	name: Id = 0
+	key: K = ""
+	code: ids.Code = new ids.Code()
+}
+export function code(k: K): ids.Code
+export type Ks = K[]
+export function ro(a: string[][readonly]): i32
+export type Obj = { readonly a: Id, k: K }
+export const one = 1
+export const b: i64 = -1
+export const c: u8 = 65
+export const d: u16 = 1 + 2
+export const xs: u8[] = [1, 2]
+export const s: string
+${f}
 `
 }

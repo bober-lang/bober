@@ -26,9 +26,9 @@
 //! imports  per decl of another module it uses: dep, owner, Str name, nth of that name in its owner
 //! types    per type, after its parts: kind byte, a and b as its kind says
 //! defs     per decl: mods, type params (Str name, constraint, default), type, supers, tags, throws, its position, Str
-//!          doc, Str signature, 0 or 1 and its code; then the module's decls, inits and deps, its imports (position,
-//!          Str specifier, dep, Str namespace, the decls named with their Str names), and where its lines end, each
-//!          after the one before; then Str its doc
+//!          doc, type as spelled, 0 or 1 and its code; then the module's decls, inits and deps, its imports (position,
+//!          Str specifier, dep, Str namespace, the decls named with their Str names), and where its lines end,
+//!          each after the one before; then Str its doc
 //! ```
 //!
 //! A code is its locals (Str name, type, mods), captures and code lists, then its op count and per op its source
@@ -72,14 +72,16 @@ type Part = op.Imm | Names
 function parts(k: kind.Kind, a: i32): Part[] {
 	return switch (k) {
 		case kind.FixedArray: [op.TypeId, op.Num]
-		case kind.Tuple, kind.Union: [op.TypeList]
+		case kind.Tuple, kind.Union, kind.Sum: [op.TypeList]
 		case kind.Object: [op.TypeList, Names]
 		case kind.Func: [op.TypeList, op.TypeId]
-		case kind.Named: [op.DeclId, op.TypeList]
+		case kind.Named, kind.Alias: [op.DeclId, op.TypeList]
 		case kind.Param: [op.DeclId, op.Num]
 		case kind.Literal: [op.TypeId, if (a == kind.String) op.StrId else if (a == kind.Bool) op.Num else op.IntId]
 		case kind.Of: [op.Num, op.StrId]
 		case kind.Member: [op.TypeId, op.StrId]
+		case kind.Sig: [op.TypeId, Names]
+		case kind.Throws: [op.TypeId, op.TypeId]
 		default: [op.TypeId]
 	}
 }
@@ -226,7 +228,7 @@ class Out {
 			this.part(defs, op.TypeList, x.throws)
 			uleb(defs, x.pos)
 			uleb(defs, this.str(x.doc))
-			uleb(defs, this.str(x.signature))
+			uleb(defs, this.type(x.spelled))
 			defs.u8(if (x.code == null) 0 else 1)
 			if (x.code != null) {
 				this.code(defs, x.code!)
@@ -455,7 +457,7 @@ export class In {
 		})
 		this.table(this.types, () => {
 			const k = this.r.u8()
-			if (k <= kind.Float || k > kind.Member) {
+			if (k <= kind.Float || k > kind.Throws) {
 				throw this.bad()
 			}
 			const a = this.part(parts(k as kind.Kind, 0)[0])
@@ -476,7 +478,7 @@ export class In {
 			x.throws = this.part(op.TypeList)
 			x.pos = this.n()
 			x.doc = this.str()
-			x.signature = this.str()
+			x.spelled = this.type()
 			if (this.r.u8() == 1) {
 				x.code = this.code()
 			}
