@@ -165,7 +165,7 @@ export class Lower implements Checked {
 	/// yet lowered.
 	builtin(name: string): i32 {
 		const file = switch (name) {
-			case "zero", "subtest", "mark", "taint": "mem"
+			case "zero", "claim", "subtest", "mark", "taint": "mem"
 			case "equal", "literal": "equal"
 			case "show", "item", "diff": "show"
 			case "newArray": "array"
@@ -1065,11 +1065,14 @@ class Gen {
 			case "switch": this.cases(p, kind.None, (b: Node) => this.block(b))
 			case "try": this.tryStmt(p)
 			case "jump": this.jump(p)
-			case "test":
+			case "test": // its name evaluated only if claimed
+				this.callBuiltin("claim", 0)
+				this.op(op.If, kind.None)
 				this.expr(p.parts[0])
 				this.closure(`${p.t.loc.pos}`, Type.function([], Null), new Node("params", p.t), p.parts[1])
 				this.callBuiltin("subtest", 0)
 				this.op(op.Drop)
+				this.op(op.End)
 			default:
 				this.expr(p)
 				this.op(op.Drop)

@@ -7,6 +7,7 @@
 #define _GNU_SOURCE  // REG_RSP
 #include "rt.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -16,12 +17,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/random.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <sys/ucontext.h>  // <ucontext.h> is an #error on macOS without _XOPEN_SOURCE
 #include <unistd.h>
 #include <unwind.h>
+#ifdef __APPLE__
+#include <libproc.h>
+#endif
 
 typedef struct { struct _Unwind_Exception header; int64_t tag, bits; void *ref; } Thrown;
 /// The exception bober_personality last landed with, for bober_caught.
@@ -191,6 +196,32 @@ _Unwind_Reason_Code bober_personality(int version, _Unwind_Action actions, uint6
   return _URC_CONTINUE_UNWIND;
 }
 
+/// In tests, the pool of tokens of the processes that run them, read from its first socket and given back to its second:
+/// a process takes one to run, and gives it back as it exits, or its parent does if it could not.
+static int jobs[2];
+
+/// Makes a pool of tokens, one per processor, into fd.
+static void pool(int *fd) {
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, fd)) fputs("cannot make the pool of test processes\n", stderr), exit(1);
+  for (long n = sysconf(_SC_NPROCESSORS_ONLN); n > 0; n--) put(fd[1], "+", 1);
+}
+
+void bober_jobs(void) {
+  int fd[2];
+  char s[32];
+  pool(fd), snprintf(s, sizeof s, "%d %d", fd[0], fd[1]), setenv("BOBER_JOBS", s, 1);
+}
+
+/// Takes a token of the pool, waiting for one if wait: whether it did.
+static bool take(bool wait) {
+  char t;
+  long n;
+  while ((n = recv(jobs[0], &t, 1, wait ? 0 : MSG_DONTWAIT)) < 0 && errno == EINTR) {}
+  return n == 1;
+}
+
+static void give(void) { put(jobs[1], "+", 1); }
+
 /// Where the tag, bits and ref of what a landing pad caught are.
 void *bober_caught(void) { return &caught->tag; }
 
@@ -202,7 +233,9 @@ void bober_start(int argc, char **argv, int32_t tested) {
     seed = STONEWALL, bober_logical = 1, cap = f ? fileno(f) : -1, saved[0] = dup(1), saved[1] = dup(2);
     dup2(cap, 1), dup2(cap, 2);
     tmp = getenv("BOBER_TMP") ? realpath(getenv("BOBER_TMP"), 0) : 0;
-    unsetenv("BOBER_TMP");  // not for the programs tests run
+    const char *j = getenv("BOBER_JOBS");
+    if (!j || sscanf(j, "%d %d", jobs, jobs + 1) != 2) pool(jobs);
+    unsetenv("BOBER_TMP"), unsetenv("BOBER_JOBS");  // not for the programs tests run
   } else getentropy(&seed, sizeof seed);
   signal(SIGPIPE, SIG_IGN);  // a write to a socket the peer closed fails with EPIPE instead
   altStack();
@@ -271,7 +304,60 @@ static void end(Level *l, bool trapped) {
   free(l->kids);
 }
 
-/// Runs f(env) as the test or subtest name, in the running one if any; a trap fails it.
+/// In a test's process, its helpers: each runs the test as it does, but of its subtests only those it claims, so that
+/// one of many subtests runs on as many processors as are free, each with the file its result goes to. A helper's
+/// result is whether it failed, whether it is tainted, and the files it read.
+static struct { pid_t pid; FILE *res; } helpers[64];
+static int nhelpers;
+static bool helper, alone;  // whether this process is a helper, and whether it runs every subtest, with no helpers
+static int claimed[2];      // of the test's subtests, the first not claimed, a datagram its processes pass on
+static long next, from, to;  // the next subtest of the test, and those this process claimed last
+
+/// How many threads this process has, 0 if unknown. It forks a helper only while it has one, as another's lock taken
+/// would stay so in the fork, as LLVM's threads' may.
+static int threads(void) {
+#ifdef __APPLE__
+  struct proc_taskinfo t;
+  return proc_pidinfo(getpid(), PROC_PIDTASKINFO, 0, &t, sizeof t) == sizeof t ? t.pti_threadnum : 0;
+#else
+  char b[4096], *p;
+  int fd = open("/proc/self/status", O_RDONLY);
+  long k = fd < 0 ? -1 : read(fd, b, sizeof b - 1);
+  close(fd);
+  return k > 0 && (b[k] = 0, p = strstr(b, "Threads:")) ? atoi(p + 8) : 0;
+#endif
+}
+
+/// A subtest of a subtest is its parent's; of a test, once this process is past those it claimed last, it claims the
+/// next not claimed, twice as many as last if those took it less than a millisecond, so that claims cost little next to
+/// their subtests, having forked a helper first if a token is free.
+int32_t bober_claim(void) {
+  static long n = 1;
+  static int64_t last;
+  if (level->up != &all) return true;
+  long i = next++;
+  if (i >= to) {
+    if (!helper && !alone && nhelpers < 64 && take(false)) {
+      FILE *res = threads() == 1 ? tmpfile() : 0;
+      pid_t pid = res ? (fflush(0), fork()) : -1;
+      if (pid < 0) give(), res && fclose(res);
+      else if (!pid) helper = true, saved[0] = fileno(res);
+      else helpers[nhelpers].pid = pid, helpers[nhelpers++].res = res;
+    }
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    int64_t now = t.tv_sec * 1000000000 + t.tv_nsec;
+    if (now - last < 1000000 && n < 1 << 16) n *= 2;
+    last = now;
+    if (recv(claimed[0], &from, sizeof from, 0) < 0) bober_trap("cannot claim a subtest", 0, -1);
+    to = from + n;
+    if (send(claimed[1], &to, sizeof to, 0) < 0) bober_trap("cannot claim a subtest", 0, -1);
+  }
+  return i >= from;
+}
+
+/// Runs f(env) as the test or subtest name, in the running one if any; a trap fails it. A helper exits at its test's
+/// end, with its result.
 static void run(const char *name, void (*f)(void *), void *env) {
   key(level, name), flush();
   Level l = {level, 0, 0, false, lseek(cap, 0, SEEK_CUR)};
@@ -280,28 +366,95 @@ static void run(const char *name, void (*f)(void *), void *env) {
   if (setjmp(here)) bober_fibers_reset(), end(&l, true);
   else f(env), end(&l, false);
   test = up, level = l.up;
+  if (helper && level == &all) {
+    put(saved[0], all.failed ? "1" : "0", 1), put(saved[0], bober_tainted ? "1" : "0", 1);
+    put(saved[0], bober_reads, bober_nreads), give(), _exit(0);
+  }
   flush();
 }
 
-/// A test running in a process of its own: its name, the files its output and its result go to, and its entry of the
-/// report once it exited.
-typedef struct { pid_t pid; const char *name; FILE *out, *res; Level entry; } Child;
+/// The n bytes f holds.
+static char *slurp(FILE *f, long *n) {
+  char *r = bober_malloc(*n = lseek(fileno(f), 0, SEEK_END));
+  *n = pread(fileno(f), r, *n, 0);
+  return r;
+}
+
+/// Waits for the helpers, taking the files they read and whether they are tainted: whether one failed.
+static bool helped(void) {
+  bool failed = false;
+  for (int i = 0; i < nhelpers; i++) {
+    int status;
+    long n;
+    while (waitpid(helpers[i].pid, &status, 0) < 0 && errno == EINTR) {}
+    char *r = slurp(helpers[i].res, &n);
+    if (n < 2) give(), failed = true;
+    else {
+      failed |= r[0] == '1', bober_tainted |= r[1] == '1';
+      bober_reads = bober_realloc(bober_reads, bober_nreads + n - 2);
+      memcpy(bober_reads + bober_nreads, r + 2, n - 2), bober_nreads += n - 2;
+    }
+    free(r), fclose(helpers[i].res);
+  }
+  return failed;
+}
+
+/// A test running in a process of its own: its name, source and function, whether it runs alone, the files its output
+/// and its result go to, and its entry of the report once it exited.
+typedef struct {
+  pid_t pid;
+  const char *name, *file;
+  void (*f)(void);
+  bool alone;
+  FILE *out, *res;
+  Level entry;
+} Child;
 static Child *children;
 static int nchildren, running;
 
-/// Waits for a child to exit, child i if i >= 0, else any, and takes its entry, its taint and the files it read, or if
-/// it exited without its entry, the end of its output and how it exited.
-static void reap(int i) {
+/// Forks c's test from this process as its module initialized it, so that it sees that state and none of another test,
+/// in a directory of its own if tmp. The child writes its entry of the report, then a line of whether it is tainted, or
+/// "r" to be run again, alone, as a test whose helpers or itself failed is, for a report as of one process; and the files
+/// it read (src/io.c), to a file of its own, which reap reads.
+static void spawn(Child *c) {
+  static int n;  // directories so far
+  if (tmp) snprintf(bober_tmp, PATH_MAX, "%s/%d", tmp, ++n), mkdir(bober_tmp, 0777);
+  c->out = tmpfile(), c->res = tmpfile();
+  if (!c->out || !c->res) bober_trap("cannot make a test's files", 0, -1);
+  fflush(0);
+  if ((c->pid = fork()) < 0) bober_trap("cannot fork a test", 0, -1);
+  if (c->pid) return;
+  seed = STONEWALL, testFile = c->file, testAt = -1, bober_nreads = 0, alone = c->alone;
+  all.n = sent = 0;  // the entries reap took before, of a test run again
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, claimed) || send(claimed[1], &(long){0}, sizeof(long), 0) < 0)
+    bober_trap("cannot share a test's subtests", 0, -1);
+  altStack();
+  cap = saved[1] = fileno(c->out), saved[0] = fileno(c->res);
+  dup2(cap, 1), dup2(cap, 2);
+  run(c->name, (void (*)(void *))c->f, 0);
+  bool redo = helped() || nhelpers && all.failed;
+  put(saved[0], redo ? "\nr" : bober_tainted ? "\n1" : "\n0", 2), put(saved[0], bober_reads, bober_nreads);
+  if (!redo) give();  // a redo's its own
+  _exit(0);
+}
+
+/// Waits for a child to exit, child i if i >= 0, else any, if wait, and takes its entry, its taint and the files it read,
+/// or if it exited without its entry, the end of its output and how it exited; or runs it again if it asks to: whether
+/// it reaped one.
+static bool reap(int i, bool wait) {
   int status;
   pid_t pid;
-  while ((pid = waitpid(i < 0 ? -1 : children[i].pid, &status, 0)) < 0 && errno == EINTR) {}
+  while ((pid = waitpid(i < 0 ? -1 : children[i].pid, &status, wait ? 0 : WNOHANG)) < 0 && errno == EINTR) {}
+  if (!pid) return false;
   if (pid < 0) bober_trap("cannot wait for a test", 0, -1);
   Child *c = children;
   while (c->pid != pid) c++;
-  long n = lseek(fileno(c->res), 0, SEEK_END);
-  char *r = bober_malloc(n);
-  n = pread(fileno(c->res), r, n, 0);
-  char *nl = n > 0 ? memchr(r, '\n', n) : 0;
+  long n;
+  char *r = slurp(c->res, &n), *nl = n > 0 ? memchr(r, '\n', n) : 0;
+  if (nl && nl + 1 < r + n && WIFEXITED(status) && nl[1] == 'r') {
+    free(r), fclose(c->out), fclose(c->res), c->alone = true, spawn(c);
+    return true;
+  }
   if (nl && nl + 1 < r + n && WIFEXITED(status)) {
     add(&c->entry, r, nl - r, false), bober_tainted |= nl[1] == '1';
     long k = r + n - nl - 2;
@@ -313,31 +466,19 @@ static void reap(int i) {
     snprintf(how, sizeof how, WIFEXITED(status) ? "exit %d" : "signal %d",
              WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status));
     key(&c->entry, c->name), raw(&c->entry, "\""), tail(&c->entry, fileno(c->out), 0);
-    raw(&c->entry, how), raw(&c->entry, "\""), all.failed = true;
+    raw(&c->entry, how), raw(&c->entry, "\""), all.failed = true, give();
   }
   free(r), fclose(c->out), fclose(c->res), c->pid = 0, running--;
+  return true;
 }
 
-/// Runs the test name in a child forked from this process as its module initialized it, so that each test sees that
-/// state and none another's, as many at once as there are processors. The child writes its entry of the report, then a
-/// line of whether it is tainted and the files it read (src/io.c), to a file of its own, which reap reads.
+/// Runs the test name in a child (spawn), as many at once as tokens of the pool are free. Those that exited are reaped
+/// first, so that only the files of those running stay open.
 void bober_test(const char *name, const char *file, void (*f)(void)) {
-  static int n;  // tests so far
-  if (tmp) snprintf(bober_tmp, PATH_MAX, "%s/%d", tmp, ++n), mkdir(bober_tmp, 0777);
-  while (running >= sysconf(_SC_NPROCESSORS_ONLN)) reap(-1);
-  Child c = {0, name, tmpfile(), tmpfile()};
-  if (!c.out || !c.res) bober_trap("cannot make a test's files", 0, -1);
-  fflush(0);
-  if ((c.pid = fork()) < 0) bober_trap("cannot fork a test", 0, -1);
-  if (!c.pid) {
-    seed = STONEWALL, testFile = file, testAt = -1, bober_nreads = 0;
-    altStack();
-    cap = saved[1] = fileno(c.out), saved[0] = fileno(c.res);
-    dup2(cap, 1), dup2(cap, 2);
-    run(name, (void (*)(void *))f, 0);
-    put(saved[0], bober_tainted ? "\n1" : "\n0", 2), put(saved[0], bober_reads, bober_nreads);
-    _exit(all.failed);
-  }
+  while (running && reap(-1, false)) {}
+  while (!take(!running)) reap(-1, true);
+  Child c = {0, name, file, f};
+  spawn(&c);
   children = bober_realloc(children, ++nchildren * sizeof *children);
   children[nchildren - 1] = c, running++;
 }
@@ -350,7 +491,7 @@ void bober_mark(int32_t at) { testAt = at; }
 /// a JSON array, null if they did what else their results may depend on (src/io.c); whether one failed.
 int32_t bober_tested(void) {
   for (int i = 0; i < nchildren; i++) {
-    if (children[i].pid) reap(i);
+    while (children[i].pid) reap(i, true);
     raw(&all, i ? "," : ""), add(&all, children[i].entry.kids, children[i].entry.n, false);
   }
   put(saved[0], "{", 1), flush(), put(saved[0], "}\n", 2);
