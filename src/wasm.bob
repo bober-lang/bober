@@ -649,7 +649,16 @@ class Wasm {
 				const env = if (cells.length == 0) this.nullRef()
 					else BinaryenStructNew(this.m, cells, cells.length as u32, this.envHeap(ls.map(l => this.types[l])))
 				this.push(this.closure(this.fn(n), p.decls[n].type, env), p.decls[n].type)
-			case op.Cast: this.push(this.cast(this.pop(), n), n)
+			case op.Cast:
+				const x = this.cast(this.pop(), n)
+				if (p.kind(this.norm(n)) != kind.Optional) {
+					this.push(x, n)
+				} else {
+					// Into an optional param, a dispatch's, given.
+					const l = this.spill(x, this.val(n))
+					this.spill(this.i32c(1), this.i32)
+					this.stack.push({ l: l, t: this.norm(n) })
+				}
 			case op.Is: this.push(this.isa(this.pop(), n), kind.Bool)
 			case op.Assert: this.check(this.cond(), "assert failed")
 			case op.Fail:

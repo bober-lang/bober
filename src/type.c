@@ -527,6 +527,8 @@ int64_t bober_is(const bober_type *t, const bober_union *u) {
     if (bober_is(t->parts[i], u)) return 1;
   if (t->kind == KUNION) return 0;
   if (t->kind == KINTERFACE || t->kind == KOBJECT) return fits(u->tag, t, 0);  // as a value converted into one keeps its tag
+  if (t->kind == KFUNCTION)  // or a function of as many params, as its code takes no more args than a call gives
+    return u->tag->kind == KFUNCTION && u->tag->length == t->length && fits(u->tag, t, 0);
   if (u->tag != t->canon) return 0;
   if (t->kind != KLITERAL) return 1;
   if (t->held != STRING) return u->bits == (uint64_t)t->length;
