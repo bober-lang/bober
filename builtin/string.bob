@@ -97,7 +97,8 @@ export function shared(buf: Ref, at: u64, n: i64): string {
 /// buffer reserve gives a, with twice the room needed, so that a string grown by += takes amortized constant time per
 /// append.
 export function concat(a: string, b: string): string {
-	return if (room(a) >= lenAt(addr(b))) extended(a, b)
+	const r = room(a)
+	return if (r >= lenAt(addr(b))) extended(a, b, r)
 		else if (lenAt(addr(a)) == 0) b
 		else append(reserve(a, lenAt(addr(b)), true), b)
 }
@@ -106,22 +107,32 @@ export function concat(a: string, b: string): string {
 export function append(a: string, b: string): string {
 	const an = lenAt(addr(a))
 	const bn = lenAt(addr(b))
-	if (room(a) < bn) {
+	const r = room(a)
+	if (r < bn) {
 		let w: u8[15]
 		memcpy(addr(w), bytesAt(addr(a)), an as u64)
 		memcpy(addr(w) + (an as u64), bytesAt(addr(b)), bn as u64)
 		return copy(addr(w), an + bn)
 	}
-	return extended(a, b)
+	return extended(a, b, r)
 }
 
-/// a + b in a's buffer, which a ends where it is used up to, with room for b.
-function extended(a: string, b: string): string {
+/// a + b in a's buffer, which a ends where it is used up to, with room r for b. A b held in place is copied by its two
+/// words if all 15 bytes fit, which takes no address of it and no call.
+function extended(a: string, b: string, r: i64): string {
 	const an = lenAt(addr(a))
-	const bn = lenAt(addr(b))
 	const buf = get[Ref, string](a, 16)
 	const at = get[u64, string](a, 8)
-	memcpy(deref(buf) + at + (an as u64), bytesAt(addr(b)), bn as u64)
+	const to = deref(buf) + at + (an as u64)
+	const w = get[u64, string](b, 0)
+	let bn = (w & 0xff) as i64
+	if (bn < 0xff && r >= 15) {
+		store[u64](to, w >> 8)
+		store[u64](to + 7, get[u64, string](b, 8))
+	} else {
+		bn = lenAt(addr(b))
+		memcpy(to, bytesAt(addr(b)), bn as u64)
+	}
 	set[u64, Ref](buf, 8, at + ((an + bn) as u64) - 16)
 	return shared(buf, at, an + bn)
 }
