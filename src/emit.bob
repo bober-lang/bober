@@ -4187,8 +4187,8 @@ class Emitter {
 		return if (k == kind.Null || k == kind.None) this.void else if (this.inlined(t)) this.ref else this.ll(t)
 	}
 
-	/// The fields of a class instance, object, tuple or interface, in order, their types as declared; while learning, the
-	/// class noted as laid out.
+	/// The fields of a class instance, object, tuple or interface, in order, their types as declared, or a type param's
+	/// constraint's, which a boxed value of it finds by name; while learning, the class noted as laid out.
 	private layout(t: i32): Slot[] {
 		if (this.p.kind(t) == kind.Named && this.facts.phase == "learning") {
 			this.facts.classes.set(this.norm(t), this.norm(t))
@@ -4201,7 +4201,9 @@ class Emitter {
 		const p = this.p
 		const [k, a, b] = [p.kind(t), p.a(t), p.b(t)]
 		const slots: Slot[] = []
-		if (k == kind.Named) {
+		if (k == kind.Param) {
+			return this.slots(p.decls[a].params[b].constraint)
+		} else if (k == kind.Named) {
 			// An interface's, which reflection and a read by name find: those of what it extends, then its own, those of
 			// what it embeds in its place; but not those its own override, as in fieldOf.
 			const ifc = p.decls[a].kind == decl.Interface

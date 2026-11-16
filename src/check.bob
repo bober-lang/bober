@@ -4191,7 +4191,7 @@ class Checker {
 	}
 
 	/// An object literal's type: the class a spread of one gives it, whose other parts shall be its fields (4.8),
-	/// else the object of its parts.
+	/// else the object of its parts, a spread's being those of its type, or a type param's constraint's.
 	private object(n: Node, want: Type | null): Type {
 		const spreads: Type[] = []
 		let cls: Type | null = null
@@ -4212,7 +4212,7 @@ class Checker {
 		let k = 0
 		for (const q of n.parts) {
 			if (q.kind == "unary") {
-				for (const f of fields(spreads[k])) {
+				for (const f of fields(constraint(spreads[k]))) {
 					if (cls != null && spreads[k] != cls) {
 						this.fit(f.type, this.fieldType(cls, f.name, q), q)
 					}
@@ -4850,7 +4850,7 @@ function tested(l: Type, t: Type): Type {
 	return if (yes.length == 0) t else Type.union(yes)
 }
 
-/// t, or the object type or interface param t extends: what a test or cast down takes its value as.
+/// t, or the object type or interface param t extends: what a test or cast down takes its value as, and a spread its fields.
 function constraint(t: Type): Type {
 	const u = t.underlying() ?? t
 	return if (u.kind == "object" || u.kind == "interface") u else t
