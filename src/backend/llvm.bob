@@ -8,6 +8,7 @@ import { HashMap } from "../../std/collections/hashmap"
 import { CompileError } from "../error"
 import { Backend, Binary, Block, Cast, Cmp, FCmp, Operand, Type, Unary, Value, codes, mark } from "./backend"
 import { dollar, isAlphabetic, isDigit, percent } from "../../std/ascii"
+import { max } from "../../std/math"
 import { arch, os } from "../../std/os"
 import * as c from "../../std/c"
 
@@ -30,23 +31,23 @@ import { LLVMAdd, LLVMAddAttributeAtIndex, LLVMAddCallSiteAttribute, LLVMAddCase
 	LLVMGetBufferSize, LLVMGetBufferStart, LLVMGetFirstFunction, LLVMGetFirstInstruction, LLVMGetFirstUse,
 	LLVMGetIncomingBlock, LLVMGetMDKindIDInContext, LLVMGetInstructionOpcode, LLVMGetNextBasicBlock,
 	LLVMGetNextFunction, LLVMGetNextInstruction, LLVMGetInstructionParent, LLVMGetNextUse, LLVMGetNormalDest,
-	LLVMGetAlignment, LLVMGetCalledValue, LLVMGetMetadata, LLVMGetNumOperands, LLVMGetOperand,
-	LLVMGetPointerAddressSpace, LLVMGetUser, LLVMCall, LLVMInvoke, LLVMLandingPad, LLVMPHI, LLVMStore,
-	LLVMVectorTypeKind, LLVMPositionBuilderBefore, LLVMSetDataLayout, LLVMSetGC, LLVMSetOperand, LLVMFAdd, LLVMFDiv,
-	LLVMFloatTypeInContext, LLVMFloatTypeKind, LLVMFP128TypeInContext, LLVMFMul, LLVMFPExt, LLVMFPToSI, LLVMFPToUI,
-	LLVMFPTrunc, LLVMFRem, LLVMFSub, LLVMFunctionType, LLVMGetArrayLength2, LLVMGetBasicBlockParent,
-	LLVMGetBasicBlockTerminator, LLVMGetElementType, LLVMGetEnumAttributeKindForName, LLVMGetInlineAsm,
-	LLVMGetInsertBlock, LLVMGetIntrinsicDeclaration, LLVMGetNamedFunction, LLVMGetNamedGlobal, LLVMGetLinkage,
-	LLVMGetParam, LLVMGetPoison, LLVMGetReturnType, LLVMGetTypeKind, LLVMGetValueName2, LLVMGlobalGetValueType,
-	LLVMGlobalUnnamedAddr, LLVMHiddenVisibility, LLVMInlineAsmDialectATT, LLVMIntegerTypeKind, LLVMIntEQ,
-	LLVMInternalLinkage, LLVMIntNE, LLVMIntSGE, LLVMIntSGT, LLVMIntSLE, LLVMIntSLT, LLVMIntToPtr, LLVMIntTypeInContext,
-	LLVMIntUGE, LLVMIntUGT, LLVMInstructionEraseFromParent, LLVMIntULE, LLVMIntULT, LLVMIsAAllocaInst, LLVMIsAFunction,
-	LLVMIsAGetElementPtrInst, LLVMIsAInstruction, LLVMIsConstant, LLVMIsDeclaration, LLVMLookupIntrinsicID, LLVMLShr,
-	LLVMMDNodeInContext2, LLVMMDStringInContext2, LLVMMetadataAsValue, LLVMModuleCreateWithNameInContext,
-	LLVMModuleFlagBehaviorWarning, LLVMMul, LLVMOr, LLVMPointerTypeInContext, LLVMPointerTypeKind,
-	LLVMPositionBuilderAtEnd, LLVMPrintModuleToString, LLVMPrivateLinkage, LLVMPtrToInt, LLVMRealOEQ, LLVMRealOGE,
-	LLVMRealOGT, LLVMRealOLE, LLVMRealOLT, LLVMRealONE, LLVMRealORD, LLVMRealUEQ, LLVMRealUGE, LLVMRealUGT, LLVMRealULE,
-	LLVMRealULT, LLVMRealUNE, LLVMRealUNO, LLVMReplaceAllUsesWith, LLVMSDiv, LLVMSetAlignment,
+	LLVMGetAlignment, LLVMGetCalledValue, LLVMGetIntrinsicID, LLVMGetMetadata, LLVMGetStringAttributeAtIndex,
+	LLVMGetNumOperands, LLVMGetOperand, LLVMGetPointerAddressSpace, LLVMGetUser, LLVMCall, LLVMInvoke, LLVMLandingPad,
+	LLVMPHI, LLVMStore, LLVMVectorTypeKind, LLVMPositionBuilderBefore, LLVMSetDataLayout, LLVMSetGC, LLVMSetOperand,
+	LLVMFAdd, LLVMFDiv, LLVMFloatTypeInContext, LLVMFloatTypeKind, LLVMFP128TypeInContext, LLVMFMul, LLVMFPExt,
+	LLVMFPToSI, LLVMFPToUI, LLVMFPTrunc, LLVMFRem, LLVMFSub, LLVMFunctionType, LLVMGetArrayLength2,
+	LLVMGetBasicBlockParent, LLVMGetBasicBlockTerminator, LLVMGetElementType, LLVMGetEnumAttributeKindForName,
+	LLVMGetInlineAsm, LLVMGetInsertBlock, LLVMGetIntrinsicDeclaration, LLVMGetNamedFunction, LLVMGetNamedGlobal,
+	LLVMGetLinkage, LLVMGetParam, LLVMGetPoison, LLVMGetReturnType, LLVMGetTypeKind, LLVMGetValueName2,
+	LLVMGlobalGetValueType, LLVMGlobalUnnamedAddr, LLVMHiddenVisibility, LLVMInlineAsmDialectATT, LLVMIntegerTypeKind,
+	LLVMIntEQ, LLVMInternalLinkage, LLVMIntNE, LLVMIntSGE, LLVMIntSGT, LLVMIntSLE, LLVMIntSLT, LLVMIntToPtr,
+	LLVMIntTypeInContext, LLVMIntUGE, LLVMIntUGT, LLVMInstructionEraseFromParent, LLVMIntULE, LLVMIntULT,
+	LLVMIsAAllocaInst, LLVMIsAFunction, LLVMIsAGetElementPtrInst, LLVMIsAInstruction, LLVMIsConstant, LLVMIsDeclaration,
+	LLVMLookupIntrinsicID, LLVMLShr, LLVMMDNodeInContext2, LLVMMDStringInContext2, LLVMMetadataAsValue,
+	LLVMModuleCreateWithNameInContext, LLVMModuleFlagBehaviorWarning, LLVMMul, LLVMOr, LLVMPointerTypeInContext,
+	LLVMPointerTypeKind, LLVMPositionBuilderAtEnd, LLVMPrintModuleToString, LLVMPrivateLinkage, LLVMPtrToInt,
+	LLVMRealOEQ, LLVMRealOGE, LLVMRealOGT, LLVMRealOLE, LLVMRealOLT, LLVMRealONE, LLVMRealORD, LLVMRealUEQ, LLVMRealUGE,
+	LLVMRealUGT, LLVMRealULE, LLVMRealULT, LLVMRealUNE, LLVMRealUNO, LLVMReplaceAllUsesWith, LLVMSDiv, LLVMSetAlignment,
 	LLVMSetCurrentDebugLocation2, LLVMSetGlobalConstant, LLVMSetInitializer, LLVMSetIsNewDbgInfoFormat, LLVMSetLinkage,
 	LLVMSetMetadata, LLVMSetOrdering, LLVMSetPersonalityFn, LLVMSetSection, LLVMSetTarget, LLVMSetThreadLocal,
 	LLVMSetUnnamedAddress, LLVMSetVisibility, LLVMSetValueName2, LLVMSetVolatile, LLVMSExt, LLVMShl, LLVMShutdown,
@@ -735,6 +736,7 @@ export class LLVM implements Backend {
 		}
 		this.optimize()
 		if (this.gc) {
+			this.frames()
 			this.barriers()
 			this.statepoints()
 		}
@@ -885,33 +887,55 @@ export class LLVM implements Backend {
 		}
 	}
 
-	/// Spills each value of fn that is a struct or array holding a ref.
-	private spillAll(fn: Value) {
-		const values: Value[] = []
-		for (const i of 0 ... (LLVMCountParams(fn) as i32) - 1) {
-			values.push(LLVMGetParam(fn, i as u32))
-		}
-		let bb = LLVMGetFirstBasicBlock(fn)
-		while (bb != 0) {
-			let i = LLVMGetFirstInstruction(bb)
-			while (i != 0) {
-				values.push(i)
-				i = LLVMGetNextInstruction(i)
+	/// Of a function keeping more than `across` values holding a ref over more than `across` calls each, moves those
+	/// into an object it allocates on entry: the stack maps then record that object at each call rather than each such
+	/// value, of which they would record a number quadratic in the function's size, and LLVM lowering them take longer
+	/// still. Fewer stay, as the object's allocation costs a call of the function more than they do. A value is kept
+	/// from where it is made to its last use in the order of the blocks: a loop's back edge or a phi may keep it longer,
+	/// by which only fewer move. Before barriers, which mark the cards of the stores to the object.
+	private frames() {
+		let fn = LLVMGetFirstFunction(this.m)
+		while (fn != 0) {
+			const all = values(fn)
+			const before = new HashMap[Value, i32]() // of each value, how many calls come before it
+			let calls = 0
+			for (const v of all) {
+				before.set(v, calls)
+				calls += if (collects(v)) 1 else 0
 			}
-			bb = LLVMGetNextBasicBlock(bb)
+			// Not a vector, which a layout has no refs of, nor a ref derived by a GEP, which may be past its object.
+			const kept = all.filter(v => (LLVMTypeOf(v) == this.ref() && LLVMIsAGetElementPtrInst(v) == 0
+				|| aggregate(LLVMTypeOf(v))) && reach(v, before) > across)
+			if (kept.length > across) {
+				const t = this.struct(kept.map(v => LLVMTypeOf(v)))
+				LLVMPositionBuilderBefore(this.b, LLVMGetFirstInstruction(LLVMGetEntryBasicBlock(fn)))
+				const alloc = this.function("bober_alloc", this.fn(this.ref(), [this.int(64), this.ptr()]), false)
+				const o = this.call(LLVMGlobalGetValueType(alloc), alloc,
+					[this.constInt(this.int(64), this.bytes(t) as i64), this.layout(t)])
+				for (const k of 0 ... kept.length - 1) {
+					this.spill(kept[k], o, () => this.field(t, o, k as u32))
+				}
+			}
+			fn = LLVMGetNextFunction(fn)
 		}
-		for (const v of values) {
+	}
+
+	/// Spills each value of fn that is a struct or array holding a ref, to a slot of its own, which sroa splits.
+	private spillAll(fn: Value) {
+		for (const v of values(fn)) {
 			if (aggregate(LLVMTypeOf(v))) {
-				this.spill(fn, v)
+				LLVMPositionBuilderBefore(this.b, LLVMGetFirstInstruction(LLVMGetEntryBasicBlock(fn)))
+				const slot = LLVMBuildAlloca(this.b, LLVMTypeOf(v), "")
+				this.spill(v, slot, () => slot)
 			}
 		}
 	}
 
-	/// Stores v to a slot of its own where it is made, and has each use load it there instead, so that v lives
-	/// only up to the store, its fields in the slot, which sroa splits. A phi's use loads at the end of the block it
-	/// comes from, except an invoke's own, which takes v as it is. An invoke's v is stored in its normal block, which
-	/// emit gives each its own.
-	private spill(fn: Value, v: Value) {
+	/// Stores v at the place place makes where v is made, and has each use load it from one instead, so that v lives
+	/// only up to the store. A param is stored after first. A phi's use loads at the end of the block it comes from,
+	/// except an invoke's own, which takes v as it is. An invoke's v is stored in its normal block, which emit gives
+	/// each its own.
+	private spill(v: Value, first: Value, place: () => Value) {
 		const users: Value[] = []
 		let u = LLVMGetFirstUse(v)
 		let plain = false
@@ -928,11 +952,8 @@ export class LLVM implements Backend {
 			return
 		}
 		const t = LLVMTypeOf(v)
-		const entry = LLVMGetEntryBasicBlock(fn)
-		LLVMPositionBuilderBefore(this.b, LLVMGetFirstInstruction(entry))
-		const slot = LLVMBuildAlloca(this.b, t, "")
 		if (LLVMIsAInstruction(v) == 0) {
-			LLVMPositionBuilderBefore(this.b, LLVMGetNextInstruction(slot))
+			LLVMPositionBuilderBefore(this.b, LLVMGetNextInstruction(first))
 		} else if (invoke) {
 			LLVMPositionBuilderBefore(this.b, body(LLVMGetNormalDest(v)))
 		} else if (isOp(v, LLVMPHI)) {
@@ -940,7 +961,7 @@ export class LLVM implements Backend {
 		} else {
 			LLVMPositionBuilderBefore(this.b, LLVMGetNextInstruction(v))
 		}
-		LLVMBuildStore(this.b, v, slot)
+		LLVMBuildStore(this.b, v, place())
 		for (const user of users) {
 			const phi = isOp(user, LLVMPHI)
 			for (const k of 0 ... LLVMGetNumOperands(user) - 1) {
@@ -956,7 +977,7 @@ export class LLVM implements Backend {
 				} else {
 					LLVMPositionBuilderBefore(this.b, user)
 				}
-				LLVMSetOperand(user, k as u32, LLVMBuildLoad2(this.b, t, slot, ""))
+				LLVMSetOperand(user, k as u32, LLVMBuildLoad2(this.b, t, place(), ""))
 			}
 		}
 	}
@@ -1036,6 +1057,51 @@ function message(p: c.ptr): string {
 	const s = c.fromCString(p)
 	LLVMDisposeMessage(p)
 	return s
+}
+
+/// How many values holding a ref a function may keep over how many calls each, with the stack maps recording each at
+/// each call.
+const across = 64
+
+/// Over how many calls of before, which counts those before each value, v is kept: up to its last use.
+function reach(v: Value, before: HashMap[Value, i32]): i32 {
+	let to = 0
+	let u = LLVMGetFirstUse(v)
+	while (u != 0) {
+		to = max(to, before.get(LLVMGetUser(u))!)
+		u = LLVMGetNextUse(u)
+	}
+	return to - before.get(v)!
+}
+
+/// The params of fn, then its instructions, block by block.
+function values(fn: Value): Value[] {
+	const vs: Value[] = []
+	for (const i of 0 ... (LLVMCountParams(fn) as i32) - 1) {
+		vs.push(LLVMGetParam(fn, i as u32))
+	}
+	let bb = LLVMGetFirstBasicBlock(fn)
+	while (bb != 0) {
+		let i = LLVMGetFirstInstruction(bb)
+		while (i != 0) {
+			vs.push(i)
+			i = LLVMGetNextInstruction(i)
+		}
+		bb = LLVMGetNextBasicBlock(bb)
+	}
+	return vs
+}
+
+/// Whether instruction i is a call where the collector may run, which statepoints record: not of an intrinsic or a
+/// gc-leaf-function.
+function collects(i: Value): bool {
+	if (!isOp(i, LLVMCall) && !isOp(i, LLVMInvoke)) {
+		return false
+	}
+	const f = LLVMGetCalledValue(i)
+	return LLVMIsAFunction(f) == 0
+		|| LLVMGetIntrinsicID(f) == 0
+		&& LLVMGetStringAttributeAtIndex(f, LLVMAttributeFunctionIndex as u32, "gc-leaf-function", 16) == 0
 }
 
 /// Whether the type t is a struct or array holding a ref.
