@@ -13,7 +13,7 @@ BOBER_SECTION(const bober_type *const, bober_types);
 
 // Primitive type ids (src/bc/kind.bob) and Type.kind's indices (builtin/type.bob).
 enum { NUL = 1, BOOL, I8, I16, I32, I64, U8, U16, U32, U64, F32, F64, STRING, TYPE = 16, INT, FLOAT };
-enum { KLITERAL = 5, KARRAY, KFIXED, KTUPLE, KOBJECT, KCLASS, KINTERFACE, KFUNCTION, KASYNC, KUNION, KTYPE, KPARAM };
+enum { KLITERAL = 5, KARRAY, KFIXED, KTUPLE, KOBJECT, KCLASS, KINTERFACE, KFUNCTION, KASYNC, KUNION, KTYPE, KPARAM, KOPTIONAL };
 enum { REF = -1, ANY = -2, PLACE = -3, PACKED = -4, EMBED = -5 };
 static const char *const ops[] = {"Eq", "Ne", "Lt", "Gt", "Le", "Ge", "Add", "Sub", "Mul", "Div", "Rem", "Pow", "And", "Or", "Xor", "Shl", "Shr", "Neg"};
 
@@ -368,6 +368,13 @@ static const bober_type *form(const bober_type *t, int64_t n, const bober_type *
   if (nominal) r->base = t->base ? t->base : t;
   add(r);
   for (int64_t i = 0; nominal && i < t->nfields; i++) fields[i].type = form(fields[i].type, n, params, args, held);
+  if (t->nmethods) {
+    bober_method *methods = alloc(t->nmethods * sizeof *methods);
+    memcpy(methods, t->methods, t->nmethods * sizeof *methods);
+    r->methods = methods;
+    for (int64_t i = 0; i < t->nmethods; i++)
+      if (methods[i].type) methods[i].type = form(methods[i].type, n, params, args, held);
+  }
   complete(r);
   return r;
 }
@@ -402,25 +409,25 @@ int64_t bober_field_of(const bober_type *t, const char *name, int64_t n, const b
   return -1;
 }
 
-/// The thunk of t's method name, or of the class embedded in t it is promoted from (§5.3), self then that place.
-static void *method(const bober_type *t, const char *name, int64_t n, bober_union *self) {
+/// t's method name, or that of the class embedded in t it is promoted from (§5.3), self then that place.
+static const bober_method *method(const bober_type *t, const char *name, int64_t n, bober_union *self) {
   for (int64_t i = 0; i < t->nmethods; i++)
     if (len(t->methods[i].name) == n && !memcmp(t->methods[i].name.bytes, name, n)) {
       if (self) self->tag = t;
-      return t->methods[i].fn;
+      return &t->methods[i];
     }
   for (int64_t i = 0; i < t->nfields; i++) {
     const bober_field *f = &t->fields[i];
-    void *fn = inPlace(f) ? method(f->type, name, n, self) : 0;
-    if (fn && self) self->ref = (char *)self->ref + f->offset;
-    if (fn) return fn;
+    const bober_method *m = inPlace(f) ? method(f->type, name, n, self) : 0;
+    if (m && self) self->ref = (char *)self->ref + f->offset;
+    if (m) return m;
   }
   return 0;
 }
 
-void *bober_method_of(const bober_type *t, const char *name, int64_t n) { return method(t, name, n, 0); }
+void *bober_method_of(const bober_type *t, const char *name, int64_t n) { const bober_method *m = method(t, name, n, 0); return m ? m->fn : 0; }
 
-void *bober_method_on(bober_union *self, const char *name, int64_t n) { return method(self->tag, name, n, self); }
+void *bober_method_on(bober_union *self, const char *name, int64_t n) { const bober_method *m = method(self->tag, name, n, self); return m ? m->fn : 0; }
 
 // Values of a type known at run time.
 
@@ -466,9 +473,50 @@ void bober_zero(const bober_type *t, bober_union *u) {
   }
 }
 
-static bool has(const bober_type *c, bober_string name) {
-  const bober_type *type;
-  return bober_method_of(c, name.bytes, len(name)) || bober_field_of(c, name.bytes, len(name), &type) >= 0;
+/// A pair of types whose fit is being worked out, and the pair it is worked out for.
+typedef struct pair { const bober_type *s, *t; const struct pair *up; } pair;
+
+static bool fits(const bober_type *s, const bober_type *t, const pair *up);
+
+/// Whether c has a member name, a method or a field, of a type that fits t.
+static bool has(const bober_type *c, bober_string name, const bober_type *t, const pair *up) {
+  const bober_type *type = 0;
+  const bober_method *m = method(c, name.bytes, len(name), 0);
+  return (m ? (type = m->type) != 0 : bober_field_of(c, name.bytes, len(name), &type) >= 0) && fits(type, t, up);
+}
+
+static bool widens(int64_t s, int64_t t);
+
+/// Whether s fits t, as src/mono.bob's fits does, at run time; a pair in up, being worked out, is assumed to fit (§4.7).
+static bool fits(const bober_type *s, const bober_type *t, const pair *up) {
+  if (s == t || (t->kind == KLITERAL && s == t->elem)) return true;
+  if (s->kind == KUNION) {
+    for (int64_t i = 0; i < s->nparts; i++)
+      if (!fits(s->parts[i], t, up)) return false;
+    return true;
+  }
+  for (int64_t i = 0; t->kind == KUNION && i < t->nparts; i++)
+    if (fits(s, t->parts[i], up)) return true;
+  if (s->kind == KLITERAL) return fits(s->elem, t, up);
+  if (t->kind == KOPTIONAL) return fits(s->kind == KOPTIONAL ? s->elem : s, t->elem, up);
+  if (s->kind == KFUNCTION && t->kind == KFUNCTION) {  // its params take t's args, its others are optional
+    if (s->length < t->length || !fits(s->parts[s->length], t->parts[t->length], up)) return false;
+    for (int64_t i = 0; i < s->length; i++)
+      if (i < t->length ? !fits(t->parts[i], s->parts[i], up) : s->parts[i]->kind != KOPTIONAL) return false;
+    return true;
+  }
+  if (t->kind == KINTERFACE || t->kind == KOBJECT) {
+    if (s->kind != KCLASS && s->kind != KINTERFACE && s->kind != KOBJECT) return false;
+    for (const pair *p = up; p; p = p->up)
+      if (p->s == s && p->t == t) return true;
+    pair here = {s, t, up};
+    for (int64_t i = 0; i < t->nfields; i++)
+      if (!has(s, t->fields[i].name, t->fields[i].type, &here)) return false;
+    for (int64_t i = 0; i < t->nmethods; i++)
+      if (!has(s, t->methods[i].name, t->methods[i].type, &here)) return false;
+    return true;
+  }
+  return widens(s->id, t->id);
 }
 
 /// Where the bytes of string s are.
@@ -478,18 +526,7 @@ int64_t bober_is(const bober_type *t, const bober_union *u) {
   for (int64_t i = 0; t->kind == KUNION && i < t->nparts; i++)
     if (bober_is(t->parts[i], u)) return 1;
   if (t->kind == KUNION) return 0;
-  if (t->kind == KINTERFACE) {  // which a class or object fits by having its members, which methods names (§4.7)
-    const bober_type *c = u->tag;
-    if (c->kind != KCLASS && c->kind != KOBJECT) return 0;
-    for (int64_t i = 0; i < t->nmethods; i++)
-      if (!has(c, t->methods[i].name)) return 0;
-    return 1;
-  }
-  if (t->kind == KOBJECT && (u->tag->kind == KCLASS || u->tag->kind == KOBJECT)) {  // or by its fields, as a value
-    for (int64_t i = 0; i < t->nfields; i++)  // converted into it keeps its class's or object type's tag
-      if (!has(u->tag, t->fields[i].name)) return 0;
-    return 1;
-  }
+  if (t->kind == KINTERFACE || t->kind == KOBJECT) return fits(u->tag, t, 0);  // as a value converted into one keeps its tag
   if (u->tag != t->canon) return 0;
   if (t->kind != KLITERAL) return 1;
   if (t->held != STRING) return u->bits == (uint64_t)t->length;
@@ -516,6 +553,11 @@ static int width(int64_t id) { return id == I8 || id == U8 ? 8 : id == I16 || id
 static bool sign(int64_t id) { return id == I8 || id == I16 || id == I32 || id == I64 || id == INT; }
 static bool real(int64_t id) { return id == F32 || id == F64 || id == FLOAT; }
 static bool number(int64_t id) { return (id >= BOOL && id <= F64) || id == INT || id == FLOAT; }
+
+/// Whether a number of primitive s widens to one of t (§4.1).
+static bool widens(int64_t s, int64_t t) {
+  return s >= I8 && s <= F64 && t >= I8 && t <= F64 && width(t) > width(s) && real(s) == real(t) && (sign(t) || !sign(s));
+}
 
 /// bits truncated to the width of id and extended as a union holds them.
 static uint64_t fit(int64_t id, uint64_t bits) {

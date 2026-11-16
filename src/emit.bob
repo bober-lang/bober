@@ -38,7 +38,7 @@ import { Code, Program, pair } from "./bc/program"
 import { showType } from "./bc/show"
 import * as c from "./c/type"
 import { CompileError } from "./error"
-import { embedded, fieldOf } from "./resolve"
+import { bases, embedded, fieldOf } from "./resolve"
 import { builtin } from "./root"
 
 /// How a program is emitted: whether it is as lowered, a debug build's; and the module that gets C's main, which runs
@@ -3885,7 +3885,8 @@ class Emitter {
 			return have
 		}
 		if (this.p.endless(n)) {
-			throw new CompileError(`${showType(this.p, n)} nests type args ever deeper`)
+			const t = showType(this.p, n)
+			throw new CompileError(`${if (t.length > 1000) `${t.slice(0, 1000)} …` else t} nests type args ever deeper`)
 		}
 		const g = this.b.extern(name, this.descTy)
 		this.pending.push([n, g])
@@ -3946,17 +3947,17 @@ class Emitter {
 			}
 		}
 		const methods: Value[] = []
+		const method = (name: string, fn: Value,
+			t: i32) => methods.push(b.constStruct([this.long(name), fn, if (t == 0) w(0) else addr(this.describe(t))]))
 		if (k == kind.Named && !this.isInterface(n)) {
-			methods.push(b.constStruct([this.long("new"), this.construction(a)]))
-			for (const f of p.decls[a].members) {
-				if (this.dispatched(f)) {
-					methods.push(b.constStruct([this.long(this.name(f)), this.thunk(f)]))
-				}
+			method("new", this.construction(a), 0)
+			for (const f of p.decls[a].members.filter(f => this.dispatched(f))) {
+				method(this.name(f), this.thunk(f), p.subst(p.decls[f].type, y))
 			}
 		} else if (k == kind.Named) {
-			// An interface's members by name alone, fields and those extended included, which a value is tested against (§4.7).
-			for (const name of this.memberNames(a)) {
-				methods.push(b.constStruct([this.long(name), b.constZero(this.ptr)]))
+			// An interface's, which a value is tested against with its fields (§4.7).
+			for (const [name, t] of this.methodsOf(n)) {
+				method(name, b.constZero(this.ptr), t)
 			}
 		}
 		const ps = (if (k == kind.Named || k == kind.Union || k == kind.Func) p.parts(n)
@@ -3965,8 +3966,9 @@ class Emitter {
 			this.long(doc)]
 		return b.constStruct([...head, this.long(typeKinds[ki]), elem, base, length, value, w(ps.length),
 			list(this.i64, ps, false), w(fields.length), list(this.fieldTy, fields, true), w(methods.length),
-			list(b.struct([this.stringTy, this.ptr]), methods, false), w(0), w(0), w(0), w(0), w(0), w(0), ...tagged,
-			if (p.closed(n)) addr(this.describe(this.norm(n))) else w(0), w(p.hash(n) as i64), w(p.head(n) as i64)])
+			list(b.struct([this.stringTy, this.ptr, this.i64]), methods, false), w(0), w(0), w(0), w(0), w(0), w(0),
+			...tagged, if (p.closed(n)) addr(this.describe(this.norm(n))) else w(0), w(p.hash(n) as i64),
+			w(p.head(n) as i64)])
 	}
 
 	/// Whether a value of t is held in memory, as a field or element, as its type's values are, which a descriptor says:
@@ -4153,23 +4155,19 @@ class Emitter {
 	/// Whether a field of a value of n, normalized, is found at run time, by its tag: if boxed, or a union.
 	private byTag(n: i32): bool { return this.boxed(n) || this.dyn && this.p.kind(n) == kind.Union }
 
-	/// The names of the members of interface decl c, but statics, with those of the interfaces it embeds or extends.
-	private memberNames(c: i32): string[] {
+	/// The names and types of the methods of interface n, but statics, with those of the interfaces it embeds or extends.
+	private methodsOf(n: i32): [string, i32][] {
 		const p = this.p
-		const names: string[] = []
-		for (const f of p.decls[c].members) {
-			if ((p.decls[f].mods & Embed) != 0) {
-				names.push(...this.memberNames(p.a(p.decls[f].type)))
-			} else if ((p.decls[f].mods & Static) == 0) {
-				names.push(this.name(f))
+		const r: [string, i32][] = []
+		for (const x of bases(p, p.a(n))) {
+			r.push(...this.methodsOf(p.subst(x, p.b(n))))
+		}
+		for (const f of p.decls[p.a(n)].members) {
+			if (p.decls[f].kind == decl.Function && (p.decls[f].mods & Static) == 0) {
+				r.push([this.name(f), p.subst(p.decls[f].type, p.b(n))])
 			}
 		}
-		for (const x of p.lists[p.decls[c].supers]) {
-			if (p.kind(x) == kind.Named) {
-				names.push(...this.memberNames(p.a(x)))
-			}
-		}
-		return names
+		return r
 	}
 
 	private isInterface(n: i32): bool { return this.p.decls[this.p.a(n)].kind == decl.Interface }

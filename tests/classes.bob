@@ -217,6 +217,38 @@ test "a cast from an interface into one it lacks a member of reaches what it hol
 	assert (a as HasN).n == 5 && (l as HasN).n == 7 && b.n == 6 && a instanceof HasN
 }
 
+interface HasKey {
+	has(k: string): bool
+}
+
+interface Linked {
+	next(): Linked | null
+}
+
+interface Tagged {
+	tag: "t"
+}
+
+class Keys {
+	has(k: string, n: i32 = 0): bool { return k == "a" }
+	next(): Keys | null { return null }
+}
+
+class Nodes {
+	has(k: N5): bool { return k.n == 5 }
+	next(): N5 | null { return null }
+}
+
+/// Whether x has key "a", if it has keys by string.
+function hasA(x: Anything): bool { return x instanceof HasKey && x.has("a") }
+
+test "a value is an interface's if its members' types fit the interface's, not by their names alone" {
+	const t: Tagged = { tag: "t" }
+	const xs: Anything[] = [new Keys(), new Nodes(), { n: "7" }, t]
+	assert hasA(xs[0]) && !hasA(xs[1]) && !hasA(xs[2])
+	assert xs[0] instanceof Linked && !(xs[1] instanceof Linked) && !(xs[2] instanceof HasN) && xs[3] instanceof Tagged
+}
+
 interface Adds {
 	add(a: i32): i32
 }

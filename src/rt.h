@@ -63,8 +63,9 @@ typedef struct { uint64_t head; const char *bytes; void *ref; } bober_string;
 /// A field of a class, object or tuple type, or of the struct a value of one refers to: its type's mods as bc's
 /// (Readonly 8, Embed 16) and its offset, which its type's completion sets.
 typedef struct { bober_string name, doc; const struct bober_type *type; int64_t mods, offset, ntags; const struct bober_type **tags; } bober_field;
-/// A method by name, called by a thunk of its receiver, args and result each as a union holds them (src/emit.bob).
-typedef struct { bober_string name; void *fn; } bober_method;
+/// A method by name, called by a thunk of its receiver, args and result each as a union holds them (src/emit.bob), and
+/// its type; an interface's has no thunk.
+typedef struct { bober_string name; void *fn; const struct bober_type *type; } bober_method;
 /// A type's descriptor (§4.11), whose address is a union's tag as lowered. emit makes one for each type a module names,
 /// a weak global listed in section bober_types, and bober_type_of those a generic's code forms, so that a type has one.
 /// Its kind is Type.kind's index in builtin/type.bob; elem a fixed array's, array's or literal's; parts a union's
