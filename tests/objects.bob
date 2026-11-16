@@ -71,12 +71,30 @@ interface Summed {
 	sum(): i32
 }
 
+interface Scaled {
+	k: i32
+
+	scale(a: i32): i32
+}
+
+/// Of a type param, so that each program copies its methods as it names them.
+class By[T] {
+	k = 3
+	unit: T
+
+	constructor(unit: T) { this.unit = unit }
+	scale(a: i32): i32 { return a * this.k }
+}
+
 test "spreading a value of an interface keeps its methods, bound to the value as spread" {
 	const s: Summed = new V()
 	const t: Summed = { ...s, x: 5 }
 	const o: { sum(): i32 } = s
 	const u: { sum(): i32 } = { ...o }
 	assert t.x == 5 && t.sum() == 3 && u.sum() == 3
+	const b: Scaled = new By[i32 | null](null)
+	const c = { ...b, k: 1 } // its scale bound to b, not called through Scaled
+	assert c.scale(2) == 6
 }
 
 interface Placed {

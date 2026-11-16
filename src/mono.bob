@@ -64,6 +64,9 @@ class Mono {
 	private thrown: i32[] = []
 	private caught: i32[] = []
 	private reached = new HashMap[i64, [i32, i32]]()
+	/// The values each object spreads and its type, and the methods of classes those bind, which a class holds.
+	private binds: [i32, i32][] = []
+	private bound = new HashMap[i32, bool]()
 
 	constructor(p: Program, units: bool) {
 		this.p = p
@@ -165,6 +168,9 @@ class Mono {
 					this.convert(i.info[j], p.a(c!.a(j)))
 				} else if (o == op.Object || o == op.New && p.kind(c!.a(j)) == kind.Object) {
 					this.source(c!.a(j), c!.a(j))
+					if (o == op.Object && i.info[j] >= 0 && p.kind(c!.a(j)) == kind.Object) {
+						this.binds.push([i.info[j], c!.a(j)])
+					}
 				} else if (o == op.Throw && !thrown.includes(i.info[j])) {
 					thrown.push(i.info[j])
 				} else if (o == op.Catch && c!.a(j) != kind.None && !caught.includes(c!.a(j))) {
@@ -197,6 +203,18 @@ class Mono {
 			for (const m of this.ins.flat(t)) {
 				this.ins.memberOf(this.ins.owner(m, name), name)
 				this.shows(m, name)
+			}
+		}
+		for (const [s, t] of this.binds) {
+			for (const m of this.ins.flat(s)) {
+				for (const k of 0 ... p.items(t).length - 1) {
+					const name = p.names[p.b(t)][2 * k]
+					const o = this.ins.owner(m, name)
+					const d = this.ins.member(o, name)
+					if (d >= 0 && p.decls[d].kind == decl.Function) {
+						this.bound.set(this.ins.memberOf(o, name), true)
+					}
+				}
 			}
 		}
 		return end
@@ -319,11 +337,12 @@ class Mono {
 		}
 	}
 
-	/// Whether the members of the owner of instance k hold it: if units, of a class, not an instance but a field.
+	/// Whether the members of the owner of instance k hold it: if units, of a class, not an instance but a field, or a
+	/// method a spread binds by name.
 	private held(k: i32): bool {
 		const x = this.p.decls[k]
 		return !this.units || this.p.classOf(k) < 0 || x.kind == decl.Var && (x.mods & decl.Static) == 0
-			|| x.generic < 0
+			|| x.generic < 0 || this.bound.has(k)
 	}
 
 	/// The decl that k is listed with: itself, or what holds it.
