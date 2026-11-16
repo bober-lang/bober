@@ -2630,9 +2630,9 @@ class Checker {
 	///
 	/// The subject is evaluated once. A label is a constant, equal to the subject with `==`, or an inclusive range
 	/// `lo ... hi` of integer constants, or a type, matching a union, object or interface subject as `instanceof` does
-	/// (§6.5), or equal to a `Type` subject. The body of the first matching case runs, else `default`'s if present.
-	/// Cases do not fall through, each has at least one statement, and `break` is not allowed inside a case, even
-	/// within a loop; `continue` is.
+	/// and narrowing it alike (§6.5), or equal to a `Type` subject. The body of the first matching case runs, else
+	/// `default`'s if present. Cases do not fall through, each has at least one statement, and `break` is not allowed
+	/// inside a case, even within a loop; `continue` is.
 	///
 	/// ```
 	/// switch (c) {
@@ -2665,7 +2665,7 @@ class Checker {
 			named.push(...types)
 			const mark = this.undo.length
 			if (b != null && types.length > 0) {
-				this.narrow([new Narrowing(b, Type.union(types))])
+				this.narrow([new Narrowing(b, Type.union(types.map(t => tested(subject!, t))))])
 			}
 			const kt = if (k == null || labels.length == 0) null else this.byKind(k.type!, labels)
 			if (kt != null) {
@@ -3617,13 +3617,8 @@ class Checker {
 			if (b == null) {
 				return new Facts([], [])
 			}
-			const yes: Type[] = []
-			const no: Type[] = []
-			for (const m of l.alternatives()) {
-				(if (m.fits(t)) yes else no).push(m)
-			}
-			return new Facts([new Narrowing(b, if (yes.length == 0) t else Type.union(yes))],
-				[new Narrowing(b, Type.union(no))])
+			const no = Type.union(l.alternatives().filter(m => !m.fits(t)))
+			return new Facts([new Narrowing(b, tested(l, t))], [new Narrowing(b, no)])
 		}
 		this.fit(this.expr(p, Bool), Bool, p)
 		return new Facts([], [])
@@ -4847,6 +4842,12 @@ function typeSet(ts: Type[]): Type { return Type.interface(Type.union(ts)) }
 /// t, or the union of the type set constraining param t.
 function opened(t: Type): Type {
 	return if (t.kind == "param" && t.base != null && isSet(t.base!)) t.base!.base! else t
+}
+
+/// What a value of type l tested as type t narrows to: the members of l that fit t, else t.
+function tested(l: Type, t: Type): Type {
+	const yes = l.alternatives().filter(m => m.fits(t))
+	return if (yes.length == 0) t else Type.union(yes)
 }
 
 /// t, or the object type or interface param t extends: what a test or cast down takes its value as.
