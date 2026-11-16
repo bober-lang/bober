@@ -16,12 +16,11 @@ jobs:
         with:
           submodules: true
       - uses: ./.github/actions/setup
-      - run: |
+      - id: build
+        run: |
           curl -fsS https://dl.bober-lang.dev/edge/bober-$RUNNER_OS-$RUNNER_ARCH.tar.gz | tar -xz -C $RUNNER_TEMP
           $RUNNER_TEMP/bober/bin/bober run -release src/bober.bob help > /dev/null
-      - if: always()
-        run: echo KEY=c-$RUNNER_OS-$RUNNER_ARCH-${{ hashFiles('build/@bober/*/*/stamp', 'build/musl/commit') }}- >> $GITHUB_ENV
-      - if: always() && !startsWith(env.CACHE_KEY, env.KEY)
+      - if: always() && !startsWith(env.CACHE_KEY, env.INPUTS)
         uses: actions/cache/save@v6
         with:
           path: |
@@ -31,7 +30,7 @@ jobs:
             !build/@bober/*/*/src
             !build/@bober/*/*/src.tar
             !build/@bober/*/*/build
-          key: ${{ env.KEY }}${{ github.run_id }}
+          key: ${{ steps.build.outcome == 'success' && env.INPUTS || format('c-{0}-{1}-', runner.os, runner.arch) }}${{ github.run_id }}
       - run: build/bober test
       - run: ./dist.sh
       - uses: actions/upload-artifact@v7

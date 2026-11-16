@@ -32,7 +32,7 @@ $(sysroot)/usr/lib/libc++.a: | $(sysroot)/usr/lib/libc.a
 	cp $(shell clang -print-libgcc-file-name -rtlib=compiler-rt) $(sysroot)/usr/lib/libclang_rt.builtins.a
 	rm -rf $(src)
 
-# musl built anew when vendor/musl moves, by a stamp of its commit, which CI's cache key hashes; libc++ is not.
+# musl built anew when vendor/musl moves, by a stamp of its commit; libc++ is not.
 $(sysroot)/usr/lib/libc.a: $(sysroot)/commit
 	rm -rf $(sysroot)/obj
 	cd $(sysroot) && $(root)/vendor/musl/configure --prefix=/usr CC=clang > /dev/null
