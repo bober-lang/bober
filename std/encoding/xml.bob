@@ -224,8 +224,9 @@ function escape(s: string, attr: bool): string {
 
 /// What a document's internal subset declares, which the parsers of entities' text share.
 class Dtd {
-	entities = new HashMap[string, string]()
-	parameters = new HashMap[string, string]()
+	/// Of each entity, its replacement text, or null for an external one.
+	entities = new HashMap[string, string | null]()
+	parameters = new HashMap[string, string | null]()
 	/// Of each element, the attributes declared for it.
 	attlists = new HashMap[string, Declared[]]()
 	/// Whether declarations may be missing, which an external subset or parameter entity could have made.
@@ -507,9 +508,10 @@ class Parser {
 		}
 		this.expect(">")
 		const entities = if (parameter) this.dtd.parameters else this.dtd.entities
-		if (v == null) {
+		if (v == null && parameter) {
 			this.dtd.partial = true
-		} else if (!entities.has(name) && (parameter || builtin(name) == null)) {
+		}
+		if (!entities.has(name) && (parameter || builtin(name) == null)) {
 			entities.set(name, v)
 		}
 	}
@@ -765,13 +767,13 @@ class Parser {
 	}
 
 	/// The replacement text of the entity name of entities, referred to at at, or null for one left out.
-	expand(entities: HashMap[string, string], name: string, at: i32): string | null {
+	expand(entities: HashMap[string, string | null], name: string, at: i32): string | null {
+		if (!entities.has(name) && !this.dtd.partial) {
+			throw new ParseError("syntax", at)
+		}
 		const v = entities.get(name)
 		if (v == null) {
-			if (this.dtd.partial) {
-				return null
-			}
-			throw new ParseError("syntax", at)
+			return null
 		}
 		if (this.depth > 16) {
 			throw new ParseError("range", at)
@@ -848,6 +850,8 @@ class Parser {
 					this.nested(v, at, p => {
 						out += p.attrValue(0)
 					})
+				} else if (this.dtd.entities.has(name)) {
+					throw new ParseError("syntax", at)
 				}
 			} else {
 				out += if (ch == ascii.tab || ch == ascii.lf || ch == ascii.cr) " " else chr(ch)
