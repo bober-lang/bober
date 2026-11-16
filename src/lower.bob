@@ -35,11 +35,12 @@ import { Opcode } from "./bc/op"
 import { Code, Program, TypeParam, sourceHash } from "./bc/program"
 
 import { Checked, Node, after, arrowBody, bodyOf, check, child, compared, element, has, isLink, isTok, isTypeValue,
-	operands, optional, selfOf, show as showType, sourceOf, standsFor, substitute, supers } from "./check"
+	operands, optional, selfOf, show as showType, signature, sourceOf, standsFor, substitute, supers } from "./check"
 
 import { CompileError } from "./error"
 import { Tok } from "./lex"
 import { Lift } from "./lift"
+import { moduleDoc } from "./parse"
 import { holdsType } from "./resolve"
 import { builtinPath, root } from "./root"
 import { Bool, Field, Null, String, Type, basics, members, spells } from "./type"
@@ -170,7 +171,7 @@ export class Lower implements Checked {
 		}
 		return this.top(symbol)
 			?? this.unit(path).entry(symbol, -1, name, if (name == "Future") decl.Class else decl.Function, decl.Export,
-			Null, "", null)
+			Null, null, null)
 	}
 }
 
@@ -232,7 +233,7 @@ class Unit {
 				const body = bodyOf(n)
 				const extern = body == null && indexOf(this.path(), ": ") >= 0 // a C header's, not an intrinsic's
 				const d = this.entry(name.symbol, -1, text, decl.Function, mods | (if (extern) decl.Extern else 0), t,
-					n.doc, null)
+					n, null)
 				this.generic(ps, d)
 				this.later(() => {
 					this.prog.decls[d].params = this.typeParams(ps)
@@ -241,11 +242,11 @@ class Unit {
 						this.body(d, t, null, child(n, "params"), body, t.params))
 				})
 			case "var":
-				const d = this.entry(name.symbol, -1, text, decl.Var, mods, t, n.doc, this.vars)
+				const d = this.entry(name.symbol, -1, text, decl.Var, mods, t, n, this.vars)
 				this.later(() => this.define(d, this.ty(t, true), this.initializer(d, after(n, "="), t, null, [])))
 			case "class": this.klass(n, name.symbol, text, mods, -1)
 			case "type":
-				const d = this.entry(name.symbol, -1, text, decl.Alias, mods, t, n.doc, null)
+				const d = this.entry(name.symbol, -1, text, decl.Alias, mods, t, n, null)
 				this.generic(ps, d)
 				this.later(() => {
 					this.prog.decls[d].params = this.typeParams(ps)
@@ -262,7 +263,7 @@ class Unit {
 		this.outer.set(t.id, outer)
 		const k: decl.Kind = if (n.t.kind == "class") decl.Class else decl.Interface
 		// A local one is new, never declared ahead, though its function may have another of its name.
-		const d = if (owner < 0) this.entry(symbol, owner, name, k, mods, t, n.doc, null)
+		const d = if (owner < 0) this.entry(symbol, owner, name, k, mods, t, n, null)
 			else this.l.newDecl(this.m, owner, name, k, mods, t, n.doc)
 		if (this.l.lift.nominals.get(t.id) == null) {
 			// not declared ahead
@@ -294,7 +295,7 @@ class Unit {
 		const k: decl.Kind = if (p.kind == "method") decl.Function else decl.Var
 		const self = if (has(p, "static")) null else selfOf(t)
 		const pt = p.type!
-		const md = this.entry("", d, key, k, pm, pt, p.doc, if (k == decl.Var && self == null) this.vars else null)
+		const md = this.entry("", d, key, k, pm, pt, p, if (k == decl.Var && self == null) this.vars else null)
 		if (self != null && (k == decl.Var || key == "constructor")) {
 			this.depend(d, md) // what new runs (spec 3)
 		}
@@ -324,11 +325,12 @@ class Unit {
 		return this.prog.list(if (t == null) [] else this.prog.members(this.ty(t)))
 	}
 
-	/// Drops the source, keeping its hash and where its lines end, then lists the module's top-level decls, and its
-	/// variables in the order they are initialized: consts, then lets, each after those it depends on (spec 3).
+	/// Drops the source, keeping its hash, where its lines end and its doc, then lists the module's top-level decls, and
+	/// its variables in the order they are initialized: consts, then lets, each after those it depends on (spec 3).
 	finish() {
 		const m = this.prog.modules[this.m]
 		m.source = sourceHash(m.path, this.src)
+		m.doc = this.prog.intern(moduleDoc(this.src))
 		for (const i of 0 ... this.src.length - 1) {
 			if (this.src[i] == lf) {
 				m.newlines.push(i)
@@ -344,8 +346,8 @@ class Unit {
 				}
 			}
 		}
-		this.prog.modules[this.m].decls = this.tops
-		this.prog.modules[this.m].inits = order
+		m.decls = this.tops
+		m.inits = order
 	}
 
 	/// Adds to order the variables d depends on, then d if it is one.
@@ -492,19 +494,23 @@ class Unit {
 		}
 	}
 
-	/// The decl of name in owner, -1 for none, of the checker's symbol if top-level, of type t: declared ahead, or else
-	/// now; added to tops if top-level and to list when lowered, so that they are in the order its declarations are
-	/// lowered whatever was declared ahead, and a module is lowered the same in every program.
-	entry(symbol: string, owner: i32, name: string, k: decl.Kind, mods: i32, t: Type, doc: string,
+	/// The decl of name in owner, -1 for none, of the checker's symbol if top-level, of type t, declared by n if any:
+	/// declared ahead, or else now; added to tops if top-level and to list when lowered, so that they are in the order
+	/// its declarations are lowered whatever was declared ahead, and a module is lowered the same in every program.
+	entry(symbol: string, owner: i32, name: string, k: decl.Kind, mods: i32, t: Type, n: Node | null,
 		list: i32[] | null): i32 {
 		const ahead = if (owner < 0) this.l.lift.entries.get(symbol) ?? -1 else this.prog.find(this.m, owner, name)
-		const d = if (ahead >= 0) ahead else this.l.newDecl(this.m, owner, name, k, mods, t, doc)
+		const d = if (ahead >= 0) ahead else this.l.newDecl(this.m, owner, name, k, mods, t)
 		if (ahead >= 0) {
 			this.prog.decls[d].mods = mods
-			this.prog.decls[d].doc = this.prog.intern(doc)
 			this.l.lift.types.set(d, t)
 		} else if (owner < 0) {
 			this.l.lift.entries.set(symbol, d)
+		}
+		if (n != null) {
+			this.prog.decls[d].pos = n.t.loc.pos
+			this.prog.decls[d].doc = this.prog.intern(n.doc)
+			this.prog.decls[d].signature = this.prog.intern(signature(this.src, n!))
 		}
 		if (this.listing) {
 			if (owner < 0) {
