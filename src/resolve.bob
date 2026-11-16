@@ -424,12 +424,23 @@ export class Instances {
 			case kind.Tuple: for (const i of 0 ... ts.length - 1) {
 				field(p.elementName(i), ts[i], false, 0, array([]))
 			}
-			case kind.Named: for (const m of p.decls[p.a(t)].members) {
-				const x = p.decls[m]
-				if (x.kind == decl.Var && (x.mods & decl.Static) == 0) {
-					field(x.name, p.subst(x.type, p.b(t)), (x.mods & decl.Readonly) != 0, x.doc, this.tags(m, p.b(t)))
+			case kind.Named:
+				// An interface has the fields of what it extends, then its own, those of what it embeds in its place; but
+				// not those its own override, as in fieldOf.
+				const ifc = p.decls[p.a(t)].kind == decl.Interface
+				const inherited = (f: Known) => p.member(p.a(t), f.items![0].op!.a) < 0
+				for (const s of if (ifc) p.lists[p.decls[p.a(t)].supers] else []) {
+					fs.push(...this.fields(p.subst(s, p.b(t))).filter(inherited))
 				}
-			}
+				for (const m of p.decls[p.a(t)].members) {
+					const x = p.decls[m]
+					if (ifc && embedded(p, m)) {
+						fs.push(...this.fields(p.subst(x.type, p.b(t))).filter(inherited))
+					} else if (x.kind == decl.Var && (x.mods & decl.Static) == 0) {
+						field(x.name, p.subst(x.type, p.b(t)), (x.mods & decl.Readonly) != 0, x.doc,
+							this.tags(m, p.b(t)))
+					}
+				}
 		}
 		return fs
 	}

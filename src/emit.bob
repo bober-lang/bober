@@ -38,7 +38,7 @@ import { Code, Program, pair } from "./bc/program"
 import { showType } from "./bc/show"
 import * as c from "./c/type"
 import { CompileError } from "./error"
-import { fieldOf } from "./resolve"
+import { embedded, fieldOf } from "./resolve"
 import { builtin } from "./root"
 
 /// How a program is emitted: whether it is as lowered, a debug build's; and the module that gets C's main, which runs
@@ -4152,8 +4152,8 @@ class Emitter {
 		return if (k == kind.Null || k == kind.None) this.void else if (this.inlined(t)) this.ref else this.ll(t)
 	}
 
-	/// The fields of a class instance, object or tuple, in order, their types as declared; while learning, the class
-	/// noted as laid out.
+	/// The fields of a class instance, object, tuple or interface, in order, their types as declared; while learning, the
+	/// class noted as laid out.
 	private layout(t: i32): Slot[] {
 		if (this.p.kind(t) == kind.Named && this.facts.phase == "learning") {
 			this.facts.classes.set(this.norm(t), this.norm(t))
@@ -4167,9 +4167,19 @@ class Emitter {
 		const [k, a, b] = [p.kind(t), p.a(t), p.b(t)]
 		const slots: Slot[] = []
 		if (k == kind.Named) {
+			// An interface's, which reflection and a read by name find: those of what it extends, then its own, those of
+			// what it embeds in its place; but not those its own override, as in fieldOf.
+			const ifc = p.decls[a].kind == decl.Interface
+			const inherited = (s: Slot) => p.member(a, s.name) < 0
+			const supers = if (ifc) p.lists[p.decls[a].supers] else []
+			for (const s of supers.filter(s => p.kind(s) == kind.Named || p.kind(s) == kind.Object)) {
+				slots.push(...this.slots(p.subst(s, b)).filter(inherited))
+			}
 			for (const f of p.decls[a].members) {
 				const d = p.decls[f]
-				if (d.kind == decl.Var && (d.mods & Static) == 0) {
+				if (ifc && embedded(p, f)) {
+					slots.push(...this.slots(p.subst(d.type, b)).filter(inherited))
+				} else if (d.kind == decl.Var && (d.mods & Static) == 0) {
 					slots.push({ name: d.name, t: p.subst(d.type, b), embed: (d.mods & Embed) != 0, mods: d.mods,
 						decl: f })
 				}
