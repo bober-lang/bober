@@ -1,7 +1,8 @@
 //! Recursive descent with Pratt expressions, into a tree of constructs.
 
 import { comma, isBlank, isSpace, lf, semicolon, space } from "../std/ascii"
-import { partitionPoint, startsWith } from "../std/algo"
+import { indexOf, partitionPoint, startsWith } from "../std/algo"
+import { trim } from "../std/string"
 import { Keyword, Kind, Lexer, Loc, SyntaxError, Tok, assigns } from "./lex"
 
 /// A construct, entered at its keyword, operator or opening bracket, at the name of a typeParam, prop
@@ -114,8 +115,7 @@ export class Parser {
 	/// The text of comments[i], a doc comment, taken.
 	private take(i: i32): string {
 		this.taken[i] = true
-		const text = this.l.text(this.comments[i])
-		return text.slice(if (text.length > 3 && text[3] == space) 4 else 3, text.length)
+		return body(this.l.text(this.comments[i]))
 	}
 
 	/// The next of the file's imports and then declarations, or null at its end.
@@ -875,6 +875,30 @@ function continues(t: Tok): bool {
 }
 
 function fail(t: Tok, want: string): SyntaxError { return new SyntaxError(t.loc, `expected ${want}, got ${t.kind}`) }
+
+/// Doc comment text without its `///` or `//!` and a space after.
+export function body(text: string): string {
+	return text.slice(if (text.length > 3 && text[3] == space) 4 else 3, text.length)
+}
+
+/// The module doc of src, its `//!` comments before its first token, without `//!` and a space after.
+export function moduleDoc(src: string): string {
+	const lines: string[] = []
+	let i = 0
+	while (i < src.length) {
+		const nl = indexOf(src, "\n", i)
+		const end = if (nl < 0) src.length else nl
+		const l = trim(src.slice(i, end))
+		if (l != "" && !startsWith(l, "//")) {
+			break
+		}
+		if (startsWith(l, "//!")) {
+			lines.push(body(l))
+		}
+		i = end + 1
+	}
+	return lines.join("\n")
+}
 
 /// Whether only blanks come before pos on its line.
 export function leads(src: string, pos: i32): bool {

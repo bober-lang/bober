@@ -25,9 +25,9 @@
 //! decls    per decl of its own, in the order made: Str name, kind byte, owner
 //! imports  per decl of another module it uses: dep, owner, Str name, nth of that name in its owner
 //! types    per type, after its parts: kind byte, a and b as its kind says
-//! defs     per decl: mods, type params (Str name, constraint, default), type, supers, tags, throws, Str doc, 0 or 1
-//!          and its code; then the module's decls, inits and deps, and where its lines end, each after the one before;
-//!          then Str its docs
+//! defs     per decl: mods, type params (Str name, constraint, default), type, supers, tags, throws, its position, Str
+//!          doc, Str signature, 0 or 1 and its code; then the module's decls, inits and deps, and where its lines end,
+//!          each after the one before; then Str its doc
 //! ```
 //!
 //! A code is its locals (Str name, type, mods), captures and code lists, then its op count and per op its source
@@ -223,7 +223,9 @@ class Out {
 			this.part(defs, op.TypeList, x.supers)
 			this.part(defs, op.TypeList, x.tags)
 			this.part(defs, op.TypeList, x.throws)
+			uleb(defs, x.pos)
 			uleb(defs, this.str(x.doc))
+			uleb(defs, this.str(x.signature))
 			defs.u8(if (x.code == null) 0 else 1)
 			if (x.code != null) {
 				this.code(defs, x.code!)
@@ -459,7 +461,9 @@ export class In {
 			x.supers = this.part(op.TypeList)
 			x.tags = this.part(op.TypeList)
 			x.throws = this.part(op.TypeList)
+			x.pos = this.n()
 			x.doc = this.str()
+			x.signature = this.str()
 			if (this.r.u8() == 1) {
 				x.code = this.code()
 			}

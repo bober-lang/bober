@@ -8,7 +8,7 @@ import { HashMap } from "../std/collections/hashmap"
 import { ScopedMap } from "../std/collections/scopedmap"
 import { Set } from "../std/collections/set"
 import { join } from "../std/fs/path"
-import { codePoint, quoted, unquoted } from "../std/string"
+import { codePoint, quoted, trim, unquoted } from "../std/string"
 import * as decl from "./bc/decl"
 import * as kind from "./bc/kind"
 import * as op from "./bc/op"
@@ -5047,6 +5047,18 @@ function start(p: Node): Loc {
 
 /// The source of p, of a module of source src.
 export function sourceOf(src: string, p: Node): string { return src.slice(start(p).pos, stop(p)) }
+
+/// The source of declaration p, of a module of source src, up to its body, or of a var spanning lines up to its value.
+export function signature(src: string, p: Node): string {
+	let end = stop(p)
+	for (const x of p.parts) {
+		if (x.kind == "block" || x.kind == "members"
+			|| p.kind == "var" && isTok(x, "=") && indexOf(src.slice(start(p).pos, end), "\n") >= 0) {
+			end = start(x).pos
+		}
+	}
+	return trim(src.slice(start(p).pos, end))
+}
 
 /// Where p's source ends, after its closing token if it has one.
 function stop(p: Node): i32 {
