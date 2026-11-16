@@ -62,7 +62,8 @@ export class Parts {
 		this.line()
 		const p = new Part(new Bytes(this, this.serial))
 		let head = 0
-		while (true) {
+		// Headers end at a blank line, or at the delimiter when the part has no body.
+		while (!this.atDelim()) {
 			const l = this.line()
 			if (l == "") {
 				break
@@ -116,6 +117,13 @@ export class Parts {
 			i = indexOf(this.buf, this.delim, i + 1)
 		}
 		return i
+	}
+
+	/// Whether a delimiter line starts buf, read until that tells.
+	private atDelim(): bool throws IoError {
+		while (startsWith(this.delim, this.buf) && this.fill()) {}
+		while (startsWith(this.buf, this.delim) && this.ends(0) == null && this.fill()) {}
+		return startsWith(this.buf, this.delim) && this.ends(0) == true
 	}
 
 	/// Whether the delimiter at i ends a delimiter line: `--` or padding, of at most 8 KiB, and then a CR follow it;
