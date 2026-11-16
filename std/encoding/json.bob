@@ -39,49 +39,66 @@ export class EncodeError {
 	constructor(value: f64) { this.value = value }
 }
 
-export function encode[T](v: T): string throws EncodeError {
+export function encode[T](v: T): string throws EncodeError { return write("", v) }
+
+/// q followed by v's JSON, each part appended in turn, so that q grows in its buffer.
+function write[T](q: string, v: T): string throws EncodeError {
 	const t = typeof v
-	const items: string[] = []
 	switch (t.kind) {
-		case "null", "bool", "int": return `${v}`
+		case "null", "bool", "int": return q + `${v}`
 		case "float":
 			if (!isFinite(v)) {
 				throw new EncodeError(v)
 			}
-			return `${v}`
-		case "string": return quoted(v)
-		case "literal": return encode[string | bool | null](t.value)
+			return q + `${v}`
+		case "string": return writeString(q, v)
+		case "literal": return write[string | bool | null](q, t.value)
 		case "union":
 			for (const M of t.members) {
 				if (v instanceof M) {
-					return encode(v)
+					return write(q, v)
 				}
 			}
-			return ""
+			return q
 		case "array", "fixed":
+			q += "["
+			let sep = ""
 			for (const x of v) {
-				items.push(encode(x))
+				q = write(q + sep, x)
+				sep = ","
 			}
-			return `[${items.join(",")}]`
+			return q + "]"
 		case "tuple":
+			q += "["
+			let sep = ""
 			for (const f of t.fields) {
-				items.push(encode(v[f.name]))
+				q = write(q + sep, v[f.name])
+				sep = ","
 			}
-			return `[${items.join(",")}]`
+			return q + "]"
 		case "class", "object", "interface":
+			q += "{"
+			let sep = ""
 			for (const f of t.fields) {
 				const x = v[f.name]
 				if (has(f.tags, Rest) && f.type == Unknown[]) {
 					for (const [k, text] of x) {
-						items.push(`${quoted(k)}:${text}`)
+						q = writeString(q + sep, k) + ":" + text
+						sep = ","
 					}
 				} else if (!encoding.omits(f.tags, Skip, OmitEmpty, x)) {
-					const k = quoted(encoding.key(f.tags, Name, f.name))
-					items.push(`${k}:${if (has(f.tags, Mapping)) entries(x) else encode(x)}`)
+					// A name needs no escape, so its comma and quotes fold into one literal; a tagged key may need one.
+					if (has(f.tags, Name) || has(f.tags, encoding.Name)) {
+						q = writeString(q + sep, encoding.key(f.tags, Name, f.name)) + ":"
+					} else {
+						q += if (sep == "") `"${f.name}":` else `,"${f.name}":`
+					}
+					q = if (has(f.tags, Mapping)) entries(q, x) else write(q, x)
+					sep = ","
 				}
 			}
-			return `{${items.join(",")}}`
-		default: return quoted(t.name)
+			return q + "}"
+		default: return writeString(q, t.name)
 	}
 }
 
@@ -91,19 +108,23 @@ function keyOf[K](k: K): string throws EncodeError {
 	return if (s[0] == quote) s else quoted(s)
 }
 
-/// A Mapping field's entries as an object.
-function entries[T](xs: T): string throws EncodeError {
-	const items: string[] = []
+/// q followed by a Mapping field's entries as an object.
+function entries[T](q: string, xs: T): string throws EncodeError {
+	q += "{"
 	switch (T.kind) {
-		case "array": for (const e of xs) {
-			const kv: string[] = []
-			for (const f of T.elem.fields) {
-				kv.push(if (kv.length == 0) keyOf(e[f.name]) else encode(e[f.name]))
+		case "array":
+			let sep = ""
+			for (const e of xs) {
+				q += sep
+				let i = 0
+				for (const f of T.elem.fields) {
+					q = if (i == 0) q + keyOf(e[f.name]) else write(q + ":", e[f.name])
+					i++
+				}
+				sep = ","
 			}
-			items.push(kv.join(":"))
-		}
 	}
-	return `{${items.join(",")}}`
+	return q + "}"
 }
 
 export function decode[T extends Decodable](s: string): T throws ParseError {
@@ -138,19 +159,28 @@ const maxDepth = 128
 const retries: i64 = 16 // i64, as the bound it makes passes 2^31
 
 /// s as a JSON string.
-export function quoted(s: string): string {
-	let q = ""
-	for (const ch of s) {
-		q += switch (ch) {
-			case quote: "\\\""
-			case backslash: "\\\\"
-			case lf: "\\n"
-			case cr: "\\r"
-			case tab: "\\t"
-			default: if (isControl(ch)) `\\u00${chr(hex[ch >> 4])}${chr(hex[ch & 15])}` else chr(ch)
+export function quoted(s: string): string { return writeString("", s) }
+
+/// q followed by s as a JSON string, its bytes that need no escape appended a run at a time.
+function writeString(q: string, s: string): string {
+	q += "\""
+	let from = 0
+	for (const i of 0 ... s.length - 1) {
+		const ch = s[i]
+		if (ch == quote || ch == backslash || isControl(ch)) {
+			q += s.slice(from, i)
+			q += switch (ch) {
+				case quote: "\\\""
+				case backslash: "\\\\"
+				case lf: "\\n"
+				case cr: "\\r"
+				case tab: "\\t"
+				default: `\\u00${chr(hex[ch >> 4])}${chr(hex[ch & 15])}`
+			}
+			from = i + 1
 		}
 	}
-	return `"${q}"`
+	return q + s.slice(from, s.length) + "\""
 }
 
 /// The valid JSON s with each member and element on a line of its own, indented by a tab for each array and object it
