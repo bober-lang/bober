@@ -16,7 +16,7 @@ $(sysroot)/usr/lib/mimalloc.o: $(sysroot)/usr/lib/libc.a
 	clang --target=$(triple) --sysroot=$(sysroot) -O3 -DNDEBUG -DMI_MALLOC_OVERRIDE -DMI_LIBC_MUSL=1 -fno-builtin-malloc \
 		-I$(root)/vendor/mimalloc/include -c -o $@ $(root)/vendor/mimalloc/src/static.c
 
-$(sysroot)/usr/lib/libc++.a: $(sysroot)/usr/lib/libc.a
+$(sysroot)/usr/lib/libc++.a: | $(sysroot)/usr/lib/libc.a
 	mkdir -p $(src) && curl -sSL $(llvm) | tar xz -C $(src) --strip-components=1
 	cmake -G Ninja -S $(src)/runtimes -B $(src)/build -DCMAKE_BUILD_TYPE=Release \
 		-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_ASM_COMPILER=clang \
@@ -32,8 +32,14 @@ $(sysroot)/usr/lib/libc++.a: $(sysroot)/usr/lib/libc.a
 	cp $(shell clang -print-libgcc-file-name -rtlib=compiler-rt) $(sysroot)/usr/lib/libclang_rt.builtins.a
 	rm -rf $(src)
 
-$(sysroot)/usr/lib/libc.a:
-	mkdir -p $(sysroot)
+# musl built anew when vendor/musl moves, by a stamp of its commit, which CI's cache key hashes; libc++ is not.
+$(sysroot)/usr/lib/libc.a: $(sysroot)/commit
+	rm -rf $(sysroot)/obj
 	cd $(sysroot) && $(root)/vendor/musl/configure --prefix=/usr CC=clang > /dev/null
 	$(MAKE) -C $(sysroot) -s DESTDIR=$(sysroot) install
 	cp -rL /usr/include/linux /usr/include/asm-generic /usr/include/$(shell uname -m)-linux-gnu/asm $(sysroot)/usr/include
+
+$(sysroot)/commit: FORCE
+	@mkdir -p $(sysroot) && git -C $(root)/vendor/musl rev-parse HEAD | cmp -s - $@ || git -C $(root)/vendor/musl rev-parse HEAD > $@
+
+FORCE:
