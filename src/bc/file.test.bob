@@ -5,7 +5,7 @@ import { lower } from "../lower"
 import * as decl from "./decl"
 import { abi, read, write } from "./file"
 import * as kind from "./kind"
-import { Program } from "./program"
+import { Import, Program } from "./program"
 import { showDecl } from "./show"
 
 /// The modules of main.bob of source src, where it imports lib.bob of source lib.
@@ -13,11 +13,18 @@ function lowered(src: string, lib: string = ""): Program {
 	return lower(["main.bob"], [], [], path => if (path == "main.bob") src else if (path == "lib.bob") lib else null)
 }
 
-/// Module m of p shown, with its doc, top-level decls, inits and deps; its decls as a file has them.
+/// Module m of p shown, with its doc, top-level decls, inits, deps and imports; its decls as a file has them.
 function shown(p: Program, m: i32): string {
 	const x = p.modules[m]
 	const names = (ds: i32[]) => ds.map(d => p.strings[p.decls[d].name]).join(", ")
-	return `${p.strings[x.doc]}\n[${names(x.decls)}] [${names(x.inits)}] [${x.deps.map(d => p.modules[d].path).join(", ")}]\n${owned(p, x.decls)}`
+	const deps = x.deps.map(d => p.modules[d].path).join(", ")
+	return `${p.strings[x.doc]}\n[${names(x.decls)}] [${names(x.inits)}] [${deps}]\n${imports(p, m)}${owned(p, x.decls)}`
+}
+
+/// The imports of module m of p, one a line: where, specifier, module, namespace and names.
+function imports(p: Program, m: i32): string {
+	const names = (x: Import) => x.names.map(e => `${p.strings[p.decls[e[0]].name]} ${p.strings[e[1]]}`).join(", ")
+	return p.modules[m].imports.map(x => `${x.pos} ${p.strings[x.spec]} ${p.modules[x.module].path} ${p.strings[x.ns]} [${names(x)}]\n`).join("")
 }
 
 /// The decls ds of p shown, each with its signature before those it owns.
@@ -54,10 +61,12 @@ function malformed(bytes: string): bool {
 
 test "a module reads back as written" {
 	const p = lowered(`//! The main module.
-import { Box, twice } from "./lib"
+import { Box, Pair as Two, twice } from "./lib"
+import * as lib from "./lib"
 /// Doubles.
 export function f(b: Box[i32]): i32 { return twice(b.v) + g[i32](1) }
 function g[T](x: T): T { return (() => x)() }
+export function h(p: Two[i32] | "x", f: (n: i32) => void throws string, b: lib.Box[i32]) {}
 export const k: "a" | "b" = "a"
 test "f" { assert f(new Box[i32](2)) == 5 }`,
 		`export class Box[T] {
@@ -67,6 +76,7 @@ test "f" { assert f(new Box[i32](2)) == 5 }`,
 export function twice(x: i32): i32 throws string { return 2 * x }
 export type Pair[T] = [T, T]`)
 	assert p.strings[p.modules[p.module("main.bob")].doc] == "The main module."
+	assert imports(p, p.module("main.bob")) == "21 ./lib lib.bob  [Box , Pair Two, twice ]\n69 ./lib lib.bob lib []\n"
 	roundTrip(p)
 }
 

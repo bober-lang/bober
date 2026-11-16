@@ -35,7 +35,8 @@ import { Opcode } from "./bc/op"
 import { Code, Program, TypeParam, sourceHash } from "./bc/program"
 
 import { Checked, Node, after, arrowBody, bodyOf, check, child, compared, element, has, isLink, isTok, isTypeValue,
-	operands, optional, selfOf, show as showType, signature, sourceOf, standsFor, substitute, supers } from "./check"
+	operands, optional, segment, selfOf, show as showType, signature, sourceOf, standsFor, substitute,
+	supers } from "./check"
 
 import { CompileError } from "./error"
 import { Tok } from "./lex"
@@ -79,7 +80,13 @@ export class Lower implements Checked {
 	decl(n: Node, path: string, src: string) {
 		const u = this.unit(path)
 		u.src = src
-		this.trying(() => u.lower(n))
+		this.trying(() => {
+			if (n.kind == "import") {
+				u.imported(n)
+			} else {
+				u.lower(n)
+			}
+		})
 	}
 
 	declare(n: Node, path: string, src: string) {
@@ -198,6 +205,23 @@ class Unit {
 		this.l = l
 		this.prog = l.lift.prog
 		this.m = l.lift.prog.addModule(path)
+	}
+
+	/// Adds import n to its module's imports.
+	imported(n: Node) {
+		const p = this.prog
+		const what = n.parts[0]
+		const bare = isTok(what, "string") // import "p", of namespace p
+		const spec = unquoted(this.text((if (bare) what else n.parts[1]).t))
+		const ns = if (what.kind == "binary") this.text(what.parts[1].t) else if (bare) segment(spec) else ""
+		const m = p.module(n.symbol.slice(0, n.symbol.length - 1))
+		const names: [i32, i32][] = []
+		for (const q of if (what.kind == "object") what.parts else []) {
+			const renamed = q.kind != "token"
+			const d = p.find(m, -1, this.text((if (renamed) q.parts[0] else q).t))
+			names.push([d, if (renamed) p.intern(this.text(q.parts[1].t)) else 0])
+		}
+		p.modules[this.m].imports.push({ pos: n.t.loc.pos, spec: p.intern(spec), module: m, ns: p.intern(ns), names })
 	}
 
 	/// Lowers top-level declaration n, reusing the decls it was declared ahead with, and lists them.
