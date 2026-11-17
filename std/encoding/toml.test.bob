@@ -236,6 +236,17 @@ test "decode is strict" {
 		assert decode[Config]("[[points]]\nx = 1\n[[points]]\nx = 2").points.map(p => p.x) == [1, 2]
 		assert decode[Loose]("a = {x = 1}\nx = 2").x == 2
 	}
+	test "defined twice through dotted keys or an inline table" {
+		assert decode[Config]("origin.x = 1\norigin = {y = 2}") throws new ParseError("syntax", 13)
+		assert decode[Config]("origin = {x = 1}\norigin.y = 2") throws new ParseError("syntax", 17)
+		assert decode[Config]("origin.x = 1\n[origin]") throws new ParseError("syntax", 13)
+		assert decode[Config]("points = []\n[[points]]") throws new ParseError("syntax", 12)
+		assert decode[Config]("origin.x = 1\norigin.y = 2").origin.y == 2.0
+		const fruit = "[fruit]\napple.color = 'red'\n"
+		assert decode[Loose](`${fruit}[fruit.apple.texture]`).rest == [["fruit.apple.color", "'red'"]]
+		assert decode[Loose](`${fruit}[fruit.apple]`) throws new ParseError("syntax", 28)
+		assert decode[Loose]("[[s.a]]\n[s]\na.r = 2") throws new ParseError("syntax", 12)
+	}
 }
 
 class Loose {
