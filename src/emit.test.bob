@@ -25,7 +25,7 @@ function run(name: string, src: string, lib: string = "", tests: bool = false): 
 	writeFile(`${dir()}/lib.bob`, lib)
 	const p = lower([main])
 	const m = p.module(main)
-	mono(p, m)
+	mono(p, m, false, 64) // as a release build
 	const files: string[] = []
 	for (const i of 0 ... p.modules.length - 1) {
 		const b = new LLVM(p.modules[i].path, 0)
@@ -695,4 +695,16 @@ test "a method whose type nests its class's type args ever deeper, or ever wider
 		msg = e.msg
 	}
 	assert msg.length == 1000 + " … nests type args ever deeper".length && endsWith(msg, " … nests type args ever deeper")
+}
+
+test "a function another module copies traps at its own source" {
+	assert run("copies", `import { at } from "./lib"
+
+function main(): i32 { return at([1], 1) }
+`, `
+
+export function at(xs: i32[], i: i32): i32 { return xs[i] }
+`) == `${dir()}/lib.bob:3:55: trap: index out of range
+exit 1
+`
 }

@@ -582,8 +582,8 @@ function hasTests(path: string): bool {
 	}
 }
 
-/// Compiles the program of main into the executable build/<name>, or with tests build/<name>.test, all as one,
-/// monomorphized, by LLVM, optimized, if release, else into the image, each module by TPDE, fast to compile: as
+/// Compiles the program of main into the executable build/<name>, or with tests build/<name>.test,
+/// monomorphized, each module by LLVM, optimized, if release, else into the image, each module by TPDE, fast to compile: as
 /// lowered, or at -O1 monomorphized of its package, and at -O2 so by LLVM once unchanged (image); -O2 counts over -O0,
 /// -O0 over -O1. Returns the command that runs it, or its tests: the executable, or the launcher on the image's entry,
 /// named with the program's version, run by the C library's loader where it is the sysroot's, the image as image has
@@ -602,19 +602,22 @@ export function build(main: string, tests: bool, f: Compile, pin: bool): string[
 	const exe = `${dir}/${name(main)}${if (tests) ".test" else ""}`
 	const [files, cxx] = linked(p, program(p, [m], true), tests, f.headers.I)
 	const o = { main: m, tests: tests, dyn: false }
-	mono(p, m)
-	const whole = new LLVM(main, 2, !f.baseline) // which alone makes code, of all linked into it
+	mono(p, m, false, small)
 	const facts = learn(p, o, m => new LLVM(p.modules[m].path))
+	const objects: string[] = []
 	for (const m of 0 ... p.modules.length - 1) {
-		const b = new LLVM(p.modules[m].path)
+		const b = new LLVM(p.modules[m].path, 2, !f.baseline)
 		emit(p, m, b, o, facts)
-		b.verify() // which also finishes it, before it is linked
-		whole.link(b)
+		b.verify()
+		objects.push(`${exe}.${m}.o`)
+		b.emit(objects[m], false)
 	}
-	whole.emit(`${exe}.o`, false)
-	ld([`${exe}.o`, ...files], exe)
+	ld([...objects, ...files], exe)
 	return [exe]
 }
+
+/// The ops below which a release build gives a function to each module reaching it, to inline, as mono takes it.
+const small = 64
 
 /// The code of the program build built last, natively, by which its tests' results are kept (runTests); "" if none.
 let built = ""

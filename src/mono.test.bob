@@ -383,6 +383,24 @@ End
 `
 }
 
+test "a function of fewer than small ops is a copy of each module reaching it, not its module's own, but a root is" {
+	const p = new Program()
+	const lib = p.addModule("lib")
+	const one = add(p, lib, -1, "one", decl.Function, fn(p, [], I32),
+		code(p, [], [[op.Int, I32, p.int(1)], [op.Return], [op.End]]))
+	p.decls[one].mods = decl.Export
+	const m = p.addModule("main")
+	add(p, m, -1, "main", decl.Function, fn(p, [], I32),
+		code(p, [], [[op.Call, one, p.list([])], [op.Return], [op.End]]))
+	mono(p, m, false, 4)
+	assert out(p, lib) == "" && p.modules[m].copies.map(d => qualified(p, d)) == ["one"]
+	assert out(p, m) == `function main: () => i32
+	Call one
+	Return
+End
+`
+}
+
 /// A local of type { x: i32 } holding a literal of it and one of { x: i32, y: i32 }, whose x is read.
 test "an object type is the union of its literals and what is converted to it" {
 	const p = new Program()
