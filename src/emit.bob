@@ -86,6 +86,9 @@ export class Facts {
 	byValue = new HashMap[i32, bool]()
 	/// Once learned, the classes held by value.
 	inline = new HashMap[i32, bool]()
+	/// Once learned, what these two are, which a module is compiled as: their names, the same of any build that learns
+	/// the same.
+	names = ""
 	/// By type id, what Emitter's functions of their names make of it, and by decl its symbol.
 	norms = new HashMap[i32, i32]()
 	keeps = new HashMap[i32, i32]()
@@ -3354,6 +3357,14 @@ class Emitter {
 		this.facts.inline = this.inlines()
 		this.facts.phase = "learned"
 		this.facts.byValue = this.byValue()
+		const names = this.facts.classes.values().filter(t => this.inlined(t)).map(t => this.key(t))
+		for (const d of 0 ... this.p.decls.length - 1) {
+			if (this.facts.byValue.has(d)) {
+				names.push(this.symbol(d))
+			}
+		}
+		sort(names)
+		this.facts.names = names.join(" ")
 	}
 
 	/// The classes held by value: each of which no instance is touched, of no C header or builtin/, with no field
