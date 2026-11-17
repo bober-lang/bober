@@ -326,6 +326,20 @@ test "a test file's report is not kept by a file it read that changed while it r
 	}
 }
 
+test "test files whose paths differ by / and _, run at once, each keep their own report" {
+	const files = [`${home()}/x/y.test.bob`, `${home()}/x_y.test.bob`]
+	mkdirAll(`${home()}/x`)
+	writeFile(files[0], `test "a" { assert true }\n`)
+	writeFile(files[1], `test "b" { assert true }\n`)
+	dir = `${home()}/build`
+	try {
+		const ran = files.map(f => runTests(f, [], () => build(f, true, new Compile(), true)))
+		assert ran.map(r => r()[1]) == [`{"a":"ok"}`, `{"b":"ok"}`]
+	} finally {
+		dir = "build"
+	}
+}
+
 test "a module's unit as lowered and monomorphized are held side by side, each build linking its own" {
 	anew()
 	const [out, mono] = [built(files(1)), built([], "-O1")]
