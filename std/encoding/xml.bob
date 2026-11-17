@@ -1107,6 +1107,15 @@ function value[T extends Decodable](n: Node): T throws ParseError {
 							if (f.type.kind == "array") {
 								const xs: f.type = r[f.name]
 								xs.push(value[f.type.elem](c))
+							} else if (f.type.kind == "union" && f.type.members.length == 2
+								&& f.type.members[0].kind == "array" && f.type.members[1].kind == "null") {
+								// An array or null, null last (§4.4): the item pushed, the array begun at the first.
+								for (const A of f.type.members) {
+									if (A.kind != "null") {
+										const v = r[f.name]
+										r[f.name] = pushed[A](if (v instanceof A) v else null, c)
+									}
+								}
 							} else {
 								r[f.name] = value[f.type](c)
 							}
@@ -1125,6 +1134,16 @@ function value[T extends Decodable](n: Node): T throws ParseError {
 			}
 			return scalar[T](n.text(), n.at)
 	}
+}
+
+/// xs, or a new array if null, with the item c holds pushed; A is an array.
+function pushed[A extends Decodable](xs: A | null, c: Node): A throws ParseError {
+	if (A.kind == "array") {
+		const ys: A = xs ?? []
+		ys.push(value[A.elem](c))
+		return ys
+	}
+	throw new ParseError("syntax", c.at)
 }
 
 /// The T that the text s at at holds.

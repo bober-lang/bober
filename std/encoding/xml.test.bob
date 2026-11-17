@@ -34,6 +34,11 @@ class Tags @encoding.Name["t"] {
 
 class Own @Name["o"] @encoding.Name["x"] {}
 
+class Tagged @Name["t"] {
+	tags: string[] | null = null
+	n: i32 | null = null
+}
+
 test "xml's own tags over ../encoding's" {
 	assert encode(new Tags()) == "<t><A>1</A><B>2</B></t>" && encode(new Own()) == "<o/>"
 	const t = decode[Tags]("<t><A>4</A><B>5</B></t>")
@@ -112,6 +117,12 @@ test "encode and decode" {
 	const g = decode[Feed](s)
 	assert encode(g) == s
 	assert decode[Feed]("<other/>") throws new ParseError("syntax", 0)
+}
+
+test "a field of an array or null takes an element per item, as encode writes it" {
+	const s = "<t><tags>a</tags><tags>b</tags></t>"
+	assert decode[Tagged](s).tags == ["a", "b"] && encode(decode[Tagged](s)) == s
+	assert decode[Tagged]("<t/>").tags == null && decode[Tagged]("<t><n>1</n></t>").n == 1
 }
 
 test "a union takes an integer member first" {
