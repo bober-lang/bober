@@ -241,7 +241,7 @@ const host = {
 	writeFile: (path, s) => {
 		try { writeFileSync(str(path), Buffer.from(str(s), "latin1")); return 1 } catch { return 0 }
 	},
-	idOf: (() => {
+	id: (() => {
 		const ids = new WeakMap()
 		let next = 1n
 		return x => typeof x == "object" && x != null ? ids.get(x) ?? (ids.set(x, next), next++) : BigInt(x ?? 0)

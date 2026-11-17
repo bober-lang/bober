@@ -1,5 +1,7 @@
 //! builtin/io.bob for WebAssembly GC (src/wasm.bob): the JS host's, which it imports.
 
+import { bits } from "./math"
+
 export function print[T](x: T) { put(1, `${x}\n`) }
 /// Writes s to fd; whether all of it was.
 function put(fd: i32, s: string): bool
@@ -20,4 +22,19 @@ export function targetOs(): string { return "wasm" }
 export function targetArch(): string { return "wasm" }
 export function now(): i64
 export function random(): u64
-export function idOf[T](x: T): u64
+
+/// Of a union, that of the value it holds; of a float, its bits, as BigInt takes no fraction.
+export function idOf[T](x: T): u64 {
+	switch (T.kind) {
+		case "union": for (const M of T.members) {
+			if (x instanceof M) {
+				return idOf(x)
+			}
+		}
+		case "float": return bits(x)
+	}
+	return id(x)
+}
+
+/// The host's number of a ref while it lives, else of its value.
+function id[T](x: T): u64
