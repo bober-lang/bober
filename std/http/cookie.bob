@@ -185,9 +185,10 @@ export class Jar {
 			else if (age == null) min(c.expires!, now() + ageLimit * second)
 			else if (age <= 0) 0 as i64
 			else now() + min(age, ageLimit) * second
-		this.stored = this.stored.filter(s => !(s.c.name == c.name && s.c.domain == domain && s.c.path == path)
-			&& (s.expiry == null || s.expiry! > now()))
+		this.stored = this.stored.filter(s => s.expiry == null || s.expiry! > now())
+		const old = this.stored.find(s => s.c.name == c.name && s.c.domain == domain && s.c.path == path)
 		if (expiry != null && expiry <= now()) {
+			this.stored = this.stored.filter(s => s != old)
 			return
 		}
 		// Copies, as slices of the header would keep all of it.
@@ -197,7 +198,13 @@ export class Jar {
 		kept.secure = c.secure
 		kept.httpOnly = c.httpOnly
 		kept.sameSite = c.sameSite
-		this.stored.push(new Stored(kept, hostOnly, expiry))
+		const stored = new Stored(kept, hostOnly, expiry)
+		if (old != null) {
+			// In its place, as it keeps the creation time of the one it replaces (§5.3), which orders those of a path length.
+			this.stored[this.stored.indexOf(old)] = stored
+			return
+		}
+		this.stored.push(stored)
 		// Past the least RFC 6265 §6.1 has a jar keep, 50 a domain and 3000 in all, the oldest go.
 		const same = this.stored.filter(s => s.c.domain == domain)
 		if (same.length > 50) {
