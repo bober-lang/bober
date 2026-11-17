@@ -151,7 +151,7 @@ static void release(uint32_t p, int n) {
   if (p < hint) hint = p;
 }
 
-/// An old slot of class c, its bits 0, from its free list, which a new page refills.
+/// An old slot of class c, its bits 0, counted in olds, from its free list, which a new page refills.
 static char *promoted(int c) {
   if (!spare[c]) {
     uint32_t p = take(1, OLD);
@@ -159,14 +159,9 @@ static char *promoted(int c) {
     for (char *h = at(p); h + sizes[c] <= at(p + 1); h += sizes[c]) *(char **)h = spare[c], spare[c] = h;
   }
   char *h = spare[c];
-  spare[c] = *(char **)h;
+  spare[c] = *(char **)h, olds += sizes[c];
   return h;
 }
-
-// Tracing.
-
-static char **gray;
-static int64_t grays, grayCap;
 
 /// The start of the object p points into, and its page, or null if p is not into the heap, as into a frame, a
 /// constant or null. p may be at its object's end, but that is short of its cell's: an array of no room is 24 bytes,
@@ -180,6 +175,51 @@ static char *object(void *p, Page **page) {
   return g->kind == BIG ? at(i) : at(i) + a % PAGE / sizes[g->class] * sizes[g->class];
 }
 
+// Ids. An object's id is where it is once old, which it then never leaves: an old or big one's own address, and a young
+// one's the old slot taken for it when first asked, which the next collection moves it into. A slot whose object dies
+// young is left unmarked, and so freed by the next major collection, which its bytes count toward as if it had moved.
+
+typedef struct { char *young, *old; } Id;
+static Id *ids;  // the young objects given an old slot, open addressed and at most half full
+static uint64_t idMask, idCount;
+
+/// The entry of young object h, or where it goes.
+static Id *entry(char *h) {
+  uint64_t i = (uintptr_t)h * 0x9e3779b97f4a7c15 >> 20;
+  while (ids[i & idMask].young && ids[i & idMask].young != h) i++;
+  return &ids[i & idMask];
+}
+
+/// The old slot young object h was given, taking one of class c if none.
+static char *slot(char *h, int c) {
+  if (2 * (idCount + 1) > idMask + 1) {
+    Id *old = ids;
+    uint64_t m = idMask;
+    idMask = old ? 2 * m + 1 : 63;
+    if (!(ids = calloc(idMask + 1, sizeof *ids))) fputs("out of memory\n", stderr), exit(1);
+    for (uint64_t i = 0; old && i <= m; i++)
+      if (old[i].young) *entry(old[i].young) = old[i];
+    free(old);
+  }
+  Id *e = entry(h);
+  if (!e->young) *e = (Id){h, promoted(c)}, idCount++;
+  return e->old;
+}
+
+/// The old slot young object h was given, or null.
+static char *given(char *h) { return idCount ? entry(h)->old : 0; }
+
+uint64_t bober_id(void *p) {
+  Page *g;
+  char *h = object(p, &g);
+  return (uintptr_t)(h && g->kind == YOUNG ? slot(h, g->class) + ((char *)p - h) : p);
+}
+
+// Tracing.
+
+static char **gray;
+static int64_t grays, grayCap;
+
 /// The place of what p points into once traced: a young object moved, an old one marked unless in a minor, where only
 /// a new one is, each first reached with refs put on gray. p not into the heap stays.
 static void *trace(void *p) {
@@ -191,12 +231,13 @@ static void *trace(void *p) {
   if (g->kind == YOUNG) {
     if (bit(marks, cell(h))) return *(char **)h + into;
     int64_t size = sizes[g->class];
-    char *n = promoted(g->class);
+    char *n = given(h);
+    if (!n) n = promoted(g->class);
     memcpy(n, h, size);
     for (int64_t w = 0, k = size / 8; g->class < CLASSES && w < k; w += 64)
       or64(refs, word(n) + w, get64(refs, word(h) + w) & (k - w < 64 ? (1ull << (k - w)) - 1 : ~0ull));
     put(marks, cell(h), 1), *(char **)h = n;
-    h = n, olds += size;
+    h = n;
   }
   if (!minor || g->kind != YOUNG) put(marks, cell(h), 1);
   if (g->class < CLASSES) {
@@ -381,56 +422,6 @@ static void frames(void **fp) {
   }
 }
 
-// Ids. Those bober_id gave out are kept by the address they are of, open addressed and at most half full, and each
-// collection moves those of what moved and drops those of what died.
-
-typedef struct { void *at; uint64_t id; } Id;
-static Id *ids;
-static uint64_t idMask, idCount, lastId;
-
-/// The entry of p, or where it goes.
-static Id *entry(void *p) {
-  uint64_t i = (uintptr_t)p * 0x9e3779b97f4a7c15 >> 20;
-  while (ids[i & idMask].at && ids[i & idMask].at != p) i++;
-  return &ids[i & idMask];
-}
-
-/// Where p points once traced, or null if what it points into was not reached.
-static void *survivor(void *p) {
-  Page *g;
-  char *h = object(p, &g);
-  if (!h) return p;
-  bool marked = bit(marks, cell(h));
-  if (g->kind != YOUNG) return minor && !g->used || marked ? p : 0;
-  return marked ? *(char **)h + ((char *)p - h) : 0;
-}
-
-/// Moves the ids into a table of n entries.
-static void rekey(uint64_t n) {
-  Id *old = ids;
-  uint64_t m = idMask;
-  if (!(ids = calloc(n, sizeof *ids))) fputs("out of memory\n", stderr), exit(1);
-  idMask = n - 1, idCount = 0;
-  for (uint64_t i = 0; old && i <= m; i++)
-    if (old[i].at) *entry(old[i].at) = old[i], idCount++;
-  free(old);
-}
-
-/// Moves each id to where what it is of went once traced, dropping those of the dead.
-static void survive(void) {
-  for (uint64_t i = 0; i <= idMask; i++)
-    if (ids[i].at) ids[i].at = survivor(ids[i].at);
-  rekey(idMask + 1);
-}
-
-uint64_t bober_id(void *p) {
-  if (!p) return 0;  // which entry takes for an empty slot
-  if (2 * (idCount + 1) > idMask + 1) rekey(ids ? 2 * (idMask + 1) : 64);
-  Id *e = entry(p);
-  if (!e->at) *e = (Id){p, ++lastId}, idCount++;
-  return e->id;
-}
-
 /// Traces from the roots, then frees the young pages, the new objects not reached and, in a major, the old ones.
 /// Probes bober:gc_start with the bytes allocated since the last collection, and bober:gc_end with those old.
 static void collect(void) {
@@ -446,7 +437,7 @@ static void collect(void) {
   if (minor) dirty(false);
   while (grays) values(gray[--grays]);
   if (minor && verify) verifying = true, bober_parked(frames, true), dirty(true), verifying = false;
-  if (ids) survive();
+  free(ids), ids = 0, idMask = idCount = 0;
   if (!minor) memset(spare, 0, sizeof spare);
   int64_t live = 0;
   for (uint32_t p = 1; p < top; p++) {
