@@ -2,7 +2,7 @@
 
 import { comma, isBlank, isSpace, lf, semicolon } from "../std/ascii"
 import { partitionPoint, startsWith } from "../std/algo"
-import { Keyword, Kind, Lexer, Loc, SyntaxError, Tok, assigns } from "./lex"
+import { Keyword, Kind, Lexer, Loc, SyntaxError, Tok, assigns, bom } from "./lex"
 
 /// A construct, entered at its keyword, operator or opening bracket, at the name of a typeParam, prop
 /// or method, or at the first token of a param. A block is the statements after { or a case's :, and
@@ -87,7 +87,7 @@ export class Parser {
 
 	/// Reports the doc comments doc did not take, as warnings, and the module docs after the first token.
 	strays(report: (at: Loc, msg: string, warning: bool) => void) {
-		let at = 0 // where the comments up to here end, if no token is before them
+		let at = bom(this.src) // where the comments up to here end, if no token is before them
 		for (const i of 0 ... this.comments.length - 1) {
 			const c = this.comments[i]
 			while (at >= 0 && at < c.loc.pos && isSpace(this.src[at])) {
@@ -872,5 +872,5 @@ export function leads(src: string, pos: i32): bool {
 	while (i > 0 && isBlank(src[i - 1])) {
 		i--
 	}
-	return i == 0 || src[i - 1] == lf
+	return i <= bom(src) || src[i - 1] == lf
 }
