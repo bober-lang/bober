@@ -35,8 +35,11 @@ import { builtin, builtinPath } from "./root"
 /// members those of its members' instances it owns, those of one decl in the order of their hashes, the same however p
 /// is read; its ABI hash, which mono changes, forgotten. If units, a module's decls are its roots and vars, and the
 /// statics of instances of its classes, which are one per program, its copies the others its code reaches, and its
-/// uses the modules of what else it names.
-export function mono(p: Program, main: i32, units = false) throws CompileError { new Mono(p, units).run(main) }
+/// uses the modules of what else it names. Else a function of fewer than small ops, but a closure, is a copy of each
+/// module that reaches it, which compiled by itself may so inline it, and but a root not its module's own.
+export function mono(p: Program, main: i32, units = false, small = 0) throws CompileError {
+	new Mono(p, units, small).run(main)
+}
 
 class Mono {
 	p: Program
@@ -53,9 +56,12 @@ class Mono {
 	private structs = new HashMap[i32, i32]()
 	private main = 0
 	private units: bool
-	/// The instances kept, and the dispatch functions and classes made; the decls listed as their module's own, if units.
-	private keep = new HashMap[i32, bool]()
+	private small: i32
+	/// The decls listed as their module's own, and those apart, a copy of each module that reaches one: if units the
+	/// instances kept and the dispatch functions and classes made that are not their module's own, else the functions
+	/// of fewer than small ops, of which a root is its module's own too.
 	private own = new HashMap[i32, bool]()
+	private apart = new HashMap[i32, bool]()
 	/// Per module, type, member and access, the dispatch function made there.
 	private made = new HashMap[[i32, i32, i32, string], i32]()
 	/// The dispatch functions and classes made.
@@ -68,10 +74,11 @@ class Mono {
 	private binds: [i32, i32][] = []
 	private bound = new HashMap[i32, bool]()
 
-	constructor(p: Program, units: bool) {
+	constructor(p: Program, units: bool, small: i32) {
 		this.p = p
 		this.ins = new Instances(p)
 		this.units = units
+		this.small = small
 	}
 
 	run(main: i32) throws CompileError {
@@ -291,6 +298,13 @@ class Mono {
 		for (const k of statics) {
 			this.own.set(k, true)
 		}
+		// Apart, a function or method of fewer than small ops, but a closure or a method a spread binds, as held.
+		for (const k of kept.filter(k => p.decls[k].kind == decl.Function && !this.bound.has(k))) {
+			const c = ins.insts.get(k)!.code
+			if ((p.decls[k].owner < 0 || p.classOf(k) >= 0) && c != null && c!.ops.length < this.small) {
+				this.apart.set(k, true)
+			}
+		}
 		// Per instance kept, its members kept, in source order, the generic methods instanced for it included.
 		const owned = new HashMap[i32, i32[]]()
 		for (const k of kept.filter(k => p.decls[k].owner >= 0 && this.held(k))) {
@@ -314,6 +328,10 @@ class Mono {
 				x.code = if (i.code == null) null else this.lower(x.module, i.code!, i.info)
 			}
 		}
+		// What else is kept or made: if units apart, else its module's own.
+		for (const k of [...kept, ...this.dispatches].filter(k => !this.own.has(k) && !this.apart.has(k))) {
+			(if (this.units) this.apart else this.own).set(k, true)
+		}
 		const instances = (ds: i32[]) => {
 			const out: i32[] = []
 			for (const d of ds) {
@@ -321,28 +339,29 @@ class Mono {
 			}
 			return out
 		}
-		for (const k of [...kept, ...this.dispatches]) {
-			this.keep.set(k, true)
-		}
 		for (const mi of 0 ... p.modules.length - 1) {
 			const m = p.modules[mi]
 			if (this.units) {
 				m.decls = [...m.decls.filter(d => this.own.has(d)),
 					...byHash(statics.filter(k => p.decls[k].module == mi))]
-				m.copies = this.copies(m)
 			} else {
-				m.decls = [...instances(m.decls), ...byHash(this.dispatches.filter(d => p.decls[d].module == mi))]
+				m.decls = [...instances(m.decls),
+					...byHash(this.dispatches.filter(d => p.decls[d].module == mi))].filter(d => this.own.has(d))
 			}
 			m.inits = instances(m.inits)
+			m.copies = this.copies(m)
 		}
 	}
 
 	/// Whether the members of the owner of instance k hold it: if units, of a class, not an instance but a field, or a
-	/// method a spread binds by name.
+	/// method a spread binds by name; else but a method apart.
 	private held(k: i32): bool {
 		const x = this.p.decls[k]
-		return !this.units || this.p.classOf(k) < 0 || x.kind == decl.Var && (x.mods & decl.Static) == 0
-			|| x.generic < 0 || this.bound.has(k)
+		if (!this.units) {
+			return !this.apart.has(k)
+		}
+		return this.p.classOf(k) < 0 || x.kind == decl.Var && (x.mods & decl.Static) == 0 || x.generic < 0
+			|| this.bound.has(k)
 	}
 
 	/// The decl that k is listed with: itself, or what holds it.
@@ -351,37 +370,51 @@ class Mono {
 		return if (o < 0 || !this.held(k)) k else this.top(o)
 	}
 
-	/// The decls kept that the code of m's decls, and of what they hold, names, but those modules list as their own,
-	/// each in the order reached, with what it holds: a module's copies; the modules of those, m's uses. Of a class,
-	/// also its constructor, which emit finds by name.
+	/// The decls apart that the code of m's decls, and of what they hold, names, but m's own, each in the order reached,
+	/// with what it holds: a module's copies; the modules of the own ones named, m's uses. Of a class, also its
+	/// constructor, which emit finds by name.
 	private copies(m: Module): i32[] {
 		const p = this.p
 		const out: i32[] = []
 		const todo = m.decls.slice(0, m.decls.length)
 		const seen = new HashMap[i32, bool]()
+		for (const d of m.decls) {
+			seen.set(d, true)
+		}
 		const types = new HashMap[i32, bool]()
 		const reach = (d: i32) => {
 			const t = this.top(d)
 			if (this.own.has(t) && !m.uses.includes(p.decls[t].module)) {
 				m.uses.push(p.decls[t].module)
-			} else if (this.keep.has(t) && !this.own.has(t) && !seen.has(t)) {
+			}
+			if (this.apart.has(t) && !seen.has(t)) {
 				seen.set(t, true)
 				out.push(t)
 				todo.push(t)
 			}
 		}
+		// The constructor of a class, of one named too, though its module's own.
+		const ctor = (c: i32) => {
+			const d = if (p.decls[c].kind == decl.Class) p.member(c, p.intern("constructor")) else -1
+			if (d >= 0) {
+				reach(d)
+			}
+		}
+		const named = (d: i32) => {
+			reach(d)
+			if (this.own.has(d)) {
+				ctor(d)
+			}
+		}
 		let i = 0
 		while (i < todo.length) {
 			const x = p.decls[todo[i]]
-			const ctor = if (x.kind == decl.Class) p.member(todo[i], p.intern("constructor")) else -1
-			if (ctor >= 0) {
-				reach(ctor)
-			}
+			ctor(todo[i])
 			i++
 			todo.append(x.members)
 			const c = x.code ?? new Code()
 			for (const t of [x.type, ...p.lists[x.tags], ...c.locals.map(l => l.type)]) {
-				this.named(t, types, reach)
+				this.named(t, types, named)
 			}
 			for (const j of 0 ... c.ops.length - 1) {
 				const s = op.shape[c.ops[j]]
@@ -391,7 +424,7 @@ class Mono {
 						reach(v)
 					} else if (s[k] == op.TypeId || s[k] == op.TypeList) {
 						for (const t of if (s[k] == op.TypeId) [v] else p.lists[v]) {
-							this.named(t, types, reach)
+							this.named(t, types, named)
 						}
 					}
 				}
