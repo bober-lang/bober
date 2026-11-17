@@ -1,4 +1,4 @@
-//! Monomorphization (§8.3): a release build's whole Program in, the same Program out with no generics, interfaces,
+//! Monomorphization (§8.3): a whole Program in, the same Program out with no generics, interfaces,
 //! object types held as unions or Type values left in what its modules list. It runs in three steps. Instantiation
 //! (src/resolve.bob) makes each decl reached from the roots an instance per env and copies its code. Then the types
 //! converted into each interface and object type are collected program-wide, making it the union of them (§4.7). Last,
@@ -7,9 +7,9 @@
 //! numbered for their tags.
 //!
 //! For a module's unit of its own (src/bober.bob's image), the same in each program that has the module, the Program
-//! being of all its package's files, which fixes what each union holds, a module lists only what is its own, and as
-//! its copies what else its code reaches, as C++ does templates: the instances, dispatch functions and classes mono
-//! makes, each defined in every module that lists it.
+//! being of all its package's files, which fixes what each union holds, or a release build's of its own alone, a
+//! module lists only what is its own, and as its copies what else its code reaches, as C++ does templates: the
+//! instances, dispatch functions and classes mono makes, each defined in every module that lists it.
 //!
 //! A dispatch function is a decl of the module using it named `.f[T]` for reading field f of T, `.f=[T]` for writing
 //! it and `.f()[T]` for calling method f. An intrinsic, a function of builtin/ without a body, is called as itself with
@@ -35,7 +35,7 @@ import { builtin, builtinPath } from "./root"
 /// members those of its members' instances it owns, those of one decl in the order of their hashes, the same however p
 /// is read; its ABI hash, which mono changes, forgotten. If units, a module's decls are its roots and vars, and the
 /// statics of instances of its classes, which are one per program, its copies the others its code reaches, and its
-/// uses the modules of what else it names. Else a function of fewer than small ops, but a closure, is a copy of each
+/// uses the modules of what else it names. A function of fewer than small ops, but a closure, is a copy of each
 /// module that reaches it, which compiled by itself may so inline it, and but a root not its module's own.
 export function mono(p: Program, main: i32, units = false, small = 0) throws CompileError {
 	new Mono(p, units, small).run(main)
@@ -57,9 +57,9 @@ class Mono {
 	private main = 0
 	private units: bool
 	private small: i32
-	/// The decls listed as their module's own, and those apart, a copy of each module that reaches one: if units the
-	/// instances kept and the dispatch functions and classes made that are not their module's own, else the functions
-	/// of fewer than small ops, of which a root is its module's own too.
+	/// The decls listed as their module's own, and those apart, a copy of each module that reaches one: the functions
+	/// of fewer than small ops, of which a root is its module's own too, and if units the instances kept and the
+	/// dispatch functions and classes made that are not their module's own.
 	private own = new HashMap[i32, bool]()
 	private apart = new HashMap[i32, bool]()
 	/// Per module, type, member and access, the dispatch function made there.
@@ -328,8 +328,9 @@ class Mono {
 				x.code = if (i.code == null) null else this.lower(x.module, i.code!, i.info)
 			}
 		}
-		// What else is kept or made: if units apart, else its module's own.
-		for (const k of [...kept, ...this.dispatches].filter(k => !this.own.has(k) && !this.apart.has(k))) {
+		// What else is kept or made, but what its owner holds: if units apart, else its module's own.
+		const rest = (k: i32) => this.top(k) == k && !this.own.has(k) && !this.apart.has(k)
+		for (const k of [...kept, ...this.dispatches].filter(rest)) {
 			(if (this.units) this.apart else this.own).set(k, true)
 		}
 		const instances = (ds: i32[]) => {
@@ -353,15 +354,13 @@ class Mono {
 		}
 	}
 
-	/// Whether the members of the owner of instance k hold it: if units, of a class, not an instance but a field, or a
-	/// method a spread binds by name; else but a method apart.
+	/// Whether the members of the owner of instance k hold it: but one apart, and if units, of a class, not an instance
+	/// but a field, or a method a spread binds by name.
 	private held(k: i32): bool {
 		const x = this.p.decls[k]
-		if (!this.units) {
-			return !this.apart.has(k)
-		}
-		return this.p.classOf(k) < 0 || x.kind == decl.Var && (x.mods & decl.Static) == 0 || x.generic < 0
-			|| this.bound.has(k)
+		return !this.apart.has(k)
+			&& (!this.units || this.p.classOf(k) < 0 || x.kind == decl.Var && (x.mods & decl.Static) == 0
+			|| x.generic < 0 || this.bound.has(k))
 	}
 
 	/// The decl that k is listed with: itself, or what holds it.

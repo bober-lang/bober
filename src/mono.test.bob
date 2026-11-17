@@ -475,3 +475,16 @@ function main: () => i32
 End
 `
 }
+
+test "if units, a function of fewer than small ops is its module's own and a copy of each other module reaching it" {
+	const p = new Program()
+	const lib = p.addModule("lib")
+	add(p, lib, -1, "one", decl.Function, fn(p, [], I32), code(p, [], [[op.Int, I32, p.int(1)], [op.Return], [op.End]]))
+	const m = p.addModule("main")
+	add(p, m, -1, "main", decl.Function, fn(p, [], I32),
+		code(p, [], [[op.Call, p.modules[lib].decls[0], p.list([])], [op.Return], [op.End]]))
+	mono(p, m, true, 4)
+	const names = (ds: i32[]) => ds.map(d => qualified(p, d))
+	assert names(p.modules[lib].decls) == ["one"] && names(p.modules[lib].copies) == []
+	assert names(p.modules[m].copies) == ["one"]
+}
