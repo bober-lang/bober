@@ -173,6 +173,8 @@ class Member {
 	hidden = false
 	/// Whether it is readonly, so assigned only by its initializer or, on this, by its class's constructor.
 	readonly = false
+	/// Whether it is a method, which is not assigned.
+	method = false
 	/// Whether its type is known, or is yet to be given by its initializer, or is not, as checking it failed.
 	state: "typed" | "pending" | "failed" = "typed"
 	warning: Warning | null = null
@@ -706,6 +708,7 @@ class Linked {
 			const a = about(t, f.name, f.static)
 			a.hidden = (y.mods & decl.Private) != 0
 			a.readonly = (y.mods & decl.Readonly) != 0
+			a.method = y.kind == decl.Function
 			a.errors = this.errors(m)
 			if (t.kind == "class" && (f.static || y.kind == decl.Function) && f.name != "constructor") {
 				a.decl = this.decl(m)
@@ -2115,6 +2118,7 @@ class Checker {
 			const a = about(t, f.name, f.static)
 			a.hidden = has(m, "private")
 			a.readonly = has(m, "readonly")
+			a.method = m.kind == "method"
 			a.errors.listed = isTok(n.parts[0], "export") && !a.hidden
 			a.warning = this.warning(m)
 			a.state = state
@@ -3851,7 +3855,7 @@ class Checker {
 	/// `T` is a type. `f(args)` calls; `...xs` spreads an array into the arguments of a rest parameter or of
 	/// `push` (§4.5). The operand of `.`, `[` or `(` shall not be `null`; use `?.`, or `as` (§6.6) to trap instead;
 	/// `a!` is `a` cast from `T | null` to `T`. A generic function or method is called or instantiated, not otherwise
-	/// a value.
+	/// a value; no method or instantiation is assigned.
 	///
 	/// `a?.b`, `a?.[i]` and `a?.(args)` give `null` without evaluating the rest of the chain when `a` is `null`; the
 	/// chain's type is the result's type `| null`. `a` shall not be of type `null`, which has no members.
@@ -3975,6 +3979,9 @@ class Checker {
 		if (assigned && a.readonly && !(own && this.fn?.builds == g)) {
 			throw this.error(name.loc, `${k} is readonly`)
 		}
+		if (assigned && a.method) {
+			throw this.error(name.loc, `${k} is a method, not assignable`)
+		}
 		if (a.state == "pending") {
 			throw this.error(name.loc, `${k} is read before its initializer gives it a type`)
 		}
@@ -3999,6 +4006,9 @@ class Checker {
 		}
 		switch (o.kind) {
 			case "function":
+				if (assigned) {
+					throw this.error(n.t.loc, `${this.source(n)} is not assignable`)
+				}
 				const targs: Type[] = []
 				for (const a of args) {
 					targs.push(this.typeExpr(a))
