@@ -1389,10 +1389,7 @@ class Gen {
 			this.op(op.Is, this.ty(Type.union(others)))
 			n++
 		}
-		// In the order of the lowered union, by hash: the checker's, as it made them, is not the same in every program.
-		const literals = t.alternatives().filter(m => m.kind == "literal")
-		sortBy(literals, (a, b) => this.prog.hash(this.ty(a)) < this.prog.hash(this.ty(b)))
-		for (const m of literals) {
+		for (const m of this.literals(t)) {
 			const j = this.ty(compared(st, m) ?? st)
 			this.op(op.Local, s)
 			this.cast(this.ty(st), j)
@@ -1408,6 +1405,15 @@ class Gen {
 			}
 			n++
 		}
+	}
+
+	/// The literals of union t in the order of the lowered union, by hash: the checker's, as it made them, is not the
+	/// same in every program.
+	private literals(t: Type): Type[] {
+		const ls = t.alternatives().filter(m => m.kind == "literal")
+		const hash = (m: Type) => this.prog.hash(this.u.ty(m, true, this))
+		sortBy(ls, (a, b) => hash(a) < hash(b))
+		return ls
 	}
 
 	/// Pushes whether string p spells one of string literal types t: its words compared with those of each literal of
@@ -2718,9 +2724,9 @@ class Gen {
 				}
 				// An integer becomes a value of an integer literal type only where it is one of its literals (§4.2), which
 				// expr's Cast then makes it.
-				const ls = t.alternatives()
 				if (a.type!.isInt() && !a.type!.fits(t)
-					&& ls.every(m => m.kind == "literal" && m.base!.kind == "int")) {
+					&& t.alternatives().every(m => m.kind == "literal" && m.base!.kind == "int")) {
+					const ls = this.literals(t)
 					const from = this.ty(a.type!)
 					const v = this.temp(from)
 					this.op(op.SetLocal, v)
