@@ -132,8 +132,8 @@ export class Instances {
 
 	constructor(p: Program) { this.p = p }
 
-	/// The instance of decl d for the env, made on first use; of a class with its members, but generic methods, which are
-	/// instanced as they are called, and but builtin/'s, of which only what is used is.
+	/// The instance of decl d for the env, made on first use; of a class with its fields and its constructor, which emit
+	/// finds by name, its methods as they are called; but of builtin/'s only what is used is.
 	instance(d: i32, env: i32): i32 throws CompileError {
 		const p = this.p
 		const found = p.instances.get(pair(d, env))
@@ -153,7 +153,9 @@ export class Instances {
 		const k = this.add(p.instance(d, env, owner), [], false)
 		if ((x.kind == decl.Class || x.kind == decl.Interface) && !builtin(p.modules[x.module].path)) {
 			for (const m of x.members) {
-				if (p.decls[m].params.length == 0 && !takesType(p, m, env)) {
+				const y = p.decls[m]
+				if ((y.kind != decl.Function || p.strings[y.name] == "constructor") && y.params.length == 0
+					&& !takesType(p, m, env)) {
 					this.instance(m, env)
 				}
 			}
