@@ -26,7 +26,7 @@ import { HashMap } from "../std/collections/hashmap"
 import { ScopedMap } from "../std/collections/scopedmap"
 import { parseFloat } from "../std/float"
 import { join } from "../std/fs/path"
-import { inf, min } from "../std/math"
+import { inf, max, min } from "../std/math"
 import { ParseError, codePoint, unquoted } from "../std/string"
 import * as decl from "./bc/decl"
 import * as kind from "./bc/kind"
@@ -744,8 +744,10 @@ function primitive(t: Type): i32 {
 	}
 }
 
-/// How many values of a literal an Outlined function sets.
+/// How many values of a literal an Outlined function sets, and how many statements of a long block one runs, or more.
 const chunk = 64
+/// How many statements make a block long, its statements run by Outlined functions.
+const long = 256
 
 /// Where break and continue in a loop go: the levels of the blocks they branch out of.
 class Loop {
@@ -985,10 +987,63 @@ class Gen {
 
 	block(n: Node) {
 		this.scopes.enter()
-		for (const p of n.parts) {
-			this.stmt(p)
+		if (n.parts.length < long) {
+			this.stmts(n.parts)
+		} else {
+			this.chunks(n.parts)
 		}
 		this.scopes.leave()
+	}
+
+	private stmts(ps: Node[]) {
+		for (const p of ps) {
+			this.stmt(p)
+		}
+	}
+
+	/// Lowers the statements ps of a long block, each part of them by an Outlined function, as LLVM takes long on a
+	/// long block. A part is `chunk` statements and on to the last that names what one of them declares, by the text,
+	/// so no sooner than it may end. A statement stays here if that is `chunk` away, as do a class, one that may jump
+	/// out, and a part that one of these or the block's end cuts short.
+	private chunks(ps: Node[]) {
+		const by = new HashMap[string, i32]() // the statement that declares each name
+		const last: i32[] = [] // of each statement, the last that names what it declares, `chunk` away if it stays
+		for (const i of 0 ... ps.length - 1) {
+			const p = ps[i]
+			last.push(if (p.kind == "class") i + chunk else i)
+			within(p, q => {
+				const d = by.get(this.text(q))
+				if (d != null) {
+					last[d!] = max(last[d!], i)
+				}
+				if (q.kind == "jump" && q.t.kind != "throw") {
+					last[i] = i + chunk
+				}
+			})
+			if (p.kind == "var" || p.kind == "function") {
+				within(operands(p)[0], q => by.set(this.text(q), i))
+			}
+		}
+		let lo = 0
+		while (lo < ps.length) {
+			let hi = lo
+			let open = lo // the last statement that names what one of lo to hi declares
+			while (hi < ps.length && last[hi] - hi < chunk && (hi - lo < chunk || open >= hi)) {
+				open = max(open, last[hi])
+				hi++
+			}
+			if (hi - lo >= chunk && open < hi) {
+				const part = ps.slice(lo, hi)
+				const pos = part[0].t.loc.pos
+				this.nested(`${pos}`, Type.function([], Null), decl.Outlined, pos, g => g.stmts(part))
+				this.op(op.CallRef, 0)
+				this.op(op.Drop)
+			} else {
+				hi = min(hi + 1, ps.length)
+				this.stmts(ps.slice(lo, hi))
+			}
+			lo = hi
+		}
 	}
 
 	private stmt(p: Node) {
@@ -2869,6 +2924,15 @@ function eached(t: Type): bool {
 }
 
 function holdsTypes(t: Type): bool { return isTypeValue(t) || t.kind == "array" && holdsTypes(t.params[0]) }
+
+/// Calls visit with p and each node in it.
+function within(p: Node, visit: (q: Node) => void): void {
+	visit(p)
+	for (const q of p.parts) {
+		within(q, visit)
+	}
+}
+
 /// Whether p names something, so that its value may be other than what its source spells; this, often large, alone is
 /// not shown.
 function names(p: Node): bool { return if (p.kind == "token") p.t.kind == "ident" else p.parts.some(names) }
