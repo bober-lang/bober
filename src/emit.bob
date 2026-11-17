@@ -40,6 +40,7 @@ import { Code, Module, Program, pair } from "./bc/program"
 import { showType } from "./bc/show"
 import * as c from "./c/type"
 import { CompileError } from "./error"
+import { fits } from "./mono"
 import { bases, embedded, fieldOf } from "./resolve"
 import { builtin } from "./root"
 
@@ -2625,6 +2626,10 @@ class Emitter {
 			}
 			return this.cast({ v: this.cast(v, u), t: u }, t)
 		}
+		const called = if (tk == kind.Union && fk == kind.Func && !this.holds(t, f)) this.calledAs(f, t) else null
+		if (called != null) {
+			return this.cast({ v: this.cast(v, called), t: called }, t)
+		}
 		if (tk == kind.Optional) {
 			// Given, or as given as v, an optional of another type, as a generic's param bound.
 			const opt = fk == kind.Optional
@@ -2672,16 +2677,20 @@ class Emitter {
 		}
 		if (tk == kind.Union && fk == kind.Union) {
 			// Tags mean the same in every union: the value passes as is, checked only if f has a member t lacks; a
-			// number member t lacks but has a wider one for widens (§4.1). A thin one is made fat for it, and thin again.
+			// number member t lacks but has a wider one for widens (§4.1), a function one is called as one of fewer params.
+			// A thin one is made fat for it, and thin again.
 			const u = this.fat(v)
 			const lacking = this.p.members(f).filter(m => !this.holds(t, m))
 			const widened = lacking.filter(m => this.p.members(t).some(x => kind.widens(m, x)))
-			if (lacking.length > widened.length) {
-				const ok = this.ir().binary("or", this.isaOf(v, lacking, t), this.tagIn(this.tagOf(u), widened))
-				this.check(ok, "cast to a type that is not the value's")
-			}
-			const r = this.widen(u, widened, t)
-			return if (this.thin(t)) this.refOf(r) else r
+			const fns = lacking.filter(m => this.calledAs(m, t) != null)
+			return this.byMember(u, fns, t, () => {
+				if (lacking.length > widened.length + fns.length) {
+					const ok = this.ir().binary("or", this.isaOf(v, lacking, t), this.tagIn(this.tagOf(u), widened))
+					this.check(ok, "cast to a type that is not the value's")
+				}
+				const r = this.widen(u, widened, t)
+				return if (this.thin(t)) this.refOf(r) else r
+			})
 		}
 		if (tk == kind.Union) {
 			return if (this.thin(t)) this.refIn(v.v, f) else this.unionOf(this.tag(f), v.v, f)
@@ -2696,25 +2705,10 @@ class Emitter {
 			// converted; else t, which may be no member, where a test of a class the union does not hold narrows to it.
 			const u = this.fat(v)
 			const ms = p.members(f).filter(m => this.converts(m, t) && (kind.widens(m, t) || p.kind(m) == kind.Func))
-			if (ms.length == 0) {
+			return this.byMember(u, ms, t, () => {
 				this.check(this.isa(v, t), "cast to a type that is not the value's")
 				return this.unbits(u, t)
-			}
-			const r = this.scratch(this.ll(t), promoted)
-			const done = this.label()
-			for (const m of ms) {
-				const [yes, no] = [this.label(), this.label()]
-				this.condBr(this.ir().icmp("eq", this.tagOf(u), this.tag(m)), yes, no)
-				this.start(yes)
-				this.ir().store(this.cast({ v: this.unbits(u, m), t: m }, t), r, false)
-				this.jump(done)
-				this.start(no)
-			}
-			this.check(this.isa(v, t), "cast to a type that is not the value's")
-			this.ir().store(this.unbits(u, t), r, false)
-			this.jump(done)
-			this.start(done)
-			return this.ir().load(this.ll(t), r, false)
+			})
 		}
 		if (fk == kind.Func && tk == kind.Func && (!this.dyn || this.converts(f, t))) {
 			return this.closure(this.adapter(f, t), [v.v])
@@ -2748,6 +2742,32 @@ class Emitter {
 			return v.v
 		}
 		return this.ir().cast(if (fw > tw) "trunc" else if (kind.isSigned(fk)) "sext" else "zext", v.v, tt)
+	}
+
+	/// Union u converted to t: of a member of ms, that member's value cast to t, else other's.
+	private byMember(u: Value, ms: i32[], t: i32, other: () => Value): Value {
+		if (ms.length == 0) {
+			return other()
+		}
+		const r = this.scratch(this.ll(t), promoted)
+		const done = this.label()
+		for (const m of ms) {
+			const [yes, no] = [this.label(), this.label()]
+			this.condBr(this.ir().icmp("eq", this.tagOf(u), this.tag(m)), yes, no)
+			this.start(yes)
+			this.ir().store(this.cast({ v: this.unbits(u, m), t: m }, t), r, false)
+			this.jump(done)
+			this.start(no)
+		}
+		this.ir().store(other(), r, false)
+		this.jump(done)
+		this.start(done)
+		return this.ir().load(this.ll(t), r, false)
+	}
+
+	/// The member of union t a function of type f it lacks is called as, one of fewer params, if any.
+	private calledAs(f: i32, t: i32): i32 | null {
+		return this.p.members(t).find(m => this.p.kind(m) == kind.Func && fits(this.p, f, m))
 	}
 
 	/// The union of tag holding x of type t: a number's bits in the second word, else in the third its ref.
