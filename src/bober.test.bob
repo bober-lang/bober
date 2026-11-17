@@ -305,6 +305,27 @@ test "a test file whose report is kept leaves no pin of the image, which its lau
 	assert pins() == before
 }
 
+test "a test file's report is not kept by a file it read that changed while it ran" {
+	const [main, data] = [`${home()}/reads.bob`, `${home()}/data.txt`]
+	mkdirAll(home())
+	writeFile(main, `test "t" { assert readFile("${data}") == "a" }\n`)
+	writeFile(data, "a")
+	const run = () => runTests(main, [], () => build(main, true, new Compile(), true))
+	const logs = () => glob(`${home()}/build/tmp/*.log`)
+	dir = `${home()}/build`
+	try {
+		const first = run()
+		writeFile(data, "a") // as it was, but perhaps after the test read it
+		assert first()[0] == 0
+		for (const log of logs()) {
+			remove(log)
+		}
+		assert run()()[0] == 0 && logs() != [] // run again, not its report kept
+	} finally {
+		dir = "build"
+	}
+}
+
 test "a module's unit as lowered and monomorphized are held side by side, each build linking its own" {
 	anew()
 	const [out, mono] = [built(files(1)), built([], "-O1")]

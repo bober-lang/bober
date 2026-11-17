@@ -499,15 +499,16 @@ export function runTests(main: string, args: string[], command: () => string[]):
 		}
 		mkdirAll(tmp)
 		setenv("BOBER_TMP", tmp, 1)
+		const since = stat(tmp).modified // by the files' clock, before the tests read any
 		const p = process.start(cmd, out)
-		return () => tested(p, out, code, file)
+		return () => tested(p, out, code, file, since)
 	} catch (e: CompileError | IoError) {
 		return () => failure(e)
 	}
 }
 
-/// What runTests gives of the tests p runs, printing to out, kept by code in file unless code is "".
-function tested(p: process.Process, out: string, code: string, file: string): [i32, string] {
+/// What runTests gives of the tests p runs, started at since, printing to out, kept by code in file unless code is "".
+function tested(p: process.Process, out: string, code: string, file: string, since: i64): [i32, string] {
 	try {
 		const status = p.wait()
 		// The report, which a crash cuts off after the key of the test it was in, then the files the tests read.
@@ -524,7 +525,7 @@ function tested(p: process.Process, out: string, code: string, file: string): [i
 					k.report = r
 					const files = decodeJson[string[]](reads)
 					sortBy(files, (a, b) => a < b)
-					k.files = unique(files).map(x => [x, hashOf(x)])
+					k.files = unique(files).map(x => [x, hashOf(x, since)])
 					mkdirAll(`${dir}/kept`)
 					save(file, encode(k))
 				}
@@ -542,10 +543,10 @@ function failure(e: CompileError | IoError): [i32, string] {
 	return [1, quoted(if (e instanceof IoError) e.message() else e.msg)]
 }
 
-/// The hash of the bytes of the file at path, "" if there is none.
-function hashOf(path: string): string {
+/// The hash of the bytes of the file at path, "" if there is none, "changed" if it changed at since or after.
+function hashOf(path: string, since: i64 = 0): string {
 	try {
-		return `${fnv(readFile(path))}`
+		return if (since > 0 && stat(path).modified >= since) "changed" else `${fnv(readFile(path))}`
 	} catch (e: IoError) {
 		return ""
 	}
