@@ -26,3 +26,16 @@ test "a test file is a valid module, whose tests pass where there is node" {
 		}
 	}
 }
+
+test "a string literal of more bytes than V8 takes in one array.new_fixed" {
+	let s = "a"
+	for (const _ of 1 ... 14) {
+		s += s
+	}
+	const path = `${dir}/long.bob`
+	assert writeFile(path, `test "long" { assert "${s}\\0b"[16385] == 98 }`)
+	const f = new Compile()
+	f.wasm = true
+	const cmd = build(path, true, f, false)
+	assert !node() || run(cmd, `${dir}/long.wasm.out`) == 0
+}
