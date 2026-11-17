@@ -872,8 +872,9 @@ class Binding {
 	/// Whether a function it is captured by assigns it, so that it is not narrowed.
 	shared = false
 	symbol = ""
-	/// For the binding of a member path, that path, as this.a.b.
+	/// For the binding of a member path, that path, as this.a.b, and the local it starts at, null at this.
 	path = ""
+	from: Binding | null = null
 	/// A generic class's, interface's or alias's type params.
 	params: Type[] = []
 	/// For a const initialized by an integer or string constant, the literal type its name denotes in a type (4.2).
@@ -2972,8 +2973,9 @@ class Checker {
 	/// Narrows to none the member paths under the assigned target p, whose members may be anything now.
 	private clobber(p: Node) {
 		const s = this.path(p)
+		const r = this.from(p)
 		for (const b of this.paths) {
-			if (s != null && startsWith(b.path, `${s}.`)) {
+			if (s != null && b.from == r && startsWith(b.path, `${s}.`)) {
 				this.narrow([new Narrowing(b, null)])
 			}
 		}
@@ -3744,8 +3746,9 @@ class Checker {
 		if (s == null) {
 			return null
 		}
+		const r = this.from(p)
 		for (const b of this.paths) {
-			if (b.path == s) {
+			if (b.path == s && b.from == r) {
 				return b
 			}
 		}
@@ -3755,6 +3758,7 @@ class Checker {
 		const b = new Binding(declared, true, false)
 		b.depth = this.depth
 		b.path = s
+		b.from = r
 		this.paths.push(b)
 		return b
 	}
@@ -3769,6 +3773,11 @@ class Checker {
 			return if (o == null) null else `${o}.${this.text(p.parts[1].t)}`
 		}
 		return if (p.kind == "token" && this.place(p) != null) this.text(p.t) else null
+	}
+
+	/// The local member path p starts at, as a later block may declare another of its name; null at this.
+	private from(p: Node): Binding | null {
+		return if (p.kind == "member") this.from(p.parts[0]) else this.place(p)
 	}
 
 	/// Opens a function's scope, with no member paths narrowed and mutable variables unnarrowed, as they may change
