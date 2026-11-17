@@ -299,6 +299,37 @@ static bober_string keyOf(const bober_type *t) {
   return s;
 }
 
+/// The name of r, formed of t: a union's of its members' names, else t's, each of the n params' names in it the arg's,
+/// in parens if a union or function an array is of.
+static bober_string nameOf(const bober_type *r, const bober_type *t, int64_t n, const bober_type *const *params, const bober_type *const *args) {
+  const char *s = t->name.bytes;
+  int64_t size = 0, room = 64, l = len(t->name);
+  char *b = alloc(room);
+  if (r->kind == KUNION)
+    for (int64_t i = 0; i < r->nparts; i++) {
+      if (i) put(&b, &size, &room, " | ", 3);
+      put(&b, &size, &room, r->parts[i]->name.bytes, len(r->parts[i]->name));
+    }
+  else
+    for (int64_t i = 0, j = 0; i < l; i = j) {
+      while (j < l && (s[j] == '_' || (s[j] | 32) >= 'a' && (s[j] | 32) <= 'z' || s[j] >= '0' && s[j] <= '9')) j++;
+      if (j == i) {
+        put(&b, &size, &room, s + j++, 1);
+        continue;
+      }
+      const bober_type *a = 0;
+      for (int64_t k = 0; k < n; k++)
+        if (len(params[k]->name) == j - i && !memcmp(params[k]->name.bytes, s + i, j - i)) a = args[k];
+      bool paren = a && j < l && s[j] == '[' && (a->kind == KUNION || a->kind == KFUNCTION);
+      if (paren) put(&b, &size, &room, "(", 1);
+      put(&b, &size, &room, a ? a->name.bytes : s + i, a ? len(a->name) : j - i);
+      if (paren) put(&b, &size, &room, ")", 1);
+    }
+  bober_string name = string(b, size);
+  free(b);
+  return name;
+}
+
 /// r's hash, as src/bc/program.bob's of its head and parts.
 static uint64_t hashOf(const bober_type *r) {
   if (r->elem) return mix(r->head, r->elem->hash);
@@ -376,6 +407,7 @@ static const bober_type *shape(const bober_type *t, int64_t n, const bober_type 
     free((void *)r->key.bytes), free(fields), free(parts), free(r);
     return have;
   }
+  r->name = nameOf(r, t, n, params, args);
   // Added first, so that its canon, and a class's fields that hold it, find it.
   if (nominal) r->base = t->base ? t->base : t;
   add(r);
