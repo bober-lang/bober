@@ -36,7 +36,7 @@ import { Embed, Extern, Mixin, Static } from "./bc/decl"
 import * as kind from "./bc/kind"
 import * as op from "./bc/op"
 import { Opcode } from "./bc/op"
-import { Code, Program, pair } from "./bc/program"
+import { Code, Module, Program, pair } from "./bc/program"
 import { showType } from "./bc/show"
 import * as c from "./c/type"
 import { CompileError } from "./error"
@@ -220,6 +220,8 @@ class Emitter {
 	private fnDecl = 0
 	private ctor = false
 	private selves = new HashMap[Value, bool]()
+	/// The module whose source the code being emitted is of, another than m for a copy; its places are in that.
+	private src: Module
 	/// Per local, the New whose instances it alone holds, as their owner, else -1, as newsOf has them; and the values
 	/// loaded from an owner, by it.
 	private newAt: i32[] = []
@@ -265,6 +267,7 @@ class Emitter {
 		this.p = p
 		this.m = m
 		this.path = p.modules[m].path
+		this.src = p.modules[m]
 		this.b = b
 		this.o = o
 		this.dyn = o.dyn
@@ -298,7 +301,7 @@ class Emitter {
 
 	/// The line and column of the source position pos, from 1.
 	private lineCol(pos: i32): [u32, u32] {
-		const newlines = this.p.modules[this.m].newlines
+		const newlines = this.src.newlines
 		const i = lowerBound(newlines, pos) as i32
 		const bol = if (i == 0) 0 else newlines[i - 1] + 1
 		return [(i + 1) as u32, (pos - bol + 1) as u32]
@@ -379,6 +382,7 @@ class Emitter {
 		for (const d of this.decls) {
 			this.decl(d)
 		}
+		this.src = p.modules[this.m]
 		this.init()
 		if (this.o.main < 0) {
 			this.cMain(entry(this.path, false), false)
@@ -406,6 +410,7 @@ class Emitter {
 			return
 		}
 		this.fnDecl = d
+		this.src = p.modules[x.module]
 		this.ctor = c >= 0 && (if (x.kind == decl.Function) this.name(d) == "constructor" else (x.mods & Static) == 0)
 		const code = x.code
 		if (x.kind == decl.Class) {
@@ -663,7 +668,7 @@ class Emitter {
 				line = this.lineCol(pos)[0]
 			}
 		}
-		b.debugFunction(f, line)
+		b.debugFunction(f, this.src.path, line)
 		const n = if (env) 0 else scope.length
 		this.enter(scope, this.params(f, 0, n))
 		// A closure's env: its code, its captures, each copied in or its cell's ref, then its descriptors.
@@ -3869,7 +3874,7 @@ class Emitter {
 	}
 
 	/// The source path and position of the op being emitted, as rt.c's functions that trap take them.
-	private site(): Value[] { return [this.cstr(this.path), this.b.constInt(this.i32, this.pos)] }
+	private site(): Value[] { return [this.cstr(this.src.path), this.b.constInt(this.i32, this.pos)] }
 	// The stack and the blocks.
 	private push(v: Value, t: i32) { this.stack.push({ v: v, t: this.norm(t) }) }
 	private pop(): V { return this.heap(this.taken(this.stack.pop())) }
