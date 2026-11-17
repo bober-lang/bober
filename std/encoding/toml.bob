@@ -52,9 +52,8 @@ export function decode[T extends Decodable](s: string): T throws ParseError {
 					d.expect(rbracket)
 					if (array) {
 						d.expect(rbracket)
-					} else {
-						d.define(header, at)
 					}
+					d.header(header, array, at)
 					root = d.walk[T](root, header, 0, if (array) "array" else "table", at)
 				} else {
 					root = d.pair[T](root, header)
@@ -178,6 +177,13 @@ function key(k: string): string {
 
 function bare(ch: u8): bool { return isAlphanumeric(ch) || ch == underscore || ch == minus }
 
+/// What a key path is defined as: a value, a table by a [table] or by dotted keys, which more of them may add to, or
+/// an [[array]] of tables.
+type Defined = "value" | "table" | "dotted" | "array"
+
+/// The key path of keys, each quoted as need be.
+function joined(path: string[]): string { return path.map(key).join(".") }
+
 /// An inline table of any keys.
 class Keys {
 	all: Unknown[] @Rest = []
@@ -186,17 +192,17 @@ class Keys {
 class Decoder {
 	s: string
 	i = 0
-	/// The paths of the arrays of tables begun, which a [[header]] appends to rather than replaces.
-	arrays: string[] = []
-	/// The key paths of the keys and [tables] defined, which may not be again: in an inline table, its own.
-	defined: string[] = []
+	/// The key paths defined, and as what, which no key or [table] may define again: in an inline table, its own.
+	defined: [string, Defined][] = []
+	/// Whether the last [[header]] appends to an array begun before, rather than begins it.
+	begun = false
 
 	constructor(s: string) { this.s = s }
 
 	pair[T extends Decodable](v: T, table: string[]): T throws ParseError {
 		const at = this.i
 		const path = [...table, ...this.keys()]
-		this.define(path, at)
+		this.define(path, table.length, at)
 		this.expect(equal)
 		this.space()
 		return this.walk[T](v, path, 0, "value", at)
@@ -245,7 +251,7 @@ class Decoder {
 				}
 				if (T.elem.kind == "class") {
 					if (i == path.length && leaf == "array") {
-						const xs: T = if (this.again(path)) v else []
+						const xs: T = if (this.begun) v else []
 						xs.push(new T.elem())
 						return xs
 					}
@@ -255,22 +261,40 @@ class Decoder {
 		throw new ParseError("syntax", at)
 	}
 
-	/// Marks path defined, or throws a ParseError at at if it was.
-	define(path: string[], at: i32) throws ParseError {
-		const k = path.map(key).join(".")
-		if (this.defined.includes(k)) {
+	/// Defines path as a value of the table of its first n keys, the tables between as dotted, or throws a ParseError
+	/// at at if path or a key under it is defined, or a table between is not one of dotted keys.
+	define(path: string[], n: i32, at: i32) throws ParseError {
+		for (const i of n + 1 ... path.length - 1) {
+			const k = joined(path.slice(0, i))
+			const d = this.defined.find(e => e[0] == k)
+			if (d == null) {
+				this.defined.push([k, "dotted"])
+			} else if (d[1] != "dotted") {
+				throw new ParseError("syntax", at)
+			}
+		}
+		const k = joined(path)
+		if (this.defined.some(e => e[0] == k || startsWith(e[0], `${k}.`))) {
 			throw new ParseError("syntax", at)
 		}
-		this.defined.push(k)
+		this.defined.push([k, "value"])
 	}
 
-	/// Whether the array of tables at path was begun before, marking it begun and what is in its new element not.
-	again(path: string[]): bool {
-		const k = path.map(key).join(".")
-		const begun = this.arrays.includes(k)
-		this.arrays = [k, ...this.arrays.filter(a => a != k && !startsWith(a, `${k}.`))]
-		this.defined = this.defined.filter(a => !startsWith(a, `${k}.`))
-		return begun
+	/// Defines path as a [table], or as an [[array]] whose new element nothing under it is defined in yet, or throws a
+	/// ParseError at at if path is defined otherwise or under a value, or a new [[array]] has keys under it.
+	header(path: string[], array: bool, at: i32) throws ParseError {
+		const k = joined(path)
+		this.begun = array && this.defined.some(e => e[0] == k && e[1] == "array")
+		const taken = (e: [string, Defined]) => e[0] == k || (array && startsWith(e[0], `${k}.`))
+			|| e[1] == "value" && startsWith(k, `${e[0]}.`)
+		if (!this.begun && this.defined.some(taken)) {
+			throw new ParseError("syntax", at)
+		}
+		if (this.begun) {
+			this.defined = this.defined.filter(e => !startsWith(e[0], `${k}.`))
+		} else {
+			this.defined.push([k, if (array) "array" else "table"])
+		}
 	}
 
 	value[T extends Decodable](): T throws ParseError {
