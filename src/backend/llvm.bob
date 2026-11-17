@@ -55,7 +55,8 @@ import { LLVMAdd, LLVMAddAttributeAtIndex, LLVMAddCallSiteAttribute, LLVMAddCase
 	LLVMSIToFP, LLVMSizeOf, LLVMSRem, LLVMStructGetTypeAtIndex, LLVMStructTypeInContext, LLVMStructTypeKind, LLVMSub,
 	LLVMTokenTypeInContext, LLVMTrunc, LLVMTypeOf, LLVMUDiv, LLVMUIToFP, LLVMURem, LLVMValueAsMetadata,
 	LLVMVoidTypeInContext, LLVMWeakAnyLinkage, LLVMExternalWeakLinkage, LLVMWeakODRLinkage, LLVMXor, LLVMZExt,
-	LLVMConstAddrSpaceCast, LLVMGetConstOpcode, LLVMIsAConstantExpr } from "llvm-c/Core.h"
+	LLVMConstAddrSpaceCast, LLVMGetConstOpcode, LLVMIsAConstantExpr, LLVMExternalLinkage, LLVMGetFirstGlobal,
+	LLVMGetNextGlobal } from "llvm-c/Core.h"
 
 import { LLVMReturnStatusAction, LLVMVerifyModule } from "llvm-c/Analysis.h"
 import { LLVMDisposeErrorMessage, LLVMGetErrorMessage } from "llvm-c/Error.h"
@@ -119,6 +120,8 @@ export class LLVM implements Backend {
 	private gc = false
 	private layouts = new HashMap[Type, Value]()
 	private roots: Value[] = []
+	/// Whether link moved others into it, by which it is the whole program.
+	private linked = false
 	/// The access tags of an array's header and of its elements, once aliasing made them.
 	private tbaa: u64[] = []
 
@@ -732,6 +735,9 @@ export class LLVM implements Backend {
 			this.scalars()
 		}
 		this.optimize()
+		if (this.linked) {
+			this.closed()
+		}
 		if (this.gc) {
 			this.frames()
 			this.barriers()
@@ -739,14 +745,41 @@ export class LLVM implements Backend {
 		}
 	}
 
-	/// Moves the module of other, verified, into this one, to be optimized with it as one.
+	/// Moves the module of other, verified, into this one, to be optimized with it as one: the whole program, once all
+	/// its modules are.
 	link(other: LLVM) {
 		if (other.gc && !this.gc) {
 			this.collected()
 		}
+		this.linked = true
 		if (LLVMLinkModules2(this.m, other.m) != 0) {
 			throw new CompileError("cannot link the modules")
 		}
+	}
+
+	/// Once optimized, makes its own what the whole program defines by a name C cannot spell, one with a . or a : in it,
+	/// and drops what nothing uses any more, as a function inlined into each caller. Not before: LLVM inlines an own
+	/// function into its only caller however large, and takes longer.
+	private closed() {
+		const hide = (v: Value) => {
+			const n = [0 as u64]
+			const name = fromBytes(LLVMGetValueName2(v, n), n[0])
+			if (LLVMIsDeclaration(v) == 0 && LLVMGetLinkage(v) == (LLVMExternalLinkage as u32)
+				&& (indexOf(name, ".") >= 0 || indexOf(name, ":") >= 0)) {
+				LLVMSetLinkage(v, LLVMInternalLinkage as u32)
+			}
+		}
+		let f = LLVMGetFirstFunction(this.m)
+		while (f != 0) {
+			hide(f)
+			f = LLVMGetNextFunction(f)
+		}
+		let g = LLVMGetFirstGlobal(this.m)
+		while (g != 0) {
+			hide(g)
+			g = LLVMGetNextGlobal(g)
+		}
+		failed(LLVMRunPasses(this.m, "globaldce", this.tm, LLVMCreatePassBuilderOptions()))
 	}
 
 	/// Runs LLVM's default pass pipeline at this module's level.
