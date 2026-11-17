@@ -952,10 +952,11 @@ export class LLVM implements Backend {
 		}
 	}
 
-	/// Spills each value of fn that is a struct or array holding a ref, to a slot of its own, which sroa splits.
+	/// Spills each value of fn that is a struct or array holding a ref and may live across a call that collects, to a
+	/// slot of its own, which sroa splits.
 	private spillAll(fn: Value) {
 		for (const v of values(fn)) {
-			if (aggregate(LLVMTypeOf(v))) {
+			if (aggregate(LLVMTypeOf(v)) && crosses(fn, v)) {
 				LLVMPositionBuilderBefore(this.b, LLVMGetFirstInstruction(LLVMGetEntryBasicBlock(fn)))
 				const slot = LLVMBuildAlloca(this.b, LLVMTypeOf(v), "")
 				this.spill(v, slot, () => slot)
@@ -1134,6 +1135,26 @@ function collects(i: Value): bool {
 	return LLVMIsAFunction(f) == 0
 		|| LLVMGetIntrinsicID(f) == 0
 		&& LLVMGetStringAttributeAtIndex(f, LLVMAttributeFunctionIndex as u32, "gc-leaf-function", 16) == 0
+}
+
+/// Whether v, a param or instruction of fn, may live across a call where the collector may run: used by a phi, in
+/// another block than it is made in, or there after such a call.
+function crosses(fn: Value, v: Value): bool {
+	let uses = 0
+	let u = LLVMGetFirstUse(v)
+	while (u != 0) {
+		uses++
+		u = LLVMGetNextUse(u)
+	}
+	let i = if (LLVMIsAInstruction(v) != 0) LLVMGetNextInstruction(v)
+		else LLVMGetFirstInstruction(LLVMGetEntryBasicBlock(fn))
+	while (uses > 0 && i != 0) {
+		for (const k of 0 ... LLVMGetNumOperands(i) - 1) {
+			uses -= if (!isOp(i, LLVMPHI) && LLVMGetOperand(i, k as u32) == v) 1 else 0
+		}
+		i = if (collects(i)) 0 else LLVMGetNextInstruction(i)
+	}
+	return uses > 0
 }
 
 /// Whether the type t is a struct or array holding a ref.
