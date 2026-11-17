@@ -466,11 +466,12 @@ export class LLVM implements Backend {
 	fence() { LLVMBuildFence(this.b, LLVMAtomicOrderingSequentiallyConsistent as u32, 0, "") }
 	trap() { this.intrinsic("llvm.trap", [], []) }
 
-	readable(p: Value, n: Value, align: i64) {
+	readable(p: () => Value, n: () => Value, align: i64) {
 		const f = LLVMGetIntrinsicDeclaration(this.m, LLVMLookupIntrinsicID("llvm.assume", 11), 0, 0)
-		const bundles = [bundle("dereferenceable", [p, n])]
+		const at = p()
+		const bundles = [bundle("dereferenceable", [at, n()])]
 		if (align > 1) {
-			bundles.push(bundle("align", [p, this.constInt(this.int(64), align)]))
+			bundles.push(bundle("align", [at, this.constInt(this.int(64), align)]))
 		}
 		LLVMBuildCallWithOperandBundles(this.b, LLVMGlobalGetValueType(f), f, [this.constInt(this.int(1), 1)], 1,
 			bundles, bundles.length as u32, "")
