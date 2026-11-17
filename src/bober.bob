@@ -478,6 +478,7 @@ class TestCache {
 /// for them, giving their exit status and their report, the JSON object src/rt.c prints, ended by the exit status if a
 /// crash cut it off, or else what failed as a JSON string.
 export function runTests(main: string, args: string[], command: () => string[]): () => [i32, string] {
+	let lock: File | null = null // held till its report is kept, which a bober test running them at once waits for
 	try {
 		const launch = command()
 		const cmd = [...launch, ...args]
@@ -485,9 +486,14 @@ export function runTests(main: string, args: string[], command: () => string[]):
 		const out = `${dir}/tmp/${flat}.log`
 		const file = `${dir}/kept/${flat}`
 		const code = if (built == "") "" else `${built} ${args.map(quoted).join(" ")}`
+		mkdirAll(`${dir}/tmp`)
+		const held = open(out, "a")
+		lock = held
+		held.lock(false, true)
 		try {
 			const k = decodeJson[TestCache](readFile(file))
 			if (code != "" && k.code == code && k.files.every(x => hashOf(x[0]) == x[1])) {
+				held.close()
 				for (const pin of launch.filter(a => endsWith(a, ".run"))) {
 					remove(pin) // as src/launch.c would, which does not run
 				}
@@ -502,14 +508,16 @@ export function runTests(main: string, args: string[], command: () => string[]):
 		setenv("BOBER_TMP", tmp, 1)
 		const since = stat(tmp).modified // by the files' clock, before the tests read any
 		const p = process.start(cmd, out)
-		return () => tested(p, out, code, file, since)
+		return () => tested(p, held, out, code, file, since)
 	} catch (e: CompileError | IoError) {
+		lock?.close()
 		return () => failure(e)
 	}
 }
 
-/// What runTests gives of the tests p runs, started at since, printing to out, kept by code in file unless code is "".
-function tested(p: process.Process, out: string, code: string, file: string, since: i64): [i32, string] {
+/// What runTests gives of the tests p runs, started at since, printing to out, kept by code in file unless code is "",
+/// closing lock.
+function tested(p: process.Process, lock: File, out: string, code: string, file: string, since: i64): [i32, string] {
 	try {
 		const status = p.wait()
 		// The report, which a crash cuts off after the key of the test it was in, then the files the tests read.
@@ -536,6 +544,8 @@ function tested(p: process.Process, out: string, code: string, file: string, sin
 		return [if (status == 0) 1 else status, quoted(trim(`${text}\nexit ${status}`))]
 	} catch (e: IoError) {
 		return failure(e)
+	} finally {
+		lock.close()
 	}
 }
 

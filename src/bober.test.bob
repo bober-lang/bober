@@ -340,6 +340,33 @@ test "test files whose paths differ by / and _, run at once, each keep their own
 	}
 }
 
+test "a test file is locked while its tests run, and freed after, kept or not" {
+	const main = `${home()}/locked.bob`
+	const flat = replace(main, "/", "%2F")
+	mkdirAll(home())
+	writeFile(main, `test "t" { assert true }\n`)
+	const kept = `${home()}/build/kept/${flat}`
+	if (exists(kept)) {
+		remove(kept) // an earlier run's report, which would skip the run
+	}
+	const free = () => {
+		const f = open(`${home()}/build/tmp/${flat}.log`, "a")
+		const was = f.lock(false, false)
+		f.close()
+		return was
+	}
+	const run = () => runTests(main, [], () => build(main, true, new Compile(), true))
+	dir = `${home()}/build`
+	try {
+		const ran = run()
+		assert !free()
+		assert ran()[0] == 0 && free()
+		assert run()()[0] == 0 && free() // its report kept
+	} finally {
+		dir = "build"
+	}
+}
+
 test "a module's unit as lowered and monomorphized are held side by side, each build linking its own" {
 	anew()
 	const [out, mono] = [built(files(1)), built([], "-O1")]
