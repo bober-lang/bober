@@ -16,6 +16,8 @@
 //! type in the program, else its id, so that a tag means the same in every union; a ref member, or a boxed string or
 //! T[n], is in ref and any other in bits, so that a word is a ref by its type alone. In a field or element it is packed
 //! (§4.4, stored), its members' refs sharing a word, where the collector may find a number, but below 2^32, so no ref.
+//! A union of null and one member held by a ref is, unless as lowered, that ref, zero for null, as it is packed: thin;
+//! fat makes it the three words.
 //! A function value is a ref to { ptr code, captures... }, its code taking it first. A thrown value is held as a union
 //! of any type: the union without members, which as a type no value has, so that the two meanings never meet.
 //!
@@ -801,7 +803,7 @@ class Emitter {
 				const u = this.pop()
 				const f = this.open(o, kind.None, i)
 				f.others = p.lists[n].map(_ => this.label())
-				this.branchTag(this.tagOf(u.v), p.lists[n].map(t => p.members(t)), f.others)
+				this.branchTag(this.tagOf(this.fat(u)), p.lists[n].map(t => p.members(t)), f.others)
 				this.start(f.others.remove(0))
 			case op.Else:
 				const f = this.frames[this.frames.length - 1]
@@ -1849,7 +1851,7 @@ class Emitter {
 			// Its ref, or the address of a copy of its bits.
 			const v = this.pop()
 			this.touch(v.t) // by identity
-			const u = v.v
+			const u = this.fat(v)
 			const r = this.ir().cast("ptrtoint", this.refOf(u), this.i64)
 			const bits = this.spill(this.bitsOf(u), this.i64, this.slot(this.i64))
 			const at = this.ir().cast("ptrtoint", bits, this.i64)
@@ -2383,8 +2385,9 @@ class Emitter {
 		const u = src.t
 		if (this.p.kind(u) == kind.Union) {
 			const ms = this.p.members(u)
-			this.cases(ms.length, to => this.branchTag(this.tagOf(src.v), ms.map(m => [m]), to),
-				i => this.copy({ v: this.unbits(src.v, ms[i]), t: ms[i] }, dst))
+			const x = this.fat(src)
+			this.cases(ms.length, to => this.branchTag(this.tagOf(x), ms.map(m => [m]), to),
+				i => this.copy({ v: this.unbits(x, ms[i]), t: ms[i] }, dst))
 			return
 		}
 		const held = this.busy.length
@@ -2664,38 +2667,46 @@ class Emitter {
 		}
 		if (tk == kind.Union && fk == kind.Union) {
 			// Tags mean the same in every union: the value passes as is, checked only if f has a member t lacks; a
-			// number member t lacks but has a wider one for widens (§4.1).
+			// number member t lacks but has a wider one for widens (§4.1). A thin one is made fat for it, and thin again.
+			const u = this.fat(v)
 			const lacking = this.p.members(f).filter(m => !this.holds(t, m))
 			const widened = lacking.filter(m => this.p.members(t).some(x => kind.widens(m, x)))
 			if (lacking.length > widened.length) {
-				const ok = this.ir().binary("or", this.isaOf(v, lacking, t), this.tagIn(this.tagOf(v.v), widened))
+				const ok = this.ir().binary("or", this.isaOf(v, lacking, t), this.tagIn(this.tagOf(u), widened))
 				this.check(ok, "cast to a type that is not the value's")
 			}
-			return this.widen(v.v, widened, t)
+			const r = this.widen(u, widened, t)
+			return if (this.thin(t)) this.refOf(r) else r
 		}
 		if (tk == kind.Union) {
-			return this.unionOf(this.tag(f), v.v, f)
+			return if (this.thin(t)) this.refIn(v.v, f) else this.unionOf(this.tag(f), v.v, f)
+		}
+		if (fk == kind.Union && this.thin(f) && t != kind.Null && this.holds(f, t)) {
+			// A thin union's member is its ref, checked not zero, with no union made of it, as of x!.
+			this.check(this.isa(v, t), "cast to a type that is not the value's")
+			return if (this.inlined(t)) this.unbox(v.v, t) else v.v
 		}
 		if (fk == kind.Union) {
 			// Of a member that converts to t, as a number widens or a function is called as one of fewer params, that
 			// converted; else t, which may be no member, where a test of a class the union does not hold narrows to it.
+			const u = this.fat(v)
 			const ms = p.members(f).filter(m => this.converts(m, t) && (kind.widens(m, t) || p.kind(m) == kind.Func))
 			if (ms.length == 0) {
 				this.check(this.isa(v, t), "cast to a type that is not the value's")
-				return this.unbits(v.v, t)
+				return this.unbits(u, t)
 			}
 			const r = this.scratch(this.ll(t), promoted)
 			const done = this.label()
 			for (const m of ms) {
 				const [yes, no] = [this.label(), this.label()]
-				this.condBr(this.ir().icmp("eq", this.tagOf(v.v), this.tag(m)), yes, no)
+				this.condBr(this.ir().icmp("eq", this.tagOf(u), this.tag(m)), yes, no)
 				this.start(yes)
-				this.ir().store(this.cast({ v: this.unbits(v.v, m), t: m }, t), r, false)
+				this.ir().store(this.cast({ v: this.unbits(u, m), t: m }, t), r, false)
 				this.jump(done)
 				this.start(no)
 			}
 			this.check(this.isa(v, t), "cast to a type that is not the value's")
-			this.ir().store(this.unbits(v.v, t), r, false)
+			this.ir().store(this.unbits(u, t), r, false)
 			this.jump(done)
 			this.start(done)
 			return this.ir().load(this.ll(t), r, false)
@@ -2734,8 +2745,7 @@ class Emitter {
 		return this.ir().cast(if (fw > tw) "trunc" else if (kind.isSigned(fk)) "sext" else "zext", v.v, tt)
 	}
 
-	/// The union of tag holding x of type t: a number's bits in the second word, a ref in the third, a string boxed
-	/// there, as is a fixed array as retval does.
+	/// The union of tag holding x of type t: a number's bits in the second word, else in the third its ref.
 	private unionOf(tag: Value, x: Value, t: i32): Value {
 		const n = this.norm(t)
 		const k = this.p.kind(n)
@@ -2750,13 +2760,22 @@ class Emitter {
 			bits = this.ir().cast("bitcast", x, this.i64)
 		} else if (isNumber(k) || k == kind.Type) {
 			bits = this.ext({ v: x, t: n })
-		} else if (k == kind.String || this.inlined(n)) {
-			ref = this.alloc(this.ll(n))
-			this.ir().store(this.cast({ v: x, t: n }, n), ref, false)
-		} else if (k != kind.Null && k != kind.None) {
-			ref = this.retval({ v: x, t: n }, n)
+		} else {
+			ref = this.refIn(x, n)
 		}
 		return this.union(tag, bits, ref)
+	}
+
+	/// The ref of a union holding x of type n, no number: the box of a string or of a class held by value, a fixed
+	/// array's as retval makes it, zero for null.
+	private refIn(x: Value, n: i32): Value {
+		const k = this.p.kind(n)
+		if (k == kind.String || this.inlined(n)) {
+			const r = this.alloc(this.ll(n))
+			this.ir().store(this.cast({ v: x, t: n }, n), r, false)
+			return r
+		}
+		return if (k == kind.Null || k == kind.None) this.b.constZero(this.ref) else this.retval({ v: x, t: n }, n)
 	}
 
 	/// The union of the tag, bits and ref.
@@ -2833,7 +2852,7 @@ class Emitter {
 	/// Whether union v, whose members t lacks are lacking, is of t: by the tag alone if those are null, as of x!.
 	private isaOf(v: V, lacking: i32[], t: i32): Value {
 		const nullOnly = lacking.length == 1 && lacking[0] == kind.Null && !this.unbound(t)
-		return if (nullOnly) this.ir().icmp("ne", this.tagOf(v.v), this.tag(kind.Null)) else this.isa(v, t)
+		return if (nullOnly) this.ir().icmp("ne", this.tagOf(this.fat(v)), this.tag(kind.Null)) else this.isa(v, t)
 	}
 
 	/// Whether v's type, the type of its tag if a union, fits t.
@@ -2850,6 +2869,14 @@ class Emitter {
 		}
 		if (this.p.kind(v.t) != kind.Union && !this.boxed(v.t)) {
 			return this.bool(ts.includes(v.t))
+		}
+		if (this.thin(v.t)) {
+			// Of null if its ref is zero, else of its member.
+			const none = ts.includes(kind.Null)
+			const some = this.p.members(this.norm(v.t)).some(m => m != kind.Null && ts.includes(m))
+			return if (none == some) this.bool(none)
+				else this.ir().icmp(if (none) "eq" else "ne", this.ir().cast("ptrtoint", v.v, this.i64),
+				this.i64Const(0))
 		}
 		return this.tagIn(this.tagOf(v.v), ts)
 	}
@@ -2878,6 +2905,26 @@ class Emitter {
 		const ms = this.p.members(n)
 		return this.p.kind(n) == kind.Union && n != this.any && !this.boxed(n) && !this.unbound(n) && ms.length <= 256
 			&& !ms.some(m => this.boxed(m) || this.p.kind(m) == kind.FixedArray)
+	}
+
+	/// Whether a value of t is thin: a union of null and one member held by a ref, itself that ref, zero for null, as
+	/// packed (shape's -1); not as lowered, where a union meets the union of any type.
+	private thin(t: i32): bool {
+		const n = this.norm(t)
+		return !this.dyn && this.packed(n) && this.shape(n)[0] < 0
+	}
+
+	/// v as the tag, bits and ref of a union, which a thin one is made.
+	private fat(v: V): Value { return if (this.thin(v.t)) this.tagged(v.v, this.norm(v.t)) else v.v }
+	/// The ref of union u of type n: u itself, if thin.
+	private refAs(u: Value, n: i32): Value { return if (this.thin(n)) u else this.refOf(u) }
+
+	/// The union of n, of null and a ref, holding ref x, null if zero.
+	private tagged(x: Value, n: i32): Value {
+		const ms = this.p.members(n)
+		const none = this.ir().icmp("eq", this.ir().cast("ptrtoint", x, this.i64), this.i64Const(0))
+		const m = if (ms[0] == kind.Null) ms[1] else ms[0]
+		return this.union(this.ir().select(none, this.tag(kind.Null), this.tag(m)), this.i64Const(0), x)
 	}
 
 	/// The byte packed union n's tag is in, -1 if its members are null and a ref, which null is the zero of; the word its
@@ -2925,9 +2972,7 @@ class Emitter {
 		const [at, r] = this.shape(n)
 		if (at < 0) {
 			const x = this.ir().load(this.ref, q, false)
-			const none = this.ir().icmp("eq", this.ir().cast("ptrtoint", x, this.i64), this.i64Const(0))
-			const m = if (ms[0] == kind.Null) ms[1] else ms[0]
-			return this.union(this.ir().select(none, this.tag(kind.Null), this.tag(m)), this.i64Const(0), x)
+			return if (this.thin(n)) x else this.tagged(x, n)
 		}
 		// The tag, read as the refs' word's top byte if there, so that taking it off a ref is a mask.
 		const tag = if (r >= 0) this.ir().binary("lshr",
@@ -2978,7 +3023,7 @@ class Emitter {
 		const store = (i: i32, x: V) => {
 			const p = this.ir().gep(this.b.int(8), q, [this.i64Const(this.placed(r, ms[i]))])
 			if (this.inlined(ms[i])) {
-				this.ir().store(this.refOf(this.cast(x, n)), p, false) // its box
+				this.ir().store(this.refAs(this.cast(x, n), n), p, false) // its box
 			} else {
 				this.put(p, x, ms[i])
 			}
@@ -2995,7 +3040,7 @@ class Emitter {
 		const u = this.cast(v, t)
 		if (ms.every(m => m == kind.Null || this.spare(m) == 7)) {
 			// Of refs at word 0, null's 0 too: the ref stored once, then only its tag byte by the case of its type.
-			this.ir().store(this.refOf(u), q, false)
+			this.ir().store(this.refAs(u, n), q, false)
 			if (at >= 0) {
 				const tag = this.ir().gep(this.b.int(8), q, [this.i64Const(at)])
 				this.cases(ms.length, to => this.branchTag(this.tagOf(u), ms.map(m => [m]), to),
@@ -3125,7 +3170,7 @@ class Emitter {
 			r = this.bool(o != op.Ne)
 		} else if (this.boxed(t)) {
 			r = this.boxedCompare(o, x, y)
-		} else if (k == kind.String && eqs || k == kind.Union) {
+		} else if (k == kind.String && eqs || k == kind.Union && !this.thin(t)) {
 			r = if (k == kind.String) this.strEq(x, y) else this.unionEq(x, y, t)
 			if (o == op.Ne) {
 				r = this.not(r)
@@ -4299,7 +4344,7 @@ class Emitter {
 			case kind.Null, kind.Bool: this.i1
 			case kind.F32: this.b.f32()
 			case kind.F64, kind.Float: this.b.f64()
-			case kind.Union: this.unionTy
+			case kind.Union: if (this.thin(n)) this.ref else this.unionTy
 			case kind.String: this.stringTy
 			case kind.Optional: this.b.struct([this.ll(this.p.a(n)), this.i1])
 			default: if (kind.isInt(k)) this.b.int(kind.width(k) as u32) else this.ref
@@ -4439,7 +4484,7 @@ class Emitter {
 			this.rt("zero", [this.desc(n), u], false)
 			return this.ir().load(this.unionTy, u, false)
 		}
-		if (k == kind.Union || this.boxed(n)) {
+		if (k == kind.Union && !this.thin(n) || this.boxed(n)) {
 			const z = if (this.boxed(n)) n else if (this.holds(n, kind.Null)) kind.Null else this.p.members(n)[0]
 			return this.b.constStruct([this.tag(z), this.i64Const(0), this.b.constZero(this.ref)])
 		}
