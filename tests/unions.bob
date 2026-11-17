@@ -449,3 +449,14 @@ test "a union of null and one class is spread, and cast to that of another" {
 	const c: Circle | null = null
 	assert narrow[Pt | null](p)!.r == 2.0 && narrow[Circle | null](c) == null
 }
+
+test "a function into a union of a function of fewer params is converted to it, as is a union's member" {
+	type Wide = ((a: i32, b: i32 = 2) => i32) | string | null
+	type Narrow = ((a: i32) => i32) | string | null
+	function fewer(w: Wide): Narrow { return w }
+	function thin(f: ((a: i32, b: i32 = 1) => i32) | null): ((a: i32) => i32) | null { return f }
+	const h: ((a: i32) => i32) | null = (a: i32, b: i32 = 3) => a - b
+	const n = fewer((a: i32, b: i32 = 2) => a * b)
+	assert thin((a: i32, b: i32 = 1) => a + b)!(2) == 3 && (n as ((a: i32) => i32))(3) == 6 && fewer("s") == "s"
+		&& fewer(null) == null && h!(5) == 2
+}

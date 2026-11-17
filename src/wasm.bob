@@ -1627,8 +1627,11 @@ class Wasm {
 		const t = this.bare(to)
 		const fk = p.kind(f)
 		const tk = p.kind(t)
+		const called = if (tk == kind.Union && fk == kind.Func && !this.holds(t, f)) this.calledAs(f, t) else null
 		if (f == t) {
 			return this.get(v)
+		} else if (called != null) {
+			return this.box({ l: this.spill(this.cast(v, called), this.val(called)), t: called }, t)
 		} else if (tk == kind.Union && isNumber(fk) && (kind.untyped(fk) || !this.holds(t, f))) {
 			// As the union's number member it converts to, else an untyped constant as an i64 or f64.
 			const m = p.numberIn(t, fk)
@@ -1673,24 +1676,26 @@ class Wasm {
 		return this.get(v)
 	}
 
-	/// Union v as union t, which has each member of v's but numbers, which widen (§4.1); checked if it lacks one. Held
-	/// alike and none widening, it is as it was, else made anew of the member it holds.
+	/// Union v as union t, which has each member of v's but numbers, which widen (§4.1), and functions, called as one of
+	/// fewer params; checked if it lacks one. Held alike and none converted, it is as it was; boxed, its box but of a
+	/// member converted; else made anew of the member it holds.
 	private rebox(v: V, t: i32): u64 {
 		const p = this.p
 		const from = if (v.t == this.any) p.members(t) else p.members(v.t)
 		const lacking = from.filter(m => !this.holds(t, m))
-		const widened = lacking.filter(m => p.members(t).some(x => kind.widens(m, x)))
-		if (lacking.length > widened.length) {
-			const ok = BinaryenBinary(this.m, BinaryenOrInt32(), this.isa(v, t), this.isIn(v, widened))
+		const converted = lacking.filter(m => p.members(t).some(x => kind.widens(m, x)) || this.calledAs(m, t) != null)
+		if (lacking.length > converted.length) {
+			const ok = BinaryenBinary(this.m, BinaryenOrInt32(), this.isa(v, t), this.isIn(v, converted))
 			this.check(ok, "cast to a type that is not the value's")
 		}
 		const vt = this.val(t)
 		const alike = this.boxed(v.t) == this.boxed(t)
-		if (alike && widened.length == 0) {
+		if (alike && converted.length == 0) {
 			return this.recast(v, vt)
 		}
-		const r = if (alike) this.spill(this.get(v), vt) else this.temp(vt)
-		for (const m of if (alike) widened else from.filter(m => this.holds(t, m) || widened.includes(m))) {
+		const kept = alike && this.boxed(t) // a ref of null or a function converted is another ref
+		const r = if (kept) this.spill(this.get(v), vt) else this.temp(vt)
+		for (const m of if (kept) converted else from.filter(m => this.holds(t, m) || converted.includes(m))) {
 			const set = this.nested(() => {
 				const x: V = { l: this.spill(this.unbits(v, m), this.val(m)), t: m }
 				this.emit(BinaryenLocalSet(this.m, r as u32, this.cast(x, t)))
@@ -1762,6 +1767,11 @@ class Wasm {
 	private tagOf(v: V): u64 { return BinaryenStructGet(this.m, 0, this.get(v), this.i32, false) }
 	/// Whether union u holds a value of type t: has it as a member, or is the union of any type.
 	private holds(u: i32, t: i32): bool { return u == this.any || this.p.members(u).includes(this.norm(t)) }
+
+	/// The member of union t a function of type f it lacks is called as, one of fewer params, if any.
+	private calledAs(f: i32, t: i32): i32 | null {
+		return this.p.members(t).find(m => this.p.kind(m) == kind.Func && fits(this.p, f, m))
+	}
 
 	/// Whether v's type, the type of its value if a union, fits t.
 	private isa(v: V, t: i32): u64 {
