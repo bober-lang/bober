@@ -18,6 +18,22 @@ class Link {
 	next: Link | null = null
 }
 
+class Pt {
+	x: i32
+	y: i32
+
+	constructor(x: i32, y: i32) {
+		this.x = x
+		this.y = y
+	}
+}
+
+interface PtOrCircle extends Pt | Circle | null {}
+
+function narrow[T extends PtOrCircle](x: T): Circle | null {
+	return if (x instanceof (Circle | null)) x else new Circle(2.0)
+}
+
 interface HasSide {
 	side: f64
 }
@@ -420,4 +436,16 @@ test "a packed union's number is not taken for a ref" {
 	for (const i of 0 ... 99) {
 		assert xs[i] == was[i]
 	}
+}
+
+test "a union of null and one class is spread, and cast to that of another" {
+	const ps = [new Pt(1, 2)]
+	const qs: (Pt | null)[] = [null, ...ps]
+	assert qs[0] == null && qs[1]!.y == 2
+	const a: { p: Pt | null, k: i32 } = { p: new Pt(3, 4), k: 5 }
+	const b: { p: Pt | null, k: i32 } = { ...a }
+	assert b.p!.x == 3 && b.k == 5
+	const p: Pt | null = ps[0]
+	const c: Circle | null = null
+	assert narrow[Pt | null](p)!.r == 2.0 && narrow[Circle | null](c) == null
 }
