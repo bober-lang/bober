@@ -48,6 +48,7 @@ static uint32_t hint = 1;  // where the first free page may be
 static uint32_t sizes[2 * CLASSES], classOf[SMALL / 16 + 1];
 static uint32_t bumped[2 * CLASSES];  // the young page of each class being bumped through
 static char *spare[2 * CLASSES];      // the old slots of each class free, each linked through its first word
+static int64_t reserved;  // what young may reach without a collection, as bober_reserve promised
 static int64_t young, every = 32 << 20;  // what has been allocated since the last collection, and how much collects
 static int64_t olds, major = 64 << 20;   // the bytes of old objects, the dead since the last major too, and how many
                                          // make the next collection a major one
@@ -470,7 +471,7 @@ static void collect(void) {
   memset(cards, 0, (int64_t)top * PAGE >> CARD);
   if (minor) olds += live;
   else olds = live, major = 2 * live > 64 << 20 ? 2 * live : 64 << 20, majors++;
-  allocated += young, collections++, young = 0;
+  allocated += young, collections++, young = reserved = 0;
   PROBE(gc_end, olds);
 }
 
@@ -506,7 +507,7 @@ __attribute__((noinline)) static void lay(char *p, int64_t n, const bober_layout
 
 /// What bober_alloc does but bump: collects, and takes a page or a big object's pages, new.
 __attribute__((noinline, cold)) static void *slow(int64_t n, int64_t size, int c, const bober_layout *l) {
-  if ((young += size) > every) collect();
+  if ((young += size) > every && young > reserved) collect();
   char *h;
   if (size > SMALL) {
     uint32_t p = take((size + PAGE - 1) / PAGE, BIG);
@@ -523,6 +524,12 @@ __attribute__((noinline, cold)) static void *slow(int64_t n, int64_t size, int c
   }
   if (l) lay(h, n, l);
   return h;
+}
+
+/// Collects now if allocating n more bytes would, so that slow does not while they are allocated.
+void bober_reserve(int64_t n) {
+  if (young + n > every) collect();
+  reserved = young + n;
 }
 
 /// Bumps through the young page of the size's class, which no page yet is before the first allocation.
