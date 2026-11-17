@@ -2,13 +2,13 @@
 //! they import. It declares a file's top-level names, then checks each declaration, those it uses first, and hands it
 //! to the next stage with the type of each construct and token in it.
 
-import { endsWith, indexOf, stableSort, startsWith } from "../std/algo"
+import { endsWith, indexOf, lastIndexOf, stableSort, startsWith } from "../std/algo"
 import { digit, isAlphabetic, minus, o, x } from "../std/ascii"
 import { HashMap } from "../std/collections/hashmap"
 import { ScopedMap } from "../std/collections/scopedmap"
 import { Set } from "../std/collections/set"
 import { join } from "../std/fs/path"
-import { codePoint, quoted, unquoted } from "../std/string"
+import { codePoint, quoted, trim, unquoted } from "../std/string"
 import * as decl from "./bc/decl"
 import * as kind from "./bc/kind"
 import * as op from "./bc/op"
@@ -4810,7 +4810,12 @@ class Checker {
 	}
 
 	private text(t: Tok): string { return this.src.slice(t.loc.pos, t.loc.end()) }
-	private source(p: Node): string { return sourceOf(this.src, p) }
+	/// p's source as a message quotes it, on one line: of several, the first and the last.
+	private source(p: Node): string {
+		const s = sourceOf(this.src, p)
+		const i = indexOf(s, "\n")
+		return if (i < 0) s else `${trim(s.slice(0, i))} … ${trim(s.slice(lastIndexOf(s, "\n") + 1, s.length))}`
+	}
 
 	private key(t: Tok): string {
 		const s = this.text(t)
