@@ -842,28 +842,32 @@ export class LLVM implements Backend {
 
 	/// Once optimized, marks the card of each place a ref is stored at (src/gc.c): before, a barrier would keep LLVM
 	/// from dropping a store or the object stored to. None where the ref is a constant, or the place is in the frame
-	/// or a global, which every collection scans, or in the object the block's last call allocated, so young.
+	/// or a global, which every collection scans, or in an object the block allocated with no call since where the
+	/// collector may run, so still young.
 	/// A masked store or scatter of refs it would not see: the target has none, as tm's CPU has none.
 	private barriers() {
 		const alloc = this.named("bober_alloc")
 		const have = this.named("bober_heap")
 		const at = if (have != 0) have else this.extern("bober_heap", this.int(64))
 		let block: Block = 0
-		let fresh: Value = 0
+		let fresh: Value[] = []
 		let heap: Value = 0
 		this.each(i => {
 			if (LLVMGetInstructionParent(i) != block) {
 				block = LLVMGetInstructionParent(i)
-				fresh = 0
+				fresh = []
 				heap = 0
 			}
-			if (isOp(i, LLVMCall)) {
-				fresh = if (LLVMGetCalledValue(i) == alloc) i else 0
+			if (collects(i)) {
+				fresh = []
+			}
+			if (isOp(i, LLVMCall) && LLVMGetCalledValue(i) == alloc) {
+				fresh.push(i)
 			} else if (isOp(i, LLVMStore) && holdsRef(LLVMTypeOf(LLVMGetOperand(i, 0)))
 				&& LLVMIsConstant(LLVMGetOperand(i, 0)) == 0) {
 				const q = LLVMGetOperand(i, 1)
 				const base = whole(q)
-				if (base != fresh && LLVMIsAAllocaInst(base) == 0 && LLVMIsConstant(base) == 0) {
+				if (!fresh.includes(base) && LLVMIsAAllocaInst(base) == 0 && LLVMIsConstant(base) == 0) {
 					LLVMPositionBuilderBefore(this.b, LLVMGetNextInstruction(i))
 					if (heap == 0) {
 						heap = this.load(this.int(64), at, false)
