@@ -3,6 +3,7 @@
 import { emit } from "./emit"
 import { LLVM } from "./backend/llvm"
 import { CompileError } from "./error"
+import { Outlined } from "./bc/decl"
 import { lower } from "./lower"
 import { mono } from "./mono"
 import { endsWith, startsWith } from "../std/algo"
@@ -707,4 +708,26 @@ export function at(xs: i32[], i: i32): i32 { return xs[i] }
 `) == `${dir()}/lib.bob:3:55: trap: index out of range
 exit 1
 `
+}
+
+test "a long block is run by several functions, but for what leaves it or is named far on" {
+	let body = ""
+	for (const k of 0 ... 139) {
+		body += `\tconst a${k} = s % 7 + ${k}\n\ts += a${k}\n`
+		if (k == 69) {
+			body += "\tconst near = s\n\tif (stop) {\n\t\treturn near\n\t}\n\ts += near\n"
+		}
+	}
+	assert run("long",
+		`function long(stop: bool): i32 {
+	let s = 0
+	const first = 1
+${body}	return s + first
+}
+
+function main() { print(\`\${long(false)} \${long(true)}\`) }
+`) == "12767 2619\nexit 0\n"
+	const p = lower([`${dir()}/long.bob`])
+	const m = p.module(`${dir()}/long.bob`)
+	assert p.decls.filter(d => d.module == m && (d.mods & Outlined) != 0).length == 4
 }
