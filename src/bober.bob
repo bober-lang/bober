@@ -103,7 +103,7 @@ export class Compile @optarg.Cc {
 }
 
 /// build a program and run it
-class Run @optarg.Cc {
+export class Run @optarg.Cc {
 	compile: ...Compile
 	args: string[] @optarg.Rest = []
 }
@@ -146,7 +146,7 @@ class Report {
 class Skill {}
 
 /// link the package's image, or with -o one module's object, or with -wasm the program's WebAssembly; for CI but -wasm
-class Build @optarg.Cc @optarg.Verbose {
+export class Build @optarg.Cc @optarg.Verbose {
 	compile: ...Compile
 	/// the object, or with -wasm the program, to write
 	o: string = ""
@@ -238,6 +238,11 @@ function main(): i32 {
 	}
 	if (c == null) {
 		print(usage(null, false))
+		return 2
+	}
+	const ignores = if (c instanceof Run || c instanceof Test || c instanceof Build) ignored(c) else null
+	if (ignores != null) {
+		print(ignores)
 		return 2
 	}
 	notice()
@@ -679,6 +684,36 @@ function wasmSource(path: string): string | null {
 	const variant = join(root, "builtin/wasm", base(path))
 	const at = if (builtin(path) && exists(variant)) variant else path
 	return if (exists(at)) readFile(at) else null
+}
+
+/// An option given to c that its build would ignore, which is an error rather than ignored, as "-wasm ignores -O2";
+/// else null. -O1 is given where it is not its default, as CI sets it.
+export function ignored(c: Run | Test | Build): string | null {
+	const f = c.compile
+	const build = c instanceof Build
+	const ir = c instanceof Build && c.emitLLVM
+	const levels: [string, bool][] = [["-O0", f.O0], ["-O1", f.O1 != new Compile().O1], ["-O2", f.O2]]
+	const mllvm: [string, bool] = ["-mllvm", f.mllvm.length > 0]
+	if (c instanceof Build && c.args.length == 0) {
+		return first("build of the package",
+			[["-o", c.o != ""], ["-emit-llvm", ir], ["-wasm", f.wasm], ["-release", f.release],
+			["-baseline", f.baseline], ...levels, mllvm])
+	}
+	if (f.wasm) {
+		return first("-wasm",
+			[["-release", f.release], ["-baseline", f.baseline], ["-emit-llvm", ir], ...levels, mllvm])
+	}
+	const llvm = f.release || ir || !build && (f.O2 || f.O1 && !f.O0)
+	return first(if (build) "build" else "-release", if (build || f.release) levels else [])
+		?? first("-emit-llvm", [["-release", ir && f.release]])
+		?? first("a build but -release or -emit-llvm", [["-baseline", f.baseline && !f.release && !ir]])
+		?? first("a build by TPDE alone", [["-mllvm", mllvm[1] && !llvm]])
+}
+
+/// That by ignores the first of options given, else null.
+function first(by: string, options: [string, bool][]): string | null {
+	const o = options.find(o => o[1])
+	return if (o == null) null else `${by} ignores ${o![0]}`
 }
 
 /// The build command on no file: links the modules of home and below, but those of build/, hidden directories, builtin/
