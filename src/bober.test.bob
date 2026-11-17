@@ -1,11 +1,11 @@
 //! Tests of src/bober.bob's builds into the image, which keeps what it holds across them.
 
 import { endsWith, indexOf, startsWith } from "../std/algo"
-import { exists, mkdirAll, open, remove } from "../std/fs"
+import { exists, glob, mkdirAll, open, remove } from "../std/fs"
 import { base } from "../std/fs/path"
 import * as process from "../std/process"
 import { replace } from "../std/string"
-import { Compile, build, format, machine, toolchain } from "./bober"
+import { Compile, build, format, machine, runTests, toolchain } from "./bober"
 import { Bytes } from "./link/bytes"
 import { Linker } from "./link/link"
 import { CLib, dir } from "./pkg"
@@ -267,6 +267,22 @@ function main() { print(\`\${name()} \${one()}\`) }\n`
 	const [out, again, edited] = [run("1"), run("1"), run("2")]
 	assert startsWith(out, `bober.main.${home()}/main.bob@`) && again == out
 	assert edited != replace(out, " 1", " 2") && endsWith(edited, " 2\n")
+}
+
+test "a test file whose report is kept leaves no pin of the image, which its launcher would remove" {
+	const kept = `${home()}/kept.bob`
+	mkdirAll(home())
+	writeFile(kept, `test "t" { assert true }\n`)
+	const pins = () => glob(`${home()}/build/image.so.*.run`)
+	const before = pins()
+	const run = () => runTests(kept, [], () => build(kept, true, new Compile(), true))()[0]
+	dir = `${home()}/build`
+	try {
+		assert run() == 0 && run() == 0
+	} finally {
+		dir = "build"
+	}
+	assert pins() == before
 }
 
 test "a module's unit as lowered and monomorphized are held side by side, each build linking its own" {
