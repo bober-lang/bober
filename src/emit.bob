@@ -23,7 +23,7 @@
 //! of a type, its key, members, layout and struct, it computes once per id.
 
 import { fromBits } from "../builtin/math"
-import { endsWith, lowerBound, startsWith } from "../std/algo"
+import { endsWith, lowerBound, sort, startsWith } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
 import { encode as hex } from "../std/encoding/hex"
 import { max, min } from "../std/math"
@@ -2851,12 +2851,15 @@ class Emitter {
 		return this.tagIn(this.tagOf(v.v), ts)
 	}
 
-	/// Whether tag is that of one of the types: an or of the tests, of more than a few as branchTag finds it.
+	/// Whether tag is that of one of the types: an or of the tests, of more than a few a binary search of their ids,
+	/// branchTag's, in a sorted table.
 	private tagIn(tag: Value, ts: i32[]): Value {
-		if (ts.length > few) {
-			const is = this.slot(this.i1)
-			this.cases(2, to => this.branchTag(tag, [ts, []], to), i => this.ir().store(this.bool(i == 0), is, false))
-			return this.ir().load(this.i1, is, false)
+		if (ts.length > few && !ts.some(t => this.unbound(t))) {
+			const ids = ts.map(t => this.id(this.norm(t)))
+			sort(ids)
+			const table = this.b.constant(this.b.constArray(this.i64, ids.map(n => this.i64Const(n))))
+			const id = if (this.dyn) this.word(tag, hashAt) else tag
+			return this.langCall("idIn", [id, this.b.constCast("ptrtoint", table, this.i64), this.i64Const(ids.length)])
 		}
 		let r = this.bool(false)
 		for (const t of ts) {
@@ -4510,7 +4513,7 @@ const layoutAt = 30
 const slayoutAt = 31
 const canonAt = 34
 const hashAt = 35
-/// The most types branchTag compares a tag with one by one.
+/// The most types branchTag or tagIn compares a tag with one by one.
 const few = 4
 
 /// The names of the kinds from Array on, as keys name them.

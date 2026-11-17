@@ -8,6 +8,7 @@ import { mono } from "./mono"
 import { endsWith, startsWith } from "../std/algo"
 import { appendFile, mkdirAll } from "../std/fs"
 import { base } from "../std/fs/path"
+import { split } from "../std/string"
 import * as process from "../std/process"
 import { ld, runtime } from "./bober"
 
@@ -183,6 +184,44 @@ false falsetrue truefalse
 ${dir()}/union.bob:3:11: trap: cast to a type that is not the value's
 exit 1
 `
+}
+
+test "a cast to a union of more than a few members is checked by code of O(1), the read of a chain of instanceof too" {
+	const classes = ["A", "B", "C", "D", "E", "F"].map(c => `class ${c} { x = 1 }\n`).join("")
+	const trap = "trap: cast to a type that is not the value's\nexit 1\n"
+	assert run("narrower6",
+		`${classes}type N = A | B | D | E | F
+function f(u: A | B | C | D | E | F): N { return u as N }
+
+function main(): i32 {
+	f(new B())
+	f(new C())
+	return 0
+}
+`) == `${dir()}/narrower6.bob:8:52: ${trap}`
+	mkdirAll(dir())
+	const size = (n: i32) => {
+		let src = ""
+		let u = "C0"
+		let ifs = ""
+		for (const i of 0 ... n - 1) {
+			src += `class C${i} { x = ${i} }\n`
+			u += if (i > 0) ` | C${i}` else ""
+			ifs += `\tif (b.u instanceof C${i}) { return b.u.x }\n`
+		}
+		const main = `${dir()}/box${n}.bob`
+		writeFile(main,
+			`${src}class Box { u: ${u} = new C0() }\nfunction f(b: Box): i32 {\n${ifs}\treturn -1\n}\n
+function main(): i32 { return f(new Box()) }\n`)
+		const p = lower([main])
+		const m = p.module(main)
+		mono(p, m)
+		const b = new LLVM(main, 0)
+		emit(p, m, b, { main: m, tests: false, dyn: false })
+		return split(b.text(), "\n").length
+	}
+	// Of lines, as a switch on the tag per read was n lines.
+	assert size(128) < 5 * size(32)
 }
 
 test "a type param's value cast into a class it is not traps" {
