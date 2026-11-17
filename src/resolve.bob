@@ -18,6 +18,7 @@
 //! Of two known strings, `+` folds to the one they make.
 
 import { bits, fromBits } from "../builtin/math"
+import { lastIndexOf } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
 import { combine, fnv } from "../std/hash"
 import { min } from "../std/math"
@@ -63,9 +64,9 @@ export class Known {
 		this.names = names
 	}
 
-	/// A record's value of field name.
+	/// A record's value of field name, the last of the name, as a spread's later one replaces it.
 	get(name: string): Known throws CompileError {
-		const i = this.names.indexOf(name)
+		const i = lastIndexOf(this.names, [name])
 		if (i < 0) {
 			throw new CompileError(`no field ${name}`)
 		}
@@ -543,7 +544,7 @@ function keyOf(v: Known | null): string {
 	return if (v.fn >= 0) `f${v.fn}`
 		else if (o != null) `${o.op as i32}.${o.a}.${o.b}`
 		else if (v.t >= 0) `t${v.t}`
-		else `[${v.items!.map(x => keyOf(x)).join(",")}]`
+		else `[${v.items!.map(x => keyOf(x)).join(",")}]${v.names.join(",")}`
 }
 
 /// The hash of a known value, of what its ids stand for, the same in every program.
@@ -899,20 +900,25 @@ class Copy {
 			case op.Array, op.Object:
 				const t = this.type(a)
 				const spreads = s.items(s.c(i))
-				if (o == op.Array && holdsType(p, t)) {
-					// Its items are known, so it is.
+				if (holdsType(p, t)) {
+					// Its items are known, so it is; an object's props, before its spreads, are its first fields.
 					const base = this.stack.length - b
 					const items: Known[] = []
+					const names: string[] = []
 					for (const j of 0 ... b - 1) {
 						const v = this.taken(this.stack[base + j])
 						if (spreads.includes(j)) {
 							items.push(...v.items!)
+							names.push(...v.names)
 						} else {
+							if (o == op.Object) {
+								names.push(p.strings[p.names[p.b(t)][2 * j]])
+							}
 							items.push(v)
 						}
 					}
 					this.cut(base)
-					this.known(array(items))
+					this.known(array(items, names))
 				} else {
 					// The elements of the arrays spread, which mono notes as converted to t's, or the values an object
 					// spreads, whose methods it binds.
@@ -922,9 +928,9 @@ class Copy {
 					this.info[this.info.length - 1] = if (ts.length > 0) p.union(ts) else -1
 				}
 			case op.Init:
-				// Dropped where the Array is known, as above.
+				// Dropped where the literal is known, as above.
 				const t = this.type(a)
-				if (p.kind(t) == kind.Object || !holdsType(p, t)) {
+				if (!holdsType(p, t)) {
 					this.plain(o, 1, this.top().t, t, b, s.c(i))
 				}
 			case op.New:
@@ -1225,7 +1231,7 @@ class Copy {
 		} else if (v.t >= 0) {
 			this.known(this.ins.reflect(v.t, this.p.strings[name]))
 		} else if (v.items != null) {
-			this.known(if (this.p.strings[name] == "length") this.ins.int(v.items!.length)
+			this.known(if (this.p.strings[name] == "length" && v.names.length == 0) this.ins.int(v.items!.length)
 				else v.get(this.p.strings[name]))
 		} else {
 			this.known(this.ins.int(this.p.strings[this.name(v)].length))
