@@ -416,7 +416,7 @@ static int nchildren, running;
 /// Forks c's test from this process as its module initialized it, so that it sees that state and none of another test,
 /// in a directory of its own if tmp. The child writes its entry of the report, then a line of whether it is tainted, or
 /// "r" to be run again, alone, as a test whose helpers or itself failed is, for a report as of one process; and the files
-/// it read (src/io.c), to a file of its own, which reap reads.
+/// it read (src/io.c), to a file of its own, which reap reads; it exits 1 if the test failed.
 static void spawn(Child *c) {
   static int n;  // directories so far
   if (tmp) snprintf(bober_tmp, PATH_MAX, "%s/%d", tmp, ++n), mkdir(bober_tmp, 0777);
@@ -426,7 +426,7 @@ static void spawn(Child *c) {
   if ((c->pid = fork()) < 0) bober_trap("cannot fork a test", 0, -1);
   if (c->pid) return;
   seed = STONEWALL, testFile = c->file, testAt = -1, bober_nreads = 0, alone = c->alone;
-  all.n = sent = 0;  // the entries reap took before, of a test run again
+  all.n = sent = 0, all.failed = false;  // reap's, of tests before or of a test run again
   if (socketpair(AF_UNIX, SOCK_DGRAM, 0, claimed) || send(claimed[1], &(long){0}, sizeof(long), 0) < 0)
     bober_trap("cannot share a test's subtests", 0, -1);
   altStack();
@@ -436,7 +436,7 @@ static void spawn(Child *c) {
   bool redo = helped() || nhelpers && all.failed;
   put(saved[0], redo ? "\nr" : bober_tainted ? "\n1" : "\n0", 2), put(saved[0], bober_reads, bober_nreads);
   if (!redo) give();  // a redo's its own
-  _exit(0);
+  _exit(all.failed);
 }
 
 /// Waits for a child to exit, child i if i >= 0, else any, and takes its entry, its taint and the files it read, or if
