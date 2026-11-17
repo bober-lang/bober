@@ -507,7 +507,13 @@ class Emitter {
 			const g = if (set) this.fieldInit(s.decl) else 0
 			const init = () => this.returned(this.call(this.b.valueType(g), g, [...this.descs, self]), s.t)
 			if (s.embed) {
-				this.initialize(q, this.norm(s.t), [])
+				if (this.dynamic(s.t)) {
+					// Of a type param, as new of its arg makes one, copied in as its descriptor says.
+					this.makeOf(s.t)
+					this.dynSet(this.dynPlace({ v: self, t: n }, this.str(this.p.strings[s.name])), this.pop())
+				} else {
+					this.initialize(q, this.norm(s.t), [])
+				}
 				if (set) {
 					init()
 				}
@@ -2294,7 +2300,10 @@ class Emitter {
 				return
 			}
 			const [q, s] = this.place(obj, name)
-			this.push(if (s.embed) q else this.read(q, s.t), s.t)
+			// An embedded field in place, as load holds one.
+			this.push(if (!s.embed) this.read(q, s.t)
+				else if (this.dynamic(s.t)) this.union(this.desc(s.t), this.i64Const(0), q)
+				else q, s.t)
 		}
 	}
 
