@@ -450,3 +450,16 @@ test "an option a build would ignore is an error, but -O1 where CI sets it" {
 	b.args = []
 	assert ignored(b) == "build of the package ignores -emit-llvm"
 }
+
+test "-release holds the object LLVM made of each module in the image, and compiles anew only one that changed" {
+	const objects = () => held().filter(o => indexOf(o, "^R@") >= 0)
+	anew()
+	const out = built(files(1), "-release")
+	const fresh = objects()
+	assert out == printed(1) && fresh.length > 0 && built([], "-release") == out && objects() == fresh
+	const edited = built([["lib.bob", replace(lib, "return f(i32)", "return f(i64)")]], "-release")
+	const now = objects()
+	assert edited == replace(out, "true i32", "true i64") && now.length == fresh.length
+	assert now.some(o => !fresh.includes(o)) && now.some(o => fresh.includes(o))
+	assert built([]) == edited && built([], "-release") == edited
+}
