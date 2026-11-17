@@ -282,7 +282,8 @@ class Long {
 test "a union of functions, or of methods, is called as the function each fits" {
 	const h: ((a: i32) => i32) | ((a: i32, b: i32 = 3) => i32) = (a: i32, b: i32 = 3): i32 => a + b
 	const ms: (Short | Long)[] = [new Short(), new Long()]
-	assert h(4) == 7 && ms.map(m => m.f(2) as i64) == [200, 12]
+	const u: ((x: i32) => i32) | ((s: string) => string) = (x: i32): i32 => x * 2
+	assert h(4) == 7 && ms.map(m => m.f(2) as i64) == [200, 12] && (u as ((x: i32) => i32))(5) == 10
 }
 
 test "a type refers to itself through a class, not an alias" {
@@ -322,6 +323,9 @@ test "a field of a literal type reflects as that literal" {
 }
 
 test "a union is packed: its refs in one word, its tag in that word's top byte, else appended" {
+	if (targetOs() == "wasm") {
+		return // of the native layout
+	}
 	assert sizeOf[i32[] | null]() == 8 // null is the zero ref
 	assert sizeOf[Square | Circle]() == 8
 	assert sizeOf[i32 | i32[]]() == 8 // the tag in the top byte of the ref
@@ -390,6 +394,9 @@ test "packed unions hold their members in fields and elements" {
 }
 
 test "a packed union's number is not taken for a ref" {
+	if (targetOs() == "wasm") {
+		return // of the native layout
+	}
 	const squares: Square[] = []
 	const xs: (i64 | Square)[] = []
 	const was: i64[] = []

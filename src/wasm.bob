@@ -30,6 +30,7 @@ import { Code, Program } from "./bc/program"
 import { showType } from "./bc/show"
 import { listed } from "./emit"
 import { CompileError } from "./error"
+import { fits } from "./mono"
 import { fieldOf } from "./resolve"
 import { builtin, builtinPath } from "./root"
 
@@ -1624,8 +1625,26 @@ class Wasm {
 		} else if (tk == kind.Union) {
 			return this.box(v, t)
 		} else if (fk == kind.Union) {
-			this.check(this.isa(v, t), "cast to a type that is not the value's")
-			return this.unbits(v, t)
+			// Of a member that converts to t, as a number widens or a function fitting t is called as one of fewer
+			// params, that converted; else t, checked.
+			const ms = p.members(f).filter(m => m != t && (kind.widens(m, t) || tk == kind.Func && fits(p, m, t)))
+			const checked = () => {
+				this.check(this.isa(v, t), "cast to a type that is not the value's")
+				return this.unbits(v, t)
+			}
+			if (ms.length == 0) {
+				return checked()
+			}
+			const r = this.temp(this.val(t))
+			let x = this.nested(() => this.emit(BinaryenLocalSet(this.m, r as u32, checked())))
+			for (const m of ms) {
+				x = BinaryenIf(this.m, this.is(v, m), this.nested(() => {
+					const u: V = { l: this.spill(this.unbits(v, m), this.val(m)), t: m }
+					this.emit(BinaryenLocalSet(this.m, r as u32, this.cast(u, t)))
+				}), x)
+			}
+			this.emit(x)
+			return BinaryenLocalGet(this.m, r as u32, this.val(t))
 		} else if (fk == kind.Func && tk == kind.Func) {
 			return this.adapt(v, t)
 		} else if (isNumber(fk) && isNumber(tk)) {
