@@ -739,6 +739,7 @@ export class LLVM implements Backend {
 			this.closed()
 		}
 		if (this.gc) {
+			this.leaves()
 			this.frames()
 			this.barriers()
 			this.statepoints()
@@ -916,6 +917,37 @@ export class LLVM implements Backend {
 				LLVMInstructionEraseFromParent(call)
 			}
 			LLVMDeleteFunction(marker)
+		}
+	}
+
+	/// Makes each of the module's own functions from which no call where the collector may run is reached a
+	/// gc-leaf-function, so that a call of it is none either.
+	private leaves() {
+		const callers = new HashMap[Value, Value[]]() // of each own function, and of 0 for the others, those calling it
+		this.each(i => {
+			if (collects(i)) {
+				const to = if (own(LLVMGetCalledValue(i))) LLVMGetCalledValue(i) else 0
+				const fs = callers.get(to) ?? []
+				fs.push(LLVMGetBasicBlockParent(LLVMGetInstructionParent(i)))
+				callers.set(to, fs)
+			}
+		})
+		const may = new HashMap[Value, bool]() // those from which such a call is reached
+		const found: Value[] = [0]
+		while (found.length > 0) {
+			for (const f of callers.get(found.pop()!) ?? []) {
+				if (may.get(f) == null) {
+					may.set(f, true)
+					found.push(f)
+				}
+			}
+		}
+		let f = LLVMGetFirstFunction(this.m)
+		while (f != 0) {
+			if (own(f) && may.get(f) == null) {
+				this.attr(f, LLVMAttributeFunctionIndex as i32, "gc-leaf-function", 0)
+			}
+			f = LLVMGetNextFunction(f)
 		}
 	}
 
@@ -1155,6 +1187,11 @@ function crosses(fn: Value, v: Value): bool {
 		i = if (collects(i)) 0 else LLVMGetNextInstruction(i)
 	}
 	return uses > 0
+}
+
+/// Whether v is a function the module defines for itself alone, so that no other definition may stand for it.
+function own(v: Value): bool {
+	return LLVMIsAFunction(v) != 0 && LLVMIsDeclaration(v) == 0 && LLVMGetLinkage(v) == (LLVMInternalLinkage as u32)
 }
 
 /// Whether the type t is a struct or array holding a ref.
