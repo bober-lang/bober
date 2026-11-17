@@ -5,7 +5,7 @@ import { exists, glob, mkdirAll, open, remove } from "../std/fs"
 import { base } from "../std/fs/path"
 import * as process from "../std/process"
 import { replace } from "../std/string"
-import { Compile, build, format, machine, runTests, toolchain } from "./bober"
+import { Build, Compile, Run, build, format, ignored, machine, runTests, toolchain } from "./bober"
 import { Bytes } from "./link/bytes"
 import { Linker } from "./link/link"
 import { CLib, dir } from "./pkg"
@@ -434,4 +434,24 @@ test "a C library's toolchain file includes its own, of a package found by a roo
 	assert indexOf(toolchain(c, "/w"), `include("/p/tc.cmake")`) >= 0
 	c.toolchain = "tc.cmake"
 	assert indexOf(toolchain(c, "/w"), `include("/w/tc.cmake")`) >= 0
+}
+
+test "an option a build would ignore is an error, but -O1 where CI sets it" {
+	const r = new Run()
+	assert ignored(r) == null
+	r.compile.release = true
+	r.compile.O2 = true
+	assert ignored(r) == "-release ignores -O2"
+	r.compile.wasm = true
+	assert ignored(r) == "-wasm ignores -release"
+	const b = new Build()
+	b.args = ["main.bob"]
+	b.compile.baseline = true
+	assert ignored(b) == "a build but -release or -emit-llvm ignores -baseline"
+	b.emitLLVM = true
+	assert ignored(b) == null
+	b.compile.O0 = true
+	assert ignored(b) == "build ignores -O0"
+	b.args = []
+	assert ignored(b) == "build of the package ignores -emit-llvm"
 }
