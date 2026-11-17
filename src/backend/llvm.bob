@@ -11,6 +11,7 @@ import { dollar, isAlphabetic, isDigit, percent } from "../../std/ascii"
 import { max } from "../../std/math"
 import { arch, os } from "../../std/os"
 import * as c from "../../std/c"
+import { bober_first } from "./llvm/lld.h"
 
 import { LLVMAdd, LLVMAddAttributeAtIndex, LLVMAddCallSiteAttribute, LLVMAddCase, LLVMAddClause, LLVMAddDestination,
 	LLVMAddFunction, LLVMAddGlobal, LLVMAddModuleFlag, LLVMAddrSpaceCast, LLVMAnd, LLVMAppendBasicBlockInContext,
@@ -862,7 +863,9 @@ export class LLVM implements Backend {
 		failed(LLVMRunPasses(this.m, "function(sroa),rewrite-statepoints-for-gc", this.tm,
 			LLVMCreatePassBuilderOptions()))
 		LLVMSetModuleDataLayout(this.m, this.td) // the target's, which codegen and LTO take, now no ref is hidden
-		if (this.named("llvm.experimental.gc.statepoint.p0") != 0) {
+		const statepoint = this.named("llvm.experimental.gc.statepoint.p0")
+		if (statepoint != 0) {
+			bober_first(statepoint) // which Value::canBeFreed looks for from the front, for each load of a ref
 			this.moduleAsm(`.pushsection ${section("bober_stackmaps")}${if (os == "macos") "" else `,"aw"`}
 .p2align 3
 .quad __LLVM_StackMaps
