@@ -193,6 +193,7 @@ class Cell[T] {
 	constructor(v: T) { this.v = v }
 	get(): T { return this.v }
 	with[U](u: U): [T, U] { return [this.v, u] }
+	or[U](u: U, n = 1): i32 { return n }
 	kept(): bool { return valueOf(this) == this.v } // T inferred of this
 }
 
@@ -204,6 +205,22 @@ test "a generic's instance takes and gives each kind of value as its type args h
 	const c = new Cell[u16](7)
 	assert c.get() == 7 && c.with("x")[1] == "x" && c.with[i8](-1)[1] == -1
 	assert c.kept()
+}
+
+test "a generic method's instance and a builtin's method are values bound to their object" {
+	const ws: ((s: string) => [u16, string])[] = []
+	for (const n of [1 as u16, 2]) {
+		ws.push(new Cell(n).with[string])
+	}
+	const c = new Cell[u16](7)
+	const or = c.or[bool]
+	const xs = [1, 2]
+	const push = xs.push
+	push(3)
+	const join = xs.join
+	const slice = "abc".slice
+	assert ws[0]("x")[0] == 1 && ws[1]("x")[0] == 2 && or(true) == 1 && c.with?.(true)[1] == true
+	assert join("-") == "1-2-3" && xs.map[string]!((x: i32) => `${x}`)[2] == "3" && slice(1, 2) == "b"
 }
 
 interface Num extends i32 | i64 | f64 {}

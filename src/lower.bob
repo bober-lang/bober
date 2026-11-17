@@ -2141,6 +2141,11 @@ class Gen {
 				}
 				const name = this.text(p.parts[1])
 				const o = this.promote(this.receiver(p, chain), name)
+				// A builtin's or generic method, bound here; a class's other methods emit binds.
+				const m = this.methodOf(o, name)
+				if (m != null && (o.kind != "class" || this.u.l.lift.types.get(m!)!.params.length > 0)) {
+					return this.bound(o, m!, p)
+				}
 				// The member's declared type, which expr casts to p's narrowed one (6.11).
 				return this.read(o, name, o.member(name) ?? p.type!)
 			case "index":
@@ -2151,7 +2156,17 @@ class Gen {
 				const a = p.parts[0]
 				const i = p.parts[1]
 				if (a.type!.kind == "function") {
-					return this.loadDecl(this.global(a), p)
+					const d = this.global(a)
+					if (d == null && a.kind == "member") {
+						const name = this.text(a.parts[1])
+						const o = this.promote(this.receiver(a, chain), name)
+						const m = this.methodOf(o, name)
+						if (m == null) {
+							throw this.fail(p, `${name} of ${showType(o)} instantiated, not called`)
+						}
+						return this.bound(o, m!, p)
+					}
+					return this.loadDecl(d, p)
 				}
 				const key = this.fieldKey(i, a.type!)
 				const o = this.promote(this.receiver(p, chain), key)
@@ -2167,6 +2182,36 @@ class Gen {
 			default: return this.call(p, chain)
 		}
 		return this.ty(p.type!)
+	}
+
+	/// The decl of method name of a value of type o, if its class, string or array has one.
+	private methodOf(o: Type, name: string): i32 | null {
+		const c = methods(o)
+		const m = if (c == null) null else this.u.l.member(c!, name)
+		return if (m != null && this.prog.decls[m!].kind == decl.Function) m else null
+	}
+
+	/// Pushes method m of the value of type o on the stack, as p reads it, maybe instantiated: a closure calling m with
+	/// that value and its own args, a left-out one Missing.
+	private bound(o: Type, m: i32, p: Node): i32 {
+		const f = p.type!.nonNull() // of o?.m too
+		const r = this.temp(this.ty(o))
+		this.op(op.Fresh, r)
+		this.op(op.SetLocal, r)
+		this.nested(this.prog.strings[this.prog.decls[m].name], f, 0, p.t.loc.pos, g => {
+			const ps = f.types.map(_ => g.local("", kind.None))
+			for (const i of 0 ... ps.length - 1) {
+				const t = g.ty(f.types[i])
+				g.code.locals[ps[i]].type = if (i < f.n) t else this.prog.type(kind.Optional, t)
+			}
+			g.op(op.Local, g.capture(r))
+			for (const l of ps) {
+				g.op(op.Local, l)
+			}
+			g.op(op.Call, g.ref(m), g.exact([...g.u.args(methods(o)!), ...g.inferred(m, f, p)]))
+			g.op(if (f.base!.kind == "null") op.Drop else op.Return)
+		})
+		return this.ty(f)
 	}
 
 	/// Pushes a member of a type value, as T.kind (4.11).
