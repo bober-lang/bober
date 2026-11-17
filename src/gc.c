@@ -537,6 +537,7 @@ __attribute__((noinline, cold)) static void *slow(int64_t n, int64_t size, int c
 void *bober_alloc(int64_t n, const bober_layout *l) {
   int64_t size = (n + 15) & ~15;
   allocs++;
+  PROBE(alloc, n);
   int c = size <= SMALL ? classOf[size / 16] + (l ? 0 : CLASSES) : 0;
   Page *g = &pages[bumped[c]];
   if (__builtin_expect(size > SMALL || young + size > every || !bumped[c] || g->used + sizes[c] > PAGE, 0))
