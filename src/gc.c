@@ -333,9 +333,13 @@ static char *sp(struct Call *c, void **fp) {
     unw_context_t ctx;
     unw_cursor_t u;
     unw_word_t top;
+    unw_proc_info_t info;
     unw_getcontext(&ctx), unw_init_local(&u, &ctx);
     unw_set_reg(&u, FP, (uintptr_t)*fp), unw_set_reg(&u, UNW_REG_IP, c->ret - 1);  // in the call, which may end it
-    if (unw_step(&u) <= 0) fputs("collect: a frame libunwind does not know\n", stderr), abort();
+    // The step to a caller libunwind does not know, as main's in the C library, ends the stack (0) but is taken; this
+    // frame it must know.
+    if (unw_get_proc_info(&u, &info) || unw_step(&u) < 0)
+      fputs("collect: a frame libunwind does not know\n", stderr), abort();
     unw_get_reg(&u, UNW_REG_SP, &top);
     c->below = (char *)*fp - ((char *)top - c->size);
   }

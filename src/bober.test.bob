@@ -246,6 +246,26 @@ function main() {\n\tlet sum: i64 = 0\n\tfor (const p of made()) {\n\t\tsum += p
 	assert built([["main.bob", main]], "-O2") == "19900\n"
 }
 
+test "-release keeps the refs main holds across collections that move them, though libunwind does not know main's caller" {
+	const main = `class Box {\n\tv = 0\n\tnext: Box | null = null\n}\n
+function main() {
+	let head: Box | null = null
+	for (const i of 0 ... 3000000) {
+		const b = new Box()
+		b.v = i
+		b.next = if (i % 1000 == 1) null else head
+		head = b
+	}
+	let n = 0
+	while (head != null) {
+		n += head.v & 1
+		head = head.next
+	}
+	print(\`\${n}\`)
+}\n`
+	assert built([["main.bob", main]], "-release") == "500\n"
+}
+
 test "-O2 has LLVM compile each monomorphized module, an edited one TPDE until it is unchanged, which -O1 keeps" {
 	const units = () => held().filter(o => indexOf(o, "^O") >= 0)
 	anew()
