@@ -56,7 +56,8 @@ import { LLVMAdd, LLVMAddAttributeAtIndex, LLVMAddCallSiteAttribute, LLVMAddCase
 	LLVMTokenTypeInContext, LLVMTrunc, LLVMTypeOf, LLVMUDiv, LLVMUIToFP, LLVMURem, LLVMValueAsMetadata,
 	LLVMVoidTypeInContext, LLVMWeakAnyLinkage, LLVMExternalWeakLinkage, LLVMWeakODRLinkage, LLVMXor, LLVMZExt,
 	LLVMConstAddrSpaceCast, LLVMGetConstOpcode, LLVMIsAConstantExpr, LLVMExternalLinkage, LLVMGetFirstGlobal,
-	LLVMGetNextGlobal } from "llvm-c/Core.h"
+	LLVMGetNextGlobal, LLVMGetCallSiteStringAttribute, LLVMConstIntGetZExtValue,
+	LLVMIsAConstantInt } from "llvm-c/Core.h"
 
 import { LLVMReturnStatusAction, LLVMVerifyModule } from "llvm-c/Analysis.h"
 import { LLVMDisposeErrorMessage, LLVMGetErrorMessage } from "llvm-c/Error.h"
@@ -741,6 +742,7 @@ export class LLVM implements Backend {
 		}
 		if (this.gc) {
 			this.leaves()
+			this.reserves()
 			this.frames()
 			this.barriers()
 			this.statepoints()
@@ -919,6 +921,31 @@ export class LLVM implements Backend {
 			}
 			LLVMDeleteFunction(marker)
 		}
+	}
+
+	/// Before two or more allocations of constant size in a row in a block, with no other call where the collector may
+	/// run between them, reserves their bytes (bober_reserve, src/rt.h): the collector then runs there if at all, so
+	/// each is marked a gc-leaf-function, a call statepoints does not record. Before frames, which counts such calls.
+	private reserves() {
+		const alloc = this.named("bober_alloc")
+		const t = this.fn(this.void(), [this.int(64)])
+		let run: Value[] = []
+		this.each(i => {
+			if (isOp(i, LLVMCall) && LLVMGetCalledValue(i) == alloc && LLVMIsAConstantInt(LLVMGetOperand(i, 0)) != 0) {
+				run.push(i)
+			} else if (collects(i) || i == LLVMGetBasicBlockTerminator(LLVMGetInstructionParent(i))) {
+				if (run.length > 1) {
+					let bytes = 0 as u64
+					for (const a of run) {
+						bytes += (LLVMConstIntGetZExtValue(LLVMGetOperand(a, 0)) + 15) / 16 * 16
+						this.attr(a, LLVMAttributeFunctionIndex as i32, "gc-leaf-function", 0)
+					}
+					LLVMPositionBuilderBefore(this.b, run[0])
+					this.call(t, this.function("bober_reserve", t, false), [this.constInt(this.int(64), bytes as i64)])
+				}
+				run = []
+			}
+		})
 	}
 
 	/// Makes each of the module's own functions from which no call where the collector may run is reached a
@@ -1159,12 +1186,15 @@ function values(fn: Value): Value[] {
 }
 
 /// Whether instruction i is a call where the collector may run, which statepoints record: not of an intrinsic or a
-/// gc-leaf-function.
+/// gc-leaf-function, nor one marked so itself, as reserves marks an allocation.
 function collects(i: Value): bool {
 	if (!isOp(i, LLVMCall) && !isOp(i, LLVMInvoke)) {
 		return false
 	}
 	const f = LLVMGetCalledValue(i)
+	if (LLVMGetCallSiteStringAttribute(i, LLVMAttributeFunctionIndex as u32, "gc-leaf-function", 16) != 0) {
+		return false
+	}
 	return LLVMIsAFunction(f) == 0
 		|| LLVMGetIntrinsicID(f) == 0
 		&& LLVMGetStringAttributeAtIndex(f, LLVMAttributeFunctionIndex as u32, "gc-leaf-function", 16) == 0

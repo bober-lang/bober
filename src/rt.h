@@ -38,6 +38,9 @@ typedef struct { int64_t size; uint64_t refs[]; } bober_layout;
 /// n new zero bytes, 16-aligned, of values laid out as l, or of none holding a ref if l is null: a ref, which may
 /// point into them anywhere. It may collect, so that refs held across it move.
 void *bober_alloc(int64_t n, const bober_layout *l);
+/// Collects now if allocating n more bytes would, n the sizes of the allocations that follow, each rounded up to 16:
+/// before any other call that may collect, those then do not, so that refs held across them stay.
+void bober_reserve(int64_t n);
 /// The bytes of a page of the heap. An object of more has pages of its own, from one's start, and never moves; once it
 /// is not reached, they are mapped anew, which unmaps what bober_io_map mapped there but its first.
 #define BOBER_PAGE (1 << 16)
