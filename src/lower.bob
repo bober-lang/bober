@@ -1954,11 +1954,12 @@ class Gen {
 				}
 				this.spread(op.Array, t, p.parts, (q: Node, i: i32) => this.value(q, element(t, i)!))
 			case "object":
-				// An Object op places props only before its spreads, so it makes the object of the parts up to the first
-				// prop after a spread; each later part, in source order, is set on it or, a spread, makes it anew. Its
-				// temp's SetLocal and last load are marked a Spread.
+				// An Object op places each field once and props only before its spreads, so it makes the object of the
+				// parts up to the first prop after a spread or naming a field again; each later part, in source order, is
+				// set on it or, a spread, makes it anew. Its temp's SetLocal and last load are marked a Spread.
 				let n = 0
-				while (n < p.parts.length && p.parts[n].kind != "unary") {
+				while (n < p.parts.length && p.parts[n].kind != "unary"
+					&& !p.parts.slice(0, n).some(q => this.key(q.t) == this.key(p.parts[n].t))) {
 					n++
 				}
 				while (n < p.parts.length && p.parts[n].kind == "unary") {
