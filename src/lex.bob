@@ -2,12 +2,13 @@
 //!
 //! # Lexical elements
 //!
-//! Source is UTF-8. Tokens are formed by longest match. Whitespace is space, tab, CR and LF.
+//! Source is UTF-8; a leading byte order mark is skipped. Tokens are formed by longest match. Whitespace is space,
+//! tab, CR and LF.
 //!
 //! Grammar notation: `{x}` zero or more, `[x]` optional, `"x"` a token; the lexical rules of §2.3–§2.5 are regular
 //! expressions.
 
-import { lowerBound } from "../std/algo"
+import { lowerBound, startsWith } from "../std/algo"
 import { min } from "../std/math"
 import * from "../std/ascii"
 
@@ -89,6 +90,9 @@ export class SyntaxError {
 	}
 }
 
+/// The length of src's leading byte order mark, 0 if none.
+export function bom(src: string): i32 { return if (startsWith(src, "\xEF\xBB\xBF")) 3 else 0 }
+
 export class Lexer {
 	private src = ""
 	private pos: i32 = 0
@@ -98,7 +102,10 @@ export class Lexer {
 	/// The last token taken other than a comment.
 	private last: Kind = ";"
 
-	constructor(src: string) { this.src = src }
+	constructor(src: string) {
+		this.src = src
+		this.pos = bom(src)
+	}
 
 	/// The token ahead, retagged as keyword `want` if it spells that contextual keyword.
 	peek(want: Kind = "ident"): Tok throws SyntaxError {
