@@ -34,8 +34,9 @@ import * as op from "./bc/op"
 import { Opcode } from "./bc/op"
 import { Code, Program, TypeParam, sourceHash } from "./bc/program"
 
-import { Checked, Node, after, arrowBody, bodyOf, check, child, compared, element, has, isLink, isTok, isTypeValue,
-	operands, optional, segment, selfOf, show as showType, sourceOf, standsFor, substitute, supers } from "./check"
+import { Checked, Node, after, arrowBody, bodyOf, check, child, compared, declarer, element, has, isLink, isTok,
+	isTypeValue, operands, optional, segment, selfOf, show as showType, sourceOf, standsFor, substitute,
+	supers } from "./check"
 
 import { CompileError } from "./error"
 import { Tok } from "./lex"
@@ -2101,7 +2102,7 @@ class Gen {
 		if (isTok(a, "ident") && endsWith(a.symbol, ":")) {
 			return l.lift.entries.get(a.symbol + name)
 		}
-		const c = standsFor(a.type!)
+		const c = this.staticOwner(p)
 		const d = if (c != null && c.kind == "class") l.member(c!, name) else null
 		return if (d != null && (this.prog.decls[d!].mods & decl.Static) != 0) d else null
 	}
@@ -2125,7 +2126,7 @@ class Gen {
 
 	/// The type of var d that p names: of a static of a generic class, as the instance named has it.
 	private varType(d: i32, p: Node): i32 {
-		const c = if (p.kind == "member") standsFor(p.parts[0].type!) else null
+		const c = this.staticOwner(p)
 		const t = this.u.l.lift.types.get(d)!
 		return this.ty(if (c?.generic == null) t else t.in(c!.generic!, c!.params))
 	}
@@ -2435,8 +2436,14 @@ class Gen {
 
 	/// The type args of the generic class whose static member p names, as C[T].f or C.f within C, before f's own.
 	private ownerArgs(p: Node): Type[] {
-		const c = if (p.kind == "member") standsFor(p.parts[0].type!) else null
+		const c = this.staticOwner(p)
 		return if (c == null || c.kind != "class") [] else this.u.args(c)
+	}
+
+	/// The class that declares the static member p names, as C.f: C, or a class C embeds (5.3).
+	private staticOwner(p: Node): Type | null {
+		const c = if (p.kind == "member") standsFor(p.parts[0].type!) else null
+		return if (c == null) null else declarer(c!, this.text(p.parts[1]), true) ?? c
 	}
 
 	/// A call of method name of the string or array o, with it and the args on the stack.
