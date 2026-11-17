@@ -4,9 +4,10 @@
 //!
 //! - null, bool and integers of up to 32 bits as an i32, normalized to their type; 64-bit ones as an i64; floats as an
 //!   f32 or f64.
-//! - A string as a struct of its length, an array of its bytes and whether it ends where they are used, so that
-//!   appends take the free bytes after it (builtin/wasm/string.bob); a T[] as a struct of its length and a T[0] of its
-//!   elements, which push grows; a T[n] as an array of them, copied deeply where stored, as it is a value.
+//! - A string as a struct of its length, an array of its bytes, whether it ends where they are used, so that appends
+//!   take the free bytes after it (builtin/wasm/string.bob), and where in them it starts, so that a slice shares them;
+//!   a T[] as a struct of its length and a T[0] of its elements, which push grows; a T[n] as an array of them, copied
+//!   deeply where stored, as it is a value.
 //! - A class instance, object or tuple as a struct of its fields, an embedded one a ref to a struct of its own.
 //! - A union of refs and null as a ref, null a null one, its type told by a cast; another as a box: the id of its
 //!   value's type, its bits if a number, else its ref; null's is one global.
@@ -368,7 +369,7 @@ class Wasm {
 		}
 		exported("strLen", [s], this.i32, BinaryenStructGet(this.m, 0, arg(0, s), this.i32, false))
 		exported("strAt", [s, this.i32], this.i32,
-			BinaryenArrayGet(this.m, this.bytes(arg(0, s)), arg(1, this.i32), this.i32, false))
+			BinaryenArrayGet(this.m, this.bytes(arg(0, s)), this.offset(arg(0, s), arg(1, this.i32)), this.i32, false))
 		exported("strNew", [this.i32], s, this.newStr(0))
 		exported("strSet", [s, this.i32, this.i32], this.none,
 			BinaryenArraySet(this.m, this.bytes(arg(0, s)), arg(1, this.i32), arg(2, this.i32)))
@@ -965,9 +966,10 @@ class Wasm {
 				const xs = this.popN(3).map(x => this.get(x))
 				this.pushResult(BinaryenArraySet(this.m, this.bytes(xs[0]), xs[1], xs[2]), ret)
 			case "copyBytes":
-				const xs = this.popN(5).map(x => this.get(x))
-				this.pushResult(BinaryenArrayCopy(this.m, this.bytes(xs[0]), xs[1], this.bytes(xs[2]), xs[3], xs[4]),
-					ret)
+				const xs = this.popN(5)
+				const g = (i: i32) => this.get(xs[i])
+				this.pushResult(BinaryenArrayCopy(this.m, this.bytes(g(0)), g(1), this.bytes(g(2)),
+					this.offset(g(2), g(3)), g(4)), ret)
 			case "room":
 				const s = this.pop()
 				const free = this.binary(op.Sub, this.i32, false, BinaryenArrayLen(this.m, this.data(s)),
@@ -978,8 +980,13 @@ class Wasm {
 				const n = this.pop()
 				const s = this.pop()
 				this.emit(BinaryenStructSet(this.m, 2, this.get(s), this.i32c(0)))
-				this.push(BinaryenStructNew(this.m, [this.get(n), this.data(s), this.i32c(1)], 3, this.strHeap()),
-					kind.String)
+				this.push(BinaryenStructNew(this.m, [this.get(n), this.data(s), this.i32c(1), this.i32c(0)], 4,
+					this.strHeap()), kind.String)
+			case "view":
+				const xs = this.popN(3)
+				const g = (i: i32) => this.get(xs[i])
+				this.push(BinaryenStructNew(this.m, [g(2), this.bytes(g(0)), this.i32c(0), this.offset(g(0), g(1))], 4,
+					this.strHeap()), kind.String)
 			case "bits":
 				const x = this.get(this.pop())
 				this.push(if (this.kindOf(t) == kind.F32) BinaryenUnary(this.m, BinaryenExtendUInt32(),
@@ -1462,7 +1469,8 @@ class Wasm {
 	/// Element at, an i32 in range, of arr.
 	private at(arr: V, at: u64): u64 {
 		const e = this.elementType(arr.t)
-		return BinaryenArrayGet(this.m, this.data(arr), at, this.storage(e)[0], this.signed(e))
+		const i = if (this.p.kind(arr.t) == kind.String) this.offset(this.get(arr), at) else at
+		return BinaryenArrayGet(this.m, this.data(arr), i, this.storage(e)[0], this.signed(e))
 	}
 
 	/// Index k into arr, checked.
@@ -2160,11 +2168,16 @@ class Wasm {
 	/// A new string of as many zero bytes as local l holds, that ends where they are used.
 	private newStr(l: i32): u64 {
 		const len = () => BinaryenLocalGet(this.m, l as u32, this.i32)
-		return BinaryenStructNew(this.m, [len(), this.newData(kind.U8, len()), this.i32c(1)], 3, this.strHeap())
+		return BinaryenStructNew(this.m, [len(), this.newData(kind.U8, len()), this.i32c(1), this.i32c(0)], 4,
+			this.strHeap())
 	}
 
 	/// The bytes of string s, some after its end maybe free (builtin/wasm/string.bob).
 	private bytes(s: u64): u64 { return BinaryenStructGet(this.m, 1, s, this.ref(this.dataHeap(kind.U8)), false) }
+	/// The index in the bytes of string s of its byte i.
+	private offset(s: u64, i: u64): u64 {
+		return this.binary(op.Add, this.i32, false, BinaryenStructGet(this.m, 3, s, this.i32, false), i)
+	}
 	private nullRef(): u64 { return this.nullOf(this.eqref) }
 	private nullOf(t: u64): u64 { return BinaryenRefNull(this.m, BinaryenTypeGetHeapType(t)) }
 	private ref(h: u64): u64 { return BinaryenTypeFromHeapType(h, true) }
@@ -2181,7 +2194,7 @@ class Wasm {
 			}
 			const data = BinaryenArrayNewFixed(this.m, this.dataHeap(kind.U8), bytes, bytes.length as u32)
 			BinaryenAddGlobal(this.m, name, this.strType(), false,
-				BinaryenStructNew(this.m, [this.i32c(s.length), data, this.i32c(0)], 3, this.strHeap()))
+				BinaryenStructNew(this.m, [this.i32c(s.length), data, this.i32c(0), this.i32c(0)], 4, this.strHeap()))
 			this.strs.set(s, name)
 		}
 		return BinaryenGlobalGet(this.m, name, this.strType())
@@ -2271,13 +2284,13 @@ class Wasm {
 		}
 	}
 
-	/// What a value of type n, which has a heap type, is made of: a string's length, bytes and whether it ends where
-	/// they are used (builtin/wasm/string.bob); a T[]'s length and elements; a fixed array's element; a function's
-	/// params and result; else its fields.
+	/// What a value of type n, which has a heap type, is made of: a string's length, bytes, whether it ends where they
+	/// are used (builtin/wasm/string.bob) and where in them it starts; a T[]'s length and elements; a fixed array's
+	/// element; a function's params and result; else its fields.
 	private parts(n: i32): i32[] {
 		const p = this.p
 		return switch (p.kind(n)) {
-			case kind.String: [kind.I32, p.type(kind.FixedArray, kind.U8, 0), kind.Bool]
+			case kind.String: [kind.I32, p.type(kind.FixedArray, kind.U8, 0), kind.Bool, kind.I32]
 			case kind.Array: [kind.I32, p.type(kind.FixedArray, p.a(n), 0)]
 			case kind.FixedArray, kind.Func: p.parts(n)
 			default: this.layout(n).map(s => s.t)

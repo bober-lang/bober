@@ -1,7 +1,8 @@
-//! builtin/string.bob for WebAssembly GC (src/wasm.bob), where a string is its length and bytes, of which those after
-//! it may be free for one string to take, the one that ends where they are used.
+//! builtin/string.bob for WebAssembly GC (src/wasm.bob), where a string is its length, bytes and where in them it
+//! starts, as a slice shares them; the bytes after it may be free for one string to take, the one that ends where they
+//! are used.
 
-import { copyBytes, extend, newString, room, setByte, trap } from "./mem"
+import { copyBytes, extend, newString, room, setByte, trap, view } from "./mem"
 
 /// The methods of a string, which is this.
 export class String {
@@ -23,17 +24,19 @@ export class String {
 
 	/// Whether f holds for each code unit.
 	every(f: (x: u8) => bool): bool { return !this.some(x => !f(x)) }
-	/// It, as its bytes are its own.
-	copy(): string { return this }
+	/// It in bytes of its own, not keeping alive those of a string it is a slice of.
+	copy(): string {
+		const r = newString(this.length)
+		copyBytes(r, 0, this, 0, this.length)
+		return r
+	}
 
-	/// The code units from from up to to.
+	/// The code units from from up to to, which share this's bytes.
 	slice(from: i32, to: i32): string {
 		if (from < 0 || from > to || to > this.length) {
 			trap("slice out of range")
 		}
-		const r = newString(to - from)
-		copyBytes(r, 0, this, from, to - from)
-		return r
+		return view(this, from, to - from)
 	}
 }
 
