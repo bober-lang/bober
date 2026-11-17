@@ -70,7 +70,9 @@ export class Bytes {
 			let end = min(to, (at | 0xfff) + 1)
 			let part = ""
 			if (this.written(at)) {
-				part = fromBytes(this.pages[(at >> 12) as i32].slice((at & 0xfff) as i32, (end - (at & ~0xfff)) as i32))
+				const page = this.pages[(at >> 12) as i32]
+				part = fromBytes(if (end - at == 4096) page
+					else page.slice((at & 0xfff) as i32, (end - (at & ~0xfff)) as i32))
 			} else {
 				while (end < to && !this.written(end)) {
 					end = min(to, end + 4096)
@@ -140,7 +142,7 @@ export function le(v: u64, n: i32): string {
 	return s
 }
 
-/// Writes bytes to f, as it has those the bytes are written over: their written pages, coalesced, and their last page,
+/// Writes bytes to f, as it has those the bytes are written over: their written pages, each, and their last page,
 /// at which the file ends; their first page last, zeros until then, so that a file left half written is no image, nor
 /// one a build continues.
 export function store(f: File, bytes: Bytes) {
@@ -149,14 +151,10 @@ export function store(f: File, bytes: Bytes) {
 	const end = (bytes.length + 0xfff) >> 12
 	let p: u64 = 1
 	while (p < end) {
-		let q = p
-		while (q < end && (bytes.written(q << 12) || q == end - 1)) {
-			q++
+		if (bytes.written(p << 12) || p == end - 1) {
+			f.writeAt(p << 12, bytes.slice(p << 12, min((p + 1) << 12, bytes.length)))
 		}
-		if (q > p) {
-			f.writeAt(p << 12, bytes.slice(p << 12, min(q << 12, bytes.length)))
-		}
-		p = q + 1
+		p++
 	}
 	f.writeAt(0, first)
 }
@@ -176,8 +174,10 @@ export function mapped(bytes: Bytes, kept: [u64, u64][] = []): string {
 	return s
 }
 
-/// n zero bytes.
-export function zeros(n: i32): string { return fromBytes(new u8[](n)) }
+/// n zero bytes, of one page of them if they fit.
+export function zeros(n: i32): string { return if (n <= 4096) zeroPage.slice(0, n) else fromBytes(new u8[](n)) }
+
+const zeroPage = fromBytes(new u8[](4096))
 
 /// v's low n bytes, big-endian.
 export function be(v: u64, n: i32): string {
