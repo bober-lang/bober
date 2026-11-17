@@ -2047,8 +2047,9 @@ class Checker {
 	/// all have defaults. `x.a` is a reference to the `T` inside `x`, which keeps `x` alive. The field's initializer,
 	/// and a value assigned to `x.a`, shall be an object literal: a new `T` takes its fields and is copied into place,
 	/// so `x.a = {...v}` copies `v` and `x.a = v` is an error. A class shall not hold itself in place, directly or
-	/// through embeds or `T[n]` fields. `...T` alone is the field `T: ...T`, whose members are also reachable directly
-	/// on the class and run on the embedded value; the class's own members win over embedded ones.
+	/// through embeds or `T[n]` fields, and a static field shall not embed, as no instance holds it. `...T` alone is
+	/// the field `T: ...T`, whose members are also reachable directly on the class and run on the embedded value; the
+	/// class's own members win over embedded ones.
 	///
 	/// A class shall have every member of the type it `implements`, an interface embedding several for several. An
 	/// interface has the members of the type it `extends`, then its own. An interface that extends a union declares no
@@ -2072,6 +2073,8 @@ class Checker {
 	/// class M { m: M }                              // error: no zero value
 	/// class N { next: N | null = null }             // a reference, so N may hold an N
 	/// class R { r: ...R }                           // error: embeds itself
+	/// class E { e: ...i32 }                         // error: embeds a class, not i32
+	/// class F { static f: ...A }                    // error: no instance holds it
 	/// class S { s: S[1] }                           // error: holds itself in place
 	/// class K { static n = 0; static readonly m = K.n }  // error: a const depends on a let (§3)
 	/// class P {}; class Q {}; const p: P = new Q()  // error: classes are nominal
@@ -2222,6 +2225,12 @@ class Checker {
 			throw this.error(m.t.loc, "a field needs a type or an initializer")
 		} else {
 			return "pending"
+		}
+		if (f.embedded && t.kind == "class" && f.type.kind != "class" && f.type.kind != "param") {
+			throw this.error(m.t.loc, `a class embeds a class, not ${show(f.type)}`)
+		}
+		if (f.embedded && f.static) {
+			throw this.error(m.t.loc, "a static field is not embedded, as no instance holds it")
 		}
 		if (f.embedded) {
 			this.runs(f.type, "constructor", false)
