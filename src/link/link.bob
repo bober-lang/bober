@@ -268,10 +268,11 @@ export class Linker {
 	/// The names of the objects given that the continued image holds, in order.
 	objects(): string[] { return this.units.slice(0, this.loaded).filter(u => !u.frozen).map(u => u.object.name) }
 
-	/// The bytes of the sections of that name of the objects given that the continued image holds.
-	sections(name: string): string[] {
+	/// The bytes of the sections of that name of the objects given that the continued image holds, whose names start
+	/// with of.
+	sections(name: string, of = ""): string[] {
 		const out: string[] = []
-		for (const u of this.units.slice(0, this.loaded).filter(u => !u.frozen)) {
+		for (const u of this.units.slice(0, this.loaded).filter(u => !u.frozen && startsWith(u.object.name, of))) {
 			for (const i of 0 ... u.object.sections.length - 1) {
 				const sec = u.object.sections[i]
 				if (sec.name == name && u.at[i] != dropped) {
@@ -806,6 +807,10 @@ export class Linker {
 				}
 				file = max(file, end)
 			}
+		}
+		// An image nothing of which is mapped, as one of Kept sections alone, has an empty segment, for its writer.
+		if (image.segments.length == 0) {
+			image.segments.push({ address: base, size: 0, zero: 0, write: false, exec: false })
 		}
 		const all = merged(laid)
 		image.sections = all.filter(e => e[1] != Kept).map(e => [e[0], e[2], e[3] - e[2]])
