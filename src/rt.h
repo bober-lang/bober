@@ -46,7 +46,8 @@ void bober_written(void *p);
 /// The place of static field key of the generic class instance of descriptor t (src/emit.bob), a root of size bytes laid
 /// out as l, made zero on first use, as is the word before it, which the caller sets once it initializes it.
 void *bober_static(const void *key, const void *t, int64_t size, const bober_layout *l);
-/// A number, from 1, that is p's alone while what p points into lives, however it moves; 0 for null.
+/// A number that is p's alone while what p points into lives, however it moves, and may be another's after: where p
+/// is once old (src/gc.c), as is 0 for null.
 uint64_t bober_id(void *p);
 /// n bytes from C's malloc, which the collector neither moves nor frees, for C to hold; exits if out of memory.
 void *bober_malloc(uint64_t n);
