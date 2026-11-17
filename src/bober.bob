@@ -476,9 +476,10 @@ class TestCache {
 /// Starts main's tests by the command command gives, building them, with args, unless their report is kept: what waits
 /// for them, giving their exit status and their report, the JSON object src/rt.c prints, ended by the exit status if a
 /// crash cut it off, or else what failed as a JSON string.
-function runTests(main: string, args: string[], command: () => string[]): () => [i32, string] {
+export function runTests(main: string, args: string[], command: () => string[]): () => [i32, string] {
 	try {
-		const cmd = [...command(), ...args]
+		const launch = command()
+		const cmd = [...launch, ...args]
 		const flat = replace(normal(main), "/", "_")
 		const out = `${dir}/tmp/${flat}.log`
 		const file = `${dir}/kept/${flat}`
@@ -486,6 +487,9 @@ function runTests(main: string, args: string[], command: () => string[]): () => 
 		try {
 			const k = decodeJson[TestCache](readFile(file))
 			if (code != "" && k.code == code && k.files.every(x => hashOf(x[0]) == x[1])) {
+				for (const pin of launch.filter(a => endsWith(a, ".run"))) {
+					remove(pin) // as src/launch.c would, which does not run
+				}
 				return () => [0, k.report]
 			}
 		} catch (e: IoError | ParseError) {}
