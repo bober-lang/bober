@@ -3015,7 +3015,11 @@ class Checker {
 	/// `&&`, `||`, `??`, `?.`, `if` and `switch` evaluate only what their rules state. A value has one static type, and
 	/// where it is used decides the conversion it undergoes (§4.10).
 	private expr(p: Node, want: Type | null): Type {
-		const t = this.linked(p, want)
+		return this.concrete(p, this.linked(p, want))
+	}
+
+	/// t, the type of p, which shall not be a generic function's: one is called or instantiated, not otherwise a value.
+	private concrete(p: Node, t: Type): Type {
 		if (t.kind == "function" && t.params.length > 0) {
 			throw this.error(start(p), `${this.source(p)} needs type arguments`)
 		}
@@ -3878,7 +3882,7 @@ class Checker {
 			throw this.error(start(n), `${this.source(n)} is not assignable`)
 		}
 		const t = switch (n.kind) {
-			case "postfix": o.nonNull()
+			case "postfix": this.concrete(a, o.nonNull())
 			case "member": this.field(o, n.parts[1], assigned, isTok(a, "this"))
 			case "index": this.index(o, n, assigned)
 			default: this.call(o.called() ?? o, a, n.parts.slice(1, n.parts.length), n.t, want)
