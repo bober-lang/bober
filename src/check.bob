@@ -142,9 +142,13 @@ function special(path: string, name: string, t: Type) {
 }
 
 /// The members of t a value has: those not static, of an interface those of what it embeds in its place, but not
-/// those its own override.
+/// those its own override. Not to be changed: they are t's own list where that is all of them.
 function fields(t: Type): Field[] {
-	const own = members(t).filter(f => !f.static)
+	const all = members(t)
+	if (!all.some(f => f.static || f.embedded && t.kind == "interface")) {
+		return all
+	}
+	const own = all.filter(f => !f.static)
 	const fs: Field[] = []
 	for (const f of own) {
 		if (f.embedded && t.kind == "interface") {
