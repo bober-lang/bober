@@ -168,6 +168,9 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 	/// By index in TPDE's layout, each block's predecessors.
 	std::vector<std::vector<u32>> preds;
 	u32 mark = 0;
+	/// Those of the adaptor's refs defined so far, the parameters and allocas from the start, that live has not found
+	/// freed: what it looks through, not all the function's at each of its calls.
+	std::vector<std::pair<u32, u32>> open;
 	/// By local index, each slot's bit, else ~0u, and each call's offset into alive of the bits of the slots live across
 	/// it, as liveSlots finds them.
 	std::vector<u32> slots, aliveAt;
@@ -295,9 +298,13 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 	/// Finds the immediate dominators, by Cooper, Harvey and Kennedy's "A Simple, Fast Dominance Algorithm", in TPDE's
 	/// layout, which puts a block of a reducible graph after those dominating it, if refs may live across a call.
 	void analysis_end() {
+		open.clear();
 		if (this->adaptor->refs.empty() || !this->adaptor->calls) {
 			return;
 		}
+		std::ranges::copy_if(this->adaptor->refs, std::back_inserter(open), [&](auto &r) {
+			return m().vals[r.first].op == Op::Param || m().vals[r.first].op == Op::Alloca;
+		});
 		const auto &layout = this->analyzer.block_layout;
 		preds.resize(layout.size());
 		for (auto &p : preds) {
@@ -415,11 +422,13 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 		for (u32 b = u32(this->cur_block_idx); marks[b] != mark; b = idom[b]) {
 			marks[b] = mark;
 		}
+		// One without an assignment was freed, and gets none again; one past its last use but not yet freed is still
+		// reported, as its block may loop back to a use.
+		std::erase_if(open, [&](auto &r) { return !this->val_assignment(this->val_idx(r.first)); });
 		std::vector<i32> at;
-		for (auto [v, def] : this->adaptor->refs) {
+		for (auto [v, def] : open) {
 			tpde::ValueAssignment *va = this->val_assignment(this->val_idx(v));
-			// One past its last use but not yet freed is still reported, as its block may loop back to a use.
-			if (!va || v == call || marks[u32(this->analyzer.block_idx(def))] != mark) {
+			if (v == call || marks[u32(this->analyzer.block_idx(def))] != mark) {
 				continue;
 			}
 			if (va->variable_ref) {
@@ -513,6 +522,9 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 
 	bool compile_inst(u32 i, InstRange) {
 		const Value &v = m().vals[i];
+		if (m().collected && this->adaptor->calls && v.op != Op::Alloca && std::ranges::any_of(parts(i), &Part::ref)) {
+			open.push_back({i, v.block});
+		}
 		switch (v.op) {
 		case Op::Alloca: return true;
 		case Op::StackAlloc: return stackAlloc(i);
