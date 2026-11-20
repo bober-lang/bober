@@ -215,16 +215,16 @@ class Unit {
 	/// Adds import n to its module's imports.
 	imported(n: Node) {
 		const p = this.prog
-		const what = n.parts[0]
+		const what = n.parts![0]
 		const bare = isTok(what, "string") // import "p", of namespace p
-		const spec = unquoted(this.text((if (bare) what else n.parts[1]).t))
-		const ns = if (what.kind == "binary") this.text(what.parts[1].t) else if (bare) segment(spec) else ""
+		const spec = unquoted(this.text((if (bare) what else n.parts![1]).t))
+		const ns = if (what.kind == "binary") this.text(what.parts![1].t) else if (bare) segment(spec) else ""
 		const m = p.module(n.symbol.slice(0, n.symbol.length - 1))
 		const names: [i32, i32][] = []
-		for (const q of if (what.kind == "object") what.parts else []) {
+		for (const q of if (what.kind == "object") what.parts! else []) {
 			const renamed = q.kind != "token"
-			const d = p.find(m, -1, this.text((if (renamed) q.parts[0] else q).t))
-			names.push([d, if (renamed) p.intern(this.text(q.parts[1].t)) else 0])
+			const d = p.find(m, -1, this.text((if (renamed) q.parts![0] else q).t))
+			names.push([d, if (renamed) p.intern(this.text(q.parts![1].t)) else 0])
 		}
 		p.modules[this.m].imports.push({ pos: n.t.loc.pos, spec: p.intern(spec), module: m, ns: p.intern(ns), names })
 	}
@@ -243,22 +243,22 @@ class Unit {
 	/// to lower of it; ahead of lowering it, as one lowered before refers to it, what is left is dropped.
 	declare(n: Node): (() => void)[] {
 		this.jobs = []
-		const name = if (n.kind == "test") n.parts[0] else operands(n)[0]
+		const name = if (n.kind == "test") n.parts![0] else operands(n)[0]
 		const text = this.text(name.t)
 		if (name.kind != "token") {
 			throw this.fail(name, "a pattern at the top level")
 		}
-		const mods = (if (isTok(n.parts[0], "export")) decl.Export else 0)
+		const mods = (if (isTok(n.parts![0], "export")) decl.Export else 0)
 			| (if (n.t.kind == "const") decl.Readonly else 0)
 		const t = n.type ?? Type.function([], Null)
 		// A function's, with those of its `T[readonly]` params, or an alias's.
-		const ps = if (n.kind == "function") t.params else child(n, "typeParams")?.parts.map(p => p.type!) ?? []
+		const ps = if (n.kind == "function") t.params else child(n, "typeParams")?.parts?.map(p => p.type!) ?? []
 		switch (n.kind) {
 			case "test":
 				const d = this.l.newDecl(this.m, -1, unquoted(text), decl.Test, 0, t)
 				this.owners.set(n.t.loc.pos, d)
 				this.tops.push(d)
-				this.later(() => this.define(d, this.fn(t), this.body(d, t, null, null, n.parts[1], [])))
+				this.later(() => this.define(d, this.fn(t), this.body(d, t, null, null, n.parts![1], [])))
 			case "function":
 				const body = bodyOf(n)
 				const extern = body == null && indexOf(this.path(), ": ") >= 0 // a C header's, not an intrinsic's
@@ -309,7 +309,7 @@ class Unit {
 		// A local one is declared as its function is lowered, after listing: list its statics now.
 		const listing = this.listing
 		this.listing = listing || owner >= 0
-		for (const p of child(n, "members")!.parts) {
+		for (const p of child(n, "members")!.parts!) {
 			this.member(p, t, d, mods)
 		}
 		this.listing = listing
@@ -370,7 +370,7 @@ class Unit {
 	spelling(n: Node): i32 {
 		switch (n.kind) {
 			case "function", "method", "arrow": return this.sig(child(n, "params")!, after(n, ":"), after(n, "throws"))
-			case "type": return this.spell(n.parts[n.parts.length - 1])
+			case "type": return this.spell(n.parts![n.parts!.length - 1])
 			case "class":
 				const s = supers(n)
 				return if (s.length == 0) 0 else this.spell(s[0])
@@ -384,12 +384,12 @@ class Unit {
 		const p = this.prog
 		const ts: i32[] = []
 		const names: i32[] = []
-		for (const q of params.parts) {
-			const rest = q.parts[0].kind == "unary"
+		for (const q of params.parts!) {
+			const rest = q.parts![0].kind == "unary"
 			const t = after(q, ":")
 			const s = if (t == null) 0 else this.spell(t!)
 			ts.push(if (rest && s != 0) p.type(kind.Rest, s) else s)
-			names.push(p.intern(this.text((if (rest) q.parts[0].parts[0] else q.parts[0]).t)))
+			names.push(p.intern(this.text((if (rest) q.parts![0].parts![0] else q.parts![0]).t)))
 			names.push(0)
 		}
 		const f = p.type(kind.Func, p.list(ts), if (result == null) 0 else this.spell(result!))
@@ -403,39 +403,39 @@ class Unit {
 	spell(n: Node): i32 {
 		const p = this.prog
 		const r = this.ty(standsFor(n.type!) ?? n.type!, true)
-		const a = n.parts.at(0)
+		const a = n.parts?.at(0)
 		switch (n.kind) {
 			case "paren": return this.spell(a!)
 			case "binary": if (n.t.kind == "|") {
-				return p.type(kind.Sum, p.list([...this.members(a!), ...this.members(n.parts[1])]))
+				return p.type(kind.Sum, p.list([...this.members(a!), ...this.members(n.parts![1])]))
 			}
 			case "array": return p.type(kind.Tuple,
-				p.list(n.parts.map(q => if (q.kind == "unary"
-				&& q.t.kind == "...") p.type(kind.Rest, this.spell(q.parts[0]))
+				p.list(n.parts!.map(q => if (q.kind == "unary"
+				&& q.t.kind == "...") p.type(kind.Rest, this.spell(q.parts![0]))
 				else this.spell(q))))
-			case "arrow": return this.sig(a!, n.parts[1], after(n, "throws"))
+			case "arrow": return this.sig(a!, n.parts![1], after(n, "throws"))
 			case "unary": if (n.t.kind == "...") {
 				return p.type(kind.Embed, this.spell(a!))
 			}
-			case "index": return if (n.parts.length == 1) p.type(kind.Array, this.spell(a!))
+			case "index": return if (n.parts!.length == 1) p.type(kind.Array, this.spell(a!))
 				else if (p.kind(r) == kind.FixedArray) p.type(kind.FixedArray, this.spell(a!), p.b(r))
 				else if (p.kind(r) == kind.Param) r
-				else this.spelledName(a!, n.parts.slice(1, n.parts.length), r) // T[readonly]
+				else this.spelledName(a!, n.parts!.slice(1, n.parts!.length), r) // T[readonly]
 			case "token", "member": return this.spelledName(n, [], r)
 			case "object":
 				const names: i32[] = []
-				for (const m of n.parts) {
+				for (const m of n.parts!) {
 					names.push(p.intern(this.key(m.t)))
 					names.push(if (has(m, "readonly")) decl.Readonly else 0)
 				}
-				return p.type(kind.Object, p.list(n.parts.map(m => this.spelling(m))), p.nameList(names))
+				return p.type(kind.Object, p.list(n.parts!.map(m => this.spelling(m))), p.nameList(names))
 		}
 		return r
 	}
 
 	/// The members of union n as written, in order.
 	private members(n: Node): i32[] {
-		return if (n.kind == "binary" && n.t.kind == "|") [...this.members(n.parts[0]), ...this.members(n.parts[1])]
+		return if (n.kind == "binary" && n.t.kind == "|") [...this.members(n.parts![0]), ...this.members(n.parts![1])]
 			else [this.spell(n)]
 	}
 
@@ -443,8 +443,8 @@ class Unit {
 	/// only spelling), or of a class or interface whose args are not r's, as those left to their defaults; else r.
 	private spelledName(n: Node, args: Node[], r: i32): i32 {
 		const p = this.prog
-		const ns = n.parts.at(0)?.symbol ?? ""
-		const d = this.l.top(if (n.kind == "member" && endsWith(ns, ":")) ns + this.text(n.parts[1].t) else n.symbol)
+		const ns = n.parts?.at(0)?.symbol ?? ""
+		const d = this.l.top(if (n.kind == "member" && endsWith(ns, ":")) ns + this.text(n.parts![1].t) else n.symbol)
 		if (d == null) {
 			return r
 		}
@@ -607,7 +607,7 @@ class Unit {
 		const ps: i32[] = []
 		for (const i of 0 ... t.types.length - 1) {
 			const p = this.ty(t.types[i], false, g)
-			const embed = params != null && after(params.parts[i], ":")?.kind == "unary"
+			const embed = params != null && after(params.parts![i], ":")?.kind == "unary"
 			ps.push(if (t.rest && i == t.types.length - 1) this.prog.type(kind.Rest, p)
 				else if (i >= t.n) this.prog.type(kind.Optional, p)
 				else if (embed) this.prog.type(kind.Embed, p)
@@ -879,8 +879,8 @@ class Gen {
 
 	/// Marks the op added last with the type args function p is written with, as f[T], op.Spelled each.
 	private spellArgs(p: Node) {
-		if (p.kind == "index" && p.parts[0].type?.kind == "function") {
-			for (const t of p.parts.slice(1, p.parts.length)) {
+		if (p.kind == "index" && p.parts![0].type?.kind == "function") {
+			for (const t of p.parts!.slice(1, p.parts!.length)) {
 				this.mark(op.Spelled, this.written(t))
 			}
 		}
@@ -958,8 +958,8 @@ class Gen {
 	/// Binds params n of function t, each a local in order, then lowers their defaults and patterns.
 	params(n: Node, t: Type) {
 		const patterns: Node[] = []
-		for (const p of n.parts) {
-			const pattern = if (p.parts[0].kind == "unary") p.parts[0].parts[0] else p.parts[0]
+		for (const p of n.parts ?? []) {
+			const pattern = if (p.parts![0].kind == "unary") p.parts![0].parts![0] else p.parts![0]
 			patterns.push(pattern)
 			// A param holding Types takes them when compiling (4.11).
 			const types = holdsTypes(p.type!)
@@ -969,13 +969,13 @@ class Gen {
 		}
 		// Typed once each is a local, so that the locals typing them captures follow them.
 		for (const i of 0 ... patterns.length - 1) {
-			this.code.locals[this.paramLocals[i]].type = this.ty(n.parts[i].type!)
+			this.code.locals[this.paramLocals[i]].type = this.ty(n.parts![i].type!)
 		}
 		for (const i of 0 ... patterns.length - 1) {
-			const d = after(n.parts[i], "=")
+			const d = after(n.parts![i], "=")
 			if (d != null) {
 				this.open(op.Default, this.paramLocals[i])
-				this.value(d, n.parts[i].type!)
+				this.value(d, n.parts![i].type!)
 				this.op(op.End)
 			}
 			if (patterns[i].kind != "token") {
@@ -987,10 +987,10 @@ class Gen {
 
 	block(n: Node) {
 		this.scopes.enter()
-		if (n.parts.length < long) {
-			this.stmts(n.parts)
+		if (n.parts!.length < long) {
+			this.stmts(n.parts!)
 		} else {
-			this.chunks(n.parts)
+			this.chunks(n.parts!)
 		}
 		this.scopes.leave()
 	}
@@ -1062,7 +1062,7 @@ class Gen {
 		const pos = this.at(p)
 		this.cast(this.raw(p), this.ty(p.type!))
 		if (p.kind == "binary" && p.t.kind == "as") {
-			this.mark(op.As, this.written(p.parts[1]))
+			this.mark(op.As, this.written(p.parts![1]))
 		}
 		const i = this.shown.indexOf(p)
 		if (i >= 0) {
@@ -1150,8 +1150,8 @@ class Gen {
 			case "type": return
 			case "assign": this.assign(p)
 			case "if":
-				this.cond(p.parts[0], kind.None)
-				this.block(p.parts[1])
+				this.cond(p.parts![0], kind.None)
+				this.block(p.parts![1])
 				const e = after(p, "else")
 				if (e != null) {
 					this.op(op.Else)
@@ -1170,8 +1170,8 @@ class Gen {
 			case "test": // its name evaluated only if claimed
 				this.callBuiltin("claim", 0)
 				this.op(op.If, kind.None)
-				this.expr(p.parts[0])
-				this.closure(`${p.t.loc.pos}`, Type.function([], Null), new Node("params", p.t), p.parts[1])
+				this.expr(p.parts![0])
+				this.closure(`${p.t.loc.pos}`, Type.function([], Null), new Node("params", p.t), p.parts![1])
 				this.callBuiltin("subtest", 0)
 				this.op(op.Drop)
 				this.op(op.End)
@@ -1190,12 +1190,12 @@ class Gen {
 	/// A while, or `for (init; cond; step) body`, whose step a continue goes to, after a Fresh of each variable init
 	/// declares, so that each iteration has its own; a const's never changes.
 	private whileStmt(p: Node) {
-		const c = p.parts.length == 4
-		const cond = p.parts[if (c) 1 else 0]
+		const c = p.parts!.length == 4
+		const cond = p.parts![if (c) 1 else 0]
 		this.scopes.enter()
 		const from = this.code.locals.length
 		if (c) {
-			this.stmt(p.parts[0])
+			this.stmt(p.parts![0])
 		}
 		const to = this.code.locals.length
 		const exit = this.open(op.Block, kind.None)
@@ -1205,7 +1205,7 @@ class Gen {
 			this.op(op.Not)
 			this.br(op.BrIf, exit)
 		}
-		this.loop(p.parts[p.parts.length - 1], exit, if (c) this.open(op.Block, kind.None) else loop)
+		this.loop(p.parts![p.parts!.length - 1], exit, if (c) this.open(op.Block, kind.None) else loop)
 		if (c) {
 			this.op(op.End)
 			for (const l of from ... to - 1) {
@@ -1216,7 +1216,7 @@ class Gen {
 				this.op(op.Fresh, l)
 				this.op(op.SetLocal, l)
 			}
-			this.stmt(p.parts[2])
+			this.stmt(p.parts![2])
 		}
 		this.br(op.Br, loop)
 		this.op(op.End)
@@ -1227,18 +1227,18 @@ class Gen {
 	/// for over a range, counting up to its last value; a `for (const x of …)` over a tuple or what eached says, an Each
 	/// of a Readonly local, which mono unrolls where it knows the elements; else over the elements by index (7.3).
 	private forStmt(p: Node) {
-		const pattern = p.parts[1]
-		const over = p.parts[2]
-		const ro = isTok(p.parts[0], "const")
+		const pattern = p.parts![1]
+		const over = p.parts![2]
+		const ro = isTok(p.parts![0], "const")
 		this.scopes.enter()
 		const exit = this.open(op.Block, kind.None)
 		if (over.kind == "binary" && over.t.kind == "...") {
 			const t = this.ty(over.type!)
 			const i = this.temp(t)
 			const last = this.temp(t)
-			this.value(over.parts[0], over.type!)
+			this.value(over.parts![0], over.type!)
 			this.op(op.SetLocal, i)
-			this.value(over.parts[1], over.type!)
+			this.value(over.parts![1], over.type!)
 			this.op(op.SetLocal, last)
 			this.compareLocals(i, last, op.Gt)
 			this.br(op.BrIf, exit)
@@ -1246,7 +1246,7 @@ class Gen {
 			const next = this.open(op.Block, kind.None)
 			this.op(op.Local, i)
 			this.bind(pattern, ro)
-			this.loop(p.parts[3], exit, next)
+			this.loop(p.parts![3], exit, next)
 			this.op(op.End)
 			this.compareLocals(i, last, op.Eq)
 			this.br(op.BrIf, exit)
@@ -1265,7 +1265,7 @@ class Gen {
 					this.holds.set(held!.id, this.prog.type(kind.Of, l, if (key == "") 0 else this.prog.intern(key)))
 				}
 			}
-			this.loop(p.parts[3], exit, this.open(op.Each, l))
+			this.loop(p.parts![3], exit, this.open(op.Each, l))
 		} else {
 			const xs = this.temp(this.ty(over.type!))
 			const i = this.temp(kind.I32)
@@ -1284,7 +1284,7 @@ class Gen {
 			this.op(op.Local, i)
 			this.op(op.Subscript)
 			this.bind(pattern, ro)
-			this.loop(p.parts[3], exit, next)
+			this.loop(p.parts![3], exit, next)
 			this.op(op.End)
 			this.increment(i, kind.I32)
 			this.br(op.Br, loop)
@@ -1318,20 +1318,20 @@ class Gen {
 	/// static (4.11), then per case, in order, an If of whether a label matches with the body body lowers, the cases
 	/// after it in its Else, and the default, or an Unreachable, innermost.
 	private cases(p: Node, t: i32, body: (b: Node) => void) {
-		const s = p.parts[0]
+		const s = p.parts![0]
 		const subject = this.code.local(0, this.ty(s.type!), decl.Readonly)
 		this.expr(s)
 		this.op(op.SetLocal, subject)
 		this.mark(op.Switch)
 		let fallback: Node | null = null
 		let depth = 0
-		for (const c of p.parts.slice(1, p.parts.length)) {
-			const b = c.parts[c.parts.length - 1]
+		for (const c of p.parts!.slice(1, p.parts!.length)) {
+			const b = c.parts![c.parts!.length - 1]
 			if (c.t.kind == "default") {
 				fallback = b
 				continue
 			}
-			const labels = c.parts.slice(0, c.parts.length - 1)
+			const labels = c.parts!.slice(0, c.parts!.length - 1)
 			for (const i of 0 ... labels.length - 1) {
 				this.match(labels[i], s.type!, subject)
 				if (i > 0) {
@@ -1361,11 +1361,11 @@ class Gen {
 		}
 		this.op(op.Local, s)
 		if (l.kind == "binary" && l.t.kind == "...") {
-			this.value(l.parts[0], st)
+			this.value(l.parts![0], st)
 			this.op(op.Ge)
 			this.open(op.If, kind.Bool)
 			this.op(op.Local, s)
-			this.value(l.parts[1], st)
+			this.value(l.parts![1], st)
 			this.op(op.Le)
 			this.op(op.Else)
 			this.op(op.False)
@@ -1529,7 +1529,7 @@ class Gen {
 	/// Whether case label p names a type rather than a value.
 	private isType(p: Node): bool {
 		if (p.kind == "paren" || p.kind == "index" || p.kind == "binary" && p.t.kind == "|") {
-			return this.isType(p.parts[0])
+			return this.isType(p.parts![0])
 		}
 		if (!isTok(p, "ident") || p.symbol == "" && this.find(this.text(p)) != null) {
 			return false
@@ -1554,7 +1554,7 @@ class Gen {
 
 	private tryStmt(p: Node) {
 		this.open(op.Try)
-		this.block(p.parts[0])
+		this.block(p.parts![0])
 		const c = child(p, "catch")
 		if (c != null) {
 			this.scopes.enter()
@@ -1565,9 +1565,9 @@ class Gen {
 			if (ann != null) {
 				this.annotate(ann!, t)
 				this.op(op.Local, l)
-				this.bind(c!.parts[0])
+				this.bind(c!.parts![0])
 			}
-			this.block(c!.parts[c!.parts.length - 1])
+			this.block(c!.parts![c!.parts!.length - 1])
 			this.scopes.leave()
 		}
 		const f = after(p, "finally")
@@ -1582,11 +1582,11 @@ class Gen {
 	/// subexpression of it that was evaluated, but of strings == compares, how their lines differ.
 	private assert(p: Node) {
 		if (p.kind == "binary" && p.t.kind == "&&") {
-			this.assert(p.parts[0])
-			return this.assert(p.parts[1])
+			this.assert(p.parts![0])
+			return this.assert(p.parts![1])
 		}
-		const texts = p.kind == "binary" && p.t.kind == "==" && p.parts.every(q => textual(q.type!))
-		this.shown = if (texts) [...p.parts] else []
+		const texts = p.kind == "binary" && p.t.kind == "==" && p.parts!.every(q => textual(q.type!))
+		this.shown = if (texts) [...p.parts!] else []
 		this.watch(p, true)
 		this.kept = this.shown.map(q => -1)
 		this.value(p, Bool)
@@ -1607,7 +1607,7 @@ class Gen {
 		if (texts) {
 			for (const i of 0 ... 1) {
 				this.op(op.Local, this.kept[i])
-				this.cast(this.ty(p.parts[i].type!), kind.String)
+				this.cast(this.ty(p.parts![i].type!), kind.String)
 			}
 			this.callBuiltin("diff", 0)
 			this.op(op.Add)
@@ -1638,7 +1638,7 @@ class Gen {
 		const or = p.kind == "binary" && p.t.kind == "||"
 		const branches = p.kind == "binary" && ["&&", "||", "??"].includes(p.t.kind) && !(top && or) || link
 			|| ["ifExpr", "switchExpr", "chain"].includes(p.kind)
-		for (const q of if (p.kind == "arrow") [] else if (branches) [p.parts[0]] else p.parts) {
+		for (const q of if (p.kind == "arrow") [] else if (branches) [p.parts![0]] else p.parts ?? []) {
 			this.watch(q, top && (or || p.kind == "paren"))
 		}
 	}
@@ -1661,7 +1661,7 @@ class Gen {
 	}
 
 	private jump(p: Node) {
-		const x = if (p.parts.length > 0) p.parts[0] else null
+		const x = if (p.parts!.length > 0) p.parts![0] else null
 		const loop = if (this.loops.length > 0) this.loops[this.loops.length - 1] else null
 		switch (p.t.kind) {
 			case "return":
@@ -1704,22 +1704,22 @@ class Gen {
 		}
 		if (tmp >= 0 && p.kind == "array" && pt.kind != "tuple") {
 			let n = 0
-			for (const q of p.parts) {
+			for (const q of p.parts!) {
 				n += if (q.kind == "unary") 0 else 1
 			}
 			this.op(op.Local, tmp)
 			this.op(op.Unpack, n)
 			this.op(op.Drop)
 		}
-		for (const i of 0 ... p.parts.length - 1) {
-			const q = p.parts[i]
+		for (const i of 0 ... p.parts!.length - 1) {
+			const q = p.parts![i]
 			this.op(op.Local, if (tmp >= 0) tmp else temps[i])
 			if (q.kind == "unary" && pt.kind == "array") {
 				this.int(kind.I32, i)
 				this.op(op.Local, tmp)
 				this.op(op.Field, this.prog.intern("length"))
 				this.method(pt, "slice")
-				this.bind(q.parts[0], ro)
+				this.bind(q.parts![0], ro)
 			} else if (q.kind == "unary" && p.kind == "array") {
 				// Of a tuple or T[n], made of the elements left.
 				if (pt.rest) {
@@ -1731,21 +1731,21 @@ class Gen {
 					this.op(op.Local, tmp)
 				}
 				this.op(op.Drop)
-				this.op(op.Array, this.ty(q.parts[0].type!), n - i, 0)
-				this.bind(q.parts[0], ro)
+				this.op(op.Array, this.ty(q.parts![0].type!), n - i, 0)
+				this.bind(q.parts![0], ro)
 			} else if (q.kind == "unary") {
-				this.op(op.Object, this.ty(q.parts[0].type!), 1, this.code.list([0])) // {...tmp} of the unnamed fields
-				this.bind(q.parts[0], ro)
+				this.op(op.Object, this.ty(q.parts![0].type!), 1, this.code.list([0])) // {...tmp} of the unnamed fields
+				this.bind(q.parts![0], ro)
 			} else if (p.kind == "array") {
 				const e = element(pt, i)!
 				if (tmp >= 0) {
 					this.read(pt, `${i}`, e, true)
 				}
-				const d = if (q.kind == "binary") q.parts[1] else null
+				const d = if (q.kind == "binary") q.parts![1] else null
 				if (d != null) {
 					this.orElse(e, () => this.value(d!, e.nonNull()), e.nonNull())
 				}
-				this.bind(if (d != null) q.parts[0] else q, ro)
+				this.bind(if (d != null) q.parts![0] else q, ro)
 			} else {
 				const key = this.key(q.t)
 				const f = pt.member(key)!
@@ -1802,18 +1802,18 @@ class Gen {
 	}
 
 	private assign(p: Node) {
-		const target = p.parts[0]
+		const target = p.parts![0]
 		const how = p.t.kind
 		if (target.kind == "array") {
-			const temps = this.elements(target, p.parts[1])
+			const temps = this.elements(target, p.parts![1])
 			if (temps.length == 0) {
-				this.to(p.parts[1], this.ty(target.type!))
+				this.to(p.parts![1], this.ty(target.type!))
 			}
 			return this.unpack(target, temps)
 		}
 		const at = this.place(target, how != "=")
 		if (how == "=") {
-			this.to(this.copied(target, p.parts[1]), at.type)
+			this.to(this.copied(target, p.parts![1]), at.type)
 			return this.op(at.store, at.a, at.b)
 		}
 		if (how == "??=") {
@@ -1822,7 +1822,7 @@ class Gen {
 			this.open(op.If, kind.None)
 			this.mark(op.Compound)
 			this.parts(at)
-			this.to(p.parts[1], at.type)
+			this.to(p.parts![1], at.type)
 			this.op(at.store, at.a, at.b)
 			return this.op(op.End)
 		}
@@ -1835,7 +1835,7 @@ class Gen {
 		} else if (step) {
 			this.int(this.ty(t), 1)
 		} else {
-			this.to(p.parts[1], at.type)
+			this.to(p.parts![1], at.type)
 		}
 		this.arith(opcode(how.slice(0, if (step) 1 else how.length - 1)), t)
 		this.op(at.store, at.a, at.b)
@@ -1845,10 +1845,10 @@ class Gen {
 	/// What `target = p` stores: of `{...v}` into a field embedding v's class, v, which storing copies into place without
 	/// making the literal first (5.3); else p.
 	private copied(target: Node, p: Node): Node {
-		const o = if (target.kind == "member") target.parts[0].type! else null
-		const f = if (o?.kind == "class") members(o!).find(f => f.name == this.text(target.parts[1])) else null
-		const s = if (f?.embedded == true && p.kind == "object" && p.parts.length == 1) p.parts[0] else null
-		return if (s?.kind == "unary" && this.ty(f!.type) == this.ty(s!.parts[0].type!)) s!.parts[0] else p
+		const o = if (target.kind == "member") target.parts![0].type! else null
+		const f = if (o?.kind == "class") members(o!).find(f => f.name == this.text(target.parts![1])) else null
+		const s = if (f?.embedded == true && p.kind == "object" && p.parts!.length == 1) p.parts![0] else null
+		return if (s?.kind == "unary" && this.ty(f!.type) == this.ty(s!.parts![0].type!)) s!.parts![0] else p
 	}
 
 	/// Stores the tuple on the stack, or the elements temps hold, into the places array pattern p lists, each assigned
@@ -1860,8 +1860,8 @@ class Gen {
 			this.op(op.SetLocal, tmp)
 			this.mark(op.Pattern)
 		}
-		for (const i of 0 ... p.parts.length - 1) {
-			const q = p.parts[i]
+		for (const i of 0 ... p.parts!.length - 1) {
+			const q = p.parts![i]
 			if (q.kind == "unary") {
 				throw this.fail(q, "a rest in an assignment")
 			}
@@ -1882,13 +1882,13 @@ class Gen {
 	/// p's and no spread.
 	private elements(p: Node, v: Node, spelled = 0): i32[] {
 		const temps: i32[] = []
-		if (p.kind != "array" || v.kind != "array" || v.parts.length != p.parts.length
-			|| p.parts.some(q => q.kind == "unary") || v.parts.some(e => e.kind == "unary" && e.t.kind == "...")) {
+		if (p.kind != "array" || v.kind != "array" || v.parts!.length != p.parts!.length
+			|| p.parts!.some(q => q.kind == "unary") || v.parts!.some(e => e.kind == "unary" && e.t.kind == "...")) {
 			return temps
 		}
-		for (const i of 0 ... v.parts.length - 1) {
+		for (const i of 0 ... v.parts!.length - 1) {
 			const e = element(p.type!, i)!
-			this.value(v.parts[i], e)
+			this.value(v.parts![i], e)
 			temps.push(this.temp(this.ty(e)))
 			this.op(op.SetLocal, temps[i])
 			this.mark(op.Pattern, spelled)
@@ -1911,15 +1911,15 @@ class Gen {
 			at.type = this.varType(d!, p)
 			return at
 		}
-		const r = p.parts[0]
+		const r = p.parts![0]
 		if (saved && p.kind == "index" && r.type!.kind == "fixed"
 			&& (r.kind == "token" || r.kind == "member" || r.kind == "index")) {
 			// A fixed array is a value; a copy of it in a temp would take the update.
 			const at = new Place(op.Subscript, op.SetSubscript)
 			at.type = this.ty(p.type!)
 			at.array = this.place(r, true)
-			this.expr(p.parts[1])
-			at.index = this.temp(this.ty(p.parts[1].type!))
+			this.expr(p.parts![1])
+			at.index = this.temp(this.ty(p.parts![1].type!))
 			this.op(op.SetLocal, at.index)
 			this.mark(op.Kept)
 			return at
@@ -1928,8 +1928,8 @@ class Gen {
 		// loaded it is cast.
 		const loc = if (saved && p.kind == "member" && r.kind == "token" && r.symbol == "") this.find(this.text(r))
 			else null
-		const i = if (p.kind == "index") p.parts[1] else null
-		const key = if (i == null) this.text(p.parts[1]) else this.fieldKey(i!, r.type!)
+		const i = if (p.kind == "index") p.parts![1] else null
+		const key = if (i == null) this.text(p.parts![1]) else this.fieldKey(i!, r.type!)
 		const own = if (loc != null && (key == null || through(r.type!, key!) == null)
 			&& this.code.locals[loc!].type == this.ty(r.type!)) loc
 			else null
@@ -2001,8 +2001,8 @@ class Gen {
 			case "token": return this.atom(p)
 			case "prop": return this.named(p)
 			case "paren":
-				this.expr(p.parts[0])
-				return this.ty(p.parts[0].type!)
+				this.expr(p.parts![0])
+				return this.ty(p.parts![0].type!)
 			case "unary": return this.unary(p)
 			case "binary": return this.binary(p)
 			case "chain": return this.chain(p)
@@ -2018,31 +2018,31 @@ class Gen {
 				if (t.kind == "tuple" && t.rest) {
 					throw this.fail(p, "a literal of a tuple with a rest")
 				}
-				this.spread(op.Array, t, p.parts, (q: Node, i: i32) => this.value(q, element(t, i)!))
+				this.spread(op.Array, t, p.parts!, (q: Node, i: i32) => this.value(q, element(t, i)!))
 			case "object":
 				// An Object op places each field once and props only before its spreads, so it makes the object of the
 				// parts up to the first prop after a spread or naming a field again; each later part, in source order, is
 				// set on it or, a spread, makes it anew. Its temp's SetLocal and last load are marked a Spread.
 				let n = 0
-				while (n < p.parts.length && p.parts[n].kind != "unary"
-					&& !p.parts.slice(0, n).some(q => this.key(q.t) == this.key(p.parts[n].t))) {
+				while (n < p.parts!.length && p.parts![n].kind != "unary"
+					&& !p.parts!.slice(0, n).some(q => this.key(q.t) == this.key(p.parts![n].t))) {
 					n++
 				}
-				while (n < p.parts.length && p.parts[n].kind == "unary") {
+				while (n < p.parts!.length && p.parts![n].kind == "unary") {
 					n++
 				}
-				this.spread(op.Object, t, p.parts.slice(0, n), (q: Node, i: i32) => this.prop(q))
-				if (n == p.parts.length) {
+				this.spread(op.Object, t, p.parts!.slice(0, n), (q: Node, i: i32) => this.prop(q))
+				if (n == p.parts!.length) {
 					return this.ty(t)
 				}
 				const ot = this.ty(t)
 				const o = this.temp(ot)
 				this.op(op.SetLocal, o)
 				this.mark(op.Spread)
-				for (const q of p.parts.slice(n, p.parts.length)) {
+				for (const q of p.parts!.slice(n, p.parts!.length)) {
 					this.op(op.Local, o)
 					if (q.kind == "unary") {
-						this.expr(q.parts[0])
+						this.expr(q.parts![0])
 						this.op(op.Object, ot, 2, this.code.list([0, 1]))
 						this.op(op.SetLocal, o)
 					} else {
@@ -2052,12 +2052,12 @@ class Gen {
 				}
 				this.op(op.Local, o)
 				this.mark(op.Spread)
-			case "arrow": this.closure(`${p.t.loc.pos}`, t, p.parts[0], arrowBody(p), p)
+			case "arrow": this.closure(`${p.t.loc.pos}`, t, p.parts![0], arrowBody(p), p)
 			case "ifExpr":
-				this.cond(p.parts[0], this.ty(t))
-				this.value(p.parts[1], t)
+				this.cond(p.parts![0], this.ty(t))
+				this.value(p.parts![1], t)
 				this.op(op.Else)
-				this.value(p.parts[2], t)
+				this.value(p.parts![2], t)
 				this.op(op.End)
 			case "switchExpr": this.cases(p, this.ty(t), (v: Node) => this.value(v, t))
 			case "template":
@@ -2072,7 +2072,7 @@ class Gen {
 					}
 				}
 				part(this.piece(p.t))
-				for (const q of p.parts) {
+				for (const q of p.parts!) {
 					if (isTok(q, "templateMid") || isTok(q, "templateTail")) {
 						part(this.piece(q.t))
 					} else {
@@ -2162,8 +2162,8 @@ class Gen {
 		if (p.kind != "member") {
 			return null
 		}
-		const a = p.parts[0]
-		const name = this.text(p.parts[1])
+		const a = p.parts![0]
+		const name = this.text(p.parts![1])
 		if (isTok(a, "ident") && endsWith(a.symbol, ":")) {
 			return l.lift.entries.get(a.symbol + name)
 		}
@@ -2202,10 +2202,10 @@ class Gen {
 		switch (p.kind) {
 			case "member":
 				const d = this.global(p)
-				if (d != null || isTypeValue(p.parts[0].type!) && standsFor(p.parts[0].type!)?.kind != "class") {
+				if (d != null || isTypeValue(p.parts![0].type!) && standsFor(p.parts![0].type!)?.kind != "class") {
 					return if (d != null) this.loadDecl(d, p) else this.reflect(p)
 				}
-				const name = this.text(p.parts[1])
+				const name = this.text(p.parts![1])
 				const o = this.promote(this.receiver(p, chain), name)
 				// A builtin's or generic method, bound here; a class's other methods emit binds.
 				const m = this.methodOf(o, name)
@@ -2219,12 +2219,12 @@ class Gen {
 				if (known != null) {
 					return this.typeOf(p, this.ty(known!))
 				}
-				const a = p.parts[0]
-				const i = p.parts[1]
+				const a = p.parts![0]
+				const i = p.parts![1]
 				if (a.type!.kind == "function") {
 					const d = this.global(a)
 					if (d == null && a.kind == "member") {
-						const name = this.text(a.parts[1])
+						const name = this.text(a.parts![1])
 						const o = this.promote(this.receiver(a, chain), name)
 						const m = this.methodOf(o, name)
 						if (m == null) {
@@ -2282,8 +2282,8 @@ class Gen {
 
 	/// Pushes a member of a type value, as T.kind (4.11).
 	private reflect(p: Node): i32 {
-		this.expr(p.parts[0])
-		this.op(op.Field, this.prog.intern(this.text(p.parts[1])))
+		this.expr(p.parts![0])
+		this.op(op.Field, this.prog.intern(this.text(p.parts![1])))
 		return this.ty(p.type!)
 	}
 
@@ -2311,7 +2311,7 @@ class Gen {
 	/// Pushes the object of link p, branching out of the block at level chain where it is null after a ?., and returns
 	/// its type there.
 	private receiver(p: Node, chain: i32): Type {
-		const a = p.parts[0]
+		const a = p.parts![0]
 		if (isLink(a) && chain >= 0) {
 			this.cast(this.link(a, chain), this.ty(a.type!))
 		} else {
@@ -2327,12 +2327,12 @@ class Gen {
 	/// Pushes the result of call p: of a function or method by its decl, of a method of anything but a class by name,
 	/// else of a function value.
 	private call(p: Node, chain: i32): i32 {
-		const callee = p.parts[0]
-		const args = p.parts.slice(1, p.parts.length)
+		const callee = p.parts![0]
+		const args = p.parts!.slice(1, p.parts!.length)
 		const f = callee.type!
 		const r = this.ty(p.type!)
 		// Without its type args, as f in f[T](); a subscript, as fs[0], is called as a value.
-		const named = if (callee.kind == "index" && callee.parts[0].type?.kind == "function") callee.parts[0]
+		const named = if (callee.kind == "index" && callee.parts![0].type?.kind == "function") callee.parts![0]
 			else callee
 		const d = this.global(named)
 		const l = if (isTok(named, "ident") && named.symbol == "") this.find(this.text(named)) else null
@@ -2351,14 +2351,14 @@ class Gen {
 			return r
 		}
 		if (named.kind == "member" && p.t.kind != "?.") {
-			const name = this.text(named.parts[1])
+			const name = this.text(named.parts![1])
 			const o = this.promote(this.receiver(named, chain), name)
 			const c = methods(o)
 			const m = if (c == null) null else this.u.l.member(c!, name)
 			if (m == null || this.prog.decls[m!].kind == decl.Function) {
 				// xs.push(...ys) appends ys whole.
 				if (o.kind == "array" && name == "push" && args[0].kind == "unary" && args[0].t.kind == "...") {
-					this.expr(args[0].parts[0])
+					this.expr(args[0].parts![0])
 					this.method(o, "append")
 				} else if (m == null) {
 					this.args(f, args)
@@ -2430,7 +2430,7 @@ class Gen {
 		for (const i of 0 ... ps.length - 1) {
 			const q = ps[i]
 			if (q.kind == "unary" && q.t.kind == "...") {
-				this.expr(q.parts[0])
+				this.expr(q.parts![0])
 				spreads.push(i)
 			} else {
 				item(q, i)
@@ -2496,7 +2496,7 @@ class Gen {
 
 	/// The list of the type args of generic decl d's use p, of type inst, 0 if d is not generic.
 	private typeArgs(d: i32, inst: Type, p: Node): i32 {
-		return this.exact([...this.ownerArgs(if (p.kind == "index") p.parts[0] else p), ...this.inferred(d, inst, p)])
+		return this.exact([...this.ownerArgs(if (p.kind == "index") p.parts![0] else p), ...this.inferred(d, inst, p)])
 	}
 
 	/// The type args of the generic class whose static member p names, as C[T].f or C.f within C, before f's own.
@@ -2507,8 +2507,8 @@ class Gen {
 
 	/// The class that declares the static member p names, as C.f: C, or a class C embeds (5.3).
 	private staticOwner(p: Node): Type | null {
-		const c = if (p.kind == "member") standsFor(p.parts[0].type!) else null
-		return if (c == null) null else declarer(c!, this.text(p.parts[1]), true) ?? c
+		const c = if (p.kind == "member") standsFor(p.parts![0].type!) else null
+		return if (c == null) null else declarer(c!, this.text(p.parts![1]), true) ?? c
 	}
 
 	/// A call of method name of the string or array o, with it and the args on the stack.
@@ -2540,7 +2540,7 @@ class Gen {
 		if (ps.length == 0 || g.kind != "function") {
 			return []
 		}
-		const given = if (p.kind == "index") p.parts.slice(1, p.parts.length) else []
+		const given = if (p.kind == "index") p.parts!.slice(1, p.parts!.length) else []
 		const found: (Type | null)[] = []
 		for (const i of 0 ... ps.length - 1) {
 			found.push(if (i < given.length) given[i].type else null)
@@ -2560,7 +2560,7 @@ class Gen {
 
 	private construct(p: Node): i32 {
 		const t = p.type!
-		const args = p.parts.slice(1, p.parts.length)
+		const args = p.parts!.slice(1, p.parts!.length)
 		if (t.kind == "class") {
 			this.ref(this.u.l.nominal(t)) // so that a variable initialized by it comes after what its new runs
 			const c = t.member("constructor")
@@ -2580,7 +2580,7 @@ class Gen {
 			return this.ty(t)
 		}
 		this.op(op.New, this.ty(t))
-		this.annotate(p.parts[0], this.ty(t))
+		this.annotate(p.parts![0], this.ty(t))
 		return this.ty(t)
 	}
 
@@ -2617,7 +2617,7 @@ class Gen {
 	}
 
 	private unary(p: Node): i32 {
-		const x = p.parts[0]
+		const x = p.parts![0]
 		const t = p.type!
 		const id = this.ty(t)
 		switch (p.t.kind) {
@@ -2641,15 +2641,15 @@ class Gen {
 				this.callBuiltin("start", this.u.list([x.type!], false, this))
 			case "await":
 				if (x.t.kind == "...") {
-					const fs = x.parts[0]
+					const fs = x.parts![0]
 					const f = Type.async(t.types[1])
 					if (fs.kind != "array") {
 						this.expr(fs)
-					} else if (fs.parts.some(q => q.type != f)) {
-						this.race(fs.parts, t)
+					} else if (fs.parts!.some(q => q.type != f)) {
+						this.race(fs.parts!, t)
 						return id
 					} else {
-						this.spread(op.Array, Type.array(f), fs.parts, (q: Node, i: i32) => this.value(q, f))
+						this.spread(op.Array, Type.array(f), fs.parts!, (q: Node, i: i32) => this.value(q, f))
 					}
 					this.callBuiltin("race", this.u.list([t.types[1]], false, this))
 					return id
@@ -2703,8 +2703,8 @@ class Gen {
 	}
 
 	private binary(p: Node): i32 {
-		const a = p.parts[0]
-		const b = p.parts[1]
+		const a = p.parts![0]
+		const b = p.parts![1]
 		const t = p.type!
 		switch (p.t.kind) {
 			case "as":
@@ -2847,13 +2847,13 @@ class Gen {
 		let q = p
 		while (q.kind == "chain") {
 			links.push(q)
-			q = q.parts[0]
+			q = q.parts![0]
 		}
 		links.push(q)
-		const xs = [q.parts[0]]
+		const xs = [q.parts![0]]
 		const hows: string[] = []
 		for (const i of 1 ... links.length) {
-			xs.push(links[links.length - i].parts[1])
+			xs.push(links[links.length - i].parts![1])
 			hows.push(links[links.length - i].t.kind)
 		}
 		let prev = -1
@@ -2934,14 +2934,14 @@ function holdsTypes(t: Type): bool { return isTypeValue(t) || t.kind == "array" 
 /// Calls visit with p and each node in it.
 function within(p: Node, visit: (q: Node) => void): void {
 	visit(p)
-	for (const q of p.parts) {
+	for (const q of p.parts ?? []) {
 		within(q, visit)
 	}
 }
 
 /// Whether p names something, so that its value may be other than what its source spells; this, often large, alone is
 /// not shown.
-function names(p: Node): bool { return if (p.kind == "token") p.t.kind == "ident" else p.parts.some(names) }
+function names(p: Node): bool { return if (p.kind == "token") p.t.kind == "ident" else p.parts!.some(names) }
 
 /// Word i, 0 or 1, of literal l of up to 15 bytes as a short string holds it (builtin/string.bob): its length, then
 /// its bytes, 8 to a word, little-endian.

@@ -105,20 +105,20 @@ class File implements Checked {
 	private walk(n: Node, up: Node): void {
 		if (n.kind == "call" || n.kind == "new") {
 			this.calls++
-			for (const a of n.parts.slice(1, n.parts.length)) {
+			for (const a of n.parts!.slice(1, n.parts!.length)) {
 				this.value(a, this.calls)
 			}
 		}
 		const init = after(n, "=")
 		if (n.kind == "var" && init != null) {
 			this.value(init, 0)
-			if (n.parts[0].kind == "token") {
+			if (n.parts![0].kind == "token") {
 				this.add(this.vars, n, 0)
 			}
 		}
 		this.note(n, this.src)
-		if (n.kind == "jump" && n.t.kind == "return" && n.parts.length > 0) {
-			this.value(n.parts[0], 0)
+		if (n.kind == "jump" && n.t.kind == "return" && n.parts!.length > 0) {
+			this.value(n.parts![0], 0)
 		}
 		const ann = after(n, ":")
 		if (ann != null
@@ -126,7 +126,7 @@ class File implements Checked {
 			|| n.kind == "prop" && up.kind == "members")) {
 			this.add(this.types, ann, 0)
 		}
-		for (const p of n.parts) {
+		for (const p of n.parts ?? []) {
 			this.walk(p, n)
 		}
 	}
@@ -134,8 +134,8 @@ class File implements Checked {
 	/// Notes the name of n, of src, if n is an untyped const or a let.
 	private note(n: Node, src: string) {
 		const init = after(n, "=")
-		if (n.kind == "var" && n.parts[0].kind == "token") {
-			const name = src.slice(n.parts[0].t.loc.pos, n.parts[0].t.loc.end())
+		if (n.kind == "var" && n.parts![0].kind == "token") {
+			const name = src.slice(n.parts![0].t.loc.pos, n.parts![0].t.loc.end())
 			if (n.t.kind == "let") {
 				this.lets.push(name)
 			} else if (init?.type?.isUntyped() ?? false) {
@@ -224,12 +224,12 @@ class File implements Checked {
 			return null
 		}
 		const v = r.of(this.vars)
-		const name = v.n.parts[0].t.loc
+		const name = v.n.parts![0].t.loc
 		const ann = this.types.filter(a => a.n == after(v.n, ":"))
 		if (kind == "untype") {
 			return if (ann.length > 0) this.edit(kind, Loc.at(name.end(), ann[0].at.end() - name.end()), "") else null
 		}
-		const vs = spelled(v.n.parts[0], v.decl)
+		const vs = spelled(v.n.parts![0], v.decl)
 		return if (vs.length > 0 && after(v.n, ":") == null) this.edit(kind, Loc.at(name.end(), 0), `: ${r.of(vs)}`)
 			else null
 	}
@@ -285,7 +285,7 @@ const risky = ["swap", "graft", "retype", "untype"]
 /// Whether n is a number or string literal, possibly negated.
 function literal(n: Node): bool {
 	return n.kind == "token" && ["int", "float", "string"].includes(n.t.kind)
-		|| n.kind == "unary" && literal(n.parts[0])
+		|| n.kind == "unary" && literal(n.parts![0])
 }
 
 /// The tokens of src but comments, a template's text between its expressions as the parser takes it.
@@ -325,7 +325,7 @@ function nesting(t: Tok): i32 {
 /// From n's first token through the last of its parts.
 function cover(n: Node): Loc {
 	let c = Loc.at(n.t.loc.pos, n.t.loc.len)
-	for (const p of n.parts) {
+	for (const p of n.parts ?? []) {
 		c = c.join(cover(p))
 	}
 	return c
