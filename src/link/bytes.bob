@@ -55,11 +55,25 @@ export class Bytes {
 		while (i < s.length) {
 			const a = at + (i as u64)
 			const part = s.slice(i, min(s.length, i + 4096 - ((a & 0xfff) as i32)))
-			if (this.slice(a, a + (part.length as u64)) != part) {
+			if (!this.holds(a, part)) {
 				set(this.page(a), (a & 0xfff) as i32, part)
 			}
 			i += part.length
 		}
+	}
+
+	/// Whether the bytes at at, on one page, are s already.
+	private holds(at: u64, s: string): bool {
+		const page = if (this.written(at)) this.pages[(at >> 12) as i32] else none
+		const n = this.file.length as u64
+		for (const i of 0 ... s.length - 1) {
+			const a = at + (i as u64)
+			const b = if (page.length > 0) page[(a & 0xfff) as i32] else if (a < n) this.file[a as i32] else 0
+			if (b != s[i]) {
+				return false
+			}
+		}
+		return true
 	}
 
 	/// The bytes from from to to.
@@ -102,8 +116,11 @@ export class Bytes {
 		}
 		if (this.pages[p].length == 0) {
 			const from = at & ~0xfff
+			const n = this.file.length as u64
 			this.pages[p] = new u8[](4096)
-			set(this.pages[p], 0, this.under(from, from + 4096))
+			if (from < n) {
+				set(this.pages[p], 0, this.file.slice(from as i32, min(n, from + 4096) as i32))
+			}
 		}
 		return this.pages[p]
 	}
