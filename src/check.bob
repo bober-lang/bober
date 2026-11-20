@@ -287,7 +287,8 @@ class Ignore implements Checked {
 export class Node {
 	kind: Syntax | "token"
 	t: Tok
-	parts: Node[] = []
+	/// Its parts, a token's none.
+	parts: Node[] | null = null
 	/// Where its closing token is, if it has one, as Tree's end.
 	end = 0
 	/// Its value's type once checked; of a type expression, declaration or pattern, the type it stands for.
@@ -1168,9 +1169,11 @@ class Checker {
 	private node(t: Tree): Node {
 		const n = new Node(t.kind, t.t)
 		n.end = t.end
+		const ps: Node[] = []
 		for (const p of t.parts) {
-			n.parts.push(if (p instanceof Tree) this.node(p) else new Node("token", p))
+			ps.push(if (p instanceof Tree) this.node(p) else new Node("token", p))
 		}
+		n.parts = ps
 		if (documented.includes(t.kind)) {
 			this.p.doc(start(n).pos, stop(n), n.t.loc.pos)
 		}
@@ -1187,8 +1190,8 @@ class Checker {
 		if (op == "as") {
 			return
 		}
-		const l = outer(n.parts[0])
-		const r = outer(n.parts[1])
+		const l = outer(n.parts![0])
+		const r = outer(n.parts![1])
 		const ok = l != "as" && r != "as" && switch (op) {
 			case "??": (l == "??" || prec(l) == 0) && prec(r) == 0
 			case "**": l != "unary" && l != "await"
@@ -1201,16 +1204,16 @@ class Checker {
 
 	private declare(n: Node): Decl {
 		if (n.kind == "test") {
-			const name = this.text(n.parts[0].t)
+			const name = this.text(n.parts![0].t)
 			if (this.tests.has(name)) {
-				this.report(n.parts[0].t.loc, `test ${name} is declared twice`)
+				this.report(n.parts![0].t.loc, `test ${name} is declared twice`)
 			}
 			this.tests.add(name)
 			return new Decl(n, n.t)
 		}
 		const names = patternNames(operands(n)[0])
 		const d = new Decl(n, names[0].t)
-		d.errors.listed = isTok(n.parts[0], "export") || this.text(names[0].t) == "main"
+		d.errors.listed = isTok(n.parts![0], "export") || this.text(names[0].t) == "main"
 		if (n.kind == "class") {
 			d.nominal = this.nominal(n, d)
 			n.type = d.nominal
@@ -1226,7 +1229,7 @@ class Checker {
 			this.declareTop(name, t.t, b)
 			const own = name.copy() // as it outlives the source
 			this.m.tops.set(own, b)
-			if (isTok(n.parts[0], "export")) {
+			if (isTok(n.parts![0], "export")) {
 				this.m.names.push(own)
 				this.m.exports.set(own, b)
 			}
@@ -1237,7 +1240,7 @@ class Checker {
 	/// Declares the names import n names (3).
 	private imports(n: Node) {
 		const ts = tags(n)
-		const s = n.parts[n.parts.length - 1 - 2 * ts.length].t
+		const s = n.parts![n.parts!.length - 1 - 2 * ts.length].t
 		const spec = this.key(s)
 		const c = endsWith(spec, ".h") || endsWith(spec, ".c")
 		for (const e of ts) {
@@ -1245,12 +1248,12 @@ class Checker {
 				this.report(start(e), "an import's one tag is @Deterministic, of a C import")
 			}
 		}
-		const what = n.parts[0]
+		const what = n.parts![0]
 		const listed = what.kind == "object"
 		const names: Tok[] = []
 		const texts: string[] = []
-		for (const p of if (listed) what.parts else []) {
-			names.push(if (p.kind == "token") p.t else p.parts[0].t)
+		for (const p of if (listed) what.parts! else []) {
+			names.push(if (p.kind == "token") p.t else p.parts![0].t)
 			texts.push(this.text(names[names.length - 1]))
 		}
 		let m: Module | string = ""
@@ -1271,8 +1274,8 @@ class Checker {
 			const visible = if (tests) m.tops else m.exports
 			for (const i of 0 ... names.length - 1) {
 				const b = visible.get(texts[i])
-				const p = what.parts[i]
-				const alias = if (p.kind == "token") p.t else p.parts[1].t
+				const p = what.parts![i]
+				const alias = if (p.kind == "token") p.t else p.parts![1].t
 				if (b == null) {
 					this.report(names[i].loc, `${spec} does not ${if (tests) "declare" else "export"} ${texts[i]}`)
 				} else {
@@ -1284,7 +1287,7 @@ class Checker {
 				this.declareTop(name, what.t, m.exports.get(name)!)
 			}
 		} else {
-			const at = if (what.kind == "binary") what.parts[1].t else s
+			const at = if (what.kind == "binary") what.parts![1].t else s
 			const name = if (what.kind == "binary") this.text(at) else segment(spec)
 			const b = new Binding(Empty, false, false)
 			b.symbol = m.path + ":"
@@ -1512,8 +1515,8 @@ class Checker {
 		const f = new Fn(Null)
 		f.tests = true
 		this.testing = true
-		this.expr(n.parts[0], null)
-		this.body(n.parts[1], f)
+		this.expr(n.parts![0], null)
+		this.body(n.parts![1], f)
 	}
 
 	/// # Declarations
@@ -1563,7 +1566,7 @@ class Checker {
 				this.locals.enter()
 				const ps = this.paramsOf(n)
 				this.typeParams(n, ps, true)
-				const a = this.typeExpr(n.parts[n.parts.length - 1])
+				const a = this.typeExpr(n.parts![n.parts!.length - 1])
 				this.locals.leave()
 				t.type = a
 				t.params = ps
@@ -1717,8 +1720,8 @@ class Checker {
 		if (p.kind == "token" || p.kind == "prop") {
 			return this.define(p.t, t, mutable)
 		}
-		for (const i of 0 ... p.parts.length - 1) {
-			const q = p.parts[i]
+		for (const i of 0 ... p.parts!.length - 1) {
+			const q = p.parts![i]
 			if (p.kind == "array") {
 				const e = element(t, i)
 				if (e == null || t.kind == "fixed" && i >= t.n) {
@@ -1726,15 +1729,15 @@ class Checker {
 				}
 				if (q.kind == "unary") {
 					const tuple = t.kind == "tuple" && !t.rest
-					this.bind(q.parts[0],
+					this.bind(q.parts![0],
 						if (tuple) Type.tuple(t.types.slice(i, t.types.length), false) else Type.array(e), mutable)
 				} else if (q.kind == "binary") {
-					this.bindPart(q.parts[0], e, q.parts[1], mutable)
+					this.bindPart(q.parts![0], e, q.parts![1], mutable)
 				} else {
 					this.bind(q, e, mutable)
 				}
 			} else if (q.kind == "unary") {
-				this.bind(q.parts[0], this.rest(t, p), mutable)
+				this.bind(q.parts![0], this.rest(t, p), mutable)
 			} else {
 				const m = this.member(t, q.t)
 				q.type = m
@@ -1748,7 +1751,7 @@ class Checker {
 		const fs: Field[] = []
 		for (const f of fields(t)) {
 			let named = false
-			for (const q of p.parts) {
+			for (const q of p.parts!) {
 				named = named || q.kind != "unary" && this.key(q.t) == f.name
 			}
 			if (!named) {
@@ -1835,13 +1838,13 @@ class Checker {
 		let required = 0
 		let rest = false
 		let defaulted = false
-		for (const i of 0 ... n.parts.length - 1) {
-			const p = n.parts[i]
-			const name = if (p.parts[0].kind == "unary") p.parts[0].parts[0] else p.parts[0]
+		for (const i of 0 ... n.parts!.length - 1) {
+			const p = n.parts![i]
+			const name = if (p.parts![0].kind == "unary") p.parts![0].parts![0] else p.parts![0]
 			if (rest) {
 				this.report(start(p), "a rest param is the last")
 			}
-			rest = p.parts[0].kind == "unary"
+			rest = p.parts![0].kind == "unary"
 			if (after(p, "=") != null) {
 				defaulted = true
 			} else if (!rest) {
@@ -1870,7 +1873,7 @@ class Checker {
 	private param(p: Node, i: i32, want: Type | null, defaults: bool, ps: Type[] | null): Type {
 		const ann = after(p, ":")
 		const init = after(p, "=")
-		const rest = p.parts[0].kind == "unary"
+		const rest = p.parts![0].kind == "unary"
 		let pt = if (ann != null && ps != null && this.isReadonly(ann)) this.readonly(ann, ps)
 			else if (ann != null) this.annotation(ann)
 			else if (want == null) null
@@ -1896,7 +1899,7 @@ class Checker {
 	/// The type of a param annotated `T[readonly]` n: a type param of its own, added to ps, constrained by `T[] | string`
 	/// (readonlyOf).
 	private readonly(n: Node, ps: Type[]): Type {
-		const e = this.annotation(n.parts[0])
+		const e = this.annotation(n.parts![0])
 		const t = new Type("param")
 		t.base = Type.union([Type.array(e), String])
 		names.set(t, `${show(e)}[readonly]`)
@@ -1907,15 +1910,15 @@ class Checker {
 
 	/// Whether type expression n is `T[readonly]`.
 	private isReadonly(n: Node): bool {
-		return n.kind == "index" && n.parts.length == 2 && isTok(n.parts[1], "ident")
-			&& this.text(n.parts[1].t) == "readonly"
+		return n.kind == "index" && n.parts!.length == 2 && isTok(n.parts![1], "ident")
+			&& this.text(n.parts![1].t) == "readonly"
 	}
 
 	/// The type params n declares, without their constraints and defaults yet.
 	private paramsOf(n: Node): Type[] {
 		const ps: Type[] = []
 		const tp = child(n, "typeParams")
-		for (const p of if (tp == null) [] else tp.parts) {
+		for (const p of if (tp == null) [] else tp.parts!) {
 			const t = new Type("param")
 			names.set(t, this.text(p.t).copy())
 			ps.push(t)
@@ -1927,7 +1930,7 @@ class Checker {
 	private typeParams(n: Node, ps: Type[], bounds: bool) {
 		const tp = child(n, "typeParams")
 		for (const i of 0 ... ps.length - 1) {
-			const p = tp!.parts[i]
+			const p = tp!.parts![i]
 			const t = ps[i]
 			p.type = t
 			this.insert(p.t, new Binding(t, false, true))
@@ -2109,7 +2112,7 @@ class Checker {
 			t.base = Type.union(set)
 		}
 		this.host = t
-		const ms = child(n, "members")!.parts
+		const ms = child(n, "members")!.parts!
 		let constructs = false
 		for (const m of ms) {
 			constructs = constructs || m.kind == "method" && this.key(m.t) == "constructor"
@@ -2127,7 +2130,7 @@ class Checker {
 			a.hidden = has(m, "private")
 			a.readonly = has(m, "readonly")
 			a.method = m.kind == "method"
-			a.errors.listed = isTok(n.parts[0], "export") && !a.hidden
+			a.errors.listed = isTok(n.parts![0], "export") && !a.hidden
 			a.warning = this.warning(m)
 			a.state = state
 			if (t.kind == "class" && this.wall < 0 && (f.static || m.kind == "method") && f.name != "constructor") {
@@ -2164,7 +2167,7 @@ class Checker {
 				return new Warning("experimental", this.m.path)
 			}
 			if (t.generic != null && t.generic == tagTypes.get("Deprecated")) {
-				const e = if (es[i].kind == "index") es[i].parts[1] else null
+				const e = if (es[i].kind == "index") es[i].parts![1] else null
 				return new Warning(`deprecated${this.deprecation(e)}`, this.m.path)
 			}
 		}
@@ -2180,13 +2183,13 @@ class Checker {
 		const bad = "@Deprecated takes a string, or { use: T, why: string }"
 		let why = ""
 		let use = ""
-		for (const m of if (e.kind == "object") e.parts else []) {
+		for (const m of if (e.kind == "object") e.parts! else []) {
 			const a = after(m, ":")!
 			const k = this.key(m.t)
 			if (k == "why" && isTok(a, "string")) {
 				why = `: ${this.key(a.t)}`
 			} else if (k == "use") {
-				use = `; use ${this.source(if (a.kind == "unary" && a.t.kind == "typeof") a.parts[0] else a)}`
+				use = `; use ${this.source(if (a.kind == "unary" && a.t.kind == "typeof") a.parts![0] else a)}`
 			} else {
 				this.report(start(e), bad)
 				return ""
@@ -2210,7 +2213,7 @@ class Checker {
 	private declareMember(m: Node, f: Field, t: Type, constructs: bool): "typed" | "pending" {
 		const ann = after(m, ":")
 		if (m.kind == "unary") {
-			f.type = this.typeExpr(m.parts[0])
+			f.type = this.typeExpr(m.parts![0])
 			f.name = nameOf(f.type.generic ?? f.type) ?? ""
 			f.embedded = true
 			f.mixin = true
@@ -2302,7 +2305,7 @@ class Checker {
 				})
 			}
 		}
-		const ms = child(n, "members")!.parts
+		const ms = child(n, "members")!.parts!
 		for (const i of 0 ... ms.length - 1) {
 			const m = ms[i]
 			const static = has(m, "static")
@@ -2335,8 +2338,8 @@ class Checker {
 		let open = true
 		let reported = false
 		let i = 0
-		while (i < n.parts.length) {
-			const p = n.parts[i]
+		while (i < n.parts!.length) {
+			const p = n.parts![i]
 			if (!open && !reported) {
 				this.report(start(p), "unreachable", true)
 				reported = true
@@ -2352,20 +2355,20 @@ class Checker {
 	/// Makes the statements after the ith of block n its else where it is a static if (4.11) without one whose block
 	/// ends in a jump, so that an instantiation taking the if compiles none of them.
 	private guard(n: Node, i: i32) {
-		const p = n.parts[i]
-		if (p.kind != "if" || i + 1 == n.parts.length || after(p, "else") != null || !this.dependent(p.parts[0])) {
+		const p = n.parts![i]
+		if (p.kind != "if" || i + 1 == n.parts!.length || after(p, "else") != null || !this.dependent(p.parts![0])) {
 			return
 		}
-		const body = p.parts[1].parts
+		const body = p.parts![1].parts!
 		const last = if (body.length == 0) null else body[body.length - 1]
 		if (last == null || last.kind != "jump" || last.t.kind == "assert") {
 			return
 		}
-		const rest = new Node("block", n.parts[i + 1].t)
-		rest.parts = n.parts.slice(i + 1, n.parts.length)
-		p.parts.push(new Node("token", new Tok("else", last.t.loc)))
-		p.parts.push(rest)
-		n.parts = n.parts.slice(0, i + 1)
+		const rest = new Node("block", n.parts![i + 1].t)
+		rest.parts = n.parts!.slice(i + 1, n.parts!.length)
+		p.parts!.push(new Node("token", new Tok("else", last.t.loc)))
+		p.parts!.push(rest)
+		n.parts = n.parts!.slice(0, i + 1)
 	}
 
 	/// Checks a statement, and returns whether its end is reachable. Where it fails, the names it declares fail where
@@ -2451,19 +2454,19 @@ class Checker {
 			case "assign": this.assign(p)
 			case "if": return this.ifStmt(p)
 			case "while":
-				if (p.parts.length == 4) {
+				if (p.parts!.length == 4) {
 					return this.cFor(p)
 				}
-				this.forget(p.parts[1])
-				const broke = this.loop(p.parts[1], this.facts(p.parts[0]).yes)
-				return broke || !isTok(p.parts[0], "true")
+				this.forget(p.parts![1])
+				const broke = this.loop(p.parts![1], this.facts(p.parts![0]).yes)
+				return broke || !isTok(p.parts![0], "true")
 			case "for":
 				this.locals.enter()
-				if (this.bindBy(p.parts[1], () => this.iterated(p.parts[2]), isTok(p.parts[0], "let"))) {
-					this.generic(p.parts[1], p.parts[2])
+				if (this.bindBy(p.parts![1], () => this.iterated(p.parts![2]), isTok(p.parts![0], "let"))) {
+					this.generic(p.parts![1], p.parts![2])
 				}
-				this.forget(p.parts[3])
-				this.loop(p.parts[3], [])
+				this.forget(p.parts![3])
+				this.loop(p.parts![3], [])
 				this.locals.leave()
 			case "switch":
 				const mark = this.undo.length
@@ -2477,7 +2480,7 @@ class Checker {
 					}
 					f.cased = cased
 				})
-				if (!p.parts.some(c => c.t.kind == "default")) {
+				if (!p.parts!.some(c => c.t.kind == "default")) {
 					ends.push([])
 				}
 				this.merge(ends)
@@ -2489,12 +2492,12 @@ class Checker {
 				if (!f.tests) {
 					this.report(p.t.loc, "a test is only at the top level or in a test, outside try")
 				}
-				this.expr(p.parts[0], null)
-				this.forget(p.parts[1])
+				this.expr(p.parts![0], null)
+				this.forget(p.parts![1])
 				const mark = this.undo.length
 				const inLoop = f.inLoop
 				f.inLoop = false // its block is a function of its own (src/lower.bob)
-				this.block(p.parts[1])
+				this.block(p.parts![1])
 				f.inLoop = inLoop
 				this.restore(mark)
 			default: this.value(p)
@@ -2506,11 +2509,11 @@ class Checker {
 	///
 	/// The condition is a `bool`; branches and bodies are blocks, not bare statements.
 	private ifStmt(n: Node): bool {
-		const f = this.facts(n.parts[0])
+		const f = this.facts(n.parts![0])
 		const mark = this.undo.length
 		const ends: Narrowing[][] = []
 		this.narrow(f.yes)
-		if (this.block(n.parts[1])) {
+		if (this.block(n.parts![1])) {
 			ends.push(this.since(mark))
 		}
 		this.restore(mark)
@@ -2562,16 +2565,16 @@ class Checker {
 			this.calls()
 		}
 		if (n.kind == "assign") {
-			this.clobber(n.parts[0])
-			for (const b of this.places(n.parts[0])) {
+			this.clobber(n.parts![0])
+			for (const b of this.places(n.parts![0])) {
 				this.narrow([new Narrowing(b, null)])
 			}
 		}
 		this.locals.enter()
 		if (n.kind == "for") {
-			this.failNames(n.parts[1])
+			this.failNames(n.parts![1])
 		}
-		for (const p of n.parts) {
+		for (const p of n.parts ?? []) {
 			this.forget(p)
 			if (n.kind == "block" || n.kind == "while") {
 				this.fail(p)
@@ -2608,7 +2611,7 @@ class Checker {
 	/// for (let p = head; p != null; p = p.next) { n++ }
 	/// ```
 	private cFor(p: Node): bool {
-		const [init, cond, step, body] = p.parts
+		const [init, cond, step, body] = p.parts!
 		this.locals.enter()
 		this.stmt(init)
 		this.forget(step)
@@ -2644,14 +2647,14 @@ class Checker {
 	/// ```
 	private iterated(p: Node): Type {
 		if (p.kind == "binary" && p.t.kind == "...") {
-			const a = this.expr(p.parts[0], null)
-			const b = this.expr(p.parts[1], null)
+			const a = this.expr(p.parts![0], null)
+			const b = this.expr(p.parts![1], null)
 			const t = if (a.isUntyped() && b.isUntyped()) I32 else this.common(bases(a), bases(b), null, p.t)
 			if (!t.isInt()) {
 				throw this.error(p.t.loc, `expected integers, got ${show(t)}`)
 			}
-			this.convert(p.parts[0], t)
-			this.convert(p.parts[1], t)
+			this.convert(p.parts![0], t)
+			this.convert(p.parts![1], t)
 			p.type = t
 			return t
 		}
@@ -2695,7 +2698,7 @@ class Checker {
 	/// switch (v) { case string: n = v.length; case i32: n = v }
 	/// ```
 	private cases(n: Node, body: (p: Node, at: Tok) => void): bool {
-		const s = n.parts[0]
+		const s = n.parts![0]
 		let subject: Type | null = null
 		this.apart(() => {
 			subject = this.own(s, this.expr(s, null))
@@ -2704,9 +2707,9 @@ class Checker {
 		const k = this.kindOf(s)
 		let all = false
 		const named: Type[] = []
-		for (const c of n.parts.slice(1, n.parts.length)) {
+		for (const c of n.parts!.slice(1, n.parts!.length)) {
 			all = all || c.t.kind == "default"
-			const labels = c.parts.slice(0, c.parts.length - 1)
+			const labels = c.parts!.slice(0, c.parts!.length - 1)
 			const types: Type[] = []
 			for (const l of if (subject == null) [] else labels) {
 				this.apart(() => this.label(l, subject!, types))
@@ -2724,7 +2727,7 @@ class Checker {
 			if (d != null) {
 				this.narrow(d.yes)
 			}
-			body(c.parts[c.parts.length - 1], c.t)
+			body(c.parts![c.parts!.length - 1], c.t)
 			this.restore(mark)
 		}
 		return all
@@ -2739,17 +2742,17 @@ class Checker {
 				return b != null && (b.generic || b.isType && b.type?.kind == "param")
 			case "unary":
 				if (p.t.kind != "typeof") {
-					return p.t.kind == "!" && this.dependent(p.parts[0])
+					return p.t.kind == "!" && this.dependent(p.parts![0])
 				}
 				// A binding's type, as guard asks before the operand is checked.
-				const x = p.parts[0]
+				const x = p.parts![0]
 				const b = if (isTok(x, "ident")) this.find(this.text(x.t)) else null
 				return (b?.type ?? x.type)?.kind == "param"
-			case "member", "index", "paren": return this.dependent(p.parts[0])
+			case "member", "index", "paren": return this.dependent(p.parts![0])
 			case "binary":
 				const op = p.t.kind
 				return (op == "==" || op == "!=" || op == "&&" || op == "||")
-					&& (this.dependent(p.parts[0]) || this.dependent(p.parts[1]))
+					&& (this.dependent(p.parts![0]) || this.dependent(p.parts![1]))
 		}
 		return false
 	}
@@ -2758,8 +2761,8 @@ class Checker {
 	/// that is known only per instantiation stands for a param of its own: each of `T.members` for one of T's, as each of
 	/// a known union's does, and the type of each of `T.fields` for one of T's fields' (4.11).
 	private generic(pattern: Node, p: Node) {
-		const of = if (p.kind == "member") standsFor(p.parts[0].type!) else null
-		const member = if (of == null) "" else this.text(p.parts[1].t)
+		const of = if (p.kind == "member") standsFor(p.parts![0].type!) else null
+		const member = if (of == null) "" else this.text(p.parts![1].t)
 		const one = of != null && of!.kind != "param" && member == "members"
 		if (pattern.kind == "token" && (one || this.dependent(p))) {
 			const b = this.locals.get(this.text(pattern.t))!
@@ -2782,7 +2785,7 @@ class Checker {
 	/// the subject's it is the one value of, a literal or null.
 	private label(p: Node, subject: Type, types: Type[]) {
 		if (p.kind == "binary" && p.t.kind == "...") {
-			for (const q of p.parts) {
+			for (const q of p.parts!) {
 				this.fit(this.expr(q, subject), subject, q)
 			}
 		} else if (this.isType(p) && !isTypeValue(subject)) {
@@ -2844,26 +2847,26 @@ class Checker {
 		const mark = this.undo.length
 		const all = this.fn?.errors?.sites ?? []
 		const from = all.length
-		let open = this.block(n.parts[0])
+		let open = this.block(n.parts![0])
 		const sites = all.slice(from, all.length)
 		this.restore(mark)
 		this.forget(n)
 		const caught = this.undo.length
-		for (const i of 1 ... n.parts.length - 1) {
-			const p = n.parts[i]
+		for (const i of 1 ... n.parts!.length - 1) {
+			const p = n.parts![i]
 			this.restore(caught)
 			if (p.kind == "token") {
-				open = this.block(n.parts[i + 1]) && open
+				open = this.block(n.parts![i + 1]) && open
 				break
 			}
 			// A catch without a type, or whose type fails, takes any.
 			let takes: Type | null = null
 			const ann = after(p, ":")
 			this.locals.enter()
-			if (p.parts.length > 1) {
-				this.bindBy(p.parts[0], () => {
+			if (p.parts!.length > 1) {
+				this.bindBy(p.parts![0], () => {
 					if (ann == null) {
-						throw this.error(start(p.parts[0]), "a caught value needs a type")
+						throw this.error(start(p.parts![0]), "a caught value needs a type")
 					}
 					takes = this.annotation(ann!)
 					return takes!
@@ -2872,7 +2875,7 @@ class Checker {
 			for (const s of sites) {
 				s.caught.push(takes)
 			}
-			open = this.block(p.parts[p.parts.length - 1]) || open
+			open = this.block(p.parts![p.parts!.length - 1]) || open
 			this.locals.leave()
 		}
 		this.restore(caught)
@@ -2895,7 +2898,7 @@ class Checker {
 	/// ```
 	private jump(n: Node): bool {
 		const f = this.fn!
-		const x = if (n.parts.length > 0) n.parts[0] else null
+		const x = if (n.parts!.length > 0) n.parts![0] else null
 		switch (n.t.kind) {
 			case "return":
 				const result = f.result
@@ -2934,16 +2937,17 @@ class Checker {
 	}
 
 	private assign(n: Node) {
-		const target = n.parts[0]
+		const target = n.parts![0]
 		const op = n.t.kind
 		const t = this.target(target)
 		const now = target.type!
-		const value = if (n.parts.length > 1) n.parts[1] else null
+		const value = if (n.parts!.length > 1) n.parts![1] else null
 		if ((op == "++" || op == "--") && !now.isNumber()) {
 			throw this.error(n.t.loc, `${op} needs a number, got ${show(now)}`)
 		}
 		const v = if (value == null) now else this.expr(value, if (op == "??=") t.nonNull() else t)
-		if (target.kind == "member" && fieldOf(target.parts[0].type!, this.text(target.parts[1].t))?.embedded == true) {
+		if (target.kind == "member"
+			&& fieldOf(target.parts![0].type!, this.text(target.parts![1].t))?.embedded == true) {
 			this.embeds(value ?? target)
 		}
 		const r = switch (op) {
@@ -2992,8 +2996,8 @@ class Checker {
 			return if (b == null) [] else [b]
 		}
 		const bs: Binding[] = []
-		for (const q of p.parts) {
-			bs.push(...this.places(if (q.kind == "unary") q.parts[0] else q))
+		for (const q of p.parts!) {
+			bs.push(...this.places(if (q.kind == "unary") q.parts![0] else q))
 		}
 		return bs
 	}
@@ -3002,10 +3006,10 @@ class Checker {
 	private target(p: Node): Type {
 		if (p.kind == "array") {
 			const ts: Type[] = []
-			for (const q of p.parts) {
-				ts.push(if (q.kind == "unary") this.target(q.parts[0]) else this.target(q))
+			for (const q of p.parts!) {
+				ts.push(if (q.kind == "unary") this.target(q.parts![0]) else this.target(q))
 			}
-			const t = Type.tuple(ts, p.parts.length > 0 && p.parts[p.parts.length - 1].kind == "unary")
+			const t = Type.tuple(ts, p.parts!.length > 0 && p.parts![p.parts!.length - 1].kind == "unary")
 			p.type = t
 			return t
 		}
@@ -3089,7 +3093,7 @@ class Checker {
 
 	/// The binding of the param that static s is the kind of, as T in `T.kind` or `(typeof v).kind`, or null.
 	private kindOf(s: Node): Binding | null {
-		const t = if (s.kind == "member" && this.text(s.parts[1].t) == "kind") s.parts[0].type else null
+		const t = if (s.kind == "member" && this.text(s.parts![1].t) == "kind") s.parts![0].type else null
 		const p = if (t == null) null else standsFor(t)
 		return if (p?.kind == "param") this.holder(p!, true) else null
 	}
@@ -3140,7 +3144,7 @@ class Checker {
 	private valueOf(p: Node, want: Type | null): Type {
 		switch (p.kind) {
 			case "token": return this.atom(p)
-			case "paren": return this.expr(p.parts[0], want)
+			case "paren": return this.expr(p.parts![0], want)
 			case "unary": return this.unary(p, want)
 			case "binary": return this.binary(p, want)
 			case "chain":
@@ -3154,17 +3158,17 @@ class Checker {
 			case "object": return this.object(p, want)
 			case "arrow": return this.arrow(p, want)
 			case "ifExpr":
-				const f = this.cond(p.parts[0])
-				const yes = p.parts[1]
-				const no = p.parts[2]
+				const f = this.cond(p.parts![0])
+				const yes = p.parts![1]
+				const no = p.parts![2]
 				const called = this.called
 				const later = if (want == null && yes.kind == "array") this.branch(no, f.no, null) else null
 				const a = this.branch(yes, f.yes, want ?? later)
 				const b = later ?? this.branch(no, f.no, if (want == null && no.kind == "array") a else want)
 				this.kept(called)
 				const t = this.joined(a, b, want, p.t.loc)
-				this.convert(p.parts[1], t)
-				this.convert(p.parts[2], t)
+				this.convert(p.parts![1], t)
+				this.convert(p.parts![2], t)
 				return t
 			case "switchExpr":
 				const ts: Type[] = []
@@ -3181,12 +3185,12 @@ class Checker {
 					throw this.error(p.t.loc, "a switch expression needs a case")
 				}
 				const t = ts[ts.length - 1]
-				for (const c of p.parts.slice(1, p.parts.length)) {
-					this.convert(c.parts[c.parts.length - 1], t)
+				for (const c of p.parts!.slice(1, p.parts!.length)) {
+					this.convert(c.parts![c.parts!.length - 1], t)
 				}
 				return t
 			case "template":
-				for (const q of p.parts) {
+				for (const q of p.parts!) {
 					// Each piece converts by its toString, which every type has.
 					const t = if (isTok(q, "templateMid") || isTok(q, "templateTail")) null else this.value(q)
 					if (t != null) {
@@ -3356,7 +3360,7 @@ class Checker {
 	/// - `await f`, of an `async T`: waits for `f`; `T`
 	/// - `await ...fs`, of an `(async T)[]`: waits for the first of `fs` not taken to finish; `[i32, T]` (§6.10)
 	private unary(n: Node, want: Type | null): Type {
-		const x = n.parts[0]
+		const x = n.parts![0]
 		const op = n.t.kind
 		switch (op) {
 			case "!":
@@ -3374,10 +3378,10 @@ class Checker {
 				this.suspend(true)
 				this.calls() // as other fibers run, which may assign them
 				if (x.kind == "unary" && x.t.kind == "...") {
-					const fs = x.parts[0]
+					const fs = x.parts![0]
 					const ts: Type[] = []
 					// Of an array literal, each future; else x, the array spread.
-					for (const f of if (fs.kind == "array") fs.parts else [x]) {
+					for (const f of if (fs.kind == "array") fs.parts! else [x]) {
 						const t = this.expr(f, null)
 						ts.push(this.awaited(if (f == x) t.params[0] else t, f))
 					}
@@ -3500,8 +3504,8 @@ class Checker {
 	/// let w: string = "else"; w instanceof "if" | "else"   // true, w then "if" | "else"
 	/// ```
 	private binary(n: Node, want: Type | null): Type {
-		const a = n.parts[0]
-		const b = n.parts[1]
+		const a = n.parts![0]
+		const b = n.parts![1]
 		switch (n.t.kind) {
 			case "&&", "||", "instanceof":
 				this.cond(n)
@@ -3587,8 +3591,8 @@ class Checker {
 	/// Checks a comparison or chain of them, and returns the type of its last operand.
 	private compare(n: Node): Type {
 		n.type = Bool
-		const a = n.parts[0]
-		const b = n.parts[1]
+		const a = n.parts![0]
+		const b = n.parts![1]
 		const r0 = if (literals(a)) this.expr(b, null) else null // as in binary
 		const l = if (n.kind == "chain") this.compare(a) else this.expr(a, context(r0))
 		const r = r0 ?? this.expr(b, l)
@@ -3601,7 +3605,7 @@ class Checker {
 			if (!l.isNumber() || !r.isNumber()) {
 				// as the type they join to, untyped constants in neither's context taking their own types (4.1)
 				const t = if (j!.isLoose()) j!.widen(false) else j!
-				this.convert(if (n.kind == "chain") a.parts[1] else a, t)
+				this.convert(if (n.kind == "chain") a.parts![1] else a, t)
 				this.convert(b, t)
 			}
 		} else if (!l.isNumber() || !r.isNumber()) {
@@ -3617,7 +3621,7 @@ class Checker {
 			}
 			const t = if (l.isUntyped() && r.isUntyped() && l.kind == r.kind) l.widen(false)
 				else this.common(bases(l), bases(r), null, n.t)
-			this.convert(if (n.kind == "chain") a.parts[1] else a, t)
+			this.convert(if (n.kind == "chain") a.parts![1] else a, t)
 			this.convert(b, t)
 		}
 		return r
@@ -3628,18 +3632,18 @@ class Checker {
 		const op = p.t.kind
 		p.type = Bool
 		if (p.kind == "paren") {
-			return this.cond(p.parts[0])
+			return this.cond(p.parts![0])
 		}
 		if (p.kind == "unary" && op == "!") {
-			const f = this.cond(p.parts[0])
+			const f = this.cond(p.parts![0])
 			return new Facts(f.no, f.yes)
 		}
 		if (p.kind == "binary" && (op == "&&" || op == "||")) {
-			const a = this.facts(p.parts[0])
+			const a = this.facts(p.parts![0])
 			const mark = this.undo.length
 			const called = this.called
 			this.narrow(if (op == "&&") a.yes else a.no)
-			const b = this.facts(p.parts[1])
+			const b = this.facts(p.parts![1])
 			this.restore(mark)
 			this.kept(called)
 			// What a holds of member paths holds after b only if b calls nothing.
@@ -3649,24 +3653,26 @@ class Checker {
 		}
 		if (p.kind == "binary" && (op == "==" || op == "!=")) {
 			this.compare(p)
-			const k = this.kindOf(p.parts[0])
-			const kt = if (k == null) null else this.byKind(k.type!, [p.parts[1]])
+			const k = this.kindOf(p.parts![0])
+			const kt = if (k == null) null else this.byKind(k.type!, [p.parts![1]])
 			if (k != null && kt != null) {
-				const f = new Facts([new Narrowing(k, kt)], this.otherKind(k, p.parts[1]))
+				const f = new Facts([new Narrowing(k, kt)], this.otherKind(k, p.parts![1]))
 				return if (op == "==") f else new Facts(f.no, f.yes)
 			}
 			// A Type standing for a param, equal to another Type, is that one (4.11).
-			const tp = standsFor(p.parts[0].type!)
-			const tv = standsFor(p.parts[1].type!)
+			const tp = standsFor(p.parts![0].type!)
+			const tv = standsFor(p.parts![1].type!)
 			if (tp?.kind == "param" && tv != null) {
 				const f = new Facts([new Narrowing(this.holder(tp!, true)!, tv)], [])
 				return if (op == "==") f else new Facts(f.no, f.yes)
 			}
-			const d = this.discriminated(p.parts[0], [p.parts[1]])
+			const d = this.discriminated(p.parts![0], [p.parts![1]])
 			if (d != null) {
 				return if (op == "==") d else new Facts(d.no, d.yes)
 			}
-			const x = if (isTok(p.parts[1], "null")) p.parts[0] else if (isTok(p.parts[0], "null")) p.parts[1] else null
+			const x = if (isTok(p.parts![1], "null")) p.parts![0]
+				else if (isTok(p.parts![0], "null")) p.parts![1]
+				else null
 			const b = if (x == null) null else this.place(x)
 			if (b == null) {
 				return new Facts([], [])
@@ -3676,9 +3682,9 @@ class Checker {
 			return if (op == "==") f else new Facts(f.no, f.yes)
 		}
 		if (p.kind == "binary" && op == "instanceof") {
-			const x = p.parts[0]
+			const x = p.parts![0]
 			const l = this.expr(x, null)
-			const t = this.typeExpr(p.parts[1])
+			const t = this.typeExpr(p.parts![1])
 			const b = this.place(x)
 			if (!spells(l, t) && !this.narrows(l, t)) {
 				throw this.error(p.t.loc, `${show(l)} is never ${show(t)}`)
@@ -3696,7 +3702,7 @@ class Checker {
 	/// What x.k being one of string literals ls narrows x, a path to a union, to (6.11): the members whose k may be one of
 	/// them, and those whose k may be another; null where p is not such an x.k.
 	private discriminated(p: Node, ls: Node[]): Facts | null {
-		const b = if (p.kind == "member" && p.t.kind == ".") this.place(p.parts[0]) else null
+		const b = if (p.kind == "member" && p.t.kind == ".") this.place(p.parts![0]) else null
 		const t = if (b == null) null else b.narrowed ?? b.type
 		if (t == null || t.kind != "union") {
 			return null
@@ -3711,7 +3717,7 @@ class Checker {
 		const yes: Type[] = []
 		const no: Type[] = []
 		for (const m of t.types) {
-			const k = m.member(this.text(p.parts[1].t)) ?? String
+			const k = m.member(this.text(p.parts![1].t)) ?? String
 			for (const v of vs) {
 				if (v.fits(k)) {
 					yes.push(m)
@@ -3773,15 +3779,15 @@ class Checker {
 			return "this"
 		}
 		if (p.kind == "member" && p.t.kind == ".") {
-			const o = this.path(p.parts[0])
-			return if (o == null) null else `${o}.${this.text(p.parts[1].t)}`
+			const o = this.path(p.parts![0])
+			return if (o == null) null else `${o}.${this.text(p.parts![1].t)}`
 		}
 		return if (p.kind == "token" && this.place(p) != null) this.text(p.t) else null
 	}
 
 	/// The local member path p starts at, as a later block may declare another of its name; null at this.
 	private from(p: Node): Binding | null {
-		return if (p.kind == "member") this.from(p.parts[0]) else this.place(p)
+		return if (p.kind == "member") this.from(p.parts![0]) else this.place(p)
 	}
 
 	/// Opens a function's scope, with no member paths narrowed and mutable variables unnarrowed, as they may change
@@ -3851,8 +3857,8 @@ class Checker {
 	/// "é" as u8           // error: u8 takes only ASCII, as "é"[0] == 0xC3
 	/// ```
 	private cast(n: Node): Type {
-		const x = n.parts[0]
-		const t = this.typeExpr(n.parts[1])
+		const x = n.parts![0]
+		const t = this.typeExpr(n.parts![1])
 		const v = this.expr(x, if (x.kind == "call" && t.isNumber()) null else t) // a call's type args are its own, not the target's
 		const scalars = (v.isNumber() || v.kind == "bool") && (t.isNumber() || t.kind == "bool")
 		const char = isTok(x, "string") && t.kind == "int"
@@ -3889,7 +3895,7 @@ class Checker {
 	/// const e = null; e?.b            // error: e is always null
 	/// ```
 	private link(n: Node, assigned: bool, want: Type | null = null): Type {
-		const a = n.parts[0]
+		const a = n.parts![0]
 		const space = this.namespace(n)
 		if (space != null) {
 			return this.exported(n, space, assigned)
@@ -3909,9 +3915,9 @@ class Checker {
 		}
 		const t = switch (n.kind) {
 			case "postfix": this.concrete(a, o.nonNull())
-			case "member": this.field(o, n.parts[1], assigned, isTok(a, "this"))
+			case "member": this.field(o, n.parts![1], assigned, isTok(a, "this"))
 			case "index": this.index(o, n, assigned)
-			default: this.call(o.called() ?? o, a, n.parts.slice(1, n.parts.length), n.t, want)
+			default: this.call(o.called() ?? o, a, n.parts!.slice(1, n.parts!.length), n.t, want)
 		}
 		if (n.kind == "call" && n != this.deferred) {
 			this.thrown(n.t.loc, this.errorsOf(a))
@@ -3924,45 +3930,45 @@ class Checker {
 	/// Whether p is a const's `T[n]`, or a readonly field's but on this in its class's constructor, or one in an element
 	/// of it, whose elements and their fields are not assignable.
 	private held(p: Node): bool {
-		if (p.kind == "index" && p.parts[0].type!.kind == "fixed") {
-			return this.held(p.parts[0])
+		if (p.kind == "index" && p.parts![0].type!.kind == "fixed") {
+			return this.held(p.parts![0])
 		} else if (p.type!.kind != "fixed") {
 			return false
 		} else if (p.kind == "token") {
 			return !(this.find(this.text(p.t))?.mutable ?? true)
 		} else if (p.kind != "member") {
-			return (p.kind == "postfix" || p.kind == "paren") && this.held(p.parts[0])
+			return (p.kind == "postfix" || p.kind == "paren") && this.held(p.parts![0])
 		}
-		const k = this.text(p.parts[1].t)
+		const k = this.text(p.parts![1].t)
 		const space = this.namespace(p)
 		if (space != null) {
 			return !space.exports!.get(k)!.mutable
 		}
-		const o = p.parts[0].type!.nonNull()
+		const o = p.parts![0].type!.nonNull()
 		const s = standsFor(o)
 		const c = s ?? o.methods() ?? o
 		const w = declarer(c, k, s != null) ?? c
-		const own = isTok(p.parts[0], "this") && this.fn?.builds == (w.generic ?? w)
-		return about(w, k, s != null).readonly && !own || this.held(p.parts[0])
+		const own = isTok(p.parts![0], "this") && this.fn?.builds == (w.generic ?? w)
+		return about(w, k, s != null).readonly && !own || this.held(p.parts![0])
 	}
 
 	/// The namespace import whose member member link n reads, if it is one.
 	private namespace(n: Node): Binding | null {
-		const b = if (n.kind == "member" && isTok(n.parts[0], "ident")) this.find(this.text(n.parts[0].t)) else null
+		const b = if (n.kind == "member" && isTok(n.parts![0], "ident")) this.find(this.text(n.parts![0].t)) else null
 		return if (b?.exports == null) null else b
 	}
 
 	/// The type of n, the member of namespace import space that is an export of its module, as one imported by name.
 	private exported(n: Node, space: Binding, assigned: bool): Type {
-		const name = n.parts[1].t
-		n.parts[0].symbol = space.symbol
-		n.parts[0].type = space.type
+		const name = n.parts![1].t
+		n.parts![0].symbol = space.symbol
+		n.parts![0].type = space.type
 		const b = this.lookup(name, true, space.exports)
 		if (assigned && !b.mutable) {
 			throw this.error(name.loc, `${this.text(name)} is not assignable`)
 		}
 		const t = this.typeOf(b, name)
-		n.parts[1].type = t
+		n.parts![1].type = t
 		n.type = if (b.isType) meta(t, b.params) else if (assigned) t else this.place(n, t)?.narrowed ?? t
 		return n.type!
 	}
@@ -4016,7 +4022,7 @@ class Checker {
 	}
 
 	private index(o: Type, n: Node, assigned: bool): Type {
-		const args = n.parts.slice(1, n.parts.length)
+		const args = n.parts!.slice(1, n.parts!.length)
 		if (assigned && o.isString()) {
 			throw this.error(n.t.loc, "strings are immutable")
 		}
@@ -4035,20 +4041,20 @@ class Checker {
 				for (const a of args) {
 					targs.push(this.typeExpr(a))
 				}
-				return this.applied(o, o.params, targs, n.parts[0])
+				return this.applied(o, o.params, targs, n.parts![0])
 		}
 		if (args.length != 1) {
 			throw this.error(n.t.loc, `expected one subscript, got ${args.length}`)
 		}
 		const i = args[0]
 		if (isTok(i, "string")) {
-			const m = this.member(o, i.t, assigned, isTok(n.parts[0], "this"))
+			const m = this.member(o, i.t, assigned, isTok(n.parts![0], "this"))
 			i.type = m
 			return m
 		}
 		const t = this.value(i)
 		const f = if (i.kind == "member"
-			&& this.text(i.parts[1].t) == "name") standsFor((i.parts[0].type!).member("type") ?? Null)
+			&& this.text(i.parts![1].t) == "name") standsFor((i.parts![0].type!).member("type") ?? Null)
 			else null
 		if (o.kind == "param" && f?.kind == "param" && f!.text == "fields") {
 			return f! // the field of each of T.fields by its name (4.11)
@@ -4086,8 +4092,8 @@ class Checker {
 			throw this.error(at.loc, `cannot call ${show(f)}`)
 		}
 		if (this.appends(callee, args)) {
-			const xs = callee.parts[0].type!
-			this.fit(this.expr(args[0].parts[0], xs), xs, args[0].parts[0])
+			const xs = callee.parts![0].type!
+			this.fit(this.expr(args[0].parts![0], xs), xs, args[0].parts![0])
 			callee.type = f
 			return Null
 		}
@@ -4100,22 +4106,22 @@ class Checker {
 
 	/// Whether callee(args) is xs.push(...ys), which appends the elements of ys (4.5).
 	private appends(callee: Node, args: Node[]): bool {
-		return callee.kind == "member" && callee.parts[0].type!.kind == "array"
-			&& this.text(callee.parts[1].t) == "push" && args.length == 1 && args[0].kind == "unary"
+		return callee.kind == "member" && callee.parts![0].type!.kind == "array"
+			&& this.text(callee.parts![1].t) == "push" && args.length == 1 && args[0].kind == "unary"
 			&& args[0].t.kind == "..."
 	}
 
 	/// The errors of callee where it names a top-level function or a method, else null: a function value's are unchecked.
 	private errorsOf(callee: Node): Errors | null {
-		const c = if (callee.kind == "index") callee.parts[0] else callee
+		const c = if (callee.kind == "index") callee.parts![0] else callee
 		const space = this.namespace(c)
 		if (space != null) {
-			return space.exports!.get(this.text(c.parts[1].t))?.decl?.errors ?? null
+			return space.exports!.get(this.text(c.parts![1].t))?.decl?.errors ?? null
 		}
 		if (c.kind == "member") {
-			const o = c.parts[0].type!.nonNull()
+			const o = c.parts![0].type!.nonNull()
 			const s = standsFor(o)
-			const k = this.key(c.parts[1].t)
+			const k = this.key(c.parts![1].t)
 			const m = s ?? o.methods() ?? o
 			return about(declarer(m, k, s != null) ?? m, k, s != null).errors
 		}
@@ -4198,13 +4204,13 @@ class Checker {
 	/// new u8[4]()                         // error: write `let b: u8[4]`
 	/// ```
 	private construct(n: Node, want: Type | null): Type {
-		const args = n.parts.slice(1, n.parts.length)
+		const args = n.parts!.slice(1, n.parts!.length)
 		const known: (Type | null)[] = []
-		const t = this.inferred(n, args, known, want) ?? this.typeExpr(n.parts[0])
+		const t = this.inferred(n, args, known, want) ?? this.typeExpr(n.parts![0])
 		switch (t.kind) {
 			case "class":
 				if (t.staticOnly()) {
-					throw this.error(start(n.parts[0]), `${show(t)} has only statics; it is not instantiated`)
+					throw this.error(start(n.parts![0]), `${show(t)} has only statics; it is not instantiated`)
 				}
 				const c = t.member("constructor")
 				this.args(if (c?.kind == "function") c! else Type.function([], Null), args, n.t, known)
@@ -4213,25 +4219,25 @@ class Checker {
 			case "array":
 				const e = t.params[0]
 				if (!e.hasZero()) {
-					throw this.error(start(n.parts[0]), `${show(e)} has no zero value`)
+					throw this.error(start(n.parts![0]), `${show(e)} has no zero value`)
 				}
 				this.args(Type.function([I32], Null), args, n.t)
 			case "tuple": this.args(Type.function([], Null), args, n.t)
 			case "param":
 				// A param each of whose types new makes without arguments makes one so (4.9).
 				if (!newable(t) || args.length > 0) {
-					throw this.error(start(n.parts[0]), `${show(t)} has no new`)
+					throw this.error(start(n.parts![0]), `${show(t)} has no new`)
 				}
 				this.runs(t, "constructor", false)
 				this.calls()
-			default: throw this.error(start(n.parts[0]), `${show(t)} has no new`)
+			default: throw this.error(start(n.parts![0]), `${show(t)} has no new`)
 		}
 		return t
 	}
 
 	/// The instance of the generic class new n names without type args that its constructor's args give, else null.
 	private inferred(n: Node, args: Node[], known: (Type | null)[], want: Type | null): Type | null {
-		const p = n.parts[0]
+		const p = n.parts![0]
 		const [g, ps] = if (isTok(p, "ident")) this.named(p) else [Null, []]
 		if (g.kind != "class" || ps.length == 0 || g.params != ps) {
 			return null
@@ -4246,20 +4252,20 @@ class Checker {
 	private array(n: Node, want: Type | null): Type {
 		const w = aim(want, ["array", "fixed", "tuple"])
 		const n0 = if (w?.kind == "tuple" && !w!.rest) w!.types.length else if (w?.kind == "fixed") w!.n else -1
-		if (n0 >= 0 && n.parts.length != n0) {
-			throw this.error(n.t.loc, `expected ${n0} elements, got ${n.parts.length}`)
+		if (n0 >= 0 && n.parts!.length != n0) {
+			throw this.error(n.t.loc, `expected ${n0} elements, got ${n.parts!.length}`)
 		}
 		// A sibling literal's or a ?? operand's untyped constants shape the elements, but are no type to take.
 		const shaped = w != null && !w.isLoose() && !w.mentions(this.inferring)
 		// Wanted as one of several tuples and no array, or as a tuple of type args being inferred, it is the tuple of its
 		// elements' types, which are not their literal types, for what it is wanted as to pick or infer from.
 		const ms = (w ?? want)?.alternatives() ?? []
-		const tuple = !shaped && !n.parts.some(e => e.kind == "unary" && e.t.kind == "...")
+		const tuple = !shaped && !n.parts!.some(e => e.kind == "unary" && e.t.kind == "...")
 			&& ms.some(m => m.kind == "tuple") && !ms.some(m => m.kind == "array" || m.kind == "fixed")
 		let elem: Type | null = null
 		const ts: Type[] = []
-		for (const i of 0 ... n.parts.length - 1) {
-			const e = n.parts[i]
+		for (const i of 0 ... n.parts!.length - 1) {
+			const e = n.parts![i]
 			const ew = if (w == null) null else element(w, i)
 			const spread = e.kind == "unary" && e.t.kind == "..."
 			const t = if (spread) element(this.expr(e, null), 0)!
@@ -4273,7 +4279,7 @@ class Checker {
 					else this.joined(elem, t, null, start(e))
 			}
 		}
-		if (shaped || n.parts.length == 0 && w != null && !w.mentions(this.inferring)) {
+		if (shaped || n.parts!.length == 0 && w != null && !w.mentions(this.inferring)) {
 			return w!
 		}
 		if (tuple) {
@@ -4284,7 +4290,7 @@ class Checker {
 		}
 		// Not yet a variable's, a literal's elements are not their literal types, so ["a"] fits a string[].
 		const t = based(elem)
-		for (const e of n.parts) {
+		for (const e of n.parts!) {
 			this.convert(e, t) // untyped constants take the type the other elements give
 		}
 		return Type.array(t)
@@ -4296,11 +4302,11 @@ class Checker {
 	private object(n: Node, want: Type | null): Type {
 		const spreads: Type[] = []
 		let cls: Type | null = null
-		for (const q of n.parts) {
+		for (const q of n.parts!) {
 			if (q.kind == "unary") {
-				const t = this.own(q.parts[0], this.expr(q.parts[0], null))
+				const t = this.own(q.parts![0], this.expr(q.parts![0], null))
 				if (t == Empty) {
-					throw this.error(start(q.parts[0]), `cannot spread ${show(t)}`)
+					throw this.error(start(q.parts![0]), `cannot spread ${show(t)}`)
 				}
 				if (t.kind == "class") {
 					if (cls != null && cls != t) {
@@ -4314,7 +4320,7 @@ class Checker {
 		const w = cls ?? aim(want, ["object", "interface"]) ?? this.byTags(n, want)
 		const fs: Field[] = []
 		let k = 0
-		for (const q of n.parts) {
+		for (const q of n.parts!) {
 			if (q.kind == "unary") {
 				for (const f of fields(constraint(spreads[k]))) {
 					if (cls != null && spreads[k] != cls) {
@@ -4350,7 +4356,7 @@ class Checker {
 	/// the string fits: the member its tags (§4.4) select; null if none or several.
 	private byTags(n: Node, want: Type | null): Type | null {
 		const alts = want?.alternatives() ?? []
-		const ms = alts.filter(m => (m.kind == "object" || m.kind == "interface") && n.parts.every(q => {
+		const ms = alts.filter(m => (m.kind == "object" || m.kind == "interface") && n.parts!.every(q => {
 			const v = if (q.kind == "unary") null else after(q, ":")
 			if (v == null || !isTok(v!, "string")) {
 				return true
@@ -4396,8 +4402,8 @@ class Checker {
 	private arrow(n: Node, want: Type | null): Type {
 		const w = aim(want, ["function"])
 		const [paths, mark] = this.open()
-		const sig = this.params(n.parts[0], w)
-		const declared = if (isTok(n.parts[1], ":")) this.annotation(n.parts[2]) else null
+		const sig = this.params(n.parts![0], w)
+		const declared = if (isTok(n.parts![1], ":")) this.annotation(n.parts![2]) else null
 		const f = new Fn(declared ?? w?.base)
 		const body = arrowBody(n)
 		const outer = this.fn
@@ -4427,7 +4433,7 @@ class Checker {
 		if (t.types.includes(Empty)) {
 			throw new Failed()
 		}
-		n.parts[0].type = t
+		n.parts![0].type = t
 		return t
 	}
 
@@ -4462,7 +4468,7 @@ class Checker {
 	}
 
 	private typeOfExpr(p: Node): Type {
-		const a = if (p.parts.length > 0) p.parts[0] else p
+		const a = p.parts?.at(0) ?? p
 		switch (p.kind) {
 			case "token":
 				switch (p.t.kind) {
@@ -4476,7 +4482,7 @@ class Checker {
 				throw this.error(p.t.loc, `expected a type, got ${p.t.kind}`)
 			case "paren": return this.typeExpr(a)
 			case "binary": if (p.t.kind == "|") {
-				return Type.union([this.typeExpr(a), this.typeExpr(p.parts[1])])
+				return Type.union([this.typeExpr(a), this.typeExpr(p.parts![1])])
 			}
 			case "index":
 				if (this.isReadonly(p)) {
@@ -4485,33 +4491,33 @@ class Checker {
 				const [base,
 					ps] = if (isTok(a, "ident") || a.kind == "member") this.named(a) else [this.typeExpr(a), []]
 				a.type = base
-				if (p.parts.length == 1) {
+				if (p.parts!.length == 1) {
 					return Type.array(this.applied(base, ps, [], a))
 				}
-				const n = this.constant(p.parts[1])
-				if (n != null && p.parts.length == 2) {
+				const n = this.constant(p.parts![1])
+				if (n != null && p.parts!.length == 2) {
 					const len = small(n!)
 					if (len == null) {
-						throw this.error(start(p.parts[1]), `${n} is not a length`)
+						throw this.error(start(p.parts![1]), `${n} is not a length`)
 					}
 					return Type.fixed(this.applied(base, ps, [], a), len!)
 				}
 				const args: Type[] = []
-				for (const q of p.parts.slice(1, p.parts.length)) {
+				for (const q of p.parts!.slice(1, p.parts!.length)) {
 					args.push(this.typeExpr(q))
 				}
 				return this.applied(base, ps, args, a)
 			case "array":
 				const ts: Type[] = []
 				let rest = false
-				for (const q of p.parts) {
+				for (const q of p.parts!) {
 					rest = q.kind == "unary"
 					ts.push(this.typeExpr(q))
 				}
 				return Type.tuple(ts, rest)
 			case "object":
 				const fs: Field[] = []
-				for (const m of p.parts) {
+				for (const m of p.parts!) {
 					const ann = after(m, ":")
 					if (m.kind != "method" && ann == null) {
 						throw this.error(m.t.loc, "a member needs a type")
@@ -4527,7 +4533,7 @@ class Checker {
 				if (sig.types.includes(Empty)) {
 					throw new Failed()
 				}
-				const t = returning(sig, this.typeExpr(p.parts[1]))
+				const t = returning(sig, this.typeExpr(p.parts![1]))
 				const thrown = after(p, "throws")
 				if (thrown != null) {
 					this.typeExpr(thrown!) // resolved for Decl.spelled
@@ -4726,7 +4732,7 @@ class Checker {
 			return b != null && b.isType
 		}
 		return (p.kind == "paren" || p.kind == "index" || p.kind == "binary" && p.t.kind == "|")
-			&& this.isType(p.parts[0])
+			&& this.isType(p.parts![0])
 	}
 
 	/// Reports v not fitting want, or an integer constant not representable in it.
@@ -4754,7 +4760,7 @@ class Checker {
 			return
 		}
 		if (p.kind == "unary" && p.t.kind == "...") {
-			return this.convert(p.parts[0], Type.array(t)) // an array spread's elements convert to t
+			return this.convert(p.parts![0], Type.array(t)) // an array spread's elements convert to t
 		}
 		const m = taken(u, t)
 		// An object literal keeps an object of its own members, in its order, of t's types where t has them, converting
@@ -4767,27 +4773,27 @@ class Checker {
 			this.representable(p, c)
 		}
 		switch (p.kind) {
-			case "array": for (const i of 0 ... p.parts.length - 1) {
+			case "array": for (const i of 0 ... p.parts!.length - 1) {
 				const e = element(c, i)
 				if (e != null) {
-					this.convert(p.parts[i], e)
+					this.convert(p.parts![i], e)
 				}
 			}
-			case "object": for (const q of p.parts) {
+			case "object": for (const q of p.parts!) {
 				const m = if (q.kind == "prop") c.member(this.key(q.t)) else null
 				if (m != null) {
 					this.convert(q, m)
 				}
 			}
-			case "switchExpr": for (const k of p.parts.slice(1, p.parts.length)) {
-				this.convert(k.parts[k.parts.length - 1], c)
+			case "switchExpr": for (const k of p.parts!.slice(1, p.parts!.length)) {
+				this.convert(k.parts![k.parts!.length - 1], c)
 			}
 			case "ifExpr":
-				this.convert(p.parts[1], c)
-				this.convert(p.parts[2], c)
-			case "index": this.convert(p.parts[0], Type.array(c))
-			case "prop", "paren", "unary", "binary": for (const q of p.parts) {
-				const nullable = q == p.parts[0] && p.t.kind == "??" // ?? reads its left operand as nullable
+				this.convert(p.parts![1], c)
+				this.convert(p.parts![2], c)
+			case "index": this.convert(p.parts![0], Type.array(c))
+			case "prop", "paren", "unary", "binary": for (const q of p.parts ?? []) {
+				const nullable = q == p.parts![0] && p.t.kind == "??" // ?? reads its left operand as nullable
 				this.convert(q, if (nullable) c.nullable() else c, !isConstant(p)) // a constant's value is checked whole, with its sign
 			}
 		}
@@ -4809,13 +4815,13 @@ class Checker {
 			return if (s == null) null else decimal(s!)
 		}
 		if (p.kind == "paren") {
-			return this.constant(p.parts[0])
+			return this.constant(p.parts![0])
 		}
 		if (p.kind == "binary" && p.t.kind == "as") {
-			const v = this.constant(p.parts[0])
+			const v = this.constant(p.parts![0])
 			return if (v != null && p.type?.kind == "int" && holds(p.type!, v!)) v else null
 		}
-		const v = if (p.kind == "unary" && p.t.kind == "-") this.constant(p.parts[0]) else null
+		const v = if (p.kind == "unary" && p.t.kind == "-") this.constant(p.parts![0]) else null
 		return if (v == null) null else negated(v!)
 	}
 
@@ -5056,10 +5062,10 @@ export function segment(spec: string): string {
 /// The parts after a declaration's modifiers.
 export function operands(n: Node): Node[] {
 	let i = 0
-	while (i < n.parts.length && isModifier(n.parts[i])) {
+	while (i < n.parts!.length && isModifier(n.parts![i])) {
 		i++
 	}
-	return n.parts.slice(i, n.parts.length)
+	return n.parts!.slice(i, n.parts!.length)
 }
 
 function isModifier(p: Node): bool {
@@ -5067,7 +5073,7 @@ function isModifier(p: Node): bool {
 }
 
 /// Whether a ?. in access chain n makes it null where it cuts the chain short.
-export function optional(n: Node): bool { return n.t.kind == "?." || isLink(n.parts[0]) && optional(n.parts[0]) }
+export function optional(n: Node): bool { return n.t.kind == "?." || isLink(n.parts![0]) && optional(n.parts![0]) }
 
 /// The operator on the outside of p: a binary one, as, await, unary for another unary one, or "".
 function outer(p: Node): Shape {
@@ -5094,7 +5100,7 @@ export function isLink(n: Node): bool {
 export function isTok(p: Node, kind: Kind): bool { return p.kind == "token" && p.t.kind == kind }
 
 export function has(n: Node, kind: Kind): bool {
-	for (const p of n.parts) {
+	for (const p of n.parts ?? []) {
 		if (isTok(p, kind)) {
 			return true
 		}
@@ -5103,16 +5109,17 @@ export function has(n: Node, kind: Kind): bool {
 }
 
 export function after(n: Node, kind: Kind): Node | null {
-	for (const i of 1 ... n.parts.length - 1) {
-		if (isTok(n.parts[i - 1], kind)) {
-			return n.parts[i]
+	const ps = n.parts ?? []
+	for (const i of 1 ... ps.length - 1) {
+		if (isTok(ps[i - 1], kind)) {
+			return ps[i]
 		}
 	}
 	return null
 }
 
 export function child(n: Node, kind: Syntax): Node | null {
-	for (const p of n.parts) {
+	for (const p of n.parts ?? []) {
 		if (p.kind == kind) {
 			return p
 		}
@@ -5129,26 +5136,27 @@ export function supers(n: Node): Node[] {
 /// The tags of a class, interface or member: the type after each @.
 export function tags(n: Node): Node[] {
 	const ts: Node[] = []
-	for (const i of 1 ... n.parts.length - 1) {
-		if (isTok(n.parts[i - 1], "@")) {
-			ts.push(n.parts[i])
+	for (const i of 1 ... n.parts!.length - 1) {
+		if (isTok(n.parts![i - 1], "@")) {
+			ts.push(n.parts![i])
 		}
 	}
 	return ts
 }
 
 /// The body of arrow n, after its params and result type.
-export function arrowBody(n: Node): Node { return n.parts[if (isTok(n.parts[1], ":")) 3 else 1] }
+export function arrowBody(n: Node): Node { return n.parts![if (isTok(n.parts![1], ":")) 3 else 1] }
 /// Whether function n declares its type without its body: it has a result type or no body.
 function declaresType(n: Node): bool { return after(n, ":") != null || bodyOf(n) == null }
 
 export function bodyOf(n: Node): Node | null {
-	const b = n.parts[n.parts.length - 1]
+	const b = n.parts![n.parts!.length - 1]
 	return if (b.kind == "block") b else null
 }
 
 function start(p: Node): Loc {
-	const first = if (p.parts.length > 0) start(p.parts[0]) else p.t.loc
+	const q = p.parts?.at(0)
+	const first = if (q == null) p.t.loc else start(q)
 	return if (first.pos < p.t.loc.pos) first else p.t.loc
 }
 
@@ -5158,7 +5166,7 @@ export function sourceOf(src: string, p: Node): string { return src.slice(start(
 /// Where p's source ends, after its closing token if it has one.
 function stop(p: Node): i32 {
 	let end = if (p.end > p.t.loc.pos) p.end + 1 else p.t.loc.end()
-	for (const q of p.parts) {
+	for (const q of p.parts ?? []) {
 		const e = stop(q)
 		end = if (e > end) e else end
 	}
@@ -5193,9 +5201,9 @@ function context(t: Type | null): Type | null {
 function literals(p: Node): bool {
 	return switch (p.kind) {
 		case "token": p.t.kind == "int" || p.t.kind == "float"
-		case "paren": literals(p.parts[0])
-		case "unary": (p.t.kind == "-" || p.t.kind == "~") && literals(p.parts[0])
-		case "binary": prec(p.t.kind) > 4 && literals(p.parts[0]) && literals(p.parts[1])
+		case "paren": literals(p.parts![0])
+		case "unary": (p.t.kind == "-" || p.t.kind == "~") && literals(p.parts![0])
+		case "binary": prec(p.t.kind) > 4 && literals(p.parts![0]) && literals(p.parts![1])
 		default: false
 	}
 }
@@ -5203,11 +5211,11 @@ function literals(p: Node): bool {
 /// The phase infer checks arg p in.
 function phaseOf(p: Node): i32 {
 	return switch (p.kind) {
-		case "array", "object": if (p.parts.length == 0) 3 else 1
+		case "array", "object": if (p.parts!.length == 0) 3 else 1
 		case "ifExpr", "switchExpr": 1
 		case "arrow": 2 // after the literals, whose types its params may take
 		case "binary": if (p.t.kind == "??" || prec(p.t.kind) > 4) 1 else 0 // arithmetic and bitwise, untyped if their operands are
-		case "paren", "unary": phaseOf(p.parts[0])
+		case "paren", "unary": phaseOf(p.parts![0])
 		default: 0
 	}
 }
@@ -5226,7 +5234,7 @@ function small(v: string): i32 | null { return if (v[0] != minus && holds(I32, v
 /// Whether p is a constant, so that an untyped one initializes an untyped const (4.1).
 function isConstant(p: Node): bool {
 	return p.kind == "token" || p.kind == "member"
-		|| (p.kind == "paren" || p.kind == "unary" && p.t.kind == "-") && isConstant(p.parts[0])
+		|| (p.kind == "paren" || p.kind == "unary" && p.t.kind == "-") && isConstant(p.parts![0])
 }
 
 /// t, or if a literal of a value, its base: the type a literal's element or member is of where no type is wanted.
@@ -5236,10 +5244,10 @@ function based(t: Type): Type { return if (t.kind == "literal" && t.params.lengt
 function unrun(p: Node): Node[] {
 	switch (p.kind) {
 		case "arrow": return [p]
-		case "binary": return if (p.t.kind == "as") unrun(p.parts[0]) else []
+		case "binary": return if (p.t.kind == "as") unrun(p.parts![0]) else []
 		case "paren", "ifExpr", "switchExpr", "case", "array", "object", "prop":
 			let fns: Node[] = []
-			for (const q of p.parts) {
+			for (const q of p.parts ?? []) {
 				fns = [...fns, ...unrun(q)]
 			}
 			return fns
@@ -5253,7 +5261,7 @@ export function patternNames(p: Node): Node[] {
 		case "token": return [p]
 		case "array", "object":
 			let ns: Node[] = []
-			for (const q of p.parts) {
+			for (const q of p.parts ?? []) {
 				ns = [...ns, ...patternNames(q)]
 			}
 			return ns
@@ -5261,7 +5269,7 @@ export function patternNames(p: Node): Node[] {
 			const v = after(p, ":")
 			return if (v == null) [p] else patternNames(v)
 	}
-	return patternNames(p.parts[0])
+	return patternNames(p.parts![0])
 }
 
 /// What param p is where its kind is k (4.11): a string, bool, null or Type, an array of a param standing for p's elem, else
