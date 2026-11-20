@@ -1750,7 +1750,7 @@ class Emitter {
 		this.start(array)
 		const e = this.word(d, elemAt)
 		this.ir().store(this.union(d, this.i64Const(0),
-			this.cell(this.word(e, sizeAt), this.i64Const(0), this.layoutOf(e))), r, false)
+			this.cell(this.word(e, sizeAt), this.i64Const(0), this.layoutOf(e), true)), r, false)
 		this.jump(done)
 		this.start(tuple)
 		this.ir().store(this.union(d, this.i64Const(0),
@@ -2022,7 +2022,7 @@ class Emitter {
 			}
 			this.b.readable(() => this.strBytes(v), () => this.strLen(v), 1)
 		} else if (k == kind.Array) {
-			// The elements are after the header in its 16-aligned cell, or in a cell of their own.
+			// The elements follow its length, capacity and data in its 16-aligned cell, or are a cell of their own; none: null.
 			this.b.readable(() => this.elements(v),
 				() => this.ir().binary("mul", this.arrLen(v), this.sizeOf(this.elem(t))), 8)
 		}
@@ -2449,12 +2449,12 @@ class Emitter {
 	}
 
 	/// A new array of n zero elements of type e.
-	private cellOf(e: i32, n: Value): Value {
+	private cellOf(e: i32, n: Value, empty = false): Value {
 		if (this.dynamic(e)) {
 			const d = this.desc(e)
-			return this.cell(this.word(d, sizeAt), n, this.layoutOf(d))
+			return this.cell(this.word(d, sizeAt), n, this.layoutOf(d), empty)
 		}
-		return this.cell(this.sizeOf(e), n, this.b.layout(this.stored(e)))
+		return this.cell(this.sizeOf(e), n, this.b.layout(this.stored(e)), empty)
 	}
 
 	/// An array, tuple, fixed array or object of type t of the values; a spread's elements appended, or its fields copied.
@@ -2522,7 +2522,7 @@ class Emitter {
 		const k = this.p.kind(u)
 		const st = if (k == kind.FixedArray) this.mem(u) else 0
 		// A T[n] is copied where stored, so one holding no refs, which would have the collector find it, is in the frame.
-		const r = if (k == kind.Array) this.cellOf(this.p.a(u), this.i64Const(n))
+		const r = if (k == kind.Array) this.cellOf(this.p.a(u), this.i64Const(n), n == 0)
 			else if (k != kind.FixedArray) this.instance(u)
 			else if (!this.b.holdsRef(st)) this.gc(this.spill(this.zero(u), st, this.slot(st)))
 			else this.fixed(u)
@@ -3804,13 +3804,15 @@ class Emitter {
 	}
 
 	/// A new array of n zero elements, each of size bytes laid out as layout, in one cell: its length, capacity and
-	/// data, which points past them to the elements; the layout's low bit tells the collector so (src/gc.c).
-	private cell(size: Value, n: Value, layout: Value): Value {
+	/// data, which points past them to the elements; the layout's low bit tells the collector so (src/gc.c). If empty,
+	/// the data is null, never dereferenced, as one into the cell would keep LLVM from dropping an array not used.
+	private cell(size: Value, n: Value, layout: Value, empty = false): Value {
 		const bytes = this.ir().binary("add", this.b.sizeOf(this.arrayTy), this.ir().binary("mul", n, size))
 		const r = this.rt("alloc", [bytes, this.ir().gep(this.b.int(8), layout, [this.i64Const(1)])], false)
 		this.ir().store(n, r, false)
 		this.ir().store(n, this.ir().field(this.arrayTy, r, 1), false)
-		this.ir().store(this.ir().gep(this.arrayTy, r, [this.i64Const(1)]), this.ir().field(this.arrayTy, r, 2), false)
+		const data = if (empty) this.b.constZero(this.ref) else this.ir().gep(this.arrayTy, r, [this.i64Const(1)])
+		this.ir().store(data, this.ir().field(this.arrayTy, r, 2), false)
 		return r
 	}
 
