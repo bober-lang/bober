@@ -13,10 +13,11 @@
 //! (src/fiber.c), and the refs of old objects on dirty cards. A card is 512 bytes of the heap, a byte after its 64
 //! GiB, which the write barrier sets for each place a ref is stored to (src/backend/backend.bob); so an old object holds a ref
 //! to a young or new one only where its card is dirty, and a fiber that has not run since a collection none. A major
-//! collection, once the old objects take twice the bytes live after the last, and over 64 MiB, traces from every fiber
-//! and marks each old object it reaches in place, freeing those left unmarked onto the free lists promotion takes
-//! from. Each cleans every card. BOBER_GC_VERIFY=1 checks after each minor's trace that no old object or fiber left
-//! still holds a ref to a young object, as one that a missed barrier hides would.
+//! collection, once the old objects take over 64 MiB and two to four times the bytes live after the last, the more the
+//! less of what became old before the last had died by it, traces from every fiber and marks each old object it reaches
+//! in place, freeing those left unmarked onto the free lists promotion takes from. Each cleans every card.
+//! BOBER_GC_VERIFY=1 checks after each minor's trace that no old object or fiber left still holds a ref to a young
+//! object, as one that a missed barrier hides would.
 
 #include "rt.h"
 #include <libunwind.h>
@@ -50,8 +51,8 @@ static uint32_t bumped[2 * CLASSES];  // the young page of each class being bump
 static char *spare[2 * CLASSES];      // the old slots of each class free, each linked through its first word
 static int64_t reserved;  // what young may reach without a collection, as bober_reserve promised
 static int64_t young, every = 32 << 20;  // what has been allocated since the last collection, and how much collects
-static int64_t olds, major = 64 << 20;   // the bytes of old objects, the dead since the last major too, and how many
-                                         // make the next collection a major one
+static int64_t olds, kept, major = 64 << 20;  // the bytes of old objects, the dead since the last major too, those
+                                              // live after it, and how many make the next collection a major one
 static bool minor, verify, verifying;
 static void **bottom;  // the frame pointer of the program's entry, where a walk of the first fiber's frames stops
 static int64_t allocs, allocated, collections, majors;  // in all, for BOBER_GC_STATS
@@ -449,9 +450,10 @@ static void collect(void) {
     } else if (minor && !(g->kind == BIG && g->used)) {
       continue;
     } else if (g->kind == BIG) {
-      g->used = 0;
-      if (bit(marks, cell(at(p)))) put(marks, cell(at(p)), 0), live += (int64_t)g->pages * PAGE;
+      int64_t size = (int64_t)g->pages * PAGE;
+      if (bit(marks, cell(at(p)))) put(marks, cell(at(p)), 0), live += size, olds += g->used ? size : 0;
       else release(p, g->pages);
+      g->used = 0;
     } else if (g->kind == OLD) {
       int64_t n = 0, size = sizes[g->class];
       for (char *h = at(p); h + size <= at(p + 1); h += size) n += bit(marks, cell(h));
@@ -469,8 +471,13 @@ static void collect(void) {
     }
   }
   memset(cards, 0, (int64_t)top * PAGE >> CARD);
-  if (minor) olds += live;
-  else olds = live, major = 2 * live > 64 << 20 ? 2 * live : 64 << 20, majors++;
+  if (!minor) {
+    // The next major once what becomes old, dying as what became old since the last did, leaves as many bytes dead as
+    // live: twice live if all of it died, at most four times if little did.
+    double dead = olds - live, since = olds - kept;
+    int64_t more = dead * 3 <= since ? 3 * live : dead >= since ? live : live * since / dead;
+    kept = olds = live, major = live + more > 64 << 20 ? live + more : 64 << 20, majors++;
+  }
   allocated += young, collections++, young = reserved = 0;
   PROBE(gc_end, olds);
 }
