@@ -660,7 +660,11 @@ export class Type {
 		let ms: Type[] = []
 		for (const t of ts) {
 			const mid = ms.length
-			ms.append(t.alternatives())
+			if (t.kind == "union") {
+				ms.append(t.types)
+			} else {
+				ms.push(t)
+			}
 			merge(ms, mid, (a, b) => a.id < b.id)
 		}
 		ms = unique(ms)
@@ -958,8 +962,17 @@ function internField(f: Field): Field {
 class Structure {
 	static hash(t: Type): u64 {
 		let h = combine(combine(fnv(t.text), t.n), t.generic?.id ?? -1)
-		for (const p of t.parts()) {
+		for (const p of t.params) {
 			h = combine(h, p.id)
+		}
+		if (t.generic == null) {
+			h = combine(h, t.base?.id ?? -1)
+			for (const p of t.types) {
+				h = combine(h, p.id)
+			}
+			for (const f of t.fields) {
+				h = combine(h, f.type.id)
+			}
 		}
 		return h
 	}
