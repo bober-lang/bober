@@ -1684,7 +1684,7 @@ class Checker {
 		} else {
 			this.bind(pattern, t, n.t.kind == "let")
 		}
-		if (init != null && n.t.kind == "const") {
+		if (init != null && n.t.kind == "const" && this.locals.level > 0) {
 			this.generic(pattern, init)
 		}
 	}
@@ -5015,12 +5015,11 @@ export function standsFor(t: Type): Type | null {
 /// Whether a value of type t is a Type.
 export function isTypeValue(t: Type): bool { return t == Meta || standsFor(t) != null }
 
-/// The type of member name of a Type standing for t where it says more than builtin/type.bob's: a union's members, an
-/// element, or a literal's value (4.11).
+/// The type of member name of a Type standing for t where it says more than builtin/type.bob's: an element or a
+/// literal's value (4.11).
 function reflected(t: Type, name: string): Type | null {
 	const e = t.underlying()
 	return switch (name) {
-		case "members": if (t.kind == "union") Type.array(meta(t)) else null
 		case "elem": if (e?.kind == "array") meta(e!.params[0]) else if (e?.kind == "fixed") meta(e!.base!) else null
 		case "value": if (t.kind == "param" || t.alternatives().every(m => m.kind == "literal")) t else null
 		default: null
