@@ -20,7 +20,7 @@ import { env, monotonic as mono, tz as localTz } from "../builtin/sys"
 import { open, readLink } from "./fs"
 import { maxOf, minOf } from "./limits"
 import { abs, clamp, min } from "./math"
-import { ParseError } from "./string"
+import { ParseError, replace } from "./string"
 import { bober_io_sleep } from "../src/rt.h"
 
 export const nanosecond: i64 = 1
@@ -448,15 +448,67 @@ export function rfc3339(t: i64, zone: Zone = utc): string {
 }
 
 /// The instant an RFC 3339 timestamp names: 2006-01-02T15:04:05Z, with a fraction of up to 9 digits after the seconds,
-/// a t or z for T or Z and an offset such as +01:00 for Z. A leap second, 60, is taken for 59, as Temporal does.
-export function parseRfc3339(s: string): i64 throws ParseError {
-	const date = expect(s, 0, "0000-00-00")
-	const sep = s.at(10)
-	if (sep != T && sep != lowerT) {
-		throw new ParseError("syntax", 10)
+/// a t or z for T or Z and an offset such as +01:00 for Z. A leap second, 60, is taken for 59, and a year of 6 digits
+/// after a sign as ISO 8601 expands it, +002006, as Temporal does.
+export function parseRfc3339(s: string): i64 throws ParseError { return timestamp(s, false) }
+
+/// t as ISO 8601's basic format writes it, rfc3339's without the - and : between the parts: 20060102T150405.5+0100.
+export function iso8601Basic(t: i64, zone: Zone = utc): string {
+	const s = rfc3339(t, zone)
+	return replace(s.slice(0, 10), "-", "") + replace(s.slice(10, s.length), ":", "")
+}
+
+/// The instant a timestamp of ISO 8601's basic format names, as parseRfc3339 takes it without the - and : between the
+/// parts: 20060102T150405Z, 19961219T163957.5-0800.
+export function parseIso8601Basic(s: string): i64 throws ParseError { return timestamp(s, true) }
+
+/// The date s is as Date.toString writes it: 2006-01-02, or -000044-03-15 with a year of 6 digits after a sign.
+export function parseDate(s: string): Date throws ParseError {
+	const [date, i] = dateAt(s, false)
+	end(s, i)
+	return date
+}
+
+/// The reading s is as DateTime.toString writes it, with a year as parseDate takes it: 2006-01-02T15:04:05.5, a t for
+/// T. A leap second, 60, is taken for 59.
+export function parseDateTime(s: string): DateTime throws ParseError {
+	const [dt, i] = dateTimeAt(s, false)
+	end(s, i)
+	return dt
+}
+
+/// The instant a timestamp names as RFC 3339 writes it, or as ISO 8601's basic format if basic.
+function timestamp(s: string, basic: bool): i64 throws ParseError {
+	const [dt, at] = dateTimeAt(s, basic)
+	const w = (!basic) as i32
+	let i = at
+	let offset = 0
+	const z = s.at(i)
+	if (z == Z || z == lowerZ) {
+		i++
+	} else if (z == plus || z == minus) {
+		const hm = expect(s, i + 1, if (basic) "0000" else "00:00")
+		const minutes = ranged(hm / 100, i + 1, 0, 23) * 60 + ranged(hm % 100, i + 3 + w, 0, 59)
+		offset = (if (z == minus) -60 else 60) * minutes
+		i += 5 + w
+	} else {
+		throw new ParseError("syntax", i)
 	}
-	const hms = expect(s, 11, "00:00:00")
-	let i = 19
+	end(s, i)
+	return within(localSeconds(dt) - (offset as i64), dt.nanosecond as i64, 0)
+}
+
+/// The reading at the start of s as DateTime.toString writes it, or as ISO 8601's basic format if basic, and the
+/// index past it.
+function dateTimeAt(s: string, basic: bool): [DateTime, i32] throws ParseError {
+	const [date, at] = dateAt(s, basic)
+	const sep = s.at(at)
+	if (sep != T && sep != lowerT) {
+		throw new ParseError("syntax", at)
+	}
+	const w = (!basic) as i32
+	const sod = seconds(expect(s, at + 1, if (basic) "000000" else "00:00:00"), at + 1, w) as i32
+	let i = at + 7 + 2 * w
 	let ns = 0
 	if (s.at(i) == dot) {
 		const from = i + 1
@@ -472,25 +524,28 @@ export function parseRfc3339(s: string): i64 throws ParseError {
 			ns *= 10
 		}
 	}
-	let offset = 0
-	const z = s.at(i)
-	if (z == Z || z == lowerZ) {
-		i++
-	} else if (z == plus || z == minus) {
-		const hm = expect(s, i + 1, "00:00")
-		const minutes = ranged(hm / 100, i + 1, 0, 23) * 60 + ranged(hm % 100, i + 4, 0, 59)
-		offset = (if (z == minus) -60 else 60) * minutes
-		i += 6
-	} else {
-		throw new ParseError("syntax", i)
-	}
+	return [new DateTime(date, sod / 3600, sod / 60 % 60, sod % 60, ns), i]
+}
+
+/// The date at the start of s as Date.toString writes it, its year of 4 digits or of 6 after a sign but -000000, or as
+/// ISO 8601's basic format if basic; and the index past it.
+function dateAt(s: string, basic: bool): [Date, i32] throws ParseError {
+	const sign = s.at(0)
+	const signed = sign == plus || sign == minus
+	const n = ranged(expect(s, signed as i32, if (signed) "000000" else "0000"), 0, (sign == minus) as i32, 9999)
+	const y = if (sign == minus) -n else n
+	const at = if (signed) 7 else 4
+	const w = (!basic) as i32
+	const md = expect(s, at, if (basic) "0000" else "-00-00")
+	const m = ranged(md / 100, at + w, 1, 12)
+	return [new Date(y, m, ranged(md % 100, at + 2 + 2 * w, 1, daysInMonth(y, m))), at + 4 + 2 * w]
+}
+
+/// A syntax error at i unless s ends there.
+function end(s: string, i: i32) throws ParseError {
 	if (i != s.length) {
 		throw new ParseError("syntax", i)
 	}
-	const y = date / 10000
-	const mo = ranged(date / 100 % 100, 5, 1, 12)
-	const d = ranged(date % 100, 8, 1, daysInMonth(y, mo))
-	return within(daysOf(y, mo, d) * 86400 + seconds(hms, 11) - (offset as i64), ns as i64, 0)
 }
 
 /// t as HTTP writes a date, an IMF-fixdate of RFC 9110: Sun, 06 Nov 1994 08:49:37 GMT.
@@ -564,7 +619,7 @@ function httpInstant(s: string, n: i32, y: i32, m: i32, day: i32, time: i32, yea
 		throw new ParseError("syntax", n)
 	}
 	const d = ranged(number(s, day, day + 2), day, 1, daysInMonth(y, m))
-	return within(daysOf(y, m, d) * 86400 + seconds(expect(s, time, "00:00:00"), time), 0, year)
+	return within(daysOf(y, m, d) * 86400 + seconds(expect(s, time, "00:00:00"), time, 1), 0, year)
 }
 
 /// The instant s seconds and ns ns past the epoch; a range error at at past instants' span.
@@ -576,10 +631,10 @@ function within(s: i64, ns: i64, at: i32): i64 throws ParseError {
 	return t
 }
 
-/// The seconds of the day hhmmss names, from hh:mm:ss at at, a leap second as the one before it.
-function seconds(hms: i32, at: i32): i64 throws ParseError {
-	return (ranged(hms / 10000, at, 0, 23) * 3600 + ranged(hms / 100 % 100, at + 3, 0, 59) * 60
-		+ min(ranged(hms % 100, at + 6, 0, 60), 59)) as i64
+/// The seconds of the day hhmmss names, from hh:mm:ss at at, hhmmss for w 0, a leap second as the one before it.
+function seconds(hms: i32, at: i32, w: i32): i64 throws ParseError {
+	return (ranged(hms / 10000, at, 0, 23) * 3600 + ranged(hms / 100 % 100, at + 2 + w, 0, 59) * 60
+		+ min(ranged(hms % 100, at + 4 + 2 * w, 0, 60), 59)) as i64
 }
 
 /// v, a range error at at unless lo to hi.

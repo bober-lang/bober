@@ -1,6 +1,6 @@
 import { Date, DateTime, dateOf, daysInMonth, daysOf, deadline, fixed, formatDuration, head, hour, httpDate, httpDateAt,
-	isLeap, isValid, local, maxDays, millisecond, minDays, minute, monotonic, parseHttpDate, parseRfc3339, posix,
-	rfc3339, second, sleep, tzif, utc } from "./time"
+	isLeap, isValid, iso8601Basic, local, maxDays, millisecond, minDays, minute, monotonic, parseDate, parseDateTime,
+	parseHttpDate, parseIso8601Basic, parseRfc3339, posix, rfc3339, second, sleep, tzif, utc } from "./time"
 
 import { maxOf, minOf } from "./limits"
 import { ParseError } from "./string"
@@ -281,6 +281,49 @@ test "TZif files of every version" {
 			assert failure(() => tzif("Short", good.slice(0, n)).offset(0)) != null
 		}
 	}
+}
+
+test "ISO 8601's basic format" {
+	assert iso8601Basic(0) == "19700101T000000Z" && iso8601Basic(-1) == "19691231T235959.999999999Z"
+	assert iso8601Basic(millisecond, fixed(-90 * 60)) == "19691231T223000.001-0130"
+	assert parseIso8601Basic("19850412T232050.52Z") == 482196050_520_000_000
+	assert parseIso8601Basic("19961219T163957-0800") == 851042397 * second
+	assert parseIso8601Basic("19901231t235960z") == parseRfc3339("1990-12-31T23:59:59Z")
+	assert failure(() => parseIso8601Basic("1990-12-31T23:59:59Z"))!.at == 4
+	assert failure(() => parseIso8601Basic("19901231T23:59:59Z"))!.at == 11
+	assert failure(() => parseIso8601Basic("19901231T235961Z"))!.at == 13
+	assert failure(() => parseIso8601Basic("19901331T000000Z"))!.at == 4
+	assert failure(() => parseIso8601Basic("19901231T000000+01:00"))!.at == 18
+	assert failure(() => parseIso8601Basic("19901231T000000+0160"))!.at == 18
+	assert failure(() => parseIso8601Basic("19901231T000000+0100x"))!.at == 20
+	assert failure(() => parseRfc3339("19901231T000000Z"))!.at == 4
+	assert parseRfc3339("+001990-12-31T00:00:00Z") == parseIso8601Basic("+0019901231T000000Z")
+	assert failure(() => parseRfc3339("+010000-01-01T00:00:00Z"))!.kind == "range"
+	for (const t of [1_700_000_000_123_456_789, 1, -1, max, min]) {
+		assert parseIso8601Basic(iso8601Basic(t)) == t && parseIso8601Basic(iso8601Basic(t, vienna)) == t
+	}
+}
+
+test "dates and readings parsed as they print" {
+	for (const d of [new Date(2006, 1, 2), new Date(-44, 3, 15), new Date(9999, 12, 31), new Date(-9999, 1, 1),
+		new Date(0, 2, 29)]) {
+		assert parseDate(`${d}`).compare(d) == 0
+	}
+	assert parseDate("+002024-02-29").compare(new Date(2024, 2, 29)) == 0
+	assert failure(() => parseDate("+010000-01-01").days())!.kind == "range"
+	assert failure(() => parseDate("-000000-01-01").days())!.kind == "range"
+	assert failure(() => parseDate("").days())!.at == 0 && failure(() => parseDate("-").days())!.at == 1
+	assert failure(() => parseDate("2023-02-29").days())!.at == 8
+	assert failure(() => parseDate("20230228").days())!.at == 4
+	assert failure(() => parseDate("2023-02-28T").days())!.at == 10
+	const dt = new DateTime(new Date(2006, 1, 2), 15, 4, 5, 500_000_000)
+	assert parseDateTime(`${dt}`).compare(dt) == 0
+		&& `${parseDateTime("-000044-03-15t12:00:00")}` == "-000044-03-15T12:00:00"
+	const last = new DateTime(new Date(-9999, 1, 1), 23, 59, 59, 999_999_999)
+	assert parseDateTime(`${last}`).compare(last) == 0
+	assert `${parseDateTime("2016-12-31T23:59:60.25")}` == "2016-12-31T23:59:59.25"
+	assert failure(() => parseDateTime("2006-01-02T15:04:05Z").date.days())!.at == 19
+	assert failure(() => parseDateTime("2006-01-02").date.days())!.at == 10
 }
 
 test "now moves with tests' logical time" {
