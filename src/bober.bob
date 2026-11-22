@@ -50,6 +50,7 @@ import { stamp, stamped } from "./link/keep"
 import { Linker, Stale } from "./link/link"
 import { Const, Global, Kept, Local, Object, Section, Symbol } from "./link/object"
 import { SyntaxError } from "./lex"
+import { js } from "./js"
 import { lower } from "./lower"
 import { serve } from "./lsp"
 import { mono } from "./mono"
@@ -97,6 +98,8 @@ export class Compile @optarg.Cc {
 	O0: bool @optarg.Verbose = false
 	/// compile to WebAssembly GC, run by node
 	wasm: bool = false
+	/// compile to JavaScript, run by node
+	js: bool = false
 	/// -release for the first x86-64 CPUs, not x86-64-v2, those since about 2009
 	baseline: bool @optarg.Verbose = false
 	/// pass an option to LLVM, as clang's -mllvm
@@ -146,10 +149,11 @@ class Report {
 /// print the agent skill for writing Bober
 class Skill {}
 
-/// link the package's image, or with -o one module's object, or with -wasm the program's WebAssembly; for CI but -wasm
+/// link the package's image, or with -o one module's object, or with -wasm or -js the program's WebAssembly or
+/// JavaScript; for CI but -wasm and -js
 export class Build @optarg.Cc @optarg.Verbose {
 	compile: ...Compile
-	/// the object, or with -wasm the program, to write
+	/// the object, or with -wasm or -js the program, to write
 	o: string = ""
 	/// with -o, write the file's LLVM IR, as LLVM gets it, instead
 	emitLLVM: bool @optarg.Name["emit-llvm"] @optarg.Verbose = false
@@ -280,15 +284,15 @@ function command(c: Command): i32 {
 			stdout.write(yamlOf(report))
 			return status
 		case Build:
-			if (process.env("CI") == null && !c.compile.wasm) {
+			if (process.env("CI") == null && !c.compile.wasm && !c.compile.js) {
 				stderr.write("warning: build is for CI; run and test build what they need\n")
 			}
 			if (c.args.length == 0) {
 				buildPackage(c.compile.headers.I)
 			} else if (c.o == "") {
 				throw new CompileError("build <file.bob> takes -o <out>")
-			} else if (c.compile.wasm) {
-				toWasm(c.args[0], false, c.compile.headers.I, c.o)
+			} else if (c.compile.wasm || c.compile.js) {
+				toTarget(c.args[0], false, c.compile, c.o)
 			} else {
 				inspect(c.args[0], c.o, c.compile, c.emitLLVM)
 			}
@@ -395,7 +399,7 @@ function init(name: string) {
 function testAll(f: Compile): i32 {
 	bober_jobs()
 	const files = testFiles(".")
-	const one = !f.wasm && !f.release && (f.O2 || f.O1 && !f.O0)
+	const one = !f.wasm && !f.js && !f.release && (f.O2 || f.O1 && !f.O0)
 	const commands = new HashMap[string, (main: string) => string[]]() // of the files compiled so
 	const clear = if (isatty(1) != 0) "\r\x1b[K" else ""
 	const started: (() => [i32, string])[] = [] // what waits for each file started, in order
@@ -590,7 +594,7 @@ function hasTests(path: string): bool {
 /// sysroot's, the image as image has it if pin. Throws the errors, or what failed, as a CompileError or IoError.
 export function build(main: string, tests: bool, f: Compile, pin: bool): string[] {
 	built = ""
-	return if (f.wasm) toWasm(main, tests, f.headers.I) else programs([main], tests, f, pin)(main)
+	return if (f.wasm || f.js) toTarget(main, tests, f) else programs([main], tests, f, pin)(main)
 }
 
 /// The ops below which a release build gives a function to each module reaching it, to inline, as mono takes it.
@@ -649,26 +653,38 @@ function programs(mains: string[], tests: bool, f: Compile, pin: bool): (main: s
 	}
 }
 
-/// Compiles the program of main into file, by default build/<name>.wasm, or with tests build/<name>.test.wasm,
-/// monomorphized, of builtin/'s modules builtin/wasm/'s where it has one (wasmSource), or in the package those of
-/// lib/wasm.bobc; returns the command that runs it.
-function toWasm(main: string, tests: bool, includes: string[],
-	file = `${dir}/${name(main)}${if (tests) ".test" else ""}.wasm`): string[] {
-	bundleName = "wasm"
-	const p = lower([main], includes, [], wasmSource)
+/// Compiles the program of main into file, by default build/<name>.wasm, or .mjs if f.js, with tests
+/// build/<name>.test.wasm or .mjs, monomorphized, of builtin/'s modules those of the target (targetSource), or in the
+/// package those of lib/wasm.bobc or lib/js.bobc; returns the command that runs it.
+function toTarget(main: string, tests: bool, f: Compile,
+	file = `${dir}/${name(main)}${if (tests) ".test" else ""}${if (f.js) ".mjs" else ".wasm"}`): string[] {
+	bundleName = if (f.js) "js" else "wasm"
+	const p = lower([main], f.headers.I, [], targetSource(f.js))
 	const m = p.module(normal(main))
 	mono(p, m)
 	mkdirAll(parent(file))
+	const host = join(root, if (packaged()) "lib/host.mjs" else "builtin/wasm/host.mjs")
+	if (f.js) {
+		js(p, m, tests, file)
+		return ["node", host, file]
+	}
 	wasm(p, m, tests, file)
-	return ["node", "--experimental-wasm-jspi", join(root, if (packaged()) "lib/host.mjs" else "builtin/wasm/host.mjs"),
-		file]
+	return ["node", "--experimental-wasm-jspi", host, file]
 }
 
-/// The source of the module at path for WebAssembly: of builtin/'s, builtin/wasm/'s where it has one.
-function wasmSource(path: string): string | null {
-	const variant = join(root, "builtin/wasm", base(path))
-	const at = if (builtin(path) && exists(variant)) variant else path
-	return if (exists(at)) readFile(at) else null
+/// The source of the module at path for WebAssembly, or JavaScript if toJs: of builtin/'s, builtin/js/'s where it has
+/// one if toJs, else builtin/wasm/'s where it has one.
+function targetSource(toJs: bool): (path: string) => string | null {
+	const dirs = if (toJs) ["builtin/js", "builtin/wasm"] else ["builtin/wasm"]
+	return (path: string) => {
+		for (const d of if (builtin(path)) dirs else []) {
+			const v = join(root, d, base(path))
+			if (exists(v)) {
+				return readFile(v)
+			}
+		}
+		return if (exists(path)) readFile(path) else null
+	}
 }
 
 /// An option given to c that its build would ignore, which is an error rather than ignored, as "-wasm ignores -O2";
@@ -681,12 +697,13 @@ export function ignored(c: Run | Test | Build): string | null {
 	const mllvm: [string, bool] = ["-mllvm", f.mllvm.length > 0]
 	if (c instanceof Build && c.args.length == 0) {
 		return first("build of the package",
-			[["-o", c.o != ""], ["-emit-llvm", ir], ["-wasm", f.wasm], ["-release", f.release],
+			[["-o", c.o != ""], ["-emit-llvm", ir], ["-wasm", f.wasm], ["-js", f.js], ["-release", f.release],
 			["-baseline", f.baseline], ...levels, mllvm])
 	}
-	if (f.wasm) {
-		return first("-wasm",
-			[["-release", f.release], ["-baseline", f.baseline], ["-emit-llvm", ir], ...levels, mllvm])
+	if (f.wasm || f.js) {
+		return first(if (f.js) "-js" else "-wasm",
+			[["-wasm", f.js && f.wasm], ["-release", f.release], ["-baseline", f.baseline], ["-emit-llvm", ir],
+			...levels, mllvm])
 	}
 	const llvm = f.release || ir || !build && (f.O2 || f.O1 && !f.O0)
 	return first(if (build) "build" else "-release", if (build || f.release) levels else [])
@@ -1174,9 +1191,9 @@ function cObjects(p: Program, ms: i32[], includes: string[]): [string[], bool] {
 }
 
 /// The bundle command, which dist.sh runs in the repo: writes the bundle of builtin/'s and std/'s modules, lowered
-/// from source, to lib/std.bobc (src/lift.bob), and so for WebAssembly to lib/wasm.bobc, which all must check for, with
-/// its host, lib/host.mjs; and compiles the C they link into lib: the run time's objects, the archive std.a of their
-/// glue, and their C libraries' archives.
+/// from source, to lib/std.bobc (src/lift.bob), and so for WebAssembly to lib/wasm.bobc and for JavaScript to
+/// lib/js.bobc, which all must check for, with their host, lib/host.mjs; and compiles the C they link into lib: the run
+/// time's objects, the archive std.a of their glue, and their C libraries' archives.
 function pack(lib: string) {
 	const paths = [...glob("std/**/*.bob"), ...glob("builtin/*.bob")].filter(f => !endsWith(f, ".test.bob"))
 	const p = lower(paths)
@@ -1190,7 +1207,8 @@ function pack(lib: string) {
 		save(join(lib, base(a)), readFile(a))
 	}
 	save(join(lib, "std.bobc"), bundle(p, compilerId()))
-	save(join(lib, "wasm.bobc"), bundle(lower(paths, [], [], wasmSource), compilerId()))
+	save(join(lib, "wasm.bobc"), bundle(lower(paths, [], [], targetSource(false)), compilerId()))
+	save(join(lib, "js.bobc"), bundle(lower(paths, [], [], targetSource(true)), compilerId()))
 	save(join(lib, "host.mjs"), readFile("builtin/wasm/host.mjs"))
 }
 

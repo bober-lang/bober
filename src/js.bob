@@ -1,0 +1,1789 @@
+//! JavaScript (ES2020): a monomorphized Program (src/mono.bob) as one ES module, which node runs with
+//! builtin/wasm/host.mjs. Values are held so:
+//!
+//! - null as null, bool as boolean, integers up to 32 bits as normalized JS numbers, 64-bit integers as BigInt,
+//!   f32 via Math.fround, f64 as JS number.
+//! - A string as a Latin-1 JS string (one code unit per UTF-8 byte); a T[] or T[n] as a JS Array (T[n] copied deeply
+//!   where stored); a tuple as a JS Array; a class instance or object as a plain object { f0, f1, ... }, an embedded
+//!   field a child object of its own.
+//! - A T | null union as T or null unboxed; every other union as new $B(typeId, value), null as $null.
+//! - A function value as a plain JS function; an omitted optional param as undefined.
+//! - A throw throws a $B box; Try uses JS try/catch/finally guarded so traps skip finally.
+//! - Call-site async / fibers use host.mjs's cooperative scheduler driven by JS async/await, with only functions
+//!   that transitively reach a suspending host call marked async.
+
+import { fromBits } from "../builtin/math"
+import { HashMap } from "../std/collections/hashmap"
+import { formatFloat } from "../std/float"
+import { join } from "../std/fs/path"
+import { split } from "../std/string"
+import * as decl from "./bc/decl"
+import * as kind from "./bc/kind"
+import * as op from "./bc/op"
+import { Opcode } from "./bc/op"
+import { Code, Program } from "./bc/program"
+import { showType } from "./bc/show"
+import { listed } from "./emit"
+import { CompileError } from "./error"
+import { fits } from "./mono"
+import { fieldOf } from "./resolve"
+import { builtin, builtinPath, root } from "./root"
+
+/// Translates p, monomorphized for its module main, into the ES module at path, whose export start($h) runs main, or
+/// with tests its tests, and gives the exit status.
+export function js(p: Program, main: i32, tests: bool, path: string) throws CompileError {
+	const g = new Js(p)
+	g.run(main, tests)
+	g.write(path)
+}
+
+/// A value on the operand stack: its JS expression ("" for Missing) and normalized type.
+type V = { e: string, t: i32 }
+/// A field of a class instance, object or tuple; an embedded one a child object of its own.
+type Slot = { name: i32, t: i32, embed: bool, mixin: bool, decl: i32 }
+/// Field k of the object or tuple v holds.
+type Place = { v: V, k: i32, s: Slot }
+
+/// An open block: its statements go to body, an If's after Else and a Try's catch to other, a Try's finally to fin,
+/// and once it ends, wrapped, to outer.
+class Frame {
+	/// The op that opened it, its result's type, kind.None if none, and the stack's height there, which it ends at.
+	o: Opcode = op.Block
+	t = 0
+	height = 0
+	/// Its JS label, which a Br to it breaks, or continues if a loop.
+	label = ""
+	outer: string[] = []
+	body: string[] = []
+	other: string[] = []
+	fin: string[] = []
+	/// The temp holding its result, "" if none.
+	slot = ""
+	/// An If's or Default's condition, or an Each's loop header, `for (…)`.
+	head = ""
+	/// A Try's caught value, "" if it catches nothing, and whether it has a finally.
+	err = ""
+	finally = false
+	/// A Default's param local index.
+	local = 0
+	/// A Match's conditions of its arms but the last, and the statements of earlier arms.
+	conds: string[] = []
+	arms: string[][] = []
+}
+
+/// Host imports that can suspend a fiber.
+const seeds = ["bober_fiber", "bober_park", "bober_io_sleep", "test", "subtest"]
+
+/// Translates a Program to JS, a function at a time: the values of its ops on a stack, each a constant or a variable.
+class Js {
+	p: Program
+	/// The union of any type, a thrown value's.
+	private any = 0
+	private norms = new HashMap[i32, i32]()
+	private layouts = new HashMap[i32, Slot[]]()
+	/// The decls a Closure makes a closure's code of, which takes its env first.
+	private closures = new HashMap[i32, bool]()
+	/// The vars and functions made or to be made, by name.
+	private made = new HashMap[string, bool]()
+	/// The module's statements after prelude: its vars and functions.
+	private top: string[] = []
+	/// Thunks to make once the decls are: thrown values' showing and functions' adapters.
+	private pending: (() => void)[] = []
+	/// Async call-graph reverse edges: callee node -> callers that must be async if callee is. A node is d:D function
+	/// or test decl D, i:D var or field D's initializer, a:D lazy var D's accessor, m:M module M's init, c:C class C's
+	/// initializer, t:T any function value of type T, h:N host import N, s:D the showing of a thrown value by D, and
+	/// ad:F:T the adapter of a function of type F to T.
+	private rev = new HashMap[string, string[]]()
+	// The function being emitted.
+	private curNode = ""
+	private code = new Code()
+	private mod = 0
+	private path = ""
+	private pos = -1
+	private ret = 0
+	/// The statements emitted to: the function's, an open block's or a branch's.
+	private out: string[] = []
+	private stack: V[] = []
+	private frames: Frame[] = []
+	/// Whether what is emitted is not reached: after a return, Br, throw or trap.
+	private dead = false
+	/// The count of the temps _tN made, each declared once where it is made.
+	private temps = 0
+	/// The scratch registers _sN, which sDecl declares: the next one free, how many are used, and where the next
+	/// restarts at an op on an empty stack.
+	private sCur = 0
+	private sMax = 0
+	private sBase = 0
+	/// The count of the labels LN made.
+	private labels = 0
+	/// Per local of the code, its JS variable, and whether it is a cell, { v }, which a closure captures.
+	private locals: string[] = []
+	private cells: bool[] = []
+
+	constructor(p: Program) {
+		this.p = p
+		this.any = p.type(kind.Union)
+	}
+
+	/// Translates the decls, each module's init and start, then the functions pending.
+	run(main: i32, tests: bool) throws CompileError {
+		const p = this.p
+		for (const x of p.decls) {
+			const c = x.code
+			if (c != null) {
+				for (const i of 0 ... c.ops.length - 1) {
+					if (c.ops[i] == op.Closure) {
+						this.closures.set(c.a(i), true)
+					} else if (c.ops[i] == op.CallRef && c.b(i) > 0) {
+						this.closures.set(c.b(i) - 1, true)
+					}
+				}
+			}
+		}
+		for (const m of 0 ... p.modules.length - 1) {
+			for (const d of listed(p, p.modules[m].decls)) {
+				this.decl(d)
+			}
+		}
+		for (const m of 0 ... p.modules.length - 1) {
+			this.init(m)
+		}
+		this.start(main, tests)
+		while (this.pending.length > 0) {
+			const f = this.pending.pop()
+			f()
+		}
+	}
+
+	/// Writes the module to path: prelude and top, each function that may suspend async, each call of one awaited.
+	write(path: string) throws CompileError {
+		const asyncNodes = this.solveAsync()
+		const raw = [prelude, ...this.top].join("\n") + "\n"
+		const parts = split(raw, "\x01")
+		const out: string[] = []
+		for (const i of 0 ... parts.length - 1) {
+			if ((i & 1) == 0) {
+				out.push(parts[i])
+			} else {
+				const tag = parts[i]
+				if (asyncNodes.has(tag.slice(2, tag.length))) {
+					out.push(if (tag.slice(0, 1) == "A") "async " else "await ")
+				}
+			}
+		}
+		if (!writeFile(path, out.join(""))) {
+			throw new CompileError(`cannot write ${path}`)
+		}
+	}
+
+	/// Reverse BFS from suspending host seeds to find every node that may suspend.
+	private solveAsync(): HashMap[string, bool] {
+		const seen = new HashMap[string, bool]()
+		const work: string[] = []
+		for (const s of seeds) {
+			const k = `h:${s}`
+			seen.set(k, true)
+			work.push(k)
+		}
+		while (work.length > 0) {
+			const callers = this.rev.get(work.pop())
+			if (callers != null) {
+				for (const c of callers!) {
+					if (!seen.has(c)) {
+						seen.set(c, true)
+						work.push(c)
+					}
+				}
+			}
+		}
+		return seen
+	}
+
+	/// Records that caller suspends if callee does.
+	private edge(caller: string, callee: string) {
+		if (caller == "" || callee == "" || caller == callee) {
+			return
+		}
+		const xs = this.rev.get(callee)
+		if (xs == null) {
+			this.rev.set(callee, [caller])
+		} else if (!xs!.includes(caller)) {
+			xs!.push(caller)
+		}
+	}
+
+	/// Records a call edge from the current function to callee and returns the await-marked call expression.
+	private calls(callee: string, expr: string): string {
+		this.edge(this.curNode, callee)
+		return `\x01W:${callee}\x01${expr}`
+	}
+
+	// Decls.
+	/// Translates decl d: a class's initializer, a function or test, a field's initializer, or a var, its initializer
+	/// and, if lazy, accessor.
+	private decl(d: i32) {
+		const p = this.p
+		const x = p.decls[d]
+		const c = p.classOf(d)
+		const code = x.code
+		if (c >= 0 && p.decls[c].kind == decl.Interface) {
+			return
+		}
+		if (x.kind == decl.Class) {
+			this.construct(d)
+		} else if (x.kind == decl.Test && code != null) {
+			this.define(this.fn(d), `d:${d}`, d, code, [], kind.None, false)
+		} else if (x.kind == decl.Function && this.arrayMethod(d)) {
+			this.arrayFn(d)
+		} else if (x.kind == decl.Function && this.mapMethod(d)) {
+			this.mapFn(d)
+		} else if (x.kind == decl.Function && code != null) {
+			this.define(this.fn(d), `d:${d}`, d, code, this.params(d), p.b(x.type), this.closures.has(d))
+		} else if (x.kind == decl.Var && c >= 0 && (x.mods & decl.Static) == 0) {
+			if (code != null) {
+				this.define(this.initName(d), `i:${d}`, d, code, [code.locals[0].type], x.type, false)
+			}
+		} else if (x.kind == decl.Var) {
+			this.made.set(this.fn(d), true)
+			this.top.push(`let ${this.fn(d)} = ${this.zero(x.type)};`)
+			if (code != null) {
+				this.define(this.initName(d), `i:${d}`, d, code, [], x.type, false)
+			}
+			if (this.lazy(d)) {
+				this.once(`set_${d}`, this.accessor(d), `a:${d}`, x.module, () => this.initialize(d))
+			}
+		}
+	}
+
+	private lazy(d: i32): bool { return this.p.decls[d].env != 0 }
+	private accessor(d: i32): string { return `$at_${d}` }
+	private fn(d: i32): string { return `$f_${d}` }
+	private initName(d: i32): string { return `$init_${d}` }
+	private name(d: i32): string { return this.p.strings[this.p.decls[d].name] }
+
+	/// Initializes var decl d if lazy and not yet.
+	private touch(d: i32) {
+		if (this.p.decls[d].kind == decl.Var && this.lazy(d)) {
+			this.emit(`${this.calls(`a:${d}`, `${this.accessor(d)}()`)};`)
+		}
+	}
+
+	/// The types of function decl d's params, this first in a method.
+	private params(d: i32): i32[] {
+		const x = this.p.decls[d]
+		const ps = this.p.items(x.type)
+		return if (this.p.method(d)) [x.code!.locals[0].type, ...ps] else ps
+	}
+
+	/// Module init: runs once, initializing deps (and builtin/) then this module's non-lazy vars.
+	private init(m: i32) {
+		const p = this.p
+		const deps = [...p.modules[m].deps]
+		if (!builtin(p.modules[m].path)) {
+			for (const k of 0 ... p.modules.length - 1) {
+				if (builtin(p.modules[k].path) && !deps.includes(k)) {
+					deps.push(k)
+				}
+			}
+		}
+		this.once(`inited_${m}`, `$mod_${m}`, `m:${m}`, m, () => {
+			for (const k of deps) {
+				this.emit(`${this.calls(`m:${k}`, `$mod_${k}()`)};`)
+			}
+			for (const d of p.modules[m].inits) {
+				if (this.made.has(this.fn(d)) && !this.lazy(d)) {
+					this.initialize(d)
+				}
+			}
+		})
+	}
+
+	/// Emits function name of module m, which runs the code build emits but the first time, as $flag tells.
+	private once(flag: string, name: string, node: string, m: i32, build: () => void) {
+		this.top.push(`let $${flag} = false;`)
+		this.emitFn(name, node, m, [], () => {
+			this.emit(`if ($${flag}) return;`)
+			this.emit(`$${flag} = true;`)
+			build()
+		})
+	}
+
+	/// Sets var decl d to its initializer's value, if it has one.
+	private initialize(d: i32) {
+		const t = this.p.decls[d].type
+		if (this.p.decls[d].code != null) {
+			this.pushCall(`i:${d}`, `${this.initName(d)}()`, t)
+			this.emit(`${this.fn(d)} = ${this.put(this.pop(), t)};`)
+		}
+	}
+
+	/// Exported entry start($h): initializes main's module, then runs main or each test; returns exit status.
+	private start(main: i32, tests: bool) {
+		const p = this.p
+		this.begin("start", main)
+		this.emit("$h = _h;")
+		this.emit(`${this.calls(`m:${main}`, `$mod_${main}()`)};`)
+		let r = "0"
+		for (const d of p.modules[main].decls) {
+			const x = p.decls[d]
+			if (tests && x.kind == decl.Test) {
+				this.pushCall("h:test", `$h.test(${jsStr(this.name(d))}, ${jsStr(this.path)}, ${this.fn(d)})`,
+					kind.None)
+			} else if (!tests && x.kind == decl.Function && this.name(d) == "main") {
+				this.pushCall(`d:${d}`, `${this.fn(d)}()`, p.b(x.type))
+				if (this.stack.length > 0) {
+					const v = this.pop()
+					const k = this.kindOf(v.t)
+					if (kind.isInt(k)) {
+						r = if (isBig(k)) `Number(${v.e})` else v.e
+					}
+				}
+			}
+		}
+		if (tests) {
+			r = this.spill("$h.tested()")
+		}
+		this.emit(`return ${r};`)
+		this.top.push(`export async function start(_h) {\n${this.sDecl()}${this.out.join("\n")}\n}`)
+	}
+
+	/// Initializer of class c: initializes an instance in place, field by field (spec 5.3).
+	private construct(c: i32) {
+		const p = this.p
+		const n = p.type(kind.Named, c, 0)
+		this.emitFn(this.initName(c), `c:${c}`, p.decls[c].module, ["_s"], () => {
+			if (this.jsMap(c)) {
+				this.emit(`_s.f${this.place({ e: "", t: p.type(kind.Named, c, 0) }, p.intern("size")).k} = 0;`)
+				this.emit("_s.$m = new Map();")
+				return
+			}
+			const slots = this.layout(n)
+			for (const k of 0 ... slots.length - 1) {
+				const s = slots[k]
+				const t = this.norm(s.t)
+				const code = p.decls[s.decl].code
+				if (s.embed) {
+					this.emit(`_s.f${k} = ${this.instance(t, []).e};`)
+				}
+				if (code != null) {
+					this.pushCall(`i:${s.decl}`, `${this.initName(s.decl)}(_s)`, t)
+				}
+				const v = if (code != null) this.pop() else null
+				if (!s.embed) {
+					this.emit(`_s.f${k} = ${if (v == null) this.zero(t) else this.put(v!, t)};`)
+				}
+			}
+		})
+	}
+
+	// Functions.
+	/// Starts the function of call-graph node node, of module m.
+	private begin(node: string, m: i32) {
+		this.curNode = node
+		this.mod = m
+		this.path = this.p.modules[m].path
+		this.pos = -1
+		this.out = []
+		this.stack = []
+		this.frames = []
+		this.dead = false
+		this.temps = 0
+		this.sCur = 0
+		this.sMax = 0
+		this.sBase = 0
+		this.labels = 0
+	}
+
+	/// The declaration of the scratch registers the function uses, if any.
+	private sDecl(): string {
+		if (this.sMax == 0) {
+			return ""
+		}
+		const ns: string[] = []
+		for (const i of 0 ... this.sMax - 1) {
+			ns.push(`_s${i}`)
+		}
+		return `let ${ns.join(", ")};\n`
+	}
+
+	/// Emits function name of params, its body what build emits, async if node may suspend; if that throws a
+	/// CompileError, a trap of it.
+	private emitFn(name: string, node: string, m: i32, params: string[], build: () => void) {
+		try {
+			this.begin(node, m)
+			build()
+		} catch (e: CompileError) {
+			this.begin(node, m)
+			this.trap(e.msg)
+		}
+		const body = `${this.sDecl()}${this.out.join("\n")}`
+		this.top.push(`\x01A:${node}\x01function ${name}(${params.join(", ")}) {\n${body}\n}`)
+	}
+
+	/// Defines function name of decl d's code c, of params of types ps and result ret; if env, a closure's code, which
+	/// takes its env, the cells it captures, first.
+	private define(name: string, node: string, d: i32, c: Code, ps: i32[], ret: i32, env: bool) {
+		this.emitFn(name, node, this.p.decls[d].module, pnames(ps.length, if (env) ["_env"] else []), () => {
+			this.code = c
+			this.ret = ret
+			const cells = c.locals.map(_ => false)
+			for (const i of 0 ... c.ops.length - 1) {
+				if (c.ops[i] == op.Closure) {
+					for (const l of c.items(c.c(i))) {
+						cells[l] = true
+					}
+				}
+			}
+			const capAt = c.locals.map(_ => -1)
+			for (const k of 0 ... (if (env) c.captures.length else 0) - 1) {
+				capAt[c.captures[k]] = k
+				cells[c.captures[k]] = true
+			}
+			this.cells = cells
+			this.locals = []
+			for (const i of 0 ... c.locals.length - 1) {
+				const t = this.bare(c.locals[i].type)
+				const lname = `_l${i}`
+				this.locals.push(lname)
+				if (this.p.kind(t) == kind.None) {
+					continue
+				} else if (capAt[i] >= 0) {
+					this.emit(`let ${lname} = _env[${capAt[i]}];`)
+					continue
+				}
+				let init = this.zero(t)
+				if (i < ps.length) {
+					const v: V = { e: `_p${i}`, t: t }
+					const optional = this.p.kind(ps[i]) == kind.Optional
+					init = if (optional) `_p${i} === undefined ? undefined : ${this.put(v, t)}` else this.put(v, t)
+				}
+				this.emit(if (cells[i]) `let ${lname} = { v: ${init} };` else `let ${lname} = ${init};`)
+			}
+			this.ops(0, c.ops.length)
+		})
+	}
+
+	/// Translates the ops of the code from i up to end.
+	private ops(i: i32, end: i32) throws CompileError {
+		let at = i
+		while (at < end) {
+			at = this.op(at) + 1
+		}
+	}
+
+	/// Translates op i; returns the last op it translated, itself or the End of an Each it unrolled.
+	private op(i: i32): i32 throws CompileError {
+		if (this.stack.length == 0) {
+			this.sCur = this.sBase
+		}
+		const c = this.code
+		const p = this.p
+		const o = c.ops[i]
+		const n = c.a(i)
+		this.pos = c.pos[i]
+		switch (o) {
+			case op.End: this.end()
+			case op.Unreachable: this.trap("unreachable")
+			case op.Block: this.open(o, n)
+			case op.Loop: this.open(o, kind.None)
+			case op.If:
+				const yes = this.cond()
+				this.open(o, n).head = yes
+			case op.Match:
+				const u = this.pop()
+				const ts = p.lists[n]
+				this.open(o, kind.None).conds = ts.slice(0, ts.length - 1).map(t => this.isa(u, t))
+			case op.Else:
+				const f = this.frames[this.frames.length - 1]
+				this.leaveBlock(f)
+				if (f.o == op.Match) {
+					f.arms.push(f.body)
+					f.body = []
+					this.out = f.body
+				} else {
+					this.out = f.other
+				}
+				this.dead = false
+			case op.Default:
+				const f = this.open(o, kind.None)
+				f.local = n
+				f.head = `${this.load(n)} === undefined`
+			case op.Each: return this.each(n, i)
+			case op.Try: this.open(op.Try, kind.None)
+			case op.Catch: this.catch(n, c.b(i))
+			case op.Finally: this.finally()
+			case op.Throw:
+				const v = this.pop()
+				// Fresh box for null so host.mjs tracks throw sites by box identity.
+				const box = this.spill(if (p.kind(v.t) == kind.Null) `new $B(${kind.Null}, null)`
+					else this.cast(v, this.any))
+				this.emit(`$h.thrown(${box}, ${this.showing(n)}, ${jsStr(this.path)}, ${this.pos});`)
+				this.emit(`throw ${box};`)
+				this.dead = true
+			case op.Br: this.branch(n)
+			case op.BrIf: this.branchIf(this.cond(), n)
+			case op.BrNull:
+				const u = this.pop()
+				this.pushConst("null", kind.Null)
+				this.branchIf(this.isa(u, kind.Null), n)
+				this.stack.pop()
+				const rest = p.union(p.members(u.t).filter(m => m != kind.Null))
+				this.push(this.cast(u, rest), rest)
+			case op.Return: this.return()
+			case op.Call: this.invoke(n, c.b(i))
+			case op.CallRef:
+				const xs = this.popN(n)
+				const f = this.pop()
+				const via = c.b(i) - 1
+				const callArgs = this.args(xs, p.items(f.t))
+				if (via >= 0) {
+					this.pushCall(`d:${via}`, `${this.fn(via)}(${[`${f.e}.$e`, ...callArgs].join(", ")})`, p.b(f.t))
+				} else {
+					this.pushCall(`t:${this.bare(f.t)}`, `${f.e}(${callArgs.join(", ")})`, p.b(f.t))
+				}
+			case op.Drop: this.stack.pop()
+			case op.Local: this.push(this.load(n), this.norm(c.locals[n].type))
+			case op.SetLocal: this.setLocal(n, this.pop())
+			case op.Fresh: this.renew(n)
+			case op.Global:
+				const x = p.decls[n]
+				this.touch(n)
+				this.push(if (x.kind == decl.Function) this.value(n) else this.fn(n), x.type)
+			case op.SetGlobal:
+				const t = p.decls[n].type
+				this.touch(n)
+				this.emit(`${this.fn(n)} = ${this.put(this.pop(), t)};`)
+			case op.False, op.True: this.pushConst(if (o == op.True) "true" else "false", kind.Bool)
+			case op.Null: this.pushConst("null", kind.Null)
+			case op.Int, op.Float:
+				const v = p.ints[c.b(i)]
+				const k = this.kindOf(n)
+				this.pushConst(if (o == op.Float) jsFloat(v, k == kind.F32) else jsInt(v, k), n)
+			case op.Str: this.pushConst(jsStr(p.strings[n]), kind.String)
+			case op.Missing: this.stack.push({ e: "", t: this.norm(n) })
+			case op.Member, op.Field: this.field(this.pop(), if (o == op.Field) n else p.decls[n].name)
+			case op.SetMember, op.SetField:
+				const v = this.pop()
+				this.setField(this.pop(), if (o == op.SetField) n else p.decls[n].name, v)
+			case op.Subscript:
+				const k = this.pop()
+				const arr = this.pop()
+				this.push(this.element(arr, k), this.elementType(arr.t))
+			case op.SetSubscript:
+				const v = this.pop()
+				const k = this.pop()
+				const arr = this.pop()
+				const at = this.index(arr, k)
+				this.emit(`${arr.e}[${at}] = ${this.put(v, this.elementType(arr.t))};`)
+			case op.Unpack:
+				const arr = this.stack[this.stack.length - 1]
+				if (p.kind(arr.t) == kind.Array) {
+					this.check(`${arr.e}.length >= ${n}`, "array pattern longer than array")
+				}
+			case op.Array, op.Object: this.array(n, this.popN(c.b(i)), c.items(c.c(i)))
+			case op.Init: {}
+			case op.New: this.make(n)
+			case op.Closure:
+				const ls = c.items(c.c(i)).map(l => this.locals[l])
+				const ft = this.norm(p.decls[n].type)
+				this.edge(`t:${ft}`, `d:${n}`)
+				this.push(`$cl(${this.fn(n)}, [${ls.join(", ")}])`, ft)
+			case op.Cast: this.push(this.cast(this.pop(), n), n)
+			case op.Is: this.push(this.isa(this.pop(), n), kind.Bool)
+			case op.Assert: this.check(this.cond(), "assert failed")
+			case op.Fail: this.trapExpr(`"assert failed: " + (${this.cast(this.pop(), kind.String)})`, true)
+			case op.Not: this.push(`!(${this.cond()})`, kind.Bool)
+			case op.Eq, op.Ne, op.Lt, op.Gt, op.Le, op.Ge: this.compare(o)
+			case op.Same: this.compare(op.Eq)
+			case op.Add, op.Sub, op.Mul, op.Div, op.Rem, op.Pow, op.And, op.Or, op.Xor, op.Shl, op.Shr: this.arith(o)
+			case op.Neg:
+				const a = this.pop()
+				const k = this.kindOf(a.t)
+				this.push(if (kind.isFloat(k)) `-(${a.e})` else normNum(`-(${a.e})`, k), a.t)
+			case op.Concat:
+				const xs = this.popN(n)
+				this.push(if (n == 0) `""` else xs.map(x => `(${this.cast(x, kind.String)})`).join(" + "), kind.String)
+			default: throw new CompileError(`js: ${op.names[o]}`)
+		}
+		return i
+	}
+
+	// Control flow.
+	/// Opens a block of op o and result type t, its result, if any, in a temp declared before it.
+	private open(o: Opcode, t: i32): Frame {
+		const f = new Frame()
+		f.o = o
+		f.t = t
+		f.height = this.stack.length
+		f.label = this.label()
+		f.outer = this.out
+		if (t != kind.None) {
+			f.slot = this.temp()
+			this.emit(`let ${f.slot};`)
+		}
+		this.frames.push(f)
+		this.out = f.body
+		return f
+	}
+
+	private label(): string {
+		this.labels++
+		return `L${this.labels}`
+	}
+
+	/// Ends the innermost block: emits it, labeled, to the code around and pushes its result; at the code's end,
+	/// returns if reached.
+	private end() {
+		if (this.frames.length == 0) {
+			if (!this.dead) {
+				this.return()
+			}
+			return
+		}
+		const f = this.frames.pop()
+		if (f.o != op.Try) {
+			this.leaveBlock(f)
+		}
+		this.stack = this.stack.slice(0, f.height)
+		const l = f.label
+		const x = switch (f.o) {
+			case op.Loop: braced(`${l}: for (;;)`, [...f.body, `break ${l};`])
+			case op.If: braced(`${l}: if (${f.head})`, f.body)
+				+ (if (f.other.length > 0) braced(" else", f.other) else "")
+			case op.Default: braced(`${l}: if (${f.head})`, f.body)
+			case op.Match: braced(`${l}:`, [this.match(f)])
+			case op.Try: braced(`${l}:`, this.try(f))
+			default: braced(if (f.head == "") `${l}:` else `${l}: ${f.head}`, f.body)
+		}
+		this.out = f.outer
+		this.emit(x)
+		this.dead = false
+		if (f.slot != "") {
+			this.stack.push({ e: f.slot, t: this.norm(f.t) })
+		}
+	}
+
+	/// Ends the code of f's block that falls through to its end: its result stored, or a Default's in its param.
+	private leaveBlock(f: Frame) {
+		if (!this.dead) {
+			if (f.o == op.Default) {
+				this.setLocal(f.local, this.pop())
+			} else if (f.slot != "") {
+				this.emit(`${f.slot} = ${this.cast(this.pop(), f.t)};`)
+			}
+		}
+		this.stack = this.stack.slice(0, f.height)
+	}
+
+	/// Returns what is on the stack, as the function's type.
+	private return() {
+		const rk = this.kindOf(this.ret)
+		if (rk == kind.None) {
+			this.emit("return;")
+		} else if (rk == kind.Null || this.stack.length == 0) {
+			this.emit("return null;")
+		} else {
+			this.emit(`return ${this.cast(this.pop(), this.ret)};`)
+		}
+		this.dead = true
+	}
+
+	/// Branches out of the block at depth n, its result stored: to after its end, or a Loop's start, or an Each's next
+	/// element.
+	private branch(n: i32) {
+		const f = this.frames[this.frames.length - 1 - n]
+		if (f.slot != "") {
+			this.emit(`${f.slot} = ${this.cast(this.pop(), f.t)};`)
+		}
+		const cont = f.o == op.Loop || f.o == op.Each && f.head != ""
+		this.emit(`${if (cont) "continue" else "break"} ${f.label};`)
+		this.dead = true
+	}
+
+	/// Branches out of the block at depth n if yes, the stack left as it was for the path not taken.
+	private branchIf(yes: string, n: i32) {
+		const stack = [...this.stack]
+		const taken = this.nested(() => this.branch(n))
+		this.stack = stack
+		this.dead = false
+		this.emit(`if (${yes}) {\n${taken}\n}`)
+	}
+
+	/// Each of op i into local l: over an array, fixed array or string a loop, over a tuple its body translated once
+	/// per element. Returns the last op it translated.
+	private each(l: i32, i: i32): i32 {
+		const popped = this.pop()
+		const xs: V = { e: this.keep(popped.e), t: popped.t }
+		if (this.p.kind(xs.t) == kind.Tuple) {
+			const end = this.code.next(i)
+			const base = this.sBase
+			this.sBase = this.sCur
+			for (const e of 0 ... this.p.items(xs.t).length - 1) {
+				this.open(op.Each, kind.None)
+				this.field(xs, this.p.elementName(e))
+				this.renew(l)
+				this.setLocal(l, this.pop())
+				this.ops(i + 1, end)
+				this.end()
+			}
+			this.sBase = base
+			return end
+		}
+		const at = this.temp()
+		const f = this.open(op.Each, kind.None)
+		f.head = `for (let ${at} = 0; ${at} < ${this.length(xs)}; ${at}++)`
+		this.renew(l)
+		const e = this.elementType(xs.t)
+		this.setLocal(l, { e: this.spill(this.at(xs, at)), t: this.norm(e) })
+		return i
+	}
+
+	/// Makes local l a new variable, where a closure captures its cell (Fresh).
+	private renew(l: i32) {
+		if (this.cells[l]) {
+			const t = this.bare(this.code.locals[l].type)
+			this.emit(`${this.locals[l]} = { v: ${this.zero(t)} };`)
+		}
+	}
+
+	/// Starts the catch of the Try open, of a value of type t, or of any if None, into local l.
+	private catch(t: i32, l: i32) {
+		const f = this.frames[this.frames.length - 1]
+		this.stack = this.stack.slice(0, f.height)
+		const err = this.temp()
+		f.err = err
+		this.out = f.other
+		this.dead = false
+		this.emit(`if (!(${err} instanceof $B)) throw ${err};`)
+		if (t != kind.None) {
+			const c: V = { e: err, t: this.any }
+			this.emit(`if (!(${this.isa(c, t)})) throw ${err};`)
+			this.setLocal(l, c)
+		}
+	}
+
+	/// Starts the finally of the Try open.
+	private finally() {
+		const f = this.frames[this.frames.length - 1]
+		this.stack = this.stack.slice(0, f.height)
+		f.finally = true
+		this.out = f.fin
+		this.dead = false
+	}
+
+	/// The statements of Try f: its body, with its catch, if any, in a try, and that so with its finally, if any, which
+	/// a trap skips: only a $B is thrown by bober's code.
+	private try(f: Frame): string[] {
+		const body = if (f.err == "") f.body else [braced("try", f.body) + braced(` catch (${f.err})`, f.other)]
+		if (!f.finally) {
+			return body
+		}
+		const ok = this.temp()
+		const err = this.temp()
+		return [`let ${ok} = true;`,
+			braced("try", body) + braced(` catch (${err})`, [`${ok} = ${err} instanceof $B;`, `throw ${err};`])
+			+ braced(" finally", [braced(`if (${ok})`, f.fin)])]
+	}
+
+	// Calls.
+	/// Call of decl d of env: an intrinsic of builtin/, an import of the host, $h, or a bober function.
+	private invoke(d: i32, env: i32) {
+		const p = this.p
+		const x = p.decls[d]
+		const t = p.subst(x.type, env)
+		if (x.code == null && (x.mods & decl.Extern) == 0 && this.intrinsic(this.name(d), env, p.b(t))) {
+			return
+		}
+		const xs = this.popN(p.items(t).length)
+		const first: string[] = []
+		if (p.method(d)) {
+			const obj = this.pop()
+			first.push((this.upcast(obj, x.owner) ?? obj).e)
+		} else if (this.closures.has(d)) {
+			first.push("null")
+		}
+		const callArgs = [...first, ...this.args(xs, p.items(t))]
+		if (x.code == null) {
+			const h = this.name(d)
+			this.pushCall(`h:${h}`, `$h.${h}(${callArgs.join(", ")})`, p.b(t), true)
+		} else {
+			this.pushCall(`d:${d}`, `${this.fn(d)}(${callArgs.join(", ")})`, p.b(t))
+		}
+	}
+
+	/// The intrinsic name of builtin/, of the type args of env and result ret, in place; false if it is none.
+	private intrinsic(name: string, env: i32, ret: i32): bool {
+		const t = if (env == 0) kind.None else this.p.lists[env][0]
+		switch (name) {
+			case "array": this.push(`Array.from({ length: Number(${this.pop().e}) }, () => ${this.zero(t)})`, ret)
+			case "zero": this.push(this.zero(t), t)
+			case "jsSlice":
+				const xs = this.popN(3)
+				this.push(`${xs[0].e}.slice(${xs[1].e}, ${xs[2].e})`, kind.String)
+			case "jsChr": this.push(`String.fromCharCode(${this.pop().e})`, kind.String)
+			case "jsBytes": this.push(`$bytes(${this.pop().e})`, kind.String)
+			case "jsShowUint": this.push(`String(${this.pop().e})`, kind.String)
+			case "bits": this.push(`${if (this.kindOf(t) == kind.F32) "$bits32" else "$bits64"}(${this.pop().e})`,
+				kind.U64)
+			case "fromBits": this.push(`${if (this.kindOf(t) == kind.F32) "$fromBits32" else "$fromBits64"}(${this.pop().e})`,
+				t)
+			case "trap":
+				this.trapExpr(this.pop().e, false)
+				if (this.kindOf(ret) == kind.Null) {
+					this.pushConst("null", kind.Null)
+				}
+			case "catching":
+				const into = this.pop()
+				const f = this.pop()
+				const threw = this.spill("false")
+				const err = this.temp()
+				this.emit(`try {\n${this.calls(`t:${this.bare(f.t)}`, `${f.e}()`)};\n} catch (${err}) {\nif (!(${err} instanceof $B)) throw ${err};\n${into.e}.f0 = ${err};\n${threw} = true;\n}`)
+				this.stack.push({ e: threw, t: this.norm(ret) })
+			case "rethrow":
+				this.emit(`throw ${this.pop().e}.f0;`)
+				if (this.kindOf(ret) == kind.Null) {
+					this.pushConst("null", kind.Null)
+				}
+			default: return false
+		}
+		return true
+	}
+
+	/// The args xs of params ps, cast to them; one left out undefined, as is an optional param passed on that was not
+	/// given.
+	private args(xs: V[], ps: i32[]): string[] {
+		const r: string[] = []
+		for (const k of 0 ... ps.length - 1) {
+			const opt = this.p.kind(ps[k]) == kind.Optional
+			const t = if (opt) this.p.a(ps[k]) else ps[k]
+			const given = k < xs.length && xs[k].e != ""
+			const held = given && this.p.kind(xs[k].t) == kind.Optional
+			if (!given) {
+				r.push("undefined")
+			} else if (held) {
+				const inner: V = { e: xs[k].e, t: this.p.a(xs[k].t) }
+				r.push(`${xs[k].e} === undefined ? undefined : ${this.cast(inner, t)}`)
+			} else {
+				r.push(this.cast(xs[k], t))
+			}
+		}
+		return r
+	}
+
+	/// Emits call expr of callee, recording the edge, and pushes its result of type t, a host's normalized.
+	private pushCall(callee: string, expr: string, t: i32, host = false) {
+		const call = this.calls(callee, expr)
+		const k = this.kindOf(t)
+		if (k == kind.None) {
+			this.emit(`${call};`)
+		} else if (k == kind.Null) {
+			this.emit(`${call};`)
+			this.pushConst("null", kind.Null)
+		} else {
+			this.push(if (host) wrapHost(call, k) else call, t)
+		}
+	}
+
+	/// Shows a thrown box via show's instance d.
+	private showing(d: i32): string {
+		const name = `$shown_${d}`
+		if (!this.made.has(name)) {
+			this.made.set(name, true)
+			const m = this.mod
+			this.pending.push(() => {
+				this.emitFn(name, `s:${d}`, m, ["_b"], () => {
+					this.ret = kind.String
+					const v = this.cast({ e: "_b", t: this.any }, this.p.items(this.p.decls[d].type)[0])
+					this.pushCall(`d:${d}`, `${this.fn(d)}(${v})`, kind.String)
+					this.return()
+				})
+			})
+		}
+		return name
+	}
+
+	/// Function value of function decl d.
+	private value(d: i32): string {
+		const x = this.p.decls[d]
+		const ft = this.norm(x.type)
+		if (x.code == null) {
+			const h = this.name(d)
+			this.edge(`t:${ft}`, `h:${h}`)
+			const k = this.kindOf(this.p.b(ft))
+			return `(..._a) => ${wrapHost(`$h.${h}(..._a)`, k)}`
+		}
+		this.edge(`t:${ft}`, `d:${d}`)
+		return if (this.closures.has(d)) `${this.fn(d)}.bind(null, null)` else this.fn(d)
+	}
+
+	/// Method d bound to obj.
+	private bound(d: i32, obj: V): string {
+		this.edge(`t:${this.norm(this.p.decls[d].type)}`, `d:${d}`)
+		return `${this.fn(d)}.bind(null, ${(this.upcast(obj, this.p.decls[d].owner) ?? obj).e})`
+	}
+
+	/// Function value f adapted to type to.
+	private adapt(f: V, to: i32): string {
+		const p = this.p
+		const from = this.norm(f.t)
+		const toNorm = this.norm(to)
+		const name = `$adapt_${from}_${toNorm}`
+		const node = `ad:${from}:${toNorm}`
+		if (!this.made.has(name)) {
+			this.made.set(name, true)
+			const m = this.mod
+			this.pending.push(() => {
+				const ps = p.items(toNorm)
+				this.emitFn(name, node, m, pnames(ps.length, ["_f"]), () => {
+					this.ret = p.b(toNorm)
+					const xs: V[] = []
+					for (const i of 0 ... ps.length - 1) {
+						xs.push({ e: `_p${i}`, t: this.norm(ps[i]) })
+					}
+					this.pushCall(`t:${from}`, `_f(${this.args(xs, p.items(from)).join(", ")})`, p.b(from))
+					this.return()
+				})
+			})
+		}
+		this.edge(`t:${toNorm}`, node)
+		return `${name}.bind(null, ${f.e})`
+	}
+
+	/// Whether class decl c is std/collections/hashmap's HashMap with Auto hasher and a scalar/string (or nullable) key
+	/// whose equality matches JS Map's SameValueZero exactly.
+	private jsMap(c: i32): bool {
+		const p = this.p
+		const x = p.decls[c]
+		if (x.kind != decl.Class || this.name(c) != "HashMap" || x.env == 0
+			|| p.modules[x.module].path != join(root, "std/collections/hashmap.bob")) {
+			return false
+		}
+		const args = p.lists[x.env]
+		if (args.length != 3 || p.kind(args[2]) != kind.Named) {
+			return false
+		}
+		const h = p.decls[p.a(args[2])]
+		if (p.strings[h.name] != "Auto" || p.modules[h.module].path != join(root, "std/hash.bob")) {
+			return false
+		}
+		let k = this.norm(args[0])
+		if (p.kind(k) == kind.Union && !this.boxed(k)) {
+			k = p.members(k).find(m => m != kind.Null)!
+		}
+		const kk = p.kind(k)
+		return kk == kind.String || kk == kind.Bool || kind.isInt(kk)
+	}
+
+	/// Whether d is get, has, set, delete or values of a HashMap that is a JS Map (jsMap).
+	private mapMethod(d: i32): bool {
+		const c = this.p.classOf(d)
+		return c >= 0 && this.jsMap(c) && ["get", "has", "set", "delete", "values"].includes(this.name(d))
+	}
+
+	/// Emits HashMap method d as that of the JS Map in its field $m, its field size kept the Map's.
+	private mapFn(d: i32) {
+		const p = this.p
+		const x = p.decls[d]
+		const c = p.classOf(d)
+		const ps = this.params(d)
+		const vType = this.norm(p.lists[p.decls[c].env][1])
+		const ret = this.norm(p.b(x.type))
+		const size = this.read(this.place({ e: "_p0", t: p.type(kind.Named, c, 0) }, p.intern("size")))
+		this.emitFn(this.fn(d), `d:${d}`, x.module, pnames(ps.length), () => {
+			switch (this.name(d)) {
+				case "get": this.emit(`return _p0.$m.has(_p1) ? _p0.$m.get(_p1) : ${this.zero(ret)};`)
+				case "has": this.emit("return _p0.$m.has(_p1);")
+				case "set":
+					this.emit(`_p0.$m.set(_p1, ${this.put({ e: "_p2", t: vType }, vType)});`)
+					this.emit(`${size} = _p0.$m.size;`)
+					this.emit("return null;")
+				case "delete":
+					this.emit("_p0.$m.delete(_p1);")
+					this.emit(`${size} = _p0.$m.size;`)
+					this.emit("return null;")
+				case "values": this.emit(`return ${this.copies("Array.from(_p0.$m.values())", vType)};`)
+			}
+		})
+	}
+
+	/// Whether d is Array's push, pop or slice, which are JS Array's.
+	private arrayMethod(d: i32): bool {
+		const p = this.p
+		const c = p.classOf(d)
+		return c >= 0 && p.modules[p.decls[d].module].path == builtinPath("array") && this.name(c) == "Array"
+			&& ["push", "pop", "slice"].includes(this.name(d))
+	}
+
+	/// Emits Array method d as JS Array's, a pop of an empty one or a slice out of range trapping.
+	private arrayFn(d: i32) {
+		const p = this.p
+		const x = p.decls[d]
+		const ps = this.params(d)
+		const e = this.norm(p.a(this.norm(ps[0])))
+		this.emitFn(this.fn(d), `d:${d}`, x.module, pnames(ps.length), () => {
+			switch (this.name(d)) {
+				case "push":
+					this.emit(`_p0.push(${this.put({ e: "_p1", t: e }, e)});`)
+					this.emit("return null;")
+				case "pop":
+					this.emit(`if (_p0.length === 0) $trap("pop of an empty array", null, -1);`)
+					this.emit("return _p0.pop();")
+				case "slice":
+					this.emit(`if (_p1 < 0 || _p1 > _p2 || _p2 > _p0.length) $trap("slice out of range", null, -1);`)
+					this.emit(`return ${this.copies("_p0.slice(_p1, _p2)", e)};`)
+			}
+		})
+	}
+
+	// Values.
+	private push(expr: string, t: i32) { this.stack.push({ e: this.spill(expr), t: this.norm(t) }) }
+	private pushConst(expr: string, t: i32) { this.stack.push({ e: expr, t: this.norm(t) }) }
+	private pop(): V { return this.stack.pop() }
+	private cond(): string { return this.cast(this.pop(), kind.Bool) }
+
+	private popN(n: i32): V[] {
+		const at = this.stack.length - n
+		const vs = this.stack.slice(at, this.stack.length)
+		this.stack = this.stack.slice(0, at)
+		return vs
+	}
+
+	/// A new variable's name, which the caller declares.
+	private temp(): string {
+		this.temps++
+		return `_t${this.temps}`
+	}
+
+	/// A new temp holding expr, which unlike a scratch register no later statement reuses.
+	private keep(expr: string): string {
+		const l = this.temp()
+		this.emit(`let ${l} = ${expr};`)
+		return l
+	}
+
+	/// A reusable per-statement scratch register _sN.
+	private spill(expr: string): string {
+		const i = this.sCur
+		this.sCur++
+		if (this.sCur > this.sMax) {
+			this.sMax = this.sCur
+		}
+		const l = `_s${i}`
+		this.emit(`${l} = ${expr};`)
+		return l
+	}
+
+	private emit(s: string) { this.out.push(s) }
+
+	/// The code of Match f: an if of each arm's condition, else the next's, the last arm's.
+	private match(f: Frame): string {
+		const parts: string[] = []
+		for (const i of 0 ... f.arms.length - 1) {
+			parts.push(`${if (i == 0) "if" else "else if"} (${f.conds[i]}) {\n${f.arms[i].join("\n")}\n}`)
+		}
+		parts.push(`else {\n${f.body.join("\n")}\n}`)
+		return parts.join(" ")
+	}
+
+	/// The code f emits, not emitted.
+	private nested(f: () => void): string {
+		const out = this.out
+		this.out = []
+		f()
+		const r = this.out.join("\n")
+		this.out = out
+		return r
+	}
+
+	private load(n: i32): string { return if (this.cells[n]) `${this.locals[n]}.v` else this.locals[n] }
+
+	/// Stores v in local n of the code, unless it holds nothing.
+	private setLocal(n: i32, v: V) {
+		const t = this.bare(this.code.locals[n].type)
+		if (this.p.kind(t) != kind.None) {
+			this.emit(`${this.load(n)} = ${this.put(v, t)};`)
+		}
+	}
+
+	/// v as a place of type t holds it: cast, and a T[n] deeply copied.
+	private put(v: V, t: i32): string {
+		const x = this.cast(v, t)
+		const n = this.bare(t)
+		return if (this.p.kind(n) == kind.FixedArray) this.copied(x, n) else x
+	}
+
+	/// A copy of x, a T[n] of type n, its elements copied deeply too.
+	private copied(x: string, n: i32): string { return this.copies(`(${x}).slice()`, this.norm(this.p.a(n))) }
+
+	/// The new JS Array xs of elements of type e, each copied in place if a T[n], which is a value.
+	private copies(xs: string, e: i32): string {
+		if (this.p.kind(e) != kind.FixedArray) {
+			return xs
+		}
+		const r = this.spill(xs)
+		const i = this.temp()
+		this.emit(`for (let ${i} = 0; ${i} < ${r}.length; ${i}++) {`)
+		this.emit(`${r}[${i}] = ${this.copied(`${r}[${i}]`, e)};`)
+		this.emit("}")
+		return r
+	}
+
+	/// Pushes field name of held: a length, a method bound to it or to the mixin that has it, or the value of a field.
+	private field(held: V, name: i32) {
+		const p = this.p
+		const t = held.t
+		const k = p.kind(t)
+		const d = if (k == kind.Named) p.member(p.a(t), name) else -1
+		if (p.strings[name] == "length" && (k == kind.String || k == kind.Array || k == kind.FixedArray)) {
+			this.push(this.length(held), kind.I32)
+		} else if (p.strings[name] == "length" && k == kind.Tuple) {
+			this.pushConst(`${p.items(t).length}`, kind.I32)
+		} else if (d >= 0 && p.decls[d].kind == decl.Function) {
+			this.push(this.bound(d, held), p.decls[d].type)
+		} else {
+			const via = this.layout(t).find(s => d < 0 && s.mixin
+				&& this.kindOf(fieldOf(p, this.norm(s.t), name)) == kind.Func)
+			if (via != null) {
+				this.field(held, via.name)
+				this.field(this.pop(), name)
+				return
+			}
+			const at = this.place(held, name)
+			this.push(this.read(at), at.s.t)
+		}
+	}
+
+	/// Stores v in field name of obj; in an embedded one, by copying its fields.
+	private setField(obj: V, name: i32, v: V) {
+		const at = this.place(obj, name)
+		if (at.s.embed) {
+			this.copy(v, { e: this.spill(this.read(at)), t: this.norm(at.s.t) })
+		} else {
+			this.emit(`${this.read(at)} = ${this.put(v, at.s.t)};`)
+		}
+	}
+
+	/// The field of a class instance, object or tuple of the name, a Str, also of one a mixin holds.
+	private place(obj: V, name: i32): Place {
+		const r = this.find(obj, name)
+		if (r == null) {
+			throw new CompileError(`js: no field ${this.p.strings[name]} in ${showType(this.p, obj.t)}`)
+		}
+		return r!
+	}
+
+	/// The field of obj of the name, as place, or null.
+	private find(obj: V, name: i32): Place | null {
+		const slots = this.layout(obj.t)
+		for (const i of 0 ... slots.length - 1) {
+			if (slots[i].name == name) {
+				return { v: obj, k: i, s: slots[i] }
+			}
+		}
+		for (const i of 0 ... slots.length - 1) {
+			if (slots[i].mixin) {
+				const r = this.find(this.embedded(obj, i, slots[i]), name)
+				if (r != null) {
+					return r
+				}
+			}
+		}
+		return null
+	}
+
+	private embedded(obj: V, k: i32, s: Slot): V { return { e: this.read({ v: obj, k: k, s: s }), t: this.norm(s.t) } }
+
+	/// Field at, as JS that reads or assigns it.
+	private read(at: Place): string {
+		return if (this.p.kind(at.v.t) == kind.Tuple) `${at.v.e}[${at.k}]` else `${at.v.e}.f${at.k}`
+	}
+
+	/// obj as an instance of class decl c: obj, or a mixin embedded in it; null if neither.
+	private upcast(obj: V, c: i32): V | null {
+		if (this.p.kind(obj.t) != kind.Named) {
+			return null
+		} else if (this.p.a(obj.t) == c) {
+			return obj
+		}
+		const slots = this.layout(obj.t)
+		for (const i of 0 ... slots.length - 1) {
+			if (slots[i].mixin) {
+				const r = this.upcast(this.embedded(obj, i, slots[i]), c)
+				if (r != null) {
+					return r
+				}
+			}
+		}
+		return null
+	}
+
+	/// Copies the fields of src, an object, instance or a union of them, to those of the name of dst, a method of src's
+	/// bound.
+	private copy(src: V, dst: V) {
+		const p = this.p
+		if (p.kind(src.t) == kind.Union) {
+			for (const m of p.members(src.t).filter(m => [kind.Named, kind.Object, kind.Tuple].includes(p.kind(m)))) {
+				const inner = this.nested(() => this.copy({ e: this.spill(this.unbits(src, m)), t: m }, dst))
+				this.emit(`if (${this.is(src, m)}) {\n${inner}\n}`)
+			}
+			return
+		}
+		for (const s of this.layout(dst.t)) {
+			const from = this.find(src, s.name)
+			if (from != null) {
+				this.setField(dst, s.name, { e: this.spill(this.read(from!)), t: this.norm(from!.s.t) })
+			} else if (this.kindOf(fieldOf(p, src.t, s.name)) == kind.Func) {
+				this.field(src, s.name)
+				this.setField(dst, s.name, this.pop())
+			}
+		}
+	}
+
+	private element(arr: V, k: V): string { return this.at(arr, this.index(arr, k)) }
+
+	private at(arr: V, at: string): string {
+		return if (this.p.kind(arr.t) == kind.String) `${arr.e}.charCodeAt(${at})` else `${arr.e}[${at}]`
+	}
+
+	private index(arr: V, k: V): string {
+		const idx = if (isBig(this.kindOf(k.t))) `Number(${k.e})` else k.e
+		return this.spill(`$idx(${idx}, ${this.length(arr)}, ${jsStr(this.path)}, ${this.pos})`)
+	}
+
+	private length(arr: V): string {
+		return if (this.p.kind(arr.t) == kind.FixedArray) `${this.p.b(arr.t)}` else `${arr.e}.length`
+	}
+
+	private elementType(t: i32): i32 { return if (this.p.kind(t) == kind.String) kind.U8 else this.p.a(t) }
+
+	/// Pushes an array, tuple, fixed array or object of type t of the values; a spread's elements appended, or its
+	/// fields copied.
+	private array(t: i32, vs: V[], spreads: i32[]) {
+		const p = this.p
+		const n = this.norm(t)
+		const k = p.kind(n)
+		if (k == kind.Array || k == kind.FixedArray) {
+			const e = p.a(n)
+			if (spreads.length == 0) {
+				this.push(`[${vs.map(v => this.put(v, e)).join(", ")}]`, n)
+				return
+			}
+			const r: V = { e: this.spill("[]"), t: n }
+			for (const i of 0 ... vs.length - 1) {
+				if (spreads.includes(i)) {
+					this.forEach(vs[i], x => this.emit(`${r.e}.push(${this.put(x, e)});`))
+				} else {
+					this.emit(`${r.e}.push(${this.put(vs[i], e)});`)
+				}
+			}
+			this.stack.push(r)
+		} else {
+			const slots = this.layout(n)
+			const r: V = { e: this.spill(this.blank(n)), t: n }
+			let f = 0
+			for (const i of 0 ... vs.length - 1) {
+				if (spreads.includes(i)) {
+					this.copy(vs[i], r)
+				} else {
+					this.setField(r, slots[f].name, vs[i])
+					f++
+				}
+			}
+			this.stack.push(r)
+		}
+	}
+
+	/// An object or tuple of type n of zero fields, an embedded one a blank one of its own.
+	private blank(n: i32): string {
+		const vals = this.layout(n).map(s => if (s.embed) this.blank(this.norm(s.t)) else this.zero(s.t))
+		if (this.p.kind(n) == kind.Tuple) {
+			return `[${vals.join(", ")}]`
+		}
+		const fs: string[] = []
+		for (const i of 0 ... vals.length - 1) {
+			fs.push(`f${i}: ${vals[i]}`)
+		}
+		return `{ ${fs.join(", ")} }`
+	}
+
+	/// Runs f on each element of xs, an array, fixed array, string or tuple.
+	private forEach(xs: V, f: (x: V) => void) {
+		const p = this.p
+		if (p.kind(xs.t) == kind.Tuple) {
+			for (const i of 0 ... p.items(xs.t).length - 1) {
+				this.field(xs, p.elementName(i))
+				f(this.pop())
+			}
+			return
+		}
+		const at = this.temp()
+		const e = this.elementType(xs.t)
+		const body = this.nested(() => f({ e: this.spill(this.at(xs, at)), t: this.norm(e) }))
+		this.emit(`for (let ${at} = 0; ${at} < ${this.length(xs)}; ${at}++) {\n${body}\n}`)
+	}
+
+	/// New: a class instance, initialized, then its constructor called (5.3); or a zero object.
+	private make(t: i32) {
+		const p = this.p
+		const n = this.norm(t)
+		if (p.kind(n) == kind.Object) {
+			this.array(n, [], [])
+			return
+		}
+		if (p.kind(n) != kind.Named) {
+			throw new CompileError(`js: new ${showType(p, n)}`)
+		}
+		const ctor = p.member(p.a(n), p.intern("constructor"))
+		const r = this.instance(n, this.popN(if (ctor >= 0) p.items(p.decls[ctor].type).length else 0))
+		this.stack.push(r)
+	}
+
+	/// A new instance of class type n, initialized, then constructed of args xs.
+	private instance(n: i32, xs: V[]): V {
+		const p = this.p
+		const c = p.a(n)
+		const r: V = { e: this.spill("{}"), t: n }
+		this.emit(`${this.calls(`c:${c}`, `${this.initName(c)}(${r.e})`)};`)
+		const ctor = p.member(c, p.intern("constructor"))
+		if (ctor >= 0) {
+			const callArgs = [r.e, ...this.args(xs, p.items(p.decls[ctor].type))]
+			this.emit(`${this.calls(`d:${ctor}`, `${this.fn(ctor)}(${callArgs.join(", ")})`)};`)
+		}
+		return r
+	}
+
+	// Casts and unions.
+	/// v converted to to: Cast's conversions, checked where they may fail, and the implicit ones into a union.
+	private cast(v: V, to: i32): string {
+		const p = this.p
+		const f = v.t
+		const t = this.bare(to)
+		const fk = p.kind(f)
+		const tk = p.kind(t)
+		const called = if (tk == kind.Union && fk == kind.Func && !this.holds(t, f)) this.calledAs(f, t) else null
+		if (f == t) {
+			return v.e
+		} else if (called != null) {
+			return this.box({ e: this.spill(this.cast(v, called)), t: called }, t)
+		} else if (tk == kind.Union && isScalar(fk) && (kind.untyped(fk) || !this.holds(t, f))) {
+			const m = p.numberIn(t, fk)
+			if (m == t && !kind.untyped(fk)) {
+				this.check("false", "cast to a type that is not the value's")
+				return "null"
+			}
+			const u = if (m != t) m else if (kind.isFloat(fk)) kind.F64 else kind.I64
+			return this.box({ e: this.spill(this.cast(v, u)), t: u }, t)
+		} else if (tk == kind.Union && fk == kind.Union) {
+			return this.rebox(v, t)
+		} else if (tk == kind.Union) {
+			return this.box(v, t)
+		} else if (fk == kind.Union) {
+			// Of a member that converts to t, as a number widens or a function fitting t is called as one of fewer
+			// params, that converted; else t, checked.
+			const ms = p.members(f).filter(m => m != t && (kind.widens(m, t) || tk == kind.Func && fits(p, m, t)))
+			if (ms.length == 0) {
+				this.check(this.isa(v, t), "cast to a type that is not the value's")
+				return this.unbits(v, t)
+			}
+			this.check(this.isIn(v, [t, ...ms]), "cast to a type that is not the value's")
+			const r = this.spill("null")
+			if (this.holds(f, t)) {
+				this.emit(`if (${this.is(v, t)}) { ${r} = ${this.unbits(v, t)}; }`)
+			}
+			for (const m of ms) {
+				const set = this.nested(() => {
+					const x: V = { e: this.spill(this.unbits(v, m)), t: m }
+					this.emit(`${r} = ${this.cast(x, t)};`)
+				})
+				this.emit(`if (${this.is(v, m)}) {\n${set}\n}`)
+			}
+			return r
+		} else if (fk == kind.Func && tk == kind.Func) {
+			return this.adapt(v, t)
+		} else if (isScalar(fk) && isScalar(tk)) {
+			return this.convert(v.e, fk, tk)
+		} else if (fk == kind.Null) {
+			return "null"
+		} else if (f != t) {
+			this.check(this.isa(v, t), "cast to a type that is not the value's")
+			return "null"
+		}
+		return v.e
+	}
+
+	/// Union v as union t, checked if it may hold what t does not: as it was if held alike and no member converted,
+	/// else set per member it may hold, converted.
+	private rebox(v: V, t: i32): string {
+		const p = this.p
+		const from = if (v.t == this.any) p.members(t) else p.members(v.t)
+		const lacking = from.filter(m => !this.holds(t, m))
+		const converted = lacking.filter(m => p.members(t).some(x => kind.widens(m, x)) || this.calledAs(m, t) != null)
+		if (lacking.length > converted.length) {
+			this.check(`(${this.isa(v, t)}) || (${this.isIn(v, converted)})`, "cast to a type that is not the value's")
+		}
+		const alike = this.boxed(v.t) == this.boxed(t)
+		if (alike && converted.length == 0) {
+			return v.e
+		}
+		const kept = alike && this.boxed(t) // a ref of null or a function converted is another ref
+		const r = this.spill(if (kept) v.e else "null")
+		for (const m of if (kept) converted else from.filter(m => this.holds(t, m) || converted.includes(m))) {
+			const set = this.nested(() => {
+				const x: V = { e: this.spill(this.unbits(v, m)), t: m }
+				this.emit(`${r} = ${this.cast(x, t)};`)
+			})
+			this.emit(`if (${this.is(v, m)}) {\n${set}\n}`)
+		}
+		return r
+	}
+
+	/// v, of no union type, as union t holds it: boxed, a $B of its type's id and value, null $null; else itself.
+	private box(v: V, t: i32): string {
+		const k = this.p.kind(v.t)
+		if (!this.boxed(t)) {
+			return if (k == kind.Null) "null" else this.put(v, v.t)
+		} else if (k == kind.Null) {
+			return "$null"
+		}
+		return `new $B(${v.t}, ${this.put(v, v.t)})`
+	}
+
+	/// The value of type t union v holds.
+	private unbits(v: V, t: i32): string {
+		return if (this.p.kind(this.norm(t)) == kind.Null) "null" else if (this.boxed(v.t)) `${v.e}.v` else v.e
+	}
+
+	/// Whether union v holds a value of its member type m: by its tag if boxed, else by being null or not.
+	private is(v: V, m: i32): string {
+		return if (this.boxed(v.t)) `${v.e}.t === ${m}`
+			else if (m == kind.Null) `${v.e} === null`
+			else `${v.e} !== null`
+	}
+
+	/// Whether union u holds a value of type t: has it as a member, or is the union of any type.
+	private holds(u: i32, t: i32): bool { return u == this.any || this.p.members(u).includes(this.norm(t)) }
+
+	/// The member of union t a function of type f it lacks is called as, one of fewer params, if any.
+	private calledAs(f: i32, t: i32): i32 | null {
+		return this.p.members(t).find(m => this.p.kind(m) == kind.Func && fits(this.p, f, m))
+	}
+
+	/// Whether v's type, the type of its value if a union, is t or a member of it; a constant if v is no union.
+	private isa(v: V, t: i32): string {
+		const n = this.norm(t)
+		if (this.p.kind(v.t) != kind.Union) {
+			return if (this.p.members(n).includes(v.t)) "true" else "false"
+		}
+		return this.isIn(v, this.p.members(n))
+	}
+
+	/// Whether union v holds a value of one of the types.
+	private isIn(v: V, ts: i32[]): string {
+		const tests = ts.filter(t => this.holds(v.t, t)).map(t => `(${this.is(v, t)})`)
+		return if (tests.length == 0) "false" else tests.join(" || ")
+	}
+
+	/// Scalar x of kind fk as one of kind tk: a float to an integer saturated, an integer wrapped, a bool 0 or 1.
+	private convert(x: string, fk: i32, tk: i32): string {
+		if (fk == tk) {
+			return x
+		} else if (tk == kind.Bool) {
+			return if (isBig(fk)) `(${x} !== 0n)` else `(${x} !== 0)`
+		} else if (fk == kind.Bool) {
+			return if (isBig(tk)) `(${x} ? 1n : 0n)` else `(${x} ? 1 : 0)`
+		} else if (kind.isFloat(tk)) {
+			const v = if (isBig(fk)) `Number(${x})` else x
+			return if (tk == kind.F32) `Math.fround(${v})` else v
+		} else if (kind.isFloat(fk)) {
+			if (isBig(tk)) {
+				return if (tk == kind.I64) `$satI64(${x})` else `$satU64(${x})`
+			}
+			const w: i64 = kind.width(tk)
+			const one: i64 = 1
+			const lo = if (kind.isSigned(tk)) -(one << (w - 1)) else 0
+			const hi = if (kind.isSigned(tk)) (one << (w - 1)) - 1 else (one << w) - 1
+			return normNum(`$sat(${x}, ${lo}, ${hi})`, tk)
+		} else if (isBig(fk) && !isBig(tk)) {
+			return normNum(`Number(BigInt.asIntN(32, ${x}))`, tk)
+		} else if (!isBig(fk) && isBig(tk)) {
+			return normNum(`BigInt(${x})`, tk)
+		}
+		return normNum(x, tk)
+	}
+
+	/// Pushes comparison o of the top two values, as the first's type, or the second's if only it is a union; boxed
+	/// ones equal by type id and value.
+	private compare(o: Opcode) {
+		const p = this.p
+		const b = this.pop()
+		const a = this.pop()
+		const t = if (p.kind(b.t) == kind.Union && p.kind(a.t) != kind.Union) b.t else a.t
+		const k = p.kind(t)
+		const x = this.spill(this.cast(a, t))
+		const y = this.spill(this.cast(b, t))
+		let r = ""
+		if (k == kind.Null) {
+			r = if (o == op.Ne) "false" else "true"
+		} else if (k == kind.Union && this.boxed(t)) {
+			const eq = `(${x}.t === ${y}.t && ${x}.v === ${y}.v)`
+			r = if (o == op.Ne) `!${eq}` else eq
+		} else {
+			const sym = switch (o) {
+				case op.Eq: "==="
+				case op.Ne: "!=="
+				case op.Lt: "<"
+				case op.Gt: ">"
+				case op.Le: "<="
+				default: ">="
+			}
+			r = `(${x} ${sym} ${y})`
+		}
+		this.push(r, kind.Bool)
+	}
+
+	/// An arithmetic or bitwise op of the first's type: a string's concat, an integer's wrapped, its shift count
+	/// masked, its division by 0 a trap.
+	private arith(o: Opcode) {
+		const b = this.pop()
+		const a = this.pop()
+		const t = a.t
+		const k = this.p.kind(t)
+		const x = this.spill(this.cast(a, t))
+		const y = this.spill(this.cast(b, t))
+		if (k == kind.String) {
+			this.push(`(${x} + ${y})`, kind.String)
+			return
+		}
+		const big = isBig(k)
+		const flt = kind.isFloat(k)
+		if ((o == op.Div || o == op.Rem) && !flt) {
+			this.check(`${y} !== ${if (big) "0n" else "0"}`, "division by zero")
+		}
+		const mask = if (big) `(${y} & 63n)` else `(${y} & ${kind.width(k) - 1})`
+		const r = switch (o) {
+			case op.Add: `(${x} + ${y})`
+			case op.Sub: `(${x} - ${y})`
+			case op.Mul: if (!flt && !big) `Math.imul(${x}, ${y})` else `(${x} * ${y})`
+			case op.Div: if (flt || big) `(${x} / ${y})` else `Math.trunc(${x} / ${y})`
+			case op.Rem: `(${x} % ${y})`
+			case op.Pow: `(${x} ** ${y})`
+			case op.And: `(${x} & ${y})`
+			case op.Or: `(${x} | ${y})`
+			case op.Xor: `(${x} ^ ${y})`
+			case op.Shl: `(${x} << ${mask})`
+			default: `(${x} ${if (big || kind.isSigned(k)) ">>" else ">>>"} ${mask})`
+		}
+		this.push(normNum(r, k), t)
+	}
+
+	// Traps.
+	/// Traps with what unless cond.
+	private check(cond: string, what: string) {
+		this.emit(`if (!(${cond})) $trap(${jsStr(what)}, ${jsStr(this.path)}, ${this.pos});`)
+	}
+
+	private trap(what: string) { this.trapExpr(jsStr(what), true) }
+
+	/// Traps with the JS string what, at the op if site.
+	private trapExpr(what: string, site: bool) {
+		this.emit(`$trap(${what}, ${if (site) jsStr(this.path) else "null"}, ${if (site) this.pos else -1});`)
+		this.dead = true
+	}
+
+	// Types.
+	/// t with what is held as another type as that: a literal type as its base, a rest param's and an Embed's as
+	/// theirs.
+	private norm(t: i32): i32 {
+		const have = this.norms.get(t)
+		if (have != null) {
+			return have!
+		}
+		const k = this.p.kind(t)
+		const r = if (k == kind.Literal || k == kind.Rest || k == kind.Embed) this.norm(this.p.a(t))
+			else if (k == kind.Named) t
+			else this.p.map(t, x => this.norm(x))
+		this.norms.set(t, r)
+		return r
+	}
+
+	/// t, normalized, an optional param's as what it holds.
+	private bare(t: i32): i32 {
+		const n = this.norm(t)
+		return if (this.p.kind(n) == kind.Optional) this.norm(this.p.a(n)) else n
+	}
+
+	private kindOf(t: i32): kind.Kind { return this.p.kind(this.norm(t)) }
+
+	/// Whether union u is boxed: every union except T | null with one non-null member.
+	private boxed(u: i32): bool {
+		const ms = this.p.members(u)
+		return u == this.any || !(ms.length == 2 && ms.includes(kind.Null))
+	}
+
+	/// The fields of a class instance, object or tuple of type t.
+	private layout(t: i32): Slot[] {
+		const have = this.layouts.get(t)
+		if (have != null) {
+			return have!
+		}
+		const p = this.p
+		const k = p.kind(t)
+		const slots: Slot[] = []
+		if (k == kind.Named) {
+			for (const f of p.decls[p.a(t)].members) {
+				const d = p.decls[f]
+				if (d.kind == decl.Var && (d.mods & decl.Static) == 0) {
+					slots.push({ name: d.name, t: p.subst(d.type, p.b(t)), embed: (d.mods & decl.Embed) != 0,
+						mixin: (d.mods & decl.Mixin) != 0, decl: f })
+				}
+			}
+		} else if (k == kind.Object || k == kind.Tuple) {
+			const ts = p.lists[p.a(t)]
+			for (const i of 0 ... ts.length - 1) {
+				const object = k == kind.Object
+				const mods = if (object) p.names[p.b(t)][2 * i + 1] else 0
+				const name = if (object) p.names[p.b(t)][2 * i] else p.elementName(i)
+				slots.push({ name: name, t: ts[i], embed: (mods & decl.Embed) != 0, mixin: false, decl: -1 })
+			}
+		} else {
+			throw new CompileError(`js: fields of ${showType(p, t)}`)
+		}
+		this.layouts.set(t, slots)
+		return slots
+	}
+
+	/// The zero value of t (spec 5.1).
+	private zero(t: i32): string {
+		const p = this.p
+		const n = this.bare(t)
+		const k = p.kind(n)
+		if (k == kind.String) {
+			return `""`
+		} else if (k == kind.Bool) {
+			return "false"
+		} else if (k == kind.Null) {
+			return "null"
+		} else if (isBig(k)) {
+			return "0n"
+		} else if (kind.isInt(k) || kind.isFloat(k)) {
+			return "0"
+		} else if (k == kind.Union) {
+			const m = if (this.holds(n, kind.Null)) kind.Null else p.members(n)[0]
+			return if (!this.boxed(n)) (if (m == kind.Null) "null" else this.zero(m))
+				else if (m == kind.Null) "$null"
+				else `new $B(${m}, ${this.zero(m)})`
+		} else if (k == kind.Tuple || k == kind.Object) {
+			return this.blank(n)
+		} else if (k == kind.FixedArray) {
+			return `Array.from({ length: ${p.b(n)} }, () => ${this.zero(p.a(n))})`
+		}
+		return "null"
+	}
+}
+
+/// What the module starts with: $B, a box of a union, $null, null's, $cl, a closure of its code and env, and the checks
+/// and conversions the code calls.
+const prelude = `let $h;
+class $B { constructor(t, v) { this.t = t; this.v = v; } }
+const $null = new $B(${kind.Null}, null);
+const $cl = (f, e) => Object.assign(f.bind(null, e), { $e: e });
+const $trap = (w, f, p) => $h.trap(w, f, p);
+const $idx = (i, n, f, p) => { if (i < 0 || i >= n) $trap("index out of range", f, p); return i; };
+const $bytes = a => { let s = ""; for (let i = 0; i < a.length; i++) s += String.fromCharCode(a[i]); return s; };
+const $buf = new ArrayBuffer(8), $dv = new DataView($buf);
+const $bits32 = x => ($dv.setFloat32(0, x, true), BigInt($dv.getUint32(0, true)));
+const $bits64 = x => ($dv.setFloat64(0, x, true), $dv.getBigUint64(0, true));
+const $fromBits32 = b => ($dv.setUint32(0, Number(BigInt.asUintN(32, b)), true), $dv.getFloat32(0, true));
+const $fromBits64 = b => ($dv.setBigUint64(0, BigInt.asUintN(64, b), true), $dv.getFloat64(0, true));
+const $sat = (x, lo, hi) => x !== x ? 0 : x <= lo ? lo : x >= hi ? hi : Math.trunc(x);
+const $satI64 = x => x !== x ? 0n : x <= -9223372036854775808 ? -9223372036854775808n
+	: x >= 9223372036854775808 ? 9223372036854775807n : BigInt(Math.trunc(x));
+const $satU64 = x => x !== x || x <= 0 ? 0n
+	: x >= 18446744073709551616 ? 18446744073709551615n : BigInt(Math.trunc(x));`
+
+/// The statement head, as `if (c)`, of the block of body.
+function braced(head: string, body: string[]): string { return `${head} {\n${body.join("\n")}\n}` }
+/// Whether kind k is a number or bool.
+function isScalar(k: i32): bool { return kind.isInt(k) || kind.isFloat(k) || k == kind.Bool }
+/// Whether kind k is held as a BigInt.
+function isBig(k: i32): bool { return k == kind.I64 || k == kind.U64 || k == kind.Int || k == kind.Type }
+
+/// The names of n params, _p0 on, after first.
+function pnames(n: i32, first: string[] = []): string[] {
+	const r = [...first]
+	for (const i of 0 ... n - 1) {
+		r.push(`_p${i}`)
+	}
+	return r
+}
+
+/// The host's result expr as a value of kind k: a bool a boolean, a narrow number normalized.
+function wrapHost(expr: string, k: i32): string {
+	return if (k == kind.Bool) `Boolean(${expr})` else if (kind.isInt(k) || k == kind.F32) normNum(expr, k) else expr
+}
+
+/// Number x as kind k holds it: an integer wrapped to its width, an f32 rounded.
+function normNum(x: string, k: i32): string {
+	return switch (k) {
+		case kind.I8: `((${x}) << 24 >> 24)`
+		case kind.U8: `((${x}) & 255)`
+		case kind.I16: `((${x}) << 16 >> 16)`
+		case kind.U16: `((${x}) & 65535)`
+		case kind.I32: `((${x}) | 0)`
+		case kind.U32: `((${x}) >>> 0)`
+		case kind.I64, kind.Int: `BigInt.asIntN(64, ${x})`
+		case kind.U64: `BigInt.asUintN(64, ${x})`
+		case kind.F32: `Math.fround(${x})`
+		default: x
+	}
+}
+
+/// Integer constant v as a literal of kind k.
+function jsInt(v: i64, k: i32): string {
+	return switch (k) {
+		case kind.I8: `(${v as i8})`
+		case kind.U8: `${v as u8}`
+		case kind.I16: `(${v as i16})`
+		case kind.U16: `${v as u16}`
+		case kind.I32: `(${v as i32})`
+		case kind.U32: `${v as u32}`
+		case kind.I64, kind.Int: `(${v}n)`
+		case kind.U64: `${v as u64}n`
+		case kind.F32: `Math.fround(${formatFloat(v as f64)})`
+		default: `(${formatFloat(v as f64)})`
+	}
+}
+
+/// The float of bits as a literal, an f32's rounded.
+function jsFloat(bits: i64, f32: bool): string {
+	const u = bits as u64
+	if (u == 0x8000000000000000) {
+		return "(-0)"
+	}
+	const f = fromBits[f64](u)
+	const s = if (f != f) "NaN"
+		else if (f - f != 0.0) (if (f < 0.0) "(-Infinity)" else "Infinity")
+		else `(${formatFloat(f)})`
+	return if (f32) `Math.fround(${s})` else s
+}
+
+const hexDigits = "0123456789abcdef"
+
+/// s as a 7-bit ASCII JS string literal whose UTF-16 units equal s's bytes (Latin-1).
+function jsStr(s: string): string {
+	const out = [`"`]
+	for (const i of 0 ... s.length - 1) {
+		const b = s[i]
+		if (b == 0x22) {
+			out.push(`\\"`)
+		} else if (b == 0x5c) {
+			out.push(`\\\\`)
+		} else if (b < 0x20 || b >= 0x7f) {
+			out.push(`\\x${chr(hexDigits[(b >> 4) as i32])}${chr(hexDigits[(b & 15) as i32])}`)
+		} else {
+			out.push(chr(b))
+		}
+	}
+	out.push(`"`)
+	return out.join("")
+}

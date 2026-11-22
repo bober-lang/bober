@@ -1,0 +1,31 @@
+//! Tests of src/js.bob: test files compiled to JavaScript, their tests run where there is node.
+
+import { run } from "../std/process"
+import { Compile, build } from "./bober"
+import { dir } from "./pkg"
+
+/// Whether there is a node to run the modules.
+function node(): bool {
+	try {
+		return run(["node", "-v"]) == 0
+	} catch (e: IoError) {
+		return false
+	}
+}
+
+test "a test file compiles to a module whose tests pass where there is node" {
+	const f = new Compile()
+	f.js = true
+	const runs = node()
+	for (const name of ["arrays", "async", "check", "classes", "control", "exceptions", "functions", "init", "lexing",
+		"modes", "modules", "numbers", "objects", "strings", "tags", "unions"]) {
+		test `${name}` {
+			const cmd = build(`tests/${name}.bob`, true, f, false)
+			assert !runs || run(cmd, `${dir}/${name}.js.out`) == 0
+		}
+	}
+	test "std/collections/hashmap.test.bob" {
+		const cmd = build("std/collections/hashmap.test.bob", true, f, false)
+		assert !runs || run(cmd, `${dir}/hashmap.js.out`) == 0
+	}
+}

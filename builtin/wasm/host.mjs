@@ -1,11 +1,14 @@
-// What src/rt.c is natively for a module of src/wasm.bob, run by node: `node --experimental-wasm-jspi host.mjs x.wasm
-// args…`, x.test.wasm its tests, its fibers parking by JS Promise Integration. It gives the module's imports; one it
-// lacks traps with its name. Strings cross as their bytes, one char each.
+// What src/rt.c is natively for a module of src/wasm.bob or src/js.bob, run by node: `node --experimental-wasm-jspi
+// host.mjs x.wasm args…` or `node host.mjs x.mjs args…`, x.test.{wasm,mjs} its tests, its fibers parking by JSPI or
+// JS async/await. It gives the module's imports; one it lacks traps with its name. Strings cross as Latin-1 bytes.
 
 import { readFileSync, writeFileSync, writeSync } from "node:fs"
+import { resolve } from "node:path"
+import { pathToFileURL } from "node:url"
 
 const [file, ...args] = process.argv.slice(2)
-const tests = file.endsWith(".test.wasm")
+const js = file.endsWith(".mjs")
+const tests = /\.test\.(wasm|mjs)$/.test(file)
 // In tests, now starts when Obergefell v. Hodges made same-sex marriage a right in all of the US, and random is seeded
 // with the day Stonewall began.
 const OBERGEFELL = 1435327200000000000n
@@ -13,13 +16,13 @@ const STONEWALL = 0x19690628n
 let seed = tests ? STONEWALL : BigInt(Date.now()) ^ BigInt(Math.floor(Math.random() * 2 ** 52))
 let ex // the module's exports
 
-const str = s => {
+const str = js ? s => s : s => {
 	if (s == null) return null
 	let r = ""
 	for (let i = 0, n = ex.strLen(s); i < n; i++) r += String.fromCharCode(ex.strAt(s, i))
 	return r
 }
-const make = s => {
+const make = js ? s => s : s => {
 	const r = ex.strNew(s.length)
 	for (let i = 0; i < s.length; i++) ex.strSet(r, i, s.charCodeAt(i))
 	return r
@@ -64,14 +67,14 @@ const trap = (what, file, at) => {
 /// What e, which code threw, prints: a trap's message, or of a throw not caught.
 const failure = e => {
 	if (e instanceof Trap) return e.message
-	if (e instanceof WebAssembly.Exception && e.is(ex.bober)) {
-		const box = e.getArg(ex.bober, 0)
+	const box = !js && e instanceof WebAssembly.Exception && e.is(ex.bober) ? e.getArg(ex.bober, 0) : e
+	if (sites.has(box)) {
 		const [show, ...site] = sites.get(box)
 		return trapped(`uncaught throw: ${str(show(box))}`, ...site)
 	}
 	// Of the engine: a stack overflow, else what checks bober's code does not make, as of a null.
 	if (e instanceof RangeError && /call stack/.test(e.message)) return trapped("stack overflow", null, -1)
-	if (e instanceof WebAssembly.RuntimeError) return trapped(e.message, null, -1)
+	if (e instanceof WebAssembly.RuntimeError || js && e instanceof TypeError) return trapped(e.message, null, -1)
 	throw e
 }
 
@@ -128,8 +131,9 @@ const run = async (name, f) => {
 // runs start, and each test and subtest as a call of its own.
 let fibers, running, ready
 let made = 0n
+let epoch = 0
 let call // the module's call of a closure () => null, which gives a promise
-const suspending = f => new WebAssembly.Suspending(f)
+const suspending = f => js ? f : new WebAssembly.Suspending(f)
 
 /// A promise that resolves once the running fiber, which parks, runs again.
 const resumed = () => new Promise(r => { running.resume = r })
@@ -196,6 +200,7 @@ const fail = e => depth > 0 ? level.fail(e) : (write(2, `${failure(e)}\n`), proc
 
 /// Drops every fiber but the first, which runs again, as once a test trapped.
 const reset = () => {
+	epoch++
 	running = { id: 0n }
 	fibers = new Map([[0n, running]])
 	ready = []
@@ -211,7 +216,7 @@ const host = {
 		testFile = str(file)
 		testAt = -1
 		if (!all.kids) write(1, "{")
-		await run(str(name), WebAssembly.promising(f))
+		await run(str(name), js ? () => call(f) : WebAssembly.promising(f))
 		cap = ""
 	}),
 	subtest: suspending((name, f) => run(str(name), () => call(f))),
@@ -244,15 +249,18 @@ const host = {
 	id: (() => {
 		const ids = new WeakMap()
 		let next = 1n
-		return x => typeof x == "object" && x != null ? ids.get(x) ?? (ids.set(x, next), next++) : BigInt(x ?? 0)
+		return x => (typeof x == "object" && x != null) || typeof x == "function"
+			? ids.get(x) ?? (ids.set(x, next), next++) : BigInt(x ?? 0)
 	})(),
 	bober_fiber: suspending(f => {
 		const p = resumed()
 		ready.unshift(running)
 		running.queued = true
 		const id = ++made
+		const e = epoch
 		fibers.set(id, running = { id })
-		call(f).then(() => (fibers.delete(id), next())).catch(fail)
+		call(f).then(() => { if (epoch === e) { fibers.delete(id); next() } })
+			.catch(err => { if (epoch === e) fail(err) })
 		return p
 	}),
 	bober_self: () => running.id,
@@ -271,8 +279,15 @@ const host = {
 	pow: Math.pow,
 }
 
-const imports = new Proxy(host, { get: (h, name) => h[name] ?? (() => trap(`${String(name)}: not on WebAssembly`, null, -1)) })
-const { instance } = await WebAssembly.instantiate(readFileSync(file), { bober: imports })
-ex = instance.exports
-call = WebAssembly.promising(ex.call)
-WebAssembly.promising(ex.start)().then(r => { process.exitCode = r }, fail)
+const target = js ? "JavaScript" : "WebAssembly"
+const imports = new Proxy(host, { get: (h, name) => h[name] ?? (() => trap(`${String(name)}: not on ${target}`, null, -1)) })
+if (js) {
+	call = async f => f()
+	const mod = await import(pathToFileURL(resolve(file)).href)
+	mod.start(imports).then(r => { process.exitCode = r }, fail)
+} else {
+	const { instance } = await WebAssembly.instantiate(readFileSync(file), { bober: imports })
+	ex = instance.exports
+	call = WebAssembly.promising(ex.call)
+	WebAssembly.promising(ex.start)().then(r => { process.exitCode = r }, fail)
+}

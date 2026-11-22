@@ -1,0 +1,85 @@
+//! builtin/string.bob for JavaScript (src/js.bob), where a string is a Latin-1 JS string: one code unit per UTF-8 byte,
+//! so length, indexing, +, ==, < and slice match Bober's byte semantics natively.
+
+import { trap } from "./mem"
+
+/// Intrinsics implemented inline by src/js.bob.
+function jsSlice(s: string, from: i32, to: i32): string
+/// The string of the code unit c.
+function jsChr(c: u8): string
+/// The string of the bytes, copied.
+function jsBytes(bytes: u8[]): string
+/// n in decimal.
+function jsShowUint(n: u64): string
+
+/// The methods of a string, which is this.
+export class String {
+	/// How many code units it has.
+	readonly length: i32
+
+	/// The code unit at i, or null outside the string.
+	at(i: i32): u8 | null { return if (i >= 0 && i < this.length) this[i] else null }
+
+	/// Whether f holds for a code unit.
+	some(f: (x: u8) => bool): bool {
+		for (const i of 0 ... this.length - 1) {
+			if (f(this[i])) {
+				return true
+			}
+		}
+		return false
+	}
+
+	/// Whether f holds for each code unit.
+	every(f: (x: u8) => bool): bool { return !this.some(x => !f(x)) }
+	/// It, as JS strings are immutable.
+	copy(): string { return this }
+
+	/// The code units from from up to to.
+	slice(from: i32, to: i32): string {
+		if (from < 0 || from > to || to > this.length) {
+			trap("slice out of range")
+		}
+		return jsSlice(this, from, to)
+	}
+}
+
+/// Below, at or above 0 as a is before, equal to or after b, by code units.
+export function strCompare(a: string, b: string): i32 { return if (a < b) -1 else if (a > b) 1 else 0 }
+
+/// Word i, 0 or 1, of s as a short string holds it natively (builtin/string.bob): of one of up to 15 bytes its length,
+/// then its bytes, 8 to a word, little-endian; of a longer one 0xff.
+export function strWord(s: string, i: u64): u64 {
+	if (s.length > 15) {
+		return 0xff
+	}
+	let w: u64 = 0
+	for (const b of 0 ... 7) {
+		const j = 8 * (i as i32) + b
+		const x: u64 = if (j == 0) s.length as u64 else if (j <= s.length) s[j - 1] as u64 else 0
+		w |= x << 8 * b
+	}
+	return w
+}
+
+/// The string of the code unit c.
+export function chr(c: u8): string { return jsChr(c) }
+
+/// The string of the bytes, copied; there are no addresses.
+export function fromBytes(bytes: u8[] | u64, n: u64 = 0): string {
+	if (bytes instanceof u64) {
+		trap("fromBytes of an address")
+	}
+	return jsBytes(bytes as u8[])
+}
+
+/// n in decimal.
+export function showUint(n: u64): string { return jsShowUint(n) }
+/// Traps, as the host lacks it: there are no addresses.
+export function lenAt(p: u64): i64
+/// Traps, as lenAt.
+export function bytesAt(p: u64): u64
+/// Traps, as lenAt.
+export function copy(p: u64, n: i64): string
+/// Traps, as the host lacks it: no file is mapped.
+export function mapped(fd: i32, n: i64): string | i64
