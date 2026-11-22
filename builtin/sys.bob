@@ -27,8 +27,19 @@ function checked(r: i64, op: string, what: string): i64 throws IoError {
 const chunk: i32 = 1 << 16
 
 // What reads of up to chunk bytes share: one writes it only in the call of the run time's, which never parks, and
-// copies what came before it returns.
-let scratch = new u8[](chunk)
+// copies what came before it returns. Made by the first, as a const's initializer may read, before lets are (§3).
+let scratch: u8[] | null = null
+
+/// What a read of up to n bytes reads into.
+function buffer(n: i32): u8[] {
+	if (n > chunk) {
+		return new u8[](n)
+	}
+	if (scratch == null) {
+		scratch = new u8[](chunk)
+	}
+	return scratch!
+}
 
 /// An open file or socket. A call that can wait parks its fiber alone, until by, a monotonic() time, 0 for no limit,
 /// then throws TimedOut; once the handle is closed, a call throws BadResource.
@@ -75,7 +86,7 @@ export class Handle {
 
 	/// Up to n > 0 bytes, or null at the end or once close interrupts the read.
 	read(n: i32, by: i64 = 0): string | null throws IoError {
-		const buf = if (n <= chunk) scratch else new u8[](n)
+		const buf = buffer(n)
 		const got = this.waited(false, by, "read", () => bober_io_read(this.fd, buf, n as u64)) as i32
 		return if (got == 0) null else fromBytes(buf.slice(0, got))
 	}
@@ -96,7 +107,7 @@ export class Handle {
 
 	/// The next datagram, cut to n bytes, and its sender's host and port.
 	receive(n: i32, by: i64 = 0): [string, string, u16] throws IoError {
-		const buf = if (n <= chunk) scratch else new u8[](n)
+		const buf = buffer(n)
 		const host = new u8[](BOBER_IO_HOST)
 		const port = new i32[](1)
 		const got = this.waited(false, by, "receive",

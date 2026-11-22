@@ -4,7 +4,7 @@
 //! or their address if it is null.
 
 import { elements } from "./array"
-import { Ref, addr, alloc, deref, get, load, memcmp, memcpy, set, store, trap } from "./mem"
+import { Ref, addr, deref, get, load, memcmp, memcpy, set, store, strbuf, trap } from "./mem"
 import { BOBER_PAGE, bober_io_map } from "../src/rt.h"
 
 /// The methods of a string, which is this.
@@ -186,7 +186,7 @@ export function reserve(a: string, n: i64, twice: bool): string {
 		return a
 	}
 	const c = if (twice || r >= 0) 2 * (an + n) + 16 else an + n
-	const buf = alloc[u8](16 + c)
+	const buf = strbuf(16 + c)
 	const q = deref(buf)
 	store[i64](q, c)
 	store[i64](q + 8, an)
@@ -208,7 +208,8 @@ function after(a: string): i64 {
 		else 16 + get[i64, Ref](buf, 0) - get[i64, string](a, 8) - (get[i64, string](a, 0) >> 8)
 }
 
-/// Whether a, which has a buffer, ends where that is used up to, so that the bytes after it are free.
+/// Whether a, which has a buffer, ends where that is used up to, so that the bytes after it are free, which no frozen
+/// buffer is (src/gc.c).
 function last(a: string): bool {
 	return get[u64, string](a, 8) + (get[u64, string](a, 0) >> 8) == 16 + get[u64, Ref](get[Ref, string](a, 16), 8)
 }
@@ -216,7 +217,7 @@ function last(a: string): bool {
 /// A buffer as concat's for n bytes, all used, for the caller to put at 16 on. Every long string's buffer is one,
 /// lest concat take the first 16 of its bytes for a capacity and use with room to append in place.
 function full(n: i64): Ref {
-	const buf = alloc[u8](16 + n)
+	const buf = strbuf(16 + n)
 	store[i64](deref(buf), n)
 	store[i64](deref(buf) + 8, n)
 	return buf

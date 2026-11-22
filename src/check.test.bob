@@ -341,6 +341,17 @@ test "async takes a call, and await an async" {
 		== "50: cannot spread i32; 85: expected an async, got i32"
 }
 
+test "spawn takes a call to a top-level function" {
+	const lib = "export function g(x: i32): i32 { return x }"
+	assert errors("import * as m from \"lib\"\nfunction f[T](x: T): T { return x }\n"
+		+ "function ok(): async i32 { const a = spawn m.g(1); return spawn f(2) }", ["lib.bob", lib]) == ""
+	assert errors("function f(): i32 { return 1 }\nconst a = spawn 1") == "47: expected a call after spawn"
+	const top = "spawn expects a top-level function"
+	assert errors("class C { m(): i32 { return 1 }; static s(): i32 { return 2 } }\nfunction bad(c: C) {\n"
+		+ "\tconst f = () => 1\n\tfunction inner(): i32 { return 1 }\n\tconst a = spawn c.m()\n"
+		+ "\tconst b = spawn C.s()\n\tconst d = spawn f()\n\tconst e = spawn inner()\n}") == `157: ${top}; 180: ${top}; 203: ${top}; 224: ${top}`
+}
+
 test "classes and interfaces" {
 	assert errors("interface Shape {\n\tname: string\n\n\tarea(): f64\n}\n\nclass Square implements Shape {\n\tname = \"square\"\n\tside = 1.0\n\n\tarea(): f64 { return this.side * this.side }\n}\n\nconst s: Shape = new Square()")
 		== ""
@@ -988,4 +999,15 @@ test "an import tagged @TypeScript declares the names of TypeScript typings, but
 		== "18: cannot read p.d.ts.bob; 30: an import's one tag is @Deterministic, of a C import, or @TypeScript, of another"
 	assert errors("import { N } from \"x.h\" @TypeScript @Deterministic", ["x.h", "#define N 1\n"])
 		== "25: an import's one tag is @Deterministic, of a C import, or @TypeScript, of another"
+}
+
+test "spawn takes args and a result of types that cross isolates" {
+	const decls = "class P { x = 0; s = \"\"; m(): i32 { return 1 } }\nclass H { p = new P() }\n"
+		+ "class E { p: ...P; xs: i32[4] = [1, 2, 3, 4] }\n"
+		+ "function f(a: P, b: i32[], c: string[], d: [i32, string], e: E, g: (i32 | null)[]): P { return a }\n"
+		+ "function g(a: P[]): i32 { return 1 }\nfunction h(a: H): i32 { return 1 }\nfunction r(): i32[][] { return [] }\n"
+	assert errors(decls + "function m() { const a = spawn f(new P(), [1], [\"\"], [1, \"\"], new E(), [null]) }") == ""
+	assert errors(decls + "function m() { const a = spawn g([new P()]) }\nfunction n() { const a = spawn h(new H()) }\n"
+		+ "function o() { const a = spawn r() }") == "360: P[] cannot cross isolates; 406: H cannot cross isolates; 448: i32[][] cannot cross isolates"
+	assert errors("function k(a: (i32[2] | null)[]): i32 { return 1 }\nfunction m() { const a = spawn k([null]) }") == "84: (i32[2] | null)[] cannot cross isolates"
 }

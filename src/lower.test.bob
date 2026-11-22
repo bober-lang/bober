@@ -766,8 +766,22 @@ End
 `
 }
 
-test "spawn is not lowered" {
-	assert lowered("function g(): null {\n\tconst h = spawn g()\n}") throws new CompileError("main.bob:2:12: unsupported: spawn")
+test "spawn lowers to Spawn and start" {
+	const out = lowered("function g(n: i32): i32 { return n }\nfunction main() {\n\tconst h = spawn g(1)\n}")
+	assert out == `module main.bob [g, main] inits [] deps [builtin/fiber.bob]
+function g: (i32) => i32
+	locals n: i32
+	Local 0
+	Return
+End
+function main: () => null
+	locals readonly h: Future[i32]
+	Int i32 1
+	Spawn g
+	Call start [i32]
+	SetLocal 0
+End
+`
 }
 
 test "a rest of a tuple with a rest is not lowered" {

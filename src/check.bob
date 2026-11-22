@@ -32,7 +32,7 @@ let first = ["array", "string", "type", "c", "tag", "error", "io"].map(builtinPa
 
 /// The exports of first that every module sees without importing them.
 const prelude = ["print", "readFile", "writeFile", "args", "targetOs", "targetArch", "now", "random", "idOf", "chr",
-	"fromBytes", "fromC", "Deprecated", "Experimental", "Type", "IoError", "void"]
+	"fromBytes", "fromC", "Deprecated", "Experimental", "Type", "IoError", "Trap", "void"]
 
 /// The constructs a doc comment documents.
 const documented: Syntax[] = ["test", "var", "function", "class", "type", "method", "prop", "param", "typeParam"]
@@ -87,7 +87,7 @@ function nameOf(t: Type): string | null {
 }
 
 /// The names of the classes, interfaces and type params declared, as show writes them.
-const names = new HashMap[Type, string, ById]()
+let names = new HashMap[Type, string, ById]()
 
 /// What is known of each member of a class, interface or namespace beyond its type, by its id and about's key.
 let info = new HashMap[i32, HashMap[string, Member]]()
@@ -98,13 +98,13 @@ let filling = 0
 let deferred: (() => void)[] = []
 
 /// The classes of builtin/tag.bob, by name.
-const tagTypes = new HashMap[string, Type]()
+let tagTypes = new HashMap[string, Type]()
 
 /// builtin/type.bob's Type, of any type as a value (4.11).
 let Meta = Empty
 
 /// builtin/'s classes and interfaces, by path and name, made once for every program.
-const builtins = new HashMap[string, Type]()
+let builtins = new HashMap[string, Type]()
 
 /// Class or interface name of the module at path, new, of the type params ps makes; builtin/'s made once for every
 /// program, and then filled anew each check that checks or links them, as fill also records the members' info.
@@ -3401,6 +3401,9 @@ class Checker {
 				this.deferred = x
 				const r = this.expr(x, null)
 				this.deferred = deferred
+				if (op == "spawn") {
+					this.crossing(x, r)
+				}
 				return Type.async(r)
 			case "...":
 				const t = this.expr(x, want)
@@ -3430,10 +3433,12 @@ class Checker {
 	/// The fibers of an isolate take turns: one runs until it suspends.
 	///
 	/// `spawn f(args)` is `async f(args)` run as the initial function of a new isolate (§3); `f` shall name a top-level
-	/// function. Its arguments, result and thrown value cross isolates: frozen data is shared; a value that holds no
-	/// reference but strings is copied, as is a `T[]`, tuple, object or class instance whose elements or members hold
-	/// none. Anything else traps the isolate it leaves. Spawning before the first isolate's initial function starts
-	/// traps.
+	/// function. Its arguments, result and thrown value cross isolates, copied one level deep: a value held in place
+	/// (§5.3) that holds no reference but strings, a `T[]` of such, or a tuple, object or class instance whose members
+	/// are such; a reference to frozen data is kept, not copied. A parameter or result of another type is an error: the
+	/// callee reads the frozen consts it needs itself. A value whose type does not tell, as an interface, function or
+	/// type param, and a thrown one, are checked as they cross: one that cannot traps the isolate it leaves. Spawning
+	/// before the first isolate's initial function starts traps.
 	///
 	/// ```
 	/// const job = async load(a)      // async T
@@ -3449,7 +3454,7 @@ class Checker {
 	/// const [i, v] = await ...[async load(a), async parse(b)]   // [i32, T | U]
 	///
 	/// const x = spawn work(new Point())   // the Point is copied
-	/// const y = spawn work(points)        // traps: a Point[] is neither copied nor frozen
+	/// const y = spawn sum(points)         // error: a Point[] holds references to Points
 	/// ```
 	private awaited(t: Type, p: Node): Type {
 		if (t.kind != "async") {
@@ -4112,6 +4117,38 @@ class Checker {
 		return callee.kind == "member" && callee.parts![0].type!.kind == "array"
 			&& this.text(callee.parts![1].t) == "push" && args.length == 1 && args[0].kind == "unary"
 			&& args[0].t.kind == "..."
+	}
+
+	/// Checks that spawn call x is of a top-level function whose args and result r cross isolates (§6.10).
+	private crossing(x: Node, r: Type) {
+		const callee = x.parts![0]
+		if (!this.topFunction(callee)) {
+			throw this.error(start(callee), "spawn expects a top-level function")
+		}
+		const ps = callee.type!.types
+		for (const i of 0 ... ps.length - 1) {
+			if (!crosses(ps[i])) {
+				const at = if (i + 1 < x.parts!.length) x.parts![i + 1] else callee
+				throw this.error(start(at), `${show(ps[i])} cannot cross isolates`)
+			}
+		}
+		if (!crosses(r)) {
+			throw this.error(start(callee), `${show(r)} cannot cross isolates`)
+		}
+	}
+
+	/// Whether callee names a top-level function, which spawn requires (§6.10).
+	private topFunction(callee: Node): bool {
+		const c = if (callee.kind == "index" && callee.parts![0].type?.kind == "function") callee.parts![0] else callee
+		const space = this.namespace(c)
+		if (space != null) {
+			return space.exports!.get(this.text(c.parts![1].t))?.decl?.kind == "function"
+		}
+		if (!isTok(c, "ident")) {
+			return false
+		}
+		const name = this.text(c.t)
+		return this.locals.get(name) == null && (this.top.get(name) ?? this.prelude.get(name))?.decl?.kind == "function"
 	}
 
 	/// The errors of callee where it names a top-level function or a method, else null: a function value's are unchecked.
@@ -4909,6 +4946,34 @@ function embedding(t: Type): Type {
 	return Type.object(fields(t).filter(f => f.type.kind != "function").map(f => new Field(f.name, f.type)))
 }
 
+/// Whether a value of t crosses isolates as spawn copies it (§6.10): a value held in place, an array of such, or a class,
+/// tuple or object of such members, or a union of these; or t does not tell, as an interface, a function or a type param.
+function crosses(t: Type): bool {
+	return switch (t.kind) {
+		case "array": held(t.params[0])
+		case "class", "tuple", "object": whole(t)
+		case "union": t.types.every(crosses)
+		case "async": false
+		default: true
+	}
+}
+
+/// Whether the members of class, tuple or object t, but its methods, are held in place, those embedded too.
+function whole(t: Type): bool {
+	return if (t.kind == "tuple") t.types.every(held)
+		else fields(t).every(f => about(t, f.name).method || (if (f.embedded) whole(f.type) else held(f.type)))
+}
+
+/// Whether a value of t is held in place and holds no ref but a string's.
+function held(t: Type): bool {
+	return switch (t.kind) {
+		case "null", "bool", "int", "float", "string", "literal": true
+		case "fixed": if (t.base!.kind == "class") whole(t.base!) else held(t.base!)
+		case "union": t.types.every(m => m.kind != "fixed" && held(m))  // a fixed one there is boxed
+		default: false
+	}
+}
+
 /// The class that declares member k, or static member k, of class c: c or one it embeds (5.3), else null.
 export function declarer(c: Type, k: string, static: bool): Type | null {
 	const fs = if (c.kind == "class") members(c) else []
@@ -5363,7 +5428,7 @@ function aim(want: Type | null, kinds: TypeKind[]): Type | null {
 /// found yet.
 let visited = 0
 
-const pending: Decl[] = []
+let pending: Decl[] = []
 
 /// Finds the strongly connected uses of d and of all it uses (Tarjan's), each marked as it is found with whether they
 /// loop and whether they reach a let, which those of what uses them then rest on.

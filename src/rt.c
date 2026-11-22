@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -37,21 +38,24 @@ typedef struct {
   void *show;
 } Thrown;
 /// The exception bober_personality last landed with, for bober_caught.
-static Thrown *caught;
+static _Thread_local Thrown *caught;
+/// Where the last throw was, for bober_uncaught: as nothing caught it, caught is not it.
+static _Thread_local const char *thrown_file;
+static _Thread_local int32_t thrown_at;
 
 static int argc_;
 static char **argv_;
 static bool tests;
-static uint64_t seed;  // random's state
+static _Thread_local uint64_t seed;  // random's state
 
 // In tests, now starts when Obergefell v. Hodges made same-sex marriage a right in all of the US, and random is seeded
 // with the day Stonewall began.
 #define OBERGEFELL 1435327200000000000
 #define STONEWALL 0x19690628
 
-static jmp_buf *test;          // where a trap in the running test or subtest goes, null outside one
-static const char *testFile;  // the running test's source
-static int32_t testAt;        // where in it the statement running is, -1 before the first
+static _Thread_local sigjmp_buf *trap_jmp;  // where a trap in a test or an isolate goes, null on main outside tests
+static _Thread_local const char *testFile;  // the running test's source
+static _Thread_local int32_t testAt;        // where in it the statement running is, -1 before the first
 static int cap = -1, saved[2] = {1, 2};  // in tests, the file the output and errors go to, and where they went
 static const char *tmp;  // in tests, the directory in which each gets one of its own, by number, if any: BOBER_TMP
 /// What src/io.c knows of the tests: the running one's directory, the files they read and whether they are tainted.
@@ -61,9 +65,21 @@ extern int bober_tainted;
 /// Reserves the heap (src/gc.c), before any code runs that may store to it; at is the frame pointer of the program's
 /// entry, whose frames the collector walks up to.
 void bober_gc_start(void **at);
+void bober_fibers_init(void);
 /// Drops every fiber but the first (src/fiber.c), as once a trap jumped back to it.
 void bober_fibers_reset(void);
-static char msg[4096];
+static _Thread_local char msg[4096];
+static _Thread_local bool in_init;
+static void (*lets_init)(void);
+
+/// Runs the top-level lets' initializers, this isolate's own.
+static void init_lets(void) {
+  in_init = true;
+  lets_init();
+  in_init = false;
+}
+
+void bober_set_lets_init(void (*fn)(void)) { lets_init = fn, init_lets(); }
 
 void *bober_malloc(uint64_t n) { return bober_realloc(0, n); }
 
@@ -98,7 +114,7 @@ static void position(const char *file, int32_t at, int *line, int *col) {
 _Noreturn void bober_trap(const char *what, const char *file, int32_t at) {
   int line, col, testLine, testCol;
   position(file, at, &line, &col);
-  position(testFile, test ? testAt : -1, &testLine, &testCol);
+  position(testFile, trap_jmp ? testAt : -1, &testLine, &testCol);
   char called[512] = "";  // the test's statement running, noted on what's first line if the trap is not on its line
   if (testLine && (!file || strcmp(file, testFile) || line != testLine))
     snprintf(called, sizeof called, " (called at %s:%d)", testFile, testLine);
@@ -106,7 +122,7 @@ _Noreturn void bober_trap(const char *what, const char *file, int32_t at) {
           : file ? snprintf(msg, sizeof msg, "%s: ", file) : 0;
   int first = strcspn(what, "\n");
   snprintf(msg + n, sizeof msg - n, "trap: %.*s%s%s", first, what, called, what + first);
-  if (test) longjmp(*test, 1);
+  if (trap_jmp) siglongjmp(*trap_jmp, 1);
   put(saved[1], msg, strlen(msg)), put(saved[1], "\n", 1);
   exit(1);
 }
@@ -121,8 +137,9 @@ _Noreturn void bober_trap(const char *what, const char *file, int32_t at) {
 #define SP(c) (c)->uc_mcontext.gregs[REG_RSP]
 #endif
 
-/// Ends the process as an uncaught trap on a fault by a frame stepping off the end of its stack, onto the guard below,
-/// which may be in the C library holding its state; any other fault ends it as it would have without.
+/// Traps on a write to a frozen value; ends the process as an uncaught trap on a fault by a frame stepping off the end
+/// of its stack, onto the guard below, which may be in the C library holding its state; any other fault ends it as it
+/// would have without.
 /// Gives fault a stack of its own, as the faulting one is full, anew in a forked child, which macOS gives none.
 static void altStack(void) {
   static char alt[1 << 16];
@@ -131,6 +148,13 @@ static void altStack(void) {
 
 static void fault(int sig, siginfo_t *info, void *c) {
   uintptr_t sp = SP((ucontext_t *)c), at = (uintptr_t)info->si_addr;
+  if (bober_frozen((void *)at)) {
+    const char *what = "trap: cannot write frozen value";
+    size_t n = strlen(what);
+    memcpy(msg, what, n + 1);
+    if (trap_jmp) siglongjmp(*trap_jmp, 1);
+    put(saved[1], what, n), put(saved[1], "\n", 1), _exit(1);
+  }
   if (at - sp + (1 << 16) < 1 << 17) put(saved[1], "trap: stack overflow\n", 21), _exit(1);  // within a frame of sp
   signal(sig, SIG_DFL), raise(sig);
 }
@@ -148,13 +172,8 @@ _Noreturn void bober_fail(const uint8_t *how, const char *file, int32_t at) {
   bober_trap(what, file, at);
 }
 
-/// Where the value last thrown was first thrown, and the code showing it, for a landing pad to keep.
-const char *bober_thrown_file;
-int32_t bober_thrown_at;
-void *bober_thrown_show;
-
 void bober_throw(int64_t tag, int64_t bits, void *ref, const char *file, int32_t at, void *show) {
-  bober_thrown_file = file, bober_thrown_at = at, bober_thrown_show = show;
+  thrown_file = file, thrown_at = at;
   free(caught), caught = 0;  // A landing pad loads what it caught at once, so the last throw's is done with.
   Thrown *e = bober_malloc(sizeof(Thrown));
   *e = (Thrown){.tag = tag, .bits = bits, .ref = ref, .file = file, .at = at, .show = show};
@@ -165,7 +184,7 @@ void bober_throw(int64_t tag, int64_t bits, void *ref, const char *file, int32_t
 _Noreturn void bober_uncaught(const uint8_t *shown) {
   char what[2048] = "uncaught throw: ";
   show(what + 16, sizeof what - 16, shown);
-  bober_trap(what, bober_thrown_file, bober_thrown_at);
+  bober_trap(what, thrown_file, thrown_at);
 }
 
 /// Reads a value of the language-specific data: a uleb128, or a udata4, the two encodings LLVM uses for call sites.
@@ -234,7 +253,9 @@ static void give(void) { put(jobs[1], "+", 1); }
 void *bober_caught(void) { return &caught->tag; }
 
 void bober_start(int argc, char **argv, int32_t tested) {
+  in_init = true;
   bober_gc_start(*(void ***)__builtin_frame_address(0));  // the frame pointer of the entry, which calls this
+  bober_fibers_init();
   argc_ = argc, argv_ = argv, tests = tested;
   if (tests) {
     FILE *f = tmpfile();
@@ -364,16 +385,18 @@ int32_t bober_claim(void) {
   return i >= from;
 }
 
+static void bober_spawn_finish(void);
+
 /// Runs f(env) as the test or subtest name, in the running one if any; a trap fails it. A helper exits at its test's
 /// end, with its result.
 static void run(const char *name, void (*f)(void *), void *env) {
   key(level, name), flush();
   Level l = {level, 0, 0, false, lseek(cap, 0, SEEK_CUR)};
-  jmp_buf here, *up = test;
-  level = &l, test = &here;
-  if (setjmp(here)) bober_fibers_reset(), end(&l, true);
+  sigjmp_buf here, *up = trap_jmp;
+  level = &l, trap_jmp = &here;
+  if (sigsetjmp(here, 1)) bober_spawn_finish(), bober_fibers_reset(), end(&l, true);
   else f(env), end(&l, false);
-  test = up, level = l.up;
+  trap_jmp = up, level = l.up;
   if (helper && level == &all) {
     put(saved[0], all.failed ? "1" : "0", 1), put(saved[0], bober_tainted ? "1" : "0", 1);
     put(saved[0], bober_reads, bober_nreads), give(), _exit(0);
@@ -531,4 +554,277 @@ long bober_entropy(unsigned char *p, long n) {
   if (tests) for (long i = 0; i < n; i++) p[i] = bober_random();
   else for (long i = 0; i < n; i += 256) if (getentropy(p + i, n - i < 256 ? n - i : 256)) return -errno;
   return 0;
+}
+
+// Isolates (spawn, §6.10): each runs on its own OS thread with its own heap, fibers and I/O loop.
+
+void bober_gc_isolate(void **at);
+void bober_gc_finish(void);
+void bober_gc_set_roots(bober_union *roots, int64_t n);
+int bober_io_wake_fd(void);
+void bober_io_signal(int fd);
+void bober_io_finish(void);
+
+typedef struct bober_transfer bober_transfer;
+typedef struct { bober_union u; const bober_layout *layout; int64_t size; } SpawnVal;
+typedef struct { bober_union u; bober_transfer *copy; } SpawnSlot;
+
+int bober_export(bober_union u, const bober_layout *hint_layout, int64_t hint_size, bober_transfer **out);
+bober_union bober_import(bober_union u, const bober_transfer *t);
+void bober_transfer_free(bober_transfer *t);
+
+typedef int32_t (*SpawnEntry)(void *descs, void *args, const uint8_t *given, SpawnVal *out, void *err);
+typedef struct { bober_union u; const char *file; int32_t at; void *show; } SpawnThrown;
+
+typedef struct SpawnState SpawnState;
+typedef struct Spawn {
+  SpawnEntry fn;
+  uint64_t *descs;
+  int64_t ndescs;
+  SpawnSlot *args;
+  uint8_t *given;
+  int64_t nargs;
+  SpawnState *parent;
+  uint64_t waiter;
+  struct Spawn *next_done;
+  bool queued;
+  int status;  // 0 = running, 1 = ok, 2 = threw, 3 = trapped
+  SpawnSlot result;
+  const char *err_file;
+  int32_t err_at;
+  void *err_show;
+  char *trap_msg;
+} Spawn;
+
+struct SpawnState {
+  pthread_mutex_t mu;
+  int refs, wake_fd, pending;
+  Spawn *done_head, *done_tail;
+};
+
+static _Thread_local SpawnState *spawn_state;
+
+static SpawnState *get_spawn_state(void) {
+  if (!spawn_state) {
+    spawn_state = bober_malloc(sizeof *spawn_state);
+    *spawn_state = (SpawnState){.mu = PTHREAD_MUTEX_INITIALIZER, .refs = 1, .wake_fd = bober_io_wake_fd()};
+  }
+  return spawn_state;
+}
+
+static void release_spawn_state(SpawnState *st) {
+  pthread_mutex_lock(&st->mu);
+  int left = --st->refs;
+  pthread_mutex_unlock(&st->mu);
+  if (!left) pthread_mutex_destroy(&st->mu), free(st);
+}
+
+static void free_spawn(Spawn *s) {
+  for (int64_t i = 0; i < s->nargs; i++) bober_transfer_free(s->args[i].copy);
+  free(s->args), free(s->given), free(s->descs);
+  bober_transfer_free(s->result.copy), free(s->trap_msg), free(s);
+}
+
+static void bober_spawn_finish(void) {
+  SpawnState *st = spawn_state;
+  if (!st) return;
+  spawn_state = 0;
+  pthread_mutex_lock(&st->mu);
+  st->wake_fd = -1;
+  Spawn *d = st->done_head;
+  st->done_head = st->done_tail = 0;
+  pthread_mutex_unlock(&st->mu);
+  for (Spawn *n; d; d = n) n = d->next_done, free_spawn(d);
+  release_spawn_state(st);
+}
+
+int bober_spawn_pending(void) {
+  SpawnState *st = spawn_state;
+  if (!st) return 0;
+  pthread_mutex_lock(&st->mu);
+  int p = st->pending;
+  pthread_mutex_unlock(&st->mu);
+  return p;
+}
+
+int bober_spawn_poll(void) {
+  SpawnState *st = spawn_state;
+  if (!st) return 0;
+  pthread_mutex_lock(&st->mu);
+  Spawn *d = st->done_head;
+  st->done_head = st->done_tail = 0;
+  for (Spawn *s = d; s; s = s->next_done) s->queued = false;
+  pthread_mutex_unlock(&st->mu);
+  int woke = 0;
+  for (Spawn *s = d, *n; s; s = n) {
+    n = s->next_done, s->next_done = 0;
+    if (s->waiter) bober_wake(s->waiter), woke = 1;
+  }
+  return woke;
+}
+
+/// Builds a bober_string from a C string in the running isolate's heap.
+static bober_string make_string(const char *p, int64_t n) {
+  bober_string s = {0};
+  if (n <= 15) {
+    uint8_t *b = (uint8_t *)&s;
+    b[0] = (uint8_t)n;
+    if (n) memcpy(b + 1, p, n);
+    return s;
+  }
+  void *buf = bober_strbuf(16 + n);
+  *(int64_t *)buf = n, *((int64_t *)buf + 1) = n;
+  memcpy((char *)buf + 16, p, n);
+  return (bober_string){((uint64_t)n << 8) | 0xff, (const char *)(uintptr_t)16, buf};
+}
+
+static void *isolate_main(void *arg) {
+  Spawn *s = arg;
+  char *alt = bober_malloc(1 << 16);
+  sigaltstack(&(stack_t){.ss_sp = alt, .ss_size = 1 << 16}, 0);
+  bober_gc_isolate(__builtin_frame_address(0));
+  bober_fibers_init();
+  if (tests) seed = STONEWALL;
+  else getentropy(&seed, sizeof seed);
+
+  int status = 1;
+  sigjmp_buf here;
+  trap_jmp = &here;
+  bober_union *volatile in_args = 0;
+  if (sigsetjmp(here, 1)) {
+    in_init = false;
+    bober_gc_set_roots(0, 0);
+    status = 3;
+    s->trap_msg = strdup(msg);
+  } else {
+    init_lets();
+    if (s->nargs > 0) {
+      in_args = calloc(s->nargs, sizeof *in_args);
+      if (!in_args) bober_trap("out of memory", 0, -1);
+      bober_gc_set_roots(in_args, s->nargs);
+      for (int64_t i = 0; i < s->nargs; i++) {
+        if (s->given[i]) in_args[i] = bober_import(s->args[i].u, s->args[i].copy);
+        bober_transfer_free(s->args[i].copy), s->args[i].copy = 0;
+      }
+    }
+    SpawnVal out = {.size = -1};
+    SpawnThrown err = {0};
+    int32_t r = s->fn(s->descs, in_args, s->given, &out, &err);
+    bober_gc_set_roots(0, 0);
+    if (r) out = (SpawnVal){err.u, 0, -1};
+    if (!bober_export(out.u, out.layout, out.size, &s->result.copy))
+      bober_trap("value cannot cross isolates", err.file, err.at);
+    s->result.u = out.u, s->err_file = err.file, s->err_at = err.at, s->err_show = err.show;
+    status = r ? 2 : 1;
+  }
+  free(in_args);
+  trap_jmp = 0;
+  free(caught), caught = 0;
+  bober_fibers_reset();
+  bober_spawn_finish();
+  bober_io_finish();
+  bober_gc_finish();
+  sigaltstack(&(stack_t){.ss_flags = SS_DISABLE}, 0);
+  free(alt);
+
+  SpawnState *st = s->parent;
+  pthread_mutex_lock(&st->mu);
+  s->status = status;
+  if (st->wake_fd < 0) {
+    pthread_mutex_unlock(&st->mu);
+    free_spawn(s);
+  } else {
+    if (s->waiter) {
+      if (st->done_tail) st->done_tail->next_done = s;
+      else st->done_head = s;
+      st->done_tail = s, s->queued = true;
+    }
+    bober_io_signal(st->wake_fd);
+    pthread_mutex_unlock(&st->mu);
+  }
+  release_spawn_state(st);
+  return 0;
+}
+
+uint64_t bober_spawn_start(void *fn, const uint64_t *descs, int64_t ndescs, const void *args, const uint8_t *given,
+                           int64_t nargs, const char *file, int32_t at) {
+  if (in_init) bober_trap("spawn before main", file, at);
+  Spawn *s = calloc(1, sizeof *s);
+  if (!s) bober_trap("out of memory", file, at);
+  s->fn = (SpawnEntry)fn, s->ndescs = ndescs, s->nargs = nargs;
+  if (ndescs > 0) {
+    s->descs = bober_malloc(ndescs * sizeof *s->descs);
+    memcpy(s->descs, descs, ndescs * sizeof *s->descs);
+  }
+  if (nargs > 0) {
+    s->args = memset(bober_malloc(nargs * sizeof *s->args), 0, nargs * sizeof *s->args);
+    s->given = memcpy(bober_malloc(nargs), given, nargs);
+    const SpawnVal *v = args;
+    for (int64_t i = 0; i < nargs; i++) {
+      if (!s->given[i]) continue;
+      if (!bober_export(v[i].u, v[i].layout, v[i].size, &s->args[i].copy)) {
+        free_spawn(s);
+        bober_trap("value cannot cross isolates", file, at);
+      }
+      s->args[i].u = v[i].u;
+    }
+  }
+  SpawnState *st = get_spawn_state();
+  pthread_mutex_lock(&st->mu);
+  st->refs++, st->pending++;
+  pthread_mutex_unlock(&st->mu);
+  s->parent = st;
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+  pthread_attr_setstacksize(&attr, 8 << 20);  // the main thread's, as its first fiber runs on it
+  pthread_t th;
+  int rc = pthread_create(&th, &attr, isolate_main, s);
+  pthread_attr_destroy(&attr);
+  if (rc) {
+    pthread_mutex_lock(&st->mu);
+    st->pending--;
+    pthread_mutex_unlock(&st->mu);
+    release_spawn_state(st);
+    free_spawn(s);
+    bober_trap("cannot start isolate", file, at);
+  }
+  return (uint64_t)(uintptr_t)s;
+}
+
+int32_t bober_spawn_join(uint64_t handle, void *out, void *err, void *trap_out) {
+  Spawn *s = (Spawn *)(uintptr_t)handle;
+  SpawnState *st = s->parent;
+  pthread_mutex_lock(&st->mu);
+  while (!s->status) {
+    s->waiter = bober_self();
+    pthread_mutex_unlock(&st->mu);
+    bober_park();
+    pthread_mutex_lock(&st->mu);
+  }
+  s->waiter = 0;
+  if (s->queued) {
+    Spawn **pp = &st->done_head, *prev = 0;
+    while (*pp && *pp != s) prev = *pp, pp = &(*pp)->next_done;
+    if (*pp == s) {
+      *pp = s->next_done;
+      if (st->done_tail == s) st->done_tail = prev;
+    }
+    s->queued = false;
+  }
+  st->pending--;
+  int status = s->status;
+  pthread_mutex_unlock(&st->mu);
+  if (status == 1) {
+    *(bober_union *)out = bober_import(s->result.u, s->result.copy);
+  } else if (status == 2) {
+    SpawnThrown *e = err;
+    e->u = bober_import(s->result.u, s->result.copy);
+    e->file = s->err_file, e->at = s->err_at, e->show = s->err_show;
+  } else {
+    const char *m = s->trap_msg ? s->trap_msg : "trap";
+    *(bober_string *)trap_out = make_string(m, (int64_t)strlen(m));
+  }
+  free_spawn(s);
+  return status - 1;
 }

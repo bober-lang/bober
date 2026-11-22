@@ -829,6 +829,7 @@ class Copy {
 				this.emit(o, a)
 				this.push(p.union(p.members(t).filter(m => m != kind.Null)))
 			case op.Call: this.callOf(a, this.types(b))
+			case op.Spawn: this.call(a, this.ins.env(a, this.types(b)), null, true)
 			case op.CallMethod: this.callMethod(a, b)
 			case op.CallRef:
 				const f = this.stack[this.stack.length - 1 - a]
@@ -1086,13 +1087,14 @@ class Copy {
 	/// writes out by its type args; else of its instance for what its params holding a Type get, known, which so leave
 	/// the stack, and if any did, known as what the instance returns where it knows that. With via, a CallRef of closure
 	/// via.fn, d its source, of its code for those values too, with the env of its object under the args.
-	private call(d: i32, env: i32, via: Known | null = null) throws CompileError {
+	private call(d: i32, env: i32, via: Known | null = null, spawning = false) throws CompileError {
 		const p = this.p
 		const c = p.decls[d].code
 		const n = p.items(p.decls[d].type).length + (if (p.method(d)) 1 else 0)
 		if (c == null && env != 0) {
 			const f = p.subst(p.decls[d].type, env)
-			this.plain(op.Call, n, p.b(f), d, env)
+			const r = if (spawning) p.type(kind.Func, 0, p.b(f)) else p.b(f)
+			this.plain(if (spawning) op.Spawn else op.Call, n, r, d, env)
 			return
 		}
 		const base = this.stack.length - n
@@ -1120,6 +1122,10 @@ class Copy {
 		const r = p.b(p.decls[k].type)
 		const returnsType = holdsType(p, r)
 		const given = this.stack.length - base
+		if (spawning) {
+			this.plain(op.Spawn, given, p.type(kind.Func, 0, if (returnsType) kind.None else r), k)
+			return
+		}
 		if (via != null) {
 			// Called from what may be another module.
 			p.decls[k].mods |= decl.Export

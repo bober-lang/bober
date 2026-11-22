@@ -12,8 +12,9 @@
 //! builtin/'s functions. A method of a string or array is one of its class in builtin/ (Type.methods in src/type.bob). A
 //! function without a body is C's in a C header's module, else an intrinsic of builtin/. `async c` is a Call of
 //! builtin/'s start with the closure `() => c`, so that c's callee and args are evaluated on its fiber, `await f` one
-//! of wait, and `await ...fs` one of race. spawn is not lowered, nor are a few constructs the compiler does not use;
-//! each throws where it is.
+//! of wait, and `await ...fs` one of race. `spawn f(args)` lowers to Spawn (which starts the isolate and yields a
+//! closure that awaits it) passed to start. A few constructs the compiler does not use are not lowered; each throws
+//! where it is.
 //!
 //! What is static (4.11) lowers as what it is at run time, as a debug build runs it, but in the form mono can fold
 //! where it knows the values of `Readonly` locals: a switch is a chain of Ifs on a Readonly subject, and a `for (const x
@@ -2638,6 +2639,17 @@ class Gen {
 			case "typeof": this.op(op.Type, this.ty(x.type!))
 			case "async":
 				this.closure(`${p.t.loc.pos}`, Type.function([], x.type!), new Node("params", p.t), x)
+				this.callBuiltin("start", this.u.list([x.type!], false, this))
+			case "spawn":
+				const callee = x.parts![0]
+				const args = x.parts!.slice(1, x.parts!.length)
+				const f = callee.type!
+				const named = if (callee.kind == "index" && callee.parts![0].type?.kind == "function") callee.parts![0]
+					else callee
+				const d = this.global(named)!
+				this.taint(d)
+				this.args(f, args)
+				this.op(op.Spawn, this.ref(d), this.typeArgs(d, f, callee))
 				this.callBuiltin("start", this.u.list([x.type!], false, this))
 			case "await":
 				if (x.t.kind == "...") {

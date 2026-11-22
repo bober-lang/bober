@@ -1,0 +1,373 @@
+//! Isolates, frozen consts, per-isolate lets and spawn (§3, §6.10, §7.7).
+
+import { endsWith } from "../std/algo"
+
+class Point {
+	x: i32
+	y: i32
+
+	constructor(x: i32, y: i32) {
+		this.x = x
+		this.y = y
+	}
+}
+
+class Secret {
+	private n: i32
+	label: string
+
+	constructor(n: i32, label: string) {
+		this.n = n
+		this.label = label
+	}
+
+	read(): i32 { return this.n }
+}
+
+class Vec {
+	x = 0
+	y = 0
+}
+
+class Embedded {
+	p: ...Vec
+	name: string = ""
+}
+
+class Boom {
+	msg: string
+
+	constructor(msg: string) { this.msg = msg }
+}
+
+// Top-level consts: initialized once before main, then frozen and shared across all isolates.
+const sharedPoint = new Point(7, 11)
+const sharedPointInitId = idOf(sharedPoint)
+const sharedPoints = [new Point(1, 2), new Point(3, 4)]
+const sharedLong = "0123456789abcdef" + "ghijklmnop"
+
+const sharedClosure = (() => {
+	let n = 0
+	return () => {
+		n++
+		return n
+	}
+})()
+
+// Top-level lets: initialized per isolate and independently mutable.
+let counter = 10
+let bag: i32[] = [1, 2]
+
+function add(a: i32, b: i32): i32 { return a + b }
+function greet(s: string): string { return s + "!" }
+function flipPoint(p: Point): Point { return new Point(p.y, p.x) }
+function readSecret(s: Secret): [i32, string] { return [s.read(), s.label] }
+
+function bumpEmbedded(e: Embedded): Embedded {
+	e.p.x += 10
+	e.name = e.name + "_done"
+	return e
+}
+
+function sumInts(xs: i32[]): i32 {
+	let s = 0
+	for (const x of xs) {
+		s += x
+	}
+	return s
+}
+
+function joinStrings(xs: string[]): string { return xs.join(",") }
+
+function echoFixed(a: i32[3]): i32[3] {
+	let r = a
+	r[1] += 100
+	return r
+}
+
+function withDefault(a: i32, b: i32 = 5): i32 { return a + b }
+function genericId[T](x: T): T { return x }
+function sharedId(): u64 { return idOf(sharedPoint) }
+
+function sumFrozenPoints(): i32 {
+	let s = 0
+	for (const p of sharedPoints) {
+		s += p.x + p.y
+	}
+	return s
+}
+
+
+function mutateLet(delta: i32): [i32, i32] {
+	counter += delta
+	bag.push(delta)
+	return [counter, bag.length]
+}
+
+function concatFrozen(): string { return sharedLong + "_tail" }
+
+function writeFrozenField(): i32 {
+	sharedPoint.x = 99
+	return sharedPoint.x
+}
+
+function writeFrozenArray(): i32 {
+	sharedPoints.push(new Point(9, 9))
+	return sharedPoints.length
+}
+
+function writeFrozenClosure(): i32 { return sharedClosure() }
+function throwBoom(s: string): i32 throws Boom { throw new Boom("boom: " + s) }
+
+function trapAssert(): i32 {
+	assert 1 == 2
+	return 0
+}
+
+function nestedSpawn(x: i32): i32 {
+	const inner = spawn add(x, 100)
+	return await inner + 1
+}
+
+function takeFn(f: () => i32): i32 { return f() }
+
+function spin(n: i32): i32 {
+	let acc = 0
+	for (const i of 1 ... n) {
+		acc += i
+	}
+	return acc
+}
+
+test "spawn passes primitives, strings, classes, arrays and fixed arrays" {
+	assert await spawn add(20, 22) == 42
+	assert await spawn greet("short") == "short!"
+	const longStr = "abcdefghijklmnop" + "qrstuvwxyz"
+	assert await spawn greet(longStr) == longStr + "!"
+	assert await spawn greet(longStr.slice(2, 22)) == "cdefghijklmnopqrstuv!"
+	const p = new Point(3, 4)
+	const q = await spawn flipPoint(p)
+	assert q.x == 4 && q.y == 3 && p.x == 3 && p.y == 4
+	const [n, lbl] = await spawn readSecret(new Secret(99, "long_secret_label_value"))
+	assert n == 99 && lbl == "long_secret_label_value"
+	const e = new Embedded()
+	e.p.x = 5
+	e.name = "embedded_long_name_value"
+	const e2 = await spawn bumpEmbedded(e)
+	assert e2.p.x == 15 && e2.name == "embedded_long_name_value_done" && e.p.x == 5
+	assert await spawn sumInts([1, 2, 3, 4]) == 10
+	assert await spawn sumInts([]) == 0
+	assert await spawn joinStrings(["alpha_long_string_1", "beta_long_string_2", "c"])
+		== "alpha_long_string_1,beta_long_string_2,c"
+	const fx: i32[3] = [1, 2, 3]
+	const fx2 = await spawn echoFixed(fx)
+	assert fx2[0] == 1 && fx2[1] == 102 && fx2[2] == 3 && fx[1] == 2
+}
+
+test "spawn supports default args and generics" {
+	assert await spawn withDefault(10) == 15
+	assert await spawn withDefault(10, 20) == 30
+	const p = await spawn genericId(new Point(8, 9))
+	assert p.x == 8 && p.y == 9
+	assert await spawn genericId("generic_long_string_value") == "generic_long_string_value"
+}
+
+test "top-level consts are frozen and shared across isolates" {
+	assert idOf(sharedPoint) == sharedPointInitId
+	assert await spawn sharedId() == sharedPointInitId
+	assert await spawn sumFrozenPoints() == 10
+	assert await spawn concatFrozen() == sharedLong + "_tail"
+	assert sharedLong == "0123456789abcdefghijklmnop"
+}
+
+test "writing frozen const data traps the isolate" {
+	let caught = ""
+	try {
+		await spawn writeFrozenField()
+	} catch (e: Trap) {
+		caught = e.message
+	}
+	assert caught == "trap: cannot write frozen value"
+	caught = ""
+	try {
+		await spawn writeFrozenArray()
+	} catch (e: Trap) {
+		caught = e.message
+	}
+	assert caught == "trap: cannot write frozen value"
+	caught = ""
+	try {
+		await spawn writeFrozenClosure()
+	} catch (e: Trap) {
+		caught = e.message
+	}
+	assert caught == "trap: cannot write frozen value"
+}
+
+test "top-level lets are isolated per isolate" {
+	counter = 500
+	bag.push(999)
+	const [c1, len1] = await spawn mutateLet(5)
+	const [c2, len2] = await spawn mutateLet(7)
+	assert c1 == 15 && len1 == 3
+	assert c2 == 17 && len2 == 3
+	assert counter == 500 && bag.length == 3
+}
+
+test "throws and traps cross isolates" {
+	let msg = ""
+	try {
+		await spawn throwBoom("long_error_payload_string")
+	} catch (e: Boom) {
+		msg = e.msg
+	}
+	assert msg == "boom: long_error_payload_string"
+	let trapped = ""
+	try {
+		await spawn trapAssert()
+	} catch (e: Trap) {
+		trapped = e.message
+	}
+	assert trapped != ""
+}
+
+test "parallel isolates, nested spawn and racing" {
+	assert await spawn nestedSpawn(5) == 106
+	const jobs = [spawn spin(1000), spawn spin(2000), spawn spin(3000), async spin(500)]
+	let total = 0
+	for (const _ of jobs) {
+		const [_, v] = await ...jobs
+		total += v
+	}
+	assert total == 500500 + 2001000 + 4501500 + 125250
+}
+
+function spawnCapturing(): i32 {
+	let n = 1
+	return await spawn takeFn(() => {
+		n++
+		return n
+	})
+}
+
+test "a capture-free closure crosses, a capturing one traps" {
+	assert await spawn takeFn(() => 123) == 123
+	let trapped = ""
+	try {
+		await spawn spawnCapturing()
+	} catch (e: Trap) {
+		trapped = e.message
+	}
+	assert endsWith(trapped, ": trap: value cannot cross isolates")
+}
+
+class Tiny {
+	v: i32
+
+	constructor(v: i32) { this.v = v }
+}
+
+function makeTiny(v: i32): Tiny { return new Tiny(v + 1) }
+function widenUnion(x: i64 | string): string { return if (x instanceof string) x else `${x}` }
+
+function sumRest(...xs: i32[]): i32 {
+	let s = 0
+	for (const x of xs) {
+		s += x
+	}
+	return s
+}
+
+function doNothing(x: i32) {}
+
+class Empty {}
+
+function echoEmpty(e: Empty): Empty { return e }
+
+function genericClosure[T](x: T): i32 {
+	const f = () => 77
+	return await spawn takeFn(f)
+}
+
+function multiArgs(a: string, b: i32[3], c: string, d: Point): string {
+	return `${a}:${b[0] + b[1] + b[2]}:${c}:${d.x + d.y}`
+}
+
+class WrapOffset0 {
+	v: ...Vec
+	other: Point = new Point(1, 2)
+}
+
+class WrapOffsetN {
+	pad: i32 = 99
+	v: ...Vec
+	other: Point = new Point(3, 4)
+}
+
+function echoVec(v: Vec): Vec { return v }
+
+function returnEmbeddedVec(): Vec {
+	const w = new WrapOffsetN()
+	w.v.x = 21
+	w.v.y = 34
+	return w.v
+}
+
+const frozenWrap = new WrapOffsetN()
+
+test "embedded fields at offset 0 and non-zero offset cross isolates cleanly" {
+	const w0 = new WrapOffset0()
+	w0.v.x = 7
+	w0.v.y = 8
+	const v0 = await spawn echoVec(w0.v)
+	assert v0.x == 7 && v0.y == 8
+	const wn = new WrapOffsetN()
+	wn.v.x = 11
+	wn.v.y = 12
+	const vn = await spawn echoVec(wn.v)
+	assert vn.x == 11 && vn.y == 12
+	const vr = await spawn returnEmbeddedVec()
+	assert vr.x == 21 && vr.y == 34
+	const vf = await spawn echoVec(frozenWrap.v)
+	assert idOf(vf) == idOf(frozenWrap.v)
+}
+
+test "inlined class return, union widening, rest args, void return, empty class and generic closure" {
+	assert (await spawn makeTiny(41)).v == 42
+	let u: i32 | string = 7
+	assert await spawn widenUnion(u) == "7"
+	u = "long_union_string_payload"
+	assert await spawn widenUnion(u) == "long_union_string_payload"
+	assert await spawn sumRest(1, 2, 3, 4, 5) == 15
+	assert await spawn doNothing(1) == null
+	const e = await spawn echoEmpty(new Empty())
+	assert e instanceof Empty
+	assert genericClosure[i32](1) == 77
+	assert await spawn multiArgs("first_long_string_arg", [10, 20, 30], "second_long_string_arg", new Point(4, 5))
+		== "first_long_string_arg:60:second_long_string_arg:9"
+	// Unawaited spawn runs to completion cleanly without leaking.
+	const _ = spawn add(1, 2)
+}
+
+function grow(xs: i32[], n: i32): i32[] {
+	for (const i of 1 ... n) {
+		xs.push(i)
+	}
+	return xs
+}
+
+function shout(xs: string[]): string[] {
+	for (const i of 0 ... 40) {
+		xs.push(`long_string_number_${i}`)
+	}
+	return xs.map(x => x + "!")
+}
+
+test "grown arrays cross isolates" {
+	const xs = grow([], 100)
+	const ys = await spawn grow(xs, 200)
+	assert ys.length == 300 && ys[99] == 100 && ys[299] == 200 && xs.length == 100
+	const ss = await spawn shout(["a", "long_string_in_front_of_them_all"])
+	assert ss.length == 43 && ss[1] == "long_string_in_front_of_them_all!" && ss[42] == "long_string_number_40!"
+	assert (await spawn shout(ss)).length == 84
+}

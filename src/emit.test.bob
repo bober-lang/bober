@@ -731,3 +731,51 @@ function main() { print(\`\${long(false)} \${long(true)}\`) }
 	const m = p.module(`${dir()}/long.bob`)
 	assert p.decls.filter(d => d.module == m && (d.mods & Outlined) != 0).length == 4
 }
+
+test "top-level consts initialize once while lets initialize per isolate, and spawn before main traps" {
+	assert run("iso_init",
+		`function initConst(): i32 {
+	print("const")
+	return 7
+}
+
+function initLet(): i32 {
+	print("let")
+	return 10
+}
+
+const c = initConst()
+let v = initLet()
+
+function work(d: i32): i32 {
+	v += d
+	return c + v
+}
+
+function main() {
+	print(await spawn work(1))
+	print(await spawn work(2))
+}
+`) == `const
+let
+let
+18
+let
+19
+exit 0
+`
+	assert run("spawn_const",
+		`function f(): i32 { return 1 }
+const x = await spawn f()
+function main() { print(x) }
+`) == `${dir()}/spawn_const.bob:2:17: trap: spawn before main
+exit 1
+`
+	assert run("spawn_let",
+		`function f(): i32 { return 1 }
+let x = await spawn f()
+function main() { print(x) }
+`) == `${dir()}/spawn_let.bob:2:15: trap: spawn before main
+exit 1
+`
+}

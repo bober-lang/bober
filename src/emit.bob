@@ -32,7 +32,7 @@ import { max, min } from "../std/math"
 import { Frame as AbiFrame, attrs, call as cCall, held as heldAs, signature } from "./backend/abi"
 import { Backend, Binary, Block, Cmp, FCmp, Type as IrType, Value, mark } from "./backend/backend"
 import * as decl from "./bc/decl"
-import { Embed, Extern, Mixin, Static } from "./bc/decl"
+import { Embed, Extern, Mixin, Readonly, Static } from "./bc/decl"
 import * as kind from "./bc/kind"
 import * as op from "./bc/op"
 import { Opcode } from "./bc/op"
@@ -266,6 +266,8 @@ class Emitter {
 	/// The landing pad calls go to, 0 for none.
 	private unwind: Block = 0
 	private pos = -1
+	/// Top-level function decls spawned from this module, whose entry/join wrappers are defined after normal decls.
+	private spawns: i32[] = []
 
 	constructor(p: Program, m: i32, b: Backend, o: Options, facts: Facts) {
 		this.p = p
@@ -319,13 +321,18 @@ class Emitter {
 		const declare = (name: string, ret: IrType, params: IrType[]) => {
 			const f = b.function(`bober_${name}`, b.fn(ret, params), false)
 			this.rts.set(name, f)
-			if (!["alloc", "strbuf", "test", "zero"].includes(name)) {
+			if (!["alloc", "strbuf", "freeze", "set_lets_init", "spawn_join", "test", "zero"].includes(name)) {
 				b.attr(f, -1, "gc-leaf-function", 0)
 			}
 			return f
 		}
 		b.allocator(declare("alloc", this.ref, [i64, ptr]))
 		b.allocator(declare("strbuf", this.ref, [i64]))
+		declare("lets_base", ptr, [])
+		declare("freeze", v, [])
+		declare("set_lets_init", v, [ptr])
+		declare("spawn_start", i64, [ptr, ptr, i64, ptr, ptr, i64, ptr, i32])
+		declare("spawn_join", i32, [i64, ptr, ptr, ptr])
 		b.attr(declare("trap", v, [ptr, ptr, i32]), -1, "noreturn", 0)
 		b.attr(declare("fail", v, [this.ref, ptr, i32]), -1, "noreturn", 0)
 		declare("throw", v, [i64, i64, this.ref, ptr, i32, ptr])
@@ -385,6 +392,9 @@ class Emitter {
 			this.decl(d)
 		}
 		this.src = p.modules[this.m]
+		for (const d of this.spawns) {
+			this.defineSpawn(d)
+		}
 		this.init()
 		if (this.o.main < 0) {
 			this.cMain(entry(this.path, false), false)
@@ -438,7 +448,7 @@ class Emitter {
 			if (this.lazy(d)) {
 				this.defineAccessor(d)
 			} else {
-				this.variable(d)
+				this.varGlobal(d)
 			}
 			if (code != null) {
 				const scope = this.scopeOf(d)
@@ -462,7 +472,7 @@ class Emitter {
 		return this.b.function(this.symbol(d) + ".at", this.b.fn(this.ptr, if (this.dyn) [this.i64] else []), false)
 	}
 
-	/// Defines lazy var decl d's accessor: its place, src/gc.c's cell for the class instance if dyn, else its global;
+	/// Defines lazy var decl d's accessor: its place, src/gc.c's cell for the class instance if dyn, else its let slot;
 	/// zeroed, then initialized, on first use.
 	private defineAccessor(d: i32) {
 		const b = this.b
@@ -471,9 +481,9 @@ class Emitter {
 		const start = this.startThunk(f, this.scopeOf(d), false)
 		const t = this.mem(x.type)
 		const q = if (this.dyn) this.rt("static", [f, b.param(f, 0), b.sizeOf(t), b.layout(t)], false)
-			else this.variable(d)
+			else this.varPlace(d)
 		const set = if (this.dyn) this.ir().gep(this.i64, q, [this.i64Const(-1)])
-			else b.global(this.symbol(d) + ".set", this.i64Const(0), true, 0)
+			else this.atLet(this.letSlot(this.symbol(d) + ".set", this.i64))
 		const [init, done] = [this.label(), this.label()]
 		this.condBr(this.ir().icmp("eq", this.ir().load(this.i64, set, false), this.i64Const(0)), init, done)
 		this.start(init)
@@ -543,16 +553,24 @@ class Emitter {
 		this.b.br(start)
 	}
 
-	/// bober.init.<path>, which runs once: the inits of the modules it depends on, and of builtin/ but in builtin/, whose
-	/// functions emit calls, then the initializers of its vars, static fields too, in order.
+	/// bober.init.const.<path>, once, before freezing, and bober.init.let.<path>, once per isolate: each runs the inits
+	/// of the modules it depends on, and of builtin/ but in builtin/, then its own vars and static fields.
 	private init() {
+		this.initPhase(false)
+		this.initPhase(true)
+	}
+
+	private initPhase(lets: bool) {
 		const p = this.p
 		const b = this.b
-		const done = b.global(`bober.inited.${this.path}`, b.constInt(this.i1, 0), true, 0)
-		const f = b.function(`bober.init.${this.path}`, b.fn(this.void, []), false)
+		const phase = if (lets) "let" else "const"
+		const flag = if (lets) this.letSlot(`bober.inited.let.${this.path}`, this.i1)
+			else b.global(`bober.inited.const.${this.path}`, b.constInt(this.i1, 0), true, 0)
+		const f = b.function(`bober.init.${phase}.${this.path}`, b.fn(this.void, []), false)
 		this.fn = f
 		this.unwind = 0
 		this.start(b.block(f))
+		const done = if (lets) this.atLet(flag) else flag
 		const go = b.block(f)
 		const end = b.block(f)
 		b.condBr(b.load(this.i1, done, false), end, go)
@@ -567,15 +585,26 @@ class Emitter {
 			}
 		}
 		for (const path of deps) {
-			const g = b.function(`bober.init.${path}`, b.fn(this.void, []), false)
+			const g = b.function(`bober.init.${phase}.${path}`, b.fn(this.void, []), false)
 			this.call(b.valueType(g), g, [])
 		}
 		for (const d of p.modules[this.m].inits) {
 			const x = p.decls[d]
-			if (x.code != null && !this.lazy(d)) {
+			if (this.lazy(d) || this.isLet(d) != lets) {
+				continue
+			}
+			if (x.code != null) {
 				const init = this.initOf(d)
-				this.put(this.variable(d),
+				this.put(this.varPlace(d),
 					{ v: this.returned(this.call(b.valueType(init), init, []), x.type), t: this.norm(x.type) }, x.type)
+			} else if (lets) {
+				if (this.kindOf(x.type) == kind.FixedArray) {
+					if (!this.sized(x.type)) {
+						this.ir().store(this.zero(x.type), this.varPlace(d), false)
+					}
+				} else {
+					this.put(this.varPlace(d), { v: this.zero(x.type), t: this.norm(x.type) }, x.type)
+				}
 			}
 		}
 		b.retVoid()
@@ -583,8 +612,8 @@ class Emitter {
 		b.retVoid()
 	}
 
-	/// C's main, or an entry named name like it: the args stored, the module initialized, then main called or the tests
-	/// run.
+	/// C's main, or an entry named name like it: starts the runtime, initializes and freezes top-level consts,
+	/// initializes the primary isolate's lets, then calls main or runs the tests.
 	private cMain(name: string, tests: bool) {
 		const p = this.p
 		const b = this.b
@@ -593,8 +622,11 @@ class Emitter {
 		this.unwind = 0
 		this.start(b.block(f))
 		this.rt("start", [b.param(f, 0), b.param(f, 1), b.constInt(this.i32, if (tests) 1 else 0)])
-		const init = b.function(`bober.init.${this.path}`, b.fn(this.void, []), false)
-		this.call(b.valueType(init), init, [])
+		const initConst = b.function(`bober.init.const.${this.path}`, b.fn(this.void, []), false)
+		this.call(b.valueType(initConst), initConst, [])
+		this.rt("freeze", [], false)
+		const initLet = b.function(`bober.init.let.${this.path}`, b.fn(this.void, []), false)
+		this.rt("set_lets_init", [initLet], false)
 		let r = b.constInt(this.i32, 0)
 		for (const d of p.modules[this.m].decls) {
 			const x = p.decls[d]
@@ -848,6 +880,7 @@ class Emitter {
 				this.push(this.cast(u, rest), rest)
 			case op.Return: this.return()
 			case op.Call: this.invoke(n, c.b(i))
+			case op.Spawn: this.spawn(n, c.b(i))
 			case op.CallMethod: this.callMethod(p.strings[n], c.b(i))
 			case op.CallRef:
 				const xs = this.popN(n)
@@ -1532,10 +1565,10 @@ class Emitter {
 		return s
 	}
 
-	/// The place of var decl d of env: its global, or if lazy, as its accessor gives it.
+	/// The place of var decl d of env: its global or per-isolate let slot, or if lazy, as its accessor gives it.
 	private global(d: i32, env: i32): Value {
 		if (!this.lazy(d)) {
-			return this.variable(d)
+			return this.varPlace(d)
 		}
 		// Of the instance env names, or in its class's code, as its scope binds it.
 		const c = this.p.classOf(d)
@@ -1544,20 +1577,54 @@ class Emitter {
 		return this.call(this.b.valueType(f), f, if (this.dyn) [this.desc(n, true)] else [] as Value[])
 	}
 
-	/// Var decl d, in this module with its zero value or declared.
-	private variable(d: i32): Value {
+	/// Whether var decl d lives in each isolate's let block rather than shared frozen const data.
+	private isLet(d: i32): bool {
+		const x = this.p.decls[d]
+		return (x.mods & Readonly) == 0 || this.lazy(d)
+	}
+
+	/// A local per-isolate let slot of type t, returning its offset global.
+	private letSlot(name: string, t: IrType): Value {
+		const g = this.b.global(name, this.i64Const(0), true, 0)
+		this.b.letSlot(g, t)
+		return g
+	}
+
+	/// The address in the current isolate's let block of the slot whose offset is held in global off.
+	private atLet(off: Value): Value {
+		return this.ir().gep(this.b.int(8), this.rt("lets_base", [], false), [this.ir().load(this.i64, off, false)])
+	}
+
+	/// Declares var decl d: a global for a const, or for a let the global of its offset in the lets, in bober_lets.
+	private varGlobal(d: i32): Value {
 		const sym = this.symbol(d)
 		const have = this.b.named(sym)
 		if (have != 0) {
 			return have
 		}
 		const x = this.p.decls[d]
+		const t = this.mem(x.type)
+		if (this.isLet(d)) {
+			if (!this.here.has(d)) {
+				return this.b.extern(sym, this.i64)
+			}
+			const own = this.copies.has(d) || x.owner >= 0 && this.p.classOf(d) < 0
+			const g = this.b.global(sym, this.i64Const(0), own, 0)
+			this.b.letSlot(g, t)
+			return g
+		}
 		if (!this.here.has(d)) {
-			return this.b.extern(sym, this.mem(x.type))
+			return this.b.extern(sym, t)
 		}
 		const g = this.b.global(sym, this.zero(x.type), this.copies.has(d) || x.owner >= 0 && this.p.classOf(d) < 0, 0)
 		this.b.root(g)
 		return g
+	}
+
+	/// The address of var decl d in the running isolate.
+	private varPlace(d: i32): Value {
+		const g = this.varGlobal(d)
+		return if (this.isLet(d)) this.atLet(g) else g
 	}
 
 	/// Call of decl d of env: a bober function, C's, or an intrinsic of builtin/, one without code.
@@ -1587,6 +1654,196 @@ class Emitter {
 			args = [this.b.constZero(this.ref), ...args]
 		}
 		this.pushResult(this.callByValue(f, [...this.envDescs(env), ...args], (x.mods & Extern) == 0), f.ret, env)
+	}
+
+	/// Concrete class layout and size hint for bober_export (handles embedded fields at any offset); [-1] otherwise.
+	private classHint(t: i32): [Value, Value] {
+		const n = this.norm(t)
+		if (this.p.kind(n) == kind.Named && !this.isInterface(n) && !this.unbound(n)) {
+			const st = this.struct(n)
+			return [this.b.layout(st), this.b.sizeOf(st)]
+		}
+		// Of an array, -2: its elements may be a block of their own, copied with it (src/gc.c).
+		const array = this.p.members(n).some(m => this.p.kind(m) == kind.Array)
+		return [this.b.constZero(this.ptr), this.i64Const(if (array) -2 else -1)]
+	}
+
+	/// Spawn: exports args and starts decl d of env in a new isolate, pushing a closure () => R that awaits it.
+	private spawn(d: i32, env: i32) {
+		const f = this.callee(d)
+		const xs = this.popN(f.params.length)
+		const n = f.params.length
+		const i8 = this.b.int(8)
+		const valTy = this.b.struct([this.unionTy, this.ptr, this.i64])
+		// Every arg packed first, so that no allocation boxing one makes moves a ref already stored in argsBuf.
+		const vals: Value[] = []
+		const hints: [Value, Value][] = []
+		const omitteds: bool[] = []
+		for (const k of 0 ... n - 1) {
+			const pt = this.p.subst(f.params[k], env)
+			const omitted = this.kindOf(xs[k].t) == kind.Optional
+			omitteds.push(omitted)
+			if (omitted) {
+				vals.push(this.b.constZero(this.unionTy))
+				hints.push([this.b.constZero(this.ptr), this.i64Const(-1)])
+			} else {
+				const target = if (this.kindOf(pt) == kind.Optional) this.p.a(pt) else pt
+				const v = this.heap({ v: this.retval(xs[k], target), t: this.norm(target) })
+				vals.push(this.cast(v, this.any))
+				hints.push(this.classHint(xs[k].t))
+			}
+		}
+		const argsBuf = if (n == 0) this.b.constZero(this.ptr) else this.scratch(this.b.array(valTy, n as u64))
+		const givenBuf = if (n == 0) this.b.constZero(this.ptr) else this.scratch(this.b.array(i8, n as u64))
+		for (const k of 0 ... n - 1) {
+			this.ir().store(this.b.constInt(i8, if (omitteds[k]) 0 else 1),
+				this.ir().gep(i8, givenBuf, [this.i64Const(k)]), false)
+			const slot = this.ir().gep(valTy, argsBuf, [this.i64Const(k)])
+			this.ir().store(vals[k], slot, false)
+			this.ir().store(hints[k][0], this.ir().field(valTy, slot, 1), false)
+			this.ir().store(hints[k][1], this.ir().field(valTy, slot, 2), false)
+		}
+		const ds = this.envDescs(env)
+		const descsBuf = if (ds.length == 0) this.b.constZero(this.ptr)
+			else this.scratch(this.b.array(this.i64, ds.length as u64))
+		for (const k of 0 ... ds.length - 1) {
+			this.ir().store(ds[k], this.ir().gep(this.i64, descsBuf, [this.i64Const(k)]), false)
+		}
+		const [entryFn, joinFn] = this.spawnWrappers(d)
+		const handle = this.rt("spawn_start",
+			[entryFn, descsBuf, this.i64Const(ds.length), argsBuf, givenBuf, this.i64Const(n), ...this.site()], false)
+		const ret = this.p.subst(f.ret, env)
+		this.push(this.closure(joinFn, [handle], ds), this.p.type(kind.Func, 0, ret))
+	}
+
+	/// Declares the local entry and join wrapper functions for spawning decl d, queuing them for defineSpawn.
+	private spawnWrappers(d: i32): [Value, Value] {
+		const f = this.callee(d)
+		const entryName = `${f.sym}.spawn.entry`
+		const joinName = `${f.sym}.spawn.join`
+		const had = this.b.named(entryName) != 0
+		const entryFn = this.b.function(entryName,
+			this.b.fn(this.i32, [this.ptr, this.ptr, this.ptr, this.ptr, this.ptr]), true)
+		const joinFn = this.b.function(joinName, this.codeType(f.ret, []), true)
+		if (!had) {
+			this.spawns.push(d)
+		}
+		return [entryFn, joinFn]
+	}
+
+	/// Starts emitting wrapper function f, of no code of its own.
+	private wrapping(f: Value) {
+		this.fn = f
+		this.unwind = 0
+		this.val = false
+		this.boxes = false
+		this.dead = true
+		this.stack = []
+		this.lits = []
+		this.frames = []
+	}
+
+	/// Defines the entry (runs f in the spawned isolate, catching throws) and join (awaits the isolate in the parent)
+	/// wrappers for decl d.
+	private defineSpawn(d: i32) {
+		const b = this.b
+		const f = this.callee(d)
+		this.pos = this.p.decls[d].pos
+		const [entryFn, joinFn] = this.spawnWrappers(d)
+		const errTy = b.struct([this.unionTy, this.ptr, this.i32, this.ptr])
+		const i8 = b.int(8)
+		// 1. Entry: i32 (ptr descs, ptr args, ptr given, ptr out, ptr err)
+		this.wrapping(entryFn)
+		b.personality(entryFn, this.rts.get("personality")!)
+		this.enter(f.scope, [])
+		const estart = this.label()
+		this.start(estart)
+		for (const k of 0 ... f.scope.length - 1) {
+			this.descs.push(this.ir().load(this.i64, this.ir().gep(this.i64, b.param(entryFn, 0), [this.i64Const(k)]),
+				false))
+		}
+		const args: Value[] = [...this.descs]
+		if (f.env) {
+			args.push(b.constZero(this.ref))
+		}
+		for (const k of 0 ... f.params.length - 1) {
+			const t = f.params[k]
+			const at = this.ir().gep(this.unionTy, b.param(entryFn, 1), [this.i64Const(k)])
+			if (this.kindOf(t) != kind.Optional) {
+				args.push(this.retval({ v: this.ir().load(this.unionTy, at, false), t: this.any }, t))
+				continue
+			}
+			const q = this.spill(b.constZero(this.ll(t)), this.ll(t))
+			const [yes, done] = [this.label(), this.label()]
+			const g = this.ir().load(i8, this.ir().gep(i8, b.param(entryFn, 2), [this.i64Const(k)]), false)
+			this.condBr(this.ir().icmp("ne", g, b.constInt(i8, 0)), yes, done)
+			this.start(yes)
+			this.ir().store(this.cast({ v: this.ir().load(this.unionTy, at, false), t: this.any }, t), q, false)
+			this.jump(done)
+			this.start(done)
+			args.push(this.ir().load(this.ll(t), q, false))
+		}
+		const pad = this.label()
+		this.unwind = pad
+		const r = this.callByValue(f, args, (this.p.decls[d].mods & Extern) == 0)
+		this.unwind = 0
+		const void = this.result(f.ret) == this.void
+		const rv = if (void) ({ v: this.bool(false), t: kind.Null as i32 })
+			else this.heap({ v: r, t: this.norm(f.ret) })
+		const outU = this.cast(rv, this.any)
+		const valTy = b.struct([this.unionTy, this.ptr, this.i64])
+		const [hLay, hSize] = if (void) [b.constZero(this.ptr), this.i64Const(-1)] else this.classHint(f.ret)
+		const outP = b.param(entryFn, 3)
+		this.ir().store(outU, outP, false)
+		this.ir().store(hLay, this.ir().field(valTy, outP, 1), false)
+		this.ir().store(hSize, this.ir().field(valTy, outP, 2), false)
+		this.ir().ret(b.constInt(this.i32, 0))
+		this.start(pad)
+		const [eu, site] = this.landing()
+		const ep = b.param(entryFn, 4)
+		this.ir().store(eu, ep, false)
+		this.ir().store(site[0], this.ir().field(errTy, ep, 1), false)
+		this.ir().store(site[1], this.ir().field(errTy, ep, 2), false)
+		this.ir().store(site[2], this.ir().field(errTy, ep, 3), false)
+		this.ir().ret(b.constInt(this.i32, 1))
+		b.at(this.entry)
+		b.br(estart)
+		// 2. Join closure: (ref env) => R (or unionTy if dyn)
+		this.wrapping(joinFn)
+		this.enter(f.scope, [])
+		const jstart = this.label()
+		this.start(jstart)
+		const env = b.param(joinFn, 0)
+		const handle = this.captured(env, 1, this.i64)
+		for (const k of 0 ... f.scope.length - 1) {
+			this.descs.push(this.captured(env, 2 + k, this.i64))
+		}
+		const outSlot = this.slot(this.unionTy)
+		const errSlot = this.slot(errTy)
+		const trapSlot = this.slot(this.stringTy)
+		const status = this.rt("spawn_join", [handle, outSlot, errSlot, trapSlot], false)
+		const [okBlk, errBlk, trapBlk] = [this.label(), this.label(), this.label()]
+		this.ir().switch(status, [0, 1], [okBlk, errBlk], trapBlk)
+		this.start(okBlk)
+		const resU = this.ir().load(this.unionTy, outSlot, false)
+		if (this.dyn) {
+			this.ir().ret(resU)
+		} else if (void) {
+			this.ir().retVoid()
+		} else {
+			this.ir().ret(this.returning(this.retval({ v: resU, t: this.any }, f.ret), f.ret))
+		}
+		this.start(errBlk)
+		const errU = this.ir().load(this.unionTy, errSlot, false)
+		const eFile = this.ir().load(this.ptr, this.ir().field(errTy, errSlot, 1), false)
+		const eAt = this.ir().load(this.i32, this.ir().field(errTy, errSlot, 2), false)
+		const eShow = this.ir().load(this.ptr, this.ir().field(errTy, errSlot, 3), false)
+		this.raise(errU, [eFile, eAt, eShow])
+		this.start(trapBlk)
+		this.langCall("throwTrap", [this.ir().load(this.stringTy, trapSlot, false)])
+		this.ir().unreachable()
+		b.at(this.entry)
+		b.br(jstart)
 	}
 
 	/// CallMethod: of the method of the name of its receiver's type, or of a Type's static, which its descriptor lists,

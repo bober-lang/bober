@@ -678,6 +678,13 @@ export class LLVM implements Backend {
 		}
 	}
 
+	/// Registers a per-isolate top-level let of type t in section bober_lets, 32 bytes.
+	letSlot(g: Value, t: Type) {
+		const word = this.int(64)
+		const size = this.constInt(word, this.bytes(t) as i64)
+		this.collect(this.constStruct([g, size, this.layout(t), this.constInt(word, 0)]), "bober_lets")
+	}
+
 	described(g: Value) { this.collect(this.constStruct([g]), "bober_types") }
 	/// The bytes, kept in section s though nothing reads them.
 	data(bytes: string, s: string) { this.collect(this.constBytes(bytes), s) }
@@ -686,6 +693,8 @@ export class LLVM implements Backend {
 	private collect(init: Value, s: string) {
 		const e = this.constant(init)
 		LLVMSetSection(e, section(s))
+		// As TPDE's: the 16 LLVM gives a large one pads between the entries of units of both in an image.
+		LLVMSetAlignment(e, 8)
 		LLVMSetValueName2(e, "bober.root", 10) // as llvm.compiler.used takes, which LLVM makes unique
 		this.roots.push(e)
 	}

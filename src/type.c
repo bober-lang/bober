@@ -4,6 +4,7 @@
 
 #include "rt.h"
 #include <math.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +36,7 @@ static bober_string string(const char *p, int64_t n) {
 
 static const bober_type **table;
 static uint64_t cap, count;
+static pthread_mutex_t type_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t hash(const char *p, int64_t n) {
   uint64_t h = 0xcbf29ce484222325;
@@ -342,13 +344,21 @@ static uint64_t hashOf(const bober_type *r) {
 
 /// Generic code forms its types each time it runs, so the last ones formed are kept by t and args, which fix params.
 const bober_type *bober_type_of(const bober_type *t, int64_t n, const bober_type *const *params, const bober_type *const *args) {
-  static struct formed { const bober_type *t, *args[4], *made; int64_t n; } formed[4096];
-  if (n > 4) return form(t, n, params, args, false);
+  static _Thread_local struct formed { const bober_type *t, *args[4], *made; int64_t n; } formed[4096];
+  if (n > 4) {
+    pthread_mutex_lock(&type_mu);
+    const bober_type *r = form(t, n, params, args, false);
+    pthread_mutex_unlock(&type_mu);
+    return r;
+  }
   uint64_t h = mix(0, (uint64_t)t);
   for (int64_t i = 0; i < n; i++) h = mix(h, (uint64_t)args[i]);
   struct formed *f = &formed[h >> 52];
   if (f->t != t || f->n != n || memcmp(f->args, args, n * sizeof *args)) {
-    *f = (struct formed){t, .made = form(t, n, params, args, false), .n = n};
+    pthread_mutex_lock(&type_mu);
+    const bober_type *made = form(t, n, params, args, false);
+    pthread_mutex_unlock(&type_mu);
+    *f = (struct formed){t, .made = made, .n = n};
     memcpy(f->args, args, n * sizeof *args);
   }
   return f->made;
@@ -438,13 +448,18 @@ static const bober_type *embedded(const bober_type *c) {
   int64_t n = len(c->key) + 1;
   char *key = alloc(n);
   key[0] = '&', memcpy(key + 1, c->key.bytes, n - 1);
+  pthread_mutex_lock(&type_mu);
   const bober_type *have = find(key, n);
-  if (have) return free(key), have;
+  if (have) {
+    pthread_mutex_unlock(&type_mu);
+    return free(key), have;
+  }
   bober_type *r = alloc(sizeof *r);
   *r = *c;
   r->key = (bober_string){(uint64_t)n << 8 | 0xff, key, 0};
   r->held = EMBED, r->elem = c, r->canon = r;
   add(r);
+  pthread_mutex_unlock(&type_mu);
   return r;
 }
 

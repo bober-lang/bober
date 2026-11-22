@@ -38,12 +38,26 @@ typedef struct { int64_t size; uint64_t refs[]; } bober_layout;
 /// n new zero bytes, 16-aligned, of values laid out as l, or of none holding a ref if l is null: a ref, which may
 /// point into them anywhere. It may collect, so that refs held across it move.
 void *bober_alloc(int64_t n, const bober_layout *l);
-/// n new zero bytes for a string's buffer, in pages of their own, by which a value crossing isolates has its strings
-/// copied.
-void *bober_strbuf(int64_t n);
 /// Collects now if allocating n more bytes would, n the sizes of the allocations that follow, each rounded up to 16:
 /// before any other call that may collect, those then do not, so that refs held across them stay.
 void bober_reserve(int64_t n);
+/// n new zero bytes for a string's buffer, in pages of their own, by which a value crossing isolates has its strings
+/// copied.
+void *bober_strbuf(int64_t n);
+/// 1 if p points into a frozen page (read-only const data shared by all isolates), else 0.
+int bober_frozen(void *p);
+/// The base address of this isolate's top-level let variables.
+char *bober_lets_base(void);
+/// Freezes everything reachable from top-level consts into read-only pages and starts the primary isolate's heap.
+void bober_freeze(void);
+/// Registers the program's top-level let initializer, run by each spawned isolate before its entry function.
+void bober_set_lets_init(void (*fn)(void));
+/// Starts fn in a new isolate on a new OS thread with the exported arguments; returns a handle for bober_spawn_join.
+uint64_t bober_spawn_start(void *fn, const uint64_t *descs, int64_t ndescs, const void *args, const uint8_t *given,
+                           int64_t nargs, const char *file, int32_t at);
+/// Parks the calling fiber until the spawned isolate finishes, then imports its result, throw or trap message:
+/// returns 0 (result in out), 1 (thrown in err) or 2 (trap message in trap_out).
+int32_t bober_spawn_join(uint64_t handle, void *out, void *err, void *trap_out);
 /// The bytes of a page of the heap. An object of more has pages of its own, from one's start, and never moves; once it
 /// is not reached, they are mapped anew, which unmaps what bober_io_map mapped there but its first.
 #define BOBER_PAGE (1 << 16)
