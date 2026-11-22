@@ -302,3 +302,13 @@ test "a function has the attributes of all its declarations; a hidden one is not
 	assert has(ir, "declare i32 @g(ptr, ...) #1") && has(ir, "attributes #1 = { \"frame-pointer\"=\"all\" }")
 	assert has(ir, "@x = hidden global")
 }
+
+test "unterminated attributes and non-lvalue writes are errors" {
+	assert error("int x;\n__attribute__((foo") == "t.c:2:19: expected ), got "
+	assert error("[[foo") == "t.c:1:6: expected ], got "
+	assert error("enum E { C = -1 ++ };") == "t.c:1:17: expression is not assignable"
+	assert error("int f(void) { return 1 = 2; }") == "t.c:1:24: expression is not assignable"
+	assert error("int f(void) { return ++1; }") == "t.c:1:22: expression is not assignable"
+	assert error("int *f(void) { return &1; }") == "t.c:1:23: cannot take the address of an rvalue"
+	assert error("int a[2]; void f(void) { a = 0; }") == "t.c:1:28: expression is not assignable"
+}

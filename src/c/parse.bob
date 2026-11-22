@@ -587,7 +587,7 @@ export class Parser {
 			any = true
 			if (this.eat("[")) {
 				this.next()
-				while (!this.eat("]")) {
+				while (!this.eat("]") && this.peek().kind != "eof") {
 					// The namespace of a name like gnu::packed is left out.
 					if (this.peek(1).is(":")) {
 						this.next(3)
@@ -607,7 +607,7 @@ export class Parser {
 				a.asm = this.asmString()
 			} else {
 				this.expect("(")
-				while (!this.eat(")")) {
+				while (!this.eat(")") && this.peek().kind != "eof") {
 					this.attr(a)
 					this.eat(",")
 				}
@@ -1371,10 +1371,17 @@ export class Parser {
 		if (!isAssignment(op)) {
 			return x
 		}
-		this.next()
+		const t = this.next()
 		const y = g.rv(this.assign())
 		const binary = op.slice(0, op.length - 1)
-		return g.store(x, if (op == "=") y else g.binary(binary, g.rv(x), y))
+		return g.store(this.lvalue(t, x), if (op == "=") y else g.binary(binary, g.rv(x), y))
+	}
+
+	private lvalue(t: Tok, v: Val): Val {
+		if (!v.lv || v.ty.kind == "array" || v.ty.kind == "func") {
+			throw CError.at(t, "expression is not assignable")
+		}
+		return v
 	}
 
 	/// c ? a : b, and GNU's c ?: b, which is c unless that is zero.
@@ -1552,7 +1559,7 @@ export class Parser {
 		}
 		if (op == "++" || op == "--") {
 			this.next()
-			const v = this.unary()
+			const v = this.lvalue(t, this.unary())
 			return g.store(v, g.binary(op.slice(0, 1), g.rv(v), int(1, Int)))
 		}
 		if (op != "&" && op != "*" && op != "+" && op != "-" && op != "~" && op != "!") {
@@ -1560,6 +1567,9 @@ export class Parser {
 		}
 		this.next()
 		const v = this.cast()
+		if (op == "&" && !v.lv && v.ty.kind != "func") {
+			throw CError.at(t, "cannot take the address of an rvalue")
+		}
 		return switch (op) {
 			case "&": g.addressOf(v)
 			case "*": g.deref(this.pointer(t, g.rv(v)))
@@ -1608,8 +1618,9 @@ export class Parser {
 				v = this.field(g.deref(this.pointer(t, g.rv(v))))
 			} else if (t.is("++") || t.is("--")) {
 				this.next()
-				const old = g.rv(v)
-				g.store(v, g.binary(t.text.slice(0, 1), old, int(1, Int)))
+				const lv = this.lvalue(t, v)
+				const old = g.rv(lv)
+				g.store(lv, g.binary(t.text.slice(0, 1), old, int(1, Int)))
 				v = old
 			} else {
 				return v
