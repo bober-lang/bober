@@ -8,6 +8,8 @@
 //!   field a child object of its own.
 //! - A T | null union as T or null unboxed; every other union as new $B(typeId, value), null as $null.
 //! - A function value as a plain JS function; an omitted optional param as undefined.
+//! - Across a call of a function of TypeScript typings (src/dts.bob): a string as a JS string, an object as one of its
+//!   fields by name, null as undefined; a Promise awaited.
 //! - A throw throws a $B box; Try uses JS try/catch/finally guarded so traps skip finally.
 //! - Call-site async / fibers use host.mjs's cooperative scheduler driven by JS async/await, with only functions
 //!   that transitively reach a suspending host call marked async.
@@ -24,6 +26,7 @@ import { Opcode } from "./bc/op"
 import { Code, Program } from "./bc/program"
 import { showType } from "./bc/show"
 import { listed } from "./emit"
+import { specifier } from "./dts"
 import { CompileError } from "./error"
 import { fits } from "./mono"
 import { fieldOf } from "./resolve"
@@ -32,7 +35,7 @@ import { builtin, builtinPath, root } from "./root"
 /// Translates p, monomorphized for its module main, into the ES module at path, whose export start($h) runs main, or
 /// with tests its tests, and gives the exit status.
 export function js(p: Program, main: i32, tests: bool, path: string) throws CompileError {
-	const g = new Js(p)
+	const g = new Js(p, path)
 	g.run(main, tests)
 	g.write(path)
 }
@@ -71,12 +74,15 @@ class Frame {
 	arms: string[][] = []
 }
 
-/// Host imports that can suspend a fiber.
-const seeds = ["bober_fiber", "bober_park", "bober_io_sleep", "test", "subtest"]
+/// Host imports that can suspend a fiber, and a call of TypeScript typings giving a Promise.
+const seeds = ["bober_fiber", "bober_park", "bober_io_sleep", "test", "subtest", "promise"]
 
 /// Translates a Program to JS, a function at a time: the values of its ops on a stack, each a constant or a variable.
 class Js {
 	p: Program
+	/// The module's path, and those of TypeScript typings it imports by specifier.
+	private file: string
+	private imported = new HashMap[string, string]()
 	/// The union of any type, a thrown value's.
 	private any = 0
 	private norms = new HashMap[i32, i32]()
@@ -120,8 +126,9 @@ class Js {
 	private locals: string[] = []
 	private cells: bool[] = []
 
-	constructor(p: Program) {
+	constructor(p: Program, file: string) {
 		this.p = p
+		this.file = file
 		this.any = p.type(kind.Union)
 	}
 
@@ -795,6 +802,10 @@ class Js {
 			return
 		}
 		const xs = this.popN(p.items(t).length)
+		const spec = if (x.code == null) specifier(p.modules[x.module].path, this.file) else null
+		if (spec != null) {
+			return this.foreign(d, spec!, this.args(xs, p.items(t)), t)
+		}
 		const first: string[] = []
 		if (p.method(d)) {
 			const obj = this.pop()
@@ -809,6 +820,60 @@ class Js {
 		} else {
 			this.pushCall(`d:${d}`, `${this.fn(d)}(${callArgs.join(", ")})`, p.b(t))
 		}
+	}
+
+	/// A call of d, of TypeScript typings JavaScript imports from spec, its args and result crossing, a Promise
+	/// awaited.
+	private foreign(d: i32, spec: string, args: string[], t: i32) {
+		const p = this.p
+		let m = this.imported.get(spec)
+		if (m == null) {
+			m = `$ts${this.imported.size}`
+			this.imported.set(spec, m!)
+			this.top.push(`import * as ${m} from ${jsStr(spec)};`)
+		}
+		const ps = p.items(t)
+		const xs: string[] = []
+		for (const k of 0 ... ps.length - 1) {
+			xs.push(this.crossing(args[k], ps[k], true))
+		}
+		const e = `${m}.${this.name(d)}(${xs.join(", ")})`
+		const promise = p.lists[p.decls[d].tags].some(g => p.kind(g) == kind.Named && this.name(p.a(g)) == "Promise")
+		const call = if (promise) this.calls("h:promise", e) else e
+		const r = p.b(t)
+		const k = this.kindOf(r)
+		if (k == kind.None || k == kind.Null) {
+			this.emit(`${call};`)
+			if (k == kind.Null) {
+				this.pushConst("null", kind.Null)
+			}
+		} else {
+			this.push(this.crossing(call, r, false), r)
+		}
+	}
+
+	/// JS expression e of type t as JavaScript takes it, into, or as bober holds it: a string's UTF-16 or Latin-1, an
+	/// object's fields by name or by slot, null's undefined or null.
+	private crossing(e: string, t: i32, into: bool): string {
+		const p = this.p
+		const n = this.bare(t)
+		switch (p.kind(n)) {
+			case kind.String: return `${if (into) "$utf16" else "$latin1"}(${e})`
+			case kind.Array: return `${e}.map(_v => ${this.crossing("_v", p.a(n), into)})`
+			case kind.Object:
+				const slots = this.layout(n)
+				const fs: string[] = []
+				for (const k of 0 ... slots.length - 1) {
+					const [js, ours] = [p.strings[slots[k].name], `f${k}`]
+					const from = if (into) ours else js
+					fs.push(`${if (into) js else ours}: ${this.crossing(`_v.${from}`, slots[k].t, into)}`)
+				}
+				return `((_v) => ({ ${fs.join(", ")} }))(${e})`
+			case kind.Union:
+				const v = p.members(n).find(m => m != kind.Null)!
+				return `((_v) => _v == null ? ${if (into) "undefined" else "null"} : ${this.crossing("_v", v, into)})(${e})`
+		}
+		return e
 	}
 
 	/// The intrinsic name of builtin/, of the type args of env and result ret, in place; false if it is none.
@@ -906,7 +971,9 @@ class Js {
 	private value(d: i32): string {
 		const x = this.p.decls[d]
 		const ft = this.norm(x.type)
-		if (x.code == null) {
+		if (x.code == null && specifier(this.p.modules[x.module].path, this.file) != null) {
+			throw new CompileError(`js: ${this.name(d)}, of TypeScript typings, is called, not taken as a value`)
+		} else if (x.code == null) {
 			const h = this.name(d)
 			this.edge(`t:${ft}`, `h:${h}`)
 			const k = this.kindOf(this.p.b(ft))
@@ -1690,6 +1757,8 @@ const $cl = (f, e) => Object.assign(f.bind(null, e), { $e: e });
 const $trap = (w, f, p) => $h.trap(w, f, p);
 const $idx = (i, n, f, p) => { if (i < 0 || i >= n) $trap("index out of range", f, p); return i; };
 const $bytes = a => { let s = ""; for (let i = 0; i < a.length; i++) s += String.fromCharCode(a[i]); return s; };
+const $utf16 = s => new TextDecoder().decode(Uint8Array.from(s, c => c.charCodeAt(0)));
+const $latin1 = s => $bytes(new TextEncoder().encode(s));
 const $buf = new ArrayBuffer(8), $dv = new DataView($buf);
 const $bits32 = x => ($dv.setFloat32(0, x, true), BigInt($dv.getUint32(0, true)));
 const $bits64 = x => ($dv.setFloat64(0, x, true), $dv.getBigUint64(0, true));
