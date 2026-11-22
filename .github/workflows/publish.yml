@@ -1,9 +1,9 @@
 # Publishes the packages a run of ci.yml or bootstrap.yml built as the new edge, in the environment that alone has the
 # secrets, running no code of the repo's: signs macOS's package by the Developer ID, hardened, by rcodesign, of its
 # release checked by hash, letting the launcher still load the images bober links, signed ad hoc; has Apple notarize its
-# executables, by their hashes, so that Gatekeeper lets a download of them run; and uploads the packages to Backblaze's
-# bucket that dl.bober-lang.dev serves, under builds/<commit>/, cached for good, then the line naming their build,
-# edge/version, which bober update compares. Not cancelled by a newer run, which waits.
+# executables, by their hashes, so that Gatekeeper lets a download of them run; and replaces the packages of the
+# prerelease edge, then the line naming their build, version, which bober update compares, and moves the tag edge to
+# their commit. Not cancelled by a newer run, which waits. Its callers grant it contents: write.
 name: publish
 on: workflow_call
 
@@ -37,17 +37,11 @@ jobs:
           $t/rcodesign notary-submit --api-key-file $t/key.json --wait --max-wait-seconds 900 $t/bober.zip
           tar -czf bober-macOS-ARM64/bober.tar.gz bober
       - env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_KEY }}
-          AWS_ENDPOINT_URL: https://s3.eu-central-003.backblazeb2.com
-          AWS_DEFAULT_REGION: eu-central-003
-          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          for p in bober-*/; do cp $p/bober.tar.gz ${p%/}.tar.gz; done
+          gh release upload edge --clobber bober-*.tar.gz
           tar -xzOf bober-Linux-X64/bober.tar.gz bober/lib/version > version
-          set -- $(cat version)
-          for p in bober-*; do
-            aws s3 cp --cache-control "public, max-age=31536000, immutable" $p/bober.tar.gz s3://bober-releases/builds/$2/$p.tar.gz
-            # for bobers before builds/<commit>/
-            aws s3 cp --cache-control no-cache $p/bober.tar.gz s3://bober-releases/edge/$p.tar.gz
-          done
-          aws s3 cp --cache-control no-cache version s3://bober-releases/edge/version
+          gh release upload edge --clobber version
+          gh api -X PATCH repos/$GH_REPO/git/refs/tags/edge -f sha=$GITHUB_SHA -F force=true > /dev/null
