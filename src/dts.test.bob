@@ -1,0 +1,247 @@
+import { HashMap } from "../std/collections/hashmap"
+import { CompileError } from "./error"
+import { bind, lex, located, specifier } from "./dts"
+
+const files = fixture()
+
+function fixture(): HashMap[string, string] {
+	const files = new HashMap[string, string]()
+	files.set("p/node_modules/pkg/package.json", `{ "name": "pkg", "types": "lib/index.d.ts", "version": "1.0.0" }`)
+	files.set("p/node_modules/pkg/lib/index.d.ts",
+		`import { Options } from './options.js';
+export type { Options };
+export * from './more.js';
+export { summary } from './summary.js';
+export * as platform from './platform.js';
+/** Gets an input. */
+export declare function getInput(name: string, options?: Options): string;
+export declare function setOutput(name: string, value: any): void;
+export declare function setFailed(message: string | Error): void;
+export declare function restore(paths: string[], key: string, keys?: readonly string[]): Promise<string | undefined>;
+export declare function save(paths: Array<string>): Promise<number>;
+export declare function group<T>(name: string, fn: () => Promise<T>): Promise<T>;
+export declare function log(...xs: string[]): void;
+export declare function two(x: string): void;
+export declare function two(x: number): void;
+export declare enum ExitCode { Success = 0, Failure = 1, Later }
+export declare enum Kind { A = "a", B = 'b' }
+export declare const PREFIX = "denied:";
+export declare const COUNT = -3;
+export declare let computed: string;
+export type Level = 'debug' | 'info' | "warning";
+export type Loop = Loop[] | string;
+export declare class ValidationError extends Error { constructor(message: string); }
+export interface Annotation extends Base {
+    title?: string;
+    line: number | undefined;
+    kind: Kind;
+    default?: boolean;
+}
+interface Base { file: string }
+export interface Indexed { [key: string]: string }
+export interface Method { run(): void }
+export type Cond<T> = T extends string ? 'a' : T extends infer U extends number ? U : never;
+export type Mapped = { readonly [K in keyof Base]?: Base[K] };
+export type Tmpl = \`v\${number}.\${string}\`;
+export type Fn = (a: string, b?: number) => void;
+export type Ctor = abstract new (...args: any[]) => object;
+export type Tup = [a: string, b?: number, ...rest: boolean[]];
+export type Q = typeof import('./x.js').y;
+export type Key = keyof Annotation;
+export type Sym = unique symbol;
+export type Pred = (x: unknown) => x is string;
+export declare function guard(x: unknown): asserts x is string;
+export declare function overloaded(): void;
+declare namespace NS { const v: string; }
+declare global { interface Window { core: string } }
+declare module 'other' { export function f(): void; }
+export declare function either(x: string | number): void;
+export declare function bad(x: Indexed): void;
+export {};
+	`)
+	files.set("p/node_modules/pkg/lib/options.d.ts",
+		`export interface Options { required?: boolean; trim?: boolean }
+	`)
+	files.set("p/node_modules/pkg/lib/more.d.ts",
+		`export declare function more(): boolean;
+export declare function broken(x: ): void;
+export declare function after(): string;
+	`)
+	files.set("p/node_modules/pkg/lib/summary.d.ts",
+		`declare class Summary { write(): Promise<Summary>; }
+export declare const summary: Summary;
+	`)
+	files.set("p/node_modules/@ns/b/package.json", `{ "typings": "index.d.ts" }`)
+	files.set("p/node_modules/@ns/b/index.d.ts", `export { getInput as input } from 'pkg';
+	`)
+	files.set("p/local.d.ts", `export declare function hello(to: string): string;
+	`)
+	return files
+}
+
+function b(at: string, ...names: string[]): string {
+	try {
+		return bind(at, names, p => files.get(p))
+	} catch (e: CompileError) {
+		return e.msg
+	}
+}
+
+const pkg = "p/node_modules/pkg"
+
+test "a package is found in the nearest node_modules above" {
+	assert located("p/src/a/main.bob", "pkg", p => files.get(p)) == pkg
+	assert located("p/main.bob", "@ns/b", p => files.get(p)) == "p/node_modules/@ns/b"
+	assert located("p/src/main.bob", "./x/../local.d.ts", p => files.get(p)) == "p/src/local.d.ts"
+	assert located("q/main.bob", "pkg", p => files.get(p)) == "q/node_modules/pkg"
+}
+
+test "JavaScript imports a package by name, a file by its .js" {
+	assert specifier(`${pkg}: getInput @TypeScript`, "build/a.mjs") == "pkg"
+	assert specifier("p/node_modules/@ns/b: input @TypeScript", "build/a.mjs") == "@ns/b"
+	assert specifier("p/local.d.ts: hello @TypeScript", "build/a.mjs") == "../p/local.js"
+	assert specifier("p/local.d.ts: hello @TypeScript", "a.mjs") == "./p/local.js"
+	assert specifier("stdio.h: puts", "build/a.mjs") == null
+}
+
+test "functions" {
+	assert b(pkg, "getInput")
+		== "export interface Options { required: bool | null; trim: bool | null }\n"
+		+ "export function getInput(name: string, options: Options | null = null): string\n"
+	assert b(pkg, "setOutput", "setFailed")
+		== "export function setOutput(name: string, value: string)\n" + "export function setFailed(message: string)\n"
+	assert b(pkg, "restore")
+		== "export function restore(paths: string[], key: string, keys: string[] | null = null): "
+		+ "string | null @Promise\n"
+	assert b(pkg, "save") == "export function save(paths: string[]): f64 @Promise\n"
+	assert b(pkg, "more") == "export function more(): bool\n"
+	assert b("p/local.d.ts", "hello") == "export function hello(to: string): string\n"
+	assert b("p/node_modules/@ns/b", "input")
+		== "export interface Options { required: bool | null; trim: bool | null }\n"
+		+ "export function input(name: string, options: Options | null = null): string\n"
+}
+
+test "enums, consts, types and interfaces" {
+	assert b(pkg, "ExitCode")
+		== "export const ExitCode_Success: i32 = 0\nexport const ExitCode_Failure: i32 = 1\n"
+		+ "export const ExitCode_Later: i32 = 2\nexport class ExitCode { "
+		+ "static readonly Success: ExitCode_Success = ExitCode_Success; "
+		+ "static readonly Failure: ExitCode_Failure = ExitCode_Failure; "
+		+ "static readonly Later: ExitCode_Later = ExitCode_Later }\n"
+	assert b(pkg, "Kind")
+		== "export class Kind { static readonly A: \"a\" = \"a\"; static readonly B: \"b\" = \"b\" }\n"
+	assert b(pkg, "PREFIX", "COUNT") == "export const PREFIX = \"denied:\"\nexport const COUNT: f64 = -3.0\n"
+	assert b(pkg, "Level", "Tmpl")
+		== "export type Level = \"debug\" | \"info\" | \"warning\"\nexport type Tmpl = string\n"
+	assert b(pkg, "Annotation", "Options")
+		== "export interface Base { file: string }\nexport interface Annotation { ...Base; title: string | null; "
+		+ "line: f64 | null; kind: \"a\" | \"b\"; default: bool | null }\n"
+		+ "export interface Options { required: bool | null; trim: bool | null }\n"
+}
+
+test "what bober has no type for is not imported, the error naming it and where" {
+	assert b(pkg, "group") == "group: p/node_modules/pkg/lib/index.d.ts:12:1: a generic function"
+	assert b(pkg, "log") == "log: p/node_modules/pkg/lib/index.d.ts:13:32: a rest parameter"
+	assert b(pkg, "two") == "two: p/node_modules/pkg/lib/index.d.ts:15:1: an overloaded function"
+	assert b(pkg, "computed") == "computed: p/node_modules/pkg/lib/index.d.ts:20:20: a variable"
+	assert b(pkg, "Loop") == "Loop: p/node_modules/pkg/lib/index.d.ts:22:1: a recursive type alias"
+	assert b(pkg, "ValidationError") == "ValidationError: p/node_modules/pkg/lib/index.d.ts:23:1: a class"
+	assert b(pkg, "Indexed") == "Indexed: p/node_modules/pkg/lib/index.d.ts:31:28: an index signature"
+	assert b(pkg, "Method") == "Method: p/node_modules/pkg/lib/index.d.ts:32:27: a method"
+	assert b(pkg, "Cond") == "Cond: p/node_modules/pkg/lib/index.d.ts:33:1: a generic type alias"
+	assert b(pkg, "Mapped") == "Mapped: p/node_modules/pkg/lib/index.d.ts:34:22: a mapped type"
+	assert b(pkg, "Fn") == "Fn: p/node_modules/pkg/lib/index.d.ts:36:18: a function type"
+	assert b(pkg, "Ctor") == "Ctor: p/node_modules/pkg/lib/index.d.ts:37:20: a constructor type"
+	assert b(pkg, "Tup") == "Tup: p/node_modules/pkg/lib/index.d.ts:38:19: a tuple"
+	assert b(pkg, "Q") == "Q: p/node_modules/pkg/lib/index.d.ts:39:17: a typeof type"
+	assert b(pkg, "Key") == "Key: p/node_modules/pkg/lib/index.d.ts:40:19: a keyof type"
+	assert b(pkg, "Sym") == "Sym: p/node_modules/pkg/lib/index.d.ts:41:19: a unique symbol"
+	assert b(pkg, "Pred") == "Pred: p/node_modules/pkg/lib/index.d.ts:42:20: a function type"
+	assert b(pkg, "guard") == "guard: p/node_modules/pkg/lib/index.d.ts:43:44: a type predicate"
+	assert b(pkg, "either") == "either: p/node_modules/pkg/lib/index.d.ts:48:35: a union of string and f64"
+	assert b(pkg, "bad") == "bad: p/node_modules/pkg/lib/index.d.ts:31:28: an index signature"
+	assert b(pkg, "summary") == "summary: p/node_modules/pkg/lib/summary.d.ts:2:22: a variable"
+	assert b(pkg, "platform") == "platform: p/node_modules/pkg/lib/index.d.ts:5:8: a namespace"
+	assert b(pkg, "NS") == "NS: p/node_modules/pkg/lib/index.d.ts:45:1: a namespace"
+	assert b(pkg, "after") == "export function after(): string\n"
+	assert b(pkg, "nothing") == "nothing: not declared"
+	assert b("p/node_modules/none", "x") == "p/node_modules/none has no typings"
+}
+
+test "a statement that does not parse is skipped, the first error kept for a name not found" {
+	files.set("p/bad.d.ts",
+		`export declare function ok(): void;
+export declare function oops(x: ): void;
+export declare function fine(): void;
+`)
+	assert b("p/bad.d.ts", "fine") == "export function fine()\n"
+	assert b("p/bad.d.ts", "oops") == "oops: not declared; p/bad.d.ts:2:33: expected a type, not )"
+}
+
+test "the lexer matches brackets and takes templates whole" {
+	const ts = lex("type T = `a${`b${'}'}`}` | { x: [1] }")
+	assert ts.map(t => t.k).join(" ") == "id id = tmpl | { id : [ num ] } eof"
+	assert ts[5].close == 11 && ts[8].close == 10
+}
+
+test "merged declarations, overridden fields, cycles and enums of two kinds" {
+	files.set("p/m.d.ts",
+		`export * from './m.js';
+export { a as b, b as a } from './m.js';
+export declare function core(x: string, this: Window): void;
+export declare namespace core { const v: string; }
+interface Base { x: number; y: string }
+export interface Point extends Base { x: 1; z: { w: boolean } }
+export interface Point { v: string }
+export interface Node { next: Node | null }
+export interface Self extends Self {}
+export declare enum Mixed { A = 1, B = "b" }
+export declare enum Auto { A = "a", B }
+export declare function f(): void export declare function g(): void;
+`)
+	assert b("p/m.d.ts", "core") == "export function core(x: string)\n"
+	assert b("p/m.d.ts", "Point")
+		== "export interface Base { x: f64; y: string }\n"
+		+ "export interface Point { ...Base; x: f64; z: { w: bool }; v: string }\n"
+	assert b("p/m.d.ts", "Node") == "export interface Node { next: Node | null }\n"
+	assert b("p/m.d.ts", "Mixed") == "Mixed: p/m.d.ts:10:1: a heterogeneous enum"
+	assert b("p/m.d.ts", "Auto") == "Auto: p/m.d.ts:11:1: a heterogeneous enum"
+	assert b("p/m.d.ts", "a") == "a: not declared; p/m.d.ts:12:35: expected ;, not export"
+}
+
+test "an interface is declared once, by a name no other has, a param's union skipping one that fails" {
+	files.set("p/i.d.ts",
+		`import { Shape as Other } from './j.js';
+export interface Shape { other: Other; kind: Mode; parent: Group | null }
+export interface Group extends Shape { shapes: Shape[] }
+export enum Mode { On = 1, Off = 3 }
+export declare function draw(a: Shape, b: Shape, m?: Mode): void;
+export interface Bad { ok: Shape; f: () => void }
+export declare function either(x: Bad | string): void;
+export declare function mixed(x: Mode | "none"): void;
+`)
+	files.set("p/j.d.ts", `export interface Shape { w: number }
+	`)
+	const shape = "export interface Shape2 { w: f64 }\nexport const Mode_On: i32 = 1\nexport const Mode_Off: i32 = 3\n"
+		+ "export interface Group { ...Shape; shapes: Shape[] }\n"
+		+ "export interface Shape { other: Shape2; kind: Mode_On | Mode_Off; parent: Group | null }\n"
+	assert b("p/i.d.ts", "draw")
+		== shape + "export function draw(a: Shape, b: Shape, m: Mode_On | Mode_Off | null = null)\n"
+	assert b("p/i.d.ts", "Shape", "Mode")
+		== shape
+		+ "export class Mode { static readonly On: Mode_On = Mode_On; static readonly Off: Mode_Off = Mode_Off }\n"
+	assert b("p/i.d.ts", "either") == "export function either(x: string)\n"
+	assert b("p/i.d.ts", "Bad") == "Bad: p/i.d.ts:6:38: a function type"
+	assert b("p/i.d.ts", "mixed") == "mixed: p/i.d.ts:8:34: a union of Mode_On | Mode_Off and \"none\""
+}
+
+test "an optional parameter or property of a type bober has none for is left out, a parameter with those after it" {
+	files.set("p/o.d.ts",
+		`export interface Opts { cwd?: string; env?: { [key: string]: string }; out?: stream.Writable; on?(x: string): void }
+export declare function run(cmd: string, args?: string[], headers?: Headers, verbose?: boolean): Promise<number>;
+export declare function must(headers: Headers): void;
+`)
+	assert b("p/o.d.ts", "Opts") == "export interface Opts { cwd: string | null }\n"
+	assert b("p/o.d.ts", "run") == "export function run(cmd: string, args: string[] | null = null): f64 @Promise\n"
+	assert b("p/o.d.ts", "must") == "must: p/o.d.ts:3:39: Headers is not declared"
+}

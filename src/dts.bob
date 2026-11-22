@@ -1,0 +1,1465 @@
+//! What names imported from an npm package are in bober (§3.1): the declarations its TypeScript typings give them,
+//! written as a module of declarations without a body, as a C header's are (src/c/bind.bob). The typings are read
+//! in one pass with bounded lookahead and no type computed: each declaration is parsed, or skipped by its brackets,
+//! and only those imported, and the types they name, need to mean something in bober.
+//!
+//! ## TypeScript imports
+//!
+//! An import tagged `@TypeScript` takes names, which it shall list, from the typings of npm package or `.d.ts` file
+//! String. A package is the one in the `node_modules` directory of the importing file's directory or the nearest above
+//! that has it, its typings the file its `package.json` names as `types` or `typings`, else its `index.d.ts`; a path
+//! starting with `.` names a file relative to the importing one. A name is one that file declares, imports, or exports
+//! from another, `./x.js` being `./x.d.ts`. Only a program compiled to JavaScript (-js) calls the functions, importing
+//! the package, or the `.js` file beside the `.d.ts`.
+//!
+//! A function, not overloaded or generic, is a function of the types of its parameters and result; one returning a
+//! `Promise<T>` returns T, tagged `@Promise`, as each call awaits the promise. An interface is an interface of its
+//! properties, embedding those it extends, declared once by its name, or a number added where another has it; an
+//! enumeration a class of a static field for each member, of the member's literal type, which an integer has only as
+//! the value of an `i32` const, one declared for each, and a type naming it, which bober's cannot, the union of those;
+//! a const of a literal its value; a type alias the type it names. TypeScript's types are bober's so:
+//!
+//! | TypeScript                                                | bober                                   |
+//! |-----------------------------------------------------------|-----------------------------------------|
+//! | `string`, a template literal type                         | `string`                                |
+//! | a string literal type of no escapes                       | that string literal type                |
+//! | `number`, a number literal type                           | `f64`                                   |
+//! | `boolean`, `true`, `false`                                | `bool`                                  |
+//! | `null`, `undefined`, `void`                               | `null`                                  |
+//! | `T[]`, `readonly T[]`, `Array<T>`                         | `T[]`                                   |
+//! | a union of one type, or of literals of one kind, and null | `T`, `T | null`, `"a" | "b"`            |
+//! | an interface                                              | an interface                            |
+//! | an object type literal                                    | an object type                          |
+//! | an enum, as a type                                        | the union of its members' literal types |
+//!
+//! An optional parameter or property is of `T | null`, the parameter defaulting to `null`; one of a type bober has none
+//! for is left out, a parameter with those after it. A parameter takes a part of what JavaScript would: a union of
+//! members bober has no type for takes the others, and `any` or `unknown` takes a `string`. A name whose declaration
+//! needs another type, as a generic, a class or a function type, shall not be imported, and the error names that
+//! construct and where it is. A value crosses between bober and JavaScript as its type says: a string as the UTF-8 its
+//! bytes encode, an object as one of its fields by name, and null as undefined.
+//!
+//! ```
+//! import { getInput, setFailed } from "@actions/core" @TypeScript
+//! import { restoreCache } from "@actions/cache" @TypeScript   // restoreCache(...): string | null @Promise
+//! import * as core from "@actions/core" @TypeScript           // error: names are listed
+//! import { group } from "@actions/core" @TypeScript           // error: a generic function
+//! const hit = restoreCache(["build"], `deps-${getInput("key")}`)   // awaited
+//! ```
+
+import { endsWith, indexOf, lastIndexOf, startsWith } from "../std/algo"
+
+import { apostrophe, backslash, backtick, dollar, dot, equal, greater, isAlphanumeric, isDigit, isSpace, lbrace, lf,
+	quote as dquote, rbrace, slash, star, underscore } from "../std/ascii"
+
+import { HashMap } from "../std/collections/hashmap"
+import { Rest, Unknown, decode } from "../std/encoding/json"
+import { clean, dir, isAbs, join, rel } from "../std/fs/path"
+import { ParseError, parseInt, quoted, split } from "../std/string"
+import { CompileError } from "./error"
+import { Lexer, SyntaxError } from "./lex"
+
+/// The typings spec names from importer: a .d.ts file relative to it, or the directory of the package in the
+/// node_modules of importer's directory or the nearest above that has it, else of importer's.
+export function located(importer: string, spec: string, read: (path: string) => string | null): string {
+	if (startsWith(spec, ".")) {
+		return clean(join(dir(importer), spec))
+	}
+	let d = dir(importer)
+	while (read(join(d, "node_modules", spec, "package.json")) == null) {
+		if (dir(d) == d) {
+			return join(dir(importer), "node_modules", spec)
+		}
+		d = dir(d)
+	}
+	return join(d, "node_modules", spec)
+}
+
+/// The declarations of names, as the typings at, located, export them. Throws a message for a name they lack or
+/// bober cannot declare.
+export function bind(at: string, names: string[], read: (path: string) => string | null): string {
+	const b = new Binder(read, names)
+	const entry = b.file(if (endsWith(at, ".ts")) at else b.typings(at))
+	if (entry == null) {
+		throw new CompileError(`${at} has no typings`)
+	}
+	for (const n of names) {
+		try {
+			b.bind(entry!, n)
+		} catch (e: Unbindable) {
+			throw new CompileError(`${n}: ${e.msg}`)
+		}
+	}
+	return b.out
+}
+
+/// What the JavaScript module out imports the module at path from, which Modules.header makes "<located>: <names>
+/// @TypeScript": the package's name, or the .js file of the .d.ts; null for another module.
+export function specifier(path: string, out: string): string | null {
+	if (!endsWith(path, " @TypeScript")) {
+		return null
+	}
+	const at = path.slice(0, indexOf(path, ": "))
+	if (!endsWith(at, ".ts")) {
+		return at.slice(lastIndexOf(at, "node_modules/") + 13, at.length)
+	}
+	const js = `${at.slice(0, at.length - (if (endsWith(at, ".d.ts")) 5 else 3))}.js`
+	const r = rel(dir(out), js) ?? js
+	return if (startsWith(r, "../") || isAbs(r)) r else `./${r}`
+}
+
+/// Why bober cannot declare a name.
+class Unbindable {
+	msg: string
+
+	constructor(msg: string, sc: Scope | null = null, pos = 0) {
+		this.msg = if (sc == null) msg else `${where(sc!, pos)}: ${msg}`
+	}
+}
+
+/// path:line:col of pos in sc's file.
+function where(sc: Scope, pos: i32): string {
+	let line = 1
+	let col = 1
+	for (const i of 0 ... pos - 1) {
+		col = if (sc.src[i] == lf) 1 else col + 1
+		line += if (sc.src[i] == lf) 1 else 0
+	}
+	return `${sc.path}:${line}:${col}`
+}
+
+/// A file's top-level declarations, or a namespace's, by name, and where else its exports are.
+class Scope {
+	path: string
+	src: string
+	outer: Scope | null
+	names = new HashMap[string, Decl[]]()
+	/// The modules it exports * from, and the name it exports as =.
+	stars: string[] = []
+	assigned = ""
+	/// The first statement that failed to parse, or "".
+	error = ""
+
+	constructor(path: string, src: string, outer: Scope | null = null) {
+		this.path = path
+		this.src = src
+		this.outer = outer
+	}
+
+	add(d: Decl) {
+		const ds = this.names.get(d.name)
+		if (ds == null) {
+			this.names.set(d.name, [d])
+		} else {
+			ds!.push(d)
+		}
+	}
+}
+
+/// A declaration: k is "function", "interface", "enum", "type", "var", "alias" (an import or export of another's
+/// name), or what bober has none of, as "a class".
+class Decl {
+	k: string
+	name: string
+	pos: i32
+	sc: Scope
+	/// A function's signature, an interface's object type, a type alias's type, a var's type or literal value.
+	t: Ty | null = null
+	generic = false
+	/// An enum's members, with their values: a literal, or null for one more than the last.
+	values: [string, Ty | null][] = []
+	/// An alias's module ("" for this one) and name there; a namespace's declarations.
+	from = ""
+	orig = ""
+	inner: Scope | null = null
+
+	constructor(k: string, name: string, pos: i32, sc: Scope) {
+		this.k = k
+		this.name = name
+		this.pos = pos
+		this.sc = sc
+	}
+}
+
+/// A type: k is "ref" (s and type args), "array", "union", "kw" (a keyword type s), "str", "num" and "bool" (a
+/// literal s), "tmpl" (a template literal type), "fn" (params, and args its result), "object" (params its members,
+/// args what it extends), else what bober has none of, as "a conditional type".
+class Ty {
+	k: string
+	pos: i32
+	s = ""
+	args: Ty[] = []
+	params: Part[] = []
+	/// Whether a signature has type params.
+	generic = false
+
+	constructor(k: string, pos: i32, s = "") {
+		this.k = k
+		this.pos = pos
+		this.s = s
+	}
+}
+
+/// A param ("param", or what bober has none of, as "a rest parameter") or member ("prop", or as "a method").
+class Part {
+	k: string
+	name: string
+	pos: i32
+	opt = false
+	t: Ty | null = null
+
+	constructor(k: string, name: string, pos: i32) {
+		this.k = k
+		this.name = name
+		this.pos = pos
+	}
+}
+
+/// A token: k is "id", "str" (s its contents), "num", "tmpl", "eof", else the punctuator; an opening bracket's close
+/// is the index of the one closing it.
+class Tok {
+	k: string
+	s: string
+	pos: i32
+	/// Whether a line break comes before it.
+	nl: bool
+	close = -1
+
+	constructor(k: string, s: string, pos: i32, nl: bool) {
+		this.k = k
+		this.s = s
+		this.pos = pos
+		this.nl = nl
+	}
+}
+
+class Syntax {
+	msg: string
+	pos: i32
+
+	constructor(msg: string, pos: i32) {
+		this.msg = msg
+		this.pos = pos
+	}
+}
+
+/// The tokens of src, its brackets matched, ending with "eof".
+function lex(src: string): Tok[] throws Syntax {
+	const ts: Tok[] = []
+	const open: i32[] = []
+	let i = 0
+	let nl = false
+	while (i < src.length) {
+		const c = src[i]
+		const start = i
+		if (isSpace(c)) {
+			nl = nl || c == lf
+			i++
+			continue
+		}
+		if (c == slash && i + 1 < src.length && src[i + 1] == slash) {
+			while (i < src.length && src[i] != lf) {
+				i++
+			}
+			continue
+		}
+		if (c == slash && i + 1 < src.length && src[i + 1] == star) {
+			const end = indexOf(src, "*/", i + 2)
+			i = if (end < 0) src.length else end + 2
+			nl = nl || indexOf(src.slice(start, i), "\n") >= 0
+			continue
+		}
+		let k = "id"
+		if (word(c) && !isDigit(c)) {
+			while (i < src.length && word(src[i])) {
+				i++
+			}
+		} else if (isDigit(c) || c == dot && i + 1 < src.length && isDigit(src[i + 1])) {
+			k = "num"
+			while (i < src.length && (word(src[i]) || src[i] == dot)) {
+				i++
+			}
+		} else if (c == dquote || c == apostrophe) {
+			k = "str"
+			i = quote(src, i)
+		} else if (c == backtick) {
+			k = "tmpl"
+			i = template(src, i)
+		} else {
+			k = if (c == dot && i + 2 < src.length && src[i + 1] == dot && src[i + 2] == dot) "..."
+				else if (c == equal && i + 1 < src.length && src[i + 1] == greater) "=>"
+				else src.slice(i, i + 1)
+			i += k.length
+		}
+		const s = if (k == "str") src.slice(start + 1, i - 1) else src.slice(start, i)
+		const t = new Tok(k, s, start, nl)
+		nl = false
+		if (k == "(" || k == "[" || k == "{") {
+			open.push(ts.length)
+		} else if (k == ")" || k == "]" || k == "}") {
+			if (open.length == 0 || ts[open[open.length - 1]].k != pair(k)) {
+				throw new Syntax(`unbalanced ${k}`, start)
+			}
+			ts[open.pop()].close = ts.length
+		}
+		ts.push(t)
+	}
+	if (open.length > 0) {
+		throw new Syntax(`unclosed ${ts[open[open.length - 1]].k}`, ts[open[open.length - 1]].pos)
+	}
+	ts.push(new Tok("eof", "", src.length, true))
+	return ts
+}
+
+function pair(close: string): string { return if (close == ")") "(" else if (close == "]") "[" else "{" }
+/// Whether c may be in a name or number.
+function word(c: u8): bool { return isAlphanumeric(c) || c == underscore || c == dollar || c >= 128 }
+
+/// Past the string literal at i.
+function quote(src: string, i: i32): i32 throws Syntax {
+	const q = src[i]
+	let j = i + 1
+	while (j < src.length && src[j] != q && src[j] != lf) {
+		j += if (src[j] == backslash) 2 else 1
+	}
+	if (j >= src.length || src[j] != q) {
+		throw new Syntax("unterminated string", i)
+	}
+	return j + 1
+}
+
+/// Past the template literal at i, with the types in its ${…}, which may hold strings and templates.
+function template(src: string, i: i32): i32 throws Syntax {
+	let j = i + 1
+	while (j < src.length && src[j] != backtick) {
+		if (src[j] == backslash) {
+			j += 2
+		} else if (src[j] == dollar && j + 1 < src.length && src[j + 1] == lbrace) {
+			let depth = 1
+			j += 2
+			while (j < src.length && depth > 0) {
+				const c = src[j]
+				depth += if (c == lbrace) 1 else if (c == rbrace) -1 else 0
+				j = if (c == backtick) template(src, j)
+					else if (c == dquote || c == apostrophe) quote(src, j)
+					else j + 1
+			}
+		} else {
+			j++
+		}
+	}
+	if (j >= src.length) {
+		throw new Syntax("unterminated template", i)
+	}
+	return j + 1
+}
+
+/// The words that start a statement, where one that failed is skipped to.
+const starts = ["export", "declare", "import", "function", "interface", "class", "type", "const", "let", "var", "enum",
+	"namespace", "module", "abstract", "global"]
+
+/// The keyword types.
+const keywords = ["string", "number", "boolean", "void", "null", "undefined", "any", "unknown", "never", "object",
+	"symbol", "bigint", "this"]
+
+/// A recursive descent of a .d.ts, types by precedence, never looking further ahead than a few tokens or past a
+/// bracketed group, by the index of its close.
+class Reader {
+	private ts: Tok[]
+	private i = 0
+	/// Whether a conditional type may not start here, as in another's extends clause.
+	private noCond = false
+
+	constructor(ts: Tok[]) { this.ts = ts }
+	private peek(n = 0): Tok { return this.tok(this.i + n) }
+	private tok(at: i32): Tok { return this.ts[if (at < this.ts.length) at else this.ts.length - 1] }
+
+	/// Whether the token n ahead is punctuator or word s.
+	private at(s: string, n = 0): bool {
+		const t = this.peek(n)
+		return t.k == s || t.k == "id" && t.s == s
+	}
+
+	private eat(s: string): bool {
+		if (!this.at(s)) {
+			return false
+		}
+		this.i++
+		return true
+	}
+
+	private want(s: string) throws Syntax {
+		if (!this.eat(s)) {
+			throw this.fail(`expected ${s}`)
+		}
+	}
+
+	/// msg, at the token ahead.
+	private fail(msg: string): Syntax {
+		const t = this.peek()
+		return new Syntax(if (t.k == "eof") `${msg} at the end` else `${msg}, not ${t.s}`, t.pos)
+	}
+
+	private ident(): string throws Syntax {
+		if (this.peek().k != "id") {
+			throw this.fail("expected a name")
+		}
+		this.i++
+		return this.peek(-1).s
+	}
+
+	/// Past the group at the opening bracket ahead.
+	private jump() { this.i = this.peek().close + 1 }
+
+	/// Parses statements into sc up to the end, or a namespace's to its }; one that fails is skipped, the first error
+	/// kept.
+	statements(sc: Scope) {
+		while (this.peek().k != "eof" && !(sc.outer != null && this.at("}"))) {
+			const start = this.i
+			try {
+				this.statement(sc)
+			} catch (e: Syntax) {
+				if (sc.error == "") {
+					sc.error = `${where(sc, e.pos)}: ${e.msg}`
+				}
+				this.i = start
+				this.noCond = false
+				this.skip()
+			}
+		}
+	}
+
+	/// Past the statement ahead: to its ;, or a line starting another, or the } closing its namespace.
+	private skip() {
+		const start = this.i
+		while (true) {
+			const t = this.peek()
+			if (t.k == "eof" || t.k == "}" || this.i > start && t.nl && t.k == "id" && starts.includes(t.s)) {
+				return
+			}
+			this.i = if (t.close >= 0) t.close + 1 else this.i + 1
+			if (t.k == ";") {
+				return
+			}
+		}
+	}
+
+	/// Past the ; ending a statement or member, which a line break or } may stand for.
+	private end() throws Syntax {
+		if (!this.eat(";") && !this.at("}") && !this.peek().nl) {
+			throw this.fail("expected ;")
+		}
+	}
+
+	private statement(sc: Scope) throws Syntax {
+		const pos = this.peek().pos
+		if (this.eat(";")) {
+			return
+		}
+		if (this.eat("export")) {
+			if (this.eat("=")) {
+				sc.assigned = this.ident()
+				return this.skip()
+			}
+			if (this.eat("as")) {
+				return this.skip()
+			}
+			if (this.at("{") || this.at("*") || this.at("type") && (this.at("{", 1) || this.at("*", 1))) {
+				return this.exports(sc)
+			}
+			if (this.eat("default")) {
+				if (this.peek().k == "id" && !starts.includes(this.peek().s)) {
+					const d = new Decl("alias", "default", pos, sc)
+					d.orig = this.ident()
+					sc.add(d)
+					return this.skip()
+				}
+				return this.statement(sc)
+			}
+		}
+		while ((this.at("declare") || this.at("abstract")) && this.peek(1).k == "id") {
+			this.i++
+		}
+		const t = this.peek()
+		const k = if (t.k == "id") t.s else ""
+		this.i++
+		switch (k) {
+			case "import": this.imports(sc)
+			case "function":
+				const d = new Decl("function", if (this.at("(") || this.at("<")) "default" else this.ident(), pos, sc)
+				d.t = this.signature()
+				sc.add(d)
+				this.end()
+			case "interface", "class":
+				const d = new Decl(if (k == "class") "a class" else k,
+					if (this.peek().k == "id" && !this.at("extends") && !this.at("implements")) this.ident()
+					else "default", pos, sc)
+				d.generic = this.typeParams()
+				d.t = new Ty("object", this.peek().pos)
+				while (this.eat("extends") || this.eat("implements") || this.eat(",")) {
+					d.t!.args.push(this.union())
+				}
+				if (k == "interface") {
+					d.t!.params = this.members()
+				} else {
+					this.want("{")
+					this.i = this.peek(-1).close + 1
+				}
+				sc.add(d)
+			case "enum": this.enumeration(sc, pos)
+			case "const", "let", "var":
+				if (k == "const" && this.eat("enum")) {
+					return this.enumeration(sc, pos)
+				}
+				this.vars(sc)
+			case "type":
+				const d = new Decl("type", this.ident(), pos, sc)
+				d.generic = this.typeParams()
+				this.want("=")
+				d.t = this.type()
+				sc.add(d)
+				this.end()
+			case "namespace", "module", "global":
+				const name = if (k == "global" || this.peek().k == "str") "" else this.ident()
+				this.eat("str") // an ambient module's name
+				while (this.eat(".")) {
+					this.ident()
+				}
+				if (!this.at("{")) {
+					return this.end()
+				}
+				const ds = if (name == "") null else sc.names.get(name)
+				let d = ds?.find(d => d.inner != null) ?? null
+				if (d == null) {
+					d = new Decl("a namespace", name, pos, sc)
+					d!.inner = new Scope(sc.path, sc.src, sc)
+					if (name != "") {
+						sc.add(d!)
+					}
+				}
+				this.i++
+				this.statements(d!.inner!)
+				this.want("}")
+			default:
+				this.i--
+				throw this.fail("expected a declaration")
+		}
+	}
+
+	/// After import: names from a module, a default, or a namespace.
+	private imports(sc: Scope) throws Syntax {
+		if (this.at("type") && !this.at("from", 1) && !this.at("=", 1) && !this.at(",", 1)) {
+			this.i++
+		}
+		if (this.peek().k == "str") {
+			return this.skip()
+		}
+		const pos = this.peek().pos
+		const named: [string, string][] = []
+		if (this.peek().k == "id") {
+			const name = this.ident()
+			if (this.at("=")) {
+				sc.add(new Decl("a namespace", name, pos, sc))
+				return this.skip()
+			}
+			named.push(["default", name])
+			this.eat(",")
+		}
+		if (this.eat("*")) {
+			this.want("as")
+			sc.add(new Decl("a namespace", this.ident(), pos, sc))
+		} else if (this.at("{")) {
+			named.push(...this.specs())
+		}
+		this.want("from")
+		const from = this.module()
+		for (const [orig, name] of named) {
+			const d = new Decl("alias", name, pos, sc)
+			d.from = from
+			d.orig = orig
+			sc.add(d)
+		}
+		this.end()
+	}
+
+	/// After export: { names } [from module], * from module, or * as name from module.
+	private exports(sc: Scope) throws Syntax {
+		const pos = this.peek().pos
+		this.eat("type")
+		if (this.eat("*")) {
+			if (this.eat("as")) {
+				sc.add(new Decl("a namespace", this.ident(), pos, sc))
+				this.want("from")
+				this.module()
+			} else {
+				this.want("from")
+				sc.stars.push(this.module())
+			}
+			return this.end()
+		}
+		const named = this.specs()
+		const from = if (this.eat("from")) this.module() else ""
+		for (const [orig, name] of named) {
+			if (from != "" || orig != name) {
+				// else it exports a name declared here already
+				const d = new Decl("alias", name, pos, sc)
+				d.from = from
+				d.orig = orig
+				sc.add(d)
+			}
+		}
+		this.end()
+	}
+
+	private module(): string throws Syntax {
+		if (this.peek().k != "str") {
+			throw this.fail("expected a module")
+		}
+		this.i++
+		return this.peek(-1).s
+	}
+
+	/// { a, b as c, type d }: each name there and here.
+	private specs(): [string, string][] throws Syntax {
+		this.want("{")
+		const r: [string, string][] = []
+		while (!this.eat("}")) {
+			if (this.at("type") && this.peek(1).k == "id" && !this.at("as", 1)) {
+				this.i++
+			}
+			const orig = if (this.peek().k == "str") this.module() else this.ident()
+			r.push([orig, if (this.eat("as")) this.ident() else orig])
+			if (!this.eat(",")) {
+				this.want("}")
+				break
+			}
+		}
+		return r
+	}
+
+	private vars(sc: Scope) throws Syntax {
+		while (true) {
+			const d = new Decl("var", this.ident(), this.peek(-1).pos, sc)
+			d.t = if (this.eat(":")) this.type() else null
+			if (this.eat("=")) {
+				d.t = this.initializer()
+			}
+			sc.add(d)
+			if (!this.eat(",")) {
+				return this.end()
+			}
+		}
+	}
+
+	/// After =: a literal, else skipped to the next , ; or }, "a computed value".
+	private initializer(): Ty throws Syntax {
+		const t = this.peek()
+		const neg = t.k == "-" && this.peek(1).k == "num"
+		const lit = if (neg || t.k == "num") "num"
+			else if (t.k == "str") "str"
+			else if (this.at("true") || this.at("false")) "bool"
+			else ""
+		const n = if (neg) 2 else 1
+		if (lit != "" && (this.at(",", n) || this.at(";", n) || this.at("}", n) || this.peek(n).nl)) {
+			this.i += n
+			return new Ty(lit, t.pos, if (neg) `-${this.peek(-1).s}` else this.peek(-1).s)
+		}
+		while (!this.at(",") && !this.at(";") && !this.at("}") && this.peek().k != "eof") {
+			this.i = if (this.peek().close >= 0) this.peek().close + 1 else this.i + 1
+		}
+		return new Ty("a computed value", t.pos)
+	}
+
+	private enumeration(sc: Scope, pos: i32) throws Syntax {
+		const d = new Decl("enum", this.ident(), pos, sc)
+		this.want("{")
+		while (!this.eat("}")) {
+			const name = if (this.peek().k == "str") this.module() else this.ident()
+			d.values.push([name, if (this.eat("=")) this.initializer() else null])
+			if (!this.eat(",")) {
+				this.want("}")
+				break
+			}
+		}
+		sc.add(d)
+	}
+
+	/// [<T, …>] (params) [: type], as a "fn".
+	private signature(): Ty throws Syntax {
+		const t = new Ty("fn", this.peek().pos)
+		t.generic = this.typeParams()
+		t.params = this.params()
+		if (this.eat(":")) {
+			t.args.push(this.type())
+		}
+		return t
+	}
+
+	/// <[in] [out] [const] T [extends C] [= D], …>, if there; whether there.
+	private typeParams(): bool throws Syntax {
+		if (!this.eat("<")) {
+			return false
+		}
+		while (!this.eat(">")) {
+			while ((this.at("in") || this.at("out") || this.at("const")) && this.peek(1).k == "id") {
+				this.i++
+			}
+			this.ident()
+			if (this.eat("extends")) {
+				this.inner()
+			}
+			if (this.eat("=")) {
+				this.inner()
+			}
+			if (!this.eat(",")) {
+				this.want(">")
+				break
+			}
+		}
+		return true
+	}
+
+	/// The params of a signature, but this, which only types what a method is called on.
+	private params(): Part[] throws Syntax {
+		this.want("(")
+		const ps: Part[] = []
+		while (!this.eat(")")) {
+			const p = new Part(if (this.eat("...")) "a rest parameter" else "param", "", this.peek().pos)
+			if (this.at("{") || this.at("[")) {
+				this.jump() // a destructuring pattern
+			} else {
+				p.name = this.ident()
+			}
+			p.opt = this.eat("?")
+			p.t = if (this.eat(":")) this.inner() else null
+			if (p.name != "this") {
+				ps.push(p)
+			}
+			if (!this.eat(",")) {
+				this.want(")")
+				break
+			}
+		}
+		return ps
+	}
+
+	/// { member; … } of an interface or object type.
+	private members(): Part[] throws Syntax {
+		this.want("{")
+		const ms: Part[] = []
+		while (!this.eat("}")) {
+			ms.push(this.member())
+			if (!this.eat(",")) {
+				this.end()
+			}
+		}
+		return ms
+	}
+
+	private member(): Part throws Syntax {
+		const pos = this.peek().pos
+		let k = "prop"
+		while ((this.at("readonly") || this.at("get") || this.at("set"))
+			&& (this.peek(1).k == "id" || this.peek(1).k == "str" || this.peek(1).k == "num" || this.at("[", 1))) {
+			k = if (this.at("readonly")) k else "an accessor"
+			this.i++
+		}
+		if (this.at("[") && this.peek(1).k == "id" && this.at(":", 2)) {
+			this.jump()
+			this.want(":")
+			this.type()
+			return new Part("an index signature", "", pos)
+		}
+		if (this.at("(") || this.at("<") || this.at("new") && (this.at("(", 1) || this.at("<", 1))) {
+			const m = new Part(if (this.eat("new")) "a construct signature" else "a call signature", "", pos)
+			this.signature()
+			return m
+		}
+		const m = new Part(k, this.peek().s, pos)
+		if (this.at("[")) {
+			this.jump()
+			m.k = "a computed member"
+		} else if (this.peek().k == "str" || this.peek().k == "num" || this.peek().k == "id") {
+			this.i++
+		} else {
+			throw this.fail("expected a member")
+		}
+		m.opt = this.eat("?")
+		if (this.at("(") || this.at("<")) {
+			m.k = if (m.k == "prop") "a method" else m.k
+			this.signature()
+		} else if (this.eat(":")) {
+			m.t = this.type()
+		}
+		return m
+	}
+
+	/// A type: a function or constructor type, else a union, which an extends clause makes a conditional type.
+	type(): Ty throws Syntax {
+		const pos = this.peek().pos
+		const ctor = this.at("new") || this.at("abstract") && this.at("new", 1)
+		if (ctor || this.functionAhead()) {
+			this.i += if (!ctor) 0 else if (this.at("new")) 1 else 2
+			this.signature()
+			this.want("=>")
+			this.type()
+			return new Ty(if (ctor) "a constructor type" else "a function type", pos)
+		}
+		const t = this.union()
+		if (this.noCond || !this.at("extends")) {
+			return t
+		}
+		this.i++
+		this.noCond = true
+		this.type()
+		this.noCond = false
+		this.want("?")
+		this.type()
+		this.want(":")
+		this.type()
+		return new Ty("a conditional type", pos)
+	}
+
+	/// A type in brackets, where a conditional type may start again.
+	private inner(): Ty throws Syntax {
+		const no = this.noCond
+		this.noCond = false
+		const t = this.type()
+		this.noCond = no
+		return t
+	}
+
+	/// Whether a function type starts ahead: <, or ( then ), ..., or a param's name and what follows only one, as : or
+	/// ) =>.
+	private functionAhead(): bool {
+		if (this.at("<")) {
+			return true
+		}
+		if (!this.at("(")) {
+			return false
+		}
+		if (this.at(")", 1) || this.at("...", 1)) {
+			return true
+		}
+		const p = this.peek(1)
+		const after = if (p.k == "id") this.i + 2 else if (p.k == "{" || p.k == "[") p.close + 1 else -1
+		if (after < 0) {
+			return false
+		}
+		const a = this.tok(after).k
+		return a == ":" || a == "," || a == "?" || a == "=" || a == ")" && this.tok(after + 1).k == "=>"
+	}
+
+	/// A union, or its one member.
+	private union(): Ty throws Syntax {
+		const pos = this.peek().pos
+		this.eat("|")
+		const t = this.intersection()
+		if (!this.at("|")) {
+			return t
+		}
+		const u = new Ty("union", pos)
+		u.args.push(t)
+		while (this.eat("|")) {
+			u.args.push(this.intersection())
+		}
+		return u
+	}
+
+	private intersection(): Ty throws Syntax {
+		const pos = this.peek().pos
+		this.eat("&")
+		const t = this.operator()
+		if (!this.at("&")) {
+			return t
+		}
+		while (this.eat("&")) {
+			this.operator()
+		}
+		return new Ty("an intersection", pos)
+	}
+
+	/// keyof, unique, readonly or infer and their operand, else a postfix type.
+	private operator(): Ty throws Syntax {
+		const pos = this.peek().pos
+		const n = this.peek(1).k
+		if (this.peek().k == "id"
+			&& (n == "id" || n == "str" || n == "num" || n == "tmpl" || n == "(" || n == "[" || n == "{" || n == "-")) {
+			const w = this.peek().s
+			switch (w) {
+				case "keyof", "unique":
+					this.i++
+					this.operator()
+					return new Ty(if (w == "unique") "a unique symbol" else "a keyof type", pos)
+				case "readonly":
+					this.i++
+					return this.operator()
+				case "infer":
+					this.i += 2
+					if (this.eat("extends")) {
+						this.union()
+					}
+					return new Ty("an infer type", pos)
+			}
+		}
+		let t = this.primary()
+		while (this.at("[") && !this.peek().nl) {
+			if (this.at("]", 1)) {
+				this.i += 2
+				const a = new Ty("array", t.pos)
+				a.args.push(t)
+				t = a
+			} else {
+				this.i++
+				this.inner()
+				this.want("]")
+				t = new Ty("an indexed access type", t.pos)
+			}
+		}
+		return t
+	}
+
+	private primary(): Ty throws Syntax {
+		const t = this.peek()
+		this.i++
+		switch (t.k) {
+			case "str", "num", "tmpl": return new Ty(t.k, t.pos, t.s)
+			case "-":
+				if (this.peek().k != "num") {
+					this.i--
+					throw this.fail("expected a type")
+				}
+				this.i++
+				return new Ty("num", t.pos, `-${this.peek(-1).s}`)
+			case "(":
+				const p = this.inner()
+				this.want(")")
+				return p
+			case "[":
+				this.i = t.close + 1
+				return new Ty("a tuple", t.pos)
+			case "{":
+				const n = if (this.at("readonly") || this.at("+")
+					|| this.at("-")) (if (this.at("readonly", 1)) 2 else 1)
+					else 0
+				if (this.at("[", n) && this.at("in", n + 2)) {
+					this.i = t.close + 1
+					return new Ty("a mapped type", t.pos)
+				}
+				this.i--
+				const o = new Ty("object", t.pos)
+				o.params = this.members()
+				return o
+			case "id":
+				if (this.at("is") && !this.peek().nl || t.s == "asserts" && this.peek().k == "id" && !this.peek().nl) {
+					this.i += if (this.at("is")) 0 else 1
+					if (this.eat("is")) {
+						this.type()
+					}
+					return new Ty("a type predicate", t.pos)
+				}
+				switch (t.s) {
+					case "true", "false": return new Ty("bool", t.pos, t.s)
+					case "typeof", "import":
+						if (t.s == "typeof" && this.at("import") || t.s == "import") {
+							this.eat("import")
+							this.want("(")
+							this.i = this.peek(-1).close + 1
+						} else {
+							this.ident()
+						}
+						while (this.eat(".")) {
+							this.ident()
+						}
+						this.typeArgs()
+						return new Ty(if (t.s == "typeof") "a typeof type" else "an import type", t.pos)
+				}
+				if (keywords.includes(t.s)) {
+					return new Ty("kw", t.pos, t.s)
+				}
+				const r = new Ty("ref", t.pos, t.s)
+				while (this.eat(".")) {
+					r.s += `.${this.ident()}`
+				}
+				r.args = this.typeArgs()
+				return r
+		}
+		this.i--
+		throw this.fail("expected a type")
+	}
+
+	private typeArgs(): Ty[] throws Syntax {
+		const args: Ty[] = []
+		if (this.eat("<")) {
+			while (!this.eat(">")) {
+				args.push(this.inner())
+				if (!this.eat(",")) {
+					this.want(">")
+					break
+				}
+			}
+		}
+		return args
+	}
+}
+
+/// What bober's .bob of a package's typings declares, as each name imported asks.
+class Binder {
+	out = ""
+	private read: (path: string) => string | null
+	private files = new HashMap[string, Scope | null]()
+	/// The type aliases being bound, to fail on one needing itself.
+	private binding: Decl[] = []
+	/// The names imported, and the interfaces and enums declared, with the interface's name or the enum's members'
+	/// literal types.
+	private names: string[]
+	private done: [Decl, string[]][] = []
+
+	constructor(read: (path: string) => string | null, names: string[]) {
+		this.read = read
+		this.names = names
+	}
+
+	/// The typings of the package in directory at: those its package.json names, else its index.d.ts.
+	typings(at: string): string {
+		let types = ""
+		try {
+			const m = decode[Manifest](this.read(join(at, "package.json")) ?? "{}")
+			types = m.types ?? m.typings ?? ""
+		} catch (e: ParseError) {}
+		return this.dts(join(at, if (types == "") "index.d.ts" else types))
+	}
+
+	/// The typings of the JavaScript at path: x.d.ts for x.js, x.d.mts for x.mjs, x for typings, else x.d.ts or
+	/// x/index.d.ts.
+	private dts(path: string): string {
+		const p = clean(path)
+		if (endsWith(p, ".ts")) {
+			return p
+		}
+		for (const [js, ts] of [[".js", ".d.ts"], [".mjs", ".d.mts"], [".cjs", ".d.cts"]]) {
+			if (endsWith(p, js)) {
+				return p.slice(0, p.length - js.length) + ts
+			}
+		}
+		return if (this.read(`${p}.d.ts`) != null) `${p}.d.ts` else join(p, "index.d.ts")
+	}
+
+	/// The scope of the file at path, parsed once; null if there is none.
+	file(path: string): Scope | null {
+		if (this.files.has(path)) {
+			return this.files.get(path)
+		}
+		const src = this.read(path)
+		const sc = if (src == null) null else new Scope(path, src!)
+		this.files.set(path, sc)
+		if (sc != null) {
+			try {
+				new Reader(lex(sc.src)).statements(sc)
+			} catch (e: Syntax) {
+				sc.error = `${where(sc, e.pos)}: ${e.msg}`
+			}
+		}
+		return sc
+	}
+
+	/// The file the module spec names from the file at path: relative to it, else a package's typings.
+	private module(path: string, spec: string): Scope | null {
+		if (startsWith(spec, ".")) {
+			return this.file(this.dts(join(dir(path), spec)))
+		}
+		const scoped = startsWith(spec, "@")
+		const parts = split(spec, "/")
+		const n = if (scoped) 2 else 1
+		const pkg = located(path, parts.slice(0, n).join("/"), this.read)
+		return this.file(if (parts.length > n) this.dts(join(pkg, ...parts.slice(n, parts.length)))
+			else this.typings(pkg))
+	}
+
+	/// The declarations of name in sc or a scope around it, through the imports and exports that alias it; null if
+	/// none, or if this lookup, which seen holds the steps of, has been there.
+	private lookup(sc: Scope, name: string, seen: [Scope, string][]): Decl[] | null {
+		if (seen.some(x => x[0] == sc && x[1] == name)) {
+			return null
+		}
+		seen.push([sc, name])
+		let s: Scope | null = sc
+		while (s != null) {
+			const ds = s!.names.get(name)
+			if (ds != null) {
+				const a = ds!.find(d => d.k == "alias")
+				if (a == null) {
+					return ds
+				}
+				if (a!.from == "") {
+					return this.lookup(s!, a!.orig, seen)
+				}
+				const f = this.module(s!.path, a!.from)
+				return if (f == null) null else this.exported(f!, a!.orig, seen)
+			}
+			s = s!.outer
+		}
+		return null
+	}
+
+	/// name as the file f exports it: declared or imported there, else of a file it exports * from, else a member of
+	/// the namespace it exports as =.
+	private exported(f: Scope, name: string, seen: [Scope, string][]): Decl[] | null {
+		if (seen.some(x => x[0] == f && x[1] == name)) {
+			return null // and so its * exports
+		}
+		const ds = this.lookup(f, name, seen)
+		if (ds != null) {
+			return ds
+		}
+		for (const m of f.stars) {
+			const g = this.module(f.path, m)
+			const r = if (g == null) null else this.exported(g!, name, seen)
+			if (r != null) {
+				return r
+			}
+		}
+		const ns = if (f.assigned == "") null else this.lookup(f, f.assigned, seen)?.find(d => d.inner != null)
+		return if (ns == null) null else this.lookup(ns!.inner!, name, seen)
+	}
+
+	/// The declarations of name in sc, else fails, with the first statement of the file that failed to parse.
+	private find(sc: Scope, name: string, pos: i32): Decl[] throws Unbindable {
+		const ds = this.lookup(sc, name, [])
+		if (ds == null) {
+			throw new Unbindable(if (sc.error == "") `${name} is not declared`
+				else `${name} is not declared; ${sc.error}`, sc, pos)
+		}
+		return merged(ds!)
+	}
+
+	/// Declares name as entry exports it.
+	bind(entry: Scope, name: string) throws Unbindable {
+		const found = this.exported(entry, name, [])
+		if (found == null) {
+			throw new Unbindable(if (entry.error == "") "not declared" else `not declared; ${entry.error}`)
+		}
+		const ds = merged(found!)
+		const d = ds[0]
+		switch (d.k) {
+			case "function":
+				if (ds.length > 1) {
+					throw new Unbindable("an overloaded function", d.sc, ds[1].pos)
+				}
+				this.function(name, d)
+			case "interface", "type":
+				const t = this.declared(ds, name)
+				if (t != name) {
+					this.out += `export type ${name} = ${t}\n`
+				}
+			case "enum": this.enumeration(name, d)
+			case "var":
+				const v = d.t
+				if (v == null || v!.k != "str" && v!.k != "num" && v!.k != "bool") {
+					throw new Unbindable("a variable", d.sc, d.pos)
+				}
+				this.out += `export const ${name}${if (v!.k == "num") ": f64" else ""} = ${this.literal(v!, d.sc)}\n`
+			default: throw new Unbindable(d.k, d.sc, d.pos)
+		}
+	}
+
+	private function(name: string, d: Decl) throws Unbindable {
+		const f = d.t!
+		if (f.generic) {
+			throw new Unbindable("a generic function", d.sc, d.pos)
+		}
+		let params = ""
+		for (const i of 0 ... f.params.length - 1) {
+			const p = f.params[i]
+			if (p.k != "param") {
+				throw new Unbindable(p.k, d.sc, p.pos)
+			}
+			const pt = p.t ?? new Ty("kw", p.pos, "any")
+			const t = if (p.opt) this.maybe(pt, d.sc, true) else this.type(pt, d.sc, true)
+			if (t == null) {
+				break
+			}
+			const typed = if (p.opt) `${nullable(t!)} = null` else t!
+			params += `${if (i > 0) ", " else ""}${if (isName(p.name, false)) p.name else `a${i}`}: ${typed}`
+		}
+		let r = if (f.args.length > 0) f.args[0] else null
+		const promise = r != null && r!.k == "ref" && r!.s == "Promise" && r!.args.length == 1
+		if (promise) {
+			r = r!.args[0]
+		}
+		const result = if (r == null || r!.k == "kw" && r!.s == "void") "" else `: ${this.type(r!, d.sc)}`
+		this.out += `export function ${name}(${params})${result}${if (promise) " @Promise" else ""}\n`
+	}
+
+	/// The type a name of the interface, enum or type alias ds declare stands for: the interface, as named as if it is
+	/// declared here, the union of the enum's members' literal types, the type the alias names, which shall not be
+	/// generic nor need itself.
+	private declared(ds: Decl[], as: string | null = null): string throws Unbindable {
+		const d = ds[0]
+		if (d.k == "interface") {
+			return this.iface(ds, as)
+		} else if (d.k == "enum") {
+			return this.literals(d).join(" | ")
+		} else if (d.generic) {
+			throw new Unbindable("a generic type alias", d.sc, d.pos)
+		} else if (this.binding.includes(d)) {
+			throw new Unbindable("a recursive type alias", d.sc, d.pos)
+		}
+		this.binding.push(d)
+		try {
+			return this.type(d.t!, d.sc)
+		} finally {
+			this.binding.pop()
+		}
+	}
+
+	/// The name of interface ds, declared once: as, else its own if no other has it; the interfaces it extends
+	/// embedded, then its properties, which may name it, as type aliases may again.
+	private iface(ds: Decl[], as: string | null): string throws Unbindable {
+		const had = this.done.find(x => x[0] == ds[0])
+		if (had != null) {
+			return had![1][0]
+		} else if (ds[0].generic) {
+			throw new Unbindable("a generic interface", ds[0].sc, ds[0].pos)
+		}
+		const name = as ?? this.unique(ds[0].name)
+		this.done.push([ds[0], [name]])
+		const aliases = this.binding
+		this.binding = []
+		try {
+			const ms: string[] = []
+			for (const d of ds) {
+				for (const s of d.t!.args) {
+					const base = if (s.k == "ref" && s.args.length == 0) this.find(d.sc, s.s, s.pos) else []
+					if (base.length == 0 || base[0].k != "interface") {
+						throw new Unbindable(`an interface extending ${if (base.length == 0) s.k else base[0].k}`, d.sc,
+							s.pos)
+					}
+					ms.push(`...${this.iface(base, null)}`)
+				}
+			}
+			const fields: [string, string][] = []
+			for (const d of ds) {
+				this.properties(d.t!, d.sc, fields)
+			}
+			this.out += `export interface ${name} { ${[...ms, ...fields.map(f => `${f[0]}: ${f[1]}`)].join("; ")} }\n`
+		} finally {
+			this.binding = aliases
+		}
+		return name
+	}
+
+	/// The properties of object type t, of a declaration in sc, but those fields has.
+	private properties(t: Ty, sc: Scope, fields: [string, string][]) throws Unbindable {
+		for (const m of t.params) {
+			if (m.k != "prop" || !isName(m.name, true)) {
+				if (m.opt) {
+					continue
+				}
+				throw new Unbindable(if (m.k == "prop") `a property named ${m.name}` else m.k, sc, m.pos)
+			}
+			if (!fields.some(f => f[0] == m.name)) {
+				const mt = m.t ?? new Ty("kw", m.pos, "any")
+				const ty = if (m.opt) this.maybe(mt, sc) else this.type(mt, sc)
+				if (ty != null) {
+					fields.push([m.name, if (m.opt) nullable(ty!) else ty!])
+				}
+			}
+		}
+	}
+
+	/// A class of a static field for each member of enum d, of its literal type.
+	private enumeration(name: string, d: Decl) throws Unbindable {
+		const ls = this.literals(d)
+		const fs: string[] = []
+		for (const i of 0 ... ls.length - 1) {
+			fs.push(`static readonly ${d.values[i][0]}: ${ls[i]} = ${ls[i]}`)
+		}
+		this.out += `export class ${name} { ${fs.join("; ")} }\n`
+	}
+
+	/// The literal types of the members of enum d, declared once: their strings, or each integer's, which only an i32
+	/// const of it has, one more than the member before where none is given.
+	private literals(d: Decl): string[] throws Unbindable {
+		const had = this.done.find(x => x[0] == d)
+		if (had != null) {
+			return had![1]
+		} else if (d.values.length == 0) {
+			throw new Unbindable("an empty enum", d.sc, d.pos)
+		}
+		const strings = d.values.length > 0 && d.values[0][1]?.k == "str"
+		const ls: string[] = []
+		let consts = ""
+		let next = 0
+		for (const [n, v] of d.values) {
+			if (!isName(n, true)) {
+				throw new Unbindable(`a member named ${n}`, d.sc, d.pos)
+			} else if ((v?.k == "str") != strings) {
+				throw new Unbindable("a heterogeneous enum", d.sc, d.pos)
+			} else if (strings) {
+				ls.push(this.literal(v!, d.sc))
+				continue
+			}
+			try {
+				next = if (v == null) next else parseInt(v!.s)
+			} catch (e: ParseError) {
+				throw new Unbindable(if (v!.k == "num") `a member of value ${v!.s}` else v!.k, d.sc, v!.pos)
+			}
+			ls.push(this.unique(`${d.name}_${n}`))
+			consts += `export const ${ls[ls.length - 1]}: i32 = ${next}\n`
+			next++
+		}
+		this.out += consts
+		this.done.push([d, ls])
+		return ls
+	}
+
+	/// name, else it and a number, as no name imported or declared is.
+	private unique(name: string): string {
+		let n = name
+		let k = 1
+		while (this.names.includes(n) || this.done.some(x => x[1].includes(n))) {
+			k++
+			n = `${name}${k}`
+		}
+		return n
+	}
+
+	/// A literal: a string's as written, of no escapes; a number's in decimal digits.
+	private literal(v: Ty, sc: Scope): string throws Unbindable {
+		if (v.k == "str" && indexOf(v.s, "\\") < 0) {
+			return quoted(v.s)
+		}
+		const digits = v.s.slice(if (startsWith(v.s, "-")) 1 else 0, v.s.length)
+		if (v.k == "num" && digits.length > 0 && digits.every(c => isDigit(c) || c == dot) && isDigit(digits[0])
+			&& isDigit(digits[digits.length - 1])) {
+			return if (indexOf(v.s, ".") < 0) `${v.s}.0` else v.s
+		}
+		if (v.k == "bool") {
+			return v.s
+		}
+		throw new Unbindable(if (v.k == "str") "a string with escapes"
+			else if (v.k == "num") "a number so written"
+			else v.k, sc, v.pos)
+	}
+
+	/// t, of a declaration in sc, as a bober type; a param's takes a union's members bober has a type for, and a
+	/// string for any or unknown.
+	private type(t: Ty, sc: Scope, param = false): string throws Unbindable {
+		switch (t.k) {
+			case "kw":
+				switch (t.s) {
+					case "string": return "string"
+					case "number": return "f64"
+					case "boolean": return "bool"
+					case "null", "undefined", "void": return "null"
+					case "any", "unknown": if (param) {
+						return "string"
+					}
+				}
+				throw new Unbindable(`the type ${t.s}`, sc, t.pos)
+			case "str": return this.literal(t, sc)
+			case "tmpl": return "string"
+			case "num": return "f64"
+			case "bool": return "bool"
+			case "array": return `${this.element(t.args[0], sc)}[]`
+			case "union": return this.union(t, sc, param)
+			case "ref": return this.named(t, sc)
+			case "object":
+				const fields: [string, string][] = []
+				this.properties(t, sc, fields)
+				return object(fields)
+		}
+		throw new Unbindable(t.k, sc, t.pos)
+	}
+
+	/// t as type gives it, else null, what binding it declared undone.
+	private maybe(t: Ty, sc: Scope, param = false): string | null {
+		const [out, n] = [this.out.length, this.done.length]
+		try {
+			return this.type(t, sc, param)
+		} catch (e: Unbindable) {
+			this.out = this.out.slice(0, out)
+			this.done = this.done.slice(0, n)
+			return null
+		}
+	}
+
+	private element(t: Ty, sc: Scope): string throws Unbindable {
+		const e = this.type(t, sc)
+		return if (indexOf(e, " ") >= 0) `(${e})` else e
+	}
+
+	/// A union of one type and null or undefined, or of literal types of one kind: string literals, or enums of
+	/// integers. A param's skips a member bober has no type for.
+	private union(t: Ty, sc: Scope, param: bool): string throws Unbindable {
+		const ms: string[] = []
+		let nulls = false
+		let literals = true
+		for (const m of t.args) {
+			const b = if (param) this.maybe(m, sc) else this.type(m, sc)
+			if (b == null) {
+				continue
+			}
+			nulls = nulls || b == "null"
+			literals = literals
+				&& (b == "null" || m.k == "str"
+				|| m.k == "ref" && m.args.length == 0 && this.find(sc, m.s, m.pos)[0].k == "enum")
+			if (b != "null" && !ms.includes(b!)) {
+				ms.push(b!)
+			}
+		}
+		const strings = ms.filter(b => b[0] == dquote).length
+		if (ms.length == 0 || ms.length > 1 && !(literals && (strings == 0 || strings == ms.length))) {
+			throw new Unbindable(if (ms.length == 0) "a union of no type bober has"
+				else `a union of ${ms.join(" and ")}`, sc, t.pos)
+		}
+		return if (nulls) nullable(ms.join(" | ")) else ms.join(" | ")
+	}
+
+	/// The type a type reference names: an array's, or that of the interface, enum or type alias it names.
+	private named(t: Ty, sc: Scope): string throws Unbindable {
+		if ((t.s == "Array" || t.s == "ReadonlyArray") && t.args.length == 1) {
+			return `${this.element(t.args[0], sc)}[]`
+		}
+		if (t.args.length > 0) {
+			throw new Unbindable(`a generic ${t.s}`, sc, t.pos)
+		}
+		const ds = this.find(sc, t.s, t.pos)
+		if (ds[0].k != "interface" && ds[0].k != "enum" && ds[0].k != "type") {
+			throw new Unbindable(`${t.s}, ${ds[0].k}`, sc, t.pos)
+		}
+		return this.declared(ds)
+	}
+}
+
+/// The fields of a package.json read, the rest left.
+class Manifest {
+	types: string | null = null
+	typings: string | null = null
+	rest: Unknown[] @Rest = []
+}
+
+/// Of the declarations merged under one name, those of the first kind that is not a namespace's, as an interface a
+/// namespace of the same name adds to.
+function merged(ds: Decl[]): Decl[] {
+	const k = ds.find(d => d.k != "a namespace")?.k ?? ds[0].k
+	return ds.filter(d => d.k == k)
+}
+
+/// The object type of fields.
+function object(fields: [string, string][]): string { return `{ ${fields.map(f => `${f[0]}: ${f[1]}`).join(", ")} }` }
+/// t, or null.
+function nullable(t: string): string { return if (endsWith(t, " | null") || t == "null") t else `${t} | null` }
+
+/// Whether s is a name in bober, or as a field's, a keyword too.
+function isName(s: string, field: bool): bool {
+	try {
+		const l = new Lexer(s)
+		const t = l.next()
+		return (t.kind == "ident" || field && t.loc.len == s.length && s.every(c => isAlphanumeric(c)))
+			&& l.next().kind == "eof"
+	} catch (e: SyntaxError) {
+		return false
+	}
+}

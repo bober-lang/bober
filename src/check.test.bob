@@ -977,3 +977,15 @@ test "untyped constants nothing converts take their own types: of an operand of 
 	assert typed("const o = { ...{ a: 1 } }\nconst s = switch ([1]) {\n\tdefault: 0\n}")
 		== "(var:{ a: i32 } o:{ a: i32 } (object:{ a: i32 } (unary (object:{ a: i32 } (prop:i32 1:i32))))) (var:i32 s:i32 (switchExpr:i32 (array:i32[] 1:i32) (case 0:i32)))"
 }
+
+test "an import tagged @TypeScript declares the names of TypeScript typings, but those bober has no type for" {
+	const ts = ["p.d.ts",
+		"export declare function f(s: string): Promise<number>;\nexport declare function g<T>(x: T): T;\n"]
+	assert errors("import { f } from \"./p.d.ts\" @TypeScript\nconst n: f64 = f(\"a\")", ts) == ""
+	assert errors("import { g } from \"./p.d.ts\" @TypeScript", ts) == "18: g: p.d.ts:2:1: a generic function"
+	assert errors("import * as p from \"./p.d.ts\" @TypeScript", ts) == "19: TypeScript's names are imported by name"
+	assert errors("import { f } from \"./p.d.ts\" @Deterministic", ts)
+		== "18: cannot read p.d.ts.bob; 30: an import's one tag is @Deterministic, of a C import, or @TypeScript, of another"
+	assert errors("import { N } from \"x.h\" @TypeScript @Deterministic", ["x.h", "#define N 1\n"])
+		== "25: an import's one tag is @Deterministic, of a C import, or @TypeScript, of another"
+}
