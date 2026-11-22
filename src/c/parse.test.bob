@@ -312,3 +312,15 @@ test "unterminated attributes and non-lvalue writes are errors" {
 	assert error("int *f(void) { return &1; }") == "t.c:1:23: cannot take the address of an rvalue"
 	assert error("int a[2]; void f(void) { a = 0; }") == "t.c:1:28: expression is not assignable"
 }
+
+test "_Atomic objects load and store atomically, and are not updated by ++, -- or op=" {
+	const ir = compile("_Atomic int a; int *_Atomic p; _Atomic(long) n; int f(void) { a = 1; p = 0; return a + n; }")
+	assert has(ir, "store atomic i32 1, ptr @a seq_cst, align 4") && has(ir, "store atomic ptr null, ptr @p seq_cst")
+	assert has(ir, "%2 = load atomic i32, ptr @a seq_cst, align 4") && has(ir, "%3 = load atomic i64, ptr @n seq_cst")
+	assert error("_Atomic int a; void f(void) { a++; }")
+		== "t.c:1:32: ++ of an _Atomic object is not supported; use atomic_fetch_add and the like"
+	assert error("_Atomic int a; void f(void) { a += 2; }")
+		== "t.c:1:33: += of an _Atomic object is not supported; use atomic_fetch_add and the like"
+	assert error("_Atomic struct S { int x; } s;")
+		== "t.c:1:29: only an integer of up to 8 bytes or a pointer can be _Atomic"
+}

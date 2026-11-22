@@ -26,6 +26,8 @@ export type FCmp = "oeq" | "ogt" | "oge" | "olt" | "ole" | "one" | "ord" | "ueq"
 
 /// fneg of a float, or a bit intrinsic on an integer, as a value of its type.
 export type Unary = "fneg" | "bswap" | "ctlz" | "cttz" | "ctpop" | "fabs"
+/// What an atomic read-modify-write stores: v, or the value held and v added, subtracted or combined bitwise.
+export type Rmw = "xchg" | "add" | "sub" | "and" | "or" | "xor"
 
 /// An operand of inline assembly: an input's value, or the address of one in memory, m, with t the type there; an
 /// output in a register has only the type it is given.
@@ -195,6 +197,10 @@ export interface Backend {
 	/// Loads a t from p, or stores v to it, atomically and sequentially consistent, aligned to its size.
 	atomicLoad(t: Type, p: Value): Value
 	atomicStore(v: Value, p: Value)
+	/// Changes the integer at p by op with v, or to v if it holds cmp, atomically and sequentially consistent; returns
+	/// the value it held.
+	atomicRmw(op: Rmw, p: Value, v: Value): Value
+	cmpxchg(p: Value, cmp: Value, v: Value): Value
 	/// A fence that is sequentially consistent.
 	fence()
 	/// Aborts the program.
@@ -344,6 +350,8 @@ export class Nothing implements Backend {
 	zero(dst: Value, bytes: i64) {}
 	atomicLoad(t: Type, p: Value): Value { return this.fresh() }
 	atomicStore(v: Value, p: Value) {}
+	atomicRmw(op: Rmw, p: Value, v: Value): Value { return this.fresh() }
+	cmpxchg(p: Value, cmp: Value, v: Value): Value { return this.fresh() }
 	fence() {}
 	trap() {}
 	readable(p: () => Value, n: () => Value, align: i64) {}

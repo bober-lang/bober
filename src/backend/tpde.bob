@@ -4,7 +4,7 @@
 //! bober.pkg.
 
 import { CompileError } from "../error"
-import { Backend, Binary, Block, Cast, Cmp, FCmp, Operand, Type, Unary, Value, codes } from "./backend"
+import { Backend, Binary, Block, Cast, Cmp, FCmp, Operand, Rmw, Type, Unary, Value, codes } from "./backend"
 import * as c from "../../std/c"
 
 import { TpdeABISizeOfType, TpdeAShr, TpdeAdd, TpdeAddAttributeAtIndex, TpdeAddExternal, TpdeAddFunction, TpdeAddGlobal,
@@ -25,8 +25,9 @@ import { TpdeABISizeOfType, TpdeAShr, TpdeAdd, TpdeAddAttributeAtIndex, TpdeAddE
 	TpdeRealOEQ, TpdeRealOGE, TpdeRealOGT, TpdeRealOLE, TpdeRealOLT, TpdeRealONE, TpdeRealORD, TpdeRealUEQ, TpdeRealUGE,
 	TpdeRealUGT, TpdeRealULE, TpdeRealULT, TpdeRealUNE, TpdeRealUNO, TpdeReplace, TpdeSDiv, TpdeSExt, TpdeSIToFP,
 	TpdeSRem, TpdeSetInlineOnly, TpdeSetPersonalityFn, TpdeSetWeak, TpdeShl, TpdeSizeOf, TpdeStructType, TpdeSub,
-	TpdeTrunc, TpdeTypeOf, TpdeUDiv, TpdeUIToFP, TpdeURem, TpdeVerifyModule, TpdeVoidType, TpdeXor,
-	TpdeZExt } from "tpde/tpde.h"
+	TpdeTrunc, TpdeTypeOf, TpdeUDiv, TpdeUIToFP, TpdeURem, TpdeVerifyModule, TpdeVoidType, TpdeXor, TpdeZExt,
+	TpdeBuildAtomicRMW, TpdeBuildAtomicCmpXchg, TpdeAtomicXchg, TpdeAtomicAdd, TpdeAtomicSub, TpdeAtomicAnd,
+	TpdeAtomicOr, TpdeAtomicXor } from "tpde/tpde.h"
 
 import { free } from "stdlib.h"
 
@@ -201,6 +202,8 @@ export class Tpde implements Backend {
 
 	atomicLoad(t: Type, p: Value): Value { return TpdeBuildAtomicLoad(this.m, t, p) }
 	atomicStore(v: Value, p: Value) { TpdeBuildAtomicStore(this.m, v, p) }
+	atomicRmw(op: Rmw, p: Value, v: Value): Value { return TpdeBuildAtomicRMW(this.m, rmws.get(op)! as u32, p, v) }
+	cmpxchg(p: Value, cmp: Value, v: Value): Value { return TpdeBuildAtomicCmpXchg(this.m, p, cmp, v) }
 	fence() { TpdeBuildFence(this.m) }
 	trap() { TpdeBuildTrap(this.m) }
 	readable(p: () => Value, n: () => Value, align: i64) {}
@@ -292,6 +295,9 @@ const fcmps = codes([["oeq", TpdeRealOEQ], ["ogt", TpdeRealOGT], ["oge", TpdeRea
 
 const unaries = codes([["fneg", TpdeFNeg], ["fabs", TpdeFAbs], ["bswap", TpdeBSwap], ["ctlz", TpdeCtlz],
 	["cttz", TpdeCttz], ["ctpop", TpdeCtpop]])
+
+const rmws = codes([["xchg", TpdeAtomicXchg], ["add", TpdeAtomicAdd], ["sub", TpdeAtomicSub], ["and", TpdeAtomicAnd],
+	["or", TpdeAtomicOr], ["xor", TpdeAtomicXor]])
 
 /// Throws the message at p, unless p is null.
 function checked(p: c.ptr) {

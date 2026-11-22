@@ -6,7 +6,7 @@
 import { indexOf } from "../../std/algo"
 import { HashMap } from "../../std/collections/hashmap"
 import { CompileError } from "../error"
-import { Backend, Binary, Block, Cast, Cmp, FCmp, Operand, Type, Unary, Value, codes, mark } from "./backend"
+import { Backend, Binary, Block, Cast, Cmp, FCmp, Operand, Rmw, Type, Unary, Value, codes, mark } from "./backend"
 import { dollar, isAlphabetic, isDigit, percent } from "../../std/ascii"
 import { max } from "../../std/math"
 import { arch, os } from "../../std/os"
@@ -56,7 +56,9 @@ import { LLVMAdd, LLVMAddAttributeAtIndex, LLVMAddCallSiteAttribute, LLVMAddCase
 	LLVMTokenTypeInContext, LLVMTrunc, LLVMTypeOf, LLVMUDiv, LLVMUIToFP, LLVMURem, LLVMValueAsMetadata,
 	LLVMVoidTypeInContext, LLVMWeakAnyLinkage, LLVMExternalWeakLinkage, LLVMWeakODRLinkage, LLVMXor, LLVMZExt,
 	LLVMConstAddrSpaceCast, LLVMGetConstOpcode, LLVMIsAConstantExpr, LLVMGetCallSiteStringAttribute,
-	LLVMConstIntGetZExtValue, LLVMIsAConstantInt } from "llvm-c/Core.h"
+	LLVMConstIntGetZExtValue, LLVMIsAConstantInt, LLVMBuildAtomicRMW, LLVMBuildAtomicCmpXchg, LLVMAtomicRMWBinOpXchg,
+	LLVMAtomicRMWBinOpAdd, LLVMAtomicRMWBinOpSub, LLVMAtomicRMWBinOpAnd, LLVMAtomicRMWBinOpOr,
+	LLVMAtomicRMWBinOpXor } from "llvm-c/Core.h"
 
 import { LLVMReturnStatusAction, LLVMVerifyModule } from "llvm-c/Analysis.h"
 import { LLVMDisposeErrorMessage, LLVMGetErrorMessage } from "llvm-c/Error.h"
@@ -461,7 +463,16 @@ export class LLVM implements Backend {
 
 	atomicLoad(t: Type, p: Value): Value { return this.ordered(LLVMBuildLoad2(this.b, t, p, ""), t) }
 	atomicStore(v: Value, p: Value) { this.ordered(LLVMBuildStore(this.b, v, p), LLVMTypeOf(v)) }
-	fence() { LLVMBuildFence(this.b, LLVMAtomicOrderingSequentiallyConsistent as u32, 0, "") }
+
+	atomicRmw(op: Rmw, p: Value, v: Value): Value {
+		return LLVMBuildAtomicRMW(this.b, rmws.get(op)! as u32, p, v, seqCst, 0)
+	}
+
+	cmpxchg(p: Value, cmp: Value, v: Value): Value {
+		return this.extract(LLVMBuildAtomicCmpXchg(this.b, p, cmp, v, seqCst, seqCst, 0), 0)
+	}
+
+	fence() { LLVMBuildFence(this.b, seqCst, 0, "") }
 	trap() { this.intrinsic("llvm.trap", [], []) }
 
 	readable(p: () => Value, n: () => Value, align: i64) {
@@ -543,7 +554,7 @@ export class LLVM implements Backend {
 
 	/// The load or store inst made sequentially consistent, aligned to the size of t.
 	private ordered(inst: Value, t: Type): Value {
-		LLVMSetOrdering(inst, LLVMAtomicOrderingSequentiallyConsistent as u32)
+		LLVMSetOrdering(inst, seqCst)
 		LLVMSetAlignment(inst, LLVMABISizeOfType(this.td, t) as u32)
 		return inst
 	}
@@ -1067,6 +1078,11 @@ const binaries = codes([["add", LLVMAdd], ["sub", LLVMSub], ["mul", LLVMMul], ["
 	["urem", LLVMURem], ["srem", LLVMSRem], ["shl", LLVMShl], ["lshr", LLVMLShr], ["ashr", LLVMAShr], ["and", LLVMAnd],
 	["or", LLVMOr], ["xor", LLVMXor], ["fadd", LLVMFAdd], ["fsub", LLVMFSub], ["fmul", LLVMFMul], ["fdiv", LLVMFDiv],
 	["frem", LLVMFRem]])
+
+const seqCst = LLVMAtomicOrderingSequentiallyConsistent as u32
+
+const rmws = codes([["xchg", LLVMAtomicRMWBinOpXchg], ["add", LLVMAtomicRMWBinOpAdd], ["sub", LLVMAtomicRMWBinOpSub],
+	["and", LLVMAtomicRMWBinOpAnd], ["or", LLVMAtomicRMWBinOpOr], ["xor", LLVMAtomicRMWBinOpXor]])
 
 const casts = codes([["trunc", LLVMTrunc], ["zext", LLVMZExt], ["sext", LLVMSExt], ["fptoui", LLVMFPToUI],
 	["fptosi", LLVMFPToSI], ["uitofp", LLVMUIToFP], ["sitofp", LLVMSIToFP], ["fptrunc", LLVMFPTrunc],

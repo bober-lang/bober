@@ -6,7 +6,7 @@ import { HashMap } from "../../std/collections/hashmap"
 import { ScopedMap } from "../../std/collections/scopedmap"
 import { isAlphabetic, lbracket, percent } from "../../std/ascii"
 import { split, strip } from "../../std/string"
-import { Backend, Block, Unary, Value } from "../backend/backend"
+import { Backend, Block, Rmw, Unary, Value } from "../backend/backend"
 import { attrs, signature, vaList } from "../backend/abi"
 import { Gen, Val, float, global, int, mask, object } from "./gen"
 import { CError, Tok, precedence } from "./lex"
@@ -73,6 +73,7 @@ class Spec {
 	storage: Storage = ""
 	inline = false
 	volatile = false
+	atomic = false
 	/// _Thread_local.
 	tls = false
 	attrs: ...Attrs
@@ -520,10 +521,11 @@ export class Parser {
 	private specs(): Spec {
 		const s = new Spec()
 		while (this.specifier(s)) {}
-		s.ty = s.named ?? basic(s.words)
-		if (s.volatile) {
-			s.ty = volatile(s.ty)
+		const ty = qualified(s.named ?? basic(s.words), s)
+		if (ty == null) {
+			throw CError.at(this.peek(), "only an integer of up to 8 bytes or a pointer can be _Atomic")
 		}
+		s.ty = ty
 		return s
 	}
 
@@ -562,6 +564,12 @@ export class Parser {
 			case "void", "_Bool", "char", "short", "int", "long", "float", "double", "unsigned",
 				"__int128": s.words.push(w as Word)
 			case "signed", "__signed", "__signed__": s.words.push("signed")
+			case "_Atomic":
+				s.atomic = true
+				if (this.eat("(")) {
+					s.named = this.typeName()
+					this.expect(")")
+				}
 			case "_Noreturn":
 				s.attrs.fn.push("noreturn")
 				// Qualifiers, auto and register: only volatile changes anything here.
@@ -803,9 +811,9 @@ export class Parser {
 	/// declarator apply before it: in (*f)(int), f is a pointer to a function.
 	private derivation(a: Attrs): [Tok | null, (base: Type) => Type] {
 		this.attrs(a)
-		const volatiles: bool[] = []
+		const quals: Spec[] = []
 		while (this.eat("*") || this.eat("^")) {
-			volatiles.push(this.qualifiers(a))
+			quals.push(this.qualifiers(a))
 		}
 		let name: Tok | null = null
 		let nested = (ty: Type) => ty
@@ -829,23 +837,24 @@ export class Parser {
 		this.attrs(a)
 		return [name, base => {
 			let ty = base
-			for (const v of volatiles) {
-				ty = if (v) volatile(new Ptr(ty)) else new Ptr(ty)
+			for (const q of quals) {
+				ty = qualified(new Ptr(ty), q)!
 			}
 			return nested(suffix(ty))
 		}]
 	}
 
-	/// Reads the qualifiers and attributes after a *; returns whether one is volatile.
-	private qualifiers(a: Attrs): bool {
-		let v = false
+	/// Reads the qualifiers and attributes after a *.
+	private qualifiers(a: Attrs): Spec {
+		const s = new Spec()
 		while (true) {
 			const w = this.peek().text
 			if (isQualifier(w)) {
 				this.next()
-				v = v || isVolatileWord(w)
+				s.volatile = s.volatile || isVolatileWord(w)
+				s.atomic = s.atomic || w == "_Atomic"
 			} else if (!this.attrs(a)) {
-				return v
+				return s
 			}
 		}
 	}
@@ -1374,12 +1383,16 @@ export class Parser {
 		const t = this.next()
 		const y = g.rv(this.assign())
 		const binary = op.slice(0, op.length - 1)
-		return g.store(this.lvalue(t, x), if (op == "=") y else g.binary(binary, g.rv(x), y))
+		return g.store(this.lvalue(t, x, op != "="), if (op == "=") y else g.binary(binary, g.rv(x), y))
 	}
 
-	private lvalue(t: Tok, v: Val): Val {
+	/// v, checked to be an lvalue; one updated by what it holds may not be _Atomic, as that would be a load and a store.
+	private lvalue(t: Tok, v: Val, update = false): Val {
 		if (!v.lv || v.ty.kind == "array" || v.ty.kind == "func") {
 			throw CError.at(t, "expression is not assignable")
+		}
+		if (update && isAtomic(v.ty)) {
+			throw CError.at(t, `${t.text} of an _Atomic object is not supported; use atomic_fetch_add and the like`)
 		}
 		return v
 	}
@@ -1559,7 +1572,7 @@ export class Parser {
 		}
 		if (op == "++" || op == "--") {
 			this.next()
-			const v = this.lvalue(t, this.unary())
+			const v = this.lvalue(t, this.unary(), true)
 			return g.store(v, g.binary(op.slice(0, 1), g.rv(v), int(1, Int)))
 		}
 		if (op != "&" && op != "*" && op != "+" && op != "-" && op != "~" && op != "!") {
@@ -1618,7 +1631,7 @@ export class Parser {
 				v = this.field(g.deref(this.pointer(t, g.rv(v))))
 			} else if (t.is("++") || t.is("--")) {
 				this.next()
-				const lv = this.lvalue(t, v)
+				const lv = this.lvalue(t, v, true)
 				const old = g.rv(lv)
 				g.store(lv, g.binary(t.text.slice(0, 1), old, int(1, Int)))
 				v = old
@@ -1690,6 +1703,15 @@ export class Parser {
 			texts.push(this.next().text)
 		}
 		return strings(texts)
+	}
+
+	/// v, a pointer to the integer or pointer an atomic builtin changes.
+	private changed(t: Tok, v: Val): Val {
+		const p = this.pointer(t, this.g.rv(v))
+		if (atomic(pointee(p.ty)) == null) {
+			throw CError.at(t, "an atomic change takes a pointer to an integer or a pointer")
+		}
+		return p
 	}
 
 	private identifier(t: Tok, name: string): Val {
@@ -1835,9 +1857,15 @@ export class Parser {
 					throw CError.at(t, "only the frame address of the function itself, level 0, is supported")
 				}
 				return new Val(new Ptr(Void), g.b.frameAddress())
-			case "__sync_synchronize": g.b.fence()
+			case "__sync_synchronize", "__atomic_thread_fence", "__atomic_signal_fence": g.b.fence()
 			case "__atomic_store_n": g.atomic(this.pointer(t, g.rv(a[0])), a[1])
 			case "__atomic_load_n": return g.atomic(this.pointer(t, g.rv(a[0])), null)
+			case "__atomic_exchange_n": return g.rmw("xchg", this.changed(t, a[0]), a[1])
+			case "__atomic_fetch_add", "__atomic_fetch_sub", "__atomic_fetch_and", "__atomic_fetch_or",
+				"__atomic_fetch_xor": return g.rmw(b.slice("__atomic_fetch_".length, b.length) as Rmw,
+				this.changed(t, a[0]), a[1])
+			case "__atomic_compare_exchange_n": return g.cmpxchg(this.changed(t, a[0]), this.pointer(t, g.rv(a[1])),
+				a[2])
 			case "expect": return a[0]
 			case "constant_p":
 				return int(if (a[0].known == "int" || a[0].known == "float") 1 else 0, Int)
@@ -2331,6 +2359,12 @@ function isQualifier(w: string): bool {
 }
 
 function isVolatileWord(w: string): bool { return w == "volatile" || w == "__volatile" || w == "__volatile__" }
+
+/// t qualified as s says, or null if it cannot be _Atomic.
+function qualified(t: Type, s: Spec): Type | null {
+	const v = if (s.volatile) volatile(t) else t
+	return if (s.atomic) atomic(v) else v
+}
 
 /// The integer mode m the mode attribute names: 1 to 5 for 1, 2, 4, 8 and 16 bytes, or 0 for another.
 function intMode(m: string): i32 {

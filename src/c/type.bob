@@ -20,6 +20,8 @@ export class Scalar {
 	/// True for an unsigned int; false only for signed char, which differs from char; else null.
 	unsigned: bool | null
 	volatile = false
+	/// _Atomic: loaded and stored atomically.
+	atomic = false
 
 	constructor(kind: "void" | "bool" | "int" | "float", size: i32, unsigned: bool | null = null) {
 		this.kind = kind
@@ -35,6 +37,7 @@ export class Ptr {
 	align = 8
 	base: Type
 	volatile = false
+	atomic = false
 
 	constructor(base: Type) { this.base = base }
 }
@@ -131,6 +134,7 @@ export function isUnsigned(t: Type): bool { return t.kind == "bool" || t instanc
 /// Whether t is a variable length array, or an array of them.
 export function isVla(t: Type): bool { return t instanceof Arr && t.bytes != 0 }
 export function isVolatile(t: Type): bool { return !(t instanceof Arr || t instanceof Fn) && t.volatile }
+export function isAtomic(t: Type): bool { return (t instanceof Scalar || t instanceof Ptr) && t.atomic }
 
 /// Whether t has a size: not void, nor a struct or union declared but not yet defined, nor an array of them.
 export function isComplete(t: Type): bool {
@@ -162,6 +166,18 @@ export function volatile(t: Type): Type {
 		return { ...t, volatile: true }
 	}
 	return { ...t, volatile: true }
+}
+
+/// t _Atomic-qualified, or null if it is neither an integer of up to 8 bytes nor a pointer, which one atomic
+/// instruction can change.
+export function atomic(t: Type): Type | null {
+	if (t instanceof Scalar && isInt(t) && t.size <= 8) {
+		return { ...t, atomic: true }
+	}
+	if (t instanceof Ptr) {
+		return { ...t, atomic: true }
+	}
+	return null
 }
 
 /// An array's or function's type as a value: a pointer to the element or the function (C11 6.3.2.1).

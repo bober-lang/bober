@@ -2,7 +2,7 @@
 //! emits it through the back end, folding what is known while compiling.
 
 import * as abi from "../backend/abi"
-import { Backend, Binary, Block, Cast, Cmp, FCmp, Type as Held, Operand, Unary, Value } from "../backend/backend"
+import { Backend, Binary, Block, Cast, Cmp, FCmp, Type as Held, Operand, Rmw, Unary, Value } from "../backend/backend"
 import { isDigit, plus, zero } from "../../std/ascii"
 import { max } from "../../std/math"
 import { trim } from "../../std/string"
@@ -223,14 +223,19 @@ export class Gen implements abi.Frame {
 		}
 		if (t instanceof Record) {
 			this.copy(dst, x, t.size)
+		} else if (isAtomic(t)) {
+			this.b.atomicStore(this.op(x), this.addr(dst))
 		} else {
 			this.b.store(this.op(x), this.addr(dst), isVolatile(t))
 		}
 		return x
 	}
 
-	/// Loads a t from addr, a volatile one as such.
-	private load(t: Type, addr: Value): Value { return this.b.load(this.ty(t), addr, isVolatile(t)) }
+	/// Loads a t from addr, a volatile one as such, an _Atomic one atomically.
+	private load(t: Type, addr: Value): Value {
+		return if (isAtomic(t)) this.b.atomicLoad(this.ty(t), addr) else this.b.load(this.ty(t), addr, isVolatile(t))
+	}
+
 	copy(dst: Val, src: Val, size: i64) { this.b.copy(this.addr(dst), this.addr(src), size) }
 	zero(dst: Val, size: i64) { this.b.zero(this.addr(dst), size) }
 
@@ -531,6 +536,25 @@ export class Gen implements abi.Frame {
 		}
 		this.b.atomicStore(this.op(this.cast(this.rv(v), t)), this.op(x))
 		return new Val(Void, 0)
+	}
+
+	/// Changes the object p points to by op with v atomically; returns the value it held. A pointer changes as a long,
+	/// by bytes.
+	rmw(op: Rmw, p: Val, v: Val): Val {
+		const t = pointee(p.ty)
+		const w = if (t instanceof Ptr) Long else t
+		return this.cast(new Val(w, this.b.atomicRmw(op, this.op(p), this.op(this.cast(this.rv(v), w)))), t)
+	}
+
+	/// Stores v to the object p points to if it holds the value e points to, atomically, else copies the value it
+	/// holds to *e; returns whether it stored.
+	cmpxchg(p: Val, e: Val, v: Val): Val {
+		const t = pointee(p.ty)
+		const expected = this.deref(e)
+		const cmp = this.cast(this.rv(expected), t)
+		const old = new Val(t, this.b.cmpxchg(this.op(p), this.op(cmp), this.op(this.cast(this.rv(v), t))))
+		this.store(expected, old) // the value there already if it stored
+		return this.binary("==", old, cmp)
 	}
 
 	/// The intrinsic op, bswap, ctlz, cttz, ctpop or fabs, on v as a t. Counts are ints.

@@ -23,6 +23,8 @@ typedef enum {
 
 typedef enum { TpdeFNeg, TpdeFAbs, TpdeBSwap, TpdeCtlz, TpdeCttz, TpdeCtpop } TpdeUnaryOp;
 
+typedef enum { TpdeAtomicXchg, TpdeAtomicAdd, TpdeAtomicSub, TpdeAtomicAnd, TpdeAtomicOr, TpdeAtomicXor } TpdeAtomicRMWOp;
+
 typedef enum {
 	TpdeIntEQ, TpdeIntNE, TpdeIntUGT, TpdeIntUGE, TpdeIntULT, TpdeIntULE, TpdeIntSGT, TpdeIntSGE, TpdeIntSLT,
 	TpdeIntSLE,
@@ -118,6 +120,8 @@ TpdeValueRef TpdeBuildStore(TpdeModuleRef m, TpdeValueRef v, TpdeValueRef p, int
 /// Sequentially consistent, aligned to the size of an integer or pointer.
 TpdeValueRef TpdeBuildAtomicLoad(TpdeModuleRef m, TpdeTypeRef t, TpdeValueRef p);
 TpdeValueRef TpdeBuildAtomicStore(TpdeModuleRef m, TpdeValueRef v, TpdeValueRef p);
+TpdeValueRef TpdeBuildAtomicRMW(TpdeModuleRef m, TpdeAtomicRMWOp op, TpdeValueRef p, TpdeValueRef v);
+TpdeValueRef TpdeBuildAtomicCmpXchg(TpdeModuleRef m, TpdeValueRef p, TpdeValueRef cmp, TpdeValueRef v);
 TpdeValueRef TpdeBuildFence(TpdeModuleRef m);
 TpdeValueRef TpdeBuildTrap(TpdeModuleRef m);
 /// Starts the va_list at ap for the variadic function being built.

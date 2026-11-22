@@ -544,6 +544,8 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 		case Op::Extract:
 		case Op::Insert: return element(i, v);
 		case Op::Unary: return unary(i, v);
+		case Op::AtomicRMW: return atomicRMW(i, v);
+		case Op::CmpXchg: return cmpxchg(i);
 		case Op::Fence: return derived()->encode_fence_seqcst();
 		case Op::Trap: return derived()->encode_trap();
 		case Op::VaStart: return derived()->vaStart(m().ops(i)[0]), true;
@@ -764,6 +766,38 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 			(derived()->*fns[kind(ps[k])])(Expr(reg, ps[k].off), res.part(k));
 		}
 		return true;
+	}
+
+	/// Changes the integer ops[0] points to by v.sub with ops[1], atomically; the result is the integer before.
+	bool atomicRMW(u32 i, const Value &v) {
+		std::span<u32> ops = m().ops(i);
+#define RMW(op) {&Derived::encode_atomic_##op##_u8_seqcst, &Derived::encode_atomic_##op##_u16_seqcst, \
+	&Derived::encode_atomic_##op##_u32_seqcst, &Derived::encode_atomic_##op##_u64_seqcst}
+		static constexpr Encode2 fns[][4] = {RMW(xchg), RMW(add), RMW(sub), RMW(and), RMW(or), RMW(xor)};
+#undef RMW
+		std::span<const Part> ps = parts(i);
+		if (ps.size() != 1 || ps[0].fp) {
+			return fails("an atomic change of this type");
+		}
+		ValueRef p = this->val_ref(ops[0]), x = this->val_ref(ops[1]);
+		return (derived()->*fns[v.sub][kind(ps[0])])(p.part(0), x.part(0), this->result_ref(i).part(0));
+	}
+
+	/// Stores ops[2] where ops[0] points if ops[1] is there, atomically; the result is the integer before.
+	bool cmpxchg(u32 i) {
+		std::span<u32> ops = m().ops(i);
+		using Encode = bool (Derived::*)(GenericValuePart &&, GenericValuePart &&, GenericValuePart &&, ValuePart &&,
+			ValuePart &&);
+		static constexpr Encode fns[] = {&Derived::encode_cmpxchg_u8_seqcst, &Derived::encode_cmpxchg_u16_seqcst,
+			&Derived::encode_cmpxchg_u32_seqcst, &Derived::encode_cmpxchg_u64_seqcst};
+		std::span<const Part> ps = parts(i);
+		if (ps.size() != 1 || ps[0].fp) {
+			return fails("an atomic compare and exchange of this type");
+		}
+		ValueRef p = this->val_ref(ops[0]), cmp = this->val_ref(ops[1]), x = this->val_ref(ops[2]);
+		ValuePartRef stored(this, Config::GP_BANK); // whether it stored, which the caller compares for itself
+		return (derived()->*fns[kind(ps[0])])(p.part(0), cmp.part(0), x.part(0), this->result_ref(i).part(0),
+			std::move(stored));
 	}
 
 	bool store(u32 i, const Value &v) {

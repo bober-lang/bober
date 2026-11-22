@@ -426,6 +426,14 @@ TpdeValueRef TpdeBuildAtomicLoad(TpdeModuleRef m, TpdeTypeRef t, TpdeValueRef p)
 TpdeValueRef TpdeBuildAtomicStore(TpdeModuleRef m, TpdeValueRef v, TpdeValueRef p) {
 	return inst(*m, {.op = Op::Store, .sub = 1, .ops = push(m->opList, {u32(v), u32(p)})});
 }
+TpdeValueRef TpdeBuildAtomicRMW(TpdeModuleRef m, TpdeAtomicRMWOp op, TpdeValueRef p, TpdeValueRef v) {
+	Run ops = push(m->opList, {u32(p), u32(v)});
+	return inst(*m, {.op = Op::AtomicRMW, .sub = u8(op), .type = m->vals[v].type, .ops = ops});
+}
+TpdeValueRef TpdeBuildAtomicCmpXchg(TpdeModuleRef m, TpdeValueRef p, TpdeValueRef cmp, TpdeValueRef v) {
+	Run ops = push(m->opList, {u32(p), u32(cmp), u32(v)});
+	return inst(*m, {.op = Op::CmpXchg, .type = m->vals[v].type, .ops = ops});
+}
 TpdeValueRef TpdeBuildFence(TpdeModuleRef m) { return inst(*m, {.op = Op::Fence}); }
 TpdeValueRef TpdeBuildTrap(TpdeModuleRef m) { return inst(*m, {.op = Op::Trap}); }
 TpdeValueRef TpdeBuildVaStart(TpdeModuleRef m, TpdeValueRef ap) {

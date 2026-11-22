@@ -52,14 +52,14 @@ enum class Op : u8 {
 	Param,
 	// Instructions; block targets are their block's successors.
 	Ret, Br, CondBr, Switch, Unreachable, Binary, ICmp, FCmp, Cast, Select, Alloca, StackAlloc, Load, Store, Offset, Extract,
-	Insert, Unary, Fence, Trap, VaStart, FrameAddress, Call, Invoke, LandingPad,
+	Insert, Unary, AtomicRMW, CmpXchg, Fence, Trap, VaStart, FrameAddress, Call, Invoke, LandingPad,
 };
 
 /// 32 bytes.
 struct Value {
 	Op op;
-	/// The opcode or predicate of Binary, Unary, Cast and the compares; 1 for an atomic Load or Store; the log2 of
-	/// Alloca's align.
+	/// The opcode or predicate of Binary, Unary, AtomicRMW, Cast and the compares; 1 for an atomic Load or Store; the
+	/// log2 of Alloca's align.
 	u8 sub = 0;
 	u32 type = 0;
 	/// The index among its function's parameters and instructions, or for an address among the module's addresses.
