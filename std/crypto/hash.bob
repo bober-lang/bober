@@ -1,5 +1,5 @@
 //! Digests, MACs and keys from secrets: by Monocypher BLAKE2b, SHA-512 with its HMAC and HKDF, and Argon2id; by Mbed
-//! TLS's PSA crypto SHA-256 with its HMAC.
+//! TLS's PSA crypto SHA-256 with its HMAC, and SHA-1 and MD5.
 
 import { CryptoError } from "./error"
 
@@ -9,32 +9,31 @@ import { CRYPTO_ARGON2_ID, crypto_argon2, crypto_argon2_config, crypto_argon2_ex
 import { crypto_sha512, crypto_sha512_hkdf,
 	crypto_sha512_hmac } from "../../vendor/monocypher/monocypher-ed25519.h" @Deterministic
 
-import { PSA_ALG_HASH_MASK, PSA_ALG_HMAC_BASE, PSA_ALG_SHA_256, PSA_KEY_TYPE_HMAC, PSA_KEY_USAGE_SIGN_MESSAGE,
-	psa_crypto_init, psa_destroy_key, psa_hash_compute, psa_import_key, psa_key_attributes_t, psa_mac_compute,
-	psa_set_key_algorithm, psa_set_key_type,
+import { PSA_ALG_HASH_MASK, PSA_ALG_HMAC_BASE, PSA_ALG_MD5, PSA_ALG_SHA_1, PSA_ALG_SHA_256, PSA_KEY_TYPE_HMAC,
+	PSA_KEY_USAGE_SIGN_MESSAGE, psa_crypto_init, psa_destroy_key, psa_hash_compute, psa_import_key,
+	psa_key_attributes_t, psa_mac_compute, psa_set_key_algorithm, psa_set_key_type,
 	psa_set_key_usage_flags } from "../../vendor/mbedtls/tf-psa-crypto/include/psa/crypto.h" @Deterministic
 
 import { free, malloc } from "../../builtin/c"
 import { memcpy } from "string.h" @Deterministic
 
-export function sha512(data: string): string {
+export function sha512(data: string): string throws CryptoError {
 	const h = new u8[](64)
 	crypto_sha512(h, data, data.length as u64)
 	return fromBytes(h)
 }
 
-export function hmacSha512(key: string, data: string): string {
+export function hmacSha512(key: string, data: string): string throws CryptoError {
 	const mac = new u8[](64)
 	crypto_sha512_hmac(mac, key, key.length as u64, data, data.length as u64)
 	return fromBytes(mac)
 }
 
-export function sha256(data: string): string throws CryptoError {
-	psa(psa_crypto_init())
-	const h = new u8[](32)
-	psa(psa_hash_compute(PSA_ALG_SHA_256, data, data.length as u64, h, 32, new u64[](1)))
-	return fromBytes(h)
-}
+export function sha256(data: string): string throws CryptoError { return digest(PSA_ALG_SHA_256, 32, data) }
+/// Broken against collisions: for formats that name it, not for security.
+export function sha1(data: string): string throws CryptoError { return digest(PSA_ALG_SHA_1, 20, data) }
+/// Broken against collisions: for formats that name it, not for security.
+export function md5(data: string): string throws CryptoError { return digest(PSA_ALG_MD5, 16, data) }
 
 /// Of a key of at least a byte.
 export function hmacSha256(key: string, data: string): string throws CryptoError {
@@ -60,8 +59,19 @@ function psa(status: i32) throws CryptoError {
 	}
 }
 
+/// data's digest by PSA's alg, of size bytes.
+function digest(alg: u32, size: i32, data: string): string throws CryptoError {
+	psa(psa_crypto_init())
+	const h = new u8[](size)
+	psa(psa_hash_compute(alg, data, data.length as u64, h, size as u64, new u64[](1)))
+	return fromBytes(h)
+}
+
 /// size bytes of key from the secret ikm, as RFC 5869.
-export function hkdfSha512(ikm: string, salt: string, info: string, size: i32): string {
+export function hkdfSha512(ikm: string, salt: string, info: string, size: i32): string throws CryptoError {
+	if (size < 1 || size > 255 * 64) {
+		throw new CryptoError("hkdfSha512 takes a size of 1 to 16320 bytes")
+	}
 	const k = new u8[](size)
 	crypto_sha512_hkdf(k, size as u64, ikm, ikm.length as u64, salt, salt.length as u64, info, info.length as u64)
 	return fromBytes(k)
