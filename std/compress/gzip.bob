@@ -1,31 +1,9 @@
 //! gzip (RFC 1952): members one after another, each a deflate stream between a header and a CRC32 and length trailer.
 
+import { crc32 } from "../hash/crc32"
 import { Reader } from "../io"
 import { ParseError } from "../string"
 import { Inflater, Once, deflate } from "./deflate"
-
-function table(): u32[] {
-	const t = new u32[](256)
-	for (const n of 0 ... 255) {
-		let c = n as u32
-		for (const k of 1 ... 8) {
-			c = if ((c & 1) == 1) 0xedb88320 ^ c >> 1 else c >> 1
-		}
-		t[n] = c
-	}
-	return t
-}
-
-const crcTable = table()
-
-/// The CRC32 of s after what crc covered.
-export function crc32(s: string, crc: u32 = 0): u32 {
-	let c = crc ^ 0xffffffff
-	for (const i of 0 ... s.length - 1) {
-		c = crcTable[((c ^ (s[i] as u32)) & 0xff) as i32] ^ c >> 8
-	}
-	return c ^ 0xffffffff
-}
 
 function le32(v: u32): string {
 	let s = ""
