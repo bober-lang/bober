@@ -192,8 +192,11 @@ export class Query {
 	}
 }
 
-/// s with + a space, unless in a path, and each %XX its byte; a % not followed by two hex digits is kept, as WHATWG.
-export function unescape(s: string, path = false): string {
+/// Where an escaped string goes: a form's name or value, a path, or any other component, as RFC 3986 escapes one.
+export type Mode = "form" | "path" | "component"
+
+/// s with each %XX its byte, and + a space in a form; a % not followed by two hex digits is kept, as WHATWG.
+export function unescape(s: string, mode: Mode = "form"): string {
 	let out = ""
 	let i = 0
 	while (i < s.length) {
@@ -202,7 +205,7 @@ export function unescape(s: string, path = false): string {
 			out += chr(digit(s[i + 1])! << 4 | digit(s[i + 2])!)
 			i += 3
 		} else {
-			out += if (ch == plus && !path) " " else chr(ch)
+			out += if (ch == plus && mode == "form") " " else chr(ch)
 			i++
 		}
 	}
@@ -211,15 +214,15 @@ export function unescape(s: string, path = false): string {
 
 const hex = "0123456789ABCDEF"
 
-/// s with a space as +, unless in a path, and each byte but the unreserved, letters, digits and -._~, and / in a path,
-/// as %XX.
-export function escape(s: string, path = false): string {
+/// s with each byte but the unreserved, letters, digits and -._~, as %XX; in a form a space is + instead, in a path a /
+/// is kept.
+export function escape(s: string, mode: Mode = "form"): string {
 	let out = ""
 	for (const ch of s) {
-		if (ch == space && !path) {
+		if (ch == space && mode == "form") {
 			out += "+"
 		} else if (isAlphanumeric(ch) || ch == minus || ch == dot || ch == underscore || ch == tilde
-			|| path && ch == slash) {
+			|| ch == slash && mode == "path") {
 			out += chr(ch)
 		} else {
 			out += `%${chr(hex[ch >> 4])}${chr(hex[ch & 15])}`
