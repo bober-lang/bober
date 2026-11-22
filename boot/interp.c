@@ -1418,6 +1418,11 @@ static Val bi_args(Val self, Val *a, int n, Node *site) {
 #define TARGET_ARCH "x86_64"
 #endif
 
+static Val bi_env(Val self, Val *a, int n, Node *site) {
+  const char *v = getenv(cstr(n ? a[0] : NUL, site));
+  return v ? S(mkstr(v, strlen(v))) : NUL;
+}
+
 static Val bi_targetOs(Val self, Val *a, int n, Node *site) { return S(mkstr(TARGET_OS, strlen(TARGET_OS))); }
 
 static Val bi_targetArch(Val self, Val *a, int n, Node *site) { return S(mkstr(TARGET_ARCH, strlen(TARGET_ARCH))); }
@@ -1457,12 +1462,11 @@ static Val bi_fromBytes(Val self, Val *a, int n, Node *site) {
   return S(s);
 }
 
-/// The run time's C memory, arguments, environment and entropy, none, as boot links one image, once, which rt.c gives
-/// and boot does not link.
+/// The run time's C memory, arguments and entropy, none, as boot links one image, once, which rt.c gives and boot does
+/// not link.
 void *bober_malloc(uint64_t n) { return malloc(n ? n : 1); }
 void bober_free(void *p) { free(p); }
 const char *bober_arg(int32_t i) { return i < argc_ ? argv_[i] : 0; }
-const char *bober_env(const char *name) { return getenv(name); }
 long bober_entropy(unsigned char *p, long n) { return memset(p, 0, n), 0; }
 
 static Val bi_fromC(Val self, Val *a, int n, Node *site) {
@@ -1636,6 +1640,7 @@ static void init(void) {
   builtin(prelude, "readFile", bi_readFile);
   builtin(prelude, "writeFile", bi_writeFile);
   builtin(prelude, "args", bi_args);
+  builtin(prelude, "env", bi_env);
   builtin(prelude, "targetOs", bi_targetOs);
   builtin(prelude, "targetArch", bi_targetArch);
   builtin(prelude, "now", bi_now);
@@ -1689,8 +1694,9 @@ static Mod *load(const char *path, Node *site) {
   char *real = realpath(path, 0);
   if (!real) fatal(site, "cannot open ", path);
   if (!strcmp(real, rooted("/builtin/mem.bob"))) return mem;  // its intrinsics have no body
-  // What builtin/sys.bob takes of these is the prelude's.
-  if (!strcmp(real, rooted("/builtin/string.bob")) || !strcmp(real, rooted("/builtin/c.bob"))) return prelude;
+  // What std takes of these is the prelude's.
+  if (!strcmp(real, rooted("/builtin/string.bob")) || !strcmp(real, rooted("/builtin/c.bob"))
+    || !strcmp(real, rooted("/builtin/io.bob"))) return prelude;
   Mod **tail = &mods;
   for (; *tail; tail = &(*tail)->next) if (!strcmp((*tail)->path, real)) return *tail;
   Mod *m = *tail = alloc(sizeof(Mod));

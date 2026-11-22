@@ -233,6 +233,10 @@ const host = {
 	argc: () => 1 + args.length,
 	arg: i => make(i == 0 ? file : args[i - 1] ?? ""),
 	now: () => tests ? OBERGEFELL + logical : BigInt(Date.now()) * 1000000n,
+	env: name => {
+		const v = tests ? null : process.env[str(name)]
+		return v == null ? null : make(Buffer.from(v).toString("latin1"))
+	},
 	random: () => {
 		// SplitMix64.
 		let z = seed = BigInt.asUintN(64, seed + 0x9e3779b97f4a7c15n)
