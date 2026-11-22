@@ -319,12 +319,13 @@ class Emitter {
 		const declare = (name: string, ret: IrType, params: IrType[]) => {
 			const f = b.function(`bober_${name}`, b.fn(ret, params), false)
 			this.rts.set(name, f)
-			if (!["alloc", "test", "zero"].includes(name)) {
+			if (!["alloc", "strbuf", "test", "zero"].includes(name)) {
 				b.attr(f, -1, "gc-leaf-function", 0)
 			}
 			return f
 		}
 		b.allocator(declare("alloc", this.ref, [i64, ptr]))
+		b.allocator(declare("strbuf", this.ref, [i64]))
 		b.attr(declare("trap", v, [ptr, ptr, i32]), -1, "noreturn", 0)
 		b.attr(declare("fail", v, [this.ref, ptr, i32]), -1, "noreturn", 0)
 		declare("throw", v, [i64, i64, this.ref, ptr, i32, ptr])
@@ -344,9 +345,6 @@ class Emitter {
 		libc("memcpy", ptr)
 		libc("memcmp", i32)
 		this.rts.set("heap", b.extern("bober_heap", i64))
-		this.rts.set("thrownFile", b.extern("bober_thrown_file", ptr))
-		this.rts.set("thrownAt", b.extern("bober_thrown_at", i32))
-		this.rts.set("thrownShow", b.extern("bober_thrown_show", ptr))
 		if (this.dyn) {
 			declare("type_of", i64, [i64, i64, ptr, ptr])
 			declare("field_of", i64, [i64, ptr, i64, ptr])
@@ -1321,9 +1319,12 @@ class Emitter {
 	/// The union value caught, which the exception holds, and its site, as rt.c keeps it.
 	private landing(): [Value, Value[]] {
 		this.ir().landingPad(this.b.constZero(this.ptr))
-		const u = this.ir().load(this.unionTy, this.rt("caught", [], false), false)
-		const kept = (g: string, t: IrType) => this.ir().load(t, this.rts.get(g)!, false)
-		return [u, [kept("thrownFile", this.ptr), kept("thrownAt", this.i32), kept("thrownShow", this.ptr)]]
+		const p = this.rt("caught", [], false)
+		const t = this.b.struct([this.unionTy, this.ptr, this.i32, this.ptr])
+		return [this.ir().load(this.unionTy, p, false),
+			[this.ir().load(this.ptr, this.ir().field(t, p, 1), false),
+			this.ir().load(this.i32, this.ir().field(t, p, 2), false),
+			this.ir().load(this.ptr, this.ir().field(t, p, 3), false)]]
 	}
 
 	/// Throws the union value u from its site: where it is thrown and the code showing it; if nothing catches it, traps
@@ -1790,6 +1791,10 @@ class Emitter {
 	private intrinsic(name: string, env: i32, ret: i32) {
 		if (name == "deref") {
 			this.push(this.ir().cast("ptrtoint", this.pop().v, this.i64), ret)
+			return
+		}
+		if (name == "strbuf") {
+			this.push(this.rt("strbuf", [this.pop().v], false), ret)
 			return
 		}
 		if (name == "memcpy" || name == "memcmp") {

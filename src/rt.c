@@ -28,7 +28,14 @@
 #include <libproc.h>
 #endif
 
-typedef struct { struct _Unwind_Exception header; int64_t tag, bits; void *ref; } Thrown;
+typedef struct {
+  struct _Unwind_Exception header;
+  int64_t tag, bits;
+  void *ref;
+  const char *file;
+  int32_t at;
+  void *show;
+} Thrown;
 /// The exception bober_personality last landed with, for bober_caught.
 static Thrown *caught;
 
@@ -150,7 +157,7 @@ void bober_throw(int64_t tag, int64_t bits, void *ref, const char *file, int32_t
   bober_thrown_file = file, bober_thrown_at = at, bober_thrown_show = show;
   free(caught), caught = 0;  // A landing pad loads what it caught at once, so the last throw's is done with.
   Thrown *e = bober_malloc(sizeof(Thrown));
-  *e = (Thrown){.tag = tag, .bits = bits, .ref = ref};
+  *e = (Thrown){.tag = tag, .bits = bits, .ref = ref, .file = file, .at = at, .show = show};
   memcpy(&e->header.exception_class, "bober\0\0\0", 8);
   _Unwind_RaiseException(&e->header);
 }

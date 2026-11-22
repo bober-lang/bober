@@ -31,7 +31,8 @@
 #define PAGES (1 << 20)  // of address space, 64 GiB
 #define CARD 9           // the bits of a card's size, as the write barrier has it
 #define SMALL 8192       // the size of the largest object of a size class
-#define CLASSES 36       // those of objects with refs; class c + CLASSES is c's size, of objects without
+#define CLASSES 36       // those of objects with refs; class c + CLASSES is c's size, of objects without, and
+                         // c + 2 * CLASSES of strings' buffers
 
 enum { FREE, YOUNG, OLD, BIG, REST };
 /// A page: its kind, its size class if young or old, or if big whether with refs, the offset bumped to if young or
@@ -46,9 +47,9 @@ static uint64_t *marks;  // a bit for each 16 bytes, set at an object's start if
 static Page pages[PAGES];
 static uint32_t top = 1;   // the pages ever used, from 1, so that 0 is no page
 static uint32_t hint = 1;  // where the first free page may be
-static uint32_t sizes[2 * CLASSES], classOf[SMALL / 16 + 1];
-static uint32_t bumped[2 * CLASSES];  // the young page of each class being bumped through
-static char *spare[2 * CLASSES];      // the old slots of each class free, each linked through its first word
+static uint32_t sizes[3 * CLASSES], classOf[SMALL / 16 + 1];
+static uint32_t bumped[3 * CLASSES];  // the young page of each class being bumped through
+static char *spare[3 * CLASSES];      // the old slots of each class free, each linked through its first word
 static int64_t reserved;  // what young may reach without a collection, as bober_reserve promised
 static int64_t young, every = 32 << 20;  // what has been allocated since the last collection, and how much collects
 static int64_t olds, kept, major = 64 << 20;  // the bytes of old objects, the dead since the last major too, those
@@ -104,7 +105,7 @@ static void stats(void) {
 void bober_gc_start(void **at) {
   bottom = at;
   for (int c = 0; c < CLASSES; c++)
-    sizes[c] = sizes[c + CLASSES] = c < 16 ? 16 * (c + 1) : (64 << (c - 16) / 4) * (5 + (c - 16) % 4);
+    sizes[c] = sizes[c + CLASSES] = sizes[c + 2 * CLASSES] = c < 16 ? 16 * (c + 1) : (64 << (c - 16) / 4) * (5 + (c - 16) % 4);
   for (int n = 0, c = 0; n <= SMALL / 16; n++) {
     while (16 * n > sizes[c]) c++;
     classOf[n] = c;
@@ -518,7 +519,7 @@ __attribute__((noinline, cold)) static void *slow(int64_t n, int64_t size, int c
   char *h;
   if (size > SMALL) {
     uint32_t p = take((size + PAGE - 1) / PAGE, BIG);
-    pages[p].used = 1, pages[p].class = l ? 0 : CLASSES, h = at(p);
+    pages[p].used = 1, pages[p].class = c, h = at(p);
   } else {
     Page *g = &pages[bumped[c]];
     if (!bumped[c] || g->used + sizes[c] > PAGE) {
@@ -539,12 +540,12 @@ void bober_reserve(int64_t n) {
   reserved = young + n;
 }
 
-/// Bumps through the young page of the size's class, which no page yet is before the first allocation.
-void *bober_alloc(int64_t n, const bober_layout *l) {
+/// Bumps through the young page of class c of the size, which no page yet is before the first allocation.
+static inline void *bump(int64_t n, int c, const bober_layout *l) {
   int64_t size = (n + 15) & ~15;
   allocs++;
   PROBE(alloc, n);
-  int c = size <= SMALL ? classOf[size / 16] + (l ? 0 : CLASSES) : 0;
+  c += size <= SMALL ? classOf[size / 16] : 0;
   Page *g = &pages[bumped[c]];
   if (__builtin_expect(size > SMALL || young + size > every || !bumped[c] || g->used + sizes[c] > PAGE, 0))
     return slow(n, size, c, l);
@@ -555,3 +556,7 @@ void *bober_alloc(int64_t n, const bober_layout *l) {
   else if (l) lay(h, n, l);
   return h;
 }
+
+void *bober_alloc(int64_t n, const bober_layout *l) { return bump(n, l ? 0 : CLASSES, l); }
+
+void *bober_strbuf(int64_t n) { return bump(n, 2 * CLASSES, 0); }
