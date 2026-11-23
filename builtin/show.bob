@@ -3,7 +3,12 @@
 
 import { formatFloat } from "../std/float"
 import { quoted, split } from "../std/string"
+import { idOf } from "./io"
 import { showUint } from "./string"
+
+/// The ids of the class instances show is in, the outermost first: a cycle passes through one, as a type refers to
+/// itself only through a class.
+let showing: u64[] = []
 
 /// x as a template converts it when its type has no toString of its own: by its structure, as JSON writes it.
 ///
@@ -12,7 +17,8 @@ import { showUint } from "./string"
 /// Each `${v}` is converted by `v.toString()`. Every type has `toString(): string`; one it does not declare shows a
 /// string as is, an integer in decimal, a float in the shortest decimal that round-trips, a bool as `true`/`false`,
 /// `null` as `null`, a `Type` by its name, an array, fixed array or tuple as `[a, b]`, and an object or class as `{"k": v}`, its
-/// elements and fields each by their own `toString`, strings among them quoted.
+/// elements and fields each by their own `toString`, strings among them quoted, and an instance met again within
+/// itself as `[Circular]`.
 ///
 /// ```
 /// class P { x = 0; toString(): string { return `P(${this.x})` } }
@@ -40,14 +46,16 @@ export function show[T](x: T): string {
 				es.push(item(x[f.name]))
 			}
 			return `[${es.join(", ")}]`
-		case "object", "class":
-			const fs: string[] = []
-			for (const f of T.fields) {
-				if (f.type.kind != "function") {
-					fs.push(`${quoted(f.name)}: ${item(x[f.name])}`)
-				}
+		case "object": return fields(x)
+		case "class":
+			const id = idOf(x)
+			if (showing.includes(id)) {
+				return "[Circular]"
 			}
-			return `{${fs.join(", ")}}`
+			showing.push(id)
+			const s = fields(x)
+			showing.pop()
+			return s
 		case "union": for (const M of T.members) {
 			if (x instanceof M) {
 				return `${x}`
@@ -55,6 +63,17 @@ export function show[T](x: T): string {
 		}
 	}
 	return T.kind
+}
+
+/// x, an object or class instance, as show shows it: `{"k": v}`.
+function fields[T](x: T): string {
+	const fs: string[] = []
+	for (const f of T.fields) {
+		if (f.type.kind != "function") {
+			fs.push(`${quoted(f.name)}: ${item(x[f.name])}`)
+		}
+	}
+	return `{${fs.join(", ")}}`
 }
 
 /// x as an element or field of what show shows, or a value a failed assert shows: a string quoted, also as a union's

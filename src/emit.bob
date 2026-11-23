@@ -916,6 +916,7 @@ class Emitter {
 				const env = c.b(i)
 				const to = p.subst(t, env)
 				if (p.decls[d].kind == decl.Function) {
+					this.touchByIdOf(d, env)
 					// A generic's, its type args' descriptors in the closure.
 					const g = if (env == 0) this.value(d, false)
 						else this.closure(this.value(d, false), [], this.envDescs(env))
@@ -1645,6 +1646,7 @@ class Emitter {
 			this.push(this.cast(this.pop(), p.lists[env][0]), p.lists[env][0])
 			return
 		}
+		this.touchByIdOf(d, env)
 		const f = this.callee(d)
 		if (f.env && this.dyn) {
 			this.callRef({ v: this.b.constZero(this.ref), t: p.subst(x.type, env) }, this.popN(f.params.length), d)
@@ -2129,7 +2131,9 @@ class Emitter {
 		if (name == "addr" && (this.dynamic(t) || this.kindOf(t) == kind.Union)) {
 			// Its ref, or the address of a copy of its bits.
 			const v = this.pop()
-			this.touch(v.t) // by identity
+			if (!this.isLang(this.fnDecl, "idOf")) {
+				this.touch(v.t) // by identity, but idOf's by its uses (touchByIdOf)
+			}
 			const u = this.fat(v)
 			const r = this.ir().cast("ptrtoint", this.refOf(u), this.i64)
 			const bits = this.spill(this.bitsOf(u), this.i64, this.slot(this.i64))
@@ -2176,11 +2180,27 @@ class Emitter {
 				this.push(this.bool(false), kind.Null)
 			case "addr":
 				const v = this.pop()
-				this.touch(v.t) // by identity
+				if (!this.isLang(this.fnDecl, "idOf")) {
+					this.touch(v.t) // by identity, but idOf's by its uses (touchByIdOf)
+				}
 				const q = if (this.ll(t) == this.ref) v.v else this.spill(v.v, this.ll(t), this.slot(this.ll(t)))
 				this.push(this.ir().cast("ptrtoint", q, this.i64), ret)
 			default: throw new CompileError(`emit: ${name} is not an intrinsic`)
 		}
+	}
+
+	/// Notes the class of idOf's arg touched if d of env is idOf, called or taken as a value, but not by show: its ids
+	/// only tell whether it is within an instance, which one held by value never is.
+	private touchByIdOf(d: i32, env: i32) {
+		if (this.isLang(d, "idOf") && !this.isLang(this.fnDecl, "show")) {
+			this.touch(this.p.items(this.p.subst(this.p.decls[d].type, env))[0])
+		}
+	}
+
+	/// Whether d is builtin/'s function name or an instance of it.
+	private isLang(d: i32, name: string): bool {
+		const g = this.p.decls[d].generic
+		return (if (g >= 0) g else d) == this.p.lang(name)
 	}
 
 	/// The function builtin/ exports by the name, which mono keeps for emit to call.

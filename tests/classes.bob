@@ -559,3 +559,30 @@ test "a cast to a union of more than a few classes passes its members" {
 	const us: (U0 | U1 | U2 | U3 | U4 | U5)[] = [new U5(), new U3()]
 	assert (us[0] as (U0 | U1 | U2 | U4 | U5)).x == 5 && (us[1] as (U1 | U2 | U3 | U4 | U5)).x == 3
 }
+
+class Ring { next: Ring | null = null; n = 0 }
+
+test "== in an assert finds a pair met again within itself equal" {
+	const a = new Ring()
+	a.next = a
+	const b = new Ring()
+	b.next = new Ring()
+	b.next!.next = b
+	const c = new Ring()
+	c.next = new Ring()
+	c.next!.n = 1
+	c.next!.next = c
+	assert a == b && a != c
+}
+
+interface Looping { next: Looping | null }
+class Loop implements Looping { next: Looping | null = null; n = 0 }
+
+test "== in an assert finds a pair met again within itself through an interface equal" {
+	const a: Looping = new Loop()
+	a.next = a
+	const b: Looping = new Loop()
+	b.next = new Loop()
+	b.next!.next = b
+	assert a == b
+}

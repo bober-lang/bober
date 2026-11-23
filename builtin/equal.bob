@@ -1,9 +1,14 @@
 //! Equality by value, which == and != in an assert are lowered to (§5.5), and the string literal a string spells.
 
+import { idOf } from "./io"
 import { trap, zero } from "./mem"
 
+/// The ids of the pairs of class instances equal is in, a's then b's, the outermost first: a cycle passes through one,
+/// as a type refers to itself only through a class.
+let comparing: u64[] = []
+
 /// Whether a and b hold the same value: as == compares them, or else arrays and tuples element by element, objects and
-/// classes field by field, and a union's members by tag and then value.
+/// classes field by field, and a union's members by tag and then value; a pair met again within itself is equal.
 export function equal[T](a: T, b: T): bool {
 	if (a == b) {
 		return true
@@ -27,15 +32,33 @@ export function equal[T](a: T, b: T): bool {
 				}
 			}
 			return true
-		case "tuple", "object", "class", "interface":
-			for (const f of t.fields) {
-				if (!equal(a[f.name], b[f.name])) {
-					return false
+		case "tuple", "object": return fields(a, b)
+		case "class", "interface":
+			const ia = idOf(a)
+			const ib = idOf(b)
+			for (const i of 0 ... comparing.length / 2 - 1) {
+				if (comparing[2 * i] == ia && comparing[2 * i + 1] == ib) {
+					return true
 				}
 			}
-			return true
+			comparing.push(ia)
+			comparing.push(ib)
+			const e = fields(a, b)
+			comparing.pop()
+			comparing.pop()
+			return e
 		default: return false
 	}
+}
+
+/// Whether a and b, tuples, objects, class instances or interfaces, hold equal fields.
+function fields[T](a: T, b: T): bool {
+	for (const f of T.fields) {
+		if (!equal(a[f.name], b[f.name])) {
+			return false
+		}
+	}
+	return true
 }
 
 /// The literal of T, a string literal type or a union of them, that s spells: the program's one value of it (§4.2),
