@@ -31,7 +31,7 @@ the other. A server runs a handler; a client is one; middleware wraps one; a tes
 | std/http/router | `Router`, patterns, middleware | 1 |
 | std/tls | `Conn` over Mbed TLS, client and server | 2 |
 | std/net/dns | a resolver in bober over the ring, /etc/hosts and resolv.conf, a TTL cache per isolate | 3 |
-| std/http/h2, hpack | HTTP/2 streams on one TLS connection, chosen by ALPN, under the same Request and Response | 3 |
+| std/http/h2, hpack | HTTP/2 streams on one connection, by ALPN over TLS or by prior knowledge in the clear, under the same Request and Response | 3 |
 | std/http/websocket | `accept` and `connect` over the 101 upgrade hook | 3 |
 | std/http/cookie | `Cookie`, `Jar` as a Client middleware | 3 |
 | std/http/multipart | streaming parts, `form`, `encode` | 3 |

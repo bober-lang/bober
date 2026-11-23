@@ -1248,3 +1248,24 @@ test "headerTimeout bounds the head's reads though a byte of it came as the requ
 	await job
 	l.close()
 }
+
+test "a client told the server speaks HTTP/2 speaks it in the clear, h2c, and the server takes it besides HTTP/1.1" {
+	const s = server()
+	const job = async s.serve(app)
+	const base = `http://${s.addr}`
+	const c = new Client()
+	c.h2c = true
+	assert c.send(new Request("GET", `${base}/version`)).body.text() == "HTTP/2"
+	assert c.send(new Request("GET", `${base}/scheme`)).body.text() == "http"
+	assert c.send(new Request("POST", `${base}/echo`, new Pieces(["c", "b", "a"]))).body.text() == "abc"
+	assert c.h2.length == 1 && s.conns == 1
+	// An upgrade goes over HTTP/1.1.
+	const ask = new Request("GET", `${base}/up`)
+	ask.headers.set("upgrade", "echo")
+	const up = c.send(ask)
+	assert up.status == 101 && up.stream!.read(100) == "!"
+	up.stream!.close()
+	assert get(`${base}/version`).body.text() == "HTTP/1.1"
+	s.close()
+	await job
+}

@@ -1,6 +1,6 @@
 //! HTTP/1.1 messages as RFC 9112 frames them, for std/http.
 
-import { indexOf } from "../algo"
+import { indexOf, startsWith } from "../algo"
 import { cr, hash, isAlphanumeric, isControl, isHexDigit, semicolon, space, tab } from "../ascii"
 import { Reader, Stream } from "../io"
 import { max } from "../math"
@@ -30,6 +30,12 @@ export class Buffered {
 		}
 		this.buf += s
 		return true
+	}
+
+	/// Whether the next bytes are p, read until they differ or all came, and left unread.
+	starts(p: string): bool throws IoError {
+		while (this.buf.length < p.length && startsWith(p, this.buf) && this.fill()) {}
+		return startsWith(this.buf, p)
 	}
 
 	/// Up to n bytes; null at the end.

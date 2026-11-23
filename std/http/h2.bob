@@ -1,14 +1,14 @@
-//! HTTP/2 (RFC 9113) on a TLS connection, for std/http: a Conn carries many requests at once, each a stream.
+//! HTTP/2 (RFC 9113) on a TLS connection, or a socket by prior knowledge (h2c), for std/http: a Conn carries many
+//! requests at once, each a stream.
 
 import { startsWith } from "../algo"
 import { Signal } from "../../builtin/fiber"
 import { isDigit, zero } from "../ascii"
 import { HashMap } from "../collections/hashmap"
-import { ReadCloser, Reader } from "../io"
+import { ReadCloser, Reader, Stream as IoStream } from "../io"
 import { max, min } from "../math"
 import { ParseError, lower, parseInt } from "../string"
 import { deadline, monotonic, second } from "../time"
-import * as tls from "../tls"
 import { Buffered, isTarget, isToken, isValue } from "./h1"
 import { Decoder, Encoder } from "./hpack"
 
@@ -17,7 +17,15 @@ export type Head = [string, string][]
 /// head and body, null for none, closed once sent or abandoned.
 export type Handle = (head: Head, body: Body | null) => [Head, ReadCloser | null] throws IoError
 
-const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+/// What a Conn runs on: a tls.Conn, or a net.Conn for h2c.
+export interface Socket {
+	...IoStream
+
+	end()
+	shutdown() throws IoError
+}
+
+export const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 /// The initial window, and ours of a stream and of the connection.
 const initial: i64 = 65535
 const streamWindow: i64 = 4 << 20
@@ -119,7 +127,7 @@ export class Conn {
 	closed = false
 	/// Once the peer's settings came: till then its limit on streams is unknown.
 	settled = false
-	private s: tls.Conn
+	private s: Socket
 	private server: bool
 	private b: Buffered
 	private streams = new HashMap[i64, Stream]()
@@ -154,14 +162,14 @@ export class Conn {
 	/// with bytes or END_STREAM came; at first, the start.
 	private quiet = monotonic()
 
-	/// Over s, closed as the connection ends; a client's SETTINGS, maxHeaders among them, go at once and its reads on a
-	/// fiber of its own from here on; a server's reads in serve.
-	constructor(s: tls.Conn, server: bool, maxHeaders: i64 = 1 << 16) throws IoError {
+	/// Over s, read through b, closed as the connection ends; a client's SETTINGS, maxHeaders among them, go at once
+	/// and its reads on a fiber of its own from here on; a server's reads in serve.
+	constructor(s: Socket, server: bool, maxHeaders: i64 = 1 << 16, b: Buffered = new Buffered(s)) throws IoError {
 		this.s = s
 		this.timeout = s.timeout
 		this.server = server
 		this.maxHeaders = maxHeaders
-		this.b = new Buffered(s)
+		this.b = b
 		if (!server) {
 			this.send(preface + this.ours())
 			const job = async this.run(null)
@@ -965,8 +973,8 @@ export class Conn {
 		}
 	}
 
-	/// Ends the socket once closed with no stream open, which ends the reading fiber; close_notify first, so that the
-	/// peer reads an end, not a cut.
+	/// Ends the socket once closed with no stream open, which ends the reading fiber; close_notify or a FIN first, so
+	/// that the peer reads an end, not a cut.
 	private idle() {
 		if (this.closed && this.streams.size == 0) {
 			// close_notify, unless a write is parked, which it would wait on: then the end is cut, waking it. A second

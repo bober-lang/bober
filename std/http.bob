@@ -1,8 +1,10 @@
 //! HTTP, shaped as fetch is: a Handler turns a Request into a Response; a Server runs one, a Client is one. HTTP/1.1,
-//! and HTTP/2 over TLS. A status is never an error; a message that is not HTTP, or past a limit, is an IoError.
+//! and HTTP/2 over TLS or, by prior knowledge, in the clear (h2c). A status is never an error; a message that is not
+//! HTTP, or past a limit, is an IoError.
 
 import { indexOf, startsWith } from "./algo"
 import { HashMap } from "./collections/hashmap"
+import { Identity } from "./hash"
 import { EncodeError, decode, encode } from "./encoding/json"
 import { Signal } from "../builtin/fiber"
 import { ReadCloser, Reader, Stream, copy, readAll, stderr } from "./io"
@@ -232,6 +234,9 @@ export class Client {
 	idleTimeout: i64 = 90 * second
 	/// For https, offering h2 and http/1.1.
 	tls = negotiating(new tls.Config())
+	/// Sends http requests over HTTP/2, as to a server known to take it (RFC 9113 §3.3), but an upgrade's; one that
+	/// takes HTTP/1.1 alone fails them.
+	h2c = false
 	/// Idle connections, their origins and since when, oldest first.
 	private idle: [string, Stream, Conn, i64][] = []
 	/// HTTP/2 connections and their origins.
@@ -424,24 +429,26 @@ export class Client {
 	}
 
 	/// A new connection to host:port, through TLS if secure, offering http/1.1 alone for an upgrade, and its socket;
-	/// once it agreed on HTTP/2, the h2.Conn instead, kept in this.h2 unless another of origin is yet unsettled.
+	/// once it agreed on HTTP/2, or is h2c, the h2.Conn instead, kept in this.h2 unless another of origin is yet
+	/// unsettled.
 	private connect(host: string, port: u16, secure: bool, origin: string,
 		upgrade: bool): [Stream, Conn] | h2.Conn throws IoError | ParseError {
 		const c = dial(`${host}:${port}`, this.connectTimeout)
-		if (!secure) {
-			return [c, c]
-		}
-		let s: Stream = c
+		let s: h2.Socket = c
 		try {
-			c.timeout = this.connectTimeout
-			const name = if (startsWith(host, "[")) host.slice(1, host.length - 1) else host
-			const t = tls.client(c, name, if (upgrade) upgrading(this.tls) else this.tls)
-			s = t
-			if (t.alpn != "h2") {
-				return [t, c]
+			if (secure) {
+				c.timeout = this.connectTimeout
+				const name = if (startsWith(host, "[")) host.slice(1, host.length - 1) else host
+				const t = tls.client(c, name, if (upgrade) upgrading(this.tls) else this.tls)
+				s = t
+				if (t.alpn != "h2") {
+					return [t, c]
+				}
+			} else if (upgrade || !this.h2c) {
+				return [c, c]
 			}
-			t.timeout = this.timeout
-			const h = new h2.Conn(t, false, this.maxHeaders)
+			s.timeout = this.timeout
+			const h = new h2.Conn(s, false, this.maxHeaders)
 			h.idleTimeout = this.idleTimeout
 			const other = this.h2.find(p => p[0] == origin && p[1].free())
 			if (other != null) {
@@ -610,10 +617,10 @@ export class Server {
 	private active = 0
 	private closing = false
 	private listener: Listener | null = null
-	/// Those between requests, or upgraded, each by itself.
-	private idle = new HashMap[Conn, Conn]()
+	/// Those between requests, or upgraded, each by itself; by identity, as a Conn's timeout changes.
+	private idle = new HashMap[Conn, Conn, Identity[Conn]]()
 	/// Those on HTTP/2, by their connection.
-	private h2s = new HashMap[Conn, h2.Conn]()
+	private h2s = new HashMap[Conn, h2.Conn, Identity[Conn]]()
 	/// Woken as a connection or a request ends.
 	private ended = new Signal()
 
@@ -695,24 +702,31 @@ export class Server {
 		}
 	}
 
-	/// Serves c until it ends: its requests in order, or as streams if it agreed on HTTP/2.
+	/// Serves c until it ends: its requests in order, or as streams if it agreed on HTTP/2, or in the clear begins
+	/// with its preface.
 	private connection(c: Conn, handler: Handler) {
-		let s: Stream = c
+		let s: h2.Socket = c
 		let h: h2.Conn | null = null
 		try {
 			if (this.tls != null) {
 				c.timeout = this.headerTimeout
 				s = tls.server(c, this.tls!)
 			}
-			if (s instanceof tls.Conn && s.alpn == "h2" && !this.closing) {
-				h = new h2.Conn(s, true, this.maxHeaders)
+			const b = new Buffered(s)
+			let two = s instanceof tls.Conn && s.alpn == "h2"
+			if (this.tls == null && this.next(c, b)) {
+				b.deadline = deadline(this.headerTimeout) // The preface is a head.
+				two = b.starts(h2.preface)
+			}
+			if (two && !this.closing) {
+				h = new h2.Conn(s, true, this.maxHeaders, b)
 				h.timeout = this.timeout
 				h.idleTimeout = this.idleTimeout
 				this.h2s.set(c, h)
 				const handle: h2.Handle = (head, body) => this.stream(head, body, handler)
 				h.serve(handle)
 			} else {
-				this.requests(c, s, handler)
+				this.requests(c, b, handler)
 			}
 		} catch (e: IoError) {
 			// The connection is gone, past a timeout, or not TLS.
@@ -727,17 +741,9 @@ export class Server {
 		this.ended.wake()
 	}
 
-	/// Serves the requests on s in order until it ends, the handler fails, or a message asks to close.
-	private requests(c: Conn, s: Stream, handler: Handler) throws IoError {
-		const b = new Buffered(s)
-		while (!this.closing) {
-			s.timeout = this.idleTimeout
-			this.idle.set(c, c)
-			const more = b.pending() || b.fill()
-			this.idle.delete(c)
-			if (!more || this.closing) {
-				break
-			}
+	/// Serves the requests on b, of c, in order until it ends, the handler fails, or a message asks to close.
+	private requests(c: Conn, b: Buffered, handler: Handler) throws IoError {
+		while (this.next(c, b)) {
 			this.active++
 			try {
 				if (!this.exchange(c, b, handler)) {
@@ -748,6 +754,18 @@ export class Server {
 				this.ended.wake()
 			}
 		}
+	}
+
+	/// Whether bytes came on b, of c, within idleTimeout, and before close, which ends the wait.
+	private next(c: Conn, b: Buffered): bool throws IoError {
+		if (this.closing) {
+			return false
+		}
+		b.stream.timeout = this.idleTimeout
+		this.idle.set(c, c)
+		const more = b.pending() || b.fill()
+		this.idle.delete(c)
+		return more && !this.closing
 	}
 
 	/// handler's response to req; a 500 if it throws, logged to stderr. OPTIONS *, which asks of the server and of no
@@ -853,7 +871,8 @@ export class Server {
 			headers.append("cookie", cookies.join("; "))
 		}
 		headers.entries = [["host", authority], ...headers.entries]
-		const req = new Request(method, `https://${authority}${if (star) "" else path}`)
+		const req = new Request(method,
+			`${if (this.tls == null) "http" else "https"}://${authority}${if (star) "" else path}`)
 		if (star) {
 			req.url.path = "*"
 		}
