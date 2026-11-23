@@ -143,16 +143,16 @@ class Lane {
 /// A client's connection over c to host, whose certificate is checked against cfg's roots; a trailing dot, which
 /// names the root, is neither sent nor checked.
 export function client(c: net.Conn, host: string, cfg: Config = new Config()): Conn throws IoError {
-	return context(c, false, cfg, host, t => {
+	return context(c, false, cfg, host, "", t => {
 		bober_tls_trust(t, if (cfg.insecure) 0 else roots(cfg.roots, host))
 		return handshake(c, t, if (endsWith(host, ".")) host.slice(0, host.length - 1) else host, host)
 	})
 }
 
-/// A server's connection over c, with cfg's certificate.
-export function server(c: net.Conn, cfg: Config): Conn throws IoError {
+/// A server's connection over c, with cfg's certificate; early is what was read of c already.
+export function server(c: net.Conn, cfg: Config, early = ""): Conn throws IoError {
 	const what = `${c.remote}`
-	return context(c, true, cfg, what, t => {
+	return context(c, true, cfg, what, early, t => {
 		check(bober_tls_own(t, certificate(cfg, what)), "certificate", t, what)
 		return handshake(c, t, null, what)
 	})
@@ -161,10 +161,10 @@ export function server(c: net.Conn, cfg: Config): Conn throws IoError {
 /// Parses cfg's certificate and key as server will, so that a listener on what fails at once if they are unsound.
 export function load(cfg: Config, what: string) throws IoError { certificate(cfg, what) }
 
-/// What f makes of a context on c, with cfg's protocols; freed if f throws.
-function context(c: net.Conn, server: bool, cfg: Config, what: string,
+/// What f makes of a context on c, which reads early first, with cfg's protocols; freed if f throws.
+function context(c: net.Conn, server: bool, cfg: Config, what: string, early: string,
 	f: (t: u64) => Conn throws IoError): Conn throws IoError {
-	const t = bober_tls_new(c.handle.raw(), if (server) 1 else 0)
+	const t = bober_tls_new(c.handle.raw(), if (server) 1 else 0, early, early.length as u64)
 	if (t == 0) {
 		throw new IoError("OutOfResources", "tls", what)
 	}

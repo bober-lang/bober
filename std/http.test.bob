@@ -1283,3 +1283,24 @@ test "listen checks the certificate and key it would serve, rather than fail eac
 	}
 	assert kind == "Tls" && s.addr == "127.0.0.1:0"
 }
+
+test "a server given tls serves http on the same port if clear, else answers it 400" {
+	const s = server()
+	s.tls = certified()
+	s.clear = true
+	const job = async s.serve(app)
+	const port = s.addr.slice(indexOf(s.addr, ":"), s.addr.length)
+	const c = new Client()
+	c.tls.roots = s.tls!.cert
+	assert c.send(new Request("GET", `https://localhost${port}/scheme`)).body.text() == "https"
+	assert c.send(new Request("GET", `http://localhost${port}/scheme`)).body.text() == "http"
+	const two = new Client()
+	two.h2c = true
+	assert two.send(new Request("GET", `http://localhost${port}/version`)).body.text() == "HTTP/2"
+	s.clear = false
+	const res = new Client().send(new Request("GET", `http://localhost${port}/scheme`))
+	assert res.status == 400 && res.body.text() == "Client sent an HTTP request to an HTTPS server.\n"
+	assert c.send(new Request("GET", `https://localhost${port}/scheme`)).body.text() == "https"
+	s.close()
+	await job
+}

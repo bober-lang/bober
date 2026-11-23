@@ -26,8 +26,9 @@ typedef struct {
   // by, so that a byte at a time does not hold one past its timeout; 0 for never. What a read sends, as the alert
   // refusing a renegotiation, has the read's deadline
   long until[2];
-  size_t nip;
+  size_t nip, nearly;
   unsigned char ip[16];  // a client's host if an IP, its nip bytes, checked by bober_tls_ip
+  const unsigned char *early;  // what was read of the socket before, its nearly bytes left, which the BIO gives first
   const char *alpn[9];  // null-ended
 } bober_tls;
 
@@ -59,19 +60,24 @@ static int bober_tls_send(void *ctx, const unsigned char *buf, size_t n) {
 
 static int bober_tls_recv(void *ctx, unsigned char *buf, size_t n) {
   bober_tls *t = ctx;
+  if (t->nearly) {
+    if (n > t->nearly) n = t->nearly;
+    memcpy(buf, t->early, n), t->early += n, t->nearly -= n;
+    return n;
+  }
   long r = bober_tls_io(t, 0, buf, n);
   if (!r) t->eof = 1;
   if (!t->sending) t->until[1] = t->until[0];
   return r < 0 ? (t->err = -r, MBEDTLS_ERR_NET_RECV_FAILED) : r;
 }
 
-/// A context on the socket fd, a server's if server, or null if out of memory.
-static void *bober_tls_new(int fd, int server) {
-  bober_tls *t = calloc(1, sizeof *t);
+/// A context on the socket fd, a server's if server, that reads the n bytes at early first, or null if out of memory.
+static void *bober_tls_new(int fd, int server, const void *early, size_t n) {
+  bober_tls *t = calloc(1, sizeof *t + n);
   if (!t) return 0;
   psa_crypto_init();
   mbedtls_ssl_config_init(&t->conf), mbedtls_ssl_init(&t->ssl);
-  t->fd = fd;
+  t->fd = fd, t->early = memcpy(t + 1, early, n), t->nearly = n;
   if (mbedtls_ssl_config_defaults(&t->conf, server ? MBEDTLS_SSL_IS_SERVER : MBEDTLS_SSL_IS_CLIENT,
                                   MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) return free(t), (void *)0;
   mbedtls_ssl_set_bio(&t->ssl, t, bober_tls_send, bober_tls_recv, 0);

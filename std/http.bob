@@ -603,6 +603,8 @@ export class Server {
 	addr = ":8080"
 	/// Serves https with it, if given.
 	tls: tls.Config | null = null
+	/// With tls, serves http too on the same port, each connection as its first byte tells; else http there is a 400.
+	clear = false
 	/// For a request's head as a whole, so a byte every few seconds does not hold a fiber forever; 0 for none.
 	headerTimeout: i64 = 30 * second
 	/// For each read and write of a body.
@@ -712,13 +714,25 @@ export class Server {
 		let s: h2.Socket = c
 		let h: h2.Conn | null = null
 		try {
-			if (this.tls != null) {
-				c.timeout = this.headerTimeout
-				s = tls.server(c, this.tls!)
+			let b = new Buffered(c)
+			// The first byte, waited for as between requests, tells a TLS record of the handshake, 22, from HTTP, which
+			// begins with a letter; with none, the connection ends as a plain one.
+			if (this.tls != null && this.next(c, b)) {
+				if (b.starts("\x16")) {
+					c.timeout = this.headerTimeout
+					s = tls.server(c, this.tls!, b.read(1 << 16)!)
+					b = new Buffered(s)
+				} else if (!this.clear) {
+					// As Go answers it.
+					this.respond(c, "GET", new Response(400, "Client sent an HTTP request to an HTTPS server.\n"), true,
+						"HTTP/1.1")
+					linger(c)
+					throw new IoError("Protocol", "read", "not TLS")
+				}
 			}
-			const b = new Buffered(s)
+			const secure = s instanceof tls.Conn
 			let two = s instanceof tls.Conn && s.alpn == "h2"
-			if (this.tls == null && this.next(c, b)) {
+			if (!secure && this.next(c, b)) {
 				b.deadline = deadline(this.headerTimeout) // The preface is a head.
 				two = b.starts(h2.preface)
 			}
@@ -727,7 +741,7 @@ export class Server {
 				h.timeout = this.timeout
 				h.idleTimeout = this.idleTimeout
 				this.h2s.set(c, h)
-				const handle: h2.Handle = (head, body) => this.stream(head, body, handler)
+				const handle: h2.Handle = (head, body) => this.stream(head, body, secure, handler)
 				h.serve(handle)
 			} else {
 				this.requests(c, b, handler)
@@ -788,12 +802,12 @@ export class Server {
 
 	/// One HTTP/2 stream: its head and body as a Request through handler; a 400 if the head is not a request's, a 500
 	/// if a header of the response is malformed. h2 closes the body it is given to send.
-	private stream(pairs: [string, string][], body: h2.Body | null,
+	private stream(pairs: [string, string][], body: h2.Body | null, secure: bool,
 		handler: Handler): [[string, string][], ReadCloser | null] {
 		this.active++
 		let req: Request | null = null
 		try {
-			req = this.request(pairs, body)
+			req = this.request(pairs, body, secure)
 		} catch (e: IoError | ParseError) {}
 		const got = if (req == null) new Response(400) else this.run(req, handler)
 		this.active--
@@ -844,7 +858,8 @@ export class Server {
 	/// The request an HTTP/2 head and body make, with one Host, from :authority or else Host, and its cookie fields
 	/// joined in one, as HTTP/1.1 has them (RFC 9113 §8.3.1, §8.2.3); null if the head is not a request's for a path
 	/// or OPTIONS *, or its Host and :authority differ.
-	private request(head: [string, string][], body: Reader | null): Request | null throws IoError | ParseError {
+	private request(head: [string, string][], body: Reader | null,
+		secure: bool): Request | null throws IoError | ParseError {
 		let method = ""
 		let path = ""
 		let authority = ""
@@ -875,8 +890,7 @@ export class Server {
 			headers.append("cookie", cookies.join("; "))
 		}
 		headers.entries = [["host", authority], ...headers.entries]
-		const req = new Request(method,
-			`${if (this.tls == null) "http" else "https"}://${authority}${if (star) "" else path}`)
+		const req = new Request(method, `${if (secure) "https" else "http"}://${authority}${if (star) "" else path}`)
 		if (star) {
 			req.url.path = "*"
 		}
@@ -967,7 +981,7 @@ export class Server {
 		const [given, chunked] = framing(headers, version)
 		// A request with neither header has no body, where a response's would run to the end.
 		const length = if (chunked) null else given ?? 0
-		const scheme = if (this.tls == null) "http" else "https"
+		const scheme = if (b.stream instanceof tls.Conn) "https" else "http"
 		const star = parts[0] == "OPTIONS" && parts[1] == "*"
 		const origin = star || startsWith(parts[1], "/")
 		const req = new Request(parts[0],
