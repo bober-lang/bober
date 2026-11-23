@@ -53,6 +53,10 @@ export type Options = { main: i32, tests: bool, dyn: bool }
 /// The name of the entry of the image's module at path, which runs its main as C's main would, or else its tests.
 export function entry(path: string, tests: bool): string { return `bober.${if (tests) "tests" else "main"}.${path}` }
 
+/// The ops below which a function is small: a release build gives it to each module reaching it, to inline, as mono
+/// takes it; another build never inlines one not small, so that a change of it leaves its callers' code as it was.
+export const small = 64
+
 /// Emits module m of program p into b; a release build's as facts says.
 export function emit(p: Program, m: i32, b: Backend, o: Options, facts: Facts = new Facts()) throws CompileError {
 	new Emitter(p, m, b, o, facts).run()
@@ -1440,7 +1444,8 @@ class Emitter {
 		const f = this.b.function(this.symbol(d), t,
 			this.copies.has(d)
 			|| this.here.has(d) && x.owner >= 0 && this.p.classOf(d) < 0 && (x.mods & decl.Export) == 0)
-		if ((x.mods & decl.Outlined) != 0) {
+		const code = x.code
+		if ((x.mods & decl.Outlined) != 0 || this.facts.phase == "none" && code != null && code.ops.length >= small) {
 			this.b.attr(f, -1, "noinline", 0)
 		}
 		return f

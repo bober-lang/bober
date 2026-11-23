@@ -22,13 +22,14 @@ function files(n: i32): [string, string][] {
 	return [["types.bob", types], ["own.bob", own], ["lib.bob", lib], ["main.bob", program(n)]]
 }
 
-/// What main prints, built in home at level, as lowered if "", with the files written first.
-function built(files: [string, string][], level = "", main = "main.bob"): string {
+/// What main prints, built in home at level, with none given if "", with the files written first.
+function built(files: [string, string][], level = "-O0", main = "main.bob"): string {
 	mkdirAll(home())
 	for (const [name, src] of files) {
 		writeFile(`${home()}/${name}`, src)
 	}
 	const f = new Compile()
+	f.O0 = level == "-O0"
 	f.O1 = level == "-O1"
 	f.O2 = level == "-O2"
 	f.release = level == "-release"
@@ -150,8 +151,7 @@ test "a trap in -O2's code shows its line, after an edit above it" {
 	const main = `import { at } from "./lib"\nfunction main() { at([]) }\n`
 	anew()
 	const out = built([["lib.bob", lib], ["main.bob", main]], "-O2")
-	built([["lib.bob", `\n${lib}`]], "-O2") // by TPDE
-	const again = built([], "-O2")
+	const again = built([["lib.bob", `\n${lib}`]], "-O2")
 	assert indexOf(out, "lib.bob:1:47: trap") >= 0 && indexOf(again, "lib.bob:2:47: trap") >= 0
 }
 
@@ -230,7 +230,7 @@ function main() {
 	}
 	print(\`\${wrong}\`)
 }\n`
-	for (const level of ["", "-O1", "-O2", "-release"]) {
+	for (const level of ["-O0", "-O1", "-O2", "-release"]) {
 		assert built([["main.bob", main]], level) == "0\n"
 	}
 }
@@ -269,17 +269,18 @@ function main() {
 	assert built([["main.bob", main]], "-release") == "500\n"
 }
 
-test "-O2 has LLVM compile each monomorphized module, an edited one TPDE until it is unchanged, which -O1 keeps" {
+test "with no level a module is compiled by TPDE until a build finds it unchanged, then by LLVM, at -O2 at once" {
 	const units = () => held().filter(o => indexOf(o, "^O") >= 0)
+	const by = (level: string) => units().every(o => indexOf(o, level) >= 0)
 	anew()
-	const out = built(files(1), "-O2")
-	const fresh = units()
-	assert out == printed(1) && fresh.length > 0 && fresh.every(o => indexOf(o, "^O2@") >= 0)
-	const edited = built([["lib.bob", replace(lib, "return f(i32)", "return f(i64)")]], "-O2")
+	const out = built(files(1), "")
+	assert out == printed(1) && units().length > 0 && by("^O1@") && built([], "") == out && by("^O2@")
+	const edited = built([["lib.bob", replace(lib, "return f(i32)", "return f(i64)")]], "")
 	assert edited == replace(out, "true i32", "true i64") && units().some(o => startsWith(o, `${home()}/lib.bob^O1@`))
-	const again = built([], "-O2")
+	assert built([], "") == edited && by("^O2@")
 	const opt = units()
-	assert again == edited && opt.every(o => indexOf(o, "^O2@") >= 0) && built([], "-O1") == edited && units() == opt
+	assert built([], "-O1") == edited && units() == opt
+	assert built([["lib.bob", lib]], "-O2") == out && by("^O2@")
 }
 
 test "a program is launched as its entry and the version of what it is linked from, which an edit of a module changes" {

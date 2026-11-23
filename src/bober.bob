@@ -32,7 +32,7 @@ import { show } from "./bc/show"
 import { glue, includesOf, sysroot } from "./c/bind"
 import { link, object } from "./c/bobcc"
 import { doc } from "./doc"
-import { Facts, Options, emit, entry, learn } from "./emit"
+import { Facts, Options, emit, entry, learn, small } from "./emit"
 import { check, lowered as always, normal } from "./check"
 import { CompileError } from "./error"
 import { formatFile } from "./format"
@@ -91,9 +91,10 @@ export class Compile @optarg.Cc {
 	headers: ...Headers
 	/// optimize with LLVM
 	release: bool = false
-	/// monomorphize first, so that it runs fast; by default where CI is set
+	/// monomorphize first, so that it runs fast, each module by TPDE; by default where CI is set
 	O1: bool @optarg.Verbose = process.env("CI") != null
-	/// LLVM compiles the monomorphized modules, one changed by TPDE first: runs fastest but release, slow at first
+	/// as -O1, each module by LLVM: runs fastest but release, slow to compile; with no level given where CI is not set,
+	/// a module once a build finds it unchanged
 	O2: bool @optarg.Verbose = false
 	/// each module as it is, fastest to compile, though CI is set; -O2 counts over it
 	O0: bool @optarg.Verbose = false
@@ -714,18 +715,16 @@ function hasTests(path: string): bool {
 	}
 }
 
-/// Compiles the program of main into the image, each module by TPDE, fast to compile: as lowered, or at -O1
-/// monomorphized of its package, and at -O2 so by LLVM once unchanged (image); -O2 counts over -O0, -O0 over -O1. If
-/// release, each so by LLVM, optimized, and of the objects of these the executable build/<name>, or with tests
-/// build/<name>.test, is linked (executable). Returns the command that runs it, or its tests: the executable, or the
-/// launcher on the image's entry, named with the program's version, run by the C library's loader where it is the
-/// sysroot's, the image as image has it if pin. Throws the errors, or what failed, as a CompileError or IoError.
+/// Compiles the program of main into the image, each module as lowered at -O0 by TPDE, else monomorphized of its
+/// package, by TPDE at -O1, by LLVM at -O2, and with no level given by TPDE, by LLVM once unchanged (image); -O2 counts
+/// over -O0, -O0 over -O1. If release, each so by LLVM, optimized, and of the objects of these the executable
+/// build/<name>, or with tests build/<name>.test, is linked (executable). Returns the command that runs it, or its
+/// tests: the executable, or the launcher on the image's entry, named with the program's version, run by the C
+/// library's loader where it is the sysroot's, the image as image has it if pin. Throws the errors, or what failed, as
+/// a CompileError or IoError.
 export function build(main: string, tests: bool, f: Compile, pin: bool): string[] {
 	return if (f.wasm || f.js) toTarget(main, tests, f) else programs([main], tests, f, pin)(main)
 }
-
-/// The ops below which a release build gives a function to each module reaching it, to inline, as mono takes it.
-const small = 64
 
 /// The files the program build built last, natively, is built of (inputs), by which its tests' results are kept
 /// (runTests), and its tests, each its name and the hash of the code it runs (Reached).
@@ -773,11 +772,11 @@ function testHashes(p: Program, mains: i32[]): [string, string][][] {
 	})
 }
 
-/// Compiles the programs of mains into the image as build does, at -O1 and -O2 monomorphized as one of their package,
-/// if release of themselves alone; returns what gives the command of one of them, linking the image again only where
-/// another build wrote it (done).
+/// Compiles the programs of mains into the image as build does, monomorphized as one of their package (ofWorld), but at
+/// -O0, and if release of themselves alone; returns what gives the command of one of them, linking the image again only
+/// where another build wrote it (done), and once it failed, what it threw.
 function programs(mains: string[], tests: bool, f: Compile, pin: bool): (main: string) => string[] {
-	const dyn = !f.release && !f.O2 && (!f.O1 || f.O0)
+	const dyn = !f.release && !f.O2 && f.O0
 	const p = if (dyn || f.release) lowered(mains, f.headers.I) else ofWorld(mains, f.headers.I)
 	const ms = mains.map(m => p.module(normal(m)))
 	const hashed = if (tests) testHashes(p, ms) else [] // before mono changes the code
@@ -789,8 +788,19 @@ function programs(mains: string[], tests: bool, f: Compile, pin: bool): (main: s
 		mono(p, ms[0], true, if (f.release) small else 0)
 	}
 	const [files, cxx] = linked(p, program(p, ms, dyn), tests, f.headers.I)
+	let failed: CompileError | null = null
 	return main => {
-		const [at, version] = image(p, ms, files, cxx, pin || f.release, o, f)
+		if (failed != null) {
+			throw failed!
+		}
+		let made: [string, u64] = ["", 0]
+		try {
+			made = image(p, ms, files, cxx, pin || f.release, o, f)
+		} catch (e: CompileError) {
+			failed = e
+			throw e
+		}
+		const [at, version] = made
 		const command = if (f.release) [executable(p, ms, files, at, main, tests)]
 			else [...(if (mac) [] else [`${sysroot}/usr/lib/libc.so`]),
 			if (packaged()) join(root, "lib/launch.c.exe") else launcher(dir), at,
@@ -853,7 +863,7 @@ export function ignored(c: Run | Test | Build): string | null {
 			[["-wasm", f.js && f.wasm], ["-release", f.release], ["-baseline", f.baseline], ["-emit-llvm", ir],
 			...levels, mllvm])
 	}
-	const llvm = f.release || ir || !build && (f.O2 || f.O1 && !f.O0)
+	const llvm = f.release || ir || !build && (f.O2 || !f.O0)
 	return first(if (build) "build" else "-release", if (build || f.release) levels else [])
 		?? first("-emit-llvm", [["-release", ir && f.release]])
 		?? first("a build but -release or -emit-llvm", [["-baseline", f.baseline && !f.release && !ir]])
@@ -1025,13 +1035,13 @@ let done: [Program, u64, u64] | null = null
 /// and its Bound, and monomorphized, `<path>^O1@`, by its bytecode as such too, beside the one as lowered, its symbols
 /// its own (unit), what it instances its local copies, so that programs share it; a file by its bytes; an archive,
 /// which is linked for good, by its size and when it was written. A monomorphized module is compiled by TPDE, or by
-/// LLVM as `<path>^O2@` of the same version, which any build keeps, at -O2 where the image holds TPDE's, a build
-/// finding it unchanged, or none of it. A release build's is the object LLVM makes of it, `<path>^R@`, held as it is
-/// for executable, not linked, nor any file: compiled as its program whole learns (learn), on x86-64 for x86-64-v2
-/// unless baseline, and against builtin/ as it is, its version of those too. An image that holds all and exports the
-/// entries is left as it is. Where the image cannot take the link, or an archive it holds changed, all is linked anew,
-/// fresh. The image is written in place where no other process has it, else under a name of its own, then renamed, as
-/// a running program may have the old one mapped, or another build be reading it.
+/// LLVM as `<path>^O2@` of the same version, which any build keeps, at -O2, and with no level given where the image
+/// holds TPDE's, a build finding it unchanged. A release build's is the object LLVM makes of it, `<path>^R@`, held as
+/// it is for executable, not linked, nor any file: compiled as its program whole learns (learn), on x86-64 for
+/// x86-64-v2 unless baseline, and against builtin/ as it is, its version of those too. An image that holds all and
+/// exports the entries is left as it is. Where the image cannot take the link, or an archive it holds changed, all is
+/// linked anew, fresh. The image is written in place where no other process has it, else under a name of its own,
+/// then renamed, as a running program may have the old one mapped, or another build be reading it.
 /// Of p's modules, those of the program of mains are linked (program); another is held as its bytecode alone,
 /// `<path>^bc@<version>`, that no build checks it again.
 /// Returns its path, or if pin that of a link to it of this process's, which the launcher removes, by which what the
@@ -1112,11 +1122,9 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		// Monomorphized, its code names what the ABIs its bytecode has do not cover: its signatures too.
 		const version = `@${p.modules[m].source}.${fnv(bc + b + (if (o.dyn) "" else `${write(p, m, compiler)}${signatures(p, m)}${learned}`))}`
 		const [fast, opt] = [`${path}^O1${version}`, `${path}^${if (c.release) "R" else "O2"}${version}`]
-		// LLVM's if the image holds it, or at -O2 if it holds TPDE's, which this build finds unchanged, or none of the
-		// module's; else TPDE's, as after an edit.
-		const llvm = !o.dyn
-			&& (c.release || held.includes(opt)
-			|| c.O2 && (held.includes(fast) || !held.some(h => startsWith(h, `${path}^O`))))
+		// LLVM's at -O2, or if the image holds it, or with no level given if it holds TPDE's, which this build finds
+		// unchanged; else TPDE's, as after an edit.
+		const llvm = !o.dyn && (c.release || c.O2 || held.includes(opt) || !c.O1 && held.includes(fast))
 		parts.push(if (o.dyn) `${path}${version}` else fast)
 		const wanted = if (llvm) opt else parts[parts.length - 1]
 		// Monomorphized, the others of either backend, which define the same symbols.
