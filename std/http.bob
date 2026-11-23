@@ -592,7 +592,7 @@ export function post(url: string, body: BodyInit, contentType: string): Response
 }
 
 export class Server {
-	/// Where to listen, as net.listen takes it; port 0 is any free one, which addr then holds once serving.
+	/// Where to listen, as net.listen takes it; port 0 is any free one, which addr then holds once listening.
 	addr = ":8080"
 	/// Serves https with it, if given.
 	tls: tls.Config | null = null
@@ -617,16 +617,25 @@ export class Server {
 	/// Woken as a connection or a request ends.
 	private ended = new Signal()
 
-	/// Serves until close: each connection on a fiber of its own, each request through handler. One that throws is
-	/// logged to stderr and answered 500, or ends the connection if the response had begun or more than maxHeaders of
-	/// its body was left unread.
-	serve(handler: Handler) throws IoError | ParseError {
-		if (this.closing) {
+	/// Binds addr, so it takes connections once this returns; serve then serves them. Once is enough.
+	listen() throws IoError | ParseError {
+		if (this.listener != null || this.closing) {
 			return
 		}
 		const l = listen(this.addr)
 		this.listener = l
 		this.addr = `${l.addr}`
+	}
+
+	/// Listens, and serves until close: each connection on a fiber of its own, each request through handler. One that
+	/// throws is logged to stderr and answered 500, or ends the connection if the response had begun or more than
+	/// maxHeaders of its body was left unread.
+	serve(handler: Handler) throws IoError | ParseError {
+		if (this.closing) {
+			return
+		}
+		this.listen()
+		const l = this.listener!
 		if (this.tls != null) {
 			this.tls = negotiating(this.tls!)
 		}

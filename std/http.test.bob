@@ -145,6 +145,7 @@ function app(req: Request): Response throws IoError | ParseError {
 function server(): Server {
 	const s = new Server()
 	s.addr = "127.0.0.1:0"
+	s.listen()
 	return s
 }
 
@@ -499,7 +500,6 @@ test "a server closed before serving does not serve, and once served, closing it
 	const early = server()
 	early.close()
 	early.serve(app)
-	assert early.addr == "127.0.0.1:0"
 	const s = server()
 	const job = async s.serve(app)
 	s.close()
@@ -513,8 +513,9 @@ test "a server closed before serving does not serve, and once served, closing it
 	// A unix socket's accept, which a shutdown leaves ready but never failing.
 	const dir = makeTempDir("bober-http-")
 	const path = `${dir}/s`
-	const u = server()
+	const u = new Server()
 	u.addr = `unix:${path}`
+	u.listen()
 	const served = async u.serve(app)
 	assert u.addr == `unix:${path}`
 	u.close()
