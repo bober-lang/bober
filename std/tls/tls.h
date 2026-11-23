@@ -17,8 +17,6 @@
 typedef struct {
   mbedtls_ssl_config conf;
   mbedtls_ssl_context ssl;
-  mbedtls_x509_crt own;
-  mbedtls_pk_context key;
   // sending while a send is parked in the BIO; broken, the errno of a send that failed, as Mbed TLS would resend the
   // record it left before anything else, so every send after fails the same, as Go's; notified once close_notify is
   // sent, ended once the peer's is read or bober_tls_close has cut the reads, eof once the socket has ended, as
@@ -72,7 +70,7 @@ static void *bober_tls_new(int fd, int server) {
   bober_tls *t = calloc(1, sizeof *t);
   if (!t) return 0;
   psa_crypto_init();
-  mbedtls_ssl_config_init(&t->conf), mbedtls_ssl_init(&t->ssl), mbedtls_x509_crt_init(&t->own), mbedtls_pk_init(&t->key);
+  mbedtls_ssl_config_init(&t->conf), mbedtls_ssl_init(&t->ssl);
   t->fd = fd;
   if (mbedtls_ssl_config_defaults(&t->conf, server ? MBEDTLS_SSL_IS_SERVER : MBEDTLS_SSL_IS_CLIENT,
                                   MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) return free(t), (void *)0;
@@ -97,12 +95,31 @@ static void bober_tls_trust(void *ctx, void *chain) {
   if (chain) mbedtls_ssl_conf_ca_chain(&t->conf, chain, 0);
 }
 
-/// The context's own certificate chain and key, each as PEM with its NUL.
-static int bober_tls_own(void *ctx, const unsigned char *cert, size_t n, const unsigned char *key, size_t m) {
+typedef struct {
+  mbedtls_x509_crt chain;
+  mbedtls_pk_context key;
+} bober_tls_cert;
+
+/// A certificate chain and its key, each as PEM with its NUL, parsed into *out if the key is the first certificate's;
+/// never freed.
+static int bober_tls_cert_parse(const unsigned char *cert, size_t n, const unsigned char *key, size_t m, void **out) {
+  bober_tls_cert *c = calloc(1, sizeof *c);
+  if (!c) return MBEDTLS_ERR_SSL_ALLOC_FAILED;
+  psa_crypto_init();  // which parsing a key needs, as load parses before any context exists
+  mbedtls_x509_crt_init(&c->chain), mbedtls_pk_init(&c->key);
+  int r = mbedtls_x509_crt_parse(&c->chain, cert, n);
+  if (r > 0) r = MBEDTLS_ERR_X509_INVALID_FORMAT;  // the count of those that did not parse
+  if (!r) r = mbedtls_pk_parse_key(&c->key, key, m, 0, 0);
+  if (!r) r = mbedtls_pk_check_pair(&c->chain.pk, &c->key);
+  if (r) return mbedtls_x509_crt_free(&c->chain), mbedtls_pk_free(&c->key), free(c), r;
+  return *out = c, 0;
+}
+
+/// Serves cert, of bober_tls_cert_parse.
+static int bober_tls_own(void *ctx, void *cert) {
   bober_tls *t = ctx;
-  int r = mbedtls_x509_crt_parse(&t->own, cert, n);
-  if (!r) r = mbedtls_pk_parse_key(&t->key, key, m, 0, 0);
-  return r ? r : mbedtls_ssl_conf_own_cert(&t->conf, &t->own, &t->key);
+  bober_tls_cert *c = cert;
+  return mbedtls_ssl_conf_own_cert(&t->conf, &c->chain, &c->key);
 }
 
 /// Adds proto to the protocols offered, or accepted, in order; at most 8.
@@ -205,7 +222,7 @@ static int bober_tls_errno(void *ctx) { return ((bober_tls *)ctx)->err; }
 
 static void bober_tls_free(void *ctx) {
   bober_tls *t = ctx;
-  mbedtls_ssl_free(&t->ssl), mbedtls_ssl_config_free(&t->conf), mbedtls_x509_crt_free(&t->own), mbedtls_pk_free(&t->key);
+  mbedtls_ssl_free(&t->ssl), mbedtls_ssl_config_free(&t->conf);
   for (int i = 0; i < t->nalpn; i++) free((char *)t->alpn[i]);
   free(t);
 }
@@ -213,6 +230,9 @@ static void bober_tls_free(void *ctx) {
 /// What Mbed TLS's code means, until the next call.
 static const char *bober_tls_error(int code) {
   static char buf[128];
+  // Mbed TLS 4 names none of PK's codes, -0x3F00 to -0x3980, which bober_tls_cert_parse fails with for a key.
+  if (code == MBEDTLS_ERR_PK_TYPE_MISMATCH) return "PK - The key is not the certificate's";
+  if (code <= MBEDTLS_ERR_PK_FEATURE_UNAVAILABLE && code > MBEDTLS_ERR_PK_TYPE_MISMATCH) return "PK - The key does not parse";
   mbedtls_strerror(code, buf, sizeof buf);
   return buf;
 }

@@ -13,9 +13,9 @@ import * as net from "./net"
 import { free, malloc } from "../builtin/c"
 
 import { MBEDTLS_ERR_NET_RECV_FAILED, MBEDTLS_ERR_NET_SEND_FAILED, MBEDTLS_ERR_SSL_ALLOC_FAILED, bober_tls_alpn,
-	bober_tls_alpn_of, bober_tls_chain, bober_tls_close, bober_tls_errno, bober_tls_error, bober_tls_free,
-	bober_tls_handshake, bober_tls_hasten, bober_tls_new, bober_tls_own, bober_tls_read, bober_tls_shutdown,
-	bober_tls_trust, bober_tls_write } from "./tls/tls.h"
+	bober_tls_alpn_of, bober_tls_cert_parse, bober_tls_chain, bober_tls_close, bober_tls_errno, bober_tls_error,
+	bober_tls_free, bober_tls_handshake, bober_tls_hasten, bober_tls_new, bober_tls_own, bober_tls_read,
+	bober_tls_shutdown, bober_tls_trust, bober_tls_write } from "./tls/tls.h"
 
 export class Config {
 	/// PEM roots a client trusts; null is the system's: /etc/ssl/certs/ca-certificates.crt, else /etc/ssl/cert.pem.
@@ -153,12 +153,13 @@ export function client(c: net.Conn, host: string, cfg: Config = new Config()): C
 export function server(c: net.Conn, cfg: Config): Conn throws IoError {
 	const what = `${c.remote}`
 	return context(c, true, cfg, what, t => {
-		const cert = cfg.cert ?? ""
-		const key = cfg.key ?? ""
-		check(bober_tls_own(t, cert, (cert.length + 1) as u64, key, (key.length + 1) as u64), "certificate", t, what)
+		check(bober_tls_own(t, certificate(cfg, what)), "certificate", t, what)
 		return handshake(c, t, null, what)
 	})
 }
+
+/// Parses cfg's certificate and key as server will, so that a listener on what fails at once if they are unsound.
+export function load(cfg: Config, what: string) throws IoError { certificate(cfg, what) }
 
 /// What f makes of a context on c, with cfg's protocols; freed if f throws.
 function context(c: net.Conn, server: bool, cfg: Config, what: string,
@@ -198,6 +199,24 @@ function roots(pem: string | null, what: string): u64 throws IoError {
 	const out = new u64[](1)
 	check(bober_tls_chain(text, (text.length + 1) as u64, out), "roots", 0, what)
 	chains.set(key, out[0])
+	return out[0]
+}
+
+/// The certificate chains parsed with their keys, by their PEM; as with the roots, one serves every connection.
+let certs = new HashMap[string, u64]()
+
+function certificate(cfg: Config, what: string): u64 throws IoError {
+	const cert = cfg.cert ?? ""
+	const key = cfg.key ?? ""
+	const both = `${cert}\0${key}`
+	const known = certs.get(both)
+	if (known != null) {
+		return known
+	}
+	const out = new u64[](1)
+	const r = bober_tls_cert_parse(cert, (cert.length + 1) as u64, key, (key.length + 1) as u64, out)
+	check(r, "certificate", 0, what)
+	certs.set(both, out[0])
 	return out[0]
 }
 

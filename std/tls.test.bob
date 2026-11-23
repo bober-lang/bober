@@ -1,6 +1,6 @@
 import { readFile } from "./fs"
 import * as net from "./net"
-import { Config, client, server } from "./tls"
+import { Config, client, load, server } from "./tls"
 import { millisecond, monotonic, second } from "./time"
 import { Signal } from "../builtin/fiber"
 
@@ -375,4 +375,26 @@ test "a write's timeout is for each record, so a long write goes on while the pe
 	c.close()
 	assert await job == big.length
 	l.close()
+}
+
+test "a server's key must be a key, and its certificate's" {
+	const other = `-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgHTb69NLkyqigPvWa
+4qHFY9xhLgbX7oZtGUnUfNaaFp2hRANCAASW72OWFvkZp7aJ1x8KfizgoX9ivVLR
+oopvHRbYWz6Y0SG5PhDDPXZHCgWtKUWWlhTWtw6iqmrp76M5zeH6/ayM
+-----END PRIVATE KEY-----
+`
+	const cfg = new Config()
+	cfg.cert = own.cert
+	for (const [key, want] of [["not a key", "The key does not parse"], [other, "The key is not the certificate's"]]) {
+		cfg.key = key
+		let message = ""
+		try {
+			load(cfg, ":443")
+		} catch (e: IoError) {
+			message = e.message()
+		}
+		assert message == `certificate :443: PK - ${want}: Tls`
+	}
+	load(own, ":443")
 }

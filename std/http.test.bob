@@ -1269,3 +1269,17 @@ test "a client told the server speaks HTTP/2 speaks it in the clear, h2c, and th
 	s.close()
 	await job
 }
+
+test "listen checks the certificate and key it would serve, rather than fail each handshake" {
+	const s = new Server()
+	s.addr = "127.0.0.1:0"
+	s.tls = certified()
+	s.tls!.key = s.tls!.cert
+	let kind = ""
+	try {
+		s.listen()
+	} catch (e: IoError) {
+		kind = e.kind
+	}
+	assert kind == "Tls" && s.addr == "127.0.0.1:0"
+}
