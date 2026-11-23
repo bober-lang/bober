@@ -1,0 +1,62 @@
+import { four, seven } from "./ascii"
+import { dns, max, nil, parse, toBytes, url, v3, v4, v5, v7 } from "./uuid"
+import { encode } from "./encoding/hex"
+import { ParseError, parseInt } from "./string"
+import { millisecond, sleep } from "./time"
+
+test "v3 and v5 of RFC 9562's appendix A and Go's tests" {
+	assert v3(dns, "www.example.com") == "5df41881-3aed-3515-88a7-2f4a814cf09e"
+	assert v5(dns, "www.example.com") == "2ed6657d-e927-568b-95e1-2665a8aea6a2"
+	assert v3(dns, "python.org") == "6fa459ea-ee8a-3ca4-894e-db77e160355e"
+	assert v5(dns, "python.org") == "886313e1-3b8a-5372-9b90-0c9aee199e5d"
+	assert v5(url, "python.org") != v5(dns, "python.org")
+}
+
+test "v4" {
+	const a = v4()
+	assert parse(a) == a && a[14] == four && toBytes(a)[8] >> 6 == 2 && a != v4()
+}
+
+/// The ms since 1970 of a v7.
+function ms(id: string): i64 { return parseInt[i64](id.slice(0, 8) + id.slice(9, 13), 16) }
+
+test "v7 increases with the time and within a ms" {
+	const a = v7()
+	assert a[14] == seven && toBytes(a)[8] >> 6 == 2 && parse(a) == a && ms(a) == now() / millisecond
+	sleep(millisecond)
+	let prev = v7()
+	assert ms(prev) == ms(a) + 1
+	for (const _ of 0 ... 9999) {
+		const next = v7()
+		assert next > prev
+		prev = next
+	}
+}
+
+test "parse" {
+	const id = "12345678-9abc-def0-1234-56789abcdef0"
+	for (const s of [id, "12345678-9ABC-DEF0-1234-56789ABCDEF0", "{12345678-9abc-def0-1234-56789abcdef0}",
+		"urn:uuid:12345678-9abc-def0-1234-56789abcdef0", "URN:UUID:12345678-9abc-def0-1234-56789abcdef0",
+		"123456789abcdef0123456789abcdef0", "{123456789abcdef0123456789abcdef0}"]) {
+		test `${s}` {
+			assert parse(s) == id
+		}
+	}
+	assert parse(nil) == nil && parse(max) == max
+	assert parse("") throws new ParseError("syntax", 0)
+	assert parse("12345678-9abc-def0-1234-56789abcdef") throws new ParseError("syntax", 35)
+	assert parse("12345678-9abc-def0-1234-56789abcdef01") throws new ParseError("syntax", 36)
+	assert parse("12345678-9abc-def0+1234-56789abcdef0") throws new ParseError("syntax", 18)
+	assert parse("12345678-9abc-def0-1234-56789abcdefg") throws new ParseError("syntax", 35)
+	assert parse("123456789abcdef0123456789abcdef-") throws new ParseError("syntax", 31)
+	assert parse("{12345678-9abc-def0-1234-56789abcdef0") throws new ParseError("syntax", 37)
+	assert parse("urn:uuid:") throws new ParseError("syntax", 9)
+	assert parse("urn:uid:12345678") throws new ParseError("syntax", 5)
+}
+
+test "bytes" {
+	const b = "\x12\x34\x56\x78\x9a\xbc\xde\xf0\x12\x34\x56\x78\x9a\xbc\xde\xf0"
+	assert parse(encode(b)) == "12345678-9abc-def0-1234-56789abcdef0"
+		&& toBytes("123456789ABCDEF0123456789ABCDEF0") == b
+	assert toBytes("x") throws new ParseError("syntax", 0)
+}

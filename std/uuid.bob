@@ -1,0 +1,84 @@
+//! UUIDs (RFC 9562) as their text, 32 lowercase hex digits hyphenated 8-4-4-4-12, which compares, hashes and prints as
+//! the UUID does and sorts as its bytes do: random ones, version 4; by the time, version 7; by a name in a namespace,
+//! versions 3 and 5. After Go's github.com/google/uuid.
+
+import { isHexDigit, lbrace, minus, toLower, u, x } from "./ascii"
+import { CryptoError } from "./crypto/error"
+import { md5, sha1 } from "./crypto/hash"
+import { bytes } from "./crypto/random"
+import { decode, encode } from "./encoding/hex"
+import { ParseError } from "./string"
+
+export const nil = "00000000-0000-0000-0000-000000000000"
+export const max = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+/// Namespaces of names for v3 and v5: domain names, URLs, ISO OIDs and X.500 DNs.
+export const dns = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+export const url = "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+export const oid = "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+export const x500 = "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+
+/// A random UUID.
+export function v4(): string throws IoError { return stamp(bytes(16), 4) }
+
+/// The last v7's ms since 1970 and, in the low 12 bits, the ms's fraction.
+let last: i64 = 0
+
+/// A UUID of now: ms since 1970, the ms's fraction in 12 bits, then random bits; greater than the one before.
+export function v7(): string throws IoError {
+	const t = now()
+	const next = t / 1_000_000 << 12 | t % 1_000_000 * 4096 / 1_000_000
+	last = if (next > last) next else last + 1
+	const high = last >> 12 << 16 | last & 0xfff
+	let b = ""
+	for (const i of 0 ... 7) {
+		b += chr((high >> 56 - 8 * i) as u8)
+	}
+	return stamp(b + bytes(8), 7)
+}
+
+/// The UUID of name in namespace by MD5; v5 is preferred.
+export function v3(namespace: string, name: string): string throws ParseError | CryptoError {
+	return stamp(md5(toBytes(namespace) + name), 3)
+}
+
+/// The UUID of name in namespace by SHA-1.
+export function v5(namespace: string, name: string): string throws ParseError | CryptoError {
+	return stamp(sha1(toBytes(namespace) + name), 5)
+}
+
+/// s as text: its hex digits of either case, hyphenated or not, in braces or after urn:uuid:.
+export function parse(s: string): string throws ParseError { return text(digits(s)) }
+/// The 16 bytes of id, any text parse takes; parse(encode(b)) is the UUID of 16 bytes b.
+export function toBytes(id: string): string throws ParseError { return decode(digits(id)) }
+
+/// The UUID of the first 16 of b, of the version and RFC 9562's variant.
+function stamp(b: string, version: u8): string {
+	return text(encode(b.slice(0, 6) + chr(b[6] & 0x0f | version << 4) + chr(b[7]) + chr(b[8] & 0x3f | 0x80)
+		+ b.slice(9, 16)))
+}
+
+function text(h: string): string {
+	return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
+}
+
+/// The 32 hex digits of s in lower case; a syntax error at the first character out of place.
+function digits(s: string): string throws ParseError {
+	const open = if (s.at(0) == lbrace) "{" else if (toLower(s.at(0) ?? 0) == u) "urn:uuid:" else ""
+	const hex = if (s.at(open.length + 8) == minus) "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+		else "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+	const form = open + hex + (if (open == "{") "}" else "")
+	let out = ""
+	for (const i of 0 ... form.length - 1) {
+		const ch = s.at(i)
+		if (ch == null || (if (form[i] == x) !isHexDigit(ch) else toLower(ch) != form[i])) {
+			throw new ParseError("syntax", i)
+		}
+		if (form[i] == x) {
+			out += chr(toLower(ch))
+		}
+	}
+	if (s.length > form.length) {
+		throw new ParseError("syntax", form.length)
+	}
+	return out
+}
