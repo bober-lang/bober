@@ -778,7 +778,7 @@ function testHashes(p: Program, mains: i32[]): [string, string][][] {
 /// another build wrote it (done).
 function programs(mains: string[], tests: bool, f: Compile, pin: bool): (main: string) => string[] {
 	const dyn = !f.release && !f.O2 && (!f.O1 || f.O0)
-	const p = lowered(if (dyn || f.release) mains else world(mains[0]), f.headers.I)
+	const p = if (dyn || f.release) lowered(mains, f.headers.I) else ofWorld(mains, f.headers.I)
 	const ms = mains.map(m => p.module(normal(m)))
 	const hashed = if (tests) testHashes(p, ms) else [] // before mono changes the code
 	const o = { main: -1, tests: false, dyn: dyn }
@@ -885,6 +885,16 @@ function world(main: string): string[] {
 	const d = nearest(main)
 	const all = if (d == null) [] else sources(d)
 	return if (all.includes(normal(main))) all else [main]
+}
+
+/// The Program of mains lowered with the files of the first's world, or of mains alone where another of those does not
+/// compile, as one being edited.
+function ofWorld(mains: string[], includes: string[]): Program {
+	try {
+		return lowered(world(mains[0]), includes)
+	} catch (e: CompileError) {
+		return lowered(mains, includes)
+	}
 }
 
 /// The modules the program of p's modules mains links: all, as lowered, where a type may name any; else, monomorphized,
