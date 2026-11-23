@@ -1225,8 +1225,9 @@ class Gen {
 		this.scopes.leave()
 	}
 
-	/// for over a range, counting up to its last value; a `for (const x of …)` over a tuple or what eached says, an Each
-	/// of a Readonly local, which mono unrolls where it knows the elements; else over the elements by index (7.3).
+	/// for over a range, its increment tested against one past its last value, which wraps to the least past the
+	/// greatest: an early exit LLVM vectorizes; a `for (const x of …)` over a tuple or what eached says, an Each of a
+	/// Readonly local, which mono unrolls where it knows the elements; else over the elements by index (7.3).
 	private forStmt(p: Node) {
 		const pattern = p.parts![1]
 		const over = p.parts![2]
@@ -1243,15 +1244,16 @@ class Gen {
 			this.op(op.SetLocal, last)
 			this.compareLocals(i, last, op.Gt)
 			this.br(op.BrIf, exit)
+			this.increment(last, t)
 			const loop = this.open(op.Loop)
 			const next = this.open(op.Block, kind.None)
 			this.op(op.Local, i)
 			this.bind(pattern, ro)
 			this.loop(p.parts![3], exit, next)
 			this.op(op.End)
+			this.increment(i, t)
 			this.compareLocals(i, last, op.Eq)
 			this.br(op.BrIf, exit)
-			this.increment(i, t)
 			this.br(op.Br, loop)
 		} else if (over.type!.kind == "tuple" || eached(over.type!) && ro && pattern.kind == "token") {
 			if (pattern.kind != "token") {
