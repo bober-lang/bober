@@ -46,6 +46,7 @@ function app(req: Request): Response throws IoError | ParseError {
 		case "/hello": return text("hello")
 		case "/scheme": return text(req.url.scheme)
 		case "/version": return text(req.version)
+		case "/remote": return text(req.remote!.host)
 		case "/query": return text(req.url.query.get("q") ?? "none")
 		case "/user":
 			const u = req.body.json[User]()
@@ -1257,6 +1258,7 @@ test "a client told the server speaks HTTP/2 speaks it in the clear, h2c, and th
 	c.h2c = true
 	assert c.send(new Request("GET", `${base}/version`)).body.text() == "HTTP/2"
 	assert c.send(new Request("GET", `${base}/scheme`)).body.text() == "http"
+	assert c.send(new Request("GET", `${base}/remote`)).body.text() == "127.0.0.1"
 	assert c.send(new Request("POST", `${base}/echo`, new Pieces(["c", "b", "a"]))).body.text() == "abc"
 	assert c.h2.length == 1 && s.conns == 1
 	// An upgrade goes over HTTP/1.1.
@@ -1266,6 +1268,7 @@ test "a client told the server speaks HTTP/2 speaks it in the clear, h2c, and th
 	assert up.status == 101 && up.stream!.read(100) == "!"
 	up.stream!.close()
 	assert get(`${base}/version`).body.text() == "HTTP/1.1"
+	assert get(`${base}/remote`).body.text() == "127.0.0.1"
 	s.close()
 	await job
 }

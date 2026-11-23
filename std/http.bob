@@ -10,7 +10,7 @@ import { Signal } from "../builtin/fiber"
 import { ReadCloser, Reader, Stream, copy, readAll, stderr } from "./io"
 import { Buffered, Framed, Upgraded, chunk, head, isTarget, isToken, readHead } from "./http/h1"
 import * as h2 from "./http/h2"
-import { Conn, Listener, dial, listen } from "./net"
+import { Addr, Conn, Listener, dial, listen } from "./net"
 import { isAlphanumeric, isDigit, toUpper } from "./ascii"
 import { ParseError, lower, parseInt, split, trim } from "./string"
 import { deadline, httpDate, monotonic, second } from "./time"
@@ -145,6 +145,8 @@ export class Request {
 	version: Version = "HTTP/1.1"
 	headers = new Headers()
 	body: Body
+	/// On a server, the connection's peer.
+	remote: Addr | null = null
 
 	constructor(method: string, url: string | Url, body: BodyInit = null) throws ParseError {
 		this.method = upper(method)
@@ -741,7 +743,7 @@ export class Server {
 				h.timeout = this.timeout
 				h.idleTimeout = this.idleTimeout
 				this.h2s.set(c, h)
-				const handle: h2.Handle = (head, body) => this.stream(head, body, secure, handler)
+				const handle: h2.Handle = (head, body) => this.stream(head, body, c.remote, secure, handler)
 				h.serve(handle)
 			} else {
 				this.requests(c, b, handler)
@@ -786,9 +788,10 @@ export class Server {
 		return more && !this.closing
 	}
 
-	/// handler's response to req; a 500 if it throws, logged to stderr. OPTIONS *, which asks of the server and of no
-	/// resource (RFC 9112 §3.2.4), is a 200 the handler is not asked for, as Go answers it.
-	private run(req: Request, handler: Handler): Response {
+	/// handler's response to req, from remote; a 500 if it throws, logged to stderr. OPTIONS *, which asks of the
+	/// server and of no resource (RFC 9112 §3.2.4), is a 200 the handler is not asked for, as Go answers it.
+	private run(req: Request, remote: Addr, handler: Handler): Response {
+		req.remote = remote
 		if (req.url.path == "*") {
 			return new Response(200)
 		}
@@ -802,14 +805,14 @@ export class Server {
 
 	/// One HTTP/2 stream: its head and body as a Request through handler; a 400 if the head is not a request's, a 500
 	/// if a header of the response is malformed. h2 closes the body it is given to send.
-	private stream(pairs: [string, string][], body: h2.Body | null, secure: bool,
+	private stream(pairs: [string, string][], body: h2.Body | null, remote: Addr, secure: bool,
 		handler: Handler): [[string, string][], ReadCloser | null] {
 		this.active++
 		let req: Request | null = null
 		try {
 			req = this.request(pairs, body, secure)
 		} catch (e: IoError | ParseError) {}
-		const got = if (req == null) new Response(400) else this.run(req, handler)
+		const got = if (req == null) new Response(400) else this.run(req, remote, handler)
 		this.active--
 		this.ended.wake()
 		const [res, pairs, bare] = this.prepare(got, if (req == null) "" else req.method, "HTTP/2")
@@ -925,7 +928,7 @@ export class Server {
 		const [req, framed, version] = got!
 		b.deadline = 0
 		c.timeout = this.timeout
-		const res = this.run(req, handler)
+		const res = this.run(req, conn.remote, handler)
 		const up = res.upgrade
 		if (res.status == 101 && up != null) {
 			// For close to end, as an upgrade has no request to finish.
