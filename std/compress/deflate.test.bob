@@ -1,6 +1,6 @@
 import { Reader } from "../io"
 import { ParseError } from "../string"
-import { Inflater, Once, deflate, inflate } from "./deflate"
+import { Inflater, Once, adler32, deflate, inflate } from "./deflate"
 
 const repz = "\xed\xca\xdb\x11\x82\x30\x14\x40\xc1\x56\x6e\x05\xf4\xa4\x10\x04\x51\xa2\x21\xc1\x47\xf5\x3a\x76\xe1\xcc\x7e\x9e\x39\x5b\xa7\x14\xf7\x36\xf7\x4b\x1c\x4b\x7e\xac\x31\xe6\x67\x9c\xdb\xf5\xb6\x45\xde\x53\x89\xfa\xdd\x97\xc3\xfb\x15\x43\x3e\x75\xbf\x82\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61"
 	+ "\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61\x18\x86\x61"
@@ -127,4 +127,140 @@ test "an Inflater whose source threw stays broken" {
 	const r = new Inflater(new Hiccup("\xcb\x48\xcd\xc9\xc9\x07\x00"))
 	assert r.read(100) throws new IoError("Protocol", "read", "hiccup")
 	assert r.read(100) throws new IoError("Protocol", "read", "hiccup")
+}
+
+/// What inflate makes of z given size: its output, or where it fails.
+function sized(z: string, size: i32): string {
+	try {
+		return inflate(z, size)
+	} catch (e: ParseError) {
+		return `error at ${e.at}`
+	}
+}
+
+test "inflate given the size decodes into that many bytes" {
+	assert inflate("\x03\x00", 0) == "" && inflate("\xcb\x48\xcd\xc9\xc9\x07\x00", 5) == "hello"
+	assert inflate(repz, 102400) == sentences() && inflate(rndz, 400) == noise(400)
+	const big = sentences() + noise(1 << 20) + sentences()
+	// Matches of distance 1, of a distance below their length, and stored blocks of 64 KiB and less.
+	for (const s of ["", "a", "hello", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"abcabcabcabcabcabcabcabcabcabcabcabcabcab", noise(400), sentences(), big]) {
+		for (const level of [0, 1, 6, 9]) {
+			assert inflate(deflate(s, level), s.length) == s
+		}
+	}
+	// A negative size is not known.
+	assert inflate("\xcb\x48\xcd\xc9\xc9\x07\x00", -5) == "hello"
+}
+
+test "inflate given another size than the stream's is an error, not a trap" {
+	const hello = "\xcb\x48\xcd\xc9\xc9\x07\x00"
+	assert sized(hello, 4) == "error at 6" && sized(hello, 6) == "error at 7" && sized(hello, 0) == "error at 2"
+	assert sized("\x03\x00", 1) == "error at 2"
+	// Out of room in a match, of distance 1, and in a stored block.
+	const as = deflate("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	assert sized(as, 50) == "error at 4" && sized(as, 77) == "error at 5"
+	assert sized(deflate("hello", 0), 3) == "error at 8" && sized(deflate("hello", 0), 6) == "error at 10"
+	assert sized(deflate(sentences()), 102399).slice(0, 9) == "error at "
+	assert sized(deflate(sentences()), 102401) == `error at ${deflate(sentences()).length}`
+}
+
+/// Hands out a piece of at most k bytes per read, and throws if read once all is handed out.
+class Strict implements Reader {
+	private s: string
+	private k: i32
+	private at = 0
+
+	constructor(s: string, k: i32) {
+		this.s = s
+		this.k = k
+	}
+
+	read(n: i32): string | null throws IoError {
+		if (this.at >= this.s.length) {
+			throw new IoError("Protocol", "read", "past the end")
+		}
+		const to = if (this.s.length - this.at > this.k) this.at + this.k else this.s.length
+		const s = this.s.slice(this.at, to)
+		this.at = to
+		return s
+	}
+}
+
+/// All of r, read n bytes at a time.
+function drain(r: Reader, n: i32): string throws IoError {
+	let out = ""
+	while (true) {
+		const c = r.read(n)
+		if (c == null) {
+			return out
+		}
+		assert c.length <= n
+		out += c
+	}
+}
+
+test "an Inflater reads no byte past the stream's last" {
+	const big = sentences() + noise(1 << 17) + sentences()
+	const cases: [string, string][] = [["\xcb\x48\xcd\xc9\xc9\x07\x00", "hello"], ["\x03\x00", ""], [repz, sentences()],
+		[rndz, noise(400)], [deflate(big, 0), big]]
+	// Of 3 + 5 × 9 + 7 bits, the end's code all in the last byte.
+	for (const t of ["a", "ab", "hello", "\x90\x91\x92\x93\x94", "abcabcabcabc", noise(30), big]) {
+		cases.push([deflate(t), t])
+	}
+	for (const pair of cases) {
+		for (const k of [1, 3, 65536]) {
+			assert drain(new Inflater(new Strict(pair[0], k)), 1 << 16) == pair[1]
+		}
+	}
+}
+
+test "an Inflater streams long output in small reads and large" {
+	const big = sentences() + noise(1 << 17) + sentences() + noise(1 << 16)
+	for (const level of [0, 6]) {
+		const z = deflate(big, level)
+		assert drain(new Inflater(new Drip(z)), 1) == big
+		assert drain(new Inflater(new Once(z)), 1000) == big
+		assert drain(new Inflater(new Strict(z, 4096)), 1 << 20) == big
+		assert drain(new Inflater(new Strict(z, 4096), false, big.length), 1 << 15) == big
+	}
+}
+
+/// s as a zlib stream.
+function zlib(s: string): string {
+	const a = adler32(s, 1)
+	let t = ""
+	for (const k of [24, 16, 8, 0]) {
+		t += chr((a >> k & 0xff) as u8)
+	}
+	return "\x78\x9c" + deflate(s) + t
+}
+
+test "a zlib Inflater checks the trailer of long output" {
+	const big = sentences() + noise(1 << 16)
+	assert drain(new Inflater(new Drip(zlib(big)), true), 4096) == big
+	assert drain(new Inflater(new Once(zlib(big)), true), 1 << 20) == big
+	assert new Inflater(new Once(zlib(big)), true).all() == big
+	const bad = zlib(big)
+	const r = new Inflater(new Once(bad.slice(0, bad.length - 1) + "\x00"), true)
+	assert drain(r, 1 << 20) throws new IoError("Protocol", "inflate", `byte ${bad.length}`)
+}
+
+test "a stream after again does not reach back into the one before" {
+	const hello = "\xcb\x48\xcd\xc9\xc9\x07\x00"
+	// A fixed block of one match, of length 3 at distance 1, then the end.
+	const back = "\x03\x02\x00"
+	assert inflate(back) throws new ParseError("syntax", 2)
+	for (const then of [[hello, "hello"], ["\x03\x00", ""]]) {
+		const r = new Inflater(new Drip(hello + then[0]))
+		assert drain(r, 100) == "hello"
+		r.bits.align()
+		r.again()
+		assert drain(r, 100) == then[1]
+	}
+	const r = new Inflater(new Once(hello + back))
+	assert drain(r, 100) == "hello"
+	r.bits.align()
+	r.again()
+	assert drain(r, 100) throws new IoError("Protocol", "inflate", "byte 9")
 }

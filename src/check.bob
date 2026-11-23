@@ -354,7 +354,9 @@ export class TypeError {
 /// depends on their arguments alone, so a test may call them and still be cached (Tests and assertions); or
 /// `@TypeScript`, of another's: its names are those of a package's TypeScript typings (src/dts.bob); or `@Embed`, of a
 /// file of any other kind, by `import x from "p" @Embed`, which declares `x` a `const` string of the file's bytes.
-/// `@Embed["deflate"]` holds them deflated in the program, inflated as it starts; else `x` is a string literal.
+/// `@Embed["deflate"]` holds them deflated in the program, inflated as it starts, into a string of the size they had,
+/// trading the time that takes for a smaller program; else `x` is a string literal, its bytes mapped from the program
+/// as they are read.
 ///
 /// Top-level declarations may appear in any order and may refer to each other. A variable's *dependencies* are what
 /// running its initializer may run, found lexically, whether reached at run time or not: the functions and variables
@@ -5108,14 +5110,17 @@ function newable(t: Type): bool {
 }
 
 /// The source of the module of a file embedded (3), of the file at path: `value`, its bytes, deflated in the program
-/// and inflated as it starts if deflated.
+/// and inflated as it starts, into their length, if deflated.
 function embedded(path: string, deflated: bool, read: (path: string) => string | null): string throws CompileError {
 	const s = read(path)
 	if (s == null) {
 		throw new CompileError(`cannot read ${path}`)
 	}
-	return if (!deflated) `export const value = ${quoted(s!)}\n`
-		else `import { inflate } from "std/compress/deflate"\nexport const value = inflate(${quoted(deflate(s!, 9))})\n`
+	if (!deflated) {
+		return `export const value = ${quoted(s!)}\n`
+	}
+	const z = quoted(deflate(s!, 9))
+	return `import { inflate } from "std/compress/deflate"\nexport const value = inflate(${z}, ${s!.length})\n`
 }
 
 /// The path of spec, imported from the module at importer: relative to importer's directory if it starts with a dot, else

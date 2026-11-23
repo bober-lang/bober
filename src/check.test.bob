@@ -4,7 +4,7 @@ import { HashMap } from "../std/collections/hashmap"
 import { split } from "../std/string"
 import { head, write } from "./bc/file"
 import { show as shown } from "./bc/show"
-import { Checked, Node, TypeError, check, show } from "./check"
+import { Checked, Node, TypeError, check, embedded, show } from "./check"
 import { CompileError } from "./error"
 import { Bound, Lift, bound, bundle, compilerId, unbundle } from "./lift"
 import { Lower, lower } from "./lower"
@@ -1048,4 +1048,12 @@ test "an import tagged @Embed declares a const string of a file's bytes" {
 	assert errors("import a from \"./a\"", files) == `7: ${form}`
 	const tag = "an import's one tag is @Deterministic, of a C import, or @TypeScript or @Embed, of another"
 	assert errors("import a from \"./a.txt\" @Embed[\"zip\"]", files) == `7: ${form}; 25: ${tag}`
+}
+
+test "an @Embed[\"deflate\"] module inflates the file into its length" {
+	const read = (path: string): string | null => if (path == "a.txt") "x\"\\\n\x01y" else null
+	assert embedded("a.txt", false, read) == "export const value = \"x\\\"\\\\\\n\\x01y\"\n"
+	const packed = embedded("a.txt", true, read)
+	assert packed.slice(0, 47) == "import { inflate } from \"std/compress/deflate\"\n"
+	assert packed.slice(packed.length - 5, packed.length) == ", 6)\n"
 }
