@@ -64,19 +64,21 @@ static int outside(const char *path) {
 /// Taints the tests where path is outside the running one's directory.
 static void reach(const char *path) { if (outside(path)) bober_taint(); }
 
-/// Notes, in tests, that the running test read the file at path, which is regular or none.
+/// Notes, in tests, that the running test read the file at path, which is regular or none, unless it did before.
 static void note(const char *path) {
-  char cwd[PATH_MAX] = "";
+  char cwd[PATH_MAX] = "", full[2 * PATH_MAX];
   if (path[0] != '/' && !getcwd(cwd, sizeof cwd)) {
     bober_taint();
     return;
   }
-  size_t a = strlen(cwd), b = strlen(path) + 1;
+  size_t n = snprintf(full, sizeof full, "%s%s%s", cwd, cwd[0] ? "/" : "", path) + 1;
   pthread_mutex_lock(&test_mu);
-  bober_reads = realloc(bober_reads, bober_nreads + a + 1 + b);
-  memcpy(bober_reads + bober_nreads, cwd, a), bober_nreads += a;
-  if (a) bober_reads[bober_nreads++] = '/';
-  memcpy(bober_reads + bober_nreads, path, b), bober_nreads += b;
+  long i = 0;
+  while (i < bober_nreads && strcmp(bober_reads + i, full)) i += strlen(bober_reads + i) + 1;
+  if (i == bober_nreads) {
+    bober_reads = realloc(bober_reads, bober_nreads + n);
+    memcpy(bober_reads + bober_nreads, full, n), bober_nreads += n;
+  }
   pthread_mutex_unlock(&test_mu);
 }
 

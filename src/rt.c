@@ -58,6 +58,7 @@ static _Thread_local const char *testFile;  // the running test's source
 static _Thread_local int32_t testAt;        // where in it the statement running is, -1 before the first
 static int cap = -1, saved[2] = {1, 2};  // in tests, the file the output and errors go to, and where they went
 static const char *tmp;  // in tests, the directory in which each gets one of its own, by number, if any: BOBER_TMP
+static char *passed;     // in tests, the names of those not to run, as they pass, each ended by a newline: BOBER_PASSED
 /// What src/io.c knows of the tests: the running one's directory, the files they read and whether they are tainted.
 extern char bober_tmp[], *bober_reads;
 extern long bober_nreads;
@@ -262,9 +263,10 @@ void bober_start(int argc, char **argv, int32_t tested) {
     seed = STONEWALL, bober_logical = 1, cap = f ? fileno(f) : -1, saved[0] = dup(1), saved[1] = dup(2);
     dup2(cap, 1), dup2(cap, 2);
     tmp = getenv("BOBER_TMP") ? realpath(getenv("BOBER_TMP"), 0) : 0;
+    passed = getenv("BOBER_PASSED") ? strdup(getenv("BOBER_PASSED")) : 0;
     const char *j = getenv("BOBER_JOBS");
     if (!j || sscanf(j, "%d %d", jobs, jobs + 1) != 2) pool(jobs);
-    unsetenv("BOBER_TMP"), unsetenv("BOBER_JOBS");  // not for the programs tests run
+    unsetenv("BOBER_TMP"), unsetenv("BOBER_JOBS"), unsetenv("BOBER_PASSED");  // not for the programs tests run
   } else getentropy(&seed, sizeof seed);
   signal(SIGPIPE, SIG_IGN);  // a write to a socket the peer closed fails with EPIPE instead
   altStack();
@@ -442,11 +444,13 @@ typedef struct {
 } Child;
 static Child *children;
 static int nchildren, running;
+static Level reads;  // of the tests that ran, the files each read, by name, or null if it may depend on more
 
 /// Forks c's test from this process as its module initialized it, so that it sees that state and none of another test,
 /// in a directory of its own if tmp. The child writes its entry of the report, then a line of whether it is tainted, or
 /// "r" to be run again, alone, as a test whose helpers or itself failed is, for a report as of one process; and the files
-/// it read (src/io.c), to a file of its own, which reap reads; it exits 1 if the test failed.
+/// it read (src/io.c), to a file of its own, which reap reads; it exits 1 if the test failed. It is tainted if the
+/// module's initialization is.
 static void spawn(Child *c) {
   static int n;  // directories so far
   if (tmp) snprintf(bober_tmp, PATH_MAX, "%s/%d", tmp, ++n), mkdir(bober_tmp, 0777);
@@ -469,9 +473,17 @@ static void spawn(Child *c) {
   _exit(all.failed);
 }
 
+/// Adds the n bytes of paths at p, each ended by a NUL, to l as a JSON array, or null if tainted.
+static void paths(Level *l, const char *p, long n, bool tainted) {
+  raw(l, tainted ? "null" : "[");
+  for (long i = 0; !tainted && i < n; i += strlen(p + i) + 1)
+    raw(l, i ? ",\"" : "\""), add(l, p + i, strlen(p + i), true), raw(l, "\"");
+  raw(l, tainted ? "" : "]");
+}
+
 /// Waits for a child to exit, child i if i >= 0, else any, if wait, and takes its entry, its taint and the files it read,
-/// or if it exited without its entry, the end of its output and how it exited; or runs it again if it asks to: whether
-/// it reaped one.
+/// or if it exited without its entry, the end of its output and how it exited, as tainted; or runs it again if it asks
+/// to: whether it reaped one.
 static bool reap(int i, bool wait) {
   int status;
   pid_t pid;
@@ -487,51 +499,52 @@ static bool reap(int i, bool wait) {
     return true;
   }
   if (nl && nl + 1 < r + n && WIFEXITED(status)) {
-    add(&c->entry, r, nl - r, false), bober_tainted |= nl[1] == '1';
-    long k = r + n - nl - 2;
-    bober_reads = bober_realloc(bober_reads, bober_nreads + k);
-    memcpy(bober_reads + bober_nreads, nl + 2, k), bober_nreads += k;
+    add(&c->entry, r, nl - r, false), key(&reads, c->name), paths(&reads, nl + 2, r + n - nl - 2, nl[1] == '1');
     all.failed |= WEXITSTATUS(status) != 0;
   } else {
     char how[32];
     snprintf(how, sizeof how, WIFEXITED(status) ? "exit %d" : "signal %d",
              WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status));
     key(&c->entry, c->name), raw(&c->entry, "\""), tail(&c->entry, fileno(c->out), 0);
-    raw(&c->entry, how), raw(&c->entry, "\""), all.failed = true, give();
+    raw(&c->entry, how), raw(&c->entry, "\""), key(&reads, c->name), raw(&reads, "null"), all.failed = true, give();
   }
   free(r), fclose(c->out), fclose(c->res), c->pid = 0, running--;
   return true;
 }
 
-/// Runs the test name in a child (spawn), as many at once as tokens of the pool are free. Those that exited are reaped
-/// first, so that only the files of those running stay open.
+/// Runs the test name in a child (spawn), as many at once as tokens of the pool are free, unless it passed. Those that
+/// exited are reaped first, so that only the files of those running stay open.
 void bober_test(const char *name, const char *file, void (*f)(void)) {
-  while (running && reap(-1, false)) {}
-  while (!take(!running)) reap(-1, true);
   Child c = {0, name, file, f};
-  spawn(&c);
+  size_t n = strlen(name);
+  bool ok = false;
+  for (char *p = passed; p && *p && !ok; p = strchr(p, '\n') + 1) ok = !strncmp(p, name, n) && p[n] == '\n';
+  if (ok) key(&c.entry, name), raw(&c.entry, "\"ok\"");
+  else {
+    while (running && reap(-1, false)) {}
+    while (!take(!running)) reap(-1, true);
+    spawn(&c), running++;
+  }
   children = bober_realloc(children, ++nchildren * sizeof *children);
-  children[nchildren - 1] = c, running++;
+  children[nchildren - 1] = c;
 }
 
 void bober_subtest(const char *name, uint64_t f) { run(name, *(void (**)(void *))f, (void *)(uintptr_t)f); }
 
 void bober_mark(int32_t at) { testAt = at; }
 
-/// Prints the report of the tests, a JSON object of their entries, in their order, and a line of the files they read,
-/// a JSON array, null if they did what else their results may depend on (src/io.c); whether one failed.
+/// Prints the report of the tests, a JSON object of their entries, in their order, a line of the files each that ran
+/// read, a JSON object of arrays, each null if it did what else its result may depend on (src/io.c), and a line of
+/// those the module's initialization read, which each depends on too; whether one failed.
 int32_t bober_tested(void) {
   for (int i = 0; i < nchildren; i++) {
     while (children[i].pid) reap(i, true);
     raw(&all, i ? "," : ""), add(&all, children[i].entry.kids, children[i].entry.n, false);
   }
-  put(saved[0], "{", 1), flush(), put(saved[0], "}\n", 2);
-  Level reads = {0};
-  raw(&reads, bober_tainted ? "null" : "[");
-  for (long i = 0; !bober_tainted && i < bober_nreads; i += strlen(bober_reads + i) + 1)
-    raw(&reads, i ? ",\"" : "\""), add(&reads, bober_reads + i, strlen(bober_reads + i), true), raw(&reads, "\"");
-  raw(&reads, bober_tainted ? "\n" : "]\n");
-  put(saved[0], reads.kids, reads.n);
+  Level init = {0};
+  paths(&init, bober_reads, bober_nreads, false);
+  put(saved[0], "{", 1), flush(), put(saved[0], "}\n{", 3), put(saved[0], reads.kids, reads.n), put(saved[0], "}\n", 2);
+  put(saved[0], init.kids, init.n), put(saved[0], "\n", 1);
   return all.failed;
 }
 

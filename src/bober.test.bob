@@ -5,7 +5,7 @@ import { fromCString } from "../std/c"
 import { exists, glob, mkdirAll, open, remove, stat } from "../std/fs"
 import { base } from "../std/fs/path"
 import * as process from "../std/process"
-import { replace } from "../std/string"
+import { replace, split } from "../std/string"
 import { Build, Compile, Run, build, format, ignored, machine, runTests, toolchain } from "./bober"
 import { Bytes } from "./link/bytes"
 import { Linker } from "./link/link"
@@ -528,6 +528,24 @@ test "test files of a package are built as one program, but where one does not c
 	dir = `${home()}/build`
 	try {
 		assert runTests(files, [], new Compile()).map(r => r()[0]) == [0, 1]
+	} finally {
+		dir = "build"
+	}
+}
+
+test "of a test file whose code changed, only the tests that run changed code run again" {
+	const [main, lib] = [`${home()}/each.test.bob`, `${home()}/each.bob`]
+	mkdirAll(home())
+	writeFile(main, `import { f, g } from "./each"\ntest "f" { assert f() == 1 }\ntest "g" { assert g() == 2 }\n`)
+	const ran = (g: string) => {
+		writeFile(lib, `export function f(): i32 { return 1 }\n\nexport function g(): i32 { return ${g} }\n`)
+		assert runTests([main], [], new Compile())[0]() == [0, `{"f":"ok","g":"ok"}`]
+		return split(readFile(`${home()}/build/tmp/${replace(main, "/", "%2F")}.log`)!, "\n")[1] // of those that ran
+	}
+	dir = `${home()}/build`
+	try {
+		ran("2")
+		assert ran("[2][0]") == `{"g":[]}`
 	} finally {
 		dir = "build"
 	}

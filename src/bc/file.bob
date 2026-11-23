@@ -52,12 +52,14 @@
 //! one hash, of all of theirs.
 
 import { sort } from "../../std/algo"
+import { isDigit } from "../../std/ascii"
 import { HashMap } from "../../std/collections/hashmap"
 import { Reader, Writer } from "../../std/encoding/binary"
 import { isAbs, join } from "../../std/fs/path"
 import { combine, fnv } from "../../std/hash"
 import { min } from "../../std/math"
 import { ParseError } from "../../std/string"
+import { CompileError } from "../error"
 import * as decl from "./decl"
 import * as kind from "./kind"
 import * as op from "./op"
@@ -151,6 +153,72 @@ export function abi(p: Program, m: i32): u64 {
 /// The hash of what module m's code is compiled against (Abi), which its bytecode with the ABIs of its imports does
 /// not hold once monomorphized: a generic's instance names the class it is of, of another module, exported or not.
 export function signatures(p: Program, m: i32): u64 { return new Abi(p, m, true).h }
+
+/// The hashes of what decls run: of each, its code (Abi) and the hashes of the decls it names, its members too, which a
+/// call may dispatch to; made once each, of Tarjan's strongly connected components of decls naming each other, each
+/// hashed as one, as Abis does modules.
+export class Reached {
+	p: Program
+	private index = new HashMap[i32, i32]()
+	private stack: i32[] = []
+	private abi: Abi
+	/// Of each decl visited, its own hash and the decls it names, till its component is hashed.
+	private made = new HashMap[i32, [u64, i32[]]]()
+	private hashes = new HashMap[i32, u64]()
+
+	constructor(p: Program) throws CompileError {
+		this.p = p
+		this.abi = new Abi(p, -1, true, p.lang("mark"))
+	}
+
+	/// The hash of what roots run, but where in the source it is, which only a failure tells.
+	of(roots: i32[]): u64 {
+		let h = seed
+		for (const d of roots) {
+			if (!this.hashes.has(d)) {
+				this.visit(d)
+			}
+			h = combine(h, this.hashes.get(d)!)
+		}
+		return h
+	}
+
+	/// Hashes decl d, unvisited, unless it is in a component not done; returns the least index on the stack it reaches.
+	private visit(d: i32): i32 {
+		const i = this.index.size
+		this.index.set(d, i)
+		this.stack.push(d)
+		const a = this.abi.own(d)
+		this.made.set(d, a)
+		let low = i
+		for (const u of a[1]) {
+			if (!this.hashes.has(u)) {
+				low = min(low, this.index.get(u) ?? this.visit(u))
+			}
+		}
+		if (low == i) {
+			const c: i32[] = []
+			let x = -1
+			while (x != d) {
+				x = this.stack.pop()
+				c.push(x)
+			}
+			let own: u64 = 0
+			let others: u64 = 0
+			for (const y of c) {
+				own += this.made.get(y)![0]
+				for (const u of this.made.get(y)![1]) {
+					others += this.hashes.get(u) ?? 0 // of the component's, which are not hashed yet, none
+				}
+			}
+			for (const y of c) {
+				this.hashes.set(y, combine(own, others))
+				this.made.delete(y)
+			}
+		}
+		return low
+	}
+}
 
 /// The ids a file gives the entries of a table of the Program it uses, and their section, each entry after those it
 /// is made of.
@@ -681,7 +749,10 @@ class Abis {
 }
 
 /// Module m's signatures being hashed, and the other modules they name; or if all, its decls and copies with their
-/// code, and the signatures of all they name, of other modules too, and of what these name.
+/// code, and the signatures of all they name, of other modules too, and of what these name; or if m is -1, a decl at a
+/// time (own), with its code, and the decls it names, but positions: a test's marks, calls of mark, and the names of
+/// the decls named by their position, an arrow's or an Outlined function's, which are hashed as the nth their owner
+/// owns instead.
 class Abi {
 	p: Program
 	m: i32
@@ -689,14 +760,21 @@ class Abi {
 	uses: i32[] = []
 	private all: bool
 	private done = new HashMap[i32, bool]()
-	private seen = new HashMap[i32, bool]()
+	/// The types walked, each of the decl being hashed when it was, if m is -1.
+	private seen = new HashMap[i32, i32]()
+	private at = -1
 	/// If all, the copies and what they own, whose code is hashed as of its own.
 	private copied = new HashMap[i32, bool]()
+	private mark: i32
 
-	constructor(p: Program, m: i32, all = false) {
+	constructor(p: Program, m: i32, all = false, mark = -1) {
 		this.p = p
 		this.m = m
 		this.all = all
+		this.mark = mark
+		if (m < 0) {
+			return
+		}
 		const copies = if (all) p.modules[m].copies else []
 		for (const d of copies) {
 			this.copied.set(d, true)
@@ -708,6 +786,15 @@ class Abi {
 		}
 	}
 
+	/// If m is -1, the hash of decl d alone, and the decls it names.
+	own(d: i32): [u64, i32[]] {
+		this.h = seed
+		this.uses = []
+		this.at = d
+		this.decl(d)
+		return [this.h, this.uses]
+	}
+
 	/// Adds the signature of decl d, of its members if a class or interface, its code if a const; with its doc, which
 	/// a type's descriptor holds, and whether it has code, as a call of one without is an intrinsic.
 	private decl(d: i32) {
@@ -716,7 +803,7 @@ class Abi {
 		}
 		this.done.set(d, true)
 		const x = this.p.decls[d]
-		this.h = combine(combine(combine(this.h, x.hash), x.kind), x.mods)
+		this.h = combine(combine(combine(this.h, this.id(d)), x.kind), x.mods)
 		this.h = combine(combine(this.h, fnv(this.p.strings[x.doc])), if (x.code == null) 0 else 1)
 		for (const t of x.params) {
 			this.h = combine(this.h, fnv(this.p.strings[t.name]))
@@ -728,8 +815,8 @@ class Abi {
 		this.list(x.supers)
 		this.list(x.tags)
 		this.list(x.throws)
-		const own = this.all && (x.module == this.m || this.copied.has(d))
-		for (const y of if (own && x.module != this.m) x.members else []) {
+		const own = this.all && (this.m < 0 || x.module == this.m || this.copied.has(d))
+		for (const y of if (own && this.m >= 0 && x.module != this.m) x.members else []) {
 			this.copied.set(y, true)
 		}
 		if (x.code != null && (own || x.kind == decl.Var && (x.mods & decl.Readonly) != 0)) {
@@ -737,7 +824,7 @@ class Abi {
 		}
 		if (own || x.kind == decl.Class || x.kind == decl.Interface) {
 			for (const y of x.members) {
-				this.decl(y)
+				this.named(y)
 			}
 		}
 	}
@@ -747,6 +834,10 @@ class Abi {
 			this.type(l.type)
 		}
 		for (const i of 0 ... c.ops.length - 1) {
+			if (i + 1 < c.ops.length && c.ops[i + 1] == op.Call && c.a(i + 1) == this.mark) {
+				// of its position, pushed last
+				continue
+			}
 			this.h = combine(this.h, c.ops[i])
 			const s = op.shape[c.ops[i]]
 			for (const j of 0 ... s.length - 1) {
@@ -755,7 +846,7 @@ class Abi {
 					case op.TypeId: this.type(x)
 					case op.TypeList: this.list(x)
 					case op.DeclId:
-						this.h = combine(this.h, this.p.decls[x].hash)
+						this.h = combine(this.h, this.id(x))
 						this.named(x)
 					case op.StrId: this.h = combine(this.h, fnv(this.p.strings[x]))
 					case op.IntId: this.h = combine(this.h, this.p.ints[x])
@@ -766,6 +857,14 @@ class Abi {
 				}
 			}
 		}
+	}
+
+	/// Decl d's hash, but if m is -1, of one its owner names by its position, its owner's and its nth.
+	private id(d: i32): u64 {
+		const x = this.p.decls[d]
+		const name = this.p.strings[x.name]
+		return if (this.m >= 0 || x.owner < 0 || name == "" || !isDigit(name[0])) x.hash
+			else combine(this.id(x.owner), this.p.decls[x.owner].members.indexOf(d))
 	}
 
 	private list(l: i32) {
@@ -781,10 +880,10 @@ class Abi {
 
 	/// Notes the decls t and its parts name.
 	private walk(t: i32) {
-		if (this.seen.has(t)) {
+		if (this.seen.get(t) == this.at) {
 			return
 		}
-		this.seen.set(t, true)
+		this.seen.set(t, this.at)
 		const k = this.p.kind(t)
 		if (k == kind.Named || k == kind.Param) {
 			this.named(this.p.a(t))
@@ -794,10 +893,12 @@ class Abi {
 		}
 	}
 
-	/// Adds decl d if of this module, or all are, else notes its module.
+	/// Adds decl d if of this module, or all are, else notes its module; or if m is -1, notes d.
 	private named(d: i32) {
 		const m = this.p.decls[d].module
-		if (m == this.m || this.all) {
+		if (this.m < 0) {
+			this.uses.push(d)
+		} else if (m == this.m || this.all) {
 			this.decl(d)
 		} else if (!this.uses.includes(m)) {
 			this.uses.push(m)

@@ -537,12 +537,13 @@ test "identity" {
 	assert !same
 }
 `, "", true) == `{"values":"ok","identity":"ok"}
+{"values":[],"identity":[]}
 []
 exit 0
 `
 }
 
-test "the tests' report is followed by the regular files they read, null if they may depend on more" {
+test "the tests' report is followed by the regular files each read, null if it may depend on more" {
 	mkdirAll(dir())
 	writeFile(`${dir()}/read.txt`, "x")
 	const src = `import { readFile, writeFile } from "../../std/fs"
@@ -556,11 +557,14 @@ test "pure" {
 	bober_self()
 	assert strlen("ab") == 2
 }
+function traps(): i32 { assert false; return 0 }
 `
-	assert endsWith(run("reads", src, "", true), `read.txt"]\nexit 0\n`)
-	for (const t of [`test "calls" { rand() }`, `test "takes" { assert [rand].length == 1 }`,
-		`test "writes" { writeFile("${dir()}/written.txt", "y") }`]) {
-		assert endsWith(run("reads", src + t, "", true), "}\nnull\nexit 0\n")
+	assert endsWith(run("reads", src, "", true), `read.txt"],"pure":[]}\n[]\nexit 0\n`)
+	for (const [name, body] of [["calls", "rand()"], ["takes", "assert [rand].length == 1"],
+		["writes", `writeFile("${dir()}/written.txt", "y")`],
+		["catches", "try { await spawn traps() } catch (e: Trap) {}"]]) {
+		assert endsWith(run("reads", `${src}test "${name}" { ${body} }`, "", true),
+			`"pure":[],"${name}":null}\n[]\nexit 0\n`)
 	}
 }
 

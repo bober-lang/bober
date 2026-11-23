@@ -25,7 +25,8 @@ import { fnv } from "../std/hash"
 import { File, stderr, stdin, stdout } from "../std/io"
 import { arch, os } from "../std/os"
 import { ParseError, codePoint, replace, split, trim, utf8 } from "../std/string"
-import { abi, signatures, write } from "./bc/file"
+import * as decl from "./bc/decl"
+import { Reached, abi, signatures, write } from "./bc/file"
 import { Program } from "./bc/program"
 import { show } from "./bc/show"
 import { glue, includesOf, sysroot } from "./c/bind"
@@ -461,13 +462,20 @@ function yamlOf(report: string): string {
 	}
 }
 
-/// The report of a program's tests kept (runTests), by the compiler, the include directories and their args, while the
-/// files their build and they read are as they were.
+/// The report of a program's tests kept (runTests), by the compiler, the include directories and their args: whole
+/// while the files their build and they read are as they were, else of each test that passed, while the code it runs
+/// (Reached) and the files it read are, and those of the build that are not bober's sources or are builtin/'s, which
+/// the compiler calls by name.
 class TestCache {
 	code = ""
+	/// The report, if every test passed, else "".
 	report = ""
 	/// Each file's path, time and size (stampOf), and hash (hashOf).
 	files: [string, string, string][] = []
+	/// Each test that passed: its name, the hash of the code it runs, and the files it read.
+	passed: [string, string, string[]][] = []
+	/// The files the module's initialization read, which each test depends on too.
+	init: string[] = []
 }
 
 /// Starts the tests of each of mains, built as f says, with args, unless their report is kept and f builds natively:
@@ -485,9 +493,15 @@ export function runTests(mains: string[], args: string[], f: Compile): (() => [i
 		try {
 			const cmd = [...command(h.main), ...args]
 			const files = built
+			const tests = hashes
+			const passed = passing(h.kept, files, tests)
+			if (tests.length > 0 && passed.length == tests.length) {
+				return () => tested(null, h, code, files, tests, passed)
+			}
 			setenv("BOBER_TMP", `${dir}/tmp/${flat(h.main)}`, 1)
+			setenv("BOBER_PASSED", passed.map(t => `${t[0]}\n`).join(""), 1)
 			const p = process.start(cmd, `${dir}/tmp/${flat(h.main)}.log`)
-			return () => tested(p, h, code, files)
+			return () => tested(p, h, code, files, tests, passed)
 		} catch (e: CompileError | IoError) {
 			h.lock.close()
 			return () => failure(e)
@@ -499,16 +513,18 @@ export function runTests(mains: string[], args: string[], f: Compile): (() => [i
 function flat(main: string): string { return replace(replace(normal(main), "%", "%25"), "/", "%2F") }
 
 /// The tests of main to run: the lock of their log, held till their report is kept, which a bober test running them at
-/// once waits for, and when, by the files' clock, before their build reads any.
+/// once waits for, when, by the files' clock, before their build reads any, and what is kept of them by the same code.
 class Held {
 	main: string
 	lock: File
 	since: i64
+	kept: TestCache | null
 
-	constructor(main: string, lock: File, since: i64) {
+	constructor(main: string, lock: File, since: i64, kept: TestCache | null) {
 		this.main = main
 		this.lock = lock
 		this.since = since
+		this.kept = kept
 	}
 }
 
@@ -522,18 +538,20 @@ function hold(main: string, code: string): Held | (() => [i32, string]) {
 		const l = open(`${tmp}.log`, "a")
 		lock = l
 		l.lock(false, true)
+		let kept: TestCache | null = null
 		try {
 			const k = decodeJson[TestCache](readFile(`${dir}/kept/${flat(main)}`))
-			if (code != "" && k.code == code && k.files.every(unchanged)) {
+			if (code != "" && k.code == code && k.report != "" && k.files.every(unchanged)) {
 				l.close()
 				return () => [0, k.report]
 			}
+			kept = if (code != "" && k.code == code) k else null
 		} catch (e: IoError | ParseError) {}
 		if (exists(tmp)) {
 			removeAll(tmp)
 		}
 		mkdirAll(tmp)
-		return new Held(main, l, stat(tmp).modified)
+		return new Held(main, l, stat(tmp).modified, kept)
 	} catch (e: IoError) {
 		lock?.close()
 		return () => failure(e)
@@ -562,26 +580,69 @@ function together(mains: string[], f: Compile): (main: string) => string[] {
 	}
 }
 
-/// What runTests gives of the tests p runs, held as h, built of files, kept by code unless code is "".
-function tested(p: process.Process, h: Held, code: string, files: string[]): [i32, string] {
+/// The tests of kept k that pass still, by tests, each the name of one and the hash of the code it runs: of the same
+/// hash, while the files it read are as they were, and those the initialization read, and those of the build's files
+/// that are not bober's sources or are builtin/'s.
+function passing(k: TestCache | null, built: string[], tests: [string, string][]): [string, string, string[]][] {
+	const files = byPath(k)
+	const same = (x: string) => files.has(x) && unchanged(files.get(x)!)
+	const other = built.filter(x => !endsWith(x, ".bob") || builtin(x))
+	return if (k == null || ![...other, ...k.init].every(same)) []
+		else k.passed.filter(t => tests.some(x => x[0] == t[0] && x[1] == t[1]) && t[2].every(same))
+}
+
+/// Kept k's files by path.
+function byPath(k: TestCache | null): HashMap[string, [string, string, string]] {
+	const files = new HashMap[string, [string, string, string]]()
+	for (const f of k?.files ?? []) {
+		files.set(f[0], f)
+	}
+	return files
+}
+
+/// What runTests gives of the tests p runs, held as h, built of files, kept by code unless code is "": of tests, each
+/// its name and the hash of the code it runs, all but those passed, which pass still, or none if p is null.
+function tested(p: process.Process | null, h: Held, code: string, files: string[], tests: [string, string][],
+	passed: [string, string, string[]][]): [i32, string] {
 	const out = `${dir}/tmp/${flat(h.main)}.log`
 	try {
-		const status = p.wait()
-		// The report, which a crash cuts off after the key of the test it was in, then the files the tests read.
-		const text = trim(readFile(out))
+		const status = p?.wait() ?? 0
+		// The report, which a crash cuts off after the key of the test it was in, then the files each test read, and
+		// those the initialization read.
+		const text = if (p == null) `{${tests.map(t => `${quoted(t[0])}:"ok"`).join(",")}}\n{}\n${encode(h.kept!.init)}`
+			else trim(readFile(out))
 		const nl = indexOf(text, "\n")
 		const report = if (nl < 0) text else text.slice(0, nl)
 		for (const r of [report, `${report}${quoted(`exit ${status}`)}}`]) {
 			try {
-				decodeJson[Keys](r)
-				const reads = text.slice(nl + 1, text.length)
-				if (status == 0 && code != "" && nl >= 0 && reads != "null") {
+				const entries = decodeJson[Keys](r).all
+				if (code != "" && nl >= 0) {
 					const k = new TestCache()
 					k.code = code
-					k.report = r
-					const all = [...files, ...decodeJson[string[]](reads)]
+					k.passed = passed
+					const lines = split(text.slice(nl + 1, text.length), "\n")
+					k.init = decodeJson[string[]](lines[lines.length - 1])
+					for (const [name, reads] of decodeJson[Keys](lines[0]).all) {
+						const t = tests.find(x => x[0] == name)
+						const ok = entries.some(e => e[0] == name && e[1].text == `"ok"`)
+						if (t != null && reads.text != "null" && ok && indexOf(name, "\n") < 0) {
+							// as BOBER_PASSED lists them
+							k.passed.push([name, t[1], decodeJson[string[]](reads.text)])
+						}
+					}
+					k.report = if (status == 0 && k.passed.length == tests.length) r else ""
+					const all = [...files, ...k.init]
+					for (const t of k.passed) {
+						all.push(...t[2])
+					}
 					sortBy(all, (a, b) => a < b)
-					k.files = unique(all).map(x => [x, stampOf(x), hashOf(x, h.since)])
+					const kept = byPath(h.kept)
+					k.files = unique(all).map(x => {
+						const stamp = stampOf(x)
+						const f = kept.get(x)
+						return [x, stamp,
+							if (f != null && f[1] == stamp && f[2] != "changed") f[2] else hashOf(x, h.since)]
+					})
 					mkdirAll(`${dir}/kept`)
 					save(`${dir}/kept/${flat(h.main)}`, encode(k))
 				}
@@ -667,8 +728,9 @@ export function build(main: string, tests: bool, f: Compile, pin: bool): string[
 const small = 64
 
 /// The files the program build built last, natively, is built of (inputs), by which its tests' results are kept
-/// (runTests).
+/// (runTests), and its tests, each its name and the hash of the code it runs (Reached).
 let built: string[] = []
+let hashes: [string, string][] = []
 /// The sources of the C the builds compiled or found current (newer, cmake).
 let made: string[] = []
 
@@ -676,20 +738,39 @@ let made: string[] = []
 /// imports and of builtin/'s every program holds, however many more -O lowers, the files read to bind or locate the C
 /// headers they import, the bober.pkg of their packages, and the C made.
 function inputs(p: Program, main: i32): string[] {
-	const ms = [main, ...always.map(b => p.module(b))]
-	let i = 0
-	while (i < ms.length) {
-		ms.push(...p.modules[ms[i]].deps.filter(d => !ms.includes(d)))
-		i++
-	}
 	const files = [...made]
-	for (const path of ms.map(m => p.modules[m].path)) {
+	for (const path of imported(p, main).map(m => p.modules[m].path)) {
 		const source = split(path, ": ")[0]
 		const d = nearest(source)
 		const reads = (bound.get(path)?.reads ?? []).map(r => r[0])
 		files.push(...[source, ...(if (d == null) [] else [join(d, "bober.pkg")]), ...reads])
 	}
 	return files
+}
+
+/// The modules of the program of p's module main: it, those of builtin/ every program holds, and those they import.
+function imported(p: Program, main: i32): i32[] {
+	const ms = [main, ...always.map(b => p.module(b))]
+	let i = 0
+	while (i < ms.length) {
+		ms.push(...p.modules[ms[i]].deps.filter(d => !ms.includes(d)))
+		i++
+	}
+	return ms
+}
+
+/// Of each of p's modules mains, each test: its name and the hash of the code it runs (Reached), with the inits of its
+/// program.
+function testHashes(p: Program, mains: i32[]): [string, string][][] {
+	const r = new Reached(p)
+	return mains.map(main => {
+		const inits: i32[] = []
+		for (const m of imported(p, main)) {
+			inits.push(...p.modules[m].inits)
+		}
+		const tests = p.modules[main].decls.filter(d => p.decls[d].kind == decl.Test)
+		return tests.map(d => [p.strings[p.decls[d].name], `${r.of([d, ...inits])}`])
+	})
 }
 
 /// Compiles the programs of mains into the image as build does, at -O1 and -O2 monomorphized as one of their package,
@@ -699,6 +780,7 @@ function programs(mains: string[], tests: bool, f: Compile, pin: bool): (main: s
 	const dyn = !f.release && !f.O2 && (!f.O1 || f.O0)
 	const p = lowered(if (dyn || f.release) mains else world(mains[0]), f.headers.I)
 	const ms = mains.map(m => p.module(normal(m)))
+	const hashed = if (tests) testHashes(p, ms) else [] // before mono changes the code
 	const o = { main: -1, tests: false, dyn: dyn }
 	if (!o.dyn) {
 		for (const x of 0 ... p.modules.length - 1) {
@@ -714,6 +796,7 @@ function programs(mains: string[], tests: bool, f: Compile, pin: bool): (main: s
 			if (packaged()) join(root, "lib/launch.c.exe") else launcher(dir), at,
 			`${entry(normal(main), tests)}${if (o.dyn) "" else monoSuffix}@${version}`]
 		built = if (tests) inputs(p, p.module(normal(main))) else []
+		hashes = if (tests) hashed[mains.indexOf(main)] else []
 		return command
 	}
 }

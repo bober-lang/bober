@@ -2,7 +2,7 @@
 
 import { bober_fiber, bober_park, bober_self, bober_wake } from "../src/rt.h"
 import { Trap } from "./error"
-import { Ref, addr, trap } from "./mem"
+import { Ref, addr, taint, trap } from "./mem"
 
 /// What a call threw, laid out as the union it is held as (src/emit.bob), and where, for each await of its future to
 /// throw again.
@@ -33,8 +33,12 @@ export class Future[T] {
 	waiters: u64[] = []
 }
 
-/// Throws a Trap with message msg, called when a spawned isolate trapped (§7.7).
-export function throwTrap(msg: string) throws Trap { throw new Trap(msg) }
+/// Throws a Trap with message msg, called when a spawned isolate trapped (§7.7); a test that takes one is not kept, as
+/// msg holds source positions, which the hash of its code does not.
+export function throwTrap(msg: string) throws Trap {
+	taint()
+	throw new Trap(msg)
+}
 
 /// Runs f on a new fiber at once, until it parks: f's future.
 export function start[T](f: () => T): Future[T] {
