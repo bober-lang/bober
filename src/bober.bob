@@ -1502,7 +1502,8 @@ function newer(path: string, sources: string[]): bool {
 
 /// The object of the C that defines the static functions of module m of p, if a C header's module, whose path is the header's and
 /// the names imported (src/check.bob, Modules.header), or null. Its files are named by the header's name and a hash of the
-/// module's path, as the names would make too long a file name.
+/// module's path, as the names would make too long a file name, and a hash of its C, which names the compiler and the
+/// headers as bound, that it is compiled again only once that changed.
 function glued(p: Program, m: i32, includes: string[]): string | null {
 	const path = p.modules[m].path
 	const at = indexOf(path, ": ")
@@ -1515,9 +1516,16 @@ function glued(p: Program, m: i32, includes: string[]): string | null {
 		return null
 	}
 	const f = `${dir}/${base(header)}.${fnv(path)}`
-	save(`${f}.c`, c)
-	object(sysroot, `${f}.c`, `${f}.c.o`, [".", ...includes])
-	return `${f}.c.o`
+	const text = `// ${compilerId()} ${fnv(bound.get(path)?.bytes(path) ?? "")} ${includes.join(" ")}\n${c}`
+	const o = `${f}.${fnv(text)}.o`
+	if (!exists(o)) {
+		const tmp = `${o}.${getpid()}` // its own, as another bober may be at it too
+		save(`${tmp}.c`, text)
+		object(sysroot, `${tmp}.c`, tmp, [".", ...includes])
+		remove(`${tmp}.c`)
+		rename(tmp, o)
+	}
+	return o
 }
 
 /// The executable's name for main: its file's, without .bob or .test.bob.
