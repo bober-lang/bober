@@ -63,12 +63,16 @@ export function emit(p: Program, m: i32, b: Backend, o: Options, facts: Facts = 
 export function learn(p: Program, o: Options, backend: (m: i32) => Backend): Facts throws CompileError {
 	const f = new Facts()
 	f.phase = "learning"
-	let e: Emitter | null = null
 	for (const m of 0 ... p.modules.length - 1) {
-		e = new Emitter(p, m, backend(m), o, f)
-		e!.run()
+		const b = backend(m)
+		const e = new Emitter(p, m, b, o, f)
+		e.run()
+		// The last settles before its backend goes, as settle asks it too.
+		if (m == p.modules.length - 1) {
+			e.settle()
+		}
+		b.dispose()
 	}
-	e!.settle()
 	return f
 }
 

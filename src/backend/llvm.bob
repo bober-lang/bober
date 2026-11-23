@@ -1,7 +1,6 @@
-//! LLVM as the Backend (src/backend/backend.bob), through its C API: a module in the context all share, so that
-//! they link, a builder, and the target machine of bober's own OS and CPU. Types, values and blocks are LLVM's references as
-//! they are. Errors are thrown as strings. A program using it links the C libraries of bober.pkg; the boot
-//! interpreter has the system's.
+//! LLVM as the Backend (src/backend/backend.bob), through its C API: a module in a context of its own, a builder, and
+//! the target machine of bober's own OS and CPU. Types, values and blocks are LLVM's references as they are. Errors are
+//! thrown as strings. A program using it links the C libraries of bober.pkg; the boot interpreter has the system's.
 
 import { indexOf } from "../../std/algo"
 import { HashMap } from "../../std/collections/hashmap"
@@ -65,6 +64,9 @@ import { LLVMDisposeErrorMessage, LLVMGetErrorMessage } from "llvm-c/Error.h"
 import { LLVMParseIRInContext } from "llvm-c/IRReader.h"
 import { LLVMParseCommandLineOptions } from "llvm-c/Support.h"
 import { LLVMLinkModules2 } from "llvm-c/Linker.h"
+import { LLVMContextDispose, LLVMDisposeBuilder, LLVMDisposeModule } from "llvm-c/Core.h"
+import { LLVMDisposeTargetData, LLVMDisposeTargetMachine } from "llvm-c/TargetMachine.h"
+import { LLVMDisposeDIBuilder } from "llvm-c/DebugInfo.h"
 
 import { LLVMInitializeAArch64AsmParser, LLVMInitializeAArch64AsmPrinter, LLVMInitializeAArch64Target,
 	LLVMInitializeAArch64TargetInfo, LLVMInitializeAArch64TargetMC, LLVMInitializeWebAssemblyAsmParser,
@@ -99,11 +101,9 @@ export const triple = `${if (arch == "arm64") "aarch64" else arch}-${switch (os)
 
 /// The name of section s of data: on Mach-O in segment __DATA.
 const section = (s: string) => if (os == "macos") `__DATA,${s}` else s
-/// The context of every module, so that one can be linked into another.
-const context = LLVMContextCreate()
 
 export class LLVM implements Backend {
-	private ctx = context
+	private ctx = LLVMContextCreate()
 	private m: u64
 	private b: u64
 	/// Whether at has placed the builder. Before, it knows no module, and LLVM 24 aborts on any other use of it: it is
@@ -637,6 +637,7 @@ export class LLVM implements Backend {
 	private finish() {
 		if (this.di != 0) {
 			LLVMDIBuilderFinalize(this.di)
+			LLVMDisposeDIBuilder(this.di)
 			this.di = 0
 		}
 		if (this.roots.length > 0) {
@@ -746,6 +747,14 @@ export class LLVM implements Backend {
 		const s = fromBytes(LLVMGetBufferStart(buf[0]) as u64, LLVMGetBufferSize(buf[0]))
 		LLVMDisposeMemoryBuffer(buf[0])
 		return s
+	}
+
+	dispose() {
+		LLVMDisposeBuilder(this.b)
+		LLVMDisposeModule(this.m)
+		LLVMDisposeTargetData(this.td)
+		LLVMDisposeTargetMachine(this.tm)
+		LLVMContextDispose(this.ctx)
 	}
 
 	/// Finishes the module, optimizes it, and if collected, makes its refs the collector's for code to be made of it.
@@ -1063,7 +1072,7 @@ export class LLVM implements Backend {
 		// LLVMParseIRInContext takes buf.
 		const m = [0 as u64]
 		checked(err => LLVMParseIRInContext(this.ctx, buf, m, err) as u64)
-		LLVMSetModuleDataLayout(m[0], LLVMCreateTargetDataLayout(this.tm))
+		LLVMSetModuleDataLayout(m[0], this.td)
 		if (LLVMLinkModules2(this.m, m[0]) != 0) {
 			throw new CompileError("cannot link the included ir")
 		}
