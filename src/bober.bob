@@ -280,7 +280,7 @@ function command(c: Command): i32 {
 			}
 			const main = c.args[0]
 			const f = c.compile
-			const [status, report] = runTests(main, c.args.slice(1, c.args.length), () => build(main, true, f, true))()
+			const [status, report] = runTests([main], c.args.slice(1, c.args.length), f)[0]()
 			stdout.write(yamlOf(report))
 			return status
 		case Build:
@@ -393,38 +393,20 @@ function init(name: string) {
 }
 
 /// Runs the tests of testFiles(".") as test without main.bob prints them; 0 if all passed. A failed file's YAML starts
-/// with a line for each of its directories, of which those the last failed file printed are left out. Monomorphized,
-/// the files of a package are compiled as one, once (programs). Each file starts once compiled, while those before run,
-/// all of their tests taking turns by the tokens of one pool (bober_jobs), and is reported once all are started.
+/// with a line for each of its directories, of which those the last failed file printed are left out. Each file starts
+/// once compiled (runTests), while those before run, all of their tests taking turns by the tokens of one pool
+/// (bober_jobs), and is reported once all are started.
 function testAll(f: Compile): i32 {
 	bober_jobs()
 	const files = testFiles(".")
-	const one = !f.wasm && !f.js && !f.release && (f.O2 || f.O1 && !f.O0)
-	const commands = new HashMap[string, (main: string) => string[]]() // of the files compiled so
 	const clear = if (isatty(1) != 0) "\r\x1b[K" else ""
-	const started: (() => [i32, string])[] = [] // what waits for each file started, in order
+	const started = runTests(files, [], f) // what waits for each file, in order
 	let dirs: string[] = [] // of the last failed file
 	let failed = 0
 	for (const i of 0 ... files.length - 1) {
 		if (clear != "") {
 			stdout.write(`${clear}[${i + 1}/${files.length}] ${files[i]}`)
 		}
-		started.push(runTests(files[i], [], () => {
-			if (!one) {
-				return build(files[i], true, f, true)
-			}
-			if (!commands.has(files[i])) {
-				const w = world(files[i])
-				const g = files.filter(x => x == files[i] || w.includes(normal(x)))
-				const c = programs(g, true, f, true)
-				for (const x of g) {
-					commands.set(x, c)
-				}
-			}
-			return commands.get(files[i])!(files[i])
-		}))
-	}
-	for (const i of 0 ... files.length - 1) {
 		const [s, r] = started[i]()
 		if (s != 0) {
 			const parts = split(files[i], "/")
@@ -475,58 +457,110 @@ function yamlOf(report: string): string {
 	}
 }
 
-/// The report of a program's tests kept (runTests), by the code they ran and their args, while the files they read
-/// are as hashed.
+/// The report of a program's tests kept (runTests), by the compiler, the include directories and their args, while the
+/// files their build and they read are as they were.
 class TestCache {
 	code = ""
 	report = ""
-	files: [string, string][] = []
+	/// Each file's path, time and size (stampOf), and hash (hashOf).
+	files: [string, string, string][] = []
 }
 
-/// Starts main's tests by the command command gives, building them, with args, unless their report is kept: what waits
-/// for them, giving their exit status and their report, the JSON object src/rt.c prints, ended by the exit status if a
-/// crash cut it off, or else what failed as a JSON string.
-export function runTests(main: string, args: string[], command: () => string[]): () => [i32, string] {
-	let lock: File | null = null // held till its report is kept, which a bober test running them at once waits for
-	try {
-		const launch = command()
-		const cmd = [...launch, ...args]
-		const flat = replace(replace(normal(main), "%", "%25"), "/", "%2F") // a name no other path has
-		const out = `${dir}/tmp/${flat}.log`
-		const file = `${dir}/kept/${flat}`
-		const code = if (built == "") "" else `${built} ${args.map(quoted).join(" ")}`
-		mkdirAll(`${dir}/tmp`)
-		const held = open(out, "a")
-		lock = held
-		held.lock(false, true)
+/// Starts the tests of each of mains, built as f says, with args, unless their report is kept and f builds natively:
+/// what waits for each, giving its exit status and its report, the JSON object src/rt.c prints, ended by the exit status
+/// if a crash cut it off, or else what failed as a JSON string.
+export function runTests(mains: string[], args: string[], f: Compile): (() => [i32, string])[] {
+	const code = if (f.wasm || f.js) "" else [`${compilerId()}`, ...f.headers.I, "--", ...args].map(quoted).join(" ")
+	const held = mains.map(main => hold(main, code))
+	const command = together(held.filter(h => h instanceof Held).map(h => (h as Held).main), f)
+	return held.map(x => {
+		if (!(x instanceof Held)) {
+			return x
+		}
+		const h = x
 		try {
-			const k = decodeJson[TestCache](readFile(file))
-			if (code != "" && k.code == code && k.files.every(x => hashOf(x[0]) == x[1])) {
-				held.close()
-				for (const pin of launch.filter(a => endsWith(a, ".run"))) {
-					remove(pin) // as src/launch.c would, which does not run
-				}
+			const cmd = [...command(h.main), ...args]
+			const files = built
+			setenv("BOBER_TMP", `${dir}/tmp/${flat(h.main)}`, 1)
+			const p = process.start(cmd, `${dir}/tmp/${flat(h.main)}.log`)
+			return () => tested(p, h, code, files)
+		} catch (e: CompileError | IoError) {
+			h.lock.close()
+			return () => failure(e)
+		}
+	})
+}
+
+/// The name of main's files in build/tmp and build/kept, which no other path has.
+function flat(main: string): string { return replace(replace(normal(main), "%", "%25"), "/", "%2F") }
+
+/// The tests of main to run: the lock of their log, held till their report is kept, which a bober test running them at
+/// once waits for, and when, by the files' clock, before their build reads any.
+class Held {
+	main: string
+	lock: File
+	since: i64
+
+	constructor(main: string, lock: File, since: i64) {
+		this.main = main
+		this.lock = lock
+		this.since = since
+	}
+}
+
+/// main's tests, made to run, with their directory made anew, unless their report is kept by code, which is then what
+/// gives it, or what could not be done.
+function hold(main: string, code: string): Held | (() => [i32, string]) {
+	let lock: File | null = null
+	try {
+		const tmp = `${dir}/tmp/${flat(main)}`
+		mkdirAll(`${dir}/tmp`)
+		const l = open(`${tmp}.log`, "a")
+		lock = l
+		l.lock(false, true)
+		try {
+			const k = decodeJson[TestCache](readFile(`${dir}/kept/${flat(main)}`))
+			if (code != "" && k.code == code && k.files.every(unchanged)) {
+				l.close()
 				return () => [0, k.report]
 			}
 		} catch (e: IoError | ParseError) {}
-		const tmp = `${dir}/tmp/${flat}`
 		if (exists(tmp)) {
 			removeAll(tmp)
 		}
 		mkdirAll(tmp)
-		setenv("BOBER_TMP", tmp, 1)
-		const since = stat(tmp).modified // by the files' clock, before the tests read any
-		const p = process.start(cmd, out)
-		return () => tested(p, held, out, code, file, since)
-	} catch (e: CompileError | IoError) {
+		return new Held(main, l, stat(tmp).modified)
+	} catch (e: IoError) {
 		lock?.close()
 		return () => failure(e)
 	}
 }
 
-/// What runTests gives of the tests p runs, started at since, printing to out, kept by code in file unless code is "",
-/// closing lock.
-function tested(p: process.Process, lock: File, out: string, code: string, file: string, since: i64): [i32, string] {
+/// What builds the tests of each of mains as f says: natively of a package's at once, one program, but those of one
+/// that fails to compile, each alone.
+function together(mains: string[], f: Compile): (main: string) => string[] {
+	const commands = new HashMap[string, (main: string) => string[]]()
+	return main => {
+		if (!commands.has(main)) {
+			const w = world(main)
+			const g = if (f.wasm || f.js || f.release) [main] else mains.filter(x => x == main || w.includes(normal(x)))
+			let c = (x: string) => build(x, true, f, true)
+			if (g.length > 1) {
+				try {
+					c = programs(g, true, f, true)
+				} catch (e: CompileError) {}
+			}
+			for (const x of g) {
+				commands.set(x, c)
+			}
+		}
+		return commands.get(main)!(main)
+	}
+}
+
+/// What runTests gives of the tests p runs, held as h, built of files, kept by code unless code is "".
+function tested(p: process.Process, h: Held, code: string, files: string[]): [i32, string] {
+	const out = `${dir}/tmp/${flat(h.main)}.log`
 	try {
 		const status = p.wait()
 		// The report, which a crash cuts off after the key of the test it was in, then the files the tests read.
@@ -541,11 +575,11 @@ function tested(p: process.Process, lock: File, out: string, code: string, file:
 					const k = new TestCache()
 					k.code = code
 					k.report = r
-					const files = decodeJson[string[]](reads)
-					sortBy(files, (a, b) => a < b)
-					k.files = unique(files).map(x => [x, hashOf(x, since)])
+					const all = [...files, ...decodeJson[string[]](reads)]
+					sortBy(all, (a, b) => a < b)
+					k.files = unique(all).map(x => [x, stampOf(x), hashOf(x, h.since)])
 					mkdirAll(`${dir}/kept`)
-					save(file, encode(k))
+					save(`${dir}/kept/${flat(h.main)}`, encode(k))
 				}
 				return [status, r]
 			} catch (e: ParseError) {}
@@ -554,7 +588,7 @@ function tested(p: process.Process, lock: File, out: string, code: string, file:
 	} catch (e: IoError) {
 		return failure(e)
 	} finally {
-		lock.close()
+		h.lock.close()
 	}
 }
 
@@ -563,13 +597,42 @@ function failure(e: CompileError | IoError): [i32, string] {
 	return [1, quoted(if (e instanceof IoError) e.message() else e.msg)]
 }
 
-/// The hash of the bytes of the file at path, "" if there is none, "changed" if it changed at since or after.
+/// The hash of the bytes of the file at path, "" if there is none, "changed" if it changed at since or after, as read
+/// before.
 function hashOf(path: string, since: i64 = 0): string {
 	try {
-		return if (since > 0 && stat(path).modified >= since) "changed" else `${fnv(readFile(path))}`
+		const bytes = readFile(path)
+		return if (since > 0 && stat(path).modified >= since) "changed" else `${fnv(bytes)}`
 	} catch (e: IoError) {
 		return ""
 	}
+}
+
+/// The time and size of the file at path, "" if there is none.
+function stampOf(path: string): string {
+	try {
+		const s = stat(path)
+		return `${s.modified} ${s.size}`
+	} catch (e: IoError) {
+		return ""
+	}
+}
+
+/// The hash of each file hashed by unchanged, by its path, time and size.
+let seen = new HashMap[string, string]()
+
+/// Whether the file of a kept report is as it was: of the time and size it had, else of its hash, as after a checkout;
+/// not if it changed while the tests ran.
+function unchanged(f: [string, string, string]): bool {
+	const stamp = stampOf(f[0])
+	if (stamp == f[1]) {
+		return f[2] != "changed"
+	}
+	const k = `${f[0]} ${stamp}`
+	if (!seen.has(k)) {
+		seen.set(k, hashOf(f[0]))
+	}
+	return seen.get(k) == f[2]
 }
 
 /// Whether the file at path declares a test, or does not parse, which its test run then reports.
@@ -593,37 +656,36 @@ function hasTests(path: string): bool {
 /// launcher on the image's entry, named with the program's version, run by the C library's loader where it is the
 /// sysroot's, the image as image has it if pin. Throws the errors, or what failed, as a CompileError or IoError.
 export function build(main: string, tests: bool, f: Compile, pin: bool): string[] {
-	built = ""
 	return if (f.wasm || f.js) toTarget(main, tests, f) else programs([main], tests, f, pin)(main)
 }
 
 /// The ops below which a release build gives a function to each module reaching it, to inline, as mono takes it.
 const small = 64
 
-/// The code of the program build built last, natively, by which its tests' results are kept (runTests); "" if none.
-let built = ""
+/// The files the program build built last, natively, is built of (inputs), by which its tests' results are kept
+/// (runTests).
+let built: string[] = []
+/// The sources of the C the builds compiled or found current (newer, cmake).
+let made: string[] = []
 
-/// What the tests of p's module main run, as any -O compiles them: the bytecode of main, of the modules it imports
-/// and of builtin/'s every program holds, however many more -O lowers, which this fills in, with their C's bindings,
-/// and the bytes of the files they link.
-function code(p: Program, main: i32, includes: string[]): string {
+/// The files the program of p's module main is built of, as any -O builds it: the sources of main, of the modules it
+/// imports and of builtin/'s every program holds, however many more -O lowers, the files read to bind or locate the C
+/// headers they import, the bober.pkg of their packages, and the C made.
+function inputs(p: Program, main: i32): string[] {
 	const ms = [main, ...always.map(b => p.module(b))]
 	let i = 0
 	while (i < ms.length) {
 		ms.push(...p.modules[ms[i]].deps.filter(d => !ms.includes(d)))
 		i++
 	}
-	const compiler = compilerId()
-	// An archive by when it was written, as image has it, as it may be large.
-	const hashes = [`${compiler}`,
-		...linked(p, ms, true,
-		includes)[0].map(f => if (endsWith(f, ".a")) `${stat(f).modified}.${stat(f).size}` else `${fnv(readFile(f))}`)]
-	for (const m of ms) {
-		const path = p.modules[m].path
-		p.modules[m].bc = if (p.modules[m].bc != "") p.modules[m].bc else write(p, m, compiler)
-		hashes.push(`${path} ${fnv(p.modules[m].bc + (bound.get(path)?.bytes(path) ?? ""))}`)
+	const files = [...made]
+	for (const path of ms.map(m => p.modules[m].path)) {
+		const source = split(path, ": ")[0]
+		const d = nearest(source)
+		const reads = (bound.get(path)?.reads ?? []).map(r => r[0])
+		files.push(...[source, ...(if (d == null) [] else [join(d, "bober.pkg")]), ...reads])
 	}
-	return `${fnv(hashes.join("\n"))}`
+	return files
 }
 
 /// Compiles the programs of mains into the image as build does, at -O1 and -O2 monomorphized as one of their package,
@@ -642,14 +704,13 @@ function programs(mains: string[], tests: bool, f: Compile, pin: bool): (main: s
 	}
 	const [files, cxx] = linked(p, program(p, ms, dyn), tests, f.headers.I)
 	return main => {
-		built = if (tests) code(p, p.module(normal(main)), f.headers.I) else ""
 		const [at, version] = image(p, ms, files, cxx, pin || f.release, o, f)
-		if (f.release) {
-			return [executable(p, ms, files, at, main, tests)]
-		}
-		return [...(if (mac) [] else [`${sysroot}/usr/lib/libc.so`]),
+		const command = if (f.release) [executable(p, ms, files, at, main, tests)]
+			else [...(if (mac) [] else [`${sysroot}/usr/lib/libc.so`]),
 			if (packaged()) join(root, "lib/launch.c.exe") else launcher(dir), at,
 			`${entry(normal(main), tests)}${if (o.dyn) "" else monoSuffix}@${version}`]
+		built = if (tests) inputs(p, p.module(normal(main))) else []
+		return command
 	}
 }
 
@@ -1267,7 +1328,8 @@ function archive(c: CLib, out: string, pkg: string, includes: string[]): string 
 	const objects: string[] = []
 	for (const s of globs(c.sources).filter(s => !skip.includes(s))) {
 		const o = `${out}/${rel(c.src as string, s)!}.o`
-		if (all || !newer(o, [s])) {
+		// newer first, that made has s though all be compiled
+		if (!newer(o, [s]) || all) {
 			mkdirAll(parent(o))
 			object(sysroot, s, o, dirs, c.defines)
 		}
@@ -1320,6 +1382,7 @@ function cmake(h: string) {
 			const k = `${s.modified} ${s.size}`
 			return [f, k, (if (s.modified < t) last.get(`${f} ${k}`) else null) ?? `${fnv(mapFile(f))}`]
 		})
+		made.push(...[...files, ...c.patches, c.toolchain].filter(f => f != "").map(f => under(cwd, f)))
 		mkdirAll(o)
 		const tmp = `${sides}.${getpid()}` // its own, as another bober may be at it too
 		save(tmp, hashed.map(h => `${h[0]} ${h[1]} ${h[2]}\n`).join(""))
@@ -1424,6 +1487,7 @@ function globs(patterns: string[]): string[] {
 /// Whether the file at path exists and is newer than each of sources and the compiler, which may make it otherwise, so
 /// that it need not be made again.
 function newer(path: string, sources: string[]): bool {
+	made.push(...sources.filter(s => !startsWith(s, `${dir}/`))) // not what builds made
 	if (!exists(path)) {
 		return false
 	}

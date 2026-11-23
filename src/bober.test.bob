@@ -2,7 +2,7 @@
 
 import { endsWith, indexOf, startsWith } from "../std/algo"
 import { fromCString } from "../std/c"
-import { exists, glob, mkdirAll, open, remove } from "../std/fs"
+import { exists, glob, mkdirAll, open, remove, stat } from "../std/fs"
 import { base } from "../std/fs/path"
 import * as process from "../std/process"
 import { replace } from "../std/string"
@@ -298,7 +298,7 @@ test "a test file whose report is kept leaves no pin of the image, which its lau
 	writeFile(kept, `test "t" { assert true }\n`)
 	const pins = () => glob(`${home()}/build/image.so.*.run`)
 	const before = pins()
-	const run = () => runTests(kept, [], () => build(kept, true, new Compile(), true))()[0]
+	const run = () => runTests([kept], [], new Compile())[0]()[0]
 	dir = `${home()}/build`
 	try {
 		assert run() == 0 && run() == 0
@@ -313,7 +313,7 @@ test "a test file's report is not kept by a file it read that changed while it r
 	mkdirAll(home())
 	writeFile(main, `test "t" { assert readFile("${data}") == "a" }\n`)
 	writeFile(data, "a")
-	const run = () => runTests(main, [], () => build(main, true, new Compile(), true))
+	const run = () => runTests([main], [], new Compile())[0]
 	const logs = () => glob(`${home()}/build/tmp/*.log`)
 	dir = `${home()}/build`
 	try {
@@ -336,7 +336,7 @@ test "test files whose paths differ by / and _, run at once, each keep their own
 	writeFile(files[1], `test "b" { assert true }\n`)
 	dir = `${home()}/build`
 	try {
-		const ran = files.map(f => runTests(f, [], () => build(f, true, new Compile(), true)))
+		const ran = runTests(files, [], new Compile())
 		assert ran.map(r => r()[1]) == [`{"a":"ok"}`, `{"b":"ok"}`]
 	} finally {
 		dir = "build"
@@ -358,7 +358,7 @@ test "a test file is locked while its tests run, and freed after, kept or not" {
 		f.close()
 		return was
 	}
-	const run = () => runTests(main, [], () => build(main, true, new Compile(), true))
+	const run = () => runTests([main], [], new Compile())[0]
 	dir = `${home()}/build`
 	try {
 		const ran = run()
@@ -487,5 +487,48 @@ function main() { print(\`\${store_function_named_11()}\`) }\n`
 		assert built([["store.c", c], ["main.bob", main]]) == "11\n"
 	} finally {
 		root = was
+	}
+}
+
+test "a test file's report is kept though its source was written again as it was, as by a checkout, not once it changed" {
+	const main = `${home()}/written.bob`
+	const [kept, log] = ["kept", "tmp"].map(d => `${home()}/build/${d}/${replace(main, "/", "%2F")}`)
+	mkdirAll(home())
+	if (exists(kept)) {
+		remove(kept) // of an earlier run
+	}
+	const ran = (n: string) => {
+		writeFile(main, `test "t" { assert ${n} > 0 }\n`)
+		const tick = `${home()}/tick`
+		writeFile(tick, "")
+		while (stat(tick).modified <= stat(main).modified) {
+			writeFile(tick, "") // till past the tick of the files' clock main has, that the tests start after it
+		}
+		if (exists(`${log}.log`)) {
+			remove(`${log}.log`)
+		}
+		assert runTests([main], [], new Compile())[0]()[0] == 0
+		return readFile(`${log}.log`)! != "" // which they print to
+	}
+	dir = `${home()}/build`
+	try {
+		assert ran("1") && !ran("1") && ran("2")
+	} finally {
+		dir = "build"
+	}
+}
+
+test "test files of a package are built as one program, but where one does not compile, each alone" {
+	const d = `${home()}/group`
+	const files = [`${d}/a.test.bob`, `${d}/b.test.bob`]
+	mkdirAll(d)
+	writeFile(`${d}/bober.pkg`, `{ "name": "@test/group" }\n`)
+	writeFile(files[0], `test "a" { assert true }\n`)
+	writeFile(files[1], `test "b" { assert nope }\n`)
+	dir = `${home()}/build`
+	try {
+		assert runTests(files, [], new Compile()).map(r => r()[0]) == [0, 1]
+	} finally {
+		dir = "build"
 	}
 }
