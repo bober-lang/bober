@@ -75,7 +75,7 @@ export class Lower implements Checked {
 	/// What lowering a module threw first, which finish throws, after the checker's errors.
 	private failed: CompileError | null = null
 	private units = new HashMap[string, Unit]()
-	/// By checker type id twice, plus 1 if exact, each type lowered that no local or param changes.
+	/// By checker type id thrice, plus 1 if exact, 2 if all, each type lowered that no local or param changes.
 	lowered = new HashMap[i32, i32]()
 
 	decl(n: Node, path: string, src: string) {
@@ -321,10 +321,14 @@ class Unit {
 		this.later(() => {
 			const x = this.prog.decls[d]
 			x.params = this.typeParams(t.params)
-			x.supers = this.prog.list(supers(n).map(s => this.ty(s.type!)))
+			const s = supers(n)
+			x.supers = this.prog.list(s.map(u => this.ty(u.type!)))
 			x.tags = this.tags(n)
 			if (t.kind == "interface" && t.base != null) {
 				x.type = this.ty(t.base!) // its type set
+			}
+			if (t.kind == "interface" && s.length > 0) {
+				x.exact = this.ty(t.base ?? s[0].type!, true, null, true)
 			}
 		})
 		return d
@@ -364,10 +368,10 @@ class Unit {
 	/// The list of the tags of n.
 	private tags(n: Node): i32 { return this.prog.list((n.tags ?? []).map(t => this.ty(t))) }
 
-	/// The list of the types n lists after throws.
+	/// The list of the types n lists after throws, every literal type in them kept, as only the checker reads them.
 	private throws(n: Node): i32 {
 		const t = after(n, "throws")?.type
-		return this.prog.list(if (t == null) [] else this.prog.members(this.ty(t)))
+		return this.prog.list(if (t == null) [] else this.prog.members(this.ty(t!, true, null, true)))
 	}
 
 	/// The type declaration n's head spells (Decl.spelled): a function's Sig, a var's or member's annotation, an
@@ -528,24 +532,24 @@ class Unit {
 
 	/// The bytecode type of t, in code g if it is in one. A literal type is its base type unless exact: in a union,
 	/// whose members it tells apart, as a type argument or a type param's constraint or default, or as the declared
-	/// type of a var or member.
-	ty(t: Type, exact: bool = false, g: Gen | null = null): i32 {
+	/// type of a var or member; or anywhere in it if all, as the checker links a decl by (Decl.exact).
+	ty(t: Type, exact: bool = false, g: Gen | null = null, all = false): i32 {
 		if (t.kind == "param") {
 			return this.param(t, g)
 		}
-		const key = 2 * t.id + (if (exact) 1 else 0)
+		const key = 3 * t.id + (if (all) 2 else if (exact) 1 else 0)
 		const known = this.l.lowered.get(key)
 		if (known != null) {
 			return known
 		}
-		const r = this.build(t, exact, g)
+		const r = this.build(t, exact || all, g, all)
 		if (this.prog.closed(r)) {
 			this.l.lowered.set(key, r)
 		}
 		return r
 	}
 
-	private build(t: Type, exact: bool, g: Gen | null): i32 {
+	private build(t: Type, exact: bool, g: Gen | null, all: bool): i32 {
 		const p = this.prog
 		if (isTypeValue(t)) {
 			return kind.Type
@@ -561,21 +565,21 @@ class Unit {
 					else if (base == kind.Bool) (if (t.text == "true") 1 else 0)
 					else p.int(integer(t.text))
 				return p.type(kind.Literal, base, v)
-			case "array": return p.type(kind.Array, this.ty(t.params[0], false, g))
-			case "async": return p.type(kind.Named, this.l.builtin("Future"), p.list([this.ty(t.base!, true, g)]))
-			case "fixed": return p.type(kind.FixedArray, this.ty(t.base!, false, g), t.n)
-			case "tuple": return p.type(kind.Tuple, this.list(t.types, t.rest, g))
-			case "function": return this.fn(t, null, g)
-			case "union": return p.union(t.types.map(u => this.ty(u, true, g)))
+			case "array": return p.type(kind.Array, this.ty(t.params[0], all, g, all))
+			case "async": return p.type(kind.Named, this.l.builtin("Future"), p.list([this.ty(t.base!, true, g, all)]))
+			case "fixed": return p.type(kind.FixedArray, this.ty(t.base!, all, g, all), t.n)
+			case "tuple": return p.type(kind.Tuple, this.list(t.types, t.rest, g, all))
+			case "function": return this.fn(t, null, g, all)
+			case "union": return p.union(t.types.map(u => this.ty(u, true, g, all)))
 			case "object":
 				const names: i32[] = []
 				for (const f of t.fields) {
 					names.push(p.intern(f.name))
 					names.push(if (f.embedded) decl.Embed else 0)
 				}
-				return p.type(kind.Object, this.list(t.fields.map(f => f.type), false, g), p.nameList(names))
+				return p.type(kind.Object, this.list(t.fields.map(f => f.type), false, g, all), p.nameList(names))
 		}
-		return p.type(kind.Named, this.l.nominal(t), p.list(this.args(t).map(a => this.ty(a, true, g))))
+		return p.type(kind.Named, this.l.nominal(t), p.list(this.args(t).map(a => this.ty(a, true, g, all))))
 	}
 
 	/// The type args of class or interface t: the type params of the code it is local to, then its own.
@@ -599,8 +603,8 @@ class Unit {
 	}
 
 	/// The list of the types of ts, the last a Rest if rest.
-	list(ts: Type[], rest: bool = false, g: Gen | null = null): i32 {
-		const ids = ts.map(t => this.ty(t, false, g))
+	list(ts: Type[], rest: bool = false, g: Gen | null = null, all = false): i32 {
+		const ids = ts.map(t => this.ty(t, all, g, all))
 		if (rest) {
 			ids[ids.length - 1] = this.prog.type(kind.Rest, ids[ids.length - 1])
 		}
@@ -608,23 +612,23 @@ class Unit {
 	}
 
 	/// The Func of function t: its params, a defaulted one Optional, one typed ...T, by a C header, Embed, and its result.
-	fn(t: Type, params: Node | null = null, g: Gen | null = null): i32 {
+	fn(t: Type, params: Node | null = null, g: Gen | null = null, all = false): i32 {
 		const ps: i32[] = []
 		for (const i of 0 ... t.types.length - 1) {
-			const p = this.ty(t.types[i], false, g)
+			const p = this.ty(t.types[i], all, g, all)
 			const embed = params != null && after(params.parts![i], ":")?.kind == "unary"
 			ps.push(if (t.rest && i == t.types.length - 1) this.prog.type(kind.Rest, p)
 				else if (i >= t.n) this.prog.type(kind.Optional, p)
 				else if (embed) this.prog.type(kind.Embed, p)
 				else p)
 		}
-		return this.prog.type(kind.Func, this.prog.list(ps), this.ty(t.base!, false, g))
+		return this.prog.type(kind.Func, this.prog.list(ps), this.ty(t.base!, all, g, all))
 	}
 
 	private typeParams(ps: Type[]): TypeParam[] {
-		return ps.map(p => ({ name: this.prog.intern(showType(p)),
-			constraint: if (p.base == null) 0 else this.ty(p.base!, true),
-			fallback: if (p.fallback == null) 0 else this.ty(p.fallback!, true) }))
+		const of = (t: Type | null, all: bool) => if (t == null) 0 else this.ty(t!, true, null, all)
+		return ps.map(p => ({ name: this.prog.intern(showType(p)), constraint: of(p.base, false),
+			fallback: of(p.fallback, false), exactConstraint: of(p.base, true), exactFallback: of(p.fallback, true) }))
 	}
 
 	/// Has ps, the type params of decl d, stand for its Params.
@@ -652,6 +656,9 @@ class Unit {
 			this.owners.set(n.t.loc.pos, d)
 			this.later(() => {
 				this.prog.decls[d].spelled = this.spelling(n!)
+				if (k != decl.Class && k != decl.Interface) {
+					this.prog.decls[d].exact = this.ty(t, true, null, true)
+				}
 			})
 		}
 		if (this.listing) {

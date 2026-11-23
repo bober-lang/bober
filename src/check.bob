@@ -584,9 +584,9 @@ class Module {
 }
 
 /// The modules the bundle or the cache holds (src/lift.bob), made from the decls linked into its Program rather than
-/// checked, each decl known to lift by its checker type, as one checked and lowered is. What the checker keeps of a
-/// declaration but a decl does not tell is lost: a literal type where lowering takes its base, or spelled otherwise
-/// than quoted spells it, a type a const holds, the value of an untyped int const but a literal, negated or not,
+/// checked, each decl known to lift by its checker type, as one checked and lowered is, made of its exact type
+/// (Decl.exact). What the checker keeps of a declaration but a decl does not tell is lost: a literal type spelled
+/// otherwise than quoted spells it, a type a const holds, the value of an untyped int const but a literal, negated or not,
 /// whether a const depends on a let, the errors a function infers rather than lists, and what its tags warn of.
 class Linked {
 	private lift: Lift
@@ -684,7 +684,7 @@ class Linked {
 			return this.nominal(d)
 		}
 		const ps = this.params(d)
-		const t = if (x.kind == decl.Function) this.fn(x.type, ps) else this.type(x.type)
+		const t = if (x.kind == decl.Function) this.fn(x.exact, ps) else this.type(x.exact)
 		this.lift.types.set(d, t)
 		return t
 	}
@@ -703,18 +703,14 @@ class Linked {
 		return t
 	}
 
-	/// Fills in class or interface t of decl d: an interface's members of those it extends and its type set, then the
+	/// Fills in class or interface t of decl d: an interface's type set, or its members of the type it extends, then the
 	/// members of its own, with what the checker knows of each beyond its type.
 	private fill(t: Type, d: i32) {
 		const x = this.p.decls[d]
-		for (const s of if (t.kind == "interface") this.p.lists[x.supers] else []) {
-			const st = this.type(s)
-			if (st.kind == "object" || st.kind == "class" || st.kind == "interface" && !isSet(st)) {
-				t.fields.push(...members(st))
-			}
-		}
 		if (x.type != 0) {
-			t.base = this.type(x.type)
+			t.base = this.type(x.exact)
+		} else if (x.exact != 0) {
+			t.fields.push(...members(this.type(x.exact)))
 		}
 		for (const m of x.members) {
 			const y = this.p.decls[m]
@@ -750,8 +746,8 @@ class Linked {
 			for (const i of 0 ... ids.length - 1) {
 				const tp = x.params[i]
 				const t = this.types.get(ids[i])!
-				t.base = if (tp.constraint == 0) null else this.type(tp.constraint)
-				t.fallback = if (tp.fallback == 0) null else this.type(tp.fallback)
+				t.base = if (tp.exactConstraint == 0) null else this.type(tp.exactConstraint)
+				t.fallback = if (tp.exactFallback == 0) null else this.type(tp.exactFallback)
 			}
 		}
 		return ids.map(id => this.types.get(id)!)

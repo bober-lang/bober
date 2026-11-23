@@ -1,4 +1,4 @@
-import { sort, startsWith } from "../std/algo"
+import { indexOf, sort, startsWith } from "../std/algo"
 import { fnv } from "../std/hash"
 import { HashMap } from "../std/collections/hashmap"
 import { split } from "../std/string"
@@ -855,7 +855,15 @@ export class Box[T] {
 	constructor(item: T) { this.item = item }
 	map[U](f: (x: T) => U): Box[U] { return new Box(f(this.item)) }
 	static of[V](v: V): Box[V] { return new Box(v) }
-}`
+}
+export type K = "X"
+export class In { xs: [K, i32][] | null = null }
+export function ks(k: { k: K }[]): [K][] { return [] }
+export function inferred() { return [] as [K][] }
+export interface I[T = K[]] { t: T }
+export interface J extends I[[K][]] {}
+export function first[T extends [K][]](t: T): T { return t }
+export function oops() throws [K][] { throw [] as [K][] }`
 	const files = ["lib.bob", lib]
 	const b = bundled(["lib.bob", "std/algo.bob", "std/io.bob", "std/math.bob"], files)
 	const same = (src: string): string => {
@@ -877,6 +885,10 @@ const x = new Box(1)\nconst e = x.secret\nconst h = Box.count\nfunction k() { x.
 const a: lib.Op = lib.End\nconst b = lib.id(lib.N) + max(1, 2)\nconst xs: i32[] = [1]
 const c = unique([1, 2]).length + "abc".slice(1, 2).length
 const d = ["a"].includes(lib.S) && xs.map(x => x + 1).length > 0`)
+	assert indexOf(same(`import { K, In, ks, inferred, I, J, first, oops } from "lib"\nconst a: [K, i32][] = new In().xs ?? []
+const b: [K][] = ks([{ k: "X" }])\nconst c: [K][] = inferred()\nfunction h(i: I): K[] { return i.t }
+function j(x: J): [K][] { return x.t }\nconst e: [K][] = first([["X"]])\nconst f = first([["Y"]])
+export function o() throws [K][] { oops() }`), "does not fit T's constraint") > 0
 	same(`import { Writer } from "std/io"\nclass W implements Writer { write(s: string) {} }
 const w: Writer = new W()`)
 	const l = new Lower()
@@ -966,6 +978,8 @@ test "a module whose file the cache holds is linked unless its source, or the AB
 	const g = (cache: string[]) => lower(["main.bob"], [], cache, path => source(path, main, [...b, "a.bob", a]))
 	const cut = all[0].map(f => if (head(f).path == "a.bob") f.slice(0, f.length - 1) else f)
 	assert g(cut).modules.length == g([]).modules.length
+	const k = (s: string) => `export function g(): i32 { return 1 }\nexport const k: [${s}][] = []`
+	same(k("\"Y\""), same(k("\"X\""), all, "a.bob b.bob"), "a.bob b.bob")
 }
 
 test "a header's module and its users are linked from the cache while the files bind and located read are unchanged" {

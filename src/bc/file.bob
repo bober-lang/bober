@@ -25,10 +25,10 @@
 //! decls    per decl of its own, in the order made: Str name, kind byte, owner
 //! imports  per decl of another module it uses: dep, owner, Str name, nth of that name in its owner
 //! types    per type, after its parts: kind byte, a and b as its kind says
-//! defs     per decl: mods, type params (Str name, constraint, default), type, supers, tags, throws, its position,
-//!          type as spelled, 0 or 1 and its code; then the module's decls, inits and deps, its imports (position,
-//!          Str specifier, dep, Str namespace, the decls named with their Str names), and where its lines end,
-//!          each after the one before
+//! defs     per decl: mods, type params (Str name, constraint, default, then both exact), type, supers, tags, throws,
+//!          its position, type as spelled, exact type, 0 or 1 and its code; then the module's decls, inits and deps,
+//!          its imports (position, Str specifier, dep, Str namespace, the decls named with their Str names), and where
+//!          its lines end, each after the one before
 //! comments per comment: its position less the one before's, 1 if code is before it on its line else 0, its text
 //!          after `//`, and the decl whose doc comment it is, as an owner; a decl's doc is made of these
 //! ```
@@ -224,6 +224,8 @@ class Out {
 				uleb(defs, this.str(t.name))
 				uleb(defs, this.type(t.constraint))
 				uleb(defs, this.type(t.fallback))
+				uleb(defs, this.type(t.exactConstraint))
+				uleb(defs, this.type(t.exactFallback))
 			}
 			uleb(defs, this.type(x.type))
 			this.part(defs, op.TypeList, x.supers)
@@ -231,6 +233,7 @@ class Out {
 			this.part(defs, op.TypeList, x.throws)
 			uleb(defs, x.pos)
 			uleb(defs, this.type(x.spelled))
+			uleb(defs, this.type(x.exact))
 			defs.u8(if (x.code == null) 0 else 1)
 			if (x.code != null) {
 				this.code(defs, x.code!)
@@ -489,7 +492,8 @@ export class In {
 			const x = p.decls[d]
 			x.mods = this.n()
 			for (const _ of 1 ... this.n()) {
-				x.params.push({ name: this.str(), constraint: this.type(), fallback: this.type() })
+				x.params.push({ name: this.str(), constraint: this.type(), fallback: this.type(),
+					exactConstraint: this.type(), exactFallback: this.type() })
 			}
 			x.type = this.type()
 			x.supers = this.part(op.TypeList)
@@ -497,6 +501,7 @@ export class In {
 			x.throws = this.part(op.TypeList)
 			x.pos = this.n()
 			x.spelled = this.type()
+			x.exact = this.type()
 			if (this.r.u8() == 1) {
 				x.code = this.code()
 			}
@@ -715,10 +720,11 @@ class Abi {
 		this.h = combine(combine(this.h, fnv(this.p.strings[x.doc])), if (x.code == null) 0 else 1)
 		for (const t of x.params) {
 			this.h = combine(this.h, fnv(this.p.strings[t.name]))
-			this.type(t.constraint)
-			this.type(t.fallback)
+			this.type(t.exactConstraint) // which the inexact one is made of
+			this.type(t.exactFallback)
 		}
 		this.type(x.type)
+		this.type(x.exact)
 		this.list(x.supers)
 		this.list(x.tags)
 		this.list(x.throws)
