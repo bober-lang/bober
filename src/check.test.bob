@@ -1012,3 +1012,12 @@ test "spawn takes args and a result of types that cross isolates" {
 		+ "function o() { const a = spawn r() }") == "360: P[] cannot cross isolates; 406: H cannot cross isolates; 448: i32[][] cannot cross isolates"
 	assert errors("function k(a: (i32[2] | null)[]): i32 { return 1 }\nfunction m() { const a = spawn k([null]) }") == "84: (i32[2] | null)[] cannot cross isolates"
 }
+
+test "a module of the bundle keeps the ABI its file holds, hashed of the paths where the bundle was made" {
+	const l = new Lift()
+	l.bundle = bundled(["std/algo.bob"], [])
+	const m = l.prog.modules[l.module("std/algo.bob")]
+	m.abi++ // as of another root
+	const held = m.abi
+	assert l.current() && m.abi == held
+}
