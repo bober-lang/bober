@@ -1,6 +1,7 @@
 //! Tests of src/bober.bob's builds into the image, which keeps what it holds across them.
 
 import { endsWith, indexOf, startsWith } from "../std/algo"
+import { fromCString } from "../std/c"
 import { exists, glob, mkdirAll, open, remove } from "../std/fs"
 import { base } from "../std/fs/path"
 import * as process from "../std/process"
@@ -9,6 +10,8 @@ import { Build, Compile, Run, build, format, ignored, machine, runTests, toolcha
 import { Bytes } from "./link/bytes"
 import { Linker } from "./link/link"
 import { CLib, dir } from "./pkg"
+import { root } from "./root"
+import { getcwd } from "unistd.h"
 
 /// Where the running test builds, a directory of its own, by the number of its TMPDIR, that tests running at once do not
 /// build in each other's, and as deep in the package as the build directory, that "../../" is its root.
@@ -467,4 +470,22 @@ test "-release holds the object LLVM made of each module in the image, and compi
 	assert edited == replace(out, "true i32", "true i64") && now.length == fresh.length
 	assert now.some(o => !fresh.includes(o)) && now.some(o => fresh.includes(o))
 	assert built([]) == edited && built([], "-release") == edited
+}
+
+test "a C file imported by many names is built in a file named by a hash of them, which they would make too long" {
+	const names: string[] = []
+	let c = ""
+	for (const i of 0 ... 11) {
+		names.push(`store_function_named_${i}`)
+		c += `int store_function_named_${i}(void) { return ${i}; }\n`
+	}
+	const main = `import { ${names.join(", ")} } from "./store.c" @Deterministic\n
+function main() { print(\`\${store_function_named_11()}\`) }\n`
+	const was = root
+	root = fromCString(getcwd(0, 0)) // absolute, as run outside the repo, that store.c's relative path is not under it
+	try {
+		assert built([["store.c", c], ["main.bob", main]]) == "11\n"
+	} finally {
+		root = was
+	}
 }

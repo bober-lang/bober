@@ -1436,18 +1436,20 @@ function newer(path: string, sources: string[]): bool {
 }
 
 /// The object of the C that defines the static functions of module m of p, if a C header's module, whose path is the header's and
-/// the names imported (src/check.bob, Modules.header), or null.
+/// the names imported (src/check.bob, Modules.header), or null. Its files are named by the header's name and a hash of the
+/// module's path, as the names would make too long a file name.
 function glued(p: Program, m: i32, includes: string[]): string | null {
 	const path = p.modules[m].path
 	const at = indexOf(path, ": ")
 	if (at < 0) {
 		return null
 	}
-	const c = glue(path.slice(0, at), p.modules[m].decls.map(d => p.strings[p.decls[d].name]))
+	const header = path.slice(0, at)
+	const c = glue(header, p.modules[m].decls.map(d => p.strings[p.decls[d].name]))
 	if (c == "") {
 		return null
 	}
-	const f = file(path)
+	const f = `${dir}/${base(header)}.${fnv(path)}`
 	save(`${f}.c`, c)
 	object(sysroot, `${f}.c`, `${f}.c.o`, [".", ...includes])
 	return `${f}.c.o`
@@ -1466,21 +1468,6 @@ function name(main: string): string {
 		i--
 	}
 	return n.slice(i, n.length)
-}
-
-/// Where the files of the module at path go, without extension: its path in the build directory, each / a _, relative to
-/// bober's root if in it. A C header's module is named by its path and the names imported from it, which would be too
-/// long a file name, so they are hashed instead.
-function file(path: string): string {
-	const space = indexOf(path, " ")
-	let s = ""
-	for (const c of rel(root, if (space < 0) path else path.slice(0, space)) ?? path) {
-		s += if (c == 0x2f) "_" else chr(c)
-	}
-	if (space >= 0) {
-		s += `.${fnv(path)}`
-	}
-	return `${dir}/${s}`
 }
 
 function save(path: string, s: string) {
