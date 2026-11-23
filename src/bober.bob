@@ -399,7 +399,7 @@ function init(name: string) {
 function testAll(f: Compile): i32 {
 	bober_jobs()
 	const files = testFiles(".")
-	const clear = if (isatty(1) != 0) "\r\x1b[K" else ""
+	clear = if (isatty(1) != 0) "\r\x1b[K" else ""
 	const started = runTests(files, [], f) // what waits for each file, in order
 	let dirs: string[] = [] // of the last failed file
 	let failed = 0
@@ -424,6 +424,10 @@ function testAll(f: Compile): i32 {
 	stdout.write(`${clear}# ${files.length - failed} of ${files.length} files passed\n`)
 	return if (failed == 0) 0 else 1
 }
+
+/// On a terminal, what takes the line of testAll, and of relink as it compiles each module, back to its start, erased;
+/// else "".
+let clear = ""
 
 /// The files that have tests in d and below, but in build/, hidden directories and builtin/, which no program tests.
 function testFiles(d: string): string[] {
@@ -1024,6 +1028,9 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		const wanted = if (llvm) opt else parts[parts.length - 1]
 		// Monomorphized, the others of either backend, which define the same symbols.
 		if (lacks(wanted, if (o.dyn) `${path}@` else if (c.release) `${path}^R@` else `${path}^O`)) {
+			if (clear != "") {
+				stdout.write(`${clear}[${m + 1}/${p.modules.length}] compiling ${split(path, ": ")[0]}`)
+			}
 			l.add(unit(p, m, wanted, o, bc, b, llvm, c, facts))
 		}
 	}
