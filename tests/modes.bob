@@ -379,3 +379,52 @@ test "an embedded field through a type param is the class in its place" {
 	setInts(k, 2)
 	assert k.lives == 2 && k.dogs == 2
 }
+
+class Blob {}
+class Size[Min extends string] {}
+
+function minOf(tags: Type[]): string {
+	for (const t of tags) {
+		if (t.base != Size) {
+			continue
+		}
+		return t.args[0].value as string
+	}
+	return "none"
+}
+
+function sizeOf(t: Type): string {
+	if (t.base != Size) {
+		return "none"
+	}
+	return t.args[0].value as string
+}
+
+test "no code after a known if that leaves is resolved" {
+	assert minOf([Blob, Size["1"]]) == "1" && sizeOf(Blob) == "none" && sizeOf(Size["2"]) == "2"
+}
+
+function unsized(tags: Type[]): Type[] {
+	const out: Type[] = []
+	for (const t of tags) {
+		if (t.base != Size) {
+			out.push(t)
+		}
+	}
+	return out
+}
+
+function shape[U, C](): string {
+	const classes = U.members.filter(M => M.kind == "class").length
+	return `${classes} ${U.members.some(M => M.kind == "null")} ${U.members.every(M => M.kind != "int")} ${C.fields.map(f => f.name).join(",")}`
+}
+
+test "arrays of Types are built by push and by their methods, and tested by them" {
+	assert unsized([Blob, Size["1"]]).length == 1 && shape[Rec | Blob | null, Rec]() == "2 true true name,n"
+}
+
+function sizes(tags: Type[]): string { return minOf(if (tagged(tags, Blob)) unsized(tags) else tags) }
+
+test "a known if of Types stays known though its branch runs a call" {
+	assert sizes([Blob, Size["1"]]) == "none" && sizes([Size["2"]]) == "2"
+}

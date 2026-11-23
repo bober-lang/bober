@@ -9,13 +9,15 @@
 //! Mono knows the value of a constant, of a Type, of what reflection makes of one, and of each `Readonly` local
 //! holding one of those, from the op that stores it on. From those it folds `!`, `&&`, `||`, `==`, `!=` and reflection,
 //! keeps only the branch an `If` it knows takes, and unrolls an `Each` over an array it knows, one Block per element
-//! with the local holding it. A call passes what its params holding a Type get, a closure what the locals it captures
-//! holding one hold, all known, to an instance made for those values, in whose copy they are known. A call of such an
-//! instance is still made, for its effects, but is known as what its Returns return where each it may run returns the
-//! same known value, as one returning a Type must; a Return or Throw outside any branch taken at run time ends those it
-//! may run. A type of what a local holds, Of or Member, is resolved by those values, through a memo the copy owns that
-//! is reset when one changes. A known value no op makes, a Type or an array or record of them, is never at run time.
-//! Of two known strings, `+` folds to the one they make.
+//! with the local holding it; it copies no op after a `Br`, `Return` or `Throw` out of the blocks it leaves, as none
+//! runs. A call passes what its params holding a Type get, a closure what the locals it captures holding one hold, all
+//! known, to an instance made for those values, in whose copy they are known; a method's for a known this takes none,
+//! as a static. A call of such an instance is still made, for its effects, but is known as what its Returns return
+//! where each it may run returns the same known value, as one returning a Type must. A type of what a local holds, Of
+//! or Member, is resolved by those values, through a memo the copy owns that is reset when one changes. A known value
+//! no op makes, a Type or an array or record of them, is never at run time; a push onto such an array only a local
+//! holds, not from a param or capture, in code run whenever the instance is, makes the local hold it grown. Of two
+//! known strings, `+` folds to the one they make.
 
 import { bits, fromBits } from "../builtin/math"
 import { lastIndexOf } from "../std/algo"
@@ -617,11 +619,10 @@ class Copy {
 	dst = new Code()
 	info: i32[] = []
 	private stack: Slot[] = []
-	/// Per block being copied, the stack height it starts at, its result type, None for none, and whether it is run
-	/// whenever what holds it is: a branch taken or an element of an unrolled for.
-	private frames: { base: i32, result: i32, taken: bool }[] = []
-	/// Whether a Return or Throw outside any branch taken at run time is copied, so no Return after it is run.
-	private gone = false
+	/// Per block being copied, the stack height it starts at, its result type, None for none, and whether its End may
+	/// be reached other than from the op before: if not run whenever what holds it is, as a branch taken, an element of
+	/// an unrolled for or a Block is, or by a Br copied.
+	private frames: { base: i32, result: i32, reached: bool }[] = []
 	/// Per op of dst, whether a fold took its value, so it is left out.
 	private dead: bool[] = []
 	/// Per local of src, what it holds if known.
@@ -654,6 +655,10 @@ class Copy {
 		const f = if (p.decls[d].kind == decl.Var) -1 else p.decls[k].type
 		const n = if (f < 0) 0 else p.items(f).length + (if (p.method(d)) 1 else 0)
 		const fixed = this.src.locals.map(l => holdsType(p, p.subst(l.type, this.env)))
+		if (p.method(d) && fixed[0]) {
+			// Of a known this, it takes none, as a static.
+			p.decls[k].mods |= decl.Static
+		}
 		for (const l of 0 ... fixed.length - 1) {
 			this.vary.push(!fixed[l] && p.reflected(this.src.locals[l].type))
 			this.slots.push(-1)
@@ -690,7 +695,10 @@ class Copy {
 		if (this.inst.idle) {
 			this.emit(op.Unreachable, 0)
 		} else {
-			this.block(0, this.src.ops.length)
+			// The End it ends with is copied though a Return before it ends the copy.
+			const n = this.src.ops.length - 1
+			this.block(0, n)
+			this.step(n)
 		}
 		const info: i32[] = []
 		this.dst.retain(i => {
@@ -703,76 +711,124 @@ class Copy {
 		this.inst.info = info
 	}
 
-	/// Copies the ops from start up to end.
-	private block(start: i32, end: i32) throws CompileError {
+	/// Copies the ops from start up to end, but none after a jump up to the End of a block a Br goes to, as none of them
+	/// runs; returns whether none after end runs.
+	private block(start: i32, end: i32): bool throws CompileError {
 		const s = this.src
+		let left = false
 		let i = start
 		while (i < end) {
 			const o = s.ops[i]
-			const v = if (o == op.If || o == op.Each) this.top().v else null
+			const v = if (!left && (o == op.If || o == op.Each)) this.top().v else null
 			const xs = if (o == op.Each) v?.items else null
-			if (if (o == op.Each) xs == null && this.p.kind(this.top().t) != kind.Tuple else v == null) {
-				this.step(i)
+			if (left && o != op.End && !op.splits[o]) {
+				i = this.past(i)
+			} else if (left) {
+				// The End of the block left, or another branch, which may run.
+				left = this.close(i, o == op.End)
 				i++
-				continue
-			}
-			this.dst.at = s.pos[i]
-			const e = s.next(i)
-			const last = if (s.ops[e] == op.Else) s.next(e) else e
-			if (o == op.If) {
-				this.take()
-				const t = this.type(s.a(i))
-				this.open(op.Block, t, t, true)
-				const at = this.dst.ops.length - 1
-				if (v!.op?.op == op.True) {
-					this.block(i + 1, e)
-				} else if (v!.op?.op == op.False) {
-					if (e < last) {
-						this.block(e + 1, last)
-					}
-				} else {
-					throw new CompileError(`an if needs a bool (${this.ins.where})`)
-				}
-				// A known result stays known, without the Block.
-				let kept = t != kind.None && this.stack.length > this.frames[this.frames.length - 1].base
-					&& this.top().v != null
-				for (const j of at + 1 ... this.dst.ops.length - 1) {
-					kept = kept && (this.dead[j] || j == this.top().at)
-				}
-				const top = if (kept) this.top() else null
-				this.step(last)
-				if (kept) {
-					this.dead[at] = true
-					this.dead[this.dst.ops.length - 1] = true
-					this.stack.pop()
-					this.stack.push(top!)
-				}
+			} else if (if (o == op.Each) xs == null && this.p.kind(this.top().t) != kind.Tuple else v == null) {
+				this.step(i)
+				left = op.jumps[o]
+				i++
 			} else {
-				// Per element, the local holding it, then the body in a Block, which Br 0 leaves for the next.
-				const t = this.top().t
-				const n = if (xs == null) this.p.items(t).length else xs!.length
-				const tmp = if (xs == null) this.dst.local(0, t) else -1
+				left = this.fold(i, v, xs)
+				i = this.past(i)
+			}
+		}
+		return left
+	}
+
+	/// Copies op i of src, which ends or splits the block being copied, none of whose ops after it runs if left: if
+	/// also no Br goes to its End, none after runs either, which an Unreachable after it tells the emitters, as they
+	/// take an End as reached; returns whether so.
+	private close(i: i32, left: bool): bool throws CompileError {
+		const gone = left && !this.frames[this.frames.length - 1].reached
+		this.step(i)
+		if (gone) {
+			this.emit(op.Unreachable, 0)
+		}
+		return gone
+	}
+
+	/// The op after op i of src, past the block it opens if it does.
+	private past(i: i32): i32 {
+		let j = i
+		while (op.opens[this.src.ops[j]] || op.splits[this.src.ops[j]]) {
+			j = this.src.next(j)
+		}
+		return j + 1
+	}
+
+	/// Copies the If or Each at i of src whose operand mono knows, v, xs its elements if an array, else a tuple's: of the
+	/// If, the branch it takes in a Block, of the Each, a Block per element; returns, as block does, whether none after
+	/// runs.
+	private fold(i: i32, v: Known | null, xs: Known[] | null): bool throws CompileError {
+		const s = this.src
+		const o = s.ops[i]
+		this.dst.at = s.pos[i]
+		const e = s.next(i)
+		const last = if (s.ops[e] == op.Else) s.next(e) else e
+		let left = false
+		if (o == op.If) {
+			this.take()
+			const t = this.type(s.a(i))
+			// A result holding a Type is known, none at run time.
+			const typed = holdsType(this.p, t)
+			const bt = if (typed) kind.None else t
+			this.open(op.Block, bt, bt, true)
+			const at = this.dst.ops.length - 1
+			if (v!.op?.op == op.True) {
+				left = this.block(i + 1, e)
+			} else if (v!.op?.op == op.False) {
+				left = this.block(e + 1, last)
+			} else {
+				throw new CompileError(`an if needs a bool (${this.ins.where})`)
+			}
+			// A known result stays known: one holding a Type after the Block, which runs what else the branch does;
+			// another without the Block, if nothing else in it runs.
+			const r = if (this.stack.length > this.frames[this.frames.length - 1].base) this.top() else null
+			let alone = bt != kind.None && r?.v != null
+			for (const j of at + 1 ... this.dst.ops.length - 1) {
+				alone = alone && (this.dead[j] || j == r!.at)
+			}
+			left = this.close(last, left)
+			if (alone) {
+				this.dead[at] = true
+				this.dead[this.dst.ops.length - 1] = true
+				this.stack.pop()
+			}
+			if ((alone || typed) && r != null) {
+				this.stack.push(r!)
+			}
+		} else {
+			// Per element, the local holding it, then the body in a Block, which Br 0 leaves for the next.
+			const t = this.top().t
+			const n = if (xs == null) this.p.items(t).length else xs!.length
+			const tmp = if (xs == null) this.dst.local(0, t) else -1
+			if (xs == null) {
+				this.plain(op.SetLocal, 1, kind.None, tmp)
+			} else {
+				this.take()
+			}
+			for (const j of 0 ... n - 1) {
 				if (xs == null) {
-					this.plain(op.SetLocal, 1, kind.None, tmp)
+					this.emit(op.Local, tmp)
+					this.plain(op.Field, 0, elem(this.p, t, j), this.p.elementName(j))
 				} else {
-					this.take()
+					this.known(xs![j])
 				}
-				for (const j of 0 ... n - 1) {
-					if (xs == null) {
-						this.emit(op.Local, tmp)
-						this.plain(op.Field, 0, elem(this.p, t, j), this.p.elementName(j))
-					} else {
-						this.known(xs![j])
-					}
-					this.fresh(s.a(i))
-					this.store(s.a(i), true)
-					this.open(op.Block, kind.None, kind.None, true)
-					this.block(i + 1, last)
-					this.step(last)
+				this.fresh(s.a(i))
+				this.store(s.a(i), true)
+				this.open(op.Block, kind.None, kind.None, true)
+				left = this.close(last, this.block(i + 1, last))
+				if (left) {
+					// Out of the loop, so the elements after are not run.
+					break
 				}
 			}
-			i = last + 1
 		}
+		return left
 	}
 
 	/// Copies op i of src.
@@ -784,13 +840,17 @@ class Copy {
 		const a = s.a(i)
 		const b = s.b(i)
 		this.dst.at = s.pos[i]
+		if (o == op.Br || o == op.BrIf || o == op.BrNull) {
+			// Its End may be reached by it.
+			this.frames[this.frames.length - 1 - a].reached = true
+		}
 		switch (o) {
 			case op.Block, op.If:
 				if (o == op.If) {
 					this.pop()
 				}
 				const t = this.type(a)
-				this.open(o, t, t)
+				this.open(o, t, t, o == op.Block)
 			case op.Loop, op.Try: this.open(o, kind.None)
 			case op.Default: this.open(o, kind.None, this.local(a))
 			case op.Each:
@@ -814,16 +874,11 @@ class Copy {
 				this.emit(o)
 			case op.Return:
 				const v = if (this.returnsType) this.take() else if (this.returns) this.top().v else null
-				if (!this.gone) {
-					this.inst.returned(v)
-				}
+				this.inst.returned(v)
 				this.emit(o)
-				this.end()
 			case op.Br, op.Unreachable: this.emit(o, a)
 			case op.BrIf: this.plain(o, 1, kind.None, a)
-			case op.Throw:
-				this.info[this.emit(o, ins.instance(a, ins.env(a, this.types(b))))] = this.pop().t
-				this.end()
+			case op.Throw: this.info[this.emit(o, ins.instance(a, ins.env(a, this.types(b))))] = this.pop().t
 			case op.BrNull:
 				const t = this.pop().t
 				this.emit(o, a)
@@ -1078,6 +1133,20 @@ class Copy {
 			&& !this.spelled(args[0])) {
 			// A generic as whose type turns out to be no string literal type converts as any.
 			this.cast(args[0])
+			return
+		}
+		const xs = if (this.p.strings[this.p.decls[d].name] == "push"
+			&& this.p.method(d)) this.stack[this.stack.length - 2].v
+			else null
+		const l = if (xs?.items != null) this.values.indexOf(xs) else -1
+		if (l >= 0 && (l >= this.inst.values.length || this.inst.values[l] == null)
+			&& lastIndexOf(this.values, [xs]) == l && !this.frames.some(f => f.reached)) {
+			// Onto a known array only a local holds, from no param or capture, in code run whenever this is: the local
+			// holds it grown.
+			const x = this.take()
+			this.take()
+			this.hold(l, array([...xs!.items!, x]))
+			this.known(new Known(new Op(op.Null)))
 			return
 		}
 		this.call(d, this.ins.env(d, args))
@@ -1385,12 +1454,9 @@ class Copy {
 
 	/// Opens a block of result type t, by op o of immediate a, taken if run whenever what holds it is.
 	private open(o: Opcode, t: i32, a: i32 = 0, taken = false) throws CompileError {
-		this.frames.push({ base: this.stack.length, result: t, taken })
+		this.frames.push({ base: this.stack.length, result: t, reached: !taken })
 		this.emit(o, a)
 	}
-
-	/// Ends the code run after a Return or Throw: all of it, if no branch taken at run time holds it.
-	private end() { this.gone = this.gone || this.frames.every(f => f.taken) }
 
 	/// Copies an op that pops n values used at run time and pushes one of type t, none for None.
 	private plain(o: Opcode, n: i32, t: i32, a: i32 = 0, b: i32 = 0, c: i32 = 0) throws CompileError {
