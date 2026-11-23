@@ -1,0 +1,176 @@
+import * as encoding from "../encoding"
+import { decode, encode, Name, OmitEmpty, Skip } from "./cbor"
+import * as hex from "./hex"
+import { inf, isNaN } from "../math"
+import { ParseError } from "../string"
+import { Decodable } from "../types"
+
+/// v's CBOR in hex.
+function cbor[T](v: T): string { return hex.encode(encode(v)) }
+/// The T that the CBOR in hex h spells.
+function from[T extends Decodable](h: string): T throws ParseError { return decode[T](hex.decode(h)) }
+
+class Point {
+	x: i32 = 0
+	y: f64 = 0.5
+}
+
+class User {
+	id: i32 @Name["ID"] = 7
+	nick: string | null @OmitEmpty = null
+	tags: string[] @OmitEmpty @encoding.Name["t"] = []
+	cache: string @Skip = "c"
+}
+
+class Ab {
+	a: i32 = 0
+	b: i32[] = []
+}
+
+// The vectors of RFC 8949 Appendix A that a bober type holds.
+test "encode integers in the shortest head" {
+	assert cbor(0) == "00"
+	assert cbor(23) == "17"
+	assert cbor(24) == "1818"
+	assert cbor(100) == "1864"
+	assert cbor(255 as u8) == "18ff"
+	assert cbor(256) == "190100"
+	assert cbor(1000) == "1903e8"
+	assert cbor(65536) == "1a00010000"
+	assert cbor(1000000) == "1a000f4240"
+	assert cbor(4294967296 as i64) == "1b0000000100000000"
+	assert cbor(1000000000000 as i64) == "1b000000e8d4a51000"
+	assert cbor(18446744073709551615 as u64) == "1bffffffffffffffff"
+	assert cbor(-1) == "20"
+	assert cbor(-10) == "29"
+	assert cbor(-100) == "3863"
+	assert cbor(-1000) == "3903e7"
+	assert cbor(-9223372036854775808 as i64) == "3b7fffffffffffffff"
+}
+
+test "encode floats, simple values and strings" {
+	assert cbor(1.1) == "fb3ff199999999999a"
+	assert cbor(1.0e300) == "fb7e37e43c8800759c"
+	assert cbor(100000.0 as f32) == "fa47c35000"
+	assert cbor(-inf) == "fbfff0000000000000"
+	assert cbor(false) == "f4"
+	assert cbor(true) == "f5"
+	assert cbor(null) == "f6"
+	assert cbor("") == "60"
+	assert cbor("IETF") == "6449455446"
+	assert cbor("\"\\") == "62225c"
+	assert cbor("ü") == "62c3bc"
+}
+
+test "encode arrays, maps and unions" {
+	assert cbor([] as i32[]) == "80"
+	assert cbor([1, 2, 3]) == "83010203"
+	assert cbor([[1], [2, 3]]) == "828101820203"
+	assert cbor(new Ab()) == "a2616100616280"
+	assert cbor({ a: 1, b: "x" }) == "a261610161626178"
+	assert cbor[i32 | string]("a") == "6161"
+	assert cbor[Point | null](new Point()) == "a26178006179fb3fe0000000000000"
+	const t: [i32, string] = [1, "a"]
+	assert cbor(t) == "82016161"
+}
+
+test "decode integers and floats" {
+	assert from[i32]("00") == 0
+	assert from[i32]("17") == 23
+	assert from[i32]("1818") == 24
+	assert from[i32]("1a000f4240") == 1000000
+	assert from[u64]("1bffffffffffffffff") == 18446744073709551615
+	assert from[i32]("3903e7") == -1000
+	assert from[i64]("3b7fffffffffffffff") == -9223372036854775808
+	assert from[f64]("fb3ff199999999999a") == 1.1
+	assert from[f32]("fa47c35000") == 100000.0
+	assert from[f64]("f90000") == 0.0
+	assert from[f64]("f93c00") == 1.0
+	assert from[f64]("f97bff") == 65504.0
+	assert from[f64]("f90001") == 5.960464477539063e-8
+	assert from[f64]("f90400") == 0.00006103515625
+	assert from[f64]("f9c400") == -4.0
+	assert from[f64]("f97c00") == inf
+	assert from[f64]("f9fc00") == -inf
+	assert isNaN(from[f64]("f97e00"))
+	assert from[f64]("fa7f800000") == inf
+	assert from[f64]("3863") == -100.0
+	assert from[f32]("fb7e37e43c8800759c") throws new ParseError("range", 0)
+	assert from[f32]("fa7f800000") == inf
+	assert from[u8]("190100") throws new ParseError("range", 0)
+	assert from[u32]("20") throws new ParseError("range", 0)
+	assert from[i64]("3b8000000000000000") throws new ParseError("range", 0)
+}
+
+test "decode strings, tags and simple values" {
+	assert from[string]("6449455446") == "IETF"
+	assert from[string]("4401020304") == "\x01\x02\x03\x04"
+	assert from[string]("5f42010243030405ff") == "\x01\x02\x03\x04\x05"
+	assert from[string]("7f657374726561646d696e67ff") == "streaming"
+	assert from[string]("c074323031332d30332d32315432303a30343a30305a") == "2013-03-21T20:04:00Z"
+	assert from[i64]("c11a514b67b0") == 1363896240
+	assert from[bool]("f5") && !from[bool]("f4")
+	assert from[string | null]("f6") == null
+	assert from["a" | "b"]("6162") == "b"
+	assert from[i32[] | string[]]("9f6161ff") == ["a"] // after i32[] failed past its head
+}
+
+test "decode arrays and maps, definite or not" {
+	assert from[i32[]]("80") == []
+	assert from[i32[]]("9fff") == []
+	const nested = ["8301820203820405", "9f018202039f0405ffff", "9f01820203820405ff", "83018202039f0405ff",
+		"83019f0203ff820405"]
+	for (const h of nested) {
+		const v = from[[i32, i32[], i32[]]](h)
+		assert v[0] == 1 && v[1] == [2, 3] && v[2] == [4, 5]
+	}
+	const ab = from[Ab]("bf61610161629f0203ffff")
+	assert ab.a == 1 && ab.b == [2, 3]
+	const mixed = from[[string, Ab]]("826161a1616101")
+	assert mixed[0] == "a" && mixed[1].a == 1
+}
+
+test "round trips" {
+	const u = new User()
+	assert cbor(u) == "a162494407"
+	u.nick = "n"
+	u.tags = ["x"]
+	const back = decode[User](encode(u))
+	assert back.id == 7 && back.nick == "n" && back.tags == ["x"] && back.cache == "c"
+	assert decode[(i32 | string | f64)[]](encode[(i32 | string | f64)[]]([1, "a", 1.5])) == [1, "a", 1.5]
+	const p = decode[Point[]](encode([new Point()]))
+	assert p[0].x == 0 && p[0].y == 0.5
+	const fixed: i32[3] = [1, 2, 3]
+	const back3 = decode[i32[3]](encode(fixed))
+	assert back3[0] == 1 && back3[2] == 3
+}
+
+function repeat(s: string, n: i32): string {
+	let out = ""
+	for (const _ of 1 ... n) {
+		out += s
+	}
+	return out
+}
+
+class Chain {
+	next: Chain | null = null
+}
+
+test "decode is strict" {
+	assert from[i32]("18") throws new ParseError("syntax", 1)
+	assert from[i32]("0000") throws new ParseError("syntax", 1)
+	assert from[i32]("1c") throws new ParseError("syntax", 0)
+	assert from[string]("7a7fffffff61") throws new ParseError("syntax", 6)
+	assert from[string]("5f6161ff") throws new ParseError("syntax", 1)
+	assert from[User]("a162696401") throws new ParseError("syntax", 1)
+	assert from[User]("a16563616368656161") throws new ParseError("syntax", 1)
+	assert from[[i32, i32]]("8101") throws new ParseError("syntax", 2)
+	assert from[[i32, i32]]("83010203") throws new ParseError("syntax", 3)
+	assert from[bool]("f6") throws new ParseError("syntax", 0)
+	// Each level a map and a union.
+	const chain = (n: i32) => repeat("a1646e657874", n) + "f6"
+	const job = async decode[Chain](hex.decode(chain(128)))
+	assert (await job).next != null
+	assert from[Chain](chain(129)) throws new ParseError("range", 768)
+}

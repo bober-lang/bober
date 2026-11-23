@@ -1,0 +1,374 @@
+//! Values as CBOR (RFC 8949), mapped as ./json maps them: a class, object or interface as a map of its field names,
+//! in declaration order, an array, fixed array or tuple as an array, a string as a text string, a float as wide as
+//! its type, and a union's value untagged. Heads are the shortest. Decoding is as strict as ./json's, but takes
+//! indefinite lengths, byte strings as strings, any float width and integers as floats, and skips tags.
+
+import { bits, fromBits } from "../../builtin/math"
+import * as encoding from "../encoding"
+import { compose } from "../float"
+import { maxOf, minOf } from "../limits"
+import { inf, isFinite, nan } from "../math"
+import { ParseError } from "../string"
+import { Decodable, Float, Integral } from "../types"
+
+/// ../encoding's Name, for CBOR alone.
+export class Name[K extends string] {}
+/// ../encoding's Skip, for CBOR alone.
+export class Skip {}
+/// ../encoding's OmitEmpty, for CBOR alone.
+export class OmitEmpty {}
+
+export function encode[T](v: T): string {
+	const t = typeof v
+	let out = ""
+	let n: u64 = 0
+	switch (t.kind) {
+		case "null": return chr(0xf6)
+		case "bool": return chr(if (v) 0xf5 else 0xf4)
+		case "int": return if (v < 0) head(1, ~v as u64) else head(0, v as u64)
+		case "float": return if (T == f32) chr(0xfa) + big(bits(v), 4) else chr(0xfb) + big(bits(v), 8)
+		case "string": return head(3, v.length as u64) + v
+		case "literal": return encode[string | bool | null](t.value)
+		case "union":
+			for (const M of t.members) {
+				if (v instanceof M) {
+					return encode(v)
+				}
+			}
+			return ""
+		case "array", "fixed":
+			for (const x of v) {
+				out += encode(x)
+				n++
+			}
+			return head(4, n) + out
+		case "tuple":
+			for (const f of t.fields) {
+				out += encode(v[f.name])
+				n++
+			}
+			return head(4, n) + out
+		case "class", "object", "interface":
+			for (const f of t.fields) {
+				const x = v[f.name]
+				if (!encoding.omits(f.tags, Skip, OmitEmpty, x)) {
+					out += encode(encoding.key(f.tags, Name, f.name)) + encode(x)
+					n++
+				}
+			}
+			return head(5, n) + out
+		default: return encode(t.name)
+	}
+}
+
+/// The head of major type major and argument v.
+function head(major: u8, v: u64): string {
+	if (v < 24) {
+		return chr(major << 5 | (v as u8))
+	}
+	const info: u8 = if (v < 0x100) 24 else if (v < 0x10000) 25 else if (v < 0x100000000) 26 else 27
+	return chr(major << 5 | info) + big(v, 1 << (info - 24))
+}
+
+/// v's low n bytes, big-endian.
+function big(v: u64, n: i32): string {
+	let out = ""
+	for (const i of 1 ... n) {
+		out += chr((v >> 8 * (n - i)) as u8)
+	}
+	return out
+}
+
+export function decode[T extends Decodable](s: string): T throws ParseError {
+	const d = new Decoder(s)
+	const v = d.value[T]()
+	if (d.i != s.length) {
+		throw d.error()
+	}
+	return v
+}
+
+/// Whether the CBOR of a T may start with byte c.
+function starts[T](c: u8): bool {
+	const major = c >> 5
+	switch (T.kind) {
+		case "null": return c == 0xf6
+		case "bool": return c == 0xf4 || c == 0xf5
+		case "int": return major < 2
+		case "float": return major < 2 || 0xf9 <= c <= 0xfb
+		case "string": return major == 2 || major == 3
+		case "literal": return starts[string](c) || starts[bool](c)
+		case "array", "fixed", "tuple": return major == 4
+		case "class": return major == 5
+		default: return false
+	}
+}
+
+/// The most arrays and maps decoding nests, as each takes a few KiB of a fiber's 1 MiB stack in a debug build.
+const maxDepth = 128
+/// How many times the input, for each of a union's members, the members that fail may read in all, as in ./json.
+const retries: i64 = 16
+
+/// The f64 of an f16's bits.
+function half(h: u64): f64 {
+	const e = (h >> 10 & 31) as i32
+	const m = h & 1023
+	const v = if (e == 31) (if (m == 0) inf else nan) else if (e == 0) compose(m, -24) else compose(m | 1024, e - 25)
+	return if (h >> 15 != 0) -v else v
+}
+
+class Decoder {
+	s: string
+	i = 0
+	depth = 0 // arrays and maps open
+	failed: i64 = 0 // bytes read by union members that failed
+
+	constructor(s: string) { this.s = s }
+
+	value[T extends Decodable](): T throws ParseError {
+		// Tags are skipped.
+		while (this.peek() >> 5 == 6) {
+			this.arg(this.next() & 31)
+		}
+		const at = this.i
+		switch (T.kind) {
+			case "null":
+				if (this.next() != 0xf6) {
+					throw new ParseError("syntax", at)
+				}
+				return null
+			case "bool":
+				const c = this.next()
+				if (!starts[bool](c)) {
+					throw new ParseError("syntax", at)
+				}
+				return c == 0xf5
+			case "int": return this.int[T]()
+			case "float": return this.float[T]()
+			case "string": return this.string()
+			case "literal":
+				if (this.value[string | bool | null]() != T.value) {
+					throw new ParseError("syntax", at)
+				}
+				return T.value
+			case "union":
+				// The members the head may start, integers first, as 1 fits a float too; if none decodes, the last
+				// one's error.
+				const c = this.peek()
+				const depth = this.depth
+				let last: ParseError | null = null
+				for (const ints of [true, false]) {
+					for (const M of T.members) {
+						if ((M.kind == "int") == ints && starts[M](c)) {
+							try {
+								return this.value[M]()
+							} catch (e: ParseError) {
+								this.failed += this.i - at
+								if (this.failed > retries * T.members.length * this.s.length) {
+									throw new ParseError("range", at)
+								}
+								last = e
+								this.i = at
+								this.depth = depth
+							}
+						}
+					}
+				}
+				throw last ?? this.error()
+			case "array":
+				const xs: T = []
+				const n = this.open(4)
+				while (this.more(n, xs.length)) {
+					xs.push(this.value[T.elem]())
+				}
+				return xs
+			case "fixed":
+				let fixed: T
+				const n = this.open(4)
+				for (const i of 0 ... T.length - 1) {
+					this.item(n, i)
+					fixed[i] = this.value[T.elem]()
+				}
+				this.end(n, T.length)
+				return fixed
+			case "tuple":
+				const tuple = new T()
+				const n = this.open(4)
+				let i = 0
+				for (const f of T.fields) {
+					this.item(n, i)
+					tuple[f.name] = this.value[f.type]()
+					i++
+				}
+				this.end(n, i)
+				return tuple
+			case "class":
+				const r = new T()
+				const n = this.open(5)
+				let k = 0
+				while (this.more(n, k)) {
+					const key = this.i
+					const name = this.value[string]()
+					let known = false
+					for (const f of T.fields) {
+						if (!known && !encoding.skips(f.tags, Skip) && name == encoding.key(f.tags, Name, f.name)) {
+							r[f.name] = this.value[f.type]()
+							known = true
+						}
+					}
+					if (!known) {
+						throw new ParseError("syntax", key)
+					}
+					k++
+				}
+				return r
+			default: throw this.error()
+		}
+	}
+
+	int[T extends Integral](): T throws ParseError {
+		const at = this.i
+		const c = this.next()
+		if (c >> 5 > 1) {
+			throw new ParseError("syntax", at)
+		}
+		const v = this.arg(c & 31)
+		if (v > (maxOf[T]() as u64) || c >> 5 == 1 && minOf[T]() == 0) {
+			throw new ParseError("range", at)
+		}
+		return if (c >> 5 == 0) v as T else ~(v as T)
+	}
+
+	/// A float of any width, or an integer; one too large for T, as an f64's past f32, is a range error.
+	float[T extends Float](): T throws ParseError {
+		const at = this.i
+		const c = this.next()
+		if (c >> 5 > 1 && !(0xf9 <= c <= 0xfb)) {
+			throw new ParseError("syntax", at)
+		}
+		const n = this.arg(c & 31)
+		const v = if (c >> 5 == 0) n as f64
+			else if (c >> 5 == 1) -1.0 - (n as f64)
+			else if (c == 0xf9) half(n)
+			else if (c == 0xfa) fromBits[f32](n) as f64
+			else fromBits[f64](n)
+		if (isFinite(v) && !isFinite(v as T)) {
+			throw new ParseError("range", at)
+		}
+		return v as T
+	}
+
+	/// A text or byte string, its chunks joined if of indefinite length.
+	string(): string throws ParseError {
+		const major = this.peek() >> 5
+		if (major != 2 && major != 3) {
+			throw this.error()
+		}
+		if ((this.peek() & 31) != 31) {
+			return this.chunk(major)
+		}
+		this.i++
+		let out = ""
+		while (!this.eat(0xff)) {
+			out += this.chunk(major)
+		}
+		return out
+	}
+
+	/// A string of major type major and definite length.
+	chunk(major: u8): string throws ParseError {
+		const at = this.i
+		const n = this.length(major)
+		if (n < 0) {
+			throw new ParseError("syntax", at)
+		}
+		this.i += n
+		return this.s.slice(this.i - n, this.i).copy() // not keeping all of s alive
+	}
+
+	/// The length of the head of major type major, moved past: -1 if indefinite, else at most the bytes left, as an
+	/// item takes one at least.
+	length(major: u8): i32 throws ParseError {
+		const at = this.i
+		const c = this.next()
+		if (c >> 5 != major) {
+			throw new ParseError("syntax", at)
+		}
+		if ((c & 31) == 31) {
+			return -1
+		}
+		const n = this.arg(c & 31)
+		if (n > ((this.s.length - this.i) as u64)) {
+			throw new ParseError("syntax", this.s.length)
+		}
+		return n as i32
+	}
+
+	/// The argument of a head whose first byte, just read, ends in info.
+	arg(info: u8): u64 throws ParseError {
+		if (info < 24) {
+			return info as u64
+		}
+		if (info > 27) {
+			throw new ParseError("syntax", this.i - 1)
+		}
+		let v: u64 = 0
+		for (const _ of 1 ... (1 as i32) << (info - 24)) {
+			v = v << 8 | (this.next() as u64)
+		}
+		return v
+	}
+
+	/// The length of the array or map of major type major that opens here, unless maxDepth are open.
+	open(major: u8): i32 throws ParseError {
+		if (this.depth == maxDepth) {
+			throw new ParseError("range", this.i)
+		}
+		const n = this.length(major)
+		this.depth++
+		return n
+	}
+
+	/// Whether an array or map of length n, -1 if indefinite, has more than k items; if not, it is closed.
+	more(n: i32, k: i32): bool throws ParseError {
+		const done = if (n < 0) this.eat(0xff) else k == n
+		if (done) {
+			this.depth--
+		}
+		return !done
+	}
+
+	/// Fails unless an array of length n has a kth item.
+	item(n: i32, k: i32) throws ParseError {
+		if (!this.more(n, k)) {
+			throw this.error()
+		}
+	}
+
+	/// Fails unless an array of length n ends after k items.
+	end(n: i32, k: i32) throws ParseError {
+		if (this.more(n, k)) {
+			throw this.error()
+		}
+	}
+
+	peek(): u8 { return if (this.i < this.s.length) this.s[this.i] else 0 }
+
+	next(): u8 throws ParseError {
+		if (this.i == this.s.length) {
+			throw this.error()
+		}
+		this.i++
+		return this.s[this.i - 1]
+	}
+
+	eat(c: u8): bool {
+		if (this.i == this.s.length || this.s[this.i] != c) {
+			return false
+		}
+		this.i++
+		return true
+	}
+
+	error(): ParseError { return new ParseError("syntax", this.i) }
+}
