@@ -8,7 +8,7 @@ import { indexOf, sort, startsWith } from "../algo"
 import { glob, readFile } from "../fs"
 import { base } from "../fs/path"
 import { split, trim } from "../string"
-import { decode, quoted, Rest, Unknown } from "./json"
+import { decode, quoted, Raw, Rest, Unknown } from "./json"
 import { parse, parseFragment, serialize, State, Tokenizer } from "./html"
 import { htmlNS, mathNS, Node, svgNS, xlinkNS, xmlNS, xmlnsNS } from "./xml"
 
@@ -110,7 +110,7 @@ function tokens(s: string, st: State, last: string): Value[][] {
 			case "start":
 				const a = new Attrs()
 				for (const x of t.attrs) {
-					a.rest.push([x.name, quoted(x.value)])
+					a.rest.push([x.name, new Raw(quoted(x.value))])
 				}
 				const v: Value[] = ["StartTag", t.name, a]
 				if (t.selfClosing) {
@@ -152,8 +152,8 @@ function value(v: Value): string {
 	}
 	if (v instanceof Attrs) {
 		const kv: string[] = []
-		for (const [k, text] of v.rest) {
-			kv.push(`${quoted(k)}:${quoted(decode[string](text))}`)
+		for (const [k, raw] of v.rest) {
+			kv.push(`${quoted(k)}:${quoted(decode[string](raw.text))}`)
 		}
 		return `{${kv.join(",")}}`
 	}

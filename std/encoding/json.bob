@@ -3,7 +3,7 @@
 //! if one does, with a range error once the members that failed have read 16 times the input for each member.
 //! Decoding is strict: no unknown keys, a class it makes takes no arguments, and fields left out keep their initial
 //! values. Tags on a field (spec 5.3) change its key, leave it out, take the unknown keys, or hold an object as its
-//! entries; ../encoding's count too.
+//! entries; ../encoding's count too. A Raw holds a value of any type as its text.
 
 import { stableSort } from "../algo"
 
@@ -29,8 +29,15 @@ export class Rest {}
 /// its JSON, quoted, so a string key spelling another member's JSON, as "1" in i32 | string, reads back as that member.
 export class Mapping {}
 
-/// A key and its value's text, as a Rest field holds them.
-export type Unknown = [string, string]
+/// A value of any type as its text, which decoding keeps and encoding writes as it is.
+export class Raw {
+	text: string
+
+	constructor(text = "null") { this.text = text }
+}
+
+/// A key and its value, as a Rest field holds them.
+export type Unknown = [string, Raw]
 
 /// A NaN or infinite float, which JSON cannot hold.
 export class EncodeError {
@@ -44,6 +51,9 @@ export function encode[T](v: T): string throws EncodeError { return write("", v)
 /// q followed by v's JSON, each part appended in turn, so that q grows in its buffer.
 function write[T](q: string, v: T): string throws EncodeError {
 	const t = typeof v
+	if (t == Raw) {
+		return q + v.text
+	}
 	switch (t.kind) {
 		case "null", "bool", "int": return q + `${v}`
 		case "float":
@@ -82,8 +92,8 @@ function write[T](q: string, v: T): string throws EncodeError {
 			for (const f of t.fields) {
 				const x = v[f.name]
 				if (has(f.tags, Rest) && f.type == Unknown[]) {
-					for (const [k, text] of x) {
-						q = writeString(q + sep, k) + ":" + text
+					for (const [k, raw] of x) {
+						q = writeString(q + sep, k) + ":" + raw.text
 						sep = ","
 					}
 				} else if (!encoding.omits(f.tags, Skip, OmitEmpty, x)) {
@@ -218,7 +228,7 @@ export function indent(s: string): string {
 	return out
 }
 
-/// An object of any keys, each with its value's text for decode to read.
+/// An object of any keys, each with its value for decode to read.
 export class Keys {
 	all: Unknown[] @Rest = []
 }
@@ -234,6 +244,10 @@ class Decoder {
 	value[T extends Decodable](): T throws ParseError {
 		this.space()
 		const at = this.i
+		if (T == Raw) {
+			this.skip()
+			return new Raw(this.s.slice(at, this.i).copy()) // not keeping all of s alive
+		}
 		switch (T.kind) {
 			case "null":
 				this.word("null")
@@ -318,11 +332,8 @@ class Decoder {
 					}
 					for (const f of T.fields) {
 						if (!known && has(f.tags, Rest) && f.type == Unknown[]) {
-							this.space()
-							const at = this.i
-							this.skip()
 							const rest: Unknown[] = r[f.name]
-							rest.push([name, this.s.slice(at, this.i).copy()]) // not keeping all of s alive
+							rest.push([name, this.value[Raw]()])
 							known = true
 						}
 					}

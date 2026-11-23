@@ -1,5 +1,5 @@
 import * as encoding from "../encoding"
-import { decode, encode, EncodeError, indent, Mapping, Name, OmitEmpty, Rest, Skip, Unknown } from "./json"
+import { decode, encode, EncodeError, indent, Mapping, Name, OmitEmpty, Raw, Rest, Skip, Unknown } from "./json"
 import { inf, isNaN, nan } from "../math"
 import { ParseError } from "../string"
 
@@ -180,11 +180,11 @@ class Loose {
 test "rest takes unknown keys" {
 	const v = decode[Loose](`{"a": [1, {"b": null}], "x": 2, "c": "s"}`)
 	assert v.x == 2
-	assert v.rest == [["a", `[1, {"b": null}]`], ["c", `"s"`]]
+	assert v.rest.map(e => `${e[0]}=${e[1].text}`) == [`a=[1, {"b": null}]`, `c="s"`]
 	assert encode(v) == `{"x":2,"a":[1, {"b": null}],"c":"s"}`
 	assert decode[Loose](`{"a": [1,]}`) throws new ParseError("syntax", 9)
-	assert decode[Loose](`{"a": true, "b": null, "c": -1.5e400}`).rest
-		== [["a", "true"], ["b", "null"], ["c", "-1.5e400"]]
+	assert decode[Loose](`{"a": true, "b": null, "c": -1.5e400}`).rest.map(e => e[1].text)
+		== ["true", "null", "-1.5e400"]
 	assert decode[Loose](`{"a": nope}`) throws new ParseError("syntax", 7)
 }
 
@@ -273,4 +273,19 @@ test "union members that fail read 16 times the input for each member at most" {
 	assert decode[Add | Mul | null](ops(20)) throws new ParseError("range", 0)
 	// Over 2^31 bytes in all, as 16 times 64 MiB for each of 2 members, the budget does not wrap.
 	assert decode[(i32 | f64)[]]("[1.5]" + repeat(" ", 1 << 26))[0] == 1.5
+}
+
+class Event {
+	kind = ""
+	data = new Raw()
+}
+
+test "a raw value holds any value's text" {
+	const xs = decode[Raw[]](` [1, {"a": [true]} , "s",null]`)
+	assert xs.map(x => x.text) == ["1", `{"a": [true]}`, `"s"`, "null"]
+	assert encode(xs) == `[1,{"a": [true]},"s",null]`
+	const e = decode[Event](`{"kind": "k", "data": [2, 3]}`)
+	assert e.data.text == "[2, 3]" && encode(e) == `{"kind":"k","data":[2, 3]}`
+	assert encode(new Event()) == `{"kind":"","data":null}`
+	assert decode[Raw](`{"a": }`) throws new ParseError("syntax", 6)
 }
