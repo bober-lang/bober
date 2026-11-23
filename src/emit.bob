@@ -40,6 +40,7 @@ import { Code, Module, Program, pair } from "./bc/program"
 import { showType } from "./bc/show"
 import * as c from "./c/type"
 import { CompileError } from "./error"
+import { sha256 } from "./link/sha256"
 import { fits } from "./mono"
 import { bases, embedded, fieldOf } from "./resolve"
 import { builtin } from "./root"
@@ -4234,9 +4235,9 @@ class Emitter {
 		return this.b.constStruct([this.i64Const(w[0]), this.i64Const(w[1]), this.b.constZero(this.ref)])
 	}
 
-	/// s as a long string, made once, a constant, of the program's one copy of its bytes, named by them, so that equal
-	/// literals are one value, whose words Same compares (§4.2); "" all zeros, as the zero string. A descriptor's strings
-	/// are long, as src/type.c reads them.
+	/// s as a long string, made once, a constant, of the program's one copy of its bytes, named by them, or past 64
+	/// bytes by their SHA-256, so that equal literals are one value, whose words Same compares (§4.2); "" all
+	/// zeros, as the zero string. A descriptor's strings are long, as src/type.c reads them.
 	private long(s: string): Value {
 		const have = this.strs.get(s)
 		if (have != null) {
@@ -4246,7 +4247,8 @@ class Emitter {
 		let [head, bytes] = [this.i64Const(0), this.i64Const(0)]
 		if (s != "") {
 			head = this.i64Const((s.length as i64) << 8 | 0xff)
-			bytes = b.constCast("ptrtoint", b.literal(`bober.str.${hex(s)}`, b.constBytes(s)), this.i64)
+			const name = hex(if (s.length <= 64) s else sha256(s))
+			bytes = b.constCast("ptrtoint", b.literal(`bober.str.${name}`, b.constBytes(s)), this.i64)
 		}
 		const v = b.constStruct([head, bytes, b.constZero(this.ref)])
 		this.strs.set(s, v)
