@@ -25,7 +25,7 @@
 //! of the args of each of a decl's owners with params, outermost first, then of its own: a function instance is keyed
 //! by its decl and env, and a class instance is its Named type, whose args are its env. subst substitutes an env.
 
-import { sort, sortBy } from "../../std/algo"
+import { lowerBound, sort, sortBy } from "../../std/algo"
 import { space } from "../../std/ascii"
 import { HashMap } from "../../std/collections/hashmap"
 import { combine, fnv } from "../../std/hash"
@@ -123,6 +123,13 @@ export class Module {
 	bc = ""
 
 	constructor(path: string) { this.path = path }
+
+	/// The line and column of source byte offset pos, from 1.
+	lineCol(pos: i32): [u32, u32] {
+		const i = lowerBound(this.newlines, pos) as i32
+		const bol = if (i == 0) 0 else this.newlines[i - 1] + 1
+		return [(i + 1) as u32, (pos - bol + 1) as u32]
+	}
 }
 
 /// Of a type: whether a Param occurs in it, and whether an Of or a Member does.

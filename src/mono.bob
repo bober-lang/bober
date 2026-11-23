@@ -320,6 +320,9 @@ class Mono {
 			const i = ins.insts.get(k)!
 			const x = p.decls[k]
 			ins.where = qualified(p, k)
+			ins.mod = x.module
+			ins.pos = -1
+			ins.cur = k
 			x.supers = 0
 			x.members = owned.get(k) ?? []
 			stableSort(x.members, (a, b) => source(a) < source(b) || source(a) == source(b) && hash(a) < hash(b))
@@ -456,7 +459,7 @@ class Mono {
 		const k = p.kind(t)
 		let r = 0
 		if (t == kind.Type || k == kind.Param || k == kind.Of || k == kind.Member) {
-			throw new CompileError(`${showType(p, t)} at run time (${this.ins.where})`)
+			throw this.ins.error(`${showType(p, t)} at run time`)
 		} else if (this.ins.nominal(t) == decl.Class) {
 			r = p.type(kind.Named, this.ins.instance(p.a(t), p.b(t)), 0)
 		} else if (k == kind.Union || k == kind.Literal || this.ins.abstract(t)) {
@@ -519,6 +522,7 @@ class Mono {
 			const o = c.ops[j]
 			const r = info[j]
 			to.at = c.pos[j]
+			this.ins.pos = c.pos[j]
 			if (o == op.CallMethod && r >= 0) {
 				to.add(op.Call, this.dispatch(m, r, c.a(j), "()"))
 			} else if ((o == op.Field || o == op.SetField) && r >= 0

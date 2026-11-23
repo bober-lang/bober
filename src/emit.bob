@@ -25,7 +25,7 @@
 //! of a type, its key, members, layout and struct, it computes once per id.
 
 import { fromBits } from "../builtin/math"
-import { endsWith, lowerBound, sort, startsWith } from "../std/algo"
+import { endsWith, sort, startsWith } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
 import { encode as hex } from "../std/encoding/hex"
 import { max, min } from "../std/math"
@@ -308,14 +308,6 @@ class Emitter {
 		b.collected()
 		this.runtime()
 		b.source(this.path, "bober")
-	}
-
-	/// The line and column of the source position pos, from 1.
-	private lineCol(pos: i32): [u32, u32] {
-		const newlines = this.src.newlines
-		const i = lowerBound(newlines, pos) as i32
-		const bol = if (i == 0) 0 else newlines[i - 1] + 1
-		return [(i + 1) as u32, (pos - bol + 1) as u32]
 	}
 
 	/// Declares what src/rt.c exports. Only alloc and zero collect, and test calls code that may, so the others are
@@ -704,7 +696,7 @@ class Emitter {
 		let line: u32 = 0
 		for (const pos of c.pos) {
 			if (line == 0 && pos >= 0) {
-				line = this.lineCol(pos)[0]
+				line = this.src.lineCol(pos)[0]
 			}
 		}
 		b.debugFunction(f, this.src.path, line)
@@ -821,7 +813,7 @@ class Emitter {
 		const b = this.b
 		this.pos = c.pos[i]
 		if (this.pos >= 0) {
-			const [line, col] = this.lineCol(this.pos)
+			const [line, col] = this.src.lineCol(this.pos)
 			b.line(line, col)
 		}
 		if ((o == op.Add || o == op.Concat) && this.grow(i, if (o == op.Add) 2 else n)) {
@@ -1517,7 +1509,7 @@ class Emitter {
 		b.at(here)
 		this.dead = dead
 		if (this.pos >= 0) {
-			const [line, col] = this.lineCol(this.pos)
+			const [line, col] = this.src.lineCol(this.pos)
 			b.line(line, col)
 		}
 		return f

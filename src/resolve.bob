@@ -67,10 +67,10 @@ export class Known {
 	}
 
 	/// A record's value of field name, the last of the name, as a spread's later one replaces it.
-	get(name: string): Known throws CompileError {
+	get(name: string, ins: Instances): Known throws CompileError {
 		const i = lastIndexOf(this.names, [name])
 		if (i < 0) {
-			throw new CompileError(`no field ${name}`)
+			throw ins.error(`no field ${name}`)
 		}
 		return this.items![i]
 	}
@@ -104,6 +104,9 @@ export class Inst {
 	/// How many Returns it may run.
 	returns = 0
 	copied = false
+	/// The instance whose code made it and the source offset of the op there, for errors; -1 if none.
+	by = -1
+	at = -1
 
 	/// Notes a Return of v, null if not known.
 	returned(v: Known | null) {
@@ -123,8 +126,12 @@ export class Instances {
 	/// Per interface and object type, the union of what is converted into it, as src/mono.bob collects it, complete only
 	/// once its collecting settles; copying code reads none of it.
 	held = new HashMap[i32, i32]()
-	/// The decl being worked on, for errors.
+	/// The decl being worked on, for errors, its module and the op's source byte offset, -1 if none.
 	where = ""
+	mod = -1
+	pos = -1
+	/// The instance being worked on, -1 if none.
+	cur = -1
 	/// The instances whose code is still to copy.
 	private todo: i32[] = []
 	/// Per type id, whether the class instances it names are made.
@@ -133,6 +140,39 @@ export class Instances {
 	private specials = new HashMap[string, i32]()
 
 	constructor(p: Program) { this.p = p }
+
+	/// A CompileError at the current op if known, naming the instance being worked on and, while it is an instance,
+	/// where it was instanced, back to the first decl that is none; a recursion's instances of one decl as its first.
+	error(msg: string): CompileError {
+		const p = this.p
+		const at = if (this.mod >= 0 && this.pos >= 0) `${this.site(this.mod, this.pos)}: ` else ""
+		let tail = this.where
+		let k = this.cur
+		let n = 0
+		while (k >= 0 && p.decls[k].generic >= 0 && n < 8) {
+			const i = this.insts.get(k)
+			if (i == null || i!.by < 0) {
+				break
+			}
+			const by = i!.by
+			if (p.decls[by].generic != p.decls[k].generic) {
+				const site = if (i!.at < 0) "" else `at ${this.site(p.decls[by].module, i!.at)} `
+				tail = `${tail}, ${if (n == 0) "instanced " else ""}${site}in ${qualified(p, by)}`
+				n++
+			}
+			k = by
+		}
+		if (n == 8 && k >= 0 && p.decls[k].generic >= 0) {
+			tail = `${tail}, …`
+		}
+		return new CompileError(if (tail == "") `${at}${msg}` else `${at}${msg} (${tail})`)
+	}
+
+	/// path:line:col of source offset pos in module m.
+	private site(m: i32, pos: i32): string {
+		const [line, col] = this.p.modules[m].lineCol(pos)
+		return `${this.p.modules[m].path}:${line}:${col}`
+	}
 
 	/// The instance of decl d for the env, made on first use; of a class with its fields and its constructor, which emit
 	/// finds by name, its methods as they are called; but of builtin/'s only what is used is.
@@ -150,7 +190,7 @@ export class Instances {
 			return made
 		}
 		if (p.lists[env].some(t => p.endless(t))) {
-			throw new CompileError(`${qualified(p, d)} is instanced with type args nested ever deeper (${this.where})`)
+			throw this.error(`${qualified(p, d)} is instanced with type args nested ever deeper`)
 		}
 		const k = this.add(p.instance(d, env, owner), [], false)
 		if ((x.kind == decl.Class || x.kind == decl.Interface) && !builtin(p.modules[x.module].path)) {
@@ -191,6 +231,8 @@ export class Instances {
 		const i = new Inst()
 		i.values = values
 		i.special = special
+		i.by = this.cur
+		i.at = if (this.cur < 0) -1 else this.pos
 		this.insts.set(k, i)
 		this.order.push(k)
 		this.reach(this.p.decls[k].type)
@@ -209,7 +251,7 @@ export class Instances {
 	/// The env of decl d used with the type args, which lower gives in full, defaults filled in.
 	env(d: i32, args: i32[]): i32 throws CompileError {
 		if (args.length != this.p.identity(d).length) {
-			throw new CompileError(`${qualified(this.p, d)} needs ${this.p.identity(d).length} type args (${this.where})`)
+			throw this.error(`${qualified(this.p, d)} needs ${this.p.identity(d).length} type args`)
 		}
 		return this.p.list(args)
 	}
@@ -235,9 +277,18 @@ export class Instances {
 		}
 		i.copied = true
 		const where = this.where
+		const mod = this.mod
+		const pos = this.pos
+		const cur = this.cur
 		this.where = qualified(this.p, k)
+		this.mod = this.p.decls[k].module
+		this.pos = -1
+		this.cur = k
 		new Copy(this, k, i).run()
 		this.where = where
+		this.mod = mod
+		this.pos = pos
+		this.cur = cur
 	}
 
 	/// Makes the class instances closed type t names, so that their members are copied.
@@ -335,7 +386,7 @@ export class Instances {
 		if (p.strings[name] == "length" && (text || k == kind.Array || k == kind.FixedArray || k == kind.Tuple)) {
 			return kind.I32
 		}
-		throw new CompileError(`${showType(p, t)} has no field ${p.strings[name]} (${this.where})`)
+		throw this.error(`${showType(p, t)} has no field ${p.strings[name]}`)
 	}
 
 	/// The Func type of method name of t, -1 if it has none: of a class or interface, a function field of an object, or
@@ -396,12 +447,15 @@ export class Instances {
 			case "tags": return if (named) this.tags(d, p.b(t)) else array([])
 			case "args":
 				const env = if (named) p.lists[p.b(t)] else []
-				return array(env.slice(env.length - (if (named) p.decls[d].params.length else 0),
-					env.length).map(typeValue))
+				const n = if (named) p.decls[d].params.length else 0
+				if (env.length < n) {
+					throw this.error(`${showType(p, t)} has fewer type args than params`)
+				}
+				return array(env.slice(env.length - n, env.length).map(typeValue))
 			case "base", "elem":
 				const r = p.type(kind.Member, t, p.intern(name))
 				if (p.kind(r) == kind.Member) {
-					throw new CompileError(`${showType(p, t)} has no ${name} (${this.where})`)
+					throw this.error(`${showType(p, t)} has no ${name}`)
 				}
 				return typeValue(r)
 			case "members": return array(if (p.kind(t) == kind.Union) p.members(t).map(typeValue) else [])
@@ -410,13 +464,16 @@ export class Instances {
 				else if (p.kind(t) == kind.Func) p.items(t).length
 				else 0)
 			case "value":
+				if (t != kind.Null && p.kind(t) != kind.Literal) {
+					throw this.error(`${showType(p, t)} has no value`)
+				}
 				const a = p.a(t)
 				return if (t == kind.Null) new Known(new Op(op.Null))
 					else if (a == kind.String) new Known(new Op(op.Str, p.b(t)))
 					else if (a == kind.Bool) truth(p.b(t) == 1)
 					else new Known(new Op(op.Int, a, p.b(t)))
 		}
-		throw new CompileError(`Type has no member ${name} (${this.where})`)
+		throw this.error(`Type has no member ${name}`)
 	}
 
 	/// The fields of t as reflection gives them: a record of name, type, readonly, doc and tags each.
@@ -767,6 +824,7 @@ class Copy {
 		const s = this.src
 		const o = s.ops[i]
 		this.dst.at = s.pos[i]
+		this.ins.pos = s.pos[i]
 		const e = s.next(i)
 		const last = if (s.ops[e] == op.Else) s.next(e) else e
 		let left = false
@@ -783,7 +841,7 @@ class Copy {
 			} else if (v!.op?.op == op.False) {
 				left = this.block(e + 1, last)
 			} else {
-				throw new CompileError(`an if needs a bool (${this.ins.where})`)
+				throw this.ins.error("an if needs a bool")
 			}
 			// A known result stays known: one holding a Type after the Block, which runs what else the branch does;
 			// another without the Block, if nothing else in it runs.
@@ -812,6 +870,8 @@ class Copy {
 				this.take()
 			}
 			for (const j of 0 ... n - 1) {
+				this.dst.at = s.pos[i]
+				this.ins.pos = s.pos[i]
 				if (xs == null) {
 					this.emit(op.Local, tmp)
 					this.plain(op.Field, 0, elem(this.p, t, j), this.p.elementName(j))
@@ -840,6 +900,7 @@ class Copy {
 		const a = s.a(i)
 		const b = s.b(i)
 		this.dst.at = s.pos[i]
+		this.ins.pos = s.pos[i]
 		if (o == op.Br || o == op.BrIf || o == op.BrNull) {
 			// Its End may be reached by it.
 			this.frames[this.frames.length - 1 - a].reached = true
@@ -940,11 +1001,13 @@ class Copy {
 				const xs = this.stack[this.stack.length - 2]
 				if (k.v?.op?.op == op.Str) {
 					this.field(this.name(this.take()))
-				} else if (k.v != null && xs.v?.items != null) {
-					const at = p.ints[this.take().op!.b]
+				} else if (xs.v?.items != null) {
+					const at = this.index(k, xs.v!.items!.length)
+					this.take()
 					this.known(this.take().items![at])
 				} else {
-					this.plain(o, 2, elem(p, xs.t, if (k.v == null) -1 else p.ints[k.v!.op!.b] as i32))
+					const at = if (p.kind(xs.t) == kind.Tuple) this.index(k, p.items(xs.t).length) else -1
+					this.plain(o, 2, elem(p, xs.t, at))
 				}
 			case op.SetSubscript: if (this.stack[this.stack.length - 2].v?.op?.op == op.Str) {
 				const v = this.stack.pop()
@@ -1085,7 +1148,7 @@ class Copy {
 		const c = this.p.decls[d].code!
 		const x = if (c.ops[0] == op.Global) this.untyped(c.a(0), t) else new Op(c.ops[0], t, c.b(0))
 		if (x.op != op.Int && x.op != op.Float) {
-			throw new CompileError(`an untyped const that is not a literal (${this.ins.where})`)
+			throw this.ins.error("an untyped const that is not a literal")
 		}
 		let v = this.p.ints[x.b]
 		let i = 1
@@ -1210,7 +1273,7 @@ class Copy {
 			}
 			this.known(v!)
 		} else if (returnsType) {
-			throw new CompileError(`${qualified(p, k)} returns no static value (${this.ins.where})`)
+			throw this.ins.error(`${qualified(p, k)} returns no static value`)
 		}
 	}
 
@@ -1231,7 +1294,7 @@ class Copy {
 					special = true
 				}
 			} else if (this.values[ls[j]] == null) {
-				throw new CompileError(`a captured Type not known (${this.ins.where})`)
+				throw this.ins.error("a captured Type not known")
 			} else {
 				values[c.captures[j]] = this.values[ls[j]]
 				special = true
@@ -1246,7 +1309,7 @@ class Copy {
 	/// The closure a value of a coded type, s, is known as.
 	private which(s: Slot): Known throws CompileError {
 		if ((s.v?.fn ?? -1) < 0) {
-			throw new CompileError(`a closure taking or giving a Type, not known which (${this.ins.where})`)
+			throw this.ins.error("a closure taking or giving a Type, not known which")
 		}
 		return s.v!
 	}
@@ -1269,7 +1332,7 @@ class Copy {
 		if (f < 0 && p.strings[name] == "toString") {
 			this.call(this.p.lang("show"), p.list([slot.t]))
 		} else if (f < 0) {
-			throw new CompileError(`no method ${p.strings[name]} to call (${this.ins.where})`)
+			throw this.ins.error(`no method ${p.strings[name]} to call`)
 		} else if (d >= 0 && p.decls[d].kind == decl.Function) {
 			// Each param the call leaves out, defaulted, as Missing, as lower passes it to a callee it knows.
 			const ps = p.items(p.subst(p.decls[d].type, p.b(slot.t)))
@@ -1309,7 +1372,7 @@ class Copy {
 			this.known(this.ins.reflect(v.t, this.p.strings[name]))
 		} else if (v.items != null) {
 			this.known(if (this.p.strings[name] == "length" && v.names.length == 0) this.ins.int(v.items!.length)
-				else v.get(this.p.strings[name]))
+				else v.get(this.p.strings[name], this.ins))
 		} else {
 			this.known(this.ins.int(this.p.strings[this.name(v)].length))
 		}
@@ -1392,9 +1455,21 @@ class Copy {
 	/// The string a known value is, a Str.
 	private name(v: Known): i32 throws CompileError {
 		if (v.op?.op != op.Str) {
-			throw new CompileError(`a static string is needed (${this.ins.where})`)
+			throw this.ins.error("a static string is needed")
 		}
 		return v.op!.a
+	}
+
+	/// Static int index of slot k, in 0 .. len - 1.
+	private index(k: Slot, len: i32): i32 throws CompileError {
+		if (k.v?.op?.op != op.Int) {
+			throw this.ins.error("a static index is needed")
+		}
+		const at = this.p.ints[k.v!.op!.b]
+		if (at < 0 || at >= (len as i64)) {
+			throw this.ins.error(`index ${at} out of range for length ${len}`)
+		}
+		return at as i32
 	}
 
 	/// 1 if s is a known true, 0 if a known false, else -1.
@@ -1419,15 +1494,15 @@ class Copy {
 		switch (p.kind(t)) {
 			case kind.Of:
 				const held = this.values[p.a(t)]
-				const v = if (held == null || p.b(t) == 0) held else held.get(p.strings[p.b(t)])
+				const v = if (held == null || p.b(t) == 0) held else held.get(p.strings[p.b(t)], this.ins)
 				if (v == null || v.t < 0) {
-					throw new CompileError(`${showType(p, t)} is not known (${this.ins.where})`)
+					throw this.ins.error(`${showType(p, t)} is not known`)
 				}
 				r = v.t
 			case kind.Member:
 				r = this.ins.reflect(this.type(p.a(t)), p.strings[p.b(t)]).t
 				if (r < 0) {
-					throw new CompileError(`${showType(p, t)} is not a type (${this.ins.where})`)
+					throw this.ins.error(`${showType(p, t)} is not a type`)
 				}
 			default: r = p.map(t, x => this.type(x))
 		}
@@ -1513,7 +1588,7 @@ class Copy {
 	private pop(): Slot throws CompileError {
 		const s = this.stack.pop()
 		if (s.v != null && s.at < 0) {
-			throw new CompileError(`a static value used at run time (${this.ins.where})`)
+			throw this.ins.error("a static value used at run time")
 		}
 		return s
 	}
@@ -1530,7 +1605,7 @@ class Copy {
 	/// The known value of slot s, leaving out the op that pushed it.
 	private taken(s: Slot): Known throws CompileError {
 		if (s.v == null) {
-			throw new CompileError(`a static value is needed (${this.ins.where})`)
+			throw this.ins.error("a static value is needed")
 		}
 		if (s.at >= 0) {
 			this.dead[s.at] = true

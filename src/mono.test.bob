@@ -121,7 +121,8 @@ test "a generic instanced with type args nested ever deeper is an error" {
 	for (const i of 1 ... 255) {
 		deep += "[]"
 	}
-	assert mono(p, m) throws new CompileError(`f is instanced with type args nested ever deeper (f[${deep}])`)
+	const msg = `f is instanced with type args nested ever deeper (f[${deep}], instanced in main)`
+	assert mono(p, m) throws new CompileError(msg)
 }
 
 /// `class Box[T] { item: T; get(): T { return this.item } }`, and a main making a Box[i32] and getting its item.
@@ -488,4 +489,35 @@ test "if units, a function of fewer than small ops is its module's own and a cop
 	const names = (ds: i32[]) => ds.map(d => qualified(p, d))
 	assert names(p.modules[lib].decls) == ["one"] && names(p.modules[lib].copies) == []
 	assert names(p.modules[m].copies) == ["one"]
+}
+
+test "a static subscript out of range is a compile error at its site, and where its instance was made, not a trap" {
+	const p = new Program()
+	const m = p.addModule("main.bob")
+	p.modules[m].newlines = [10, 25]
+	const empty = add(p, m, -1, "Empty", decl.Class, 0)
+	const first = add(p, m, -1, "first", decl.Function, 0, null, ["T"])
+	const t = p.type(kind.Param, first, 0)
+	p.decls[first].type = fn(p, [t], String)
+	const c = code(p, [["x", t]],
+		[[op.Type, t], [op.Field, p.intern("fields")], [op.Int, I32, p.int(0)], [op.Subscript],
+		[op.Field, p.intern("name")], [op.Return], [op.End]])
+	c.pos[3] = 15
+	p.decls[first].code = c
+	const et = p.type(kind.Named, empty, 0)
+	const main = add(p, m, -1, "main", decl.Function, fn(p, [], I32),
+		code(p, [],
+		[[op.New, et], [op.Call, first, p.list([et])], [op.Drop], [op.Int, I32, p.int(0)], [op.Return], [op.End]]))
+	p.decls[main].code!.pos[1] = 20
+	assert mono(p, m) throws new CompileError(
+		"main.bob:2:5: index 0 out of range for length 0 (first[Empty], instanced at main.bob:2:10 in main)")
+}
+
+test "a tuple subscript out of range is a compile error, not a trap" {
+	const p = new Program()
+	const m = p.addModule("main.bob")
+	const tup = p.type(kind.Tuple, p.list([I32]), 0)
+	add(p, m, -1, "main", decl.Function, fn(p, [], I32),
+		code(p, [["x", tup]], [[op.Local, 0], [op.Int, I32, p.int(2)], [op.Subscript], [op.Return], [op.End]]))
+	assert mono(p, m) throws new CompileError("index 2 out of range for length 1 (main)")
 }
