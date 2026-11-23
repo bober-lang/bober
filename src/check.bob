@@ -7,6 +7,7 @@ import { digit, isAlphabetic, minus, o, x } from "../std/ascii"
 import { HashMap } from "../std/collections/hashmap"
 import { ScopedMap } from "../std/collections/scopedmap"
 import { Set } from "../std/collections/set"
+import { deflate } from "../std/compress/deflate"
 import { join } from "../std/fs/path"
 import { codePoint, quoted, trim, unquoted } from "../std/string"
 import * as decl from "./bc/decl"
@@ -334,7 +335,7 @@ export class TypeError {
 ///
 /// ```grammar
 /// File       = {Import Term} {Decl Term}
-/// Import     = "import" [ImportList "from"] String {Tag}
+/// Import     = "import" [(ImportList | Ident) "from"] String {Tag}
 /// ImportList = "{" [Ident ["as" Ident] {"," Ident ["as" Ident]} [","]] "}" | "*" ["as" Ident]
 /// Decl       = Test | ["export"] (Function | Class | Interface | TypeAlias | Var)
 /// Term       = ";" | newline (§2.2)
@@ -351,7 +352,9 @@ export class TypeError {
 ///
 /// The one tag of an import is `@Deterministic` (builtin/tag.bob), of a C header's or C file's: what its functions give
 /// depends on their arguments alone, so a test may call them and still be cached (Tests and assertions); or
-/// `@TypeScript`, of another's: its names are those of a package's TypeScript typings (src/dts.bob).
+/// `@TypeScript`, of another's: its names are those of a package's TypeScript typings (src/dts.bob); or `@Embed`, of a
+/// file of any other kind, by `import x from "p" @Embed`, which declares `x` a `const` string of the file's bytes.
+/// `@Embed["deflate"]` holds them deflated in the program, inflated as it starts; else `x` is a string literal.
 ///
 /// Top-level declarations may appear in any order and may refer to each other. A variable's *dependencies* are what
 /// running its initializer may run, found lexically, whether reached at run time or not: the functions and variables
@@ -446,14 +449,16 @@ class Modules {
 		return if (src == null) `cannot read ${path}` else this.checked(path, src, false)
 	}
 
-	/// The module of names from C header spec, as importer includes it, or from TypeScript typings spec, or why there is
-	/// none (3.1). Tagged, it is a module of its own, its key ending so, which lowering and src/js.bob know it by.
+	/// The module of names from C header spec, as importer includes it, or from TypeScript typings spec, or of the file
+	/// spec embedded, or why there is none (3.1). Tagged, it is a module of its own, its key ending so, which lowering and src/js.bob know it by.
 	header(importer: string, spec: string, names: string[], tag: string): Module | string {
 		const includes = searched(this.includes)
 		const user = bound.get(importer) ?? new Bound(includes)
 		bound.set(importer, user)
 		const ts = tag == "TypeScript"
+		const embed = startsWith(tag, "Embed")
 		const at = if (ts) dts.located(importer, spec, user.reader(this.read))
+			else if (embed) resolve(importer, spec)
 			else located(importer, spec, this.includes, user.reader(this.read))
 		const key = `${at}: ${names.join(" ")}${if (tag == "") "" else ` @${tag}`}`
 		const m = this.loaded.get(key) ?? this.bundled(key) ?? this.reused(key)
@@ -464,6 +469,7 @@ class Modules {
 			if (!(bound.get(key)?.current(includes, this.read) ?? false)) {
 				const b = new Bound(includes)
 				b.src = if (ts) dts.bind(at, names, b.reader(this.read))
+					else if (embed) embedded(at, tag != "Embed", b.reader(this.read))
 					else bind(importer, spec, names, this.includes, b.reader(this.read))
 				bound.set(key, b)
 			}
@@ -1252,13 +1258,18 @@ class Checker {
 		const s = n.parts![n.parts!.length - 1 - 2 * ts.length].t
 		const spec = this.key(s)
 		const c = endsWith(spec, ".h") || endsWith(spec, ".c")
-		const allowed = if (c) "Deterministic" else "TypeScript"
-		const tag = if (ts.length == 1 && this.source(ts[0]) == allowed) allowed else ""
+		const allowed = if (c) ["Deterministic"] else ["TypeScript", "Embed", "Embed[\"deflate\"]"]
+		const tag = if (ts.length == 1 && allowed.includes(this.source(ts[0]))) this.source(ts[0]) else ""
 		if (ts.length > 0 && tag == "") {
 			this.report(start(ts[0]),
-				"an import's one tag is @Deterministic, of a C import, or @TypeScript, of another")
+				"an import's one tag is @Deterministic, of a C import, or @TypeScript or @Embed, of another")
 		}
 		const what = n.parts![0]
+		const embed = startsWith(tag, "Embed")
+		if (embed != isTok(what, "ident")) {
+			return this.report(start(what),
+				if (embed) `an @Embed import is import x from "p"` else `import x from "p" is of a file, tagged @Embed`)
+		}
 		const listed = what.kind == "object"
 		const names: Tok[] = []
 		const texts: string[] = []
@@ -1267,10 +1278,10 @@ class Checker {
 			texts.push(this.text(names[names.length - 1]))
 		}
 		let m: Module | string = ""
-		if (!c && tag != "TypeScript") {
+		if (!c && tag == "") {
 			m = this.modules.load(resolve(this.m.path, if (endsWith(spec, ".bob")) spec else spec + ".bob"))
-		} else if (listed) {
-			m = this.modules.header(this.m.path, spec, texts, tag)
+		} else if (listed || embed) {
+			m = this.modules.header(this.m.path, spec, if (embed) ["value"] else texts, tag)
 		} else {
 			m = `${if (c) "a C header" else "TypeScript"}'s names are imported by name`
 		}
@@ -1292,6 +1303,8 @@ class Checker {
 					this.declareTop(this.text(alias), alias, b)
 				}
 			}
+		} else if (embed) {
+			this.declareTop(this.text(what.t), what.t, m.exports.get("value")!)
 		} else if (isTok(what, "*")) {
 			for (const name of m.names) {
 				this.declareTop(name, what.t, m.exports.get(name)!)
@@ -5096,6 +5109,17 @@ function newable(t: Type): bool {
 			return c != null && c.kind == "function" && c.n == 0
 	}
 	return false
+}
+
+/// The source of the module of a file embedded (3), of the file at path: `value`, its bytes, deflated in the program
+/// and inflated as it starts if deflated.
+function embedded(path: string, deflated: bool, read: (path: string) => string | null): string throws CompileError {
+	const s = read(path)
+	if (s == null) {
+		throw new CompileError(`cannot read ${path}`)
+	}
+	return if (!deflated) `export const value = ${quoted(s!)}\n`
+		else `import { inflate } from "std/compress/deflate"\nexport const value = inflate(${quoted(deflate(s!, 9))})\n`
 }
 
 /// The path of spec, imported from the module at importer: relative to importer's directory if it starts with a dot, else

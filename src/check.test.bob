@@ -997,9 +997,9 @@ test "an import tagged @TypeScript declares the names of TypeScript typings, but
 	assert errors("import { g } from \"./p.d.ts\" @TypeScript", ts) == "18: g: p.d.ts:2:1: a generic function"
 	assert errors("import * as p from \"./p.d.ts\" @TypeScript", ts) == "19: TypeScript's names are imported by name"
 	assert errors("import { f } from \"./p.d.ts\" @Deterministic", ts)
-		== "18: cannot read p.d.ts.bob; 30: an import's one tag is @Deterministic, of a C import, or @TypeScript, of another"
+		== "18: cannot read p.d.ts.bob; 30: an import's one tag is @Deterministic, of a C import, or @TypeScript or @Embed, of another"
 	assert errors("import { N } from \"x.h\" @TypeScript @Deterministic", ["x.h", "#define N 1\n"])
-		== "25: an import's one tag is @Deterministic, of a C import, or @TypeScript, of another"
+		== "25: an import's one tag is @Deterministic, of a C import, or @TypeScript or @Embed, of another"
 }
 
 test "spawn takes args and a result of types that cross isolates" {
@@ -1020,4 +1020,17 @@ test "a module of the bundle keeps the ABI its file holds, hashed of the paths w
 	m.abi++ // as of another root
 	const held = m.abi
 	assert l.current() && m.abi == held
+}
+
+test "an import tagged @Embed declares a const string of a file's bytes" {
+	const files = ["a.txt", "x\"\\\n\x01y"]
+	assert errors("import a from \"./a.txt\" @Embed\nconst s: string = a\nconst t = a + a", files) == ""
+	assert errors("import a from \"./a.txt\" @Embed[\"deflate\"]\nconst n: i32 = a.length", files) == ""
+	assert errors("import a from \"./a.txt\" @Embed\nfunction f() { a = \"\" }", files) == "46: a is not assignable"
+	assert errors("import a from \"./b.txt\" @Embed", files) == "14: cannot read b.txt"
+	assert errors("import * as a from \"./a.txt\" @Embed", files) == "7: an @Embed import is import x from \"p\""
+	const form = "import x from \"p\" is of a file, tagged @Embed"
+	assert errors("import a from \"./a\"", files) == `7: ${form}`
+	const tag = "an import's one tag is @Deterministic, of a C import, or @TypeScript or @Embed, of another"
+	assert errors("import a from \"./a.txt\" @Embed[\"zip\"]", files) == `7: ${form}; 25: ${tag}`
 }
