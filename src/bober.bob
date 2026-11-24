@@ -32,7 +32,7 @@ import { show } from "./bc/show"
 import { glue, includesOf, sysroot } from "./c/bind"
 import { link, object } from "./c/bobcc"
 import { doc } from "./doc"
-import { Facts, Options, emit, entry, learn, small } from "./emit"
+import { Facts, Options, Tune, emit, entry, learn } from "./emit"
 import { check, lowered as always, normal } from "./check"
 import { CompileError } from "./error"
 import { formatFile } from "./format"
@@ -106,6 +106,10 @@ export class Compile @optarg.Cc {
 	baseline: bool @optarg.Verbose = false
 	/// pass an option to LLVM, as clang's -mllvm
 	mllvm: string[] @optarg.Verbose = []
+	/// set a constant of bober's heuristics, as small=32, one of those under tune
+	tune: string[] @optarg.Verbose = []
+	/// The constants -tune sets.
+	tuned: Tune @optarg.Skip = new Tune()
 }
 
 /// build a program and run it
@@ -185,9 +189,11 @@ class Lsp @optarg.Cc @optarg.Verbose {
 
 /// The help of command c, else of all, all of it if verbose.
 function usage(c: Command | null, verbose: bool): string {
+	const compiles = c instanceof Run || c instanceof Test || c instanceof Build
+	const tune = if (verbose && compiles) "tune:\n" + replace(optarg.help[Tune](), "  --", "  ") else ""
 	for (const M of Command.members) {
 		if (c instanceof M) {
-			return [M.doc, optarg.help[M](verbose)].filter(l => l != "").join("\n")
+			return [M.doc, optarg.help[M](verbose), tune].filter(l => l != "").join("\n")
 		}
 	}
 	return `usage: bober <command> [args]\n${optarg.help[Command](verbose)}\noptions:\n${optarg.help[Flags](verbose)}`
@@ -251,6 +257,14 @@ function main(): i32 {
 	if (ignores != null) {
 		print(ignores)
 		return 2
+	}
+	if (c instanceof Run || c instanceof Test || c instanceof Build) {
+		try {
+			c.compile.tuned = optarg.decode[Tune](c.compile.tune.map(t => `--${t}`))
+		} catch (e: ParseError) {
+			print(`bad -tune ${c.compile.tune[e.at]}`)
+			return 2
+		}
 	}
 	notice()
 	try {
@@ -780,12 +794,12 @@ function programs(mains: string[], tests: bool, f: Compile, pin: bool): (main: s
 	const p = if (dyn || f.release) lowered(mains, f.headers.I) else ofWorld(mains, f.headers.I)
 	const ms = mains.map(m => p.module(normal(m)))
 	const hashed = if (tests) testHashes(p, ms) else [] // before mono changes the code
-	const o = { main: -1, tests: false, dyn: dyn }
+	const o = { main: -1, tests: false, dyn: dyn, tune: f.tuned }
 	if (!o.dyn) {
 		for (const x of 0 ... p.modules.length - 1) {
 			p.modules[x].bc = if (p.modules[x].bc != "") p.modules[x].bc else write(p, x, compilerId())
 		}
-		mono(p, ms[0], true, if (f.release) small else 0)
+		mono(p, ms[0], true, if (f.release) f.tuned.small else 0)
 	}
 	const [files, cxx] = linked(p, program(p, ms, dyn), tests, f.headers.I)
 	let failed: CompileError | null = null
@@ -971,8 +985,8 @@ function inspect(path: string, out: string, f: Compile, ir: bool) {
 	}
 	const b = new LLVM(path, 2, !f.baseline)
 	b.data(write(p, m, compilerId()), "bober_bc")
-	mono(p, m, true, if (f.release) small else 0)
-	emit(p, m, b, { main: -1, tests: false, dyn: false })
+	mono(p, m, true, if (f.release) f.tuned.small else 0)
+	emit(p, m, b, { main: -1, tests: false, dyn: false, tune: f.tuned })
 	b.verify()
 	if (ir) {
 		save(out, b.text())
@@ -1018,7 +1032,7 @@ function linked(p: Program, ms: i32[], tests: bool, includes: string[]): [string
 }
 
 /// How the image's modules are emitted: as lowered.
-const debug = { main: -1, tests: false, dyn: true }
+const debug = { main: -1, tests: false, dyn: true, tune: new Tune() }
 
 /// Of build/image.so as lowered read it, the stamp, its linker and bytes; each store of it has a new random stamp, so
 /// a file of the same stamp is the one decoded, which relink then continues.
@@ -1100,12 +1114,12 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	// Of each module's unit, <path>@<source>.<version>, or monomorphized <path>^O1@<source>.<version>, which names
 	// LLVM's of its code too, <path>^O2@...; and the unit the program is linked from.
 	const ms = program(p, mains, o.dyn)
-	// A release build's, <path>^R@..., is compiled as its program whole learns, as LLVM is told, and against builtin/
-	// as it is: of those too.
+	// Monomorphized, it is compiled as tuned; a release build's, <path>^R@..., as its program whole learns, as LLVM is
+	// told, and against builtin/ as it is: of those too.
 	const facts = if (c.release) learn(p, o, m => new LLVM(p.modules[m].path)) else new Facts()
-	const learned = if (!c.release) ""
-		else `${facts.names}${c.baseline}${c.mllvm}`
-		+ `${ms.filter(m => builtin(p.modules[m].path)).map(m => abi(p, m))}`
+	const learned = encode(c.tuned)
+		+ (if (c.release) `${facts.names}${c.baseline}${c.mllvm}${ms.filter(m => builtin(p.modules[m].path)).map(m => abi(p, m))}`
+		else "")
 	const parts: string[] = []
 	for (const m of 0 ... p.modules.length - 1) {
 		const path = p.modules[m].path

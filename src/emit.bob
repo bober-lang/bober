@@ -48,14 +48,18 @@ import { builtin } from "./root"
 /// How a program is emitted: whether it is as lowered, a debug build's; and the module that gets C's main, which runs
 /// the program's main or, with tests, each of the module's tests, or if -1 each module gets two entries like it, an
 /// image's.
-export type Options = { main: i32, tests: bool, dyn: bool }
+export type Options = { main: i32, tests: bool, dyn: bool, tune: Tune }
 
 /// The name of the entry of the image's module at path, which runs its main as C's main would, or else its tests.
 export function entry(path: string, tests: bool): string { return `bober.${if (tests) "tests" else "main"}.${path}` }
 
-/// The ops below which a function is small: a release build gives it to each module reaching it, to inline, as mono
-/// takes it; another build never inlines one not small, so that a change of it leaves its callers' code as it was.
-export const small = 64
+/// The constants of the heuristics a build follows, as -tune sets them, which its units are hashed with.
+export class Tune {
+	/// inline functions of fewer ops: a release build's in each module calling them, another's only in their own
+	small: i32 = 64
+	/// hold by value, in a release build, classes of at most this many fields holding a ref, which each call reloads
+	refs: i32 = 2
+}
 
 /// Emits module m of program p into b; a release build's as facts says.
 export function emit(p: Program, m: i32, b: Backend, o: Options, facts: Facts = new Facts()) throws CompileError {
@@ -1447,7 +1451,8 @@ class Emitter {
 			this.copies.has(d)
 			|| this.here.has(d) && x.owner >= 0 && this.p.classOf(d) < 0 && (x.mods & decl.Export) == 0)
 		const code = x.code
-		if ((x.mods & decl.Outlined) != 0 || this.facts.phase == "none" && code != null && code.ops.length >= small) {
+		if ((x.mods & decl.Outlined) != 0
+			|| this.facts.phase == "none" && code != null && code.ops.length >= this.o.tune.small) {
 			this.b.attr(f, -1, "noinline", 0)
 		}
 		return f
@@ -3657,7 +3662,7 @@ class Emitter {
 	}
 
 	/// The classes held by value: each of which no instance is touched, of no C header or builtin/, with no field
-	/// embedded or a T[n], embedded in none, and none holding itself.
+	/// embedded or a T[n] and at most tune.refs holding a ref, embedded in none, and none holding itself.
 	private inlines(): HashMap[i32, bool] {
 		const p = this.p
 		const r = new HashMap[i32, bool]()
@@ -3669,8 +3674,12 @@ class Emitter {
 				embedded.push(this.norm(s.t))
 			}
 			const path = p.modules[p.decls[p.a(t)].module].path
+			const refs = slots.filter(s => {
+				const k = this.kindOf(s.t)
+				return k == kind.String || k > kind.Float
+			}).length
 			if (!builtin(path) && endsWith(path, ".bob") && !this.facts.touched.has(t)
-				&& !slots.some(s => s.embed || this.kindOf(s.t) == kind.FixedArray)) {
+				&& !slots.some(s => s.embed || this.kindOf(s.t) == kind.FixedArray) && refs <= this.o.tune.refs) {
 				r.set(t, true)
 				all.push(t)
 			}

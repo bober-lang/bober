@@ -1,6 +1,6 @@
 //! Tests of src/emit.bob: small programs compiled through the whole pipeline, with the run time, and run.
 
-import { emit } from "./emit"
+import { Tune, emit } from "./emit"
 import { LLVM } from "./backend/llvm"
 import { CompileError } from "./error"
 import { Outlined } from "./bc/decl"
@@ -30,7 +30,7 @@ function run(name: string, src: string, lib: string = "", tests: bool = false): 
 	const files: string[] = []
 	for (const i of 0 ... p.modules.length - 1) {
 		const b = new LLVM(p.modules[i].path, 0)
-		emit(p, i, b, { main: m, tests: tests, dyn: false })
+		emit(p, i, b, { main: m, tests: tests, dyn: false, tune: new Tune() })
 		b.verify()
 		const o = `${dir()}/${name}${i}.o`
 		b.emit(o, false)
@@ -218,7 +218,7 @@ function main(): i32 { return f(new Box()) }\n`)
 		const m = p.module(main)
 		mono(p, m)
 		const b = new LLVM(main, 0)
-		emit(p, m, b, { main: m, tests: false, dyn: false })
+		emit(p, m, b, { main: m, tests: false, dyn: false, tune: new Tune() })
 		return split(b.text(), "\n").length
 	}
 	// Of lines, as a switch on the tag per read was n lines.
@@ -673,7 +673,7 @@ test "a class whose fields nest its type args ever deeper is an error, not endle
 	for (const i of 1 ... 254) {
 		deep += "[]"
 	}
-	const o = { main: -1, tests: false, dyn: true }
+	const o = { main: -1, tests: false, dyn: true, tune: new Tune() }
 	assert emit(p, p.module(main), new LLVM(main, 0),
 		o) throws new CompileError(`A[${deep}] | null nests type args ever deeper`)
 }
@@ -687,7 +687,7 @@ test "a method whose type nests its class's type args ever deeper, or ever wider
 	for (const i of 1 ... 254) {
 		deep += "[]"
 	}
-	const o = { main: -1, tests: false, dyn: true }
+	const o = { main: -1, tests: false, dyn: true, tune: new Tune() }
 	assert emit(p, p.module(main), new LLVM(main, 0),
 		o) throws new CompileError(`() => P[${deep}] nests type args ever deeper`)
 	writeFile(main,
