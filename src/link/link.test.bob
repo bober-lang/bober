@@ -580,3 +580,51 @@ test "the slot of a local symbol stays the local's in a kept image's frozen unit
 	const second = file(keep(kept(first), [calls("b", "puts")]))
 	assert keep(kept(second), [calls("c", "environ")]).binds.length == 2
 }
+
+/// Where the call at a in image goes, through the veneer it reaches if it is one: `adrp x16`, `add x16`, `br x16`.
+function jumped(image: Image, a: u64): u64 {
+	const v = a + (addend(get(image, a), Call) as u64)
+	return if (get(image, v + 8) != 0xd61f0200) v
+		else (v & ~0xfff) + ((addend(get(image, v), Page) + addend(get(image, v + 4), PageOff)) as u64)
+}
+
+/// An object of 50 MiB of code.
+function far(name: string): Object {
+	const o = obj(name, Code, [], [])
+	o.sections[0].size = 50 << 20
+	return o
+}
+
+test "a call too far for its symbol reaches it through a veneer, which a continued image makes again" {
+	const main = obj("main", Code, [0x94000000], [new Symbol("main", Global, 0), new Symbol("f", Global)],
+		[new Fixup(0, Call, 1, 0)])
+	const f = obj("f", Code, [0xd65f03c0], [new Symbol("f", Global, 0)])
+	for (const image of [link([main, far("a"), far("b"), far("c"), f], ["main", "f"]),
+		keep(kept(file(keep(kept(), [main, far("a"), far("b"), far("c"), f], ["main", "f"]))), [far("d")])]) {
+		const [m, to] = [at(image, "main"), at(image, "f")]
+		assert to - m > 1 << 27 && m + (addend(get(image, m), Call) as u64) != to && jumped(image, m) == to
+	}
+}
+
+test "a frozen unit's call too far for a local symbol reaches it through a veneer, which a continued image makes again" {
+	const z = obj("z", Code, [0x94000000],
+		[new Symbol("lz", Global, 0), new Symbol("", Local, 1), new Symbol("a", Global), new Symbol("b", Global),
+		new Symbol("c", Global)], [new Fixup(0, Call, 1, 0)])
+	const helper = new Section("text.z", Code)
+	helper.bytes = "\xc0\x03\x5f\xd6"
+	helper.size = 4
+	z.sections.push(helper)
+	const l = kept()
+	for (const name of ["a", "b", "c"]) {
+		const o = far(name)
+		o.symbols = [new Symbol(name, Global, 0)]
+		l.lazy([name], () => o)
+	}
+	l.lazy(["lz"], () => z)
+	const first = keep(l, [obj("main", Code, [0x94000000], [new Symbol("lz", Global)], [new Fixup(0, Call, 0, 0)])],
+		["lz"])
+	const [from, to] = [at(first, "lz"), section(first, "text.z")]
+	for (const image of [first, keep(kept(file(first)), [])]) {
+		assert to - from > 1 << 27 && jumped(image, from) == to
+	}
+}
