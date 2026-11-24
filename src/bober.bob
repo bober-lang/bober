@@ -94,7 +94,7 @@ export class Compile @optarg.Cc {
 	/// monomorphize first, so that it runs fast, each module by TPDE; by default where CI is set
 	O1: bool @optarg.Verbose = process.env("CI") != null
 	/// as -O1, each module by LLVM: runs fastest but release, slow to compile; with no level given where CI is not set,
-	/// a module once a build finds it unchanged
+	/// a module once a command finds it unchanged
 	O2: bool @optarg.Verbose = false
 	/// each module as it is, fastest to compile, though CI is set; -O2 counts over it
 	O0: bool @optarg.Verbose = false
@@ -110,6 +110,8 @@ export class Compile @optarg.Cc {
 	tune: string[] @optarg.Verbose = []
 	/// The constants -tune sets.
 	tuned: Tune @optarg.Skip = new Tune()
+	/// The units the command compiled, which it holds but does not find unchanged.
+	compiled: HashMap[string, bool] @optarg.Skip = new HashMap[string, bool]()
 }
 
 /// build a program and run it
@@ -1136,9 +1138,10 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		// Monomorphized, its code names what the ABIs its bytecode has do not cover: its signatures too.
 		const version = `@${p.modules[m].source}.${fnv(bc + b + (if (o.dyn) "" else `${write(p, m, compiler)}${signatures(p, m)}${learned}`))}`
 		const [fast, opt] = [`${path}^O1${version}`, `${path}^${if (c.release) "R" else "O2"}${version}`]
-		// LLVM's at -O2, or if the image holds it, or with no level given if it holds TPDE's, which this build finds
-		// unchanged; else TPDE's, as after an edit.
-		const llvm = !o.dyn && (c.release || c.O2 || held.includes(opt) || !c.O1 && held.includes(fast))
+		// LLVM's at -O2, or if the image holds it, or with no level given if it holds TPDE's of a command before, which
+		// this finds unchanged; else TPDE's, as after an edit.
+		const llvm = !o.dyn
+			&& (c.release || c.O2 || held.includes(opt) || !c.O1 && held.includes(fast) && !c.compiled.has(fast))
 		parts.push(if (o.dyn) `${path}${version}` else fast)
 		const wanted = if (llvm) opt else parts[parts.length - 1]
 		// Monomorphized, the others of either backend, which define the same symbols.
@@ -1147,6 +1150,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 				stdout.write(`${clear}[${m + 1}/${p.modules.length}] compiling ${split(path, ": ")[0]}`)
 			}
 			l.add(unit(p, m, wanted, o, bc, b, llvm, c, facts))
+			c.compiled.set(wanted, true)
 		}
 	}
 	const cxxs: string[] = if (cxx) [`${lib}/libc++.a`, `${lib}/libc++abi.a`] else []
