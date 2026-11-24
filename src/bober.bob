@@ -32,7 +32,7 @@ import { show } from "./bc/show"
 import { glue, includesOf, sysroot } from "./c/bind"
 import { link, object } from "./c/bobcc"
 import { doc } from "./doc"
-import { Facts, Options, Tune, emit, entry, learn } from "./emit"
+import { Facts, Options, Tune, emit, entry, learn, symbolPath } from "./emit"
 import { check, lowered as always, normal } from "./check"
 import { CompileError } from "./error"
 import { formatFile } from "./format"
@@ -820,7 +820,7 @@ function programs(mains: string[], tests: bool, f: Compile, pin: bool): (main: s
 		const command = if (f.release) [executable(p, ms, files, at, main, tests)]
 			else [...(if (mac) [] else [`${sysroot}/usr/lib/libc.so`]),
 			if (packaged()) join(root, "lib/launch.c.exe") else launcher(dir), at,
-			`${entry(normal(main), tests)}${if (o.dyn) "" else monoSuffix}@${version}`]
+			`${exported(p, p.module(normal(main)), o.dyn, tests)}@${version}`]
 		built = if (tests) inputs(p, p.module(normal(main))) else []
 		hashes = if (tests) hashed[mains.indexOf(main)] else []
 		return command
@@ -1048,16 +1048,17 @@ let done: [Program, u64, u64] | null = null
 /// which loads the C library, on macOS the system's with those and libc++ in it, and exports the entries of p's modules
 /// mains. The image is kept (src/link/link.bob), and a build links only what it does not hold: each object is named
 /// by what it is made of, `<what>@<version>`, a module by its bytecode, which has the ABIs of the modules it imports,
-/// and its Bound, and monomorphized, `<path>^O1@`, by its bytecode as such too, beside the one as lowered, its symbols
-/// its own (unit), what it instances its local copies, so that programs share it; a file by its bytes; an archive,
-/// which is linked for good, by its size and when it was written. A monomorphized module is compiled by TPDE, or by
-/// LLVM as `<path>^O2@` of the same version, which any build keeps, at -O2, and with no level given where the image
-/// holds TPDE's, a build finding it unchanged. A release build's is the object LLVM makes of it, `<path>^R@`, held as
-/// it is for executable, not linked, nor any file: compiled as its program whole learns (learn), on x86-64 for
-/// x86-64-v2 unless baseline, and against builtin/ as it is, its version of those too. An image that holds all and
-/// exports the entries is left as it is. Where the image cannot take the link, or an archive it holds changed, all is
-/// linked anew, fresh. The image is written in place where no other process has it, else under a name of its own,
-/// then renamed, as a running program may have the old one mapped, or another build be reading it.
+/// and its Bound, and monomorphized, `<path>^<abi>^O1@`, by its bytecode as such too, beside the one as lowered, its
+/// symbols its own (unit), what it instances its local copies, so that programs share it, -tune specs of those per
+/// module; a file by its bytes; an archive, which is linked for good, by its size and when it was written. A
+/// monomorphized module is compiled by TPDE, or by LLVM as `<path>^<abi>^O2@` of the same version, which any build
+/// keeps, at -O2, and with no level given where the image holds TPDE's, a build finding it unchanged. A release
+/// build's is the object LLVM makes of it, `<path>^R@`, held as it is for executable, not linked, nor any file:
+/// compiled as its program whole learns (learn), on x86-64 for x86-64-v2 unless baseline, and against builtin/ as it
+/// is, its version of those too. An image that holds all and exports the entries is left as it is. Where the image
+/// cannot take the link, or an archive it holds changed, all is linked anew, fresh. The image is written in place where
+/// no other process has it, else under a name of its own, then renamed, as a running program may have the old one
+/// mapped, or another build be reading it.
 /// Of p's modules, those of the program of mains are linked (program); another is held as its bytecode alone,
 /// `<path>^bc@<version>`, that no build checks it again.
 /// Returns its path, or if pin that of a link to it of this process's, which the launcher removes, by which what the
@@ -1112,9 +1113,22 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		}
 		return !held.includes(name)
 	}
+	// Of the other monomorphizations of the module at path than spec, the units of the oldest past -tune specs, unlinked.
+	const evict = (path: string, spec: string) => {
+		const others: string[] = []
+		for (const h of held) {
+			const at = indexOf(h, "^O", path.length)
+			if (startsWith(h, `${path}^`) && at > 0 && h.slice(0, at) != spec && !others.includes(h.slice(0, at))) {
+				others.push(h.slice(0, at))
+			}
+		}
+		for (const i of 0 ... others.length - c.tuned.specs) {
+			lacks("", `${others[i]}^O`)
+		}
+	}
 	const compiler = compilerId()
-	// Of each module's unit, <path>@<source>.<version>, or monomorphized <path>^O1@<source>.<version>, which names
-	// LLVM's of its code too, <path>^O2@...; and the unit the program is linked from.
+	// Of each module's unit, <path>@<source>.<version>, or monomorphized <path>^<abi>^O1@<source>.<version>, which names
+	// LLVM's of its code too, <path>^<abi>^O2@...; and the unit the program is linked from.
 	const ms = program(p, mains, o.dyn)
 	// Monomorphized, it is compiled as tuned; a release build's, <path>^R@..., as its program whole learns, as LLVM is
 	// told, and against builtin/ as it is: of those too.
@@ -1137,7 +1151,8 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		}
 		// Monomorphized, its code names what the ABIs its bytecode has do not cover: its signatures too.
 		const version = `@${p.modules[m].source}.${fnv(bc + b + (if (o.dyn) "" else `${write(p, m, compiler)}${signatures(p, m)}${learned}`))}`
-		const [fast, opt] = [`${path}^O1${version}`, `${path}^${if (c.release) "R" else "O2"}${version}`]
+		const spec = symbolPath(p, m, o.dyn)
+		const [fast, opt] = [`${spec}^O1${version}`, if (c.release) `${path}^R${version}` else `${spec}^O2${version}`]
 		// LLVM's at -O2, or if the image holds it, or with no level given if it holds TPDE's of a command before, which
 		// this finds unchanged; else TPDE's, as after an edit.
 		const llvm = !o.dyn
@@ -1145,7 +1160,10 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		parts.push(if (o.dyn) `${path}${version}` else fast)
 		const wanted = if (llvm) opt else parts[parts.length - 1]
 		// Monomorphized, the others of either backend, which define the same symbols.
-		if (lacks(wanted, if (o.dyn) `${path}@` else if (c.release) `${path}^R@` else `${path}^O`)) {
+		if (lacks(wanted, if (o.dyn) `${path}@` else if (c.release) `${path}^R@` else `${spec}^O`)) {
+			if (!o.dyn && !c.release) {
+				evict(path, spec)
+			}
 			if (clear != "") {
 				stdout.write(`${clear}[${m + 1}/${p.modules.length}] compiling ${split(path, ": ")[0]}`)
 			}
@@ -1188,8 +1206,8 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		l.library(name, format.exports(file, readFile(file)))
 	}
 	for (const m of if (c.release) [] else mains) {
-		l.export(entry(p.modules[m].path, false) + (if (o.dyn) "" else monoSuffix))
-		l.export(entry(p.modules[m].path, true) + (if (o.dyn) "" else monoSuffix))
+		l.export(exported(p, m, o.dyn, false))
+		l.export(exported(p, m, o.dyn, true))
 	}
 	const changed = l.changed()
 	let at = out // where the image is written
@@ -1313,7 +1331,8 @@ function executable(p: Program, mains: i32[], files: string[], at: string, main:
 	const t = b.fn(b.int(32), [b.int(32), b.ptr()])
 	const f = b.function("main", t, false)
 	b.at(b.block(f))
-	b.ret(b.call(t, b.function(entry(normal(main), tests), t, false), [b.param(f, 0), b.param(f, 1)]))
+	b.ret(b.call(t, b.function(entry(p, p.module(normal(main)), false, tests), t, false),
+		[b.param(f, 0), b.param(f, 1)]))
 	const objects = [`${exe}.o`]
 	b.emit(objects[0], false)
 	const l = new Linker(machine, format, new Bytes(mapFile(at)))
@@ -1328,6 +1347,11 @@ function executable(p: Program, mains: i32[], files: string[], at: string, main:
 
 /// What the names of a monomorphized unit end in (unit).
 const monoSuffix = "^mono"
+
+/// The name the image exports the entry of p's module m as (entry).
+function exported(p: Program, m: i32, dyn: bool, tests: bool): string {
+	return entry(p, m, dyn, tests) + (if (dyn) "" else monoSuffix)
+}
 
 /// The symbol named by the ABI of p's module m.
 function abiSymbol(p: Program, m: i32): string { return `bober.abi.${p.modules[m].path}.${abi(p, m)}` }

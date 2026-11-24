@@ -33,6 +33,7 @@ import { Frame as AbiFrame, attrs, call as cCall, held as heldAs, signature } fr
 import { Backend, Binary, Block, Cmp, FCmp, Type as IrType, Value, mark } from "./backend/backend"
 import * as decl from "./bc/decl"
 import { Embed, Extern, Mixin, Readonly, Static } from "./bc/decl"
+import { abi } from "./bc/file"
 import * as kind from "./bc/kind"
 import * as op from "./bc/op"
 import { Opcode } from "./bc/op"
@@ -50,8 +51,16 @@ import { builtin } from "./root"
 /// image's.
 export type Options = { main: i32, tests: bool, dyn: bool, tune: Tune }
 
-/// The name of the entry of the image's module at path, which runs its main as C's main would, or else its tests.
-export function entry(path: string, tests: bool): string { return `bober.${if (tests) "tests" else "main"}.${path}` }
+/// The name of the entry of p's module m, which runs its main as C's main would, or else its tests.
+export function entry(p: Program, m: i32, dyn: bool, tests: bool): string {
+	return `bober.${if (tests) "tests" else "main"}.${symbolPath(p, m, dyn)}`
+}
+
+/// Module m's path in symbols, monomorphized then with its ABI's hash, as each package's programs monomorphize it their
+/// own way, the units of which an image holds side by side.
+export function symbolPath(p: Program, m: i32, dyn: bool): string {
+	return if (dyn) p.modules[m].path else `${p.modules[m].path}^${abi(p, m)}`
+}
 
 /// The constants of the heuristics a build follows, as -tune sets them, which its units are hashed with.
 export class Tune {
@@ -59,6 +68,9 @@ export class Tune {
 	small: i32 = 64
 	/// hold by value, in a release build, classes of at most this many fields holding a ref, which each call reloads
 	refs: i32 = 2
+	/// keep in the image the units of this many monomorphizations of a module, as programs of other packages or edits of
+	/// its ABI make them
+	specs: i32 = 4
 }
 
 /// Emits module m of program p into b; a release build's as facts says.
@@ -180,6 +192,8 @@ class Emitter {
 	p: Program
 	m: i32
 	path: string
+	/// Its path in symbols (symbolPath).
+	named: string
 	b: Backend
 	o: Options
 	/// Whether the program is as lowered, each generic's code once, taking its type args' descriptors.
@@ -286,6 +300,7 @@ class Emitter {
 		this.p = p
 		this.m = m
 		this.path = p.modules[m].path
+		this.named = symbolPath(p, m, o.dyn)
 		this.src = p.modules[m]
 		this.b = b
 		this.o = o
@@ -402,8 +417,8 @@ class Emitter {
 		}
 		this.init()
 		if (this.o.main < 0) {
-			this.cMain(entry(this.path, false), false)
-			this.cMain(entry(this.path, true), true)
+			this.cMain(entry(p, this.m, this.dyn, false), false)
+			this.cMain(entry(p, this.m, this.dyn, true), true)
 		} else if (this.m == this.o.main) {
 			this.cMain("main", this.o.tests)
 		}
@@ -569,9 +584,9 @@ class Emitter {
 		const p = this.p
 		const b = this.b
 		const phase = if (lets) "let" else "const"
-		const flag = if (lets) this.letSlot(`bober.inited.let.${this.path}`, this.i1)
-			else b.global(`bober.inited.const.${this.path}`, b.constInt(this.i1, 0), true, 0)
-		const f = b.function(`bober.init.${phase}.${this.path}`, b.fn(this.void, []), false)
+		const flag = if (lets) this.letSlot(`bober.inited.let.${this.named}`, this.i1)
+			else b.global(`bober.inited.const.${this.named}`, b.constInt(this.i1, 0), true, 0)
+		const f = b.function(`bober.init.${phase}.${this.named}`, b.fn(this.void, []), false)
 		this.fn = f
 		this.unwind = 0
 		this.start(b.block(f))
@@ -581,16 +596,16 @@ class Emitter {
 		b.condBr(b.load(this.i1, done, false), end, go)
 		this.start(go)
 		b.store(b.constInt(this.i1, 1), done, false)
-		const deps = p.modules[this.m].deps.map(m => p.modules[m].path)
+		const deps = [...p.modules[this.m].deps]
 		if (!builtin(this.path)) {
-			for (const m of p.modules) {
-				if (builtin(m.path) && !deps.includes(m.path)) {
-					deps.push(m.path)
+			for (const m of 0 ... p.modules.length - 1) {
+				if (builtin(p.modules[m].path) && !deps.includes(m)) {
+					deps.push(m)
 				}
 			}
 		}
-		for (const path of deps) {
-			const g = b.function(`bober.init.${phase}.${path}`, b.fn(this.void, []), false)
+		for (const m of deps) {
+			const g = b.function(`bober.init.${phase}.${symbolPath(p, m, this.dyn)}`, b.fn(this.void, []), false)
 			this.call(b.valueType(g), g, [])
 		}
 		for (const d of p.modules[this.m].inits) {
@@ -627,10 +642,10 @@ class Emitter {
 		this.unwind = 0
 		this.start(b.block(f))
 		this.rt("start", [b.param(f, 0), b.param(f, 1), b.constInt(this.i32, if (tests) 1 else 0)])
-		const initConst = b.function(`bober.init.const.${this.path}`, b.fn(this.void, []), false)
+		const initConst = b.function(`bober.init.const.${this.named}`, b.fn(this.void, []), false)
 		this.call(b.valueType(initConst), initConst, [])
 		this.rt("freeze", [], false)
-		const initLet = b.function(`bober.init.let.${this.path}`, b.fn(this.void, []), false)
+		const initLet = b.function(`bober.init.let.${this.named}`, b.fn(this.void, []), false)
 		this.rt("set_lets_init", [initLet], false)
 		let r = b.constInt(this.i32, 0)
 		for (const d of p.modules[this.m].decls) {
@@ -4849,7 +4864,7 @@ class Emitter {
 		}
 		const p = this.p
 		const x = p.decls[d]
-		const path = p.modules[x.module].path
+		const path = symbolPath(p, x.module, this.dyn)
 		const name = p.strings[x.name]
 		let r = if (x.kind == decl.Test) `${path}:test ${name}`
 			else if (x.owner < 0) `${path}:${name}`

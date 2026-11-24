@@ -276,7 +276,8 @@ test "with no level a module is compiled by TPDE until a build finds it unchange
 	const out = built(files(1), "")
 	assert out == printed(1) && units().length > 0 && by("^O1@") && built([], "") == out && by("^O2@")
 	const edited = built([["lib.bob", replace(lib, "return f(i32)", "return f(i64)")]], "")
-	assert edited == replace(out, "true i32", "true i64") && units().some(o => startsWith(o, `${home()}/lib.bob^O1@`))
+	assert edited == replace(out, "true i32", "true i64")
+		&& units().some(o => startsWith(o, `${home()}/lib.bob^`) && indexOf(o, "^O1@") > 0)
 	assert built([], "") == edited && by("^O2@")
 	const opt = units()
 	assert built([], "-O1") == edited && units() == opt
@@ -376,7 +377,8 @@ test "a module's unit as lowered and monomorphized are held side by side, each b
 	const [out, mono] = [built(files(1)), built([], "-O1")]
 	const both = held()
 	assert out == printed(1) && mono == out && built([]) == out && held() == both
-	assert both.some(o => startsWith(o, `${home()}/lib.bob@`)) && both.some(o => startsWith(o, `${home()}/lib.bob^O1@`))
+	assert both.some(o => startsWith(o, `${home()}/lib.bob@`))
+		&& both.some(o => startsWith(o, `${home()}/lib.bob^`) && indexOf(o, "^O1@") > 0)
 }
 
 test "programs that share a module, each of other instances of its generic and classes of its interface, built -O1" {
@@ -550,4 +552,19 @@ test "of a test file whose code changed, only the tests that run changed code ru
 	} finally {
 		dir = "build"
 	}
+}
+
+test "programs of two packages, each with a class of a module's interface, keep its unit of each side by side" {
+	const lib = `export interface Named { name(): string }\n\nexport function named(x: Named): string { return x.name() }\n`
+	const main = (c: string) => `import { named } from "../lib"\n\nclass ${c} { name(): string { return "${c}" } }\n
+function main() { print(named(new ${c}())) }\n`
+	anew()
+	mkdirAll(`${home()}/a`)
+	mkdirAll(`${home()}/b`)
+	const a = built([["lib.bob", lib], ["a/bober.pkg", `{ "name": "@test/a" }\n`], ["a/main.bob", main("A")],
+		["b/bober.pkg", `{ "name": "@test/b" }\n`], ["b/main.bob", main("B")]], "-O1", "a/main.bob")
+	assert a == "A\n" && built([], "-O1", "b/main.bob") == "B\n"
+	const units = held()
+	assert built([], "-O1", "a/main.bob") == a && held() == units
+	assert units.filter(o => startsWith(o, `${home()}/lib.bob^`)).length == 2
 }
