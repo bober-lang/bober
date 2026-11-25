@@ -48,7 +48,7 @@ import { pe } from "./link/pe"
 import { x64 } from "./link/x64"
 import { Bytes, store } from "./link/bytes"
 import { stamp, stamped } from "./link/keep"
-import { Linker, Stale } from "./link/link"
+import { Linker, Stale, key } from "./link/link"
 import { Const, Global, Kept, Local, Object, Section, Symbol } from "./link/object"
 import { SyntaxError } from "./lex"
 import { js } from "./js"
@@ -1125,7 +1125,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	const unchanged = old != null && d != null && left == d[0]
 	const kept = if (unchanged) d![2] else mapped
 	const l = if (unchanged) d![1] else new Linker(machine, format, kept)
-	// The image's objects by the path they are of (home).
+	// The image's objects by the path they are of (home), of which evict looks for those of other ABIs.
 	const held = new HashMap[string, string[]]()
 	for (const h of l.objects()) {
 		if (!held.has(home(h))) {
@@ -1134,13 +1134,15 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		held.get(home(h))!.push(h)
 	}
 	const of = (name: string) => held.get(home(name)) ?? []
-	const has = (name: string) => of(name).includes(name)
-	// Whether the image lacks the object name; the others of what, by default another version of it, are unlinked.
-	const lacks = (name: string, what = name.slice(0, lastIndexOf(name, "@") + 1)) => {
-		for (const h of of(what).filter(h => h != name && startsWith(h, what))) {
-			l.remove(h)
+	const has = (name: string) => l.holds(key(name)).includes(name)
+	// Whether the image lacks the object name; the others of keys, by default another version of it, are unlinked.
+	const lacks = (name: string, keys = [key(name)]) => {
+		for (const k of keys) {
+			for (const h of l.holds(k).filter(h => h != name)) {
+				l.remove(h)
+			}
 		}
-		return !of(what).includes(name)
+		return !has(name)
 	}
 	// Of the other monomorphizations of the module at path than spec, the units of the oldest past -tune specs, unlinked.
 	const evict = (path: string, spec: string) => {
@@ -1152,7 +1154,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			}
 		}
 		for (const i of 0 ... others.length - c.tuned.specs) {
-			lacks("", `${others[i]}^O`)
+			lacks("", [`${others[i]}^O1`, `${others[i]}^O2`])
 		}
 	}
 	const compiler = compilerId()
@@ -1188,7 +1190,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		parts.push(if (o.dyn) `${path}${version}` else fast)
 		const wanted = if (llvm) opt else parts[parts.length - 1]
 		// Monomorphized, the others of either backend, which define the same symbols.
-		if (lacks(wanted, if (o.dyn) `${path}@` else if (c.release) `${path}^R@` else `${spec}^O`)) {
+		if (lacks(wanted, if (o.dyn) [path] else if (c.release) [`${path}^R`] else [`${spec}^O1`, `${spec}^O2`])) {
 			if (!o.dyn && !c.release) {
 				evict(path, spec)
 			}
@@ -1217,7 +1219,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		const info = stat(f)
 		const name = `${f}@${info.modified}.${info.size}`
 		parts.push(name)
-		if (of(name).some(h => h != name)) {
+		if (l.holds(f).some(h => h != name)) {
 			return image(p, mains, files, cxx, pin, o, c, true)
 		}
 		if (!has(name)) {

@@ -11,7 +11,7 @@
 //! linked for good as one unit. Of the objects given, the image keeps the symbols and the fixups a link may set anew,
 //! not their bytes. A link the image cannot take is Stale, and who links then links all anew.
 
-import { merge, partitionPoint, sort, sortBy, stableSort, startsWith } from "../../std/algo"
+import { lastIndexOf, merge, partitionPoint, sort, sortBy, stableSort, startsWith } from "../../std/algo"
 import { HashMap } from "../../std/collections/hashmap"
 import { bytes as random } from "../../std/crypto/random"
 import { get, put } from "../../std/encoding/binary"
@@ -215,6 +215,9 @@ export class Linker {
 	private state = new State()
 	private loaded = 0
 	private bytes = new Bytes()
+	/// Of the units it holds but the frozen one, those not unlinked, by name, and by key (holds).
+	private named = new HashMap[string, Unit]()
+	private keyed = new HashMap[string, Unit[]]()
 	/// The frozen unit's record as the continued image has it, apart from its encoded, which fix may clear: make reads
 	/// its symbols with a name, and freeze, on making a frozen unit anew, its local ones.
 	private held = ""
@@ -251,6 +254,10 @@ export class Linker {
 		this.units[0].frozen = true
 		this.held = this.units[0].encoded
 		this.loaded = s.units.length
+		for (const u of this.units.slice(1, this.loaded)) {
+			this.named.set(u.object.name, u)
+			this.keyed.set(key(u.object.name), [...(this.keyed.get(key(u.object.name)) ?? []), u])
+		}
 		this.bytes = kept!
 		this.table = kept!
 		this.at = at
@@ -285,11 +292,15 @@ export class Linker {
 		return out
 	}
 
+	/// The names of the objects given that the continued image holds whose key is key: their name up to its last @, or
+	/// all of it if it has none.
+	holds(key: string): string[] { return (this.keyed.get(key) ?? []).map(u => u.object.name) }
+
 	/// Unlinks the object of that name the continued image holds.
 	remove(name: string) {
-		const u = this.units.slice(0, this.loaded).find(u => !u.frozen && u.object.name == name)
+		const u = this.named.get(name)
 		if (u != null) {
-			this.unlink(u)
+			this.unlink(u!)
 		}
 	}
 
@@ -508,6 +519,8 @@ export class Linker {
 		}
 		this.units = this.units.filter(x => x != u)
 		this.loaded--
+		this.named.delete(u.object.name)
+		this.keyed.set(key(u.object.name), this.keyed.get(key(u.object.name))!.filter(x => x != u))
 	}
 
 	/// Takes the groups of unit k's sections no unit before has, and its definitions over weak ones, and notes what it
@@ -1388,6 +1401,12 @@ function merged(entries: [string, u8, u64, u64][]): [string, u8, u64, u64][] {
 		}
 	}
 	return out
+}
+
+/// What Linker.holds finds an object named name by.
+export function key(name: string): string {
+	const at = lastIndexOf(name, "@")
+	return if (at >= 0) name.slice(0, at) else name
 }
 
 /// Where fixup f of section i of o is, for messages.
