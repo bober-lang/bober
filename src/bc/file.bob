@@ -52,7 +52,6 @@
 //! one hash, of all of theirs.
 
 import { sort } from "../../std/algo"
-import { isDigit } from "../../std/ascii"
 import { HashMap } from "../../std/collections/hashmap"
 import { Reader, Writer } from "../../std/encoding/binary"
 import { isAbs, join } from "../../std/fs/path"
@@ -750,9 +749,7 @@ class Abis {
 
 /// Module m's signatures being hashed, and the other modules they name; or if all, its decls and copies with their
 /// code, and the signatures of all they name, of other modules too, and of what these name; or if m is -1, a decl at a
-/// time (own), with its code, and the decls it names, but positions: a test's marks, calls of mark, and the names of
-/// the decls named by their position, an arrow's or an Outlined function's, which are hashed as the nth their owner
-/// owns instead.
+/// time (own), with its code, and the decls it names, but positions: a test's marks and calls of mark.
 class Abi {
 	p: Program
 	m: i32
@@ -803,7 +800,7 @@ class Abi {
 		}
 		this.done.set(d, true)
 		const x = this.p.decls[d]
-		this.h = combine(combine(combine(this.h, this.id(d)), x.kind), x.mods)
+		this.h = combine(combine(combine(this.h, x.hash), x.kind), x.mods)
 		this.h = combine(combine(this.h, fnv(this.p.strings[x.doc])), if (x.code == null) 0 else 1)
 		for (const t of x.params) {
 			this.h = combine(this.h, fnv(this.p.strings[t.name]))
@@ -846,7 +843,7 @@ class Abi {
 					case op.TypeId: this.type(x)
 					case op.TypeList: this.list(x)
 					case op.DeclId:
-						this.h = combine(this.h, this.id(x))
+						this.h = combine(this.h, this.p.decls[x].hash)
 						this.named(x)
 					case op.StrId: this.h = combine(this.h, fnv(this.p.strings[x]))
 					case op.IntId: this.h = combine(this.h, this.p.ints[x])
@@ -857,14 +854,6 @@ class Abi {
 				}
 			}
 		}
-	}
-
-	/// Decl d's hash, but if m is -1, of one its owner names by its position, its owner's and its nth.
-	private id(d: i32): u64 {
-		const x = this.p.decls[d]
-		const name = this.p.strings[x.name]
-		return if (this.m >= 0 || x.owner < 0 || name == "" || !isDigit(name[0])) x.hash
-			else combine(this.id(x.owner), this.p.decls[x.owner].members.indexOf(d))
 	}
 
 	private list(l: i32) {

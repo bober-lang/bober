@@ -1044,7 +1044,7 @@ class Gen {
 			if (hi - lo >= chunk && open < hi) {
 				const part = ps.slice(lo, hi)
 				const pos = part[0].t.loc.pos
-				this.nested(`${pos}`, Type.function([], Null), decl.Outlined, pos, g => g.stmts(part))
+				this.nested("", Type.function([], Null), decl.Outlined, pos, g => g.stmts(part))
 				this.op(op.CallRef, 0)
 				this.op(op.Drop)
 			} else {
@@ -1180,7 +1180,7 @@ class Gen {
 				this.callBuiltin("claim", 0)
 				this.op(op.If, kind.None)
 				this.expr(p.parts![0])
-				this.closure(`${p.t.loc.pos}`, Type.function([], Null), new Node("params", p.t), p.parts![1])
+				this.closure("", Type.function([], Null), new Node("params", p.t), p.parts![1])
 				this.callBuiltin("subtest", 0)
 				this.op(op.Drop)
 				this.op(op.End)
@@ -2063,7 +2063,7 @@ class Gen {
 				}
 				this.op(op.Local, o)
 				this.mark(op.Spread)
-			case "arrow": this.closure(`${p.t.loc.pos}`, t, p.parts![0], arrowBody(p), p)
+			case "arrow": this.closure("", t, p.parts![0], arrowBody(p), p)
 			case "ifExpr":
 				this.cond(p.parts![0], this.ty(t))
 				this.value(p.parts![1], t)
@@ -2493,7 +2493,7 @@ class Gen {
 		for (const k of 0 ... (hi - lo - 1) / part) {
 			const at = lo + k * part
 			const pos = ps[at].t.loc.pos
-			this.nested(`${pos}`, Type.function([t], Null), decl.Outlined, pos, g => {
+			this.nested("", Type.function([t], Null), decl.Outlined, pos, g => {
 				// Typed once a local, as params are, so that the locals typing it captures follow it.
 				const p = g.local("", kind.None)
 				g.code.locals[p].type = g.ty(t)
@@ -2614,9 +2614,11 @@ class Gen {
 		})
 	}
 
-	/// Pushes the closure of a function of type t with mods, a decl in this one's, whose code body lowers, at pos.
+	/// Pushes the closure of a function of type t with mods, a decl in this one's named name, or if "" the nth it owns,
+	/// whose code body lowers, at pos.
 	private nested(name: string, t: Type, mods: i32, pos: i32, body: (g: Gen) => void) {
-		const d = this.u.l.newDecl(this.u.m, this.owner, name, decl.Function, mods, t)
+		const nth = this.prog.decls[this.owner].members.length
+		const d = this.u.l.newDecl(this.u.m, this.owner, if (name == "") `${nth}` else name, decl.Function, mods, t)
 		this.u.depend(this.owner, d)
 		const g = new Gen(this.u, d, t.base!, this, this.typeParams)
 		g.code.at = pos
@@ -2648,7 +2650,7 @@ class Gen {
 				this.op(op.Xor)
 			case "typeof": this.op(op.Type, this.ty(x.type!))
 			case "async":
-				this.closure(`${p.t.loc.pos}`, Type.function([], x.type!), new Node("params", p.t), x)
+				this.closure("", Type.function([], x.type!), new Node("params", p.t), x)
 				this.callBuiltin("start", this.u.list([x.type!], false, this))
 			case "spawn":
 				const callee = x.parts![0]
