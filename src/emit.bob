@@ -221,6 +221,8 @@ class Emitter {
 	/// The module's string constants, by text and whether a C string, and the function values made.
 	private strs = new HashMap[string, Value]()
 	private cstrs = new HashMap[string, Value]()
+	/// The globals holding the positions of the decls sites are relative to, by decl.
+	private poses = new HashMap[i32, Value]()
 	private thunks = new HashMap[string, Value]()
 	/// The capture counts of the module's closures' functions, by decl, and once learned which captures each one's env
 	/// holds by value.
@@ -970,7 +972,9 @@ class Emitter {
 			case op.Null: this.push(this.bool(false), kind.Null)
 			case op.Int, op.Float:
 				const v = p.ints[c.b(i)]
-				if (this.boxed(this.norm(n))) {
+				if (c.ops[i + 1] == op.Call && this.isLang(c.a(i + 1), "mark")) {
+					this.push(this.position(), n) // a test's statement's, which is this op's
+				} else if (this.boxed(this.norm(n))) {
 					// Of a number type known at run time: converted from an i64's or f64's.
 					this.push(this.convert(this.desc(if (o == op.Int) kind.I64 else kind.F64), this.i64Const(v), n), n)
 				} else if (o == op.Float) {
@@ -1813,6 +1817,7 @@ class Emitter {
 	private defineSpawn(d: i32) {
 		const b = this.b
 		const f = this.callee(d)
+		this.fnDecl = d
 		this.pos = this.p.decls[d].pos
 		const [entryFn, joinFn] = this.spawnWrappers(d)
 		const errTy = b.struct([this.unionTy, this.ptr, this.i32, this.ptr])
@@ -4290,7 +4295,25 @@ class Emitter {
 	}
 
 	/// The source path and position of the op being emitted, as rt.c's functions that trap take them.
-	private site(): Value[] { return [this.cstr(this.src.path), this.b.constInt(this.i32, this.pos)] }
+	private site(): Value[] { return [this.cstr(this.src.path), this.position()] }
+
+	/// The position of the op being emitted, or -1: its offset in the decl it is in, added to that decl's position,
+	/// which the global <symbol>:pos holds, so that a function's code is the same wherever in its source it is.
+	private position(): Value {
+		if (this.pos < 0) {
+			return this.b.constInt(this.i32, -1)
+		}
+		const p = this.p
+		let d = if (p.decls[this.fnDecl].generic < 0) this.fnDecl else p.decls[this.fnDecl].generic
+		while (p.decls[d].owner >= 0 && p.classOf(d) < 0) {
+			d = p.decls[d].owner
+		}
+		const at = p.decls[d].pos
+		const base = this.poses.get(d)
+			?? put(this.poses, d, this.b.literal(`${this.symbol(d)}:pos`, this.b.constInt(this.i32, at)))
+		return this.ir().binary("add", this.ir().load(this.i32, base, false), this.b.constInt(this.i32, this.pos - at))
+	}
+
 	// The stack and the blocks.
 	private push(v: Value, t: i32) { this.stack.push({ v: v, t: this.norm(t) }) }
 	private pop(): V { return this.heap(this.taken(this.stack.pop())) }
