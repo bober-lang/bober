@@ -26,7 +26,6 @@ import { digit, isAlphabetic, lf, minus, o, underscore, x, zero } from "../std/a
 import { HashMap } from "../std/collections/hashmap"
 import { ScopedMap } from "../std/collections/scopedmap"
 import { parseFloat } from "../std/float"
-import { join } from "../std/fs/path"
 import { inf, max, min } from "../std/math"
 import { ParseError, codePoint, unquoted } from "../std/string"
 import * as decl from "./bc/decl"
@@ -44,7 +43,7 @@ import { Tok } from "./lex"
 import { Lift } from "./lift"
 import { Parser, leads } from "./parse"
 import { holdsType } from "./resolve"
-import { builtinPath, root } from "./root"
+import { builtinPath, runtime } from "./root"
 import { Bool, Field, Null, String, Type, basics, members, spells } from "./type"
 
 /// The modules at paths and those they import, checked and lowered into one Program, but those linked from the files
@@ -65,9 +64,6 @@ export function lower(paths: string[], dirs: string[] = [], cache: string[] = []
 	const p = l.finish()
 	return if (l.lift.current()) p else lower(paths, dirs, [], read)
 }
-
-/// The module path of an import of src/rt.h, up to its names.
-let rtH = `${join(root, "src/rt.h")}: `
 
 /// The stage after the checker: lowers each module's declarations as they are handed on.
 export class Lower implements Checked {
@@ -2540,7 +2536,7 @@ class Gen {
 	private taint(d: i32) {
 		const path = this.prog.modules[this.prog.decls[d].module].path
 		if (indexOf(path, ": ") >= 0 && indexOf(this.u.path(), ": ") < 0 && !endsWith(path, " @Deterministic")
-			&& !startsWith(path, rtH)) {
+			&& !runtime(path)) {
 			this.callBuiltin("taint", 0)
 			this.op(op.Drop)
 		}

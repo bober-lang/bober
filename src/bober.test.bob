@@ -475,6 +475,26 @@ test "-release holds the object LLVM made of each module in the image, and compi
 	assert built([]) == edited && built([], "-release") == edited
 }
 
+test "-release catches what a function of another module, once it cannot throw and its caller with it, now throws" {
+	let lib = "export function step(n: i32): i32 {\n\tlet s = n\n"
+	for (const i of 0 ... 20) {
+		lib += `\ts = s / 2 + ${i}\n` // of small ops or more, so no copy of main's module
+	}
+	lib += "\treturn s\n}\n"
+	const main = `import { step } from "./lib"\n\nfunction twice(n: i32): i32 { return step(n) * 2 }\n
+function main() {
+	try {
+		print(\`\${twice(1)}\`)
+	} catch (e: string) {
+		print(e)
+	}
+}\n`
+	anew()
+	assert built([["lib.bob", lib], ["main.bob", main]], "-release") == "76\n"
+	const throwing = replace(lib, "let", "if (n > 0) {\n\t\tthrow \"thrown\"\n\t}\n\tlet")
+	assert built([["lib.bob", throwing]], "-release") == "thrown\n"
+}
+
 test "a C file imported by many names is built in a file named by a hash of them, which they would make too long" {
 	const names: string[] = []
 	let c = ""
