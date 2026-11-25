@@ -147,7 +147,9 @@ static void altStack(void) {
   sigaltstack(&(stack_t){.ss_sp = alt, .ss_size = sizeof alt}, 0);
 }
 
+static void unhold(void);
 static void fault(int sig, siginfo_t *info, void *c) {
+  unhold();  // held only outside a test, where a fault ends the process
   uintptr_t sp = SP((ucontext_t *)c), at = (uintptr_t)info->si_addr;
   if (bober_frozen((void *)at)) {
     const char *what = "trap: cannot write frozen value";
@@ -228,16 +230,21 @@ _Unwind_Reason_Code bober_personality(int version, _Unwind_Action actions, uint6
 /// a process takes one to run, and gives it back as it exits, or its parent does if it could not.
 static int jobs[2];
 
-/// Makes a pool of tokens, one per processor, into fd.
-static void pool(int *fd) {
+/// Makes a pool of n tokens into fd, or with n < 1 of the processors, but one where CI is not set, at least one: how
+/// many.
+static long pool(int *fd, long n) {
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, fd)) fputs("cannot make the pool of test processes\n", stderr), exit(1);
-  for (long n = sysconf(_SC_NPROCESSORS_ONLN); n > 0; n--) put(fd[1], "+", 1);
+  if (n < 1) n = sysconf(_SC_NPROCESSORS_ONLN) - !getenv("CI");
+  if (n < 1) n = 1;
+  for (long i = 0; i < n; i++) put(fd[1], "+", 1);
+  return n;
 }
 
-void bober_jobs(void) {
+int32_t bober_jobs(int32_t n) {
   int fd[2];
   char s[32];
-  pool(fd), snprintf(s, sizeof s, "%d %d", fd[0], fd[1]), setenv("BOBER_JOBS", s, 1);
+  n = pool(fd, n), snprintf(s, sizeof s, "%d %d", fd[0], fd[1]), setenv("BOBER_JOBS", s, 1);
+  return n;
 }
 
 /// Takes a token of the pool, waiting for one if wait: whether it did.
@@ -249,6 +256,14 @@ static bool take(bool wait) {
 }
 
 static void give(void) { put(jobs[1], "+", 1); }
+
+/// Whether this process holds the token it took to initialize its module, which its first test then runs by.
+static bool held;
+
+/// Gives back the token held if no test ran by it, as the process ends.
+static void unhold(void) {
+  if (held) held = false, give();
+}
 
 /// Where the tag, bits and ref of what a landing pad caught are.
 void *bober_caught(void) { return &caught->tag; }
@@ -265,7 +280,8 @@ void bober_start(int argc, char **argv, int32_t tested) {
     tmp = getenv("BOBER_TMP") ? realpath(getenv("BOBER_TMP"), 0) : 0;
     passed = getenv("BOBER_PASSED") ? strdup(getenv("BOBER_PASSED")) : 0;
     const char *j = getenv("BOBER_JOBS");
-    if (!j || sscanf(j, "%d %d", jobs, jobs + 1) != 2) pool(jobs);
+    if (!j || sscanf(j, "%d %d", jobs, jobs + 1) != 2) pool(jobs, 0);
+    held = take(true), atexit(unhold);
     unsetenv("BOBER_TMP"), unsetenv("BOBER_JOBS"), unsetenv("BOBER_PASSED");  // not for the programs tests run
   } else getentropy(&seed, sizeof seed);
   signal(SIGPIPE, SIG_IGN);  // a write to a socket the peer closed fails with EPIPE instead
@@ -522,7 +538,8 @@ void bober_test(const char *name, const char *file, void (*f)(void)) {
   if (ok) key(&c.entry, name), raw(&c.entry, "\"ok\"");
   else {
     while (running && reap(-1, false)) {}
-    while (!take(!running)) reap(-1, true);
+    while (!held && !take(!running)) reap(-1, true);
+    held = false;
     spawn(&c), running++;
   }
   children = bober_realloc(children, ++nchildren * sizeof *children);

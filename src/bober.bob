@@ -123,6 +123,8 @@ export class Run @optarg.Cc {
 /// run a file's tests, or each file's here and below
 class Test @optarg.Cc {
 	compile: ...Compile
+	/// run at most this many tests at once, by default the processors, but one where CI is not set
+	j: i32 = 0
 	args: string[] @optarg.Rest = []
 }
 
@@ -293,8 +295,9 @@ function main(): i32 {
 function command(c: Command): i32 {
 	switch (c) {
 		case Test:
+			const jobs = bober_jobs(c.j)
 			if (c.args.length == 0) {
-				return testAll(c.compile)
+				return testAll(c.compile, jobs)
 			}
 			const main = c.args[0]
 			const f = c.compile
@@ -412,13 +415,12 @@ function init(name: string) {
 
 /// Runs the tests of testFiles(".") as test without main.bob prints them; 0 if all passed. A failed file's YAML starts
 /// with a line for each of its directories, of which those the last failed file printed are left out. Each file starts
-/// once compiled (runTests), while those before run, all of their tests taking turns by the tokens of one pool
-/// (bober_jobs), and is reported once all are started.
-function testAll(f: Compile): i32 {
-	bober_jobs()
+/// once compiled, at most jobs at once (runTests), their initializations and tests taking turns by the tokens of one
+/// pool (bober_jobs), and is reported once all are started.
+function testAll(f: Compile, jobs: i32): i32 {
 	const files = testFiles(".")
 	clear = if (isatty(1) != 0) "\r\x1b[K" else ""
-	const started = runTests(files, [], f) // what waits for each file, in order
+	const started = runTests(files, [], f, jobs) // what waits for each file, in order
 	let dirs: string[] = [] // of the last failed file
 	let failed = 0
 	for (const i of 0 ... files.length - 1) {
@@ -495,13 +497,15 @@ class TestCache {
 	init: string[] = []
 }
 
-/// Starts the tests of each of mains, built as f says, with args, unless their report is kept and f builds natively:
-/// what waits for each, giving its exit status and its report, the JSON object src/rt.c prints, ended by the exit status
-/// if a crash cut it off, or else what failed as a JSON string.
-export function runTests(mains: string[], args: string[], f: Compile): (() => [i32, string])[] {
+/// Starts the tests of each of mains, built as f says, with args, unless their report is kept and f builds natively,
+/// each once the one started jobs before it exited, if jobs > 0: what waits for each, giving its exit status and its
+/// report, the JSON object src/rt.c prints, ended by the exit status if a crash cut it off, or else what failed as a
+/// JSON string.
+export function runTests(mains: string[], args: string[], f: Compile, jobs = 0): (() => [i32, string])[] {
 	const code = if (f.wasm || f.js) "" else [`${compilerId()}`, ...f.headers.I, "--", ...args].map(quoted).join(" ")
 	const held = mains.map(main => hold(main, code))
 	const command = together(held.filter(h => h instanceof Held).map(h => (h as Held).main), f)
+	const started: (() => [i32, string])[] = []
 	return held.map(x => {
 		if (!(x instanceof Held)) {
 			return x
@@ -515,10 +519,19 @@ export function runTests(mains: string[], args: string[], f: Compile): (() => [i
 			if (tests.length > 0 && passed.length == tests.length) {
 				return () => tested(null, h, code, files, tests, passed)
 			}
+			if (jobs > 0 && started.length >= jobs) {
+				started[started.length - jobs]()
+			}
 			setenv("BOBER_TMP", `${dir}/tmp/${flat(h.main)}`, 1)
 			setenv("BOBER_PASSED", passed.map(t => `${t[0]}\n`).join(""), 1)
 			const p = process.start(cmd, `${dir}/tmp/${flat(h.main)}.log`)
-			return () => tested(p, h, code, files, tests, passed)
+			let r: [i32, string] | null = null
+			const wait = () => {
+				r ??= tested(p, h, code, files, tests, passed)
+				return r!
+			}
+			started.push(wait)
+			return wait
 		} catch (e: CompileError | IoError) {
 			h.lock.close()
 			return () => failure(e)
