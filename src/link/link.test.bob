@@ -428,18 +428,22 @@ test "an object a kept image holds that names what is no longer defined is unlin
 		[obj("d", Data, [0], [new Symbol("g", Global)])]) throws new Stale("g is not defined, but d names it")
 }
 
-test "the sections a kept image bounds stay one block" {
+test "the sections a kept image bounds are in a run, from its start to its top, the holes in it zeros" {
 	const x = obj("x", Data, [0, 0], [new Symbol("__start_types", Global), new Symbol("__stop_types", Global)],
 		[new Fixup(0, Abs64, 0, 0)])
-	const first = keep(kept(), [named("types", obj("a", Data, [1], [])), x, named("types", obj("b", Data, [2], []))],
+	// After bytes of an odd size, which the run starts aligned past.
+	const odd = obj("odd", Data, [1], [])
+	odd.sections[0].size = 3
+	odd.sections[0].bytes = "\x01\x02\x03"
+	const first = keep(kept(),
+		[x, odd, named("types", obj("a", Data, [1], [])), named("types", obj("b", Data, [2], []))],
 		["__start_types", "__stop_types"])
 	const l = kept(file(first))
 	l.remove("a")
 	const image = keep(l, [named("types", obj("a", Data, [3, 4, 5], []))])
-	const start = at(image, "__start_types")
-	assert at(image, "__stop_types") == start + 20 && get(image, start) == 2 && get(image, start + 8) == 3
-	const was = at(first, "__start_types")
-	assert get(image, start + 16) == 5 && start != was
+	const [was, start, stop] = [at(first, "__start_types"), at(image, "__start_types"), at(image, "__stop_types")]
+	const [hole, b, a] = [get(image, start), get(image, start + 8), get(image, stop - 12)]
+	assert start == was && start % 8 == 0 && stop == start + 28 && hole == 0 && b == 2 && a == 3
 }
 
 test "a kept image holds a lazy object for good, and a definition over its weak one is stale" {
@@ -496,7 +500,7 @@ test "a Kept section is in no segment, and a continued image has its bytes" {
 	assert kept(file(first)).sections("data").join("") == "\x07\x00\x00\x00\x08\x00\x00\x00"
 }
 
-test "the Zero sections of a kept image are a segment its file has no bytes of, and those it bounds one block" {
+test "the Zero sections of a kept image are a segment its file has no bytes of, and those it bounds a run" {
 	const zero = (name: string, size: u64) => {
 		const o = named("roots", obj(name, Zero, [], []))
 		o.sections[0].size = size
@@ -506,12 +510,14 @@ test "the Zero sections of a kept image are a segment its file has no bytes of, 
 		[new Fixup(0, Abs64, 0, 0)])
 	const first = keep(kept(), [zero("a", 8), x, zero("b", 16)], ["__start_roots", "__stop_roots"])
 	const last = first.segments[first.segments.length - 1]
-	assert last.size == 0 && last.zero == 24 && last.address == at(first, "__start_roots")
+	const start = at(first, "__start_roots")
+	assert last.size == 0 && last.zero >= 24 && last.address == start
 	assert get(first, 0x200, 8) > last.address // where the state is, which the loader takes none of
 	const l = kept(file(first))
 	l.remove("a")
 	const image = keep(l, [zero("a", 32)])
-	assert at(image, "__stop_roots") == at(image, "__start_roots") + 48 && image.bytes.length == first.bytes.length
+	const [from, to] = [at(image, "__start_roots"), at(image, "__stop_roots")]
+	assert from == start && to == start + 56 && image.bytes.length == first.bytes.length
 }
 
 test "a kept image's units keep their records and symbols where they are, and only new ones' are written" {
@@ -782,4 +788,19 @@ test "a kept image continued, by objects added, removed and replaced, reaches wh
 		linked++
 	}
 	assert linked > 600
+}
+
+test "a kept image's sections a name bounds once laid out are stale, and a run has those added once nothing bounds them" {
+	const types = (name: string, word: u64) => named("types", obj(name, Data, [word], []))
+	const x = obj("x", Data, [0, 0], [new Symbol("__start_types", Global)], [new Fixup(0, Abs64, 0, 0)])
+	assert keep(kept(file(keep(kept(), [types("a", 1)]))),
+		[x]) throws new Stale("__start_types bounds sections the image has laid out")
+	const first = file(keep(kept(), [types("a", 1), x], ["__start_types"]))
+	const l = kept(first)
+	l.remove("x")
+	const second = keep(l, [types("b", 2)])
+	const image = keep(kept(file(second)), [x], ["__start_types"])
+	const start = at(image, "__start_types")
+	const [a, b] = [get(image, start), get(image, start + 8)]
+	assert start != 0 && a == 1 && b == 2
 }

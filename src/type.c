@@ -74,8 +74,10 @@ static const bober_type *find(const char *p, int64_t n) {
   static bool found;
   if (!found) {
     found = true;
-    for (const bober_type *const *t = bober_types; t < bober_types_end; t++) add(*t);
-    for (const bober_type *const *t = bober_types; t < bober_types_end; t++) complete((bober_type *)*t);
+    for (const bober_type *const *t = bober_types; t < bober_types_end; t++)
+      if (*t) add(*t);
+    for (const bober_type *const *t = bober_types; t < bober_types_end; t++)
+      if (*t) complete((bober_type *)*t);
   }
   return cap ? *slot(p, n) : 0;
 }

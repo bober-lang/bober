@@ -175,7 +175,8 @@ void bober_gc_start(void **at) {
   if ((uintptr_t)heap >> 32 == 0) fputs("gc: the heap below 4 GiB\n", stderr), abort();
   cards = (uint8_t *)heap + n;
   refs = (uint64_t *)(cards + (n >> CARD) + 8), marks = refs + n / 512;
-  for (const Let *l = bober_lets; l < bober_lets_end; l++) *l->offset = lets_size, lets_size += (l->size + 15) & ~15;
+  for (const Let *l = bober_lets; l < bober_lets_end; l++)
+    if (l->offset) *l->offset = lets_size, lets_size += (l->size + 15) & ~15;
   begin(0, at);
   const char *e = getenv("BOBER_GC_EVERY");
   if (e) every = atoll(e);
@@ -399,6 +400,7 @@ static void records(void) {
   for (int pass = 0; pass < 2; pass++) {
     for (const uint8_t *const *m = bober_stackmaps; m < bober_stackmaps_end; m++) {
       const uint8_t *p = *m;
+      if (!p) continue;
       uint32_t fns = *(uint32_t *)(p + 4), consts = *(uint32_t *)(p + 8);
       const uint64_t *fn = (const uint64_t *)(p + 16);
       n += *(uint32_t *)(p + 12);
@@ -493,11 +495,12 @@ static void collect(bool freezing) {
   h_.minor = !freezing && h_.olds <= h_.major;
   memset(h_.bumped, 0, sizeof h_.bumped);
   for (const Root *g = bober_roots; !frozen_top && g < bober_roots_end; g++)
-    root(g->global, g->layout->size, g->layout);
+    if (g->global) root(g->global, g->layout->size, g->layout);
   if (!freezing) {
     frames(__builtin_frame_address(0));
     bober_parked(frames, !h_.minor);
-    for (const Let *l = bober_lets; l < bober_lets_end; l++) root((void **)(h_.lets + *l->offset), l->size, l->layout);
+    for (const Let *l = bober_lets; l < bober_lets_end; l++)
+      if (l->offset) root((void **)(h_.lets + *l->offset), l->size, l->layout);
     for (int i = 0; i < 1024; i++)
       for (Static *s = h_.statics[i]; s; s = s->next) root((void **)(s + 1), s->size, s->layout);
     for (int64_t i = 0; i < h_.nextra_roots; i++) h_.extra_roots[i].ref = traced(h_.extra_roots[i].ref);

@@ -20,7 +20,8 @@
 #endif
 
 /// Declares s and s_end, of type type[], the bounds of section s, which the linker defines: on Mach-O of section s of
-/// segment __DATA, on ELF __start_s and __stop_s; weak, 0 for a program without s.
+/// segment __DATA, on ELF __start_s and __stop_s; weak, 0 for a program without s. Between them may be entries of zeros,
+/// where a kept image has a hole, which who reads them skips.
 #if defined(__APPLE__)
 #define BOBER_SECTION(type, s)                                              \
   extern type s[] __asm("section$start$__DATA$" #s) __attribute__((weak)); \

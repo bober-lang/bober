@@ -9,10 +9,10 @@ import { Bytes, u } from "./bytes"
 import { Fixup, Local, Object, Section, Symbol } from "./object"
 
 /// What the head starts with, and the version of the encoding.
-const magic = "bober image 11"
+const magic = "bober image 12"
 
-/// Where the sections of one of regions are: from start to top, of which holes, in order, are free; cap, which top
-/// stays below, where the next region starts.
+/// Where the sections of one of regions, or of a run, are: from start to top, of which holes, in order, are free; cap,
+/// which top stays below, where the next region starts.
 export class Region {
 	start: u64
 	top: u64
@@ -45,10 +45,8 @@ export class State {
 	descs: [u64, u64][] = []
 	inits: [u64, u64] = [0, 0]
 	thread: [u64, u64, u64] = [0, 0, 1]
-	/// The bound names whose sections are laid out for good, as a frozen unit has some, and those whose sections are
-	/// laid out anew each link.
-	pinned: string[] = []
-	floating: string[] = []
+	/// Per bound name, the run of a region its sections are laid out in.
+	runs: [string, Region][] = []
 	exports: string[] = []
 }
 
@@ -59,9 +57,7 @@ export function write(s: State, arch: Arch): string {
 		w.uleb(x.length as u64)
 		w.raw(x)
 	}
-	w.raw(magic)
-	str(arch)
-	list(w, s.regions, r => {
+	const region = (r: Region) => {
 		w.uleb(r.start)
 		w.uleb(r.top)
 		w.uleb(r.cap)
@@ -69,7 +65,10 @@ export function write(s: State, arch: Arch): string {
 			w.uleb(h[0])
 			w.uleb(h[1])
 		})
-	})
+	}
+	w.raw(magic)
+	str(arch)
+	list(w, s.regions, region)
 	list(w, s.units, u => {
 		list(w, u[1], at => w.uleb(at))
 		list(w, u[3], b => {
@@ -102,9 +101,11 @@ export function write(s: State, arch: Arch): string {
 		s.seed]) {
 		w.uleb(v)
 	}
-	for (const names of [s.pinned, s.floating, s.exports]) {
-		list(w, names, str)
-	}
+	list(w, s.runs, e => {
+		str(e[0])
+		region(e[1])
+	})
+	list(w, s.exports, str)
 	return w.bytes
 }
 
@@ -166,14 +167,15 @@ export function read(file: Bytes, headers: u64, arch: Arch): State | null {
 		if (r.raw(magic.length) != magic || str() != arch) {
 			return null
 		}
-		const s = new State()
-		s.regions = many(r, () => {
+		const region = () => {
 			const region = new Region(r.uleb())
 			region.top = r.uleb()
 			region.cap = r.uleb()
 			region.holes = many(r, () => [r.uleb(), r.uleb()])
 			return region
-		})
+		}
+		const s = new State()
+		s.regions = many(r, region)
 		s.units = many(r, () => {
 			const at = many(r, () => r.uleb())
 			const blocks: [u64, u64][] = many(r, () => [r.uleb(), r.uleb()])
@@ -192,8 +194,7 @@ export function read(file: Bytes, headers: u64, arch: Arch): State | null {
 		s.thread = [r.uleb(), r.uleb(), r.uleb()]
 		s.names = [r.uleb(), r.uleb(), r.uleb()]
 		s.seed = r.uleb()
-		s.pinned = many(r, str)
-		s.floating = many(r, str)
+		s.runs = many(r, () => [str(), region()])
 		s.exports = many(r, str)
 		return s
 	} catch (e: ParseError) {
