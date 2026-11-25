@@ -33,7 +33,7 @@ import { glue, includesOf, sysroot } from "./c/bind"
 import { link, object } from "./c/bobcc"
 import { doc } from "./doc"
 import { Facts, Options, Tune, emit, entry, learn, symbolPath } from "./emit"
-import { check, deflation, lowered as always, normal } from "./check"
+import { check, checking, deflation, lowered as always, normal } from "./check"
 import { CompileError } from "./error"
 import { formatFile } from "./format"
 import { Backend } from "./backend/backend"
@@ -421,6 +421,9 @@ function init(name: string) {
 function testAll(d: string, f: Compile, jobs: i32): i32 {
 	const files = testFiles(d)
 	clear = if (isatty(1) != 0) "\r\x1b[K" else ""
+	if (clear != "") {
+		checking = path => stdout.write(`${clear}checking ${split(path, ": ")[0]}`)
+	}
 	const started = runTests(files, [], f, jobs) // what waits for each file, in order
 	let dirs: string[] = [] // of the last failed file
 	let failed = 0
@@ -446,7 +449,7 @@ function testAll(d: string, f: Compile, jobs: i32): i32 {
 	return if (failed == 0) 0 else 1
 }
 
-/// On a terminal, what takes the line of testAll, and of relink as it compiles each module, back to its start, erased;
+/// On a terminal, what takes the line of testAll, and of checking and compiling the modules, back to its start, erased;
 /// else "".
 let clear = ""
 
@@ -812,6 +815,9 @@ function programs(mains: string[], tests: bool, f: Compile, pin: bool): (main: s
 	const hashed = if (tests) testHashes(p, ms) else [] // before mono changes the code
 	const o = { main: -1, tests: false, dyn: dyn, tune: f.tuned }
 	if (!o.dyn) {
+		if (clear != "") {
+			stdout.write(`${clear}compiling ${p.modules.length} modules`)
+		}
 		for (const x of 0 ... p.modules.length - 1) {
 			p.modules[x].bc = if (p.modules[x].bc != "") p.modules[x].bc else write(p, x, compilerId())
 		}
