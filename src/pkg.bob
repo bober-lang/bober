@@ -1,10 +1,12 @@
 //! A package's bober.pkg, as std/encoding/json decodes it: the package of the files in its directory and below, to the
 //! next bober.pkg.
 
+import { fromCString } from "../std/c"
 import { Mapping, Rest, Unknown, decode } from "../std/encoding/json"
-import { dir as parent, join } from "../std/fs/path"
+import { isAbs, dir as parent, join, rel } from "../std/fs/path"
 import { ParseError } from "../std/string"
 import { CompileError } from "./error"
+import { chdir, getcwd } from "unistd.h"
 
 /// A package's name, "@namespace/name".
 export type Identity = string
@@ -48,20 +50,35 @@ export class Preset {
 	fields: Unknown[] @Rest = []
 }
 
-/// The directory of the bober.pkg nearest above cwd, relative to it, if any: the package home bober runs in.
-export let home: Dir | null = null
-/// Where bober builds, wherever under home it runs: home's build/, else cwd's.
+/// Where bober was started, relative to the package home, the directory of the bober.pkg nearest above it, which bober
+/// runs in, so that a file has one path wherever below home bober starts; null if there is none, where bober stays. A
+/// const, so that bober is at home before any let, as root, is found.
+export const here = enter()
+/// Path p as given where bober was started.
+export const given = (p: string) => if (isAbs(p) || here == null) p else join(here!, p)
+
+/// Where bober builds: home's build/, else cwd's.
 export let dir = "build"
+
+function enter(): string | null {
+	const cwd = fromCString(getcwd(0, 0))
+	const h = nearest(join(cwd, "bober.pkg"))
+	if (h == null) {
+		return null
+	}
+	chdir(h!)
+	return rel(h!, cwd)
+}
 
 /// Where a C library of the package is built, and a CMake project installed.
 export function out(pkg: Identity, lib: string): Dir { return join(dir, pkg, lib) }
 
-/// The directory of the bober.pkg nearest above path, or null if there is none; above cwd, home.
+/// The directory of the bober.pkg nearest above path, or null if there is none.
 export function nearest(path: string, read: (path: string) => string | null = p => readFile(p)): Dir | null {
 	let d = parent(path)
 	while (read(join(d, "bober.pkg")) == null) {
 		if (parent(d) == d) {
-			return if (d == ".") home else null
+			return null
 		}
 		d = parent(d)
 	}

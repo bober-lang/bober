@@ -59,6 +59,7 @@ static _Thread_local int32_t testAt;        // where in it the statement running
 static int cap = -1, saved[2] = {1, 2};  // in tests, the file the output and errors go to, and where they went
 static const char *tmp;  // in tests, the directory in which each gets one of its own, by number, if any: BOBER_TMP
 static char *passed;     // in tests, the names of those not to run, as they pass, each ended by a newline: BOBER_PASSED
+static char *home;       // the directory the paths of modules are relative to, if not the one it runs in: BOBER_HOME
 /// What src/io.c knows of the tests: the running one's directory, the files they read and whether they are tainted.
 extern char bober_tmp[], *bober_reads;
 extern long bober_nreads;
@@ -101,6 +102,8 @@ static bool put(int fd, const char *p, int64_t n) {
 /// The line and column of byte at of the file, or 0s if it cannot be read.
 static void position(const char *file, int32_t at, int *line, int *col) {
   *line = *col = 0;
+  char path[PATH_MAX];
+  if (file && home && *file != '/') snprintf(path, sizeof path, "%s/%s", home, file), file = path;
   long fd = file && at >= 0 ? bober_io_open(file, "r") : -1;
   if (fd < 0) return;
   char *p = bober_malloc(at);
@@ -284,6 +287,8 @@ void bober_start(int argc, char **argv, int32_t tested) {
     held = take(true), atexit(unhold);
     unsetenv("BOBER_TMP"), unsetenv("BOBER_JOBS"), unsetenv("BOBER_PASSED");  // not for the programs tests run
   } else getentropy(&seed, sizeof seed);
+  home = getenv("BOBER_HOME") ? strdup(getenv("BOBER_HOME")) : 0;
+  unsetenv("BOBER_HOME");  // not for the programs it runs
   signal(SIGPIPE, SIG_IGN);  // a write to a socket the peer closed fails with EPIPE instead
   altStack();
   struct sigaction a = {.sa_sigaction = fault, .sa_flags = SA_SIGINFO | SA_ONSTACK};

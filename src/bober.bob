@@ -57,7 +57,7 @@ import { serve } from "./lsp"
 import { mono } from "./mono"
 import { Parser } from "./parse"
 import { builtin, root } from "./root"
-import { CLib, Package, dir, home, load, nearest, out } from "./pkg"
+import { CLib, Package, dir, given, here, load, nearest, out } from "./pkg"
 import { notice, update, version } from "./update"
 import { wasm } from "./wasm"
 import * as process from "../std/process"
@@ -128,13 +128,13 @@ class Test @optarg.Cc {
 	args: string[] @optarg.Rest = []
 }
 
-/// report type errors and lint in files, directories or, with none, the package
+/// report type errors and lint in files, directories or, with none, here and below
 class Check @optarg.Cc {
 	headers: ...Headers
 	args: string[] @optarg.Rest = []
 }
 
-/// rewrite files, directories or, with none, the package in their one layout
+/// rewrite files, directories or, with none, here and below in their one layout
 class Format @optarg.Cc {
 	args: string[] @optarg.Rest = []
 }
@@ -221,6 +221,8 @@ export function ld(args: string[], out: string) {
 
 /// p, which is rooted or under cwd, rooted.
 const under = (cwd: string, p: string) => if (isAbs(p)) p else join(cwd, p)
+/// p rooted, as run runs the command it is in where bober was started.
+const rooted = (p: string) => under(fromCString(getcwd(0, 0)), p)
 
 /// The CMake toolchain file of C library c, built in cwd: bober's defaults for the target, its triple, the sysroot and on
 /// ELF static executables, with the compilers CMake finds, run by ccache if found with paths under cwd made relative,
@@ -263,6 +265,7 @@ function main(): i32 {
 		return 2
 	}
 	if (c instanceof Run || c instanceof Test || c instanceof Build) {
+		c.compile.headers.I = c.compile.headers.I.map(given)
 		try {
 			c.compile.tuned = optarg.decode[Tune](c.compile.tune.map(t => `--${t}`))
 		} catch (e: ParseError) {
@@ -272,12 +275,6 @@ function main(): i32 {
 	}
 	notice()
 	try {
-		const cwd = fromCString(getcwd(0, 0))
-		const h = nearest(join(cwd, "bober.pkg"))
-		if (h != null) {
-			home = rel(cwd, h)
-			dir = join(home!, "build")
-		}
 		const mllvm = if (c instanceof Run || c instanceof Test || c instanceof Build) c.compile.mllvm else []
 		options(mllvm)
 		const status = command(c)
@@ -296,12 +293,11 @@ function command(c: Command): i32 {
 	switch (c) {
 		case Test:
 			const jobs = bober_jobs(c.j)
-			if (c.args.length == 0) {
-				return testAll(c.compile, jobs)
+			const main = given(if (c.args.length == 0) "." else c.args[0])
+			if (exists(main) && stat(main).isDirectory) {
+				return testAll(main, c.compile, jobs)
 			}
-			const main = c.args[0]
-			const f = c.compile
-			const [status, report] = runTests([main], c.args.slice(1, c.args.length), f)[0]()
+			const [status, report] = runTests([main], c.args.slice(1, c.args.length), c.compile)[0]()
 			stdout.write(yamlOf(report))
 			return status
 		case Build:
@@ -313,23 +309,26 @@ function command(c: Command): i32 {
 			} else if (c.o == "") {
 				throw new CompileError("build <file.bob> takes -o <out>")
 			} else if (c.compile.wasm || c.compile.js) {
-				toTarget(c.args[0], false, c.compile, c.o)
+				toTarget(given(c.args[0]), false, c.compile, given(c.o))
 			} else {
-				inspect(c.args[0], c.o, c.compile, c.emitLLVM)
+				inspect(given(c.args[0]), given(c.o), c.compile, c.emitLLVM)
 			}
 			return 0
 		case Run: if (c.args.length > 0) {
-			return process.run([...build(c.args[0], false, c.compile, true), ...c.args.slice(1, c.args.length)])
+			const argv = build(given(c.args[0]), false, c.compile, true)
+			setenv("BOBER_HOME", fromCString(getcwd(0, 0)), 1) // where its traps find their modules
+			chdir(here ?? ".") // the program runs where bober was started
+			return process.run([...argv, ...c.args.slice(1, c.args.length)])
 		}
-		case Check: if (c.args.length > 0 || home != null) {
+		case Check: if (c.args.length > 0 || here != null) {
 			let status = 0
-			for (const e of check(sourcesOf(c.args), c.headers.I)) {
+			for (const e of check(sourcesOf(c.args), c.headers.I.map(given))) {
 				print(`${e.path}:${e.line}:${e.col}: ${if (e.warning) "warning: " else ""}${e.msg}`)
 				status = if (e.warning) status else 1
 			}
 			return status
 		}
-		case Format: if (c.args.length > 0 || home != null) {
+		case Format: if (c.args.length > 0 || here != null) {
 			let status = 0
 			for (const path of sourcesOf(c.args)) {
 				try {
@@ -349,7 +348,7 @@ function command(c: Command): i32 {
 			stdout.write(readFile(join(root, "skills/bober/SKILL.md")))
 			return 0
 		case Lsp:
-			serve(c.headers.I)
+			serve(c.headers.I.map(given))
 			return 0
 		case Init:
 			init(if (c.args.length == 0) "" else c.args[0])
@@ -361,7 +360,7 @@ function command(c: Command): i32 {
 		case Report: if (c.args.length > 0) {
 			let r = `${c.args[0]}\n\n${version()}, ${os} ${arch}\n`
 			for (const f of c.args.slice(1, c.args.length)) {
-				r += `\n${f}:\n\`\`\`bober\n${trim(readFile(f))}\n\`\`\`\n`
+				r += `\n${f}:\n\`\`\`bober\n${trim(readFile(given(f)))}\n\`\`\`\n`
 			}
 			stdout.write(r)
 			stderr.write(`bober: file it by piping it into gh issue create -R bober-lang/bober -t "<bug|slow|wish>: <title>" -F -
@@ -369,12 +368,13 @@ bober: or paste it at https://github.com/bober-lang/bober/issues/new/choose\n`)
 			return 0
 		}
 		case Bundle: if (c.args.length > 0) {
-			pack(c.args[0])
+			pack(given(c.args[0]))
 			return 0
 		}
 		case Lower: if (c.args.length > 0) {
-			const p = lower(c.args, c.headers.I)
-			for (const path of c.args) {
+			const paths = c.args.map(given)
+			const p = lower(paths, c.headers.I.map(given))
+			for (const path of paths) {
 				print(show(p, p.module(normal(path))))
 			}
 			return 0
@@ -384,15 +384,15 @@ bober: or paste it at https://github.com/bober-lang/bober/issues/new/choose\n`)
 	return 2
 }
 
-/// Writes bober.pkg in the directory it runs in, of the package name, else the one asked for on a terminal, else
-/// @local/<the directory's name>.
+/// Writes bober.pkg in the directory bober was started in, of the package name, else the one asked for on a terminal,
+/// else @local/<the directory's name>.
 function init(name: string) {
-	if (exists("bober.pkg")) {
+	if (exists(given("bober.pkg"))) {
 		throw new CompileError("bober.pkg exists")
 	}
 	let n = name
 	if (n == "") {
-		n = `@local/${base(fromCString(getcwd(0, 0)))}`
+		n = `@local/${base(join(fromCString(getcwd(0, 0)), here ?? "."))}`
 		if (isatty(0) != 0) {
 			stdout.write(`name (${n}): `)
 			let line = ""
@@ -410,15 +410,15 @@ function init(name: string) {
 	if (parts.length != 2 || parts[0].length < 2 || parts[1] == "" || !startsWith(n, "@")) {
 		throw new CompileError(`${n} is not @namespace/name`)
 	}
-	save("bober.pkg", `{\n\t"name": ${quoted(n)}\n}\n`)
+	save(given("bober.pkg"), `{\n\t"name": ${quoted(n)}\n}\n`)
 }
 
-/// Runs the tests of testFiles(".") as test without main.bob prints them; 0 if all passed. A failed file's YAML starts
+/// Runs the tests of testFiles(d) as test without main.bob prints them; 0 if all passed. A failed file's YAML starts
 /// with a line for each of its directories, of which those the last failed file printed are left out. Each file starts
 /// once compiled, at most jobs at once (runTests), their initializations and tests taking turns by the tokens of one
 /// pool (bober_jobs), and is reported once all are started.
-function testAll(f: Compile, jobs: i32): i32 {
-	const files = testFiles(".")
+function testAll(d: string, f: Compile, jobs: i32): i32 {
+	const files = testFiles(d)
 	clear = if (isatty(1) != 0) "\r\x1b[K" else ""
 	const started = runTests(files, [], f, jobs) // what waits for each file, in order
 	let dirs: string[] = [] // of the last failed file
@@ -830,9 +830,9 @@ function programs(mains: string[], tests: bool, f: Compile, pin: bool): (main: s
 			throw e
 		}
 		const [at, version] = made
-		const command = if (f.release) [executable(p, ms, files, at, main, tests)]
-			else [...(if (mac) [] else [`${sysroot}/usr/lib/libc.so`]),
-			if (packaged()) join(root, "lib/launch.c.exe") else launcher(dir), at,
+		const command = if (f.release) [rooted(executable(p, ms, files, at, main, tests))]
+			else [...(if (mac) [] else [rooted(`${sysroot}/usr/lib/libc.so`)]),
+			rooted(if (packaged()) join(root, "lib/launch.c.exe") else launcher(dir)), rooted(at),
 			`${exported(p, p.module(normal(main)), o.dyn, tests)}@${version}`]
 		built = if (tests) inputs(p, p.module(normal(main))) else []
 		hashes = if (tests) hashed[mains.indexOf(main)] else []
@@ -850,13 +850,13 @@ function toTarget(main: string, tests: bool, f: Compile,
 	const m = p.module(normal(main))
 	mono(p, m)
 	mkdirAll(parent(file))
-	const host = join(root, if (packaged()) "lib/host.mjs" else "builtin/wasm/host.mjs")
+	const host = rooted(join(root, if (packaged()) "lib/host.mjs" else "builtin/wasm/host.mjs"))
 	if (f.js) {
 		js(p, m, tests, file)
-		return ["node", host, file]
+		return ["node", host, rooted(file)]
 	}
 	wasm(p, m, tests, file)
-	return ["node", "--experimental-wasm-jspi", host, file]
+	return ["node", "--experimental-wasm-jspi", host, rooted(file)]
 }
 
 /// The source of the module at path for WebAssembly, or JavaScript if toJs: of builtin/'s, builtin/js/'s where it has
@@ -909,10 +909,10 @@ function first(by: string, options: [string, bool][]): string | null {
 /// and other packages, into the image, with their tests' network, exporting their entries; so that run and test of one
 /// there link little.
 function buildPackage(includes: string[]) {
-	if (home == null) {
+	if (here == null) {
 		throw new CompileError("no bober.pkg here or above")
 	}
-	const mains = sources(home!)
+	const mains = sources(".")
 	const p = lowered(mains, includes)
 	const [files, cxx] = linked(p, program(p, [], true), true, includes)
 	image(p, mains.map(m => p.module(normal(m))), files, cxx, false, debug)
@@ -976,10 +976,11 @@ function sources(d: string): string[] {
 	return files
 }
 
-/// The .bob files that check and format take of args, files and directories, a directory's its sources; of none, home's.
+/// The .bob files that check and format take of args, files and directories, a directory's its sources; of none, those
+/// where bober was started.
 function sourcesOf(args: string[]): string[] {
 	const files: string[] = []
-	for (const a of if (args.length == 0) [home!] else args) {
+	for (const a of (if (args.length == 0) ["."] else args).map(given)) {
 		files.push(...if (exists(a) && stat(a).isDirectory) sources(a) else [a])
 	}
 	return files
@@ -1407,7 +1408,7 @@ function cObjects(p: Program, ms: i32[], includes: string[]): [string[], bool] {
 			if (c.cmake.version > 0) {
 				cxx = true
 				const listed = split(readFile(`${out(p.name, name)}/libs`), "\n").filter(l => l != "")
-				libs.push(...listed.map(l => join(home ?? ".", l))) // under home, where cmake builds it
+				libs.push(...listed)
 			} else if (c.sources.length > 0) {
 				libs.push(archive(c, out(p.name, name), join(d, "bober.pkg"), dirs))
 			}
@@ -1509,20 +1510,17 @@ function archive(c: CLib, out: string, pkg: string, includes: string[]): string 
 	return a
 }
 
-/// Builds and installs each CMake project of the package p in h into its out, at home as if bober ran there, so that
-/// its stamps hold the same paths wherever bober runs, listing the static libraries it installs in out/libs,
-/// unless its stamp is what it was last: its entry in p, its patches and toolchain files, the stamps of those of p
-/// before it and the files of its src if a directory, by their contents, not times, which a checkout or a cache resets;
-/// a file's hash taken from o/hashes where its time and size are as recorded there and older than it, as git's index.
-/// Its src, copied or fetched with its hash checked to out/src, patched, and configured afresh with its preset "bober"
-/// and toolchain file, finding those of p before it, in out/build, which is kept, as the archive fetched.
+/// Builds and installs each CMake project of the package p in h into its out in home's build/, listing the static
+/// libraries it installs in out/libs, unless its stamp is what it was last: its entry in p, its patches and toolchain
+/// files, the stamps of those of p before it and the files of its src if a directory, by their contents, not times,
+/// which a checkout or a cache resets; a file's hash taken from o/hashes where its time and size are as recorded there
+/// and older than it, as git's index. Its src, copied or fetched with its hash checked to out/src, patched, and
+/// configured afresh with its preset "bober" and toolchain file, finding those of p before it, in out/build, which is
+/// kept, as the archive fetched.
 function cmake(h: string) {
-	const [here, at, sys] = [fromCString(getcwd(0, 0)), dir, sysroot]
-	const cwd = join(here, home ?? ".")
-	chdir(cwd)
-	dir = "build"
-	sysroot = under(here, sys)
-	const p = load(rel(cwd, under(here, h))!)
+	const [at, cwd] = [dir, fromCString(getcwd(0, 0))]
+	dir = "build" // though a test builds elsewhere
+	const p = load(h)
 	const before: string[] = []
 	for (const [name, c] of p.c) {
 		if (c.cmake.version == 0) {
@@ -1600,9 +1598,7 @@ file(ARCHIVE_EXTRACT INPUT "${o}/src.tar" DESTINATION "${o}/fetch")`)
 		save(`${o}/libs`, installed(o).join("\n"))
 		save(`${o}/stamp`, entry)
 	}
-	chdir(here)
 	dir = at
-	sysroot = sys
 }
 
 /// A target of a CMake project, as its file API describes it.

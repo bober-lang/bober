@@ -444,13 +444,22 @@ long bober_io_readlink(const char *path, void *buf, unsigned long n) {
   return reach(path), result(readlink(path, buf, n));
 }
 
-long bober_io_exe(char *buf) {
-  bober_taint();
 #ifdef __APPLE__
+/// The path the program was started by, rooted before it can change its directory, as macOS gives it as started.
+static char exe[PATH_MAX];
+
+__attribute__((constructor)) static void started(void) {
   int _NSGetExecutablePath(char *buf, uint32_t *size);  // of <mach-o/dyld.h>
   char path[PATH_MAX] = "";
   uint32_t n = sizeof path;
-  _NSGetExecutablePath(path, &n);
+  _NSGetExecutablePath(path, &n), realpath(path, exe);
+}
+#endif
+
+long bober_io_exe(char *buf) {
+  bober_taint();
+#ifdef __APPLE__
+  const char *path = exe;
 #else
   const char *path = "/proc/self/exe";
 #endif
