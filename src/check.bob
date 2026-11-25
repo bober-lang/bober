@@ -355,8 +355,8 @@ export class TypeError {
 /// `@TypeScript`, of another's: its names are those of a package's TypeScript typings (src/dts.bob); or `@Embed`, of a
 /// file of any other kind, by `import x from "p" @Embed`, which declares `x` a `const` string of the file's bytes.
 /// `@Embed["deflate"]` holds them deflated in the program, inflated as it starts, into a string of the size they had,
-/// trading the time that takes for a smaller program; else `x` is a string literal, its bytes mapped from the program
-/// as they are read.
+/// trading the time that takes for a smaller program, a release build's the smallest; else `x` is a string literal, its
+/// bytes mapped from the program as they are read.
 ///
 /// Top-level declarations may appear in any order and may refer to each other. A variable's *dependencies* are what
 /// running its initializer may run, found lexically, whether reached at run time or not: the functions and variables
@@ -452,7 +452,8 @@ class Modules {
 	}
 
 	/// The module of names from C header spec, as importer includes it, or from TypeScript typings spec, or of the file
-	/// spec embedded, or why there is none (3.1). Tagged, it is a module of its own, its key ending so, which lowering and src/js.bob know it by.
+	/// spec embedded, or why there is none (3.1). Tagged, it is a module of its own, its key ending so, a deflated
+	/// file's then by the level it is deflated at, which lowering and src/js.bob know it by.
 	header(importer: string, spec: string, names: string[], tag: string): Module | string {
 		const includes = searched(this.includes)
 		const user = bound.get(importer) ?? new Bound(includes)
@@ -462,7 +463,9 @@ class Modules {
 		const at = if (ts) dts.located(importer, spec, user.reader(this.read))
 			else if (embed) resolve(importer, spec)
 			else located(importer, spec, this.includes, user.reader(this.read))
-		const key = `${at}: ${names.join(" ")}${if (tag == "") "" else ` @${tag}`}`
+		const deflated = tag == "Embed[\"deflate\"]"
+		const tagged = if (deflated) `${tag} ${deflation}` else tag
+		const key = `${at}: ${names.join(" ")}${if (tagged == "") "" else ` @${tagged}`}`
 		const m = this.loaded.get(key) ?? this.bundled(key) ?? this.reused(key)
 		if (m != null) {
 			return m
@@ -471,7 +474,7 @@ class Modules {
 			if (!(bound.get(key)?.current(includes, this.read) ?? false)) {
 				const b = new Bound(includes)
 				b.src = if (ts) dts.bind(at, names, b.reader(this.read))
-					else if (embed) embedded(at, tag != "Embed", b.reader(this.read))
+					else if (embed) embedded(at, deflated, b.reader(this.read))
 					else bind(importer, spec, names, this.includes, b.reader(this.read))
 				bound.set(key, b)
 			}
@@ -5109,8 +5112,11 @@ function newable(t: Type): bool {
 	return false
 }
 
-/// The source of the module of a file embedded (3), of the file at path: `value`, its bytes, deflated in the program
-/// and inflated as it starts, into their length, if deflated.
+/// The level @Embed["deflate"] deflates at: 1, the fastest, or a release build's 9, the smallest.
+export let deflation = 1
+
+/// The source of the module of a file embedded (3), of the file at path: `value`, its bytes, deflated at deflation in
+/// the program and inflated as it starts, into their length, if deflated.
 function embedded(path: string, deflated: bool, read: (path: string) => string | null): string throws CompileError {
 	const s = read(path)
 	if (s == null) {
@@ -5119,7 +5125,7 @@ function embedded(path: string, deflated: bool, read: (path: string) => string |
 	if (!deflated) {
 		return `export const value = ${quoted(s!)}\n`
 	}
-	const z = quoted(deflate(s!, 9))
+	const z = quoted(deflate(s!, deflation))
 	return `import { inflate } from "std/compress/deflate"\nexport const value = inflate(${z}, ${s!.length})\n`
 }
 
