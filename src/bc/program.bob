@@ -173,6 +173,8 @@ export class Program {
 	/// Per type, how deep its parts nest, and how many types it is made of, 0 until known.
 	private depths: i32[] = []
 	private sizes: i32[] = []
+	/// Per type, whether a value of it holds a Type: 2 if so, 1 if not, 0 until known.
+	private holds: u8[] = []
 	/// Per tuple element index, its name, a Str.
 	private elements: i32[] = []
 	private langs = new HashMap[string, i32]()
@@ -374,6 +376,19 @@ export class Program {
 			this.sizes[t] = n
 		}
 		return this.sizes[t]
+	}
+
+	/// Whether a value of t holds a Type, and so is never at run time in a release build.
+	holdsType(t: i32): bool {
+		while (this.holds.length <= t) {
+			this.holds.push(0)
+		}
+		if (this.holds[t] == 0) {
+			const k = this.kinds[t]
+			const r = t == kind.Type || k != kind.Named && k != kind.Func && this.parts(t).some(x => this.holdsType(x))
+			this.holds[t] = if (r) 2 else 1
+		}
+		return this.holds[t] == 2
 	}
 
 	/// The types t lists: a function's params, a tuple's or object's parts, a union's members.

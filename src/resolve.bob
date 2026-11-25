@@ -636,9 +636,7 @@ export function takesType(p: Program, d: i32, env = 0): bool {
 }
 
 /// Whether a value of t holds a Type, and so is never at run time in a release build.
-export function holdsType(p: Program, t: i32): bool {
-	return t == kind.Type || p.kind(t) != kind.Named && p.kind(t) != kind.Func && p.parts(t).some(x => holdsType(p, x))
-}
+export function holdsType(p: Program, t: i32): bool { return p.holdsType(t) }
 
 /// Whether t is a function type taking or giving a Type, so that a value of it is known as its code (see Known.fn).
 function coded(p: Program, t: i32): bool {
@@ -1430,11 +1428,11 @@ class Copy {
 
 	/// Whether t is a string literal type, or a union of them, held as a string.
 	private spelled(t: i32): bool {
-		if (!literals(this.p, t)) {
-			return false
+		const p = this.p
+		if (p.kind(t) != kind.Union) {
+			return p.kind(t) == kind.Literal && p.a(t) == kind.String
 		}
-		const text = this.ins.flat(t)
-		return text.length == 1 && text[0] == kind.String
+		return p.items(t).length > 0 && p.items(t).every(m => this.spelled(m))
 	}
 
 	/// Whether s is a string literal, or of a string literal type, and so the one value of it (§4.2).
