@@ -11,8 +11,9 @@ import { min } from "../../std/math"
 /// saves them writes over a copy of the file.
 export class Bytes {
 	readonly file: string
-	/// Per page, its bytes if written, else none.
+	/// Per page, its bytes if written, else none; and those written, as numbers, in the order they were first.
 	pages: u8[][] = []
+	dirty: u64[] = []
 	/// How many bytes there are now.
 	length: u64
 
@@ -118,6 +119,7 @@ export class Bytes {
 			const from = at & ~0xfff
 			const n = this.file.length as u64
 			this.pages[p] = new u8[](4096)
+			this.dirty.push(p as u64)
 			if (from < n) {
 				set(this.pages[p], 0, this.file.slice(from as i32, min(n, from + 4096) as i32))
 			}
@@ -166,12 +168,10 @@ export function store(f: File, bytes: Bytes) {
 	const first = bytes.slice(0, min(4096, bytes.length)).copy() // not the file's, which this may write
 	f.writeAt(0, zeros(first.length))
 	const end = (bytes.length + 0xfff) >> 12
-	let p: u64 = 1
-	while (p < end) {
-		if (bytes.written(p << 12) || p == end - 1) {
+	for (const p of [...bytes.dirty, end - 1]) {
+		if (p > 0 && p < end) {
 			f.writeAt(p << 12, bytes.slice(p << 12, min((p + 1) << 12, bytes.length)))
 		}
-		p++
 	}
 	f.writeAt(0, first)
 }
