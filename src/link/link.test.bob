@@ -1,9 +1,14 @@
 //! Tests of src/link: hand-made Objects linked, and arm64's and x86-64's fixups on known instructions.
 
+import { sort, startsWith } from "../../std/algo"
+import { makeTempDir, open, removeAll } from "../../std/fs"
+import { fnv } from "../../std/hash"
+import { File } from "../../std/io"
+import { split } from "../../std/string"
 import { CompileError } from "../error"
-import { Bytes, mapped } from "./bytes"
+import { Bytes, decimal, store } from "./bytes"
 import { addend, arm64 } from "./arm64"
-import { read, write } from "./keep"
+import { read, stamp, stamped, write } from "./keep"
 import { Image, Linker, Stale } from "./link"
 
 import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Init, Kept, Local, Machine, Object, Page, PageOff, Rel32,
@@ -58,11 +63,21 @@ function keep(l: Linker, objects: Object[], names: string[] = []): Image throws 
 	return l.link()
 }
 
-/// The file of image, as a format of none writes it over the one it continues, which has its segments' bytes, symbols
-/// and their names.
+/// The stamp of the file file stored last, and that file, open.
+let last: [u64, File | null] = [0, null]
+
+/// The file of image, stored as a build stores it: over a copy of the file it continues, whose holes the copy keeps, if
+/// file stored that one last, else anew; and mapped.
 function file(image: Image): string {
-	const segments: [u64, u64][] = image.segments.map(s => [s.address, s.address + s.size])
-	return mapped(image.bytes, [...segments, image.symtab, image.strtab])
+	const old = if (stamp(new Bytes(image.bytes.file), 0x200) == last[0]) last[1] else null
+	stamped(image.bytes, 0x200)
+	const dir = makeTempDir("bober-")
+	const f = if (old != null) old.copy(`${dir}/image`, image.bytes.length) else open(`${dir}/image`, "w+")
+	removeAll(dir)
+	last[1]?.close()
+	store(f, image.bytes)
+	last = [stamp(image.bytes, 0x200), f]
+	return f.map()
 }
 
 /// The image of objects for machine, with names exported, and lazy ones as an archive's members, listed for the
@@ -627,4 +642,144 @@ test "a frozen unit's call too far for a local symbol reaches it through a venee
 	for (const image of [first, keep(kept(file(first)), [])]) {
 		assert to - from > 1 << 27 && jumped(image, from) == to
 	}
+}
+
+/// Version v of the differential test's object i, o<i>.<v>, of a section s<i> of code if i is even, else of data.
+/// It defines n<i> by a word of its own; if i is below 6, w<i % 3> weakly, by a word of that name's, and if 9, w0
+/// strongly, by one of its own; it names three of n0 to n9 and w0 to w2, by calls if code, else by pointers, which a
+/// quarter of its names must be defined for, the others weak; and it has a section `listed`, which `bounds` bounds, of
+/// a pointer to its own word.
+function version(i: u64, v: u64): Object {
+	const words: u64[] = [0x10000 + 0x100 * i + v, 0]
+	const symbols = [new Symbol(`n${i}`, Global, 0)]
+	if (i < 6 || i == 9) {
+		words[1] = if (i < 6) 0x20000 + i % 3 else 0x30000 + i
+		symbols.push(new Symbol(`w${i % 3}`, if (i < 6) Weak else Global, 0, 4))
+	}
+	const fixups: Fixup[] = []
+	for (const k of 0 ... 2) {
+		const n = fnv(`${i}.${v}.${k}`) % 13
+		const name = if (n < 10) `n${n}` else `w${n - 10}`
+		if (symbols.every(s => s.name != name)) {
+			symbols.push(new Symbol(name, if (fnv(`${i}.${v}.${k}.`) % 4 == 0) Global else Weak))
+		}
+		fixups.push(new Fixup(4 * (words.length as u64), if (i % 2 == 0) Call else Abs64,
+			symbols.map(s => s.name).indexOf(name), 0))
+		words.push(...[if (i % 2 == 0) 0x94000000 else 0, 0])
+	}
+	words.push(...new u64[]((fnv(`${i}.${v}`) % 8) as i32))
+	return listing(named(`s${i}`, obj(`o${i}.${v}`, if (i % 2 == 0) Code else Data, words, symbols, fixups)))
+}
+
+/// o, whose first symbol is its first section's, with a section `listed` of a pointer to it.
+function listing(o: Object): Object {
+	o.sections.push(named("listed", obj("", Data, [0, 0], [], [new Fixup(0, Abs64, 0, 0)])).sections[0])
+	return o
+}
+
+/// The object version made that is named name, or `bounds`, of 0xb0 and pointers to the start and stop of the
+/// `listed` sections, which it lists too.
+function made(name: string): Object {
+	if (name == "bounds") {
+		return listing(named("bounds", obj(name, Data, [0xb0, 0, 0, 0, 0, 0],
+			[new Symbol("", Local, 0), new Symbol("__start_listed", Global), new Symbol("__stop_listed", Global)],
+			[new Fixup(8, Abs64, 1, 0), new Fixup(16, Abs64, 2, 0)])))
+	}
+	const iv = split(name.slice(1, name.length), ".")
+	return version(decimal(iv[0]) as u64, decimal(iv[1]) as u64)
+}
+
+/// The image l links of objects too, or if it is stale, one linked anew of those named; null if that is an error.
+function relinked(l: Linker, objects: Object[], names: string[]): Image | null throws Stale {
+	try {
+		return keep(l, objects)
+	} catch (e: CompileError | Stale) {
+		if (e instanceof CompileError) {
+			return null
+		}
+	}
+	return anew(names)
+}
+
+/// The image linked anew of the objects named; null if it is an error.
+function anew(names: string[]): Image | null throws Stale {
+	try {
+		return keep(kept(), names.map(made))
+	} catch (e: CompileError) {
+		return null
+	}
+}
+
+/// The word that each fixup of objects, which image holds, reaches: 0 for a name no one defines, as a pointer is, or a
+/// call reaches a stub, `br x17` its third instruction.
+function reached(image: Image, objects: Object[]): u64[] {
+	const words: u64[] = []
+	for (const o of objects) {
+		const at = section(image, o.sections[0].name)
+		for (const f of o.sections[0].fixups) {
+			const to = if (f.kind == Call) jumped(image, at + f.at) else get(image, at + f.at, 8)
+			words.push(if (to == 0 || get(image, to + 8) == 0xd61f0220) 0 else get(image, to))
+		}
+	}
+	return words
+}
+
+/// The words of the objects image's `listed` sections point to, as held from the start of them to the stop, but zeros;
+/// ascending.
+function listed(image: Image): u64[] {
+	const words: u64[] = []
+	const bounds = section(image, "bounds")
+	let at = get(image, bounds + 8, 8)
+	while (at < get(image, bounds + 16, 8)) {
+		const p = get(image, at, 8)
+		if (p != 0) {
+			words.push(get(image, p))
+		}
+		at += 8
+	}
+	sort(words)
+	return words
+}
+
+test "a kept image continued, by objects added, removed and replaced, reaches what one linked anew of its objects does" {
+	let cur = file(keep(kept(), [made("bounds")]))
+	const versions = new u64[](10)
+	let linked = 0
+	for (const step of 1 ... 1000) {
+		const l = kept(cur)
+		let held = l.objects()
+		const added: Object[] = []
+		for (const k of 0 ... step % 2) {
+			const i = (fnv(`${step}`) + 3 * (k as u64)) % 10
+			const was = held.find(h => startsWith(h, `o${i}.`))
+			if (was != null) {
+				l.remove(was!)
+				held = held.filter(h => h != was)
+			}
+			if (was == null || fnv(`${step}.${k}`) % 3 != 0) {
+				versions[i]++
+				added.push(version(i, versions[i]))
+			}
+		}
+		const names = [...held, ...added.map(o => o.name)]
+		const image = relinked(l, added, names)
+		if (image == null) {
+			// An error of the objects given, which a link anew of them has too.
+			assert anew(names) == null
+			continue
+		}
+		// Of the objects it holds, those that name what is no longer defined unlinked.
+		cur = file(image!)
+		const objects = kept(cur).objects().map(made)
+		const versioned = objects.filter(o => o.name != "bounds")
+		const words = objects.map(o => new Bytes(o.sections[0].bytes).get(0, 4))
+		sort(words)
+		// Not in the assert, which shows what its calls are given: the images, their bytes too.
+		const again = keep(kept(), objects)
+		const [was, now] = [reached(image!, versioned), reached(again, versioned)]
+		const [first, second] = [listed(image!), listed(again)]
+		assert was == now && first == words && second == words
+		linked++
+	}
+	assert linked > 600
 }
