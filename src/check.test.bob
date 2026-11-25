@@ -6,7 +6,7 @@ import { head, write } from "./bc/file"
 import { show as shown } from "./bc/show"
 import { Checked, Node, TypeError, check, embedded, show } from "./check"
 import { CompileError } from "./error"
-import { Bound, Lift, bound, bundle, compilerId, unbundle } from "./lift"
+import { Bound, Lift, bound, bundle, compilerId, hash, unbundle } from "./lift"
 import { Lower, lower } from "./lower"
 import { Parser } from "./parse"
 
@@ -925,7 +925,7 @@ function built(src: string, files: string[], image: string[][] = [[], []]): [str
 	const l = new Lower()
 	const log = new Logged(l)
 	Bound.keep(image[1])
-	l.lift.cached(image[0], ["inc"], read)
+	l.lift.cached(image[0], ["inc"], p => hash(read(p)))
 	const errors = check(["main.bob"], ["inc"], read, log, l.lift).map(message)
 	if (errors.length > 0) {
 		return [[], errors, [[], []]]
@@ -965,7 +965,8 @@ test "a module whose file the cache holds is linked unless its source, or the AB
 	same("export function g(x = 1): i32 { return x }", all, "a.bob b.bob")
 	const errors = (a: string, cache: string[]): string => {
 		try {
-			lower(["main.bob"], [], cache, path => source(path, main, [...b, "a.bob", a]))
+			lower(["main.bob"], [], cache, path => source(path, main, [...b, "a.bob", a]),
+				path => hash(source(path, main, [...b, "a.bob", a])))
 		} catch (e: CompileError) {
 			return e.msg
 		}
@@ -976,7 +977,8 @@ test "a module whose file the cache holds is linked unless its source, or the AB
 	const i64 = "export function g(): i64 { return 1 }"
 	assert errors(i64, all[0]) == errors(i64, []) && errors(i64, []) != ""
 	const a = "export function g(): i32 { return 1 }"
-	const g = (cache: string[]) => lower(["main.bob"], [], cache, path => source(path, main, [...b, "a.bob", a]))
+	const g = (cache: string[]) => lower(["main.bob"], [], cache, path => source(path, main, [...b, "a.bob", a]),
+		path => hash(source(path, main, [...b, "a.bob", a])))
 	const cut = all[0].map(f => if (head(f).path == "a.bob") f.slice(0, f.length - 1) else f)
 	assert g(cut).modules.length == g([]).modules.length
 	const k = (s: string) => `export function g(): i32 { return 1 }\nexport const k: [${s}][] = []`

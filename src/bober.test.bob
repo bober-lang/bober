@@ -588,3 +588,18 @@ function main() { print(named(new ${c}())) }\n`
 	assert built([], "-O1", "a/main.bob") == a && held() == units
 	assert units.filter(o => startsWith(o, `${home()}/lib.bob^`)).length == 2
 }
+
+test "a file is known by its time and size once older than a build, else read, as touched, edited or of a later time" {
+	const dep = `${home()}/dep.bob`
+	const one = (n: string) => `export function one(): i32 { return ${n} }\n`
+	const at = (n: string, time: string[]) => {
+		writeFile(dep, one(n))
+		process.run(["touch", ...time, dep])
+		return built([])
+	}
+	assert built([["dep.bob", one("1")],
+		["main.bob", `import { one } from "./dep"\n\nfunction main() { print(\`\${one()}\`) }\n`]]) == "1\n"
+	assert at("1", []) == "1\n" && at("2", []) == "2\n"
+	// of the same time and size, which a build started in that tick or before sees, as of one written again in it
+	assert at("3", ["-t", "209901010000"]) == "3\n" && at("4", ["-t", "209901010000"]) == "4\n"
+}

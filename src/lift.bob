@@ -5,7 +5,7 @@
 import { indexOf, startsWith } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
 import { Reader, Writer } from "../std/encoding/binary"
-import { open } from "../std/fs"
+import { open, remove, rename, stat } from "../std/fs"
 import { join } from "../std/fs/path"
 import { fnv } from "../std/hash"
 import { executable, name } from "../std/process"
@@ -17,6 +17,7 @@ import { system } from "./c/bind"
 import { CompileError } from "./error"
 import { builtin, root } from "./root"
 import { Type } from "./type"
+import { getpid } from "unistd.h"
 
 /// The package's bundles (src/root.bob) by name, each once read: std, lib/std.bobc, and wasm, lib/wasm.bobc, the same
 /// of builtin/wasm/'s modules where it has one, and js, lib/js.bobc, of builtin/js/'s before those; empty in a repo,
@@ -47,9 +48,9 @@ export class Lift {
 	/// Whether a file of the cache was malformed, perhaps once prog held part of it, after which the cache is dropped.
 	malformed = false
 
-	/// Adds those of files to the cache that are of their module's source as it is, made by this compiler,
-	/// but builtin/'s, which every program checks first (src/check.bob).
-	cached(files: string[], includes: string[], read: (path: string) => string | null) throws IoError {
+	/// Adds those of files to the cache that are of their module's source as it is, as digest gives the hash of each
+	/// file's bytes, made by this compiler, but builtin/'s, which every program checks first (src/check.bob).
+	cached(files: string[], includes: string[], digest: (path: string) => u64) throws IoError {
 		if (files.length == 0) {
 			return
 		}
@@ -58,8 +59,8 @@ export class Lift {
 		for (const f of files) {
 			try {
 				const h = head(f)
-				const src = if (builtin(h.path)) null else source(h.path, joined, read)
-				if (src != null && h.source == sourceHash(h.path, src!) && h.compiler == compiler) {
+				const src = if (builtin(h.path)) 0 else hashedSource(h.path, joined, digest)
+				if (src != 0 && h.source == src && h.compiler == compiler) {
 					this.cache.set(h.path, f)
 				}
 			} catch (e: ParseError) {}
@@ -183,9 +184,9 @@ export class Bound {
 		}
 	}
 
-	/// Whether includes are those searched, and each file read is as read gives it.
-	current(includes: string, read: (path: string) => string | null): bool {
-		return includes == this.includes && this.reads.every(r => hash(read(r[0])) == r[1])
+	/// Whether includes are those searched, and each file read is of the hash digest gives.
+	current(includes: string, digest: (path: string) => u64): bool {
+		return includes == this.includes && this.reads.every(r => digest(r[0]) == r[1])
 	}
 
 	/// read, adding to reads each file it reads.
@@ -229,10 +230,85 @@ export function source(path: string, includes: string, read: (path: string) => s
 	if (b == null) {
 		return read(path)
 	}
-	return if (!b.current(includes, read)) null else if (b.src != "") b.src else read(path)
+	return if (!b.current(includes, p => hash(read(p)))) null else if (b.src != "") b.src else read(path)
 }
 
-function hash(s: string | null): u64 { return if (s == null) 0 else fnv(s!) }
+/// The hash of the source of the module at path as it is (source, sourceHash), as digest gives the hash of each file's
+/// bytes; 0 if there is none.
+function hashedSource(path: string, includes: string, digest: (path: string) => u64): u64 {
+	const b = bound.get(path)
+	if (b != null && !b.current(includes, digest)) {
+		return 0
+	}
+	const h = if (b != null && b.src != "") fnv(b!.src) else digest(path)
+	return if (h == 0) 0 else sourceHash(path, h)
+}
+
+/// The hash of bytes s, 0 if there are none.
+export function hash(s: string | null): u64 { return if (s == null) 0 else fnv(s!) }
+
+/// Of each file by path, its time and size and the hash of its bytes, of the build that runs (hashing).
+let hashes = new HashMap[string, [string, string, u64]]()
+/// When the build that runs started, by the files' clock; 0 if none runs.
+let since: i64 = 0
+
+/// The hash of the bytes of the file at path, 0 if there are none: as hashes holds it of the time and size it has, else
+/// read, and held only if written before the build started, as one written again in the same tick keeps its time and
+/// size.
+export function hashed(path: string): u64 {
+	try {
+		const s = stat(path)
+		const stamp = `${s.modified} ${s.size}`
+		const k = hashes.get(path)
+		if (k != null && k![1] == stamp) {
+			return k![2]
+		}
+		const h = hash(readFile(path))
+		if (s.modified < since) {
+			hashes.set(path, [path, stamp, h])
+		}
+		return h
+	} catch (e: IoError) {
+		return 0
+	}
+}
+
+/// f(), as a build, started at the time of a file made then: with the hashes the file at path keeps, which those held
+/// after are then written to, first to a file of its own.
+export function hashing(path: string, f: () => Program): Program {
+	const made = `${path}.${getpid()}` // its own, as another bober may be at it too
+	hashes = new HashMap[string, [string, string, u64]]()
+	try {
+		const r = new Reader(readFile(path) ?? "")
+		if (writeFile(made, "")) {
+			since = stat(made).modified
+			remove(made) // not left if this is killed
+		}
+		const s = () => r.raw(r.uleb() as i32)
+		while (r.pos < r.bytes.length) {
+			const p = s()
+			hashes.set(p, [p, s(), r.fixed(8)])
+		}
+	} catch (e: ParseError | IoError) {}
+	try {
+		return f()
+	} finally {
+		since = 0
+		const w = new Writer()
+		for (const [p, stamp, h] of hashes.values()) {
+			for (const x of [p, stamp]) {
+				w.uleb(x.length as u64)
+				w.raw(x)
+			}
+			w.fixed(h, 8)
+		}
+		try {
+			if (writeFile(made, w.bytes)) {
+				rename(made, path) // whole, if at all
+			}
+		} catch (e: IoError) {}
+	}
+}
 
 /// The files of the bundle named bundleName by the path each holds.
 export function stdBundle(): HashMap[string, string] {

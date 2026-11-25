@@ -26,6 +26,7 @@ import { digit, isAlphabetic, lf, minus, o, underscore, x, zero } from "../std/a
 import { HashMap } from "../std/collections/hashmap"
 import { ScopedMap } from "../std/collections/scopedmap"
 import { parseFloat } from "../std/float"
+import { fnv } from "../std/hash"
 import { inf, max, min } from "../std/math"
 import { ParseError, codePoint, unquoted } from "../std/string"
 import * as decl from "./bc/decl"
@@ -40,20 +41,20 @@ import { Checked, Node, after, arrowBody, bodyOf, check, child, compared, declar
 
 import { CompileError } from "./error"
 import { Tok } from "./lex"
-import { Lift } from "./lift"
+import { Lift, hashed } from "./lift"
 import { Parser, leads } from "./parse"
 import { holdsType } from "./resolve"
 import { builtinPath, runtime } from "./root"
 import { Bool, Field, Null, String, Type, basics, members, spells } from "./type"
 
 /// The modules at paths and those they import, checked and lowered into one Program, but those linked from the files
-/// cache (Lift.cached); checked again without them on an import cycle, which they may let it report through another
-/// module, if one of them is malformed, or if the ABI of a module one of them uses is not what it holds
-/// (Lift.current). Throws the type errors, or what is not lowered, as a CompileError.
+/// cache (Lift.cached) of their sources as digest hashes them; checked again without them on an import cycle, which
+/// they may let it report through another module, if one of them is malformed, or if the ABI of a module one of them
+/// uses is not what it holds (Lift.current). Throws the type errors, or what is not lowered, as a CompileError.
 export function lower(paths: string[], dirs: string[] = [], cache: string[] = [],
-	read: (path: string) => string | null = p => readFile(p)): Program {
+	read: (path: string) => string | null = p => readFile(p), digest: (path: string) => u64 = hashed): Program {
 	const l = new Lower()
-	l.lift.cached(cache, dirs, read)
+	l.lift.cached(cache, dirs, digest)
 	const errors = check(paths, dirs, read, l, l.lift).filter(e => !e.warning)
 	if (cache.length > 0 && (l.lift.malformed || errors.some(e => startsWith(e.msg, "import cycle")))) {
 		return lower(paths, dirs, [], read)
@@ -465,7 +466,7 @@ class Unit {
 	/// depends on (spec 3).
 	finish(p: Parser) {
 		const m = this.prog.modules[this.m]
-		m.source = sourceHash(m.path, this.src)
+		m.source = sourceHash(m.path, fnv(this.src))
 		for (const i of 0 ... p.comments.length - 1) {
 			const c = p.comments[i].loc
 			m.comments.push({ pos: c.pos, trails: !leads(this.src, c.pos),

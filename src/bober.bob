@@ -39,7 +39,7 @@ import { formatFile } from "./format"
 import { Backend } from "./backend/backend"
 import { LLVM, options, shutdown, triple } from "./backend/llvm"
 import { Tpde } from "./backend/tpde"
-import { Bound, bound, bundle, bundleName, compilerId } from "./lift"
+import { Bound, bound, bundle, bundleName, compilerId, hashing } from "./lift"
 import { members } from "./link/ar"
 import { arm64 } from "./link/arm64"
 import { elf } from "./link/elf"
@@ -1019,8 +1019,8 @@ function inspect(path: string, out: string, f: Compile, ir: bool) {
 }
 
 /// Program p of mains, lowered after the CMake projects of main's package are built, but the modules linked from the
-/// bytecode build/image.so holds, of the Bound each holds if any (unit), with the build directory made; its linker kept
-/// for relink.
+/// bytecode build/image.so holds, of the Bound each holds if any (unit), of files hashed as build/hashes keeps them
+/// (hashing), with the build directory made; its linker kept for relink.
 function lowered(mains: string[], includes: string[]): Program {
 	const h = nearest(mains[0])
 	if (h != null) {
@@ -1037,9 +1037,8 @@ function lowered(mains: string[], includes: string[]): Program {
 	Bound.keep(l.sections("bober_bind").map(s => s.copy()))
 	decoded = if (kept == null) null else [stamp(kept, format.headers), l, kept]
 	f?.close()
-	const p = lower(mains, includes, cache)
 	mkdirAll(dir)
-	return p
+	return hashing(`${dir}/hashes`, () => lower(mains, includes, cache))
 }
 
 /// Whether bober runs from its package, whose lib/ has the run time, the C of the bundle's modules and the launcher,
