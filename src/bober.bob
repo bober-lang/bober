@@ -1125,18 +1125,27 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	const unchanged = old != null && d != null && left == d[0]
 	const kept = if (unchanged) d![2] else mapped
 	const l = if (unchanged) d![1] else new Linker(machine, format, kept)
-	const held = l.objects()
+	// The image's objects by the path they are of (home).
+	const held = new HashMap[string, string[]]()
+	for (const h of l.objects()) {
+		if (!held.has(home(h))) {
+			held.set(home(h), [])
+		}
+		held.get(home(h))!.push(h)
+	}
+	const of = (name: string) => held.get(home(name)) ?? []
+	const has = (name: string) => of(name).includes(name)
 	// Whether the image lacks the object name; the others of what, by default another version of it, are unlinked.
 	const lacks = (name: string, what = name.slice(0, lastIndexOf(name, "@") + 1)) => {
-		for (const h of held.filter(h => h != name && startsWith(h, what))) {
+		for (const h of of(what).filter(h => h != name && startsWith(h, what))) {
 			l.remove(h)
 		}
-		return !held.includes(name)
+		return !of(what).includes(name)
 	}
 	// Of the other monomorphizations of the module at path than spec, the units of the oldest past -tune specs, unlinked.
 	const evict = (path: string, spec: string) => {
 		const others: string[] = []
-		for (const h of held) {
+		for (const h of of(`${path}^`)) {
 			const at = indexOf(h, "^O", path.length)
 			if (startsWith(h, `${path}^`) && at > 0 && h.slice(0, at) != spec && !others.includes(h.slice(0, at))) {
 				others.push(h.slice(0, at))
@@ -1175,8 +1184,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		const [fast, opt] = [`${spec}^O1${version}`, if (c.release) `${path}^R${version}` else `${spec}^O2${version}`]
 		// LLVM's at -O2, or if the image holds it, or with no level given if it holds TPDE's of a command before, which
 		// this finds unchanged; else TPDE's, as after an edit.
-		const llvm = !o.dyn
-			&& (c.release || c.O2 || held.includes(opt) || !c.O1 && held.includes(fast) && !c.compiled.has(fast))
+		const llvm = !o.dyn && (c.release || c.O2 || has(opt) || !c.O1 && has(fast) && !c.compiled.has(fast))
 		parts.push(if (o.dyn) `${path}${version}` else fast)
 		const wanted = if (llvm) opt else parts[parts.length - 1]
 		// Monomorphized, the others of either backend, which define the same symbols.
@@ -1209,10 +1217,10 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		const info = stat(f)
 		const name = `${f}@${info.modified}.${info.size}`
 		parts.push(name)
-		if (held.some(h => h != name && startsWith(h, `${f}@`))) {
+		if (of(name).some(h => h != name)) {
 			return image(p, mains, files, cxx, pin, o, c, true)
 		}
-		if (!held.includes(name)) {
+		if (!has(name)) {
 			l.add(new Object(name, machine.arch))
 			added = true
 		}
@@ -1270,6 +1278,13 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	sortBy(parts, (a, b) => a < b) // as a set, p's modules being in the order they were lowered in, another build's other
 	done = [p, left, fnv(parts.join(" "))]
 	return [own, done![2]]
+}
+
+/// What of an object's name relink finds the image's objects by: the path of the module or file it is of, up to a ^, or
+/// to the @ before its version.
+function home(name: string): string {
+	const at = indexOf(name, "^")
+	return name.slice(0, if (at >= 0) at else lastIndexOf(name, "@"))
 }
 
 let pins = 0 // made by pinned
