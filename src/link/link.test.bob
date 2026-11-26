@@ -473,7 +473,7 @@ test "the sections a kept image has for good are not one where another object's 
 test "a region of a kept image has room its file has a hole for, and one that is full is stale" {
 	const d = obj("d", Data, [7], [new Symbol("d", Global, 0)])
 	const first = keep(kept(), [obj("a", Code, [0xd65f03c0], []), d], ["d"])
-	assert at(first, "d") > 1 << 28 && first.bytes.pages.filter(p => p.length > 0).length < 8
+	assert at(first, "d") > 1 << 28 && first.bytes.pages.filter(p => p.length > 0).length < 10
 	// What is after a region that grows is where it was, its page not written again.
 	const image = keep(kept(file(first)), [obj("c", Code, new u64[](0x8000), [])])
 	assert at(image, "d") == at(first, "d") && get(image, at(image, "d")) == 7 && !image.bytes.written(at(image, "d"))
@@ -525,14 +525,15 @@ test "a kept image's units keep their records and symbols where they are, and on
 	const image = keep(kept(file(first)), [obj("b", Code, [0xd65f03c0], [new Symbol("g", Global, 0)])], ["f", "g"])
 	const [g, _, name] = image.symbols[0]
 	assert image.symbols.length == 1 && g.length == 1 && g[0].name == "g" && g[0].value == at(image, "g")
-	// Of the Kept sections' region, but its last byte, the top a later link adds from, only g's slot in the names' table.
+	// Of the Kept sections' region, but its last byte, the top a later link adds from, only g's slot in the names' table
+	// and its entry.
 	const [from, to] = [first.strtab[0], first.strtab[1] - 1]
 	const [was, now] = [first.bytes.slice(from, to), image.bytes.slice(from, to)]
 	let changed = 0
 	for (const i of 0 ... was.length - 1) {
 		changed += if (now[i] != was[i]) 1 else 0
 	}
-	assert now.length == was.length && changed <= 12
+	assert now.length == was.length && changed <= 12 + 72
 	assert image.symtab[0] == first.symtab[0] && image.symtab[1] == first.symtab[1] + 24
 	assert image.bytes.slice(name, name + 3) == "_g\x00"
 }
@@ -548,8 +549,8 @@ test "a kept image whose table of names is broken is stale" {
 	const first = keep(kept(), [obj("a", Code, [0xd65f03c0], [new Symbol("f", Global, 0)])], ["f"])
 	const c = obj("c", Code, [0x94000000], [new Symbol("f", Global)], [new Fixup(0, Call, 0, 0)])
 	assert keep(kept(file(first)), [c]).exports.length == 1
-	// The table is the last block of the Kept sections' region: of 1024 slots, each's index in its last 4 bytes.
-	const table = first.strtab[1] - 1 - 12 * 1024
+	// The table, of 1024 slots, each's index in its last 4 bytes.
+	const table = read(first.bytes, 0x200, "arm64")!.names[0]
 	for (const i of 0 ... 1023) {
 		const p = table + 12 * (i as u64) + 8
 		if (first.bytes.get(p, 4) != 0) {
@@ -568,7 +569,7 @@ test "a kept image whose table of names is full is stale" {
 	assert keep(kept(first), [obj("b", Data, [0], syms)]) throws new Stale("the table of names is full")
 }
 
-test "a kept image whose record of a unit is cut short is stale" {
+test "a kept image whose record of a unit is cut short is stale once it is read" {
 	const first = keep(kept(), [obj("a", Code, [0xd65f03c0], [new Symbol("f", Global, 0)])], ["f"])
 	// The head, where the 16 bytes after the headers say, written anew of a's record's block a byte shorter.
 	const s = read(first.bytes, 0x200, "arm64")!
@@ -577,7 +578,10 @@ test "a kept image whose record of a unit is cut short is stale" {
 	const head = write(s, "arm64")
 	first.bytes.set(first.bytes.get(0x200, 8), head)
 	first.bytes.put(0x208, head.length as u64, 8)
-	assert keep(kept(file(first)), []) throws new Stale("a's record is not as written")
+	assert keep(kept(file(first)), []).exports.length == 1
+	const l = kept(file(first))
+	l.remove("a")
+	assert keep(l, []) throws new Stale("a's record is not as written")
 }
 
 test "a kept image whose frozen unit's record has its tail flipped is stale once its local symbols are read" {
@@ -803,4 +807,22 @@ test "a kept image's sections a name bounds once laid out are stale, and a run h
 	const start = at(image, "__start_types")
 	const [a, b] = [get(image, start), get(image, start + 8)]
 	assert start != 0 && a == 1 && b == 2
+}
+
+test "a kept image whose entry of a name, or link of its chain, is broken is stale" {
+	const first = keep(kept(), [obj("a", Code, [0xd65f03c0], [new Symbol("f", Global, 0)])], ["f"])
+	// f's entry, after the table of names: its unit plus 1, and of its chain's first link, the unit plus 1 and flags.
+	const [table, cap] = read(first.bytes, 0x200, "arm64")!.names
+	let p = table + 12 * cap
+	while (first.bytes.slice(first.bytes.get(p, 8), first.bytes.get(p, 8) + 1) != "f") {
+		p += 72
+	}
+	const [unit, chain] = [first.bytes.get(p + 16, 4), first.bytes.get(p + 60, 4)]
+	first.bytes.put(p + 16, 9, 4)
+	assert keep(kept(file(first)), [], ["f"]) throws new Stale("the names' entries are broken")
+	first.bytes.put(p + 16, unit, 4)
+	first.bytes.put(p + 60, chain & 0xc0000000 | 9, 4)
+	const l = kept(file(first))
+	l.remove("a")
+	assert keep(l, []) throws new Stale("a chain of names is broken")
 }

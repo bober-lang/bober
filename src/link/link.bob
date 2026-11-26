@@ -111,6 +111,12 @@ export class Stale {
 	constructor(msg: string) { this.msg = msg }
 }
 
+/// The bytes of a name's entry in a kept image, after the table of names: where its name is, and how long; its
+/// library, unit and section, each plus 1; its value, address, slot, stub and chain; and whether weak.
+const entry: u64 = 72
+/// Of a link of a chain (Linker.links), whether its symbol defines the name, and whether it does not weakly.
+const defining: u64 = 1 << 63
+const strong: u64 = 1 << 62
 /// The address of a section of a group whose sections another object's are taken of.
 const dropped: u64 = 0xffffffff_ffffffff
 /// The address of a slot or stub the linker's own unit makes, until it is laid out.
@@ -142,7 +148,8 @@ class Name {
 	section = -1
 	value: u64 = 0
 	weak = false
-	/// The first unit that names it without defining it, and not weakly, so that it must be defined; -1 if none does.
+	/// The first unit this link defines that names it without defining it, and not weakly, so that it must be defined; -1
+	/// if none does.
 	namer = -1
 	/// The library it is imported from, -1 if none.
 	library = -1
@@ -150,13 +157,24 @@ class Name {
 	slot: u64 = 0
 	stub: u64 = 0
 	address: u64 = 0
+	/// In a kept image, the first link of the chain of the units' symbols of it (Linker.chained), 0 if none; and it as
+	/// the continued image has it, null if new.
+	chain: u64 = 0
+	was: Name | null = null
 
 	constructor(name: string) { this.name = name }
 }
 
+/// Whether n's definition is another than was's, or if address, its address.
+function moved(n: Name, was: Name, address: bool): bool {
+	return if (address) n.address != was.address
+		else n.unit != was.unit || n.section != was.section || n.value != was.value || n.library != was.library
+}
+
 /// An object as linked: per symbol, the index of its Name, -1 if it is local; per section, its address, 0 while it is
 /// to be laid out, or dropped; whether it is frozen; the bytes the continued image has its object as, "" once it is
-/// not as there; and its blocks of the file, as State has them, none until saved.
+/// not as there; its blocks of the file, as State has them, none until saved; and the bytes its symbols' links are in
+/// (Linker.links), its block of them in the image's, or until saved, bytes of its own, and where they are in those.
 class Unit {
 	object: Object
 	names: i32[] = []
@@ -164,6 +182,8 @@ class Unit {
 	frozen: bool
 	encoded = ""
 	blocks: [u64, u64][] = []
+	links = new Bytes()
+	from: u64 = 0
 
 	constructor(o: Object, frozen = false) {
 		this.object = o
@@ -186,17 +206,20 @@ export class Linker {
 	/// Per name a library defines, the first that does.
 	private imports = new HashMap[string, i32]()
 	private exported: string[] = []
-	/// The names: the shared ones, then the local ones a slot needs (unshared), from shared on; those of a continued
-	/// image made once it links. Until plan, shared is how many the continued image has.
-	private names: Name[] = []
+	/// The names: the shared ones, then the local ones a slot needs (unshared), from shared on; of a continued image,
+	/// null until read of their entries (entry). Until plan, shared is how many the continued image has. Those not null,
+	/// in the order made.
+	private names: (Name | null)[] = []
 	private shared = 0
+	private touched: i32[] = []
 	/// The table of the shared names' indices by their hash of seed, slot by slot (slot); in the image's bytes where a
 	/// continued image has it, else in bytes of its own; and whether it is not as made, so that the image is linked anew.
 	/// A kept image's has room for as many names again as it was made with, and is linked anew once that is full,
-	/// which drops those no longer named.
+	/// which drops those no longer named. After it, the names' entries.
 	private table = new Bytes()
 	private at: u64 = 0
 	private cap: u64 = 1024
+	private entries: u64 = 0
 	private seed: u64 = 0
 	private broken = false
 	/// The names wanted, in the order first wanted, for which lazy objects are looked for.
@@ -209,20 +232,24 @@ export class Linker {
 	private bounded: string[] = []
 	private errors: string[] = []
 	/// Whether the image is kept; what it keeps of its linker; how many units the continued image holds, the frozen one
-	/// first; and its file.
+	/// first, and of them those removed; and its file.
 	private keep: bool
 	private regions: u8[][]
 	private state = new State()
 	private loaded = 0
+	private removed: i32[] = []
 	private bytes = new Bytes()
 	/// Of the units it holds but the frozen one, those not unlinked, by name, and by key (holds).
-	private named = new HashMap[string, Unit]()
-	private keyed = new HashMap[string, Unit[]]()
+	private named = new HashMap[string, i32]()
+	private keyed = new HashMap[string, i32[]]()
+	/// Where the fixups this link sets anew are, or those of the units it unlinks, whose pointers, binds and descs the
+	/// continued image keeps no longer; ascending once fixed.
+	private redone: u64[] = []
 	/// The frozen unit's record as the continued image has it, apart from its encoded, which fix may clear: make reads
 	/// its symbols with a name, and freeze, on making a frozen unit anew, its local ones.
 	private held = ""
-	/// The veneers this link made, per island and address they jump to, which each link makes anew, and how much of
-	/// each island they take; and where the fixups set through one are, which are set anew too.
+	/// The veneers, per island and address they jump to, and how much of each island they take; and where the fixups
+	/// this link set through one are, which a unit's record keeps.
 	private veneers = new HashMap[string, u64]()
 	private filled = new HashMap[u64, u64]()
 	private veneered = new HashMap[u64, bool]()
@@ -239,8 +266,8 @@ export class Linker {
 		this.code = this.regions.map(r => r[0]).indexOf(Code)
 		const s = if (kept != null) read(kept, format.headers, machine.arch) else null
 		const [at, cap, count] = s?.names ?? [0, 0, 0]
-		if (s == null || count > cap / 2 || cap & (cap - 1) != 0 || at > kept!.length || cap > (kept!.length - at) / 12
-			|| !s.slots.every(e => e[0] < count)) {
+		if (s == null || count > cap / 2 || cap & (cap - 1) != 0 || at > kept!.length
+			|| cap > (kept!.length - at) / (12 + entry / 2)) {
 			return
 		}
 		this.state = s
@@ -249,21 +276,32 @@ export class Linker {
 			u.at = e[1]
 			u.encoded = e[2]
 			u.blocks = e[3]
+			u.links = kept!
+			u.from = if (u.blocks.length > 1) u.blocks[1][0] else 0
 			return u
 		})
 		this.units[0].frozen = true
 		this.held = this.units[0].encoded
 		this.loaded = s.units.length
-		for (const u of this.units.slice(1, this.loaded)) {
-			this.named.set(u.object.name, u)
-			this.keyed.set(key(u.object.name), [...(this.keyed.get(key(u.object.name)) ?? []), u])
+		for (const k of 1 ... this.loaded - 1) {
+			const name = this.units[k].object.name
+			if (name != "") {
+				this.named.set(name, k)
+				this.keyed.set(key(name), [...(this.keyed.get(key(name)) ?? []), k])
+			}
+		}
+		for (const [k, v, at] of s.veneers) {
+			this.veneers.set(`${k} ${v}`, at)
+			this.filled.set(k, max(this.filled.get(k) ?? 0, at + (machine.veneer.length as u64) - this.island(k)))
 		}
 		this.bytes = kept!
 		this.table = kept!
 		this.at = at
 		this.cap = cap
+		this.entries = at + 12 * cap
 		this.seed = s.seed
 		this.shared = count as i32
+		this.names = new (Name | null)[](count as i32)
 	}
 
 	/// Links o, in a continued image after the objects it holds.
@@ -275,7 +313,9 @@ export class Linker {
 	}
 
 	/// The names of the objects given that the continued image holds, in order.
-	objects(): string[] { return this.units.slice(0, this.loaded).filter(u => !u.frozen).map(u => u.object.name) }
+	objects(): string[] {
+		return this.units.slice(0, this.loaded).filter(u => !u.frozen && u.object.name != "").map(u => u.object.name)
+	}
 
 	/// The bytes of the sections of that name of the objects given that the continued image holds, whose names start
 	/// with of.
@@ -294,13 +334,15 @@ export class Linker {
 
 	/// The names of the objects given that the continued image holds whose key is key: their name up to its last @, or
 	/// all of it if it has none.
-	holds(key: string): string[] { return (this.keyed.get(key) ?? []).map(u => u.object.name) }
+	holds(key: string): string[] { return (this.keyed.get(key) ?? []).map(k => this.units[k].object.name) }
 
-	/// Unlinks the object of that name the continued image holds.
+	/// Unlinks the object of that name the continued image holds, once it links.
 	remove(name: string) {
-		const u = this.named.get(name)
-		if (u != null) {
-			this.unlink(u!)
+		const k = this.named.get(name)
+		if (k != null) {
+			this.named.delete(name)
+			this.keyed.set(key(name), this.keyed.get(key(name))!.filter(x => x != k!))
+			this.removed.push(k!)
 		}
 	}
 
@@ -336,7 +378,7 @@ export class Linker {
 	/// Whether what it was asked so far changes the image it continues: an object added or removed, or a name exported
 	/// anew.
 	changed(): bool {
-		return this.units.length != this.loaded || this.loaded != this.state.units.length
+		return this.units.length != this.loaded || this.removed.length > 0
 			|| this.exported.some(e => !this.state.exports.includes(e))
 	}
 
@@ -360,24 +402,61 @@ export class Linker {
 				this.seed = fnv(random(8))
 			} catch (e: IoError) {}
 		}
-		// The symbols and fixups of the units the continued image holds, read only now, as a build that links nothing
-		// anew needs but their sections, and but the frozen one's local symbols; and the names it has, named as its
-		// units define.
-		for (const u of this.units.slice(0, this.loaded)) {
-			u.names = this.rest(u, u.encoded, u.frozen)
+		if (this.loaded > 0 && this.libraries.join("\n") != this.state.libraries.join("\n")) {
+			throw new CompileError("the libraries are others")
 		}
-		for (const _ of 1 ... this.shared) {
-			this.names.push(new Name(""))
+		// A kept image's frozen unit is first, which in one linked anew is made of none at first.
+		if (this.keep && this.loaded == 0) {
+			this.units = [new Unit(new Object("the image", this.machine.arch), true), ...this.units]
 		}
-		for (const [g, slot, stub] of this.state.slots) {
-			this.names[g as i32].slot = slot
-			this.names[g as i32].stub = stub
+		for (const k of this.removed) {
+			this.unlink(k)
+		}
+		// Of the units the continued image holds, the groups taken and the names of Const sections laid out as Data.
+		for (const k of 0 ... this.loaded - 1) {
+			const u = this.units[k]
+			for (const i of 0 ... u.at.length - 1) {
+				const sec = u.object.sections[i]
+				if (u.at[i] == dropped) {
+					continue
+				}
+				if (sec.group != "" && !this.groups.has(sec.group)) {
+					this.groups.set(sec.group, k)
+				}
+				if (sec.kind == Const
+					&& this.regions[partitionPoint(this.state.regions, r => r.cap > u.at[i])][0] == Data) {
+					this.pointed.set(sec.name, true)
+				}
+			}
 		}
 		this.resolve()
-		const own = this.plan()
+		// The units this link sets the fixups of: those it links anew, and of those the continued image holds, those
+		// naming a name defined anew, and once laid out, a name moved.
+		const fixed = new bool[](this.units.length + 1)
+		const dirty = (address: bool) => {
+			for (const k of this.loaded ... this.units.length - 1) {
+				fixed[k] = true
+			}
+			for (const g of this.touched) {
+				const n = this.names[g]!
+				if (n.was != null && moved(n, n.was!, address)) {
+					for (const l of this.links(n)) {
+						fixed[this.unit(l)] = true
+					}
+				}
+			}
+			const ks: i32[] = []
+			for (const k of 0 ... this.units.length - 1) {
+				if (fixed[k]) {
+					ks.push(k)
+				}
+			}
+			return ks
+		}
+		const own = this.plan(dirty(false))
 		const defined = (name: string) => {
 			const g = this.find(name)
-			return g >= 0 && this.names[g].unit >= 0
+			return g >= 0 && this.entry(g).unit >= 0
 		}
 		for (const name of this.exported) {
 			if (!defined(name)) {
@@ -395,18 +474,15 @@ export class Linker {
 		image.libraries = this.libraries
 		image.inits = this.state.inits
 		image.thread = this.state.thread
-		image.descs = [...this.state.descs]
-		const frozen = this.state.rebases.length
 		this.layout(this.format.headers + (if (this.keep) 24 else 0), image)
-		for (const n of this.names) {
-			if (n.section >= 0) {
-				n.address = this.units[n.unit].at[n.section] + n.value
-			}
+		for (const g of this.touched) {
+			const n = this.names[g]!
+			n.address = if (n.section >= 0) this.units[n.unit].at[n.section] + n.value else 0
 		}
 		const bound = (name: string, at: u64) => {
 			const g = this.find(name)
-			if (g >= 0 && this.names[g].unit >= 0) {
-				this.names[g].address = at
+			if (g >= 0 && this.entry(g).unit >= 0) {
+				this.entry(g).address = at
 			}
 		}
 		for (const [x, run] of this.state.runs) {
@@ -415,24 +491,42 @@ export class Linker {
 		}
 		// The slots and stubs own makes are where it is laid out.
 		for (const f of own.object.sections[1].fixups) {
-			this.names[own.names[f.symbol]].slot = own.at[1] + f.at
+			this.names[own.names[f.symbol]]!.slot = own.at[1] + f.at
 		}
 		const stub = this.machine.stub.length as u64
 		for (const f of own.object.sections[0].fixups) {
-			this.names[own.names[f.symbol]].stub = own.at[0] + f.at - f.at % stub
+			this.names[own.names[f.symbol]]!.stub = own.at[0] + f.at - f.at % stub
 		}
-		this.fix(image)
-		// The frozen units' rebases, kept ascending, and this link's sorted in.
-		if (this.state.rebases.length > frozen) {
-			sort(this.state.rebases)
+		this.fix(image, dirty(true))
+		// The pointers, binds and descs the continued image has of the fixups not set anew, and this link's.
+		const s = this.state
+		sort(this.redone)
+		const old = (at: u64) => {
+			const i = partitionPoint(this.redone, x => x >= at) as i32
+			return i == this.redone.length || this.redone[i] != at
 		}
 		sort(image.rebases)
-		image.rebases = [...this.state.rebases, ...image.rebases]
-		merge(image.rebases, this.state.rebases.length, (a, b) => a < b)
+		let i = 0
+		const rebases = s.rebases.filter(at => {
+			while (i < this.redone.length && this.redone[i] < at) {
+				i++
+			}
+			return i == this.redone.length || this.redone[i] != at
+		})
+		s.rebases = [...rebases, ...image.rebases]
+		merge(s.rebases, rebases.length, (a, b) => a < b)
+		s.binds = [...s.binds.filter(b => old(b[0])), ...image.binds.map(b => {
+			const t: [u64, i32, string, bool, i64] = [b.at, b.library, b.name, b.weak, b.addend]
+			return t
+		})]
+		s.descs = [...s.descs.filter(d => old(d[0])), ...image.descs]
+		image.rebases = s.rebases
+		image.binds = s.binds.map(b => ({ at: b[0], library: b[1], name: b[2], weak: b[3], addend: b[4] }))
+		image.descs = s.descs
 		// A continued image's exports are those it had, but the names no longer defined, and those asked for now.
 		const exports = [...this.state.exports.filter(e => defined(e) && !this.exported.includes(e)), ...this.exported]
 		for (const name of exports) {
-			image.exports.push([name, this.names[this.find(name)].address])
+			image.exports.push([name, this.entry(this.find(name)).address])
 		}
 		if (this.keep) {
 			this.save(image, exports)
@@ -447,64 +541,35 @@ export class Linker {
 	}
 
 	/// Resolves the names: the objects given before any lazy one, and each lazy one linked before the next is looked
-	/// for. The objects the continued image holds that name what no one defines are unlinked, and the names resolved
-	/// anew without them.
+	/// for. The objects the continued image holds that name what no one defines are unlinked, and the names they
+	/// defined defined anew.
 	private resolve() throws CompileError {
-		let errors = this.errors.length
+		let k = this.loaded
+		let w = 0
 		while (true) {
-			let k = 0
-			let w = 0
 			while (k < this.units.length || w < this.wanted.length) {
 				if (k < this.units.length) {
 					this.define(k)
 					k++
 				} else {
-					this.pull(this.names[this.wanted[w]])
+					this.pull(this.names[this.wanted[w]]!)
 					w++
 				}
 			}
-			this.settle()
-			if (this.errors.length == errors) {
-				return
-			}
-			const missing = (u: Unit) => {
-				for (const i of 0 ... u.names.length - 1) {
-					const n = if (u.names[i] >= 0 && u.object.symbols[i].binding == Global) this.names[u.names[i]]
-						else null
-					if (n != null && n.unit < 0 && n.library < 0) {
-						return true
-					}
-				}
-				return false
-			}
-			const gone = this.units.slice(0, this.loaded).filter(u => !u.frozen && missing(u))
+			const gone = this.settle()
 			if (gone.length == 0) {
 				return
 			}
-			this.errors = this.errors.slice(0, errors)
-			for (const u of gone) {
-				this.unlink(u)
-			}
-			errors = this.errors.length
-			this.names = this.names.map(n => {
-				const m = new Name(n.name)
-				m.slot = n.slot
-				m.stub = n.stub
-				return m
-			})
-			this.wanted = []
-			this.groups = new HashMap[string, i32]()
-			this.pointed = new HashMap[string, bool]()
-			this.bounded = []
-			for (const u of this.units.slice(this.loaded, this.units.length)) {
-				u.at = new u64[](u.object.sections.length)
+			for (const k of gone) {
+				this.unlink(k)
 			}
 		}
 	}
 
-	/// Unlinks u, an object the continued image holds, its room free then, but if it has sections the image has for
-	/// good.
-	private unlink(u: Unit) {
+	/// Unlinks unit k, an object the continued image holds, its room free then, but if it has sections the image has
+	/// for good; the names it defines defined by the others that do, if any. It is then of no name.
+	private unlink(k: i32) {
+		const u = this.read(k)
 		for (const i of 0 ... u.object.sections.length - 1) {
 			const sec = u.object.sections[i]
 			if (u.at[i] != dropped && this.pinned(sec)) {
@@ -512,15 +577,24 @@ export class Linker {
 			}
 			if (u.at[i] != 0 && u.at[i] != dropped) {
 				this.free(u.at[i], sec.size)
+				for (const f of sec.fixups) {
+					this.redone.push(u.at[i] + f.at)
+				}
+			}
+		}
+		for (const j of 0 ... u.names.length - 1) {
+			if (u.names[j] >= 0) {
+				const n = this.entry(u.names[j])
+				this.unchain(n, k, j)
+				if (n.unit == k) {
+					this.redefine(n)
+				}
 			}
 		}
 		for (const [at, size] of u.blocks) {
 			this.free(at, size)
 		}
-		this.units = this.units.filter(x => x != u)
-		this.loaded--
-		this.named.delete(u.object.name)
-		this.keyed.set(key(u.object.name), this.keyed.get(key(u.object.name))!.filter(x => x != u))
+		this.units[k] = new Unit(new Object("", this.machine.arch))
 	}
 
 	/// Takes the groups of unit k's sections no unit before has, and its definitions over weak ones, and notes what it
@@ -550,17 +624,15 @@ export class Linker {
 				this.pointed.set(sec.name, true)
 			}
 		}
-		if (u.names.length == 0) {
-			u.names = o.symbols.map(s => if (s.binding == Local) -1 else this.name(s.name))
-		}
+		u.names = o.symbols.map(s => if (s.binding == Local) -1 else this.name(s.name))
+		this.chained(k)
 		for (const j of 0 ... o.symbols.length - 1) {
 			const s = o.symbols[j]
 			const g = u.names[j]
 			if (g < 0) {
 				continue
 			}
-			const n = this.names[g]
-			n.name = s.name
+			const n = this.names[g]!
 			if (s.section >= 0 && u.at[s.section] != dropped) {
 				if (n.unit < 0 || n.weak && s.binding == Global) {
 					if (n.unit == 0 && this.loaded > 0) {
@@ -570,6 +642,7 @@ export class Linker {
 					n.section = s.section
 					n.value = s.value
 					n.weak = s.binding == Weak
+					n.library = -1
 				} else if (!n.weak && s.binding == Global) {
 					this.errors.push(`${s.name} is defined in ${this.units[n.unit].object.name} and ${o.name}`)
 				}
@@ -583,7 +656,7 @@ export class Linker {
 
 	/// Links the lazy object that defines n, if one does and n is still not defined.
 	private pull(n: Name) throws CompileError {
-		if (n.unit < 0 && n.namer >= this.loaded) {
+		if (n.unit < 0 && this.first(n, l => l & (defining | strong) == strong && this.unit(l) < this.loaded) == 0) {
 			const list = this.listed
 			this.listed = () => {}
 			list()
@@ -596,10 +669,12 @@ export class Linker {
 	}
 
 	/// Defines each name no unit defines: the format's start, `__start_<x>` and `__stop_<x>` as the bounds of the
-	/// sections named x, else as an import; and notes those a unit must have defined that are none of these. The others
-	/// are weak, and 0.
-	private settle() {
-		for (const n of this.names) {
+	/// sections named x, else as an import; and notes those a unit must have defined that are none of these, or if the
+	/// continued image holds those that name them, these. The others are weak, and 0.
+	private settle(): i32[] {
+		const gone: i32[] = []
+		for (const g of this.touched) {
+			const n = this.names[g]!
 			if (n.unit >= 0) {
 				continue
 			}
@@ -612,13 +687,19 @@ export class Linker {
 			if (start || startsWith(n.name, "__stop_")) {
 				this.bound(n, n.name.slice(if (start) 8 else 7, n.name.length), !start)
 			}
-			const lib = this.imports.get(n.name) ?? -1
-			if (n.unit < 0 && lib >= 0) {
-				n.library = lib
-			} else if (n.unit < 0 && n.namer >= 0) {
-				this.errors.push(`${n.name} is not defined, but ${this.units[n.namer].object.name} names it`)
+			n.library = if (n.unit < 0) this.imports.get(n.name) ?? -1 else -1
+			if (n.unit >= 0 || n.library >= 0) {
+				continue
+			}
+			const namers = this.namers(n)
+			const k = if (n.namer >= 0) n.namer else namers.find(k => k >= this.loaded || this.units[k].frozen) ?? -1
+			if (k >= 0) {
+				this.errors.push(`${n.name} is not defined, but ${this.units[k].object.name} names it`)
+			} else {
+				gone.push(...namers.filter(k => !gone.includes(k)))
 			}
 		}
+		return gone
 	}
 
 	/// Defines n as the start of the first section named x, or as the stop of the last, if x is a C identifier; they
@@ -661,7 +742,7 @@ export class Linker {
 	/// The linker's own unit: a slot for each name a fixup reaches through one, and a stub, and its slot, for each
 	/// import a call reaches, but those the image has. Their fixups reach a name by a weak symbol, so that the slot of
 	/// one a continued image no longer has is 0.
-	private plan(): Unit {
+	private plan(ks: i32[]): Unit {
 		const stubs = new Section("stubs", Code)
 		const slots = new Section("slots", Data)
 		stubs.align = 4
@@ -670,14 +751,18 @@ export class Linker {
 		const own = new Unit(new Object("linker", this.machine.arch), this.keep)
 		own.object.sections = [stubs, slots]
 		own.at = [0, 0]
-		for (const k of 0 ... this.units.length - 1) {
-			const u = this.units[k]
+		for (const u of this.units) {
+			for (const i of 0 ... u.at.length - 1) {
+				if (u.at[i] == dropped && !this.groups.has(u.object.sections[i].group)) {
+					// A kept object's, whose bytes are gone, of a group no object has now.
+					this.errors.push(`${u.object.name} has ${u.object.sections[i].group}, which no object has now`)
+				}
+			}
+		}
+		for (const k of ks) {
+			const u = this.read(k)
 			const o = u.object
 			for (const i of 0 ... o.sections.length - 1) {
-				if (u.at[i] == dropped && !this.groups.has(o.sections[i].group)) {
-					// A kept object's, whose bytes are gone, of a group no object has now.
-					this.errors.push(`${o.name} has ${o.sections[i].group}, which no object has now`)
-				}
 				if (u.at[i] == dropped) {
 					continue
 				}
@@ -690,7 +775,7 @@ export class Linker {
 					if (g < 0) {
 						continue
 					}
-					const n = this.names[g]
+					const n = this.entry(g)
 					const call = this.stubbed(f.kind, n)
 					if (!((slot || call) && n.slot == 0 || call && n.stub == 0)) {
 						continue
@@ -732,6 +817,7 @@ export class Linker {
 		n.section = s.section
 		n.value = s.value
 		u.names[i] = this.names.length
+		this.touched.push(this.names.length)
 		this.names.push(n)
 	}
 
@@ -905,6 +991,8 @@ export class Linker {
 
 	/// Whether region r has islands: the code, of a machine with veneers.
 	private islands(r: Region): bool { return this.machine.veneer != "" && this.state.regions.indexOf(r) == this.code }
+	/// Where the code's island k is.
+	private island(k: u64): u64 { return this.state.regions[this.code].start + k * span }
 
 	/// Where what takes size bytes from at goes in region r: past the island it would be over, if any.
 	private skip(r: Region, at: u64, size: u64): u64 {
@@ -918,14 +1006,13 @@ export class Linker {
 	/// The address of a veneer to v in the island nearest p, which code at p reaches, made if there is none; 0 if
 	/// there is no such island, or no room in it.
 	private veneer(v: u64, p: u64, image: Image): u64 {
-		const r = this.state.regions[this.code]
-		const k = max((p - r.start) / span, 1)
+		const k = max((p - this.state.regions[this.code].start) / span, 1)
 		const key = `${k} ${v}`
 		const made = this.veneers.get(key)
 		if (made != null) {
 			return made!
 		}
-		const i = r.start + k * span
+		const i = this.island(k)
 		const at = i + (this.filled.get(k) ?? 0)
 		const size = this.machine.veneer.length as u64
 		if (size == 0 || at + size > i + island) {
@@ -933,6 +1020,7 @@ export class Linker {
 		}
 		this.filled.set(k, at + size - i)
 		this.veneers.set(key, at)
+		this.state.veneers.push([k, v, at])
 		image.bytes.set(at, this.machine.veneer)
 		const word = new u8[](8)
 		for (const [off, kind, addend] of this.machine.veneerFixups) {
@@ -998,12 +1086,14 @@ export class Linker {
 		}
 	}
 
-	/// Sets the bytes each fixup is at, noting a pointer to an address in the image as a rebase, one to an import as a
-	/// bind, and a Desc as a desc, which a frozen unit's fixup set for good the image keeps; reaching an import relative
-	/// to the code itself is only possible through a stub or slot.
-	private fix(image: Image) throws CompileError {
+	/// Sets the bytes each fixup of units ks is at, noting where (redone), and a pointer to an address in the image as a
+	/// rebase, one to an import as a bind, and a Desc as a desc, which the image keeps until it is set again, and a
+	/// frozen unit's record not, once set for good; reaching an import relative to the code itself is only possible
+	/// through a stub or slot.
+	private fix(image: Image, ks: i32[]) throws CompileError {
 		const word = new u8[](8) // where a fixup is set, of the 8 bytes at its address
-		for (const u of this.units) {
+		for (const k of ks) {
+			const u = this.read(k)
 			const o = u.object
 			for (const i of 0 ... o.sections.length - 1) {
 				if (u.at[i] == dropped) {
@@ -1011,6 +1101,7 @@ export class Linker {
 				}
 				for (const f of o.sections[i].fixups) {
 					const p = u.at[i] + f.at
+					this.redone.push(p)
 					const stays = u.frozen && this.stable(u, f, p)
 					const g = u.names[f.symbol]
 					let s: u64 = 0
@@ -1025,7 +1116,7 @@ export class Linker {
 						}
 						s = u.at[sym.section] + sym.value
 					} else {
-						const n = this.names[g]
+						const n = this.entry(g)
 						if (slotted(f.kind)) {
 							s = n.slot
 						} else if (this.stubbed(f.kind, n) && p != n.slot) {
@@ -1039,7 +1130,8 @@ export class Linker {
 								throw new CompileError(`${place(o, i, f)} reaches ${n.name} relative to itself, but it is not in the image`)
 							}
 							if (n.library >= 0) {
-								image.binds.push({ at: p, library: n.library, name: n.name, weak: n.namer < 0,
+								image.binds.push({ at: p, library: n.library, name: n.name,
+									weak: n.namer < 0 && this.first(n, l => l & (defining | strong) == strong) == 0,
 									addend: f.addend })
 							}
 						}
@@ -1052,16 +1144,14 @@ export class Linker {
 						if (s < image.thread[0] || s >= image.thread[1]) {
 							throw new CompileError(`${place(o, i, f)} describes bytes that are no thread's own`)
 						}
-						const desc: [u64, u64] = [p, s + (f.addend as u64) - image.thread[0]]
-						image.descs.push(desc)
+						image.descs.push([p, s + (f.addend as u64) - image.thread[0]])
 						if (stays) {
 							u.encoded = "" // the image no longer keeps the fixup
-							this.state.descs.push(desc)
 						}
 						continue
 					}
 					if (inside && f.kind == Abs64) {
-						(if (stays) this.state.rebases else image.rebases).push(p)
+						image.rebases.push(p)
 					}
 					const v = s + (f.addend as u64) - (if (f.kind == Thread32) image.thread[0] else 0)
 					put(word, 0, image.bytes.get(p, 8), 8)
@@ -1091,25 +1181,26 @@ export class Linker {
 		if (g < 0) {
 			return true
 		}
-		const n = this.names[g]
+		const n = this.entry(g)
 		return slotted(f.kind) || this.stubbed(f.kind, n) && p != n.slot
 			|| n.unit >= 0 && n.section >= 0 && this.units[n.unit].frozen || g >= this.shared
 	}
 
 	/// Keeps in the image what a later link continues it from: its units, the frozen ones as one and the others
-	/// stripped, each with blocks of its own where no loader maps, made once: of its record and of its symbols'
-	/// names in the Kept sections' region, and of their entries in the symbol table's, which the format writes; the
-	/// slots and stubs of names; and exports. The head, of all but the records, is at the end of the Kept region's
+	/// stripped, each with blocks of its own where no loader maps, made once: of its record, its symbols' links and
+	/// their names in the Kept sections' region, and of their entries in the symbol table's, which the format writes;
+	/// the names' entries; and exports. The head, of all but the records, is at the end of the Kept region's
 	/// room, where most of it is as the file has it, and the 16 bytes after the headers say where; 8 more are left for
 	/// who stores the image to stamp it (stamped).
 	private save(image: Image, exports: string[]) throws CompileError {
 		const s = this.state
 		const units = [this.freeze(), ...this.units.filter(u => !u.frozen).map(u => this.strip(u))]
 		const [kept, table] = [s.regions[s.regions.length - 2], s.regions[s.regions.length - 1]]
-		for (const u of units.filter(u => u.blocks.length == 0)) {
+		for (const u of units.filter(u => u.blocks.length == 0 && u.object.name != "")) {
 			const what = u.object.name
 			u.encoded = record(u.object, u.names)
-			u.blocks = [this.block(kept, u.encoded, what)]
+			u.blocks = [this.block(kept, u.encoded, what),
+				this.block(kept, u.links.slice(0, 16 * (u.object.symbols.length as u64)), what)]
 			// Not those whose address a later link may change: of a thread's copy.
 			const syms = u.object.symbols.filter(x => {
 				const sec = if (x.section >= 0) u.object.sections[x.section] else null
@@ -1119,17 +1210,11 @@ export class Linker {
 			if (syms.length > 0) {
 				u.blocks.push(this.block(table, zeros((this.format.symbol as i32) * syms.length), what))
 				u.blocks.push(this.block(kept, syms.map(x => `_${x.name}\x00`).join(""), what))
-				image.symbols.push([syms, u.blocks[1][0], u.blocks[2][0]])
+				image.symbols.push([syms, u.blocks[2][0], u.blocks[3][0]])
 			}
 		}
 		s.units = units.map(u => [u.object, u.at, u.encoded, u.blocks])
-		s.slots = []
-		for (const g of 0 ... this.shared - 1) {
-			if (this.names[g].slot != 0) {
-				s.slots.push([g as u64, this.names[g].slot, this.names[g].stub])
-			}
-		}
-		// A table not in the image's bytes is one made anew, or grown.
+		// A table not in the image's bytes is one made anew, or grown, its entries with it.
 		if (this.table != this.bytes) {
 			if (this.loaded > 0) {
 				throw new CompileError("the table of names is full")
@@ -1137,9 +1222,33 @@ export class Linker {
 			if (4 * (this.shared as u64) > this.cap) {
 				this.grow()
 			}
-			this.at = this.block(kept, this.table.slice(this.at, this.at + 12 * this.cap), "names")[0]
+			const b = this.table.slice(this.at, this.at + 12 * this.cap) + zeros((entry * this.cap / 2) as i32)
+			this.at = this.block(kept, b, "names")[0]
+			this.entries = this.at + 12 * this.cap
+		}
+		// The entries of the names read or made, of those made after their names, all of which take one block.
+		const made = this.touched.filter(g => g < this.shared && this.names[g]!.was == null)
+		let name = this.block(kept, made.map(g => this.names[g]!.name).join(""), "names")[0]
+		for (const g of this.touched.filter(g => g < this.shared)) {
+			const n = this.names[g]!
+			const p = this.entries + entry * (g as u64)
+			if (n.was == null) {
+				this.bytes.put(p, name, 8)
+				this.bytes.put(p + 8, n.name.length as u64, 4)
+				name += n.name.length as u64
+			}
+			this.bytes.put(p + 12, (n.library + 1) as u64, 4)
+			this.bytes.put(p + 16, (n.unit + 1) as u64, 4)
+			this.bytes.put(p + 20, (n.section + 1) as u64, 4)
+			this.bytes.put(p + 24, n.value, 8)
+			this.bytes.put(p + 32, n.address, 8)
+			this.bytes.put(p + 40, n.slot, 8)
+			this.bytes.put(p + 48, n.stub, 8)
+			this.bytes.put(p + 56, n.chain, 8)
+			this.bytes.put(p + 64, if (n.weak) 1 else 0, 1)
 		}
 		s.names = [this.at, this.cap, this.shared as u64]
+		s.libraries = this.libraries
 		s.seed = this.seed
 		s.exports = exports
 		s.inits = image.inits
@@ -1163,13 +1272,22 @@ export class Linker {
 		if (units.length == 2 && units[0].encoded != "" && units[1].object.symbols.length == 0) {
 			return units[0]
 		}
+		if (this.held != "") {
+			units[0].names = this.rest(units[0], this.held, false)
+		}
+		// Of the units given or lazy, as no chain has the linker's own, last.
+		for (const k of 0 ... this.units.length - 2) {
+			const u = this.units[k]
+			for (const j of 0 ... u.names.length - 1) {
+				if (u.frozen && u.names[j] >= 0) {
+					this.unchain(this.entry(u.names[j]), k, j)
+				}
+			}
+		}
 		for (const u of units) {
 			for (const [at, size] of u.blocks) {
 				this.free(at, size)
 			}
-		}
-		if (this.held != "") {
-			units[0].names = this.rest(units[0], this.held, false)
 		}
 		const regions = this.state.regions
 		const o = new Object("the image", this.machine.arch)
@@ -1182,7 +1300,7 @@ export class Linker {
 			const j = symbols.get(g) ?? o.symbols.length
 			if (j == o.symbols.length) {
 				names.push(if (g < this.shared) g else -1)
-				const n = this.names[g]
+				const n = this.entry(g)
 				const s = new Symbol(n.name, Weak)
 				if (n.section >= 0 && this.units[n.unit].frozen) {
 					s.binding = if (n.weak) Weak else Global
@@ -1250,6 +1368,14 @@ export class Linker {
 		const frozen = new Unit(o, true)
 		frozen.at = regions.map(r => r.start)
 		frozen.names = [...names, ...locals.map(_ => -1)]
+		// What the frozen units define, this one does, which takes their place.
+		for (const n of this.touched.map(g => this.names[g]!).filter(n => n.unit > 0 && this.units[n.unit].frozen)) {
+			n.unit = 0
+			n.section = if (n.section >= 0) region(n.address) else -1
+			n.value = if (n.section >= 0) n.address - regions[n.section].start else 0
+		}
+		this.units[0] = frozen
+		this.chained(0)
 		return frozen
 	}
 
@@ -1264,10 +1390,10 @@ export class Linker {
 	}
 
 	/// u without the bytes of its sections, and but the fixups a later link sets again: of a shared name, or a pointer
-	/// or Desc, which the image's lists are made anew of, or through a veneer.
+	/// or Desc, which the image's lists drop with it, or through a veneer.
 	/// One the continued image holds is that.
 	private strip(u: Unit): Unit {
-		if (u.encoded != "") {
+		if (u.encoded != "" || u.object.name == "") {
 			return u
 		}
 		const o = new Object(u.object.name, u.object.arch)
@@ -1288,6 +1414,8 @@ export class Linker {
 		const kept = new Unit(o)
 		kept.at = u.at
 		kept.names = u.names.map(g => if (g < this.shared) g else -1)
+		kept.links = u.links
+		kept.from = u.from
 		return kept
 	}
 
@@ -1315,6 +1443,138 @@ export class Linker {
 		return true
 	}
 
+	/// Links unit k's symbols with a name into the chains of their names, if the image is kept.
+	private chained(k: i32) {
+		if (!this.keep) {
+			return
+		}
+		const u = this.units[k]
+		const o = u.object
+		u.links = new Bytes()
+		u.from = 0
+		for (const j of 0 ... o.symbols.length - 1) {
+			const s = o.symbols[j]
+			if (u.names[j] >= 0) {
+				const defines = s.section >= 0 && u.at[s.section] != dropped
+				const n = this.entry(u.names[j])
+				u.links.put(16 * (j as u64), n.chain, 8)
+				u.links.put(16 * (j as u64) + 8, if (defines) (s.section as u64) << 32 | s.value else 0, 8)
+				n.chain = ((k + 1) as u64) << 32 | (j as u64) | (if (defines) defining else 0)
+					| (if (s.binding == Global) strong else 0)
+			}
+		}
+	}
+
+	/// The chain of n: per symbol with its name of the units linked, the latest first, (k + 1) << 32 | j of symbol j of
+	/// unit k, and whether it defines n, and not weakly, or if it does not, names it so that it must be defined. Each is
+	/// where the one before it is linked (linked) has it, the first n.
+	private links(n: Name): u64[] {
+		const ls: u64[] = []
+		this.first(n, l => {
+			ls.push(l)
+			return false
+		})
+		return ls
+	}
+
+	/// The first link of n's chain f holds of, 0 if none.
+	private first(n: Name, f: (l: u64) => bool): u64 {
+		let l = n.chain
+		while (l != 0 && !f(l)) {
+			const [b, at] = this.linked(l)
+			l = b.get(at, 8)
+		}
+		return l
+	}
+
+	/// The unit of link l, -1 of none.
+	private unit(l: u64): i32 { return ((l >> 32 & 0x3fffffff) as i32) - 1 }
+
+	/// Where the links of link l's unit k have, of l to its symbol j, the next link, and if j defines its name, its
+	/// section << 32 | value.
+	private linked(l: u64): [Bytes, u64] throws CompileError {
+		if (this.unit(l) < 0 || this.unit(l) >= this.units.length) {
+			throw new CompileError("a chain of names is broken")
+		}
+		const u = this.units[this.unit(l)]
+		return [u.links, u.from + 16 * (l & 0xffffffff)]
+	}
+
+	/// The units that name n so that it must be defined, but do not.
+	private namers(n: Name): i32[] {
+		return this.links(n).filter(l => l & (defining | strong) == strong).map(l => this.unit(l))
+	}
+
+	/// Unlinks symbol j of unit k from n's chain.
+	private unchain(n: Name, k: i32, j: i32) {
+		const me = ((k + 1) as u64) << 32 | (j as u64)
+		let before: [Bytes, u64] | null = null // where the link to it is, if not n.chain
+		let l = n.chain
+		while (l & ~(defining | strong) != me) {
+			before = this.linked(l)
+			l = before[0].get(before[1], 8)
+		}
+		const [b, at] = this.linked(l)
+		if (before == null) {
+			n.chain = b.get(at, 8)
+		} else {
+			before[0].put(before[1], b.get(at, 8), 8)
+		}
+	}
+
+	/// Defines n as the first of its chain to define it not weakly, else the first to define it, if one does.
+	private redefine(n: Name) {
+		const ls = this.links(n).filter(l => l & defining != 0)
+		const l = ls.find(l => l & strong != 0) ?? (if (ls.length > 0) ls[0] else 0)
+		const at = if (l != 0) this.linked(l)[0].get(this.linked(l)[1] + 8, 8) else 0
+		n.unit = this.unit(l)
+		n.section = if (l != 0) (at >> 32) as i32 else -1
+		n.value = at & 0xffffffff
+		n.weak = l & strong == 0 && l != 0
+		n.library = -1
+	}
+
+	/// Unit k, of which the symbols and fixups of one the continued image holds are read only once a link needs them, as
+	/// a link that leaves it as it is does not; and of the frozen one, but its local symbols.
+	private read(k: i32): Unit {
+		const u = this.units[k]
+		if (u.encoded != "" && u.names.length == 0) {
+			u.names = this.rest(u, u.encoded, u.frozen)
+		}
+		return u
+	}
+
+	/// The Name of index g, read of its entry if it is not yet.
+	private entry(g: i32): Name {
+		if (this.names[g] == null) {
+			this.names[g] = this.load(g)
+			this.names[g]!.was = this.load(g)
+			this.touched.push(g)
+		}
+		return this.names[g]!
+	}
+
+	/// The Name of index g as its entry in the continued image is.
+	private load(g: i32): Name {
+		const b = this.bytes
+		const p = this.entries + entry * (g as u64)
+		const [at, size] = [b.get(p, 8), b.get(p + 8, 4)]
+		if (at > b.length || size > b.length - at || b.get(p + 16, 4) > (this.units.length as u64)) {
+			throw new CompileError("the names' entries are broken")
+		}
+		const n = new Name(b.slice(at, at + size))
+		n.library = (b.get(p + 12, 4) as i32) - 1
+		n.unit = (b.get(p + 16, 4) as i32) - 1
+		n.section = (b.get(p + 20, 4) as i32) - 1
+		n.value = b.get(p + 24, 8)
+		n.address = b.get(p + 32, 8)
+		n.slot = b.get(p + 40, 8)
+		n.stub = b.get(p + 48, 8)
+		n.chain = b.get(p + 56, 8)
+		n.weak = b.get(p + 64, 1) != 0
+		return n
+	}
+
 	/// The index of the shared Name of name, made if there is none.
 	private name(name: string): i32 {
 		const h = this.hash(name)
@@ -1328,6 +1588,7 @@ export class Linker {
 		const p = this.slot(h)
 		this.table.put(p, h, 8)
 		this.table.put(p + 8, (this.names.length as u64) + 1, 4)
+		this.touched.push(this.names.length)
 		this.names.push(new Name(name))
 		return this.names.length - 1
 	}
