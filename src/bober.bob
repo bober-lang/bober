@@ -28,7 +28,7 @@ import { File, stderr, stdin, stdout } from "../std/io"
 import { arch, os } from "../std/os"
 import { ParseError, codePoint, replace, split, trim, utf8 } from "../std/string"
 import * as decl from "./bc/decl"
-import { Bodies, Reached, abi, sigMarks, signatures, write, writeFacts } from "./bc/file"
+import { Bodies, Reached, abi, readFacts, sigMarks, signatures, write, writeFacts } from "./bc/file"
 import { Program } from "./bc/program"
 import { show } from "./bc/show"
 import { glue, includesOf, sysroot } from "./c/bind"
@@ -810,33 +810,31 @@ function testHashes(p: Program, mains: i32[]): [string, string][][] {
 
 /// Compiles the programs of mains into the image as build does, monomorphized as one of their package (ofWorld), but at
 /// -O0, and if release of themselves alone; returns what gives the command of one of them, linking the image again only
-/// where another build wrote it (done), and once it failed, what it threw.
-function programs(mains: string[], tests: bool, f: Compile, pin: bool): (main: string) => string[] {
+/// where another build wrote it (done), and once it failed, what it threw. Should the image lack the unit of a module
+/// mono kept, as a build since changed it, another command's or of another of mains, all are compiled again,
+/// monomorphized whole.
+function programs(mains: string[], tests: bool, f: Compile, pin: bool, whole = false): (main: string) => string[] {
 	const dyn = !f.release && !f.O2 && f.O0
-	const p = if (dyn || f.release) lowered(mains, f.headers.I) else ofWorld(mains, f.headers.I)
+	const [p, hashed] = monomorphized(mains, tests, f, dyn, whole)
 	const ms = mains.map(m => p.module(normal(m)))
-	const hashed = if (tests) testHashes(p, ms) else [] // before mono changes the code
 	const o = { main: -1, tests: false, dyn: dyn, tune: f.tuned }
-	if (!o.dyn) {
-		if (clear != "") {
-			stdout.write(`${clear}compiling ${p.modules.length} modules`)
-		}
-		for (const x of 0 ... p.modules.length - 1) {
-			p.modules[x].bc = if (p.modules[x].bc != "") p.modules[x].bc else write(p, x, compilerId())
-		}
-		sigMarks(p)
-		mono(p, ms[0], true, if (f.release) f.tuned.small else 0)
-	}
 	const [files, cxx] = linked(p, program(p, ms, dyn), tests, f.headers.I)
 	let failed: CompileError | null = null
+	let instead: ((main: string) => string[]) | null = null
 	return main => {
-		if (failed != null) {
+		if (instead != null) {
+			return instead!(main)
+		} else if (failed != null) {
 			throw failed!
 		}
 		let made: [string, u64] = ["", 0]
 		try {
 			made = image(p, ms, files, cxx, pin || f.release, o, f)
-		} catch (e: CompileError) {
+		} catch (e: Unkept | CompileError) {
+			if (e instanceof Unkept) {
+				instead = programs(mains, tests, f, pin, true)
+				return instead!(main)
+			}
 			failed = e
 			throw e
 		}
@@ -849,6 +847,95 @@ function programs(mains: string[], tests: bool, f: Compile, pin: bool): (main: s
 		hashes = if (tests) hashed[mains.indexOf(main)] else []
 		return command
 	}
+}
+
+/// The Program of mains as programs compiles it, lowered, and with tests of each of mains the hashes of its tests
+/// (testHashes); unless dyn monomorphized as one of their package, the modules kept that the image holds as they are
+/// (keep), unless whole, and read again with those mono finds stale made anew too, till it finds none, or all whole.
+function monomorphized(mains: string[], tests: bool, f: Compile, dyn: bool,
+	whole: bool): [Program, [string, string][][]] {
+	const stale: string[] = []
+	let round = 0
+	while (true) {
+		const p = if (dyn || f.release) lowered(mains, f.headers.I) else ofWorld(mains, f.headers.I)
+		const ms = mains.map(m => p.module(normal(m)))
+		const hashed = if (tests) testHashes(p, ms) else [] // before mono changes the code
+		if (dyn) {
+			return [p, hashed]
+		}
+		if (clear != "") {
+			stdout.write(`${clear}compiling ${p.modules.length} modules`)
+		}
+		for (const x of 0 ... p.modules.length - 1) {
+			p.modules[x].bc = if (p.modules[x].bc != "") p.modules[x].bc else write(p, x, compilerId())
+		}
+		sigMarks(p)
+		const units = if (whole || f.release || round == 3) [] else keep(p, ms, f, stale)
+		// Of those kept, the units to be made anew, not the bytecode alone a unit of another program is linked from.
+		const more = mono(p, ms[0], true, if (f.release) f.tuned.small else 0).filter(m => units[m])
+		// A module kept by its bytecode alone is of the program now: its unit is to be made.
+		more.append(program(p, ms, false).filter(m => p.modules[m].kept && !units[m]))
+		if (more.length == 0) {
+			monoKept = p.modules.filter(m => m.kept).length
+			return [p, hashed]
+		}
+		stale.append(more.map(m => p.modules[m].path))
+		round++
+	}
+}
+
+/// Marks kept (Module.kept), its facts and the rest read into it, each of p's modules but those of the paths stale of
+/// which the image holds the unit as relink names it, its demand as read, or the bytecode alone, of a module not of
+/// the program of mains as far as the units kept tell, made of what it is now and naming no mark gone; returns
+/// whether each is kept by its unit.
+function keep(p: Program, mains: i32[], f: Compile, stale: string[]): bool[] {
+	const units = p.modules.map(_ => false)
+	if (decoded == null) {
+		return units
+	}
+	const l = decoded![1]
+	const has = (name: string) => l.holds(key(name)).includes(name)
+	worldOf(p, mains[0])
+	const [defs, lang] = marksOf(p)
+	const defined = new HashMap[u64, bool]()
+	defined.set(lang, true)
+	for (const ds of defs) {
+		for (const h of ds) {
+			defined.set(h, true)
+		}
+	}
+	for (const m of 0 ... p.modules.length - 1) {
+		const x = p.modules[m]
+		const b = bound.get(x.path)?.bytes(x.path) ?? ""
+		const spec = symbolPath(p, m, false)
+		const alone = `${x.path}^bc@${fnv(x.bc + b)}`
+		for (const h of if (stale.includes(x.path)) []
+			else [...l.holds(`${spec}^O1`), ...l.holds(`${spec}^O2`), ...l.holds(`${x.path}^bc`)]) {
+			const s = l.sections("bober_fold", h)
+			try {
+				if (s.length != 1 || readFacts(p, s[0]) != m) {
+					continue
+				}
+			} catch (e: ParseError) {
+				continue
+			}
+			const v = unitVersion(p, m, x.bc + b + `${defs[m]}${x.demand}.${x.typed}${encode(f.tuned)}`)
+			const [fast, opt] = [`${spec}^O1${v}`, `${spec}^O2${v}`]
+			if ((h == alone || h == (if (byLLVM(f, has, fast, opt)) opt else fast))
+				&& x.named.every(n => defined.has(n))) {
+				x.kept = true
+				units[m] = h != alone
+				break
+			}
+		}
+		if (!x.kept) {
+			x.uses = []
+		}
+	}
+	for (const m of program(p, mains, false).filter(m => !units[m])) {
+		p.modules[m].kept = false
+	}
+	return units
 }
 
 /// Whether a module's unit is LLVM's, opt, rather than TPDE's, fast, of an image that has what has says: at -O2, if it
@@ -893,6 +980,13 @@ function marksOf(p: Program): [u64[][], u64] {
 	}
 	sort(sigs)
 	return [defs, fnv(sigs.join(" "))]
+}
+
+/// What relink throws when the image lacks the unit of a module mono kept (Module.kept).
+class Unkept {
+	msg: string
+
+	constructor(msg: string) { this.msg = msg }
 }
 
 /// Compiles the program of main into file, by default build/<name>.wasm, or .mjs if f.js, with tests
@@ -1236,9 +1330,12 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	// Of each unit of the program by name, its module, whether LLVM's, its bytecode and Bound; and those to make.
 	const units = new HashMap[string, [i32, bool, string, string]]()
 	const made: string[] = []
-	// Of a module, its unit's facts with the marks it names.
+	// Of a module not kept, its unit's facts with the marks it names, which a build to come keeps it by.
+	const keeping = p.modules.some(x => x.kept)
 	const fold = (m: i32) => {
-		p.modules[m].named = [...signatures(p, m, bodies)[1], lang]
+		if (!p.modules[m].kept) {
+			p.modules[m].named = [...signatures(p, m, bodies)[1], lang]
+		}
 		return writeFacts(p, m)
 	}
 	for (const m of 0 ... p.modules.length - 1) {
@@ -1247,8 +1344,10 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		const b = bound.get(path)?.bytes(path) ?? ""
 		if (!ms.includes(m)) {
 			// Not the program's: what a build links it from alone, <path>^bc@<version>, rather than check it again.
+			// Of its facts as made anew too, if mono kept others.
 			const name = `${path}^bc@${fnv(bc + b)}`
-			if (lacks(name)) {
+			if (lacks(name) || keeping && !p.modules[m].kept) {
+				l.remove(name)
 				l.add(cached(new Object(name, machine.arch), bc, b, if (o.dyn || c.release) "" else fold(m)))
 			}
 			continue
@@ -1301,6 +1400,9 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	}
 	for (const u of made) {
 		const [m, llvm, bc, b] = units.get(u)!
+		if (p.modules[m].kept) {
+			throw new Unkept(`the image lacks ${u}`)
+		}
 		if (clear != "") {
 			stdout.write(`${clear}[${m + 1}/${p.modules.length}] compiling ${split(p.modules[m].path, ": ")[0]}`)
 		}
@@ -1505,6 +1607,8 @@ function marker(h: u64): string {
 
 /// If not null, given each unit unit makes but a release build's, which a test compares.
 export let onUnit: ((x: Object) => void) | null = null
+/// Of the last program monomorphized, how many modules it kept (Module.kept), which a test asks.
+export let monoKept = 0
 
 /// The objects of the glue of p's modules ms of C headers but the bundle's, of source hash 0, compiled with includes
 /// and those of the packages of these modules, and all C libraries of each package one of whose headers it imports,

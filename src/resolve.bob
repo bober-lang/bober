@@ -132,6 +132,8 @@ export class Instances {
 	pos = -1
 	/// The instance being worked on, -1 if none.
 	cur = -1
+	/// Whether copy leaves the code of an instance uncopied, which only result copies then.
+	defer: ((k: i32) => bool) | null = null
 	/// The instances whose code is still to copy.
 	private todo: i32[] = []
 	/// Per type id, whether the class instances it names are made.
@@ -174,8 +176,8 @@ export class Instances {
 		return `${this.p.modules[m].path}:${line}:${col}`
 	}
 
-	/// The instance of decl d for the env, made on first use; of a class with its fields and its constructor, which emit
-	/// finds by name, its methods as they are called; but of builtin/'s only what is used is.
+	/// The instance of decl d for the env, made on first use; of a class with its fields, which lay it out wherever its
+	/// code is copied, and but builtin/'s its constructor, which emit finds by name; its methods as they are called.
 	instance(d: i32, env: i32): i32 throws CompileError {
 		const p = this.p
 		const found = p.instances.get(pair(d, env))
@@ -193,10 +195,11 @@ export class Instances {
 			throw this.error(`${qualified(p, d)} is instanced with type args nested ever deeper`)
 		}
 		const k = this.add(p.instance(d, env, owner), [], false)
-		if ((x.kind == decl.Class || x.kind == decl.Interface) && !builtin(p.modules[x.module].path)) {
+		const own = !builtin(p.modules[x.module].path)
+		if (x.kind == decl.Class || x.kind == decl.Interface && own) {
 			for (const m of x.members) {
 				const y = p.decls[m]
-				if ((y.kind != decl.Function || p.strings[y.name] == "constructor") && y.params.length == 0
+				if ((y.kind != decl.Function || own && p.strings[y.name] == "constructor") && y.params.length == 0
 					&& !takesType(p, m, env)) {
 					this.instance(m, env)
 				}
@@ -259,11 +262,13 @@ export class Instances {
 	/// The env of the first n args of env.
 	private prefix(env: i32, n: i32): i32 { return this.p.list(this.p.lists[env].slice(0, n)) }
 
-	/// Copies the code of the instances made, as they are made.
+	/// Copies the code of the instances made, as they are made, but those deferred.
 	copy() throws CompileError {
 		let next = 0
 		while (next < this.todo.length) {
-			this.make(this.todo[next])
+			if (this.defer == null || !this.defer!(this.todo[next])) {
+				this.make(this.todo[next])
+			}
 			next++
 		}
 		this.todo = []

@@ -2,11 +2,12 @@
 
 import { endsWith, indexOf, sort, startsWith, unique } from "../std/algo"
 import { fromCString } from "../std/c"
+import { HashMap } from "../std/collections/hashmap"
 import { exists, glob, mkdirAll, open, remove, stat } from "../std/fs"
 import { base } from "../std/fs/path"
 import * as process from "../std/process"
 import { replace, split } from "../std/string"
-import { Build, Compile, Run, build, format, ignored, machine, onUnit, runTests, toolchain } from "./bober"
+import { Build, Compile, Run, build, format, ignored, machine, monoKept, onUnit, runTests, toolchain } from "./bober"
 import { Bytes } from "./link/bytes"
 import { Linker } from "./link/link"
 import { Object } from "./link/object"
@@ -835,6 +836,101 @@ function main() {\n\tconst b = new Box[i32]()\n\tb.v = 2${w}\n\tprint(\`\${u()}\
 		assert built([], "-O1") == out
 		assert units() == continued
 	}
+}
+
+/// Of a build of files, its output, and of each unit it made, its name and the rest of it (shape).
+function shaped(files: [string, string][], level = "-O1"): [string, string[]] {
+	const made: string[] = []
+	onUnit = x => {
+		const [marks, rest] = shape(x)
+		made.push(`${x.name} ${marks}\n${rest}`)
+	}
+	try {
+		const out = built(files, level)
+		sort(made)
+		return [out, made]
+	} finally {
+		onUnit = null
+	}
+}
+
+test "a build continued, monomorphizing only the modules whose units it makes, makes and holds the units a build anew does" {
+	const lib = (get: string, k: i32) => `export interface Shape { area(): i32 }\n
+export class Box[T] {\n\tstatic made = 0\n\tv: T\n\n\tconstructor(v: T) {\n\t\tthis.v = v\n\t\tBox[T].made++\n\t}\n
+\tget(): T { ${get} }\n}\n\nexport function area(s: Shape): i32 { return s.area() }\n
+export function k(): i32 { return ${k} }\n\nexport interface One { one(): i32 }\n
+export class O { one(): i32 { return 1 } }\n\nexport class Q {\n\tf: One | null = new O()\n\ta = 5\n}\n
+export function q(): Q { return new Q() }\n\nexport function o(): One | null { return new O() }\n
+export function ones(n: i32, x: One | null): i32 { return if (x == null) n else n + x!.one() }\n
+export const two = [1, 1].length\n`
+	const u = (body: string) => `import { Box, Shape, area } from "./lib"\n\nclass U { area(): i32 { return 2 } }\n
+export function u(): string { ${body} }\n`
+	const v = "import { o, ones, q } from \"./lib\"\n\nexport function v(): string { return `${ones(10, o())} ${q().a}` }\n"
+	const main = (w: string, c = "") => `import { Box, area, k, ones, two } from "./lib"\nimport { u } from "./u"\nimport { v } from "./v"\n
+class A { area(): i32 { return 1 } }\n${c}\nfunction main() {${w}\n\tprint(\`\${area(new A())} \${k()} \${u()} \${v()} \${two}\`)\n}\n`
+	const box = "return `${new Box[i32](2).get()}`"
+	const spread = "\n\tconst s: { get: () => string } = new Box[string](\"s\")\n\tconst g: { get: () => string } = { ...s }"
+	const steps: [string, string][][] = [
+		[["lib.bob", lib("return this.v", 1)], ["u.bob", u(box)], ["v.bob", v], ["main.bob", main("")]],
+		[["lib.bob", lib("return this.v", 2)]], // a plain function's body
+		[["lib.bob", lib("const v = this.v\n\t\treturn v", 2)]], // a generic's body, which u copies
+		[["main.bob", main("\n\tprint(`${new Box[string](\"s\").v}`)")]], // statics of an instance lib holds
+		[["u.bob", u("return `${area(new U())} ${new Box[string](\"t\").v}`")]], // a union lib lowers grown
+		[["main.bob", main(`${spread}\n\tprint(g.get())`)]], // a method bound of an instance u holds
+		// a union of one ref a function of lib takes and a field of its class holds, which v passes and reads, grown
+		[["main.bob", main("\n\tprint(`${ones(1, new P())}`)", "\nclass P { one(): i32 { return 2 } }\n")]]
+	]
+	// Per unit name and marks, the unit made of them last; one made again of the same must be the same.
+	const of = new HashMap[string, string]()
+	const same = (made: string[]) => made.filter(x => {
+		const was = of.get(split(x, "\n")[0])
+		of.set(split(x, "\n")[0], x)
+		return was != null && was != x
+	}).map(x => split(x, "\n")[0])
+	let fewer = false
+	for (const files of steps) {
+		const [out, made] = shaped(files)
+		assert files.length > 1 || monoKept > 0
+		assert same(made) == []
+		const continued = units()
+		anew()
+		const [again, all] = shaped([])
+		assert again == out
+		assert units() == continued
+		assert same(all) == []
+		fewer = fewer || made.length < all.length
+	}
+	assert fewer
+}
+
+test "a build continued with no level given monomorphizes only the modules whose units it makes, LLVM's of one unchanged too" {
+	const lib = (k: i32) => `export function k(): i32 { return ${k} }\n`
+	const main = (k: i32) => `import { k } from "./lib"\n\nfunction main() {\n\tprint(\`\${k()} ${k}\`)\n}\n`
+	anew()
+	assert built([["lib.bob", lib(1)], ["main.bob", main(1)]], "") == "1 1\n"
+	assert built([["lib.bob", lib(2)]], "") == "2 1\n" // of the units of a command before, LLVM's, of all but lib
+	assert built([["main.bob", main(2)]], "") == "2 2\n" // of lib, unchanged, LLVM's; the others kept
+	assert monoKept > 0
+	assert built([["lib.bob", lib(3)]], "") == "3 2\n"
+	assert monoKept > 0
+}
+
+test "a class of builtin/ is laid out with all its fields, though only a module kept sets those the code made reads not" {
+	const main = (f: string) => `import { stat } from "std/fs"\n\nfunction main() {\n\tprint(\`\${stat("${home()}/main.bob").${f}}\`)\n}\n`
+	anew()
+	assert built([["main.bob", main("isFile")]], "-O1") == "true\n"
+	assert built([["main.bob", main("isDirectory")]], "-O1") == "false\n"
+	assert monoKept > 0
+}
+
+test "a build continued after a module whose decls the facts of a unit name was deleted builds" {
+	const main = `import { e } from "./u"\n\nfunction main() { print(\`\${e[i32]()}\`) }\n`
+	anew()
+	assert built([["extra.bob", "export class E { n = 1 }\n"],
+		["u.bob", "import { E } from \"./extra\"\n\nexport function e[T](): i32 { return new E().n }\n"],
+		["main.bob", main]], "-O1") == "1\n"
+	remove(`${home()}/extra.bob`)
+	assert built([["u.bob", "class E { n = 2 }\n\nexport function e[T](): i32 { return new E().n }\n"]], "-O1") == "2\n"
 }
 
 test "a unit kept is made anew once a union of one ref that the functions it calls take and return grew" {

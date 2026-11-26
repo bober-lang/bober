@@ -9,7 +9,8 @@
 //! For a module's unit of its own (src/bober.bob's image), the same in each program that has the module, the Program
 //! being of all its package's files, which fixes what each union holds, or a release build's of its own alone, a
 //! module lists only what is its own, and as its copies what else its code reaches, as C++ does templates: the
-//! instances, dispatch functions and classes mono makes, each defined in every module that lists it.
+//! instances, dispatch functions and classes mono makes, each defined in every module that lists it. Of a module whose
+//! unit the image holds as it would be made, the facts that unit holds stand in for its code, which is left uncopied.
 //!
 //! A dispatch function is a decl of the module using it named `.f[T]` for reading field f of T, `.f=[T]` for writing
 //! it and `.f()[T]` for calling method f. An intrinsic, a function of builtin/ without a body, is called as itself with
@@ -39,8 +40,11 @@ import { builtin, builtinPath } from "./root"
 /// program, its copies the others its code reaches, and its uses the modules of what else it names. A function of
 /// fewer than small ops, but a closure, is a copy of each module that reaches it, which compiled by itself may so
 /// inline it, and but a root not its module's own.
-export function mono(p: Program, main: i32, units = false, small = 0) throws CompileError {
-	new Mono(p, units, small).run(main)
+/// Of modules kept (Module.kept), their facts are folded and their own code left uncopied, but what they demand of
+/// the others rooted; returns those kept whose typed or demand mono finds changed: their units are to be made anew
+/// too, of p read again.
+export function mono(p: Program, main: i32, units = false, small = 0): i32[] throws CompileError {
+	return new Mono(p, units, small).run(main)
 }
 
 class Mono {
@@ -72,6 +76,8 @@ class Mono {
 	private thrown: i32[] = []
 	private caught: i32[] = []
 	private reached = new HashMap[i64, [i32, i32]]()
+	/// Of those, the ones of code copied here, whose dispatch functions reach members.
+	private wanted = new HashMap[i64, [i32, i32]]()
 	/// The values each object spreads and its type, and the methods of classes those bind, which a class holds.
 	private binds: [i32, i32][] = []
 	private bound = new HashMap[i32, bool]()
@@ -93,7 +99,7 @@ class Mono {
 		this.small = small
 	}
 
-	run(main: i32) throws CompileError {
+	run(main: i32): i32[] throws CompileError {
 		const p = this.p
 		this.main = main
 		for (const m of p.modules) {
@@ -117,6 +123,17 @@ class Mono {
 				}
 			}
 		}
+		// Of a module kept, its facts, and the instances of the generic classes of others with statics, which they hold.
+		this.ins.defer = k => this.deferred(k)
+		for (const m of p.modules.filter(m => m.kept)) {
+			this.fold(m.facts, false)
+			for (const j of 0 ... m.facts.length / 3 - 1) {
+				const c = m.facts[3 * j + 1]
+				if (m.facts[3 * j] == op.Init && !p.modules[p.decls[p.a(c)].module].kept && this.statics(p.a(c))) {
+					this.ins.instance(p.a(c), p.b(c))
+				}
+			}
+		}
 		// Until no instance is made: copying, collecting, and instancing the members dispatch functions reach.
 		let from = 0
 		while (from < this.ins.order.length) {
@@ -124,20 +141,21 @@ class Mono {
 			from = this.collect(from)
 		}
 		this.write()
-		this.versions()
+		const stale = this.versions()
 		for (const m of p.modules) {
 			m.abi = 0
 		}
 		if (!this.units) {
 			this.number()
 		}
+		return stale
 	}
 
 	/// Gives each module its typed, the hash of the interface and object types its unit lowers (its Type facts) and the
 	/// unions they are held as, and of the Init facts of all, its demand: the hash of the instances of its generic
 	/// classes with statics that units hold, whose statics it holds, and of the methods spreads bind of the instances of
-	/// generic classes it holds, which those hold as members.
-	private versions() {
+	/// generic classes it holds, which those hold as members. Returns the modules kept whose typed or demand changed.
+	private versions(): i32[] {
 		const p = this.p
 		const ds = p.modules.map(_ => [] as u64[])
 		for (const mi of 0 ... p.modules.length - 1) {
@@ -155,10 +173,17 @@ class Mono {
 				}
 			}
 		}
+		const stale: i32[] = []
 		for (const mi of 0 ... p.modules.length - 1) {
-			p.modules[mi].demand = hashOf(ds[mi])
-			p.modules[mi].typed = this.typedOf(p.modules[mi])
+			const m = p.modules[mi]
+			const typed = this.typedOf(m)
+			if (m.kept && (hashOf(ds[mi]) != m.demand || typed != m.typed)) {
+				stale.push(mi)
+			}
+			m.demand = hashOf(ds[mi])
+			m.typed = typed
 		}
+		return stale
 	}
 
 	/// The hash of the types of m's Type facts and the unions they are held as.
@@ -178,6 +203,13 @@ class Mono {
 	private statics(d: i32): bool {
 		const p = this.p
 		return p.decls[d].members.some(x => p.decls[x].kind == decl.Var && (p.decls[x].mods & decl.Static) != 0)
+	}
+
+	/// Whether the code of instance k is left uncopied: one of a kept module's own, none of which a generic's, so that
+	/// emit calling a method of them finds this typed in its code as read as it would be lowered (callee).
+	private deferred(k: i32): bool {
+		const t = this.top(k)
+		return this.own.has(t) && this.p.modules[this.p.decls[t].module].kept
 	}
 
 	/// Numbers the members of the unions values have at run time for their tags, those of the largest first, so that
@@ -260,8 +292,8 @@ class Mono {
 		return out
 	}
 
-	/// Notes facts as scan makes them.
-	private fold(fs: i32[]) {
+	/// Notes facts as scan makes them, of code copied here if mine.
+	private fold(fs: i32[], mine = true) {
 		for (const j of 0 ... fs.length / 3 - 1) {
 			const o = fs[3 * j]
 			const a = fs[3 * j + 1]
@@ -269,6 +301,9 @@ class Mono {
 			if (o == op.Field) {
 				if (!this.reached.has(pair(a, b))) {
 					this.reached.set(pair(a, b), [a, b])
+				}
+				if (mine && !this.wanted.has(pair(a, b))) {
+					this.wanted.set(pair(a, b), [a, b])
 				}
 			} else if (o == op.Cast) {
 				this.convert(a, b)
@@ -311,7 +346,7 @@ class Mono {
 				}
 			}
 		}
-		for (const [t, name] of this.reached.values()) {
+		for (const [t, name] of this.wanted.values()) {
 			for (const m of this.ins.flat(t)) {
 				this.ins.memberOf(this.ins.owner(m, name), name)
 				this.shows(m, name)
@@ -435,7 +470,9 @@ class Mono {
 				this.lowered = []
 				x.type = this.low(if (x.kind == decl.Function) runtime(p, x.type) else x.type)
 				this.sigs.set(k, this.lowered.slice(0, this.lowered.length))
-				x.code = if (i.code == null) null else this.lower(x.module, i.code!, i.info)
+				if (i.copied) {
+					x.code = if (i.code == null) null else this.lower(x.module, i.code!, i.info)
+				}
 				this.typeFacts(k)
 			}
 		}
@@ -461,7 +498,11 @@ class Mono {
 					...byHash(this.dispatches.filter(d => p.decls[d].module == mi))].filter(d => this.own.has(d))
 			}
 			m.inits = instances(m.inits)
-			m.copies = this.copies(m)
+			if (!m.kept) {
+				m.facts = []
+				m.uses = []
+				m.copies = this.copies(m)
+			}
 		}
 	}
 
