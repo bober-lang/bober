@@ -1,14 +1,16 @@
 //! Tests of src/bober.bob's builds into the image, which keeps what it holds across them.
 
-import { endsWith, indexOf, startsWith } from "../std/algo"
+import { endsWith, indexOf, sort, startsWith } from "../std/algo"
+import { isDigit } from "../std/ascii"
 import { fromCString } from "../std/c"
 import { exists, glob, mkdirAll, open, remove, stat } from "../std/fs"
 import { base } from "../std/fs/path"
 import * as process from "../std/process"
 import { replace, split } from "../std/string"
-import { Build, Compile, Run, build, format, ignored, machine, runTests, toolchain } from "./bober"
+import { Build, Compile, Run, build, format, ignored, machine, onUnit, runTests, toolchain } from "./bober"
 import { Bytes } from "./link/bytes"
 import { Linker } from "./link/link"
+import { Object } from "./link/object"
 import { CLib, dir } from "./pkg"
 import { root } from "./root"
 import { getcwd } from "unistd.h"
@@ -602,4 +604,135 @@ test "a file is known by its time and size once older than a build, else read, a
 	assert at("1", []) == "1\n" && at("2", []) == "2\n"
 	// of the same time and size, which a build started in that tick or before sees, as of one written again in it
 	assert at("3", ["-t", "209901010000"]) == "3\n" && at("4", ["-t", "209901010000"]) == "4\n"
+}
+
+/// Of a unit, the marks it defines and names, and the rest of it but its bytecode and the ABIs of modules, which its
+/// names have after a ^ and its marks do not cover (unit).
+function shape(x: Object): [string, string] {
+	const plain = (name: string) => split(name, "^").map(s => {
+		let i = 0
+		while (i < s.length && isDigit(s[i])) {
+			i++
+		}
+		return s.slice(i, s.length)
+	}).join("^")
+	const marks = x.symbols.filter(s => startsWith(s.name, "~")).map(s => `${s.name}${s.section >= 0}`)
+	sort(marks)
+	let rest = ""
+	for (const s of x.sections.filter(s => s.name != "bober_bc")) {
+		rest += `${s.name} ${s.kind} ${s.align} ${s.size} ${s.bytes}\n`
+		for (const f of s.fixups) {
+			rest += `${f.at} ${f.kind} ${plain(x.symbols[f.symbol].name)} ${f.addend}\n`
+		}
+	}
+	for (const s of x.symbols.filter(s => !startsWith(s.name, "~") && !startsWith(s.name, "bober.abi."))) {
+		rest += `${plain(s.name)} ${s.binding} ${s.section} ${s.value} ${s.size}\n`
+	}
+	return [marks.join(" "), rest]
+}
+
+/// The files of a program of a generic class and function, a class others lay out, an interface whose members grow, a
+/// closure and a const, and a function's doc, each as a choice of v makes it.
+function marked(v: i32[]): [string, string][] {
+	const cs: string[] = []
+	for (const i of 0 ... v[5]) {
+		cs.push(`C${i}`)
+	}
+	const lib = `${["", "\n", "\n\n"][v[0]]}export class Box[T] {
+	v: T
+
+	constructor(v: T) { this.v = v }
+
+	get(): T { ${["return this.v", "const v = this.v\n\t\treturn v"][v[1]]} }
+}
+
+export interface Shape {
+	area(): i32${["", "\n\tsides(): i32"][v[7]]}
+}
+
+export const K = ${v[2] + 2}
+
+${["", "/// Scales x.\n"][v[10]]}export function scale(x: i32): ${["i32", "i64"][v[3]]} { return (x * K) as ${["i32", "i64"][v[3]]} }
+
+export function apply[T](f: (x: T) => T, x: T): T { return f(x) }
+
+export class P {
+	x = 1${["", "\n\ty = 2"][v[4]]}
+}
+
+export interface HasN { n: i32 }
+
+export function nOf(h: HasN): i32 { return h.n }
+
+export function total(ss: Shape[]): i32 {
+	let t = 0
+	for (const s of ss) {
+		t += s.area()
+	}
+	return t
+}
+`
+	let shapes = ""
+	for (const i of 0 ... v[5]) {
+		shapes += `export class C${i} {\n\tarea(): i32 { return ${i + 1} }\n\n\tsides(): i32 { return ${i} }\n}\n`
+	}
+	const other = `import { Box, K, P } from "./m_lib"
+
+export function other(): string { return \`\${new Box[string]("${["o", "p"][v[8]]}").get()}\${new P().x}\${K}\` }
+`
+	const main = `import { Box, P, Shape, apply, nOf, scale, total } from "./m_lib"
+import { ${cs.join(", ")} } from "./m_shapes"
+import { other } from "./m_other"
+
+function main() {
+	const ss: Shape[] = [${cs.map(c => `new ${c}()`).join(", ")}]
+	print(\`\${total(ss)} \${new Box[i32](3).get()} \${new Box[P](new P()).get().x} \${apply(x => x + ${v[6] + 1}, 1)} \${scale(2)} \${other()} \${nOf({ n: 3 })}${["", " ${nOf({ n: 4, m: 1 })}"][v[9]]}\`)
+}
+`
+	return [["m_lib.bob", lib], ["m_shapes.bob", shapes], ["m_other.bob", other], ["m_main.bob", main]]
+}
+
+test "a unit made anew of the marks it defined and named before is the same, after a random small edit" {
+	const v = [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]
+	const choices = [3, 2, 3, 2, 2, 3, 3, 2, 2, 2, 2]
+	let seed: i64 = 7
+	let before: [string, string, string][] = []
+	let same = 0
+	const differ: string[] = []
+	for (const edit of 0 ... 20) {
+		const now: [string, string, string][] = []
+		onUnit = x => {
+			const [marks, rest] = shape(x)
+			now.push([split(x.name, "^")[0], `${marks} ${split(split(x.name, "@")[1], ".")[0]}`, rest]) // and its source
+		}
+		anew()
+		try {
+			const n = v[5] + 1
+			assert built(marked(v), "-O1", "m_main.bob")
+				== `${n * (n + 1) / 2} 3 1 ${v[6] + 2} ${2 * (v[2] + 2)} ${["o", "p"][v[8]]}1${v[2] + 2} 3${["", " 4"][v[9]]}\n`
+		} finally {
+			onUnit = null
+		}
+		for (const [m, marks, rest] of now) {
+			for (const u of before.filter(u => u[0] == m && u[1] == marks)) {
+				same++
+				if (rest != u[2]) {
+					differ.push(`${m} after edit ${edit} of ${v}`)
+				}
+			}
+		}
+		before = now
+		seed = (seed * 1103515245 + 12345) % 2147483648
+		const i = edit * 3 % v.length // each in turn, of all
+		v[i] = (v[i] + 1 + ((seed / 65536 % (choices[i] - 1)) as i32)) % choices[i]
+	}
+	assert differ == [] && same > 0
+}
+
+test "-release makes anew a module that copies a function of another, once a closure in that function changed" {
+	const main = "import { f } from \"./lib\"\n\nfunction main() {\n\tprint(`${f([1])}`)\n}\n"
+	anew()
+	assert built([["lib.bob", "export function f(xs: i32[]): i32 { return xs.map(x => x + 1)[0] }\n"], ["main.bob", main]],
+		"-release") == "2\n"
+	assert built([["lib.bob", "export function f(xs: i32[]): i32 { return xs.map(x => x + 2)[0] }\n"]], "-release") == "3\n"
 }

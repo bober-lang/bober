@@ -22,7 +22,7 @@
 //! strings  per string: its bytes
 //! ints     per int: SLEB
 //! names    per names entry: its (Str, mods) pairs
-//! decls    per decl of its own, in the order made: Str name, kind byte, owner
+//! decls    per decl of its own, in the order made: Str name, kind byte, owner, the hash of its code (Decl.body)
 //! imports  per decl of another module it uses: dep, owner, Str name, nth of that name in its owner
 //! types    per type, after its parts: kind byte, a and b as its kind says
 //! defs     per decl: mods, type params (Str name, constraint, default, then both exact), type, supers, tags, throws,
@@ -51,7 +51,7 @@
 //! class, also of one two modules away, but not with a function's body. Modules whose signatures name each other have
 //! one hash, of all of theirs.
 
-import { sort } from "../../std/algo"
+import { sort, unique } from "../../std/algo"
 import { HashMap } from "../../std/collections/hashmap"
 import { Reader, Writer } from "../../std/encoding/binary"
 import { isAbs, join } from "../../std/fs/path"
@@ -151,18 +151,48 @@ export function abi(p: Program, m: i32): u64 {
 
 /// The hash of what module m's code is compiled against (Abi), which its bytecode with the ABIs of its imports does
 /// not hold once monomorphized: a generic's instance names the class it is of, of another module, exported or not;
-/// with the code of its decls and copies as emit reads it.
-export function signatures(p: Program, m: i32, bodies: Bodies): u64 { return new Abi(p, m, true, -1, bodies).h }
+/// with the code of its decls and copies as emit reads it; and the marks of what of other modules it is made of (Abi),
+/// which it covers too.
+export function signatures(p: Program, m: i32, bodies: Bodies): [u64, u64[]] {
+	const a = new Abi(p, m, true, -1, bodies)
+	sort(a.marks)
+	const marks = unique(a.marks)
+	let h = a.h
+	for (const x of marks) {
+		h = combine(h, x)
+	}
+	return [h, marks]
+}
 
-/// Of each decl, the hash of its code as emit reads it, positions counted from its root's, and the decls it names;
-/// made once, as a copy is in many modules.
+/// Of each decl, the mark of its signature and of those of the decls it names (Decl.sig), before mono makes any.
+export function sigMarks(p: Program) {
+	const r = new Reached(p)
+	for (const x of 0 ... p.decls.length - 1) {
+		p.decls[x].sig = r.of([x])
+	}
+}
+
+/// The hash of a union values are held as at run time and of the types held as it (Program.unions): its members.
+export function heldHash(p: Program, union: [i32, i32[]]): u64 {
+	const [t, ts] = union
+	const hs = ts.map(x => p.hash(x))
+	sort(hs)
+	let h = p.hash(t)
+	for (const x of hs) {
+		h = combine(h, x)
+	}
+	return h
+}
+
+/// Of each decl, the hash of its code as emit reads it, positions counted from its root's, the decls it names and the
+/// marks of the unions it holds values as; made once, as a copy is in many modules.
 export class Bodies {
 	private abi: Abi
-	private made = new HashMap[i32, [u64, i32[]]]()
+	private made = new HashMap[i32, [u64, i32[], u64[]]]()
 
 	constructor(p: Program) { this.abi = new Abi(p, -1, true) }
 
-	of(d: i32): [u64, i32[]] {
+	of(d: i32): [u64, i32[], u64[]] {
 		const have = this.made.get(d)
 		if (have != null) {
 			return have
@@ -174,8 +204,8 @@ export class Bodies {
 }
 
 /// The hashes of what decls run: of each, its code (Abi) and the hashes of the decls it names, its members too, which a
-/// call may dispatch to; made once each, of Tarjan's strongly connected components of decls naming each other, each
-/// hashed as one, as Abis does modules.
+/// call may dispatch to; or with no mark, of its signature alone and those of the decls it names; made once each, of
+/// Tarjan's strongly connected components of decls naming each other, each hashed as one, as Abis does modules.
 export class Reached {
 	p: Program
 	private index = new HashMap[i32, i32]()
@@ -185,9 +215,9 @@ export class Reached {
 	private made = new HashMap[i32, [u64, i32[]]]()
 	private hashes = new HashMap[i32, u64]()
 
-	constructor(p: Program) throws CompileError {
+	constructor(p: Program, mark = -1) {
 		this.p = p
-		this.abi = new Abi(p, -1, true, p.lang("mark"))
+		this.abi = new Abi(p, -1, mark >= 0, mark)
 	}
 
 	/// The hash of what roots run, but where in the source it is, which only a failure tells.
@@ -299,12 +329,15 @@ class Out {
 		const p = this.p
 		const decls = new Writer()
 		const defs = new Writer()
+		const codes = new Abi(p, -1, true)
 		uleb(decls, this.order.length)
 		for (const d of this.order) {
 			const x = p.decls[d]
+			x.body = if (x.code == null) 0 else combine(x.hash, codes.body(d)[0])
 			uleb(decls, this.str(x.name))
 			decls.u8(x.kind)
 			this.owner(decls, x.owner)
+			decls.fixed(x.body, 8)
 			uleb(defs, x.mods)
 			uleb(defs, x.params.length)
 			for (const t of x.params) {
@@ -549,7 +582,9 @@ export class In {
 			if (k > decl.Alias) {
 				throw this.bad()
 			}
-			return p.decl(this.m, this.owner(), name, k as decl.Kind)
+			const d = p.decl(this.m, this.owner(), name, k as decl.Kind)
+			p.decls[d].body = this.r.fixed(8)
+			return d
 		})
 		this.own = this.decls.length
 	}
@@ -772,8 +807,8 @@ class Abis {
 }
 
 /// Module m's signatures being hashed, and the other modules they name; or if all, its decls and copies with their
-/// code, and the signatures of all they name, of other modules too, and of what these name; or if m is -1, a decl at a
-/// time (own), with its code, and the decls it names, but positions: a test's marks and calls of mark.
+/// code, and the signatures of what they name that mono made, of what other decls they name the marks; or if m is -1, a
+/// decl at a time (own), with its code, and the decls it names, but positions: a test's marks and calls of mark.
 class Abi {
 	p: Program
 	m: i32
@@ -789,6 +824,9 @@ class Abi {
 	private mark: i32
 	/// The code hashes of own decls, made once (signatures), else hashed here.
 	private bodies: Bodies | null
+	/// If all, of the decls of other modules named, of the generics of instances walked, and their code if copied, and of
+	/// the unions walked (heldHash): the marks of what the code of m is made of, which its unit names.
+	marks: u64[] = []
 
 	constructor(p: Program, m: i32, all = false, mark = -1, bodies: Bodies | null = null) {
 		this.p = p
@@ -817,22 +855,28 @@ class Abi {
 	own(d: i32): [u64, i32[]] {
 		this.h = seed
 		this.uses = []
+		this.marks = []
 		this.at = d
 		this.decl(d)
 		return [this.h, this.uses]
 	}
 
-	/// If m is -1, the hash of decl d's code, and the decls it names.
-	body(d: i32): [u64, i32[]] {
+	/// If m is -1, the hash of decl d's code, the decls it names, of consts the values it took too, and the marks of the
+	/// unions it walks.
+	body(d: i32): [u64, i32[], u64[]] {
 		this.h = seed
 		this.uses = []
+		this.marks = []
 		this.at = d
 		this.code(this.p.decls[d].code!, true, this.p.decls[this.p.based(d)].pos)
-		return [this.h, this.uses]
+		for (const y of this.p.folded.get(d) ?? []) {
+			this.named(y)
+		}
+		return [this.h, this.uses, this.marks]
 	}
 
-	/// Adds the signature of decl d, of its members if a class or interface, its code if a const; with its doc, which
-	/// a type's descriptor holds, and whether it has code, as a call of one without is an intrinsic.
+	/// Adds the signature of decl d, of its members if a class or interface, its code if a const; with its doc but a
+	/// function's, which a type's descriptor holds, and whether it has code, as a call of one without is an intrinsic.
 	private decl(d: i32) {
 		if (this.done.has(d)) {
 			return
@@ -840,7 +884,8 @@ class Abi {
 		this.done.set(d, true)
 		const x = this.p.decls[d]
 		this.h = combine(combine(combine(this.h, x.hash), x.kind), x.mods)
-		this.h = combine(combine(this.h, fnv(this.p.strings[x.doc])), if (x.code == null) 0 else 1)
+		this.h = combine(combine(this.h, if (x.kind == decl.Function) 0 else fnv(this.p.strings[x.doc])),
+			if (x.code == null) 0 else 1)
 		for (const t of x.params) {
 			this.h = combine(this.h, fnv(this.p.strings[t.name]))
 			this.type(t.exactConstraint) // which the inexact one is made of
@@ -855,12 +900,17 @@ class Abi {
 		for (const y of if (own && this.m >= 0 && x.module != this.m) x.members else []) {
 			this.copied.set(y, true)
 		}
+		const s = this.p.decls[if (x.generic < 0) d else x.generic]
+		if (this.all && this.m >= 0 && s.module != this.m) {
+			this.marks.append([s.sig, if (own) s.body else 0].filter(h => h != 0))
+		}
 		if (x.code != null && own && this.bodies != null) {
-			const [h, ds] = this.bodies!.of(d)
+			const [h, ds, ms] = this.bodies!.of(d)
 			this.h = combine(this.h, h)
 			for (const y of ds) {
 				this.named(y)
 			}
+			this.marks.append(ms)
 		} else if (x.code != null && (own || x.kind == decl.Var && (x.mods & decl.Readonly) != 0)) {
 			this.code(x.code!)
 		}
@@ -928,6 +978,10 @@ class Abi {
 			return
 		}
 		this.seen.set(t, this.at)
+		const union = this.p.unions.get(t)
+		if (union != null && this.all) {
+			this.marks.push(heldHash(this.p, union!))
+		}
 		const k = this.p.kind(t)
 		if (k == kind.Named || k == kind.Param) {
 			this.named(this.p.a(t))
@@ -937,15 +991,18 @@ class Abi {
 		}
 	}
 
-	/// Adds decl d if of this module, or all are, else notes its module; or if m is -1, notes d.
+	/// Adds decl d if of this module, or if all one mono made or copied; if all, of another decl its mark (Decl.sig),
+	/// which covers what it names; else notes its module; or if m is -1, notes d.
 	private named(d: i32) {
-		const m = this.p.decls[d].module
+		const x = this.p.decls[d]
 		if (this.m < 0) {
 			this.uses.push(d)
-		} else if (m == this.m || this.all) {
+		} else if (x.module == this.m || this.all && (x.sig == 0 || this.copied.has(d))) {
 			this.decl(d)
-		} else if (!this.uses.includes(m)) {
-			this.uses.push(m)
+		} else if (this.all) {
+			this.marks.push(x.sig)
+		} else if (!this.uses.includes(x.module)) {
+			this.uses.push(x.module)
 		}
 	}
 }

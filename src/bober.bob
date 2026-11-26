@@ -13,8 +13,10 @@
 //! can catch. *implementation-defined* behavior is chosen by the implementation; a program shall not depend on
 //! implementation-defined behavior.
 
-import { endsWith, indexOf, lastIndexOf, sortBy, startsWith, unique } from "../std/algo"
+import { endsWith, indexOf, lastIndexOf, sort, sortBy, startsWith, unique } from "../std/algo"
 import { fromCString } from "../std/c"
+import * as base64 from "../std/encoding/base64"
+import { Writer } from "../std/encoding/binary"
 import { Keys, Rest, Unknown, decode as decodeJson, encode, quoted } from "../std/encoding/json"
 import * as yaml from "../std/encoding/yaml"
 import * as optarg from "../std/encoding/optarg"
@@ -26,7 +28,7 @@ import { File, stderr, stdin, stdout } from "../std/io"
 import { arch, os } from "../std/os"
 import { ParseError, codePoint, replace, split, trim, utf8 } from "../std/string"
 import * as decl from "./bc/decl"
-import { Bodies, Reached, abi, signatures, write } from "./bc/file"
+import { Bodies, Reached, abi, heldHash, sigMarks, signatures, write } from "./bc/file"
 import { Program } from "./bc/program"
 import { show } from "./bc/show"
 import { glue, includesOf, sysroot } from "./c/bind"
@@ -49,13 +51,14 @@ import { x64 } from "./link/x64"
 import { Bytes, store } from "./link/bytes"
 import { stamp, stamped } from "./link/keep"
 import { Linker, Stale, key } from "./link/link"
-import { Const, Global, Kept, Local, Object, Section, Symbol } from "./link/object"
+import { Const, Global, Kept, Local, Object, Section, Symbol, Weak } from "./link/object"
 import { SyntaxError } from "./lex"
 import { js } from "./js"
 import { lower } from "./lower"
 import { serve } from "./lsp"
 import { mono } from "./mono"
 import { Parser } from "./parse"
+import { takesType } from "./resolve"
 import { builtin, root } from "./root"
 import { CLib, Package, dir, given, here, load, nearest, out } from "./pkg"
 import { notice, update, version } from "./update"
@@ -794,7 +797,7 @@ function imported(p: Program, main: i32): i32[] {
 /// Of each of p's modules mains, each test: its name and the hash of the code it runs (Reached), with the inits of its
 /// program.
 function testHashes(p: Program, mains: i32[]): [string, string][][] {
-	const r = new Reached(p)
+	const r = new Reached(p, p.lang("mark"))
 	return mains.map(main => {
 		const inits: i32[] = []
 		for (const m of imported(p, main)) {
@@ -821,6 +824,7 @@ function programs(mains: string[], tests: bool, f: Compile, pin: bool): (main: s
 		for (const x of 0 ... p.modules.length - 1) {
 			p.modules[x].bc = if (p.modules[x].bc != "") p.modules[x].bc else write(p, x, compilerId())
 		}
+		sigMarks(p)
 		mono(p, ms[0], true, if (f.release) f.tuned.small else 0)
 	}
 	const [files, cxx] = linked(p, program(p, ms, dyn), tests, f.headers.I)
@@ -1169,6 +1173,31 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		else "")
 	const parts: string[] = []
 	const bodies = new Bodies(p)
+	// Monomorphized, the marks of each module's decls, which its unit defines; and of the unions values are held as at
+	// run time, which a unit of the world's (world) does, which each program of it shares.
+	const defs: u64[][] = p.modules.map(_ => [] as u64[])
+	if (!o.dyn && !c.release) {
+		for (const d of 0 ... p.decls.length - 1) {
+			// Of its code too if an instance may be of it, which names that: generic, nested or taking a Type.
+			const x = p.decls[d]
+			if (x.sig == 0) {
+				continue
+			}
+			const instanced = x.owner >= 0 || x.params.length > 0 || takesType(p, d)
+			defs[x.module].append([x.sig, if (instanced) x.body else 0].filter(h => h != 0))
+		}
+		const whole = p.unions.values().map(u => marker(heldHash(p, u)))
+		sort(whole)
+		const w = world(p.modules[mains[0]].path)
+		const name = `bober.marks.${if (w.length > 1) nearest(w[0])! else w[0]}@${fnv(whole.join(" "))}`
+		parts.push(name)
+		if (lacks(name)) {
+			const x = new Object(name, machine.arch)
+			x.sections.push(new Section(".rodata", Const))
+			x.symbols.append(whole.map(n => new Symbol(n, Weak, 0)))
+			l.add(x)
+		}
+	}
 	for (const m of 0 ... p.modules.length - 1) {
 		const path = p.modules[m].path
 		const bc = if (p.modules[m].bc != "") p.modules[m].bc else write(p, m, compiler)
@@ -1181,8 +1210,10 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			}
 			continue
 		}
-		// Monomorphized, its code as mono made it and what it names, which the ABIs its bytecode has do not cover.
-		const version = `@${p.modules[m].source}.${fnv(bc + b + (if (o.dyn) "" else `${signatures(p, m, bodies)}${learned}${facts.nounwind.get(m) ?? ""}`))}`
+		// Monomorphized, its code as mono made it and what it names, which the ABIs its bytecode has do not cover; and the
+		// marks of what of others it is made of, which its unit names.
+		const [h, marks] = if (o.dyn) [0 as u64, [] as u64[]] else signatures(p, m, bodies)
+		const version = `@${p.modules[m].source}.${fnv(bc + b + (if (o.dyn) "" else `${h}${learned}${facts.nounwind.get(m) ?? ""}`))}`
 		const spec = symbolPath(p, m, o.dyn)
 		const [fast, opt] = [`${spec}^O1${version}`, if (c.release) `${path}^R${version}` else `${spec}^O2${version}`]
 		// LLVM's at -O2, or if the image holds it, or with no level given if it holds TPDE's of a command before, which
@@ -1198,7 +1229,8 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			if (clear != "") {
 				stdout.write(`${clear}[${m + 1}/${p.modules.length}] compiling ${split(path, ": ")[0]}`)
 			}
-			l.add(unit(p, m, wanted, o, bc, b, llvm, c, facts))
+			l.add(unit(p, m, wanted, o, bc, b, llvm, c, facts,
+				if (o.dyn || c.release) [[], []] else [defs[m].map(marker), marks.map(marker)]))
 			c.compiled.set(wanted, true)
 		}
 	}
@@ -1302,13 +1334,14 @@ function pinned(at: string, tmp: string): string {
 /// Module m of p, compiled by TPDE, or if llvm by LLVM, as o says, as the object name. It defines a symbol named by
 /// its ABI, and names those of the modules it imports and of builtin/'s, whose functions the compiler calls unasked,
 /// so that a kept image unlinks it once one of them has another: an object another program left there, or after a
-/// change of builtin/, which no bytecode names. It holds bc, its bytecode as lowered, in section bober_bc,
+/// change of builtin/, which no bytecode names. Of marks, it defines those of its module's decls and of its source,
+/// and names those of what of others its code is made of. It holds bc, its bytecode as lowered, in section bober_bc,
 /// which a build links rather than checks the module of (lowered), and its Bound, if any (src/lift.bob), in bober_bind.
 /// Monomorphized, its names but local ones end in monoSuffix, as the module as lowered has the same ones of other
 /// layouts and calling conventions: bober's, which have a . or :, unlike C's. A release build's, compiled as facts
 /// say, holds but those two and the object file LLVM made, in bober_obj, which executable links.
 function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: string, llvm: bool, f: Compile,
-	facts: Facts): Object {
+	facts: Facts, marks: [string[], string[]]): Object {
 	const path = p.modules[m].path
 	const b: Backend = if (llvm) new LLVM(path, 2, f.release && !f.baseline) else new Tpde(path)
 	emit(p, m, b, o, facts)
@@ -1332,9 +1365,14 @@ function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: s
 			x.symbols.push(new Symbol(abiSymbol(p, d), Global, -1))
 		}
 	}
+	x.symbols.append(marks[0].map(n => new Symbol(n, Weak, x.sections.length - 1)))
+	x.symbols.append(marks[1].map(n => new Symbol(n, Global, -1)))
 	for (const s of x.symbols.filter(s => !o.dyn && s.binding != Local
 		&& (indexOf(s.name, ".") >= 0 || indexOf(s.name, ":") >= 0))) {
 		s.name += monoSuffix
+	}
+	if (onUnit != null) {
+		onUnit!(x)
 	}
 	return x
 }
@@ -1383,6 +1421,16 @@ const monoSuffix = "^mono"
 function exported(p: Program, m: i32, dyn: bool, tests: bool): string {
 	return entry(p, m, dyn, tests) + (if (dyn) "" else monoSuffix)
 }
+
+/// The symbol of mark h (src/bc/file.bob's Abi.marks): ~ and its bytes in base64url, which unit leaves as they are.
+function marker(h: u64): string {
+	const w = new Writer()
+	w.fixed(h, 8)
+	return `~${base64.encode(w.bytes, "url", "raw")}`
+}
+
+/// If not null, given each unit unit makes but a release build's, which a test compares.
+export let onUnit: ((x: Object) => void) | null = null
 
 /// The symbol named by the ABI of p's module m.
 function abiSymbol(p: Program, m: i32): string { return `bober.abi.${p.modules[m].path}.${abi(p, m)}` }
