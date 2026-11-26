@@ -150,8 +150,28 @@ export function abi(p: Program, m: i32): u64 {
 }
 
 /// The hash of what module m's code is compiled against (Abi), which its bytecode with the ABIs of its imports does
-/// not hold once monomorphized: a generic's instance names the class it is of, of another module, exported or not.
-export function signatures(p: Program, m: i32): u64 { return new Abi(p, m, true).h }
+/// not hold once monomorphized: a generic's instance names the class it is of, of another module, exported or not;
+/// with the code of its decls and copies as emit reads it.
+export function signatures(p: Program, m: i32, bodies: Bodies): u64 { return new Abi(p, m, true, -1, bodies).h }
+
+/// Of each decl, the hash of its code as emit reads it, positions counted from its root's, and the decls it names;
+/// made once, as a copy is in many modules.
+export class Bodies {
+	private abi: Abi
+	private made = new HashMap[i32, [u64, i32[]]]()
+
+	constructor(p: Program) { this.abi = new Abi(p, -1, true) }
+
+	of(d: i32): [u64, i32[]] {
+		const have = this.made.get(d)
+		if (have != null) {
+			return have
+		}
+		const r = this.abi.body(d)
+		this.made.set(d, r)
+		return r
+	}
+}
 
 /// The hashes of what decls run: of each, its code (Abi) and the hashes of the decls it names, its members too, which a
 /// call may dispatch to; made once each, of Tarjan's strongly connected components of decls naming each other, each
@@ -767,12 +787,15 @@ class Abi {
 	/// If all, the copies and what they own, whose code is hashed as of its own.
 	private copied = new HashMap[i32, bool]()
 	private mark: i32
+	/// The code hashes of own decls, made once (signatures), else hashed here.
+	private bodies: Bodies | null
 
-	constructor(p: Program, m: i32, all = false, mark = -1) {
+	constructor(p: Program, m: i32, all = false, mark = -1, bodies: Bodies | null = null) {
 		this.p = p
 		this.m = m
 		this.all = all
 		this.mark = mark
+		this.bodies = bodies
 		if (m < 0) {
 			return
 		}
@@ -785,6 +808,9 @@ class Abi {
 				this.decl(d)
 			}
 		}
+		for (const d of if (all) p.modules[m].inits else []) {
+			this.h = combine(this.h, p.decls[d].hash)
+		}
 	}
 
 	/// If m is -1, the hash of decl d alone, and the decls it names.
@@ -793,6 +819,15 @@ class Abi {
 		this.uses = []
 		this.at = d
 		this.decl(d)
+		return [this.h, this.uses]
+	}
+
+	/// If m is -1, the hash of decl d's code, and the decls it names.
+	body(d: i32): [u64, i32[]] {
+		this.h = seed
+		this.uses = []
+		this.at = d
+		this.code(this.p.decls[d].code!, true, this.p.decls[this.p.based(d)].pos)
 		return [this.h, this.uses]
 	}
 
@@ -820,7 +855,13 @@ class Abi {
 		for (const y of if (own && this.m >= 0 && x.module != this.m) x.members else []) {
 			this.copied.set(y, true)
 		}
-		if (x.code != null && (own || x.kind == decl.Var && (x.mods & decl.Readonly) != 0)) {
+		if (x.code != null && own && this.bodies != null) {
+			const [h, ds] = this.bodies!.of(d)
+			this.h = combine(this.h, h)
+			for (const y of ds) {
+				this.named(y)
+			}
+		} else if (x.code != null && (own || x.kind == decl.Var && (x.mods & decl.Readonly) != 0)) {
 			this.code(x.code!)
 		}
 		if (own || x.kind == decl.Class || x.kind == decl.Interface) {
@@ -830,11 +871,21 @@ class Abi {
 		}
 	}
 
-	private code(c: Code) {
+	/// Adds code c; if exact, as emit reads it: its locals' names, captures and positions counted from base too.
+	private code(c: Code, exact = false, base = 0) {
 		for (const l of c.locals) {
 			this.type(l.type)
+			if (exact) {
+				this.h = combine(combine(this.h, fnv(this.p.strings[l.name])), l.mods)
+			}
+		}
+		for (const l of if (exact) c.captures else []) {
+			this.h = combine(this.h, l)
 		}
 		for (const i of 0 ... c.ops.length - 1) {
+			if (exact) {
+				this.h = combine(this.h, if (c.pos[i] < 0) -1 else c.pos[i] - base)
+			}
 			if (i + 1 < c.ops.length && c.ops[i + 1] == op.Call && c.a(i + 1) == this.mark) {
 				// of its position, pushed last
 				continue
