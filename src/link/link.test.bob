@@ -901,3 +901,16 @@ test "a lazy object's slot of a local symbol is of no chain of names" {
 	const a = obj("a", Code, [0x94000000], [new Symbol("lz", Global)], [new Fixup(0, Call, 0, 0)])
 	assert keep(l, [a]).exports.length == 0
 }
+
+test "of a continued image, the names the objects removed define, and the objects held but removed naming a name" {
+	const calls = (name: string,
+		x: string) => obj(name, Code, [0x94000000], [new Symbol(x, Global)], [new Fixup(0, Call, 0, 0)])
+	const m = obj("m", Code, [0xd65f03c0], [new Symbol("m.1", Global, 0), new Symbol("~a", Weak, 0)])
+	const l = kept(file(keep(kept(), [m, calls("a", "~a"), calls("b", "~a"), calls("c", "m.1")])))
+	l.remove("m")
+	l.remove("b")
+	const defined = l.defined("~").join(" ")
+	const naming = l.naming("~a").join(" ")
+	const none = l.naming("~b").length
+	assert defined == "~a" && naming == "a" && none == 0
+}

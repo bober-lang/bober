@@ -362,6 +362,25 @@ export class Linker {
 		}
 	}
 
+	/// The names starting with of that the objects removed define.
+	defined(of: string): string[] throws CompileError {
+		const out: string[] = []
+		for (const k of this.removed) {
+			const o = this.read(k).object
+			out.append(o.symbols.filter(s => s.section >= 0 && s.binding != Local
+				&& startsWith(s.name, of)).map(s => s.name))
+		}
+		return out
+	}
+
+	/// The names of the objects the continued image holds, but those removed, that name name so that it must be defined.
+	naming(name: string): string[] throws CompileError {
+		const g = this.find(name)
+		return if (g < 0) []
+			else this.namers(this.entry(g)).filter(k => k < this.loaded && !this.units[k].frozen
+			&& !this.removed.includes(k)).map(k => this.units[k].object.name)
+	}
+
 	/// Has f, after those given before, add objects for the names the units want that none defines, but those the
 	/// continued image's units name, which a link before looked for; once there are none, f is given by name the units
 	/// the continued image held that name what none defines, unlinked now. Again until neither is left.

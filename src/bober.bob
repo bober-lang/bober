@@ -1179,6 +1179,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	// alone the directory it is in, which the units' symbols are named by.
 	const defs: u64[][] = p.modules.map(_ => [] as u64[])
 	let lang = ""
+	let whole: string[] = []
 	if (!o.dyn && !c.release) {
 		const builtins = p.modules.map(m => builtin(m.path))
 		const sigs: u64[] = []
@@ -1194,9 +1195,12 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 				sigs.push(x.sig)
 			}
 		}
+		for (const ds of defs) {
+			sort(ds) // as each program's decls are in an order of their own
+		}
 		sort(sigs)
 		lang = marker(fnv(sigs.join(" ")))
-		const whole = [...p.unions.values().map(u => marker(heldHash(p, u))), lang]
+		whole = [...p.unions.values().map(u => marker(heldHash(p, u))), lang]
 		sort(whole)
 		const w = world(p.modules[mains[0]].path)
 		const where = if (w.length > 1) nearest(w[0])! else parent(w[0])
@@ -1210,6 +1214,9 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			l.add(x)
 		}
 	}
+	// Of each unit of the program by name, its module, whether LLVM's, its bytecode and Bound; and those to make.
+	const units = new HashMap[string, [i32, bool, string, string]]()
+	const made: string[] = []
 	for (const m of 0 ... p.modules.length - 1) {
 		const path = p.modules[m].path
 		const bc = if (p.modules[m].bc != "") p.modules[m].bc else write(p, m, compiler)
@@ -1222,10 +1229,14 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			}
 			continue
 		}
-		// Monomorphized, its code as mono made it and what it names, which the ABIs its bytecode has do not cover; and the
-		// marks of what of others it is made of, which its unit names.
-		const [h, marks] = if (o.dyn) [0 as u64, [] as u64[]] else signatures(p, m, bodies)
-		const version = `@${p.modules[m].source}.${fnv(bc + b + (if (o.dyn) "" else `${h}${learned}${facts.nounwind.get(m) ?? ""}`))}`
+		// Monomorphized, what its unit defines: the marks of its module's decls and what mono made it hold, which the
+		// program decides too, as the statics of its classes' instances, or a method of a class a spread binds; the marks
+		// of what of others it is made of, which its unit names, keep it while they are. A release build's, which names
+		// none, by its code as mono made it and what it names.
+		const own = if (o.dyn) ""
+			else if (c.release) `${signatures(p, m, bodies)[0]}`
+			else `${defs[m]}${[...p.modules[m].decls, ...p.modules[m].copies].map(d => holding(p, d))}`
+		const version = `@${p.modules[m].source}.${fnv(bc + b + (if (o.dyn) "" else `${own}${learned}${facts.nounwind.get(m) ?? ""}`))}`
 		const spec = symbolPath(p, m, o.dyn)
 		const [fast, opt] = [`${spec}^O1${version}`, if (c.release) `${path}^R${version}` else `${spec}^O2${version}`]
 		// LLVM's at -O2, or if the image holds it, or with no level given if it holds TPDE's of a command before, which
@@ -1238,14 +1249,52 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			if (!o.dyn && !c.release) {
 				evict(path, spec)
 			}
-			if (clear != "") {
-				stdout.write(`${clear}[${m + 1}/${p.modules.length}] compiling ${split(path, ": ")[0]}`)
+			made.push(wanted)
+		}
+		units.set(wanted, [m, llvm, bc, b])
+	}
+	// A unit held that names a mark the units unlinked defined but none of the program's does is made anew, as what of
+	// another it is made of changed, if the program's, else unlinked.
+	if (!o.dyn && !c.release) {
+		const defined = new HashMap[string, bool]()
+		for (const n of whole) {
+			defined.set(n, true)
+		}
+		for (const m of ms) {
+			for (const h of defs[m]) {
+				defined.set(marker(h), true)
 			}
-			l.add(unit(p, m, wanted, o, bc, b, llvm, c, facts,
-				if (o.dyn || c.release) [[], []] else [defs[m].map(marker), [...marks.map(marker), lang]]))
-			c.compiled.set(wanted, true)
+		}
+		try {
+			for (const n of l.defined("~").filter(n => !defined.has(n))) {
+				for (const u of l.naming(n)) {
+					l.remove(u)
+					if (units.has(u)) {
+						made.push(u)
+					}
+				}
+			}
+		} catch (e: CompileError) {
+			return image(p, mains, files, cxx, pin, o, c, true) // the continued image is broken
 		}
 	}
+	for (const u of made) {
+		const [m, llvm, bc, b] = units.get(u)!
+		if (clear != "") {
+			stdout.write(`${clear}[${m + 1}/${p.modules.length}] compiling ${split(p.modules[m].path, ": ")[0]}`)
+		}
+		l.add(unit(p, m, u, o, bc, b, llvm, c, facts,
+			if (o.dyn || c.release) [[], []]
+			else [defs[m].map(marker), [...signatures(p, m, bodies)[1].map(marker), lang]]))
+		c.compiled.set(u, true)
+	}
+	// One held that names what none defines would be unlinked: the image is linked anew.
+	l.supply((names, gone) => {
+		const u = gone.find(u => units.has(u))
+		if (u != null) {
+			throw new CompileError(`${u} names what none defines`)
+		}
+	})
 	const cxxs: string[] = if (cxx) [`${lib}/libc++.a`, `${lib}/libc++abi.a`] else []
 	const archives: string[] = []
 	for (const f of if (c.release) []
@@ -1424,6 +1473,11 @@ const monoSuffix = "^mono"
 /// The name the image exports the entry of p's module m as (entry).
 function exported(p: Program, m: i32, dyn: bool, tests: bool): string {
 	return entry(p, m, dyn, tests) + (if (dyn) "" else monoSuffix)
+}
+
+/// Decl d as mono made it, by its hash and those of what it holds, which a unit holding it is named by (relink).
+function holding(p: Program, d: i32): string {
+	return `${p.decls[d].hash}(${p.decls[d].members.map(k => holding(p, k))})`
 }
 
 /// The symbol of mark h (src/bc/file.bob's Abi.marks): ~ and its bytes in base64url, which unit leaves as they are.

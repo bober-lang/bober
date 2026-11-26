@@ -694,7 +694,7 @@ test "a unit made anew of the marks it defined and named before is the same, aft
 		const now: [string, string, string][] = []
 		onUnit = x => {
 			const [marks, rest] = shape(x)
-			now.push([split(x.name, "^")[0], `${marks} ${split(split(x.name, "@")[1], ".")[0]}`, rest]) // and its source
+			now.push([split(x.name, "^")[0], `${marks} ${split(x.name, "@")[1]}`, rest]) // and its version
 		}
 		anew()
 		try {
@@ -740,4 +740,61 @@ function main() { print(\`\${area(new A())} \${kb()}\`) }\n`
 		"-O1") == "1 1\n"
 	const b = "\nclass B { area(): i32 { return 2 } }\n\nfunction b(): i32 { return area(new B()) }\n"
 	assert built([["lib.bob", lib(2)], ["main.bob", main(b)]], "-O1") == "1 2\n"
+}
+
+/// What main prints, built as built does, and the files of home whose units the build made, by name, and * if it made
+/// others.
+function remade(files: [string, string][], level = "-O1"): string {
+	const made: string[] = []
+	onUnit = x => {
+		const name = if (startsWith(x.name, home())) base(split(x.name, "^")[0]) else "*"
+		if (!made.includes(name)) {
+			made.push(name)
+		}
+	}
+	try {
+		const out = built(files, level)
+		sort(made)
+		return `${out}${made.join(" ")}`
+	} finally {
+		onUnit = null
+	}
+}
+
+test "a unit holding the statics of its generic class's instances is made anew once another module instances it anew" {
+	const lib = "export class Box[T] {\n\tstatic made = 0\n\n\tconstructor() { Box[T].made++ }\n}\n"
+	const main = (c: string) => `import { Box } from "./lib"\n${c}\nfunction main() {
+	new Box[i32]()
+	print(\`\${Box[i32].made}\${${if (c == "") "\"\"" else "b()"}}\`)\n}\n`
+	anew()
+	assert remade([["lib.bob", lib], ["main.bob", main("")]]) == "1\n* lib.bob main.bob"
+	const b = "export function b(): string {\n\tnew Box[string]()\n\tnew Box[string]()\n\treturn `${Box[string].made}`\n}\n"
+	assert remade([["b.bob", `import { Box } from "./lib"\n\n${b}`], ["main.bob", main(`import { b } from "./b"\n`)]])
+		== "12\nb.bob lib.bob main.bob"
+}
+
+test "units copying a generic class's instance, whose method a spread binds, are made anew once that method changed" {
+	const lib = (get: string) => `export class Box[T] {\n\tv: T | null = null\n\n\tget(): T | null { return ${get} }\n}\n`
+	const u = "import { Box } from \"./lib\"\n\nexport function u(): i32 | null { return new Box[i32]().get() }\n"
+	const main = (w: string) => `import { Box } from "./lib"\nimport { u } from "./u"\n
+function main() {${w}\n\tprint(\`\${u()}\`)\n}\n`
+	anew()
+	assert remade([["lib.bob", lib("this.v")], ["u.bob", u], ["main.bob", main("")]])
+		== "null\n* lib.bob main.bob u.bob"
+	const w = "\n\tconst b = new Box[i32]()\n\tb.v = 2\n\tconst g: { get: () => i32 | null } = { ...b }\n\tprint(\`\${g.get()}\`)"
+	assert remade([["main.bob", main(w)]]) == "2\nnull\nmain.bob"
+	assert remade([["lib.bob", lib("null")]]) == "null\nnull\nlib.bob main.bob u.bob"
+}
+
+test "a unit kept is made anew once the body of a generic it copies changed, not that of a plain function beside it" {
+	const lib = (id: string,
+		k: i32) => `export function id[T](x: T): T { ${id} }\n
+export function k(): i32 { return ${k} }\n`
+	const u = "import { id } from \"./lib\"\n\nexport function u(): i32 { return id(2) }\n"
+	const main = "import { k } from \"./lib\"\nimport { u } from \"./u\"\n\nfunction main() { print(`${u()} ${k()}`) }\n"
+	anew()
+	assert remade([["lib.bob", lib("return x", 1)], ["u.bob", u], ["main.bob", main]])
+		== "2 1\n* lib.bob main.bob u.bob"
+	assert remade([["lib.bob", lib("return x", 3)]]) == "2 3\nlib.bob"
+	assert remade([["lib.bob", lib("const y = x\n\treturn y", 3)]]) == "2 3\nlib.bob u.bob"
 }
