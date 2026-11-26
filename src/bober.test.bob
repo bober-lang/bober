@@ -1,6 +1,6 @@
 //! Tests of src/bober.bob's builds into the image, which keeps what it holds across them.
 
-import { endsWith, indexOf, sort, startsWith } from "../std/algo"
+import { endsWith, indexOf, sort, startsWith, unique } from "../std/algo"
 import { fromCString } from "../std/c"
 import { exists, glob, mkdirAll, open, remove, stat } from "../std/fs"
 import { base } from "../std/fs/path"
@@ -797,4 +797,54 @@ export function k(): i32 { return ${k} }\n`
 		== "2 1\n* lib.bob main.bob u.bob"
 	assert remade([["lib.bob", lib("return x", 3)]]) == "2 3\nlib.bob"
 	assert remade([["lib.bob", lib("const y = x\n\treturn y", 3)]]) == "2 3\nlib.bob u.bob"
+}
+
+/// Of each object of the program in home's image, its name and the marks it names, in order.
+function units(): string {
+	const image = open(`${home()}/build/image.so`)
+	const bytes = new Bytes(image.map())
+	const all = new Linker(machine, format, bytes)
+	const names = all.objects().map(o => o.copy())
+	for (const n of names) {
+		all.remove(n)
+	}
+	const defined = all.defined("~")
+	sort(defined)
+	const marks = unique(defined)
+	const l = new Linker(machine, format, bytes)
+	const out = names.filter(n => startsWith(n, home())).map(n => `${n}: ${marks.filter(k => l.naming(k).includes(n))}`)
+	image.close()
+	sort(out)
+	return out.join("\n")
+}
+
+test "a build continued after a spread copies a generic class's method, then binds it, holds the units a build anew does" {
+	const lib = "export class Box[T] {\n\tv: T | null = null\n\n\tget(): T | null { return this.v }\n}\n"
+	const u = "import { Box } from \"./lib\"\n\nexport function u(): i32 | null { return new Box[i32]().get() }\n"
+	const main = (w: string) => `import { Box } from "./lib"\nimport { u } from "./u"\n
+function main() {\n\tconst b = new Box[i32]()\n\tb.v = 2${w}\n\tprint(\`\${u()}\`)\n}\n`
+	const copied = "\n\tconst h: { get: () => i32 | null } = { ...b }\n\tprint(`${h.get()}`)"
+	const bound = `${copied}\n\tconst s: { get: () => i32 | null } = b\n\tconst g: { get: () => i32 | null } = { ...s }
+\tprint(\`\${g.get()}\`)`
+	anew()
+	assert built([["lib.bob", lib], ["u.bob", u], ["main.bob", main("")]], "-O1") == "null\n"
+	for (const [w, out] of [[copied, "2\nnull\n"], [bound, "2\n2\nnull\n"]]) {
+		assert built([["main.bob", main(w)]], "-O1") == out
+		const continued = units()
+		anew()
+		assert built([], "-O1") == out
+		assert units() == continued
+	}
+}
+
+test "a unit kept is made anew once a union of one ref that the functions it calls take and return grew" {
+	const lib = `export interface One { one(): i32 }\n\nexport class O { one(): i32 { return 1 } }\n
+export function o(): One | null { return new O() }\n
+export function ones(n: i32, x: One | null): i32 { return if (x == null) n else n + x!.one() }\n`
+	const v = "import { o, ones } from \"./lib\"\n\nexport function v(): i32 { return ones(10, o()) }\n"
+	const main = (c: string, x: string) => `import { v } from "./v"\n${c}\nfunction main() { print(\`\${v()}${x}\`) }\n`
+	anew()
+	assert remade([["lib.bob", lib], ["v.bob", v], ["main.bob", main("", "")]]) == "11\n* lib.bob main.bob v.bob"
+	const p = "import { ones } from \"./lib\"\n\nclass P { one(): i32 { return 2 } }\n\nconst three = ones(1, new P())\n"
+	assert remade([["main.bob", main(p, " ${three}")]]) == "11 3\nlib.bob main.bob v.bob"
 }

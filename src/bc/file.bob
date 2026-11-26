@@ -62,7 +62,7 @@ import { CompileError } from "../error"
 import * as decl from "./decl"
 import * as kind from "./kind"
 import * as op from "./op"
-import { Code, Program } from "./program"
+import { Code, Module, Program } from "./program"
 
 const magic = "bober"
 const seed: u64 = 14695981039346656037
@@ -92,6 +92,18 @@ function parts(k: kind.Kind, a: i32): Part[] {
 
 /// The file of module m of p as lowered, of the hash of the compiler.
 export function write(p: Program, m: i32, compiler: u64): string { return new Out(p, m).file(compiler) }
+/// Of module m's unit as mono made it, its facts, the modules it uses, the marks it names, typed and demand (Module):
+/// of a file's tables, with no decls of its own, so that they read back (readFacts) into a Program of its sources as
+/// they name decls, by name.
+export function writeFacts(p: Program, m: i32): string { return new Out(p, m, false).facts(p.modules[m]) }
+
+/// The module of a file writeFacts wrote, read into p, which holds its modules, with what it holds given it.
+export function readFacts(p: Program, bytes: string): i32 throws ParseError {
+	const x = new In(p, bytes, ".")
+	const m = p.module(x.path)
+	x.facts(p.modules[m])
+	return m
+}
 
 /// The modules of files, linked into p, each of whose deps p holds or is among them; null if one is stale, or made by
 /// another compiler or of another source than its hash in sources (sourceHash). A relative path a file holds is
@@ -172,27 +184,15 @@ export function sigMarks(p: Program) {
 	}
 }
 
-/// The hash of a union values are held as at run time and of the types held as it (Program.unions): its members.
-export function heldHash(p: Program, union: [i32, i32[]]): u64 {
-	const [t, ts] = union
-	const hs = ts.map(x => p.hash(x))
-	sort(hs)
-	let h = p.hash(t)
-	for (const x of hs) {
-		h = combine(h, x)
-	}
-	return h
-}
-
-/// Of each decl, the hash of its code as emit reads it, positions counted from its root's, the decls it names and the
-/// marks of the unions it holds values as; made once, as a copy is in many modules.
+/// Of each decl, the hash of its code as emit reads it, positions counted from its root's, and the decls it names; made
+/// once, as a copy is in many modules.
 export class Bodies {
 	private abi: Abi
-	private made = new HashMap[i32, [u64, i32[], u64[]]]()
+	private made = new HashMap[i32, [u64, i32[]]]()
 
 	constructor(p: Program) { this.abi = new Abi(p, -1, true) }
 
-	of(d: i32): [u64, i32[], u64[]] {
+	of(d: i32): [u64, i32[]] {
 		const have = this.made.get(d)
 		if (have != null) {
 			return have
@@ -313,11 +313,14 @@ class Out {
 	private ints = new Table(1)
 	private names = new Table(1)
 	private types = new Table((kind.Float as i32) + 1)
+	/// Whether of its decls, with the ABIs of its deps.
+	private whole: bool
 
-	constructor(p: Program, m: i32) {
+	constructor(p: Program, m: i32, whole = true) {
 		this.p = p
 		this.m = m
-		for (const d of [...p.modules[m].decls, ...p.modules[m].copies]) {
+		this.whole = whole
+		for (const d of if (whole) [...p.modules[m].decls, ...p.modules[m].copies] else [] as i32[]) {
 			this.collect(d)
 		}
 		for (const i of 0 ... this.order.length - 1) {
@@ -391,14 +394,38 @@ class Out {
 			text(comments, c.text)
 			uleb(comments, (this.own.get(c.owner) ?? -1) + 1) // none of a decl not written, as a test the bundle drops
 		}
+		return this.sections(compiler, abi(p, this.m), decls.bytes, [defs.bytes, comments.bytes])
+	}
+
+	facts(m: Module): string {
+		const fs = m.facts
+		const w = new Writer()
+		uleb(w, fs.length / 3)
+		for (const j of 0 ... fs.length / 3 - 1) {
+			w.u8(fs[3 * j] as u8)
+			uleb(w, this.type(fs[3 * j + 1]))
+			uleb(w, if (fs[3 * j] == op.Field) this.str(fs[3 * j + 2]) else this.type(fs[3 * j + 2]))
+		}
+		ids(w, m.uses.map(x => this.dep(x)))
+		uleb(w, m.named.length)
+		for (const h of [...m.named, m.typed, m.demand]) {
+			w.fixed(h, 8)
+		}
+		const none = new Writer()
+		uleb(none, 0)
+		return this.sections(0, 0, none.bytes, [w.bytes])
+	}
+
+	/// The header, the tables and decls, then rest.
+	private sections(compiler: u64, abi: u64, decls: string, rest: string[]): string {
 		const w = new Writer()
 		w.raw(magic)
 		w.fixed(compiler, 8)
-		w.fixed(mod.source, 8)
-		w.fixed(abi(p, this.m), 8)
-		text(w, mod.path)
-		for (const s of [this.deps.section(), this.strings.section(), this.ints.section(), this.names.section(),
-			decls.bytes, this.imports.section(), this.types.section(), defs.bytes, comments.bytes]) {
+		w.fixed(this.p.modules[this.m].source, 8)
+		w.fixed(abi, 8)
+		text(w, this.p.modules[this.m].path)
+		for (const s of [this.deps.section(), this.strings.section(), this.ints.section(), this.names.section(), decls,
+			this.imports.section(), this.types.section(), ...rest]) {
 			text(w, s)
 		}
 		return w.bytes
@@ -495,7 +522,7 @@ class Out {
 	private dep(m: i32): i32 {
 		return this.deps.find(m) ?? this.deps.add(m, w => {
 			text(w, this.p.modules[m].path)
-			w.fixed(abi(this.p, m), 8)
+			w.fixed(if (this.whole) abi(this.p, m) else 0, 8)
 		})
 	}
 
@@ -589,8 +616,8 @@ export class In {
 		this.own = this.decls.length
 	}
 
-	/// Reads the rest, the decls it imports linked.
-	link() throws ParseError {
+	/// Reads the deps, the decls it imports and the types.
+	private refs() throws ParseError {
 		const p = this.p
 		this.deps = this.paths.map(path => p.module(path))
 		this.table(this.decls, () => {
@@ -610,6 +637,12 @@ export class In {
 			const s = parts(k as kind.Kind, a)
 			return p.type(k as kind.Kind, a, if (s.length > 1) this.part(s[1]) else 0)
 		})
+	}
+
+	/// Reads the rest, the decls it imports linked.
+	link() throws ParseError {
+		const p = this.p
+		this.refs()
 		this.next()
 		const own = this.decls.slice(0, this.own)
 		for (const d of own) {
@@ -657,6 +690,29 @@ export class In {
 			throw this.bad()
 		}
 		p.document(this.m)
+	}
+
+	/// Of a file writeFacts wrote, what it holds, into m.
+	facts(m: Module) throws ParseError {
+		this.declare()
+		this.refs()
+		this.next()
+		const fs: i32[] = []
+		for (const _ of 1 ... this.n()) {
+			const o = this.r.u8() as i32
+			fs.append([o, this.type(), if (o == op.Field) this.str() else this.type()])
+		}
+		m.facts = fs
+		m.uses = this.list(() => this.of(this.deps))
+		m.named = []
+		for (const _ of 1 ... this.n()) {
+			m.named.push(this.r.fixed(8))
+		}
+		m.typed = this.r.fixed(8)
+		m.demand = this.r.fixed(8)
+		if (this.r.pos != this.end || this.end != this.r.bytes.length) {
+			throw this.bad()
+		}
 	}
 
 	private code(base: i32): Code throws ParseError {
@@ -824,8 +880,8 @@ class Abi {
 	private mark: i32
 	/// The code hashes of own decls, made once (signatures), else hashed here.
 	private bodies: Bodies | null
-	/// If all, of the decls of other modules named, of the generics of instances walked, and their code if copied, and of
-	/// the unions walked (heldHash): the marks of what the code of m is made of, which its unit names.
+	/// If all, of the decls of other modules named, of the generics of instances walked, and their code if copied: the
+	/// marks of what the code of m is made of, which its unit names.
 	marks: u64[] = []
 
 	constructor(p: Program, m: i32, all = false, mark = -1, bodies: Bodies | null = null) {
@@ -855,24 +911,21 @@ class Abi {
 	own(d: i32): [u64, i32[]] {
 		this.h = seed
 		this.uses = []
-		this.marks = []
 		this.at = d
 		this.decl(d)
 		return [this.h, this.uses]
 	}
 
-	/// If m is -1, the hash of decl d's code, the decls it names, of consts the values it took too, and the marks of the
-	/// unions it walks.
-	body(d: i32): [u64, i32[], u64[]] {
+	/// If m is -1, the hash of decl d's code, and the decls it names, of consts the values it took too.
+	body(d: i32): [u64, i32[]] {
 		this.h = seed
 		this.uses = []
-		this.marks = []
 		this.at = d
 		this.code(this.p.decls[d].code!, true, this.p.decls[this.p.based(d)].pos)
 		for (const y of this.p.folded.get(d) ?? []) {
 			this.named(y)
 		}
-		return [this.h, this.uses, this.marks]
+		return [this.h, this.uses]
 	}
 
 	/// Adds the signature of decl d, of its members if a class or interface, its code if a const; with its doc but a
@@ -905,12 +958,11 @@ class Abi {
 			this.marks.append([s.sig, if (own) s.body else 0].filter(h => h != 0))
 		}
 		if (x.code != null && own && this.bodies != null) {
-			const [h, ds, ms] = this.bodies!.of(d)
+			const [h, ds] = this.bodies!.of(d)
 			this.h = combine(this.h, h)
 			for (const y of ds) {
 				this.named(y)
 			}
-			this.marks.append(ms)
 		} else if (x.code != null && (own || x.kind == decl.Var && (x.mods & decl.Readonly) != 0)) {
 			this.code(x.code!)
 		}
@@ -978,10 +1030,6 @@ class Abi {
 			return
 		}
 		this.seen.set(t, this.at)
-		const union = this.p.unions.get(t)
-		if (union != null && this.all) {
-			this.marks.push(heldHash(this.p, union!))
-		}
 		const k = this.p.kind(t)
 		if (k == kind.Named || k == kind.Param) {
 			this.named(this.p.a(t))

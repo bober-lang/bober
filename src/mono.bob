@@ -15,8 +15,9 @@
 //! it and `.f()[T]` for calling method f. An intrinsic, a function of builtin/ without a body, is called as itself with
 //! its type args, for emit.
 
-import { stableSort } from "../std/algo"
+import { sort, stableSort, unique } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
+import { combine, fnv } from "../std/hash"
 import { min } from "../std/math"
 import * as decl from "./bc/decl"
 import * as kind from "./bc/kind"
@@ -33,10 +34,11 @@ import { builtin, builtinPath } from "./root"
 /// module's typed vars and builtin/'s plain exported functions are the roots, and only decls they reach are kept.
 /// Each module's decls and inits become their instances, its dispatch functions after its decls, and each instance's
 /// members those of its members' instances it owns, those of one decl in the order of their hashes, the same however p
-/// is read; its ABI hash, which mono changes, forgotten. If units, a module's decls are its roots and vars, and the
-/// statics of instances of its classes, which are one per program, its copies the others its code reaches, and its
-/// uses the modules of what else it names. A function of fewer than small ops, but a closure, is a copy of each
-/// module that reaches it, which compiled by itself may so inline it, and but a root not its module's own.
+/// is read; its ABI hash, which mono changes, forgotten; each module's facts, typed and demand made (versions).
+/// If units, a module's decls are its roots and vars, and the statics of instances of its classes, which are one per
+/// program, its copies the others its code reaches, and its uses the modules of what else it names. A function of
+/// fewer than small ops, but a closure, is a copy of each module that reaches it, which compiled by itself may so
+/// inline it, and but a root not its module's own.
 export function mono(p: Program, main: i32, units = false, small = 0) throws CompileError {
 	new Mono(p, units, small).run(main)
 }
@@ -73,6 +75,16 @@ class Mono {
 	/// The values each object spreads and its type, and the methods of classes those bind, which a class holds.
 	private binds: [i32, i32][] = []
 	private bound = new HashMap[i32, bool]()
+	/// Per class type, the names of the methods spreads bind of it.
+	private binding = new HashMap[i32, i32[]]()
+	/// Per instance, what its code contributes (scan), and as lowered, the interfaces and object types held as unions
+	/// that its lowering lowered (low), as Type facts.
+	private facts = new HashMap[i32, i32[]]()
+	/// Per type lowered, those its lowering lowered; and those of what is being lowered.
+	private under = new HashMap[i32, i32[]]()
+	/// Per instance but a class, those its type's lowering lowered, which a unit calling or reading it lowers too.
+	private sigs = new HashMap[i32, i32[]]()
+	private lowered: i32[] = []
 
 	constructor(p: Program, units: bool, small: i32) {
 		this.p = p
@@ -112,12 +124,60 @@ class Mono {
 			from = this.collect(from)
 		}
 		this.write()
+		this.versions()
 		for (const m of p.modules) {
 			m.abi = 0
 		}
 		if (!this.units) {
 			this.number()
 		}
+	}
+
+	/// Gives each module its typed, the hash of the interface and object types its unit lowers (its Type facts) and the
+	/// unions they are held as, and of the Init facts of all, its demand: the hash of the instances of its generic
+	/// classes with statics that units hold, whose statics it holds, and of the methods spreads bind of the instances of
+	/// generic classes it holds, which those hold as members.
+	private versions() {
+		const p = this.p
+		const ds = p.modules.map(_ => [] as u64[])
+		for (const mi of 0 ... p.modules.length - 1) {
+			const fs = p.modules[mi].facts
+			for (const j of 0 ... fs.length / 3 - 1) {
+				const c = fs[3 * j + 1]
+				if (fs[3 * j] != op.Init) {
+					continue
+				}
+				if (this.statics(p.a(c))) {
+					ds[p.decls[p.a(c)].module].push(p.hash(c))
+				}
+				for (const name of this.binding.get(c) ?? []) {
+					ds[mi].push(combine(p.hash(c), fnv(p.strings[name])))
+				}
+			}
+		}
+		for (const mi of 0 ... p.modules.length - 1) {
+			p.modules[mi].demand = hashOf(ds[mi])
+			p.modules[mi].typed = this.typedOf(p.modules[mi])
+		}
+	}
+
+	/// The hash of the types of m's Type facts and the unions they are held as.
+	private typedOf(m: Module): u64 {
+		const p = this.p
+		const hs: u64[] = []
+		for (const j of 0 ... m.facts.length / 3 - 1) {
+			const x = m.facts[3 * j + 1]
+			if (m.facts[3 * j] == op.Type) {
+				hs.push(combine(p.hash(x), p.hash(this.ins.held.get(x) ?? p.union([]))))
+			}
+		}
+		return hashOf(hs)
+	}
+
+	/// Whether class d has a static field.
+	private statics(d: i32): bool {
+		const p = this.p
+		return p.decls[d].members.some(x => p.decls[x].kind == decl.Var && (p.decls[x].mods & decl.Static) != 0)
 	}
 
 	/// Numbers the members of the unions values have at run time for their tags, those of the largest first, so that
@@ -158,39 +218,78 @@ class Mono {
 	}
 
 	// Interfaces and object types.
-	/// Collects what is converted into each interface and object type, or tested against one, a thrown value into each
-	/// type caught, from the instances from on, and makes the members dispatch functions reach; returns where the
-	/// instances it saw end.
+	/// Folds what the instances from on contribute (scan), kept as each one's facts, and settles what they make; returns
+	/// where the instances it saw end.
 	private collect(from: i32): i32 throws CompileError {
+		const end = this.ins.order.length
+		for (const k of this.ins.order.slice(from, end)) {
+			const fs = this.scan(k)
+			this.facts.set(k, fs)
+			this.fold(fs)
+		}
+		this.settle()
+		return end
+	}
+
+	/// What the code of instance k contributes to the unions, as (op, a, b) triples: a Field of type a's member named b
+	/// reached, a Cast of a into b, a New of literal a, an Object of a spread into b, a Throw of a, a Catch of a. Its
+	/// Type facts follow as it is lowered (typeFacts), a module's Init ones as its copies are listed (copies).
+	private scan(k: i32): i32[] {
+		const p = this.p
+		const i = this.ins.insts.get(k)!
+		const c = i.code
+		const out: i32[] = []
+		for (const j of 0 ... (if (c == null) 0 else c.ops.length) - 1) {
+			const o = c!.ops[j]
+			if ((o == op.CallMethod || o == op.Field || o == op.SetField) && i.info[j] >= 0) {
+				out.append([op.Field, i.info[j], c!.a(j)])
+			}
+			if (o == op.Cast || o == op.Is) {
+				out.append([op.Cast, i.info[j], c!.a(j)])
+			} else if (o == op.Array && i.info[j] >= 0 && p.kind(c!.a(j)) == kind.Array) {
+				out.append([op.Cast, i.info[j], p.a(c!.a(j))])
+			} else if (o == op.Object || o == op.New && p.kind(c!.a(j)) == kind.Object) {
+				out.append([op.New, c!.a(j), 0])
+				if (o == op.Object && i.info[j] >= 0 && p.kind(c!.a(j)) == kind.Object) {
+					out.append([op.Object, i.info[j], c!.a(j)])
+				}
+			} else if (o == op.Throw || o == op.Catch && c!.a(j) != kind.None) {
+				out.append([o, if (o == op.Throw) i.info[j] else c!.a(j), 0])
+			}
+		}
+		return out
+	}
+
+	/// Notes facts as scan makes them.
+	private fold(fs: i32[]) {
+		for (const j of 0 ... fs.length / 3 - 1) {
+			const o = fs[3 * j]
+			const a = fs[3 * j + 1]
+			const b = fs[3 * j + 2]
+			if (o == op.Field) {
+				if (!this.reached.has(pair(a, b))) {
+					this.reached.set(pair(a, b), [a, b])
+				}
+			} else if (o == op.Cast) {
+				this.convert(a, b)
+			} else if (o == op.New) {
+				this.source(a, a)
+			} else if (o == op.Object) {
+				this.binds.push([a, b])
+			} else if (o == op.Throw && !this.thrown.includes(a)) {
+				this.thrown.push(a)
+			} else if (o == op.Catch && !this.caught.includes(a)) {
+				this.caught.push(a)
+			}
+		}
+	}
+
+	/// What the facts folded make: what is converted into each interface and object type, or tested against one, a
+	/// thrown value into each type caught, the unions, and the members dispatch functions reach and spreads bind.
+	private settle() throws CompileError {
 		const p = this.p
 		const thrown = this.thrown
 		const caught = this.caught
-		const end = this.ins.order.length
-		for (const k of this.ins.order.slice(from, end)) {
-			const i = this.ins.insts.get(k)!
-			const c = i.code
-			for (const j of 0 ... (if (c == null) 0 else c.ops.length) - 1) {
-				const o = c!.ops[j]
-				if ((o == op.CallMethod || o == op.Field || o == op.SetField) && i.info[j] >= 0
-					&& !this.reached.has(pair(i.info[j], c!.a(j)))) {
-					this.reached.set(pair(i.info[j], c!.a(j)), [i.info[j], c!.a(j)])
-				}
-				if (o == op.Cast || o == op.Is) {
-					this.convert(i.info[j], c!.a(j))
-				} else if (o == op.Array && i.info[j] >= 0 && p.kind(c!.a(j)) == kind.Array) {
-					this.convert(i.info[j], p.a(c!.a(j)))
-				} else if (o == op.Object || o == op.New && p.kind(c!.a(j)) == kind.Object) {
-					this.source(c!.a(j), c!.a(j))
-					if (o == op.Object && i.info[j] >= 0 && p.kind(c!.a(j)) == kind.Object) {
-						this.binds.push([i.info[j], c!.a(j)])
-					}
-				} else if (o == op.Throw && !thrown.includes(i.info[j])) {
-					thrown.push(i.info[j])
-				} else if (o == op.Catch && c!.a(j) != kind.None && !caught.includes(c!.a(j))) {
-					caught.push(c!.a(j))
-				}
-			}
-		}
 		for (const t of caught) {
 			for (const s of thrown) {
 				this.convert(s, t)
@@ -226,11 +325,11 @@ class Mono {
 					const d = this.ins.member(o, name)
 					if (d >= 0 && p.decls[d].kind == decl.Function) {
 						this.bound.set(this.ins.memberOf(o, name), true)
+						add(this.binding, o, name)
 					}
 				}
 			}
 		}
-		return end
 	}
 
 	/// Notes what a dispatch function of member name of t converts, of each type a value of t is: the result of the
@@ -333,8 +432,11 @@ class Mono {
 			x.members = owned.get(k) ?? []
 			stableSort(x.members, (a, b) => source(a) < source(b) || source(a) == source(b) && hash(a) < hash(b))
 			if (x.kind != decl.Class) {
+				this.lowered = []
 				x.type = this.low(if (x.kind == decl.Function) runtime(p, x.type) else x.type)
+				this.sigs.set(k, this.lowered.slice(0, this.lowered.length))
 				x.code = if (i.code == null) null else this.lower(x.module, i.code!, i.info)
+				this.typeFacts(k)
 			}
 		}
 		// What else is kept or made, but what its owner holds: if units apart, else its module's own.
@@ -379,8 +481,9 @@ class Mono {
 	}
 
 	/// The decls apart that the code of m's decls, and of what they hold, names, but m's own, each in the order reached,
-	/// with what it holds: a module's copies; the modules of the own ones named, m's uses. Of a class, also its
-	/// constructor, which emit finds by name.
+	/// with what it holds: a module's copies; the modules of the own ones named, m's uses; the facts of all those, an
+	/// Init of each generic class instance's type and a Type of what the signatures and fields named lower, m's facts. Of
+	/// a class, also its constructor, which emit finds by name.
 	private copies(m: Module): i32[] {
 		const p = this.p
 		const out: i32[] = []
@@ -390,7 +493,9 @@ class Mono {
 			seen.set(d, true)
 		}
 		const types = new HashMap[i32, bool]()
+		const typed = new HashMap[i32, bool]()
 		const reach = (d: i32) => {
+			this.signed(d, typed, m.facts)
 			const t = this.top(d)
 			if (this.own.has(t) && !m.uses.includes(p.decls[t].module)) {
 				m.uses.push(p.decls[t].module)
@@ -418,6 +523,10 @@ class Mono {
 		while (i < todo.length) {
 			const x = p.decls[todo[i]]
 			ctor(todo[i])
+			m.facts.append(this.facts.get(todo[i]) ?? [])
+			if (x.kind == decl.Class && x.generic >= 0) {
+				m.facts.append([op.Init, p.type(kind.Named, x.generic, x.env), 0])
+			}
 			i++
 			todo.append(x.members)
 			const c = x.code ?? new Code()
@@ -460,8 +569,11 @@ class Mono {
 		const p = this.p
 		const found = this.lows.get(t)
 		if (found != null) {
+			this.note(this.under.get(t)!)
 			return found
 		}
+		const outer = this.lowered
+		this.lowered = []
 		const k = p.kind(t)
 		let r = 0
 		if (t == kind.Type || k == kind.Param || k == kind.Of || k == kind.Member) {
@@ -470,13 +582,8 @@ class Mono {
 			r = p.type(kind.Named, this.ins.instance(p.a(t), p.b(t)), 0)
 		} else if (k == kind.Union || k == kind.Literal || this.ins.abstract(t)) {
 			r = p.union(this.ins.flat(t).map(m => this.conc(m)))
-			if (k != kind.Literal && (this.ins.abstract(t) || p.parts(t).some(x => this.ins.abstract(x)))) {
-				const union = p.unions.get(r)
-				if (union == null) {
-					p.unions.set(r, [r, [t]])
-				} else {
-					union[1].push(t)
-				}
+			if (k != kind.Literal) {
+				this.note([t, ...p.parts(t)].filter(x => this.ins.abstract(x)))
 			}
 		} else if (k == kind.Func && runtime(p, t) != t) {
 			r = this.low(runtime(p, t))
@@ -484,7 +591,46 @@ class Mono {
 			r = p.map(t, x => this.low(x))
 		}
 		this.lows.set(t, r)
+		this.under.set(t, this.lowered)
+		const mine = this.lowered
+		this.lowered = outer
+		this.note(mine)
 		return r
+	}
+
+	/// Of decl d, a Type fact in fs of each interface or object type its type's lowering lowered, or of a class those of
+	/// its fields, through the classes it embeds, which lay it out; but those of seen.
+	private signed(d: i32, seen: HashMap[i32, bool], fs: i32[]) {
+		const p = this.p
+		for (const x of (this.sigs.get(d) ?? []).filter(x => !seen.has(x))) {
+			seen.set(x, true)
+			fs.append([op.Type, x, 0])
+		}
+		for (const f of if (p.decls[d].kind == decl.Class) p.decls[d].members else []) {
+			const t = p.decls[f].type
+			if (p.decls[f].kind == decl.Var && (p.decls[f].mods & decl.Static) == 0) {
+				this.signed(f, seen, fs)
+				if (p.kind(t) == kind.Embed && p.kind(p.a(t)) == kind.Named) {
+					this.signed(p.a(p.a(t)), seen, fs)
+				}
+			}
+		}
+	}
+
+	/// Notes interface and object types xs lowered.
+	private note(xs: i32[]) {
+		for (const x of xs.filter(x => !this.lowered.includes(x))) {
+			this.lowered.push(x)
+		}
+	}
+
+	/// Adds to instance k's facts a Type of each interface and object type its lowering lowered.
+	private typeFacts(k: i32) {
+		const fs = this.facts.get(k) ?? []
+		for (const x of this.lowered) {
+			fs.append([op.Type, x, 0])
+		}
+		this.facts.set(k, fs)
 	}
 
 	/// A type a value is held as at run time: an object type as the struct its literals make, but one its fields hold
@@ -590,6 +736,8 @@ class Mono {
 		if (found != null) {
 			return found
 		}
+		const outer = this.lowered
+		this.lowered = []
 		const tf = if (how == "()") ins.methodType(t, name) else ins.fieldType(t, name)
 		const [ps, result] = shape(p, how, tf)
 		const c = new Code()
@@ -672,8 +820,20 @@ class Mono {
 		p.decls[k].code = c
 		this.made.set([m, t, name, how], k)
 		this.dispatches.push(k)
+		this.typeFacts(k)
+		this.lowered = outer
 		return k
 	}
+}
+
+/// The hash of the hashes xs, as a set.
+function hashOf(xs: u64[]): u64 {
+	sort(xs)
+	let h = 0 as u64
+	for (const x of unique(xs)) {
+		h = combine(h, x)
+	}
+	return h
 }
 
 /// Adds v to the list of k in m.

@@ -28,7 +28,7 @@ import { File, stderr, stdin, stdout } from "../std/io"
 import { arch, os } from "../std/os"
 import { ParseError, codePoint, replace, split, trim, utf8 } from "../std/string"
 import * as decl from "./bc/decl"
-import { Bodies, Reached, abi, heldHash, sigMarks, signatures, write } from "./bc/file"
+import { Bodies, Reached, abi, sigMarks, signatures, write, writeFacts } from "./bc/file"
 import { Program } from "./bc/program"
 import { show } from "./bc/show"
 import { glue, includesOf, sysroot } from "./c/bind"
@@ -851,6 +851,50 @@ function programs(mains: string[], tests: bool, f: Compile, pin: bool): (main: s
 	}
 }
 
+/// Whether a module's unit is LLVM's, opt, rather than TPDE's, fast, of an image that has what has says: at -O2, if it
+/// holds LLVM's, or with no level given if it holds TPDE's of a command before, which this finds unchanged; else TPDE's,
+/// as after an edit.
+function byLLVM(c: Compile, has: (name: string) => bool, fast: string, opt: string): bool {
+	return c.release || c.O2 || has(opt) || !c.O1 && has(fast) && !c.compiled.has(fast)
+}
+
+/// Where the world of p's module main is (world), its package's home, or of a file alone the directory it is in, whose
+/// hash the symbols of p's units are named by (Program.world).
+function worldOf(p: Program, main: i32): string {
+	const w = world(p.modules[main].path)
+	const where = if (w.length > 1) nearest(w[0])! else parent(w[0])
+	p.world = fnv(where)
+	return where
+}
+
+/// The version of module m's unit made of what made says: of its source, and the hash of the rest.
+function unitVersion(p: Program, m: i32, made: string): string { return `@${p.modules[m].source}.${fnv(made)}` }
+
+/// Of p's modules, as monomorphized, the marks of their decls, which their units define, and the mark of the
+/// signatures of builtin/'s decls, whose functions emit calls unasked, which no bytecode names.
+function marksOf(p: Program): [u64[][], u64] {
+	const builtins = p.modules.map(m => builtin(m.path))
+	const defs: u64[][] = p.modules.map(_ => [] as u64[])
+	const sigs: u64[] = []
+	for (const d of 0 ... p.decls.length - 1) {
+		// Of its code too if an instance may be of it, which names that: generic, nested or taking a Type.
+		const x = p.decls[d]
+		if (x.sig == 0) {
+			continue
+		}
+		const instanced = x.owner >= 0 || x.params.length > 0 || takesType(p, d)
+		defs[x.module].append([x.sig, if (instanced) x.body else 0].filter(h => h != 0))
+		if (builtins[x.module]) {
+			sigs.push(x.sig)
+		}
+	}
+	for (const ds of defs) {
+		sort(ds) // as each program's decls are in an order of their own
+	}
+	sort(sigs)
+	return [defs, fnv(sigs.join(" "))]
+}
+
 /// Compiles the program of main into file, by default build/<name>.wasm, or .mjs if f.js, with tests
 /// build/<name>.test.wasm or .mjs, monomorphized, of builtin/'s modules those of the target (targetSource), or in the
 /// package those of lib/wasm.bobc or lib/js.bobc; returns the command that runs it.
@@ -1173,50 +1217,30 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		else "")
 	const parts: string[] = []
 	const bodies = new Bodies(p)
-	// Monomorphized, the marks of each module's decls, which its unit defines; and of the unions values are held as at
-	// run time and of the signatures of builtin/'s decls, whose functions emit calls unasked, which no bytecode names,
-	// which a unit of the world's (world) does, which each program of it shares: of its package's home, or of a file
-	// alone the directory it is in, which the units' symbols are named by.
-	const defs: u64[][] = p.modules.map(_ => [] as u64[])
-	let lang = ""
-	let whole: string[] = []
+	// Monomorphized, the marks of each module's decls, which its unit defines; and of the signatures of builtin/'s
+	// decls, whose functions emit calls unasked, which no bytecode names, which a unit of the world's (world) does,
+	// which each program of it shares: of its package's home, or of a file alone the directory it is in, which the
+	// units' symbols are named by.
+	const [defs, lang] = marksOf(p)
 	if (!o.dyn && !c.release) {
-		const builtins = p.modules.map(m => builtin(m.path))
-		const sigs: u64[] = []
-		for (const d of 0 ... p.decls.length - 1) {
-			// Of its code too if an instance may be of it, which names that: generic, nested or taking a Type.
-			const x = p.decls[d]
-			if (x.sig == 0) {
-				continue
-			}
-			const instanced = x.owner >= 0 || x.params.length > 0 || takesType(p, d)
-			defs[x.module].append([x.sig, if (instanced) x.body else 0].filter(h => h != 0))
-			if (builtins[x.module]) {
-				sigs.push(x.sig)
-			}
-		}
-		for (const ds of defs) {
-			sort(ds) // as each program's decls are in an order of their own
-		}
-		sort(sigs)
-		lang = marker(fnv(sigs.join(" ")))
-		whole = [...p.unions.values().map(u => marker(heldHash(p, u))), lang]
-		sort(whole)
-		const w = world(p.modules[mains[0]].path)
-		const where = if (w.length > 1) nearest(w[0])! else parent(w[0])
-		p.world = fnv(where)
-		const name = `bober.marks.${where}@${fnv(whole.join(" "))}`
+		const where = worldOf(p, mains[0])
+		const name = `bober.marks.${where}@${fnv(marker(lang))}`
 		parts.push(name)
 		if (lacks(name)) {
 			const x = new Object(name, machine.arch)
 			x.sections.push(new Section(".rodata", Const))
-			x.symbols.append(whole.map(n => new Symbol(n, Weak, 0)))
+			x.symbols.push(new Symbol(marker(lang), Weak, 0))
 			l.add(x)
 		}
 	}
 	// Of each unit of the program by name, its module, whether LLVM's, its bytecode and Bound; and those to make.
 	const units = new HashMap[string, [i32, bool, string, string]]()
 	const made: string[] = []
+	// Of a module, its unit's facts with the marks it names.
+	const fold = (m: i32) => {
+		p.modules[m].named = [...signatures(p, m, bodies)[1], lang]
+		return writeFacts(p, m)
+	}
 	for (const m of 0 ... p.modules.length - 1) {
 		const path = p.modules[m].path
 		const bc = if (p.modules[m].bc != "") p.modules[m].bc else write(p, m, compiler)
@@ -1225,23 +1249,22 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			// Not the program's: what a build links it from alone, <path>^bc@<version>, rather than check it again.
 			const name = `${path}^bc@${fnv(bc + b)}`
 			if (lacks(name)) {
-				l.add(cached(new Object(name, machine.arch), bc, b))
+				l.add(cached(new Object(name, machine.arch), bc, b, if (o.dyn || c.release) "" else fold(m)))
 			}
 			continue
 		}
-		// Monomorphized, what its unit defines: the marks of its module's decls and what mono made it hold, which the
-		// program decides too, as the statics of its classes' instances, or a method of a class a spread binds; the marks
-		// of what of others it is made of, which its unit names, keep it while they are. A release build's, which names
-		// none, by its code as mono made it and what it names.
+		// Monomorphized, its unit's version is of the marks its unit defines, of its module's decls, what the other units
+		// decide it holds (Module.demand) and the unions what it lowers is held as (Module.typed); the marks of what of
+		// others it is made of, which its unit names, keep it while they are. A release build's, which names none, is of
+		// its code as mono made it and what it names.
 		const own = if (o.dyn) ""
 			else if (c.release) `${signatures(p, m, bodies)[0]}`
-			else `${defs[m]}${[...p.modules[m].decls, ...p.modules[m].copies].map(d => holding(p, d))}`
-		const version = `@${p.modules[m].source}.${fnv(bc + b + (if (o.dyn) "" else `${own}${learned}${facts.nounwind.get(m) ?? ""}`))}`
+			else `${defs[m]}${p.modules[m].demand}.${p.modules[m].typed}`
+		const version = unitVersion(p, m,
+			bc + b + (if (o.dyn) "" else `${own}${learned}${facts.nounwind.get(m) ?? ""}`))
 		const spec = symbolPath(p, m, o.dyn)
 		const [fast, opt] = [`${spec}^O1${version}`, if (c.release) `${path}^R${version}` else `${spec}^O2${version}`]
-		// LLVM's at -O2, or if the image holds it, or with no level given if it holds TPDE's of a command before, which
-		// this finds unchanged; else TPDE's, as after an edit.
-		const llvm = !o.dyn && (c.release || c.O2 || has(opt) || !c.O1 && has(fast) && !c.compiled.has(fast))
+		const llvm = !o.dyn && byLLVM(c, has, fast, opt)
 		parts.push(if (o.dyn) `${path}${version}` else fast)
 		const wanted = if (llvm) opt else parts[parts.length - 1]
 		// Monomorphized, the others of either backend, which define the same symbols.
@@ -1257,9 +1280,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	// another it is made of changed, if the program's, else unlinked.
 	if (!o.dyn && !c.release) {
 		const defined = new HashMap[string, bool]()
-		for (const n of whole) {
-			defined.set(n, true)
-		}
+		defined.set(marker(lang), true)
 		for (const m of ms) {
 			for (const h of defs[m]) {
 				defined.set(marker(h), true)
@@ -1283,9 +1304,9 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		if (clear != "") {
 			stdout.write(`${clear}[${m + 1}/${p.modules.length}] compiling ${split(p.modules[m].path, ": ")[0]}`)
 		}
-		l.add(unit(p, m, u, o, bc, b, llvm, c, facts,
-			if (o.dyn || c.release) [[], []]
-			else [defs[m].map(marker), [...signatures(p, m, bodies)[1].map(marker), lang]]))
+		const fs = if (o.dyn || c.release) "" else fold(m)
+		l.add(unit(p, m, u, o, bc, b, fs, llvm, c, facts,
+			if (o.dyn || c.release) [[], []] else [defs[m].map(marker), p.modules[m].named.map(marker)]))
 		c.compiled.set(u, true)
 	}
 	// One held that names what none defines would be unlinked: the image is linked anew.
@@ -1395,12 +1416,12 @@ function pinned(at: string, tmp: string): string {
 /// Module m of p, compiled by TPDE, or if llvm by LLVM, as o says, as the object name. Of marks, it defines those of
 /// its module's decls and names those of what of others its code is made of, so that a kept image unlinks it once one
 /// is gone. It holds bc, its bytecode as lowered, in section bober_bc, which a build links rather than checks the
-/// module of (lowered), and its Bound, if any (src/lift.bob), in bober_bind. Monomorphized, its names but local ones
-/// end in monoSuffix, as the module as lowered has the same ones of other layouts and calling conventions: bober's,
-/// which have a . or :, unlike C's. A release build's, compiled as facts say, holds but those two and the object file
-/// LLVM made, in bober_obj, which executable links.
-function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: string, llvm: bool, f: Compile,
-	facts: Facts, marks: [string[], string[]]): Object {
+/// module of (lowered), its Bound, if any (src/lift.bob), in bober_bind, and its facts (writeFacts), if monomorphized,
+/// in bober_fold. Monomorphized, its names but local ones end in monoSuffix, as the module as lowered has the same ones
+/// of other layouts and calling conventions: bober's, which have a . or :, unlike C's. A release build's, compiled as
+/// facts say, holds but those two and the object file LLVM made, in bober_obj, which executable links.
+function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: string, fold: string, llvm: bool,
+	f: Compile, facts: Facts, marks: [string[], string[]]): Object {
 	const path = p.modules[m].path
 	const b: Backend = if (llvm) new LLVM(path, 2, f.release && !f.baseline) else new Tpde(path)
 	emit(p, m, b, o, facts)
@@ -1410,13 +1431,13 @@ function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: s
 	const bytes = b.object()
 	b.dispose()
 	if (f.release) {
-		return cached(new Object(name, machine.arch), bc, bound, bytes)
+		return cached(new Object(name, machine.arch), bc, bound, fold, bytes)
 	}
 	const x = if (llvm) format.read(name, bytes) else elf.read(name, bytes)
 	for (const s of x.sections) {
 		s.group = "" // LLVM's of the personality's pointer, each object's own, as a kept image cannot move it
 	}
-	cached(x, bc, bound)
+	cached(x, bc, bound, fold)
 	x.sections.push(new Section(".rodata", Const))
 	x.symbols.append(marks[0].map(n => new Symbol(n, Weak, x.sections.length - 1)))
 	x.symbols.append(marks[1].map(n => new Symbol(n, Global, -1)))
@@ -1430,10 +1451,10 @@ function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: s
 	return x
 }
 
-/// x, holding a module's bytecode as lowered bc in section bober_bc, its Bound, if any, in bober_bind, and the object
-/// file made of it, if any, in bober_obj.
-function cached(x: Object, bc: string, bound: string, made = ""): Object {
-	for (const [n, bytes] of [["bober_bc", bc], ["bober_bind", bound], ["bober_obj", made]]) {
+/// x, holding a module's bytecode as lowered bc in section bober_bc, its Bound, if any, in bober_bind, its facts, if
+/// any, in bober_fold, and the object file made of it, if any, in bober_obj.
+function cached(x: Object, bc: string, bound: string, fold: string, made = ""): Object {
+	for (const [n, bytes] of [["bober_bc", bc], ["bober_bind", bound], ["bober_fold", fold], ["bober_obj", made]]) {
 		if (bytes != "") {
 			const s = new Section(n, Kept)
 			s.bytes = bytes
@@ -1473,11 +1494,6 @@ const monoSuffix = "^mono"
 /// The name the image exports the entry of p's module m as (entry).
 function exported(p: Program, m: i32, dyn: bool, tests: bool): string {
 	return entry(p, m, dyn, tests) + (if (dyn) "" else monoSuffix)
-}
-
-/// Decl d as mono made it, by its hash and those of what it holds, which a unit holding it is named by (relink).
-function holding(p: Program, d: i32): string {
-	return `${p.decls[d].hash}(${p.decls[d].members.map(k => holding(p, k))})`
 }
 
 /// The symbol of mark h (src/bc/file.bob's Abi.marks): ~ and its bytes in base64url, which unit leaves as they are.
