@@ -921,7 +921,7 @@ function keep(p: Program, mains: i32[], f: Compile, stale: string[]): bool[] {
 			}
 			const v = unitVersion(p, m, x.bc + b + `${defs[m]}${x.demand}.${x.typed}${encode(f.tuned)}`)
 			const [fast, opt] = [`${spec}^O1${v}`, `${spec}^O2${v}`]
-			if ((h == alone || h == (if (byLLVM(f, has, fast, opt)) opt else fast))
+			if ((h == alone || h == opt || h == fast && !f.O2 && !promoted(f, has, fast))
 				&& x.named.every(n => defined.has(n))) {
 				x.kept = true
 				units[m] = h != alone
@@ -938,11 +938,10 @@ function keep(p: Program, mains: i32[], f: Compile, stale: string[]): bool[] {
 	return units
 }
 
-/// Whether a module's unit is LLVM's, opt, rather than TPDE's, fast, of an image that has what has says: at -O2, if it
-/// holds LLVM's, or with no level given if it holds TPDE's of a command before, which this finds unchanged; else TPDE's,
-/// as after an edit.
-function byLLVM(c: Compile, has: (name: string) => bool, fast: string, opt: string): bool {
-	return c.release || c.O2 || has(opt) || !c.O1 && has(fast) && !c.compiled.has(fast)
+/// Whether, with no level given, LLVM's is made of a unit as the image holds TPDE's, fast, of a command before, which
+/// this finds unchanged.
+function promoted(c: Compile, has: (name: string) => bool, fast: string): bool {
+	return !c.O1 && has(fast) && !c.compiled.has(fast)
 }
 
 /// Where the world of p's module main is (world), its package's home, or of a file alone the directory it is in, whose
@@ -1327,8 +1326,9 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			l.add(x)
 		}
 	}
-	// Of each unit of the program by name, its module, whether LLVM's, its bytecode and Bound; and those to make.
-	const units = new HashMap[string, [i32, bool, string, string]]()
+	// Of each unit of the program by name, its module, TPDE's name of it and LLVM's, its bytecode and Bound; and those
+	// to make.
+	const units = new HashMap[string, [i32, string, string, string, string]]()
 	const made: string[] = []
 	// Of a module not kept, its unit's facts with the marks it names, which a build to come keeps it by.
 	const keeping = p.modules.some(x => x.kept)
@@ -1363,9 +1363,8 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			bc + b + (if (o.dyn) "" else `${own}${learned}${facts.nounwind.get(m) ?? ""}`))
 		const spec = symbolPath(p, m, o.dyn)
 		const [fast, opt] = [`${spec}^O1${version}`, if (c.release) `${path}^R${version}` else `${spec}^O2${version}`]
-		const llvm = !o.dyn && byLLVM(c, has, fast, opt)
 		parts.push(if (o.dyn) `${path}${version}` else fast)
-		const wanted = if (llvm) opt else parts[parts.length - 1]
+		const wanted = if (!o.dyn && (c.release || c.O2 || has(opt))) opt else parts[parts.length - 1]
 		// Monomorphized, the others of either backend, which define the same symbols.
 		if (lacks(wanted, if (o.dyn) [path] else if (c.release) [`${path}^R`] else [`${spec}^O1`, `${spec}^O2`])) {
 			if (!o.dyn && !c.release) {
@@ -1373,10 +1372,11 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			}
 			made.push(wanted)
 		}
-		units.set(wanted, [m, llvm, bc, b])
+		units.set(wanted, [m, fast, opt, bc, b])
 	}
 	// A unit held that names a mark the units unlinked defined but none of the program's does is made anew, as what of
-	// another it is made of changed, if the program's, else unlinked.
+	// another it is made of changed, if the program's, TPDE's unless -O2, as after an edit; else unlinked. Then, of the
+	// others, LLVM's is made of TPDE's of a command before, with no level given (promoted).
 	if (!o.dyn && !c.release) {
 		const defined = new HashMap[string, bool]()
 		defined.set(marker(lang), true)
@@ -1390,16 +1390,23 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 				for (const u of l.naming(n)) {
 					l.remove(u)
 					if (units.has(u)) {
-						made.push(u)
+						const again = if (c.O2) u else units.get(u)![1]
+						units.set(again, units.get(u)!)
+						made.push(again)
 					}
 				}
+			}
+			for (const u of parts.filter(u => units.has(u) && promoted(c, has, u))) {
+				l.remove(u)
+				units.set(units.get(u)![2], units.get(u)!)
+				made.push(units.get(u)![2])
 			}
 		} catch (e: CompileError) {
 			return image(p, mains, files, cxx, pin, o, c, true) // the continued image is broken
 		}
 	}
 	for (const u of made) {
-		const [m, llvm, bc, b] = units.get(u)!
+		const [m, _, opt, bc, b] = units.get(u)!
 		if (p.modules[m].kept) {
 			throw new Unkept(`the image lacks ${u}`)
 		}
@@ -1407,7 +1414,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			stdout.write(`${clear}[${m + 1}/${p.modules.length}] compiling ${split(p.modules[m].path, ": ")[0]}`)
 		}
 		const fs = if (o.dyn || c.release) "" else fold(m)
-		l.add(unit(p, m, u, o, bc, b, fs, llvm, c, facts,
+		l.add(unit(p, m, u, o, bc, b, fs, u == opt, c, facts,
 			if (o.dyn || c.release) [[], []] else [defs[m].map(marker), p.modules[m].named.map(marker)]))
 		c.compiled.set(u, true)
 	}
