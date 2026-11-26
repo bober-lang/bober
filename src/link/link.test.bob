@@ -892,3 +892,12 @@ test "the stack maps' addresses are of the image's first byte, which the format'
 	assert get(image, m, 8) == at(image, "f") + 4 && !image.segment(m).write && get(image, at(image, "p"), 8) == 0
 		&& image.rebases.join(" ") == `${at(image, "p")}`
 }
+
+test "a lazy object's slot of a local symbol is of no chain of names" {
+	const z = obj("z", Code, [0x90000000, 0xd65f03c0], [new Symbol("lz", Global, 0), new Symbol("here", Local, 0, 4)],
+		[new Fixup(0, SlotPage, 1, 0)])
+	const l = kept()
+	l.lazily(() => [member(z)])
+	const a = obj("a", Code, [0x94000000], [new Symbol("lz", Global)], [new Fixup(0, Call, 0, 0)])
+	assert keep(l, [a]).exports.length == 0
+}
