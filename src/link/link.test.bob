@@ -37,10 +37,10 @@ function obj(name: string, kind: u8, words: u64[], symbols: Symbol[], fixups: Fi
 }
 
 /// A linker for machine, for a format of no file, whose loader sets a pointer to an import anywhere, or its slots only,
-/// and whose image starts at `__image`; of a kept image if kept is not null, as Linker's.
+/// and whose image starts at `__image`, also named `__maps`; of a kept image if kept is not null, as Linker's.
 function linker(bindsAnywhere = true, machine: Machine = arm64, kept: Bytes | null = null): Linker {
 	return new Linker(machine,
-		{ headers: 0x200, symbol: 24, bindsAnywhere: bindsAnywhere, start: "__image", tables: false,
+		{ headers: 0x200, symbol: 24, bindsAnywhere: bindsAnywhere, start: "__image", tables: false, maps: "__maps",
 		read: (name: string, bytes: string) => new Object(name, "arm64"),
 		exports: (name: string, bytes: string) => [name], write: (image: Image) => {} }, kept)
 }
@@ -879,4 +879,16 @@ test "a continued image whose units lose a name they need does not list the lazy
 	})
 	const image = keep(l, [])
 	assert listed == 0 && kept(file(image)).objects().length == 0
+}
+
+test "the stack maps' addresses are of the image's first byte, which the format's name for it is, and not rebased" {
+	const maps = obj("m", Const, [0, 0], [new Symbol("f", Global)], [new Fixup(0, Abs64, 0, 4)])
+	maps.sections[0].name = ".llvm_stackmaps"
+	const f = obj("f", Code, [0xd65f03c0], [new Symbol("f", Global, 0)])
+	const d = obj("d", Data, [0, 0], [new Symbol("__maps", Global), new Symbol("p", Global, 0)],
+		[new Fixup(0, Abs64, 0, 0)])
+	const image = link([maps, f, d], ["f", "p"])
+	const m = section(image, ".llvm_stackmaps")
+	assert get(image, m, 8) == at(image, "f") + 4 && !image.segment(m).write && get(image, at(image, "p"), 8) == 0
+		&& image.rebases.join(" ") == `${at(image, "p")}`
 }

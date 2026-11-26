@@ -22,8 +22,8 @@ import { CompileError } from "../error"
 import { Bytes, relr, unrelr, zeros } from "./bytes"
 import { Region, State, read, record, rest, write } from "./keep"
 
-import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Image32, Init, Kept, Local, Machine, Object, Page,
-	PageOff, Rel32, Rel64, Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Thread32, Unwind, Weak,
+import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Image32, Image64, Init, Kept, Local, Machine, Object,
+	Page, PageOff, Rel32, Rel64, Section, SlotPage, SlotPageOff, SlotRel32, Symbol, Thread, Thread32, Unwind, Weak,
 	Zero } from "./object"
 
 /// What a format's writer makes a file of. Its addresses are from where it is loaded, and the file has each segment's
@@ -100,7 +100,9 @@ export class Image {
 /// byte by, which the linker defines where no object does; read, the Object an object file's bytes are; exports, the
 /// names a shared library's file defines; and write, which makes the image's bytes its file. Each entry of its symbol
 /// table takes symbol bytes, 0 if it has none. Whether its loader reads a kept image's tables where they are (Image.relr).
-export type Format = { headers: u64, symbol: u64, bindsAnywhere: bool, start: string, tables: bool,
+/// Maps, another name of the image's first byte, which the addresses in section .llvm_stackmaps are then offsets from
+/// (Image64), as no loader rebases them (src/gc.c); "" if they are pointers.
+export type Format = { headers: u64, symbol: u64, bindsAnywhere: bool, start: string, tables: bool, maps: string,
 	read: (name: string, bytes: string) => Object throws CompileError,
 	exports: (name: string, bytes: string) => string[] throws CompileError,
 	write: (image: Image) => void throws CompileError }
@@ -667,6 +669,11 @@ export class Linker {
 					continue
 				}
 			}
+			if (sec.name == ".llvm_stackmaps" && this.format.maps != "") {
+				for (const f of sec.fixups.filter(f => f.kind == Abs64)) {
+					f.kind = Image64
+				}
+			}
 			if (sec.kind == Const && sec.fixups.some(f => f.kind == Abs64)) {
 				this.pointed.set(sec.name, true)
 			}
@@ -701,9 +708,9 @@ export class Linker {
 		}
 	}
 
-	/// Defines each name no unit defines: the format's start, `__start_<x>` and `__stop_<x>` as the bounds of the
-	/// sections named x, else as an import; and notes those a unit must have defined that are none of these, or if the
-	/// continued image holds those that name them, these. The others are weak, and 0.
+	/// Defines each name no unit defines: the format's start, by its name or by maps, `__start_<x>` and `__stop_<x>`
+	/// as the bounds of the sections named x, else as an import; and notes those a unit must have defined that are none of
+	/// these, or if the continued image holds those that name them, these. The others are weak, and 0.
 	private settle(): i32[] {
 		const gone: i32[] = []
 		for (const g of this.touched) {
@@ -711,7 +718,7 @@ export class Linker {
 			if (n.unit >= 0) {
 				continue
 			}
-			if (n.name == this.format.start) {
+			if (n.name == this.format.start || n.name == this.format.maps) {
 				n.unit = 0
 				n.section = -1
 				continue
@@ -1488,7 +1495,7 @@ export class Linker {
 	private apply(b: u8[], at: i32, kind: u8, v: u64, p: u64): bool {
 		const d = (v - p) as i64
 		switch (kind) {
-			case Abs64: put(b, at, v, 8)
+			case Abs64, Image64: put(b, at, v, 8)
 			case Rel64: put(b, at, d as u64, 8)
 			case Image32, Thread32:
 				if (v >= 1 << 32) {

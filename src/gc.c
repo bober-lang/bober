@@ -375,6 +375,15 @@ typedef struct { uint8_t type, reserved; uint16_t size, reg, reserved2; int32_t 
 typedef struct { uint64_t id; uint32_t offset; uint16_t reserved, locations; Location at[]; } Record;
 
 BOBER_SECTION(const uint8_t *const, bober_stackmaps);
+#if defined(__APPLE__) || defined(_WIN32)
+#define IMAGE 0
+#else
+/// The image's first byte, which src/link writes the stack maps' addresses as offsets from (Format.maps); 0 where lld
+/// links, as it rebases them.
+extern const char bober_image[] __attribute__((weak));
+#define IMAGE ((uintptr_t)bober_image)
+#endif
+
 /// Calls visit with the frame pointer of where each fiber but the running one parked: those that ran since the last
 /// collection, or, if all, every one (src/fiber.c).
 void bober_parked(void (*visit)(void **), int all);
@@ -408,7 +417,8 @@ static void records(void) {
       for (uint32_t f = 0; f < fns; f++)
         for (uint64_t k = 0; k < fn[3 * f + 2]; k++) {
           const Record *r = (const Record *)p;
-          if (pass) *call(fn[3 * f] + r->offset) = (struct Call){fn[3 * f] + r->offset, r, fn[3 * f + 1]};
+          uintptr_t ret = IMAGE + fn[3 * f] + r->offset;
+          if (pass) *call(ret) = (struct Call){ret, r, fn[3 * f + 1]};
           p = align8((const uint8_t *)&r->at[r->locations]);
           p = align8(p + 4 + 4 * *(uint16_t *)(p + 2));
         }
