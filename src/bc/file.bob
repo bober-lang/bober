@@ -303,7 +303,7 @@ class Out {
 			uleb(defs, this.type(x.exact))
 			defs.u8(if (x.code == null) 0 else 1)
 			if (x.code != null) {
-				this.code(defs, x.code!)
+				this.code(defs, x.code!, p.decls[p.based(d)].pos)
 			}
 		}
 		const mod = p.modules[this.m]
@@ -359,7 +359,8 @@ class Out {
 		}
 	}
 
-	private code(w: Writer, c: Code) {
+	/// Writes c, its positions counted from base, so that it is the same wherever in its source its decl is.
+	private code(w: Writer, c: Code, base: i32) {
 		uleb(w, c.locals.length)
 		for (const l of c.locals) {
 			uleb(w, this.str(l.name))
@@ -372,8 +373,9 @@ class Out {
 		let at = -1
 		for (const i of 0 ... c.ops.length - 1) {
 			const s = op.shape[c.ops[i]]
-			w.sleb(c.pos[i] - at)
-			at = c.pos[i]
+			const pos = if (c.pos[i] < 0) -1 else c.pos[i] - base
+			w.sleb(pos - at)
+			at = pos
 			w.u8(c.ops[i])
 			for (const j of 0 ... s.length - 1) {
 				this.part(w, s[j], c.imm(i, j))
@@ -570,7 +572,7 @@ export class In {
 			x.spelled = this.type()
 			x.exact = this.type()
 			if (this.r.u8() == 1) {
-				x.code = this.code()
+				x.code = this.code(p.decls[p.based(d)].pos)
 			}
 		}
 		const mod = p.modules[this.m]
@@ -602,15 +604,17 @@ export class In {
 		p.document(this.m)
 	}
 
-	private code(): Code throws ParseError {
+	private code(base: i32): Code throws ParseError {
 		const c = new Code()
 		for (const _ of 1 ... this.n()) {
 			c.local(this.str(), this.type(), this.n())
 		}
 		c.captures = this.list(() => this.n())
 		c.lists.append(this.list(() => this.n()))
+		let pos = -1
 		for (const _ of 1 ... this.n()) {
-			c.at += this.r.sleb() as i32
+			pos += this.r.sleb() as i32
+			c.at = if (pos < 0) -1 else base + pos
 			const o = this.r.u8()
 			if (o >= op.names.length) {
 				throw this.bad()

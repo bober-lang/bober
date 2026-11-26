@@ -407,6 +407,9 @@ class Emitter {
 
 	run() {
 		const p = this.p
+		for (const d of this.src.roots.filter(d => p.decls[d].code != null)) {
+			this.base(d)
+		}
 		for (const d of this.decls) {
 			const k = this.kin(d)
 			this.kins.set(k, [...this.kins.get(k) ?? [], d])
@@ -4303,15 +4306,22 @@ class Emitter {
 		if (this.pos < 0) {
 			return this.b.constInt(this.i32, -1)
 		}
-		const p = this.p
-		let d = if (p.decls[this.fnDecl].generic < 0) this.fnDecl else p.decls[this.fnDecl].generic
-		while (p.decls[d].owner >= 0 && p.classOf(d) < 0) {
-			d = p.decls[d].owner
+		const d = this.p.based(this.fnDecl)
+		return this.ir().binary("add", this.ir().load(this.i32, this.base(d), false),
+			this.b.constInt(this.i32, this.pos - this.p.decls[d].pos))
+	}
+
+	/// The global <symbol>:pos holding the position of decl d, which its module defines, and a copy elsewhere reaches.
+	private base(d: i32): Value {
+		const found = this.poses.get(d)
+		if (found != null) {
+			return found
 		}
-		const at = p.decls[d].pos
-		const base = this.poses.get(d)
-			?? put(this.poses, d, this.b.literal(`${this.symbol(d)}:pos`, this.b.constInt(this.i32, at)))
-		return this.ir().binary("add", this.ir().load(this.i32, base, false), this.b.constInt(this.i32, this.pos - at))
+		const x = this.p.decls[d]
+		const name = `${this.symbol(d)}:pos`
+		return put(this.poses, d,
+			if (x.module == this.m) this.b.literal(name, this.b.constInt(this.i32, x.pos))
+			else this.b.extern(name, this.i32))
 	}
 
 	// The stack and the blocks.

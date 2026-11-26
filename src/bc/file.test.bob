@@ -2,6 +2,7 @@
 
 import { ParseError } from "../../std/string"
 import { lower } from "../lower"
+import { mono } from "../mono"
 import * as decl from "./decl"
 import { abi, read, write } from "./file"
 import * as kind from "./kind"
@@ -230,4 +231,15 @@ test "a decl imported is the one of its name and nth in its owner" {
 	const q = new Program()
 	const ms = read(q, [write(p, a, 1), write(p, b, 1)], 1, [0, 0])!
 	assert q.decls[q.a(q.decls[q.modules[ms[1]].decls[0]].type)].nth == 0
+}
+
+test "monomorphized, a module's file is the same as lines are added above what of another module it copies" {
+	const main = (lib: string) => {
+		const p = lowered(`import { twice } from "./lib"\n\nexport function f(): i32 { return twice(1) }`, lib)
+		mono(p, p.module("main.bob"), true)
+		return write(p, p.module("main.bob"), 1)
+	}
+	const lib = `export function twice[T](x: T): T {\n\tassert x == x\n\treturn x\n}`
+	const [a, b] = [main(lib), main(`// moved\n\n${lib}`)]
+	assert a == b
 }

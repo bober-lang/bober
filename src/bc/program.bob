@@ -101,6 +101,9 @@ export class Module {
 	decls: i32[] = []
 	/// Monomorphized, the decls it defines too, as copies of its own: those apart it reaches (src/mono.bob).
 	copies: i32[] = []
+	/// Monomorphized, the decls as read whose position the code of each nested in one counts from (Program.based): its
+	/// top-level ones and their members, which emit defines the position of for copies elsewhere.
+	roots: i32[] = []
 	/// Monomorphized, the modules whose own decls it names, which a program of its unit links, but does not initialize.
 	uses: i32[] = []
 	/// Its vars and static fields in the order they are initialized: consts, then lets, each after those it depends on
@@ -610,6 +613,15 @@ export class Program {
 	classOf(d: i32): i32 {
 		const o = this.decls[d].owner
 		return if (o >= 0 && (this.decls[o].kind == decl.Class || this.decls[o].kind == decl.Interface)) o else -1
+	}
+
+	/// The decl whose position those of d's code count from: of its source, the one it is nested in, else itself.
+	based(d: i32): i32 {
+		let x = if (this.decls[d].generic < 0) d else this.decls[d].generic
+		while (this.decls[x].owner >= 0 && this.classOf(x) < 0) {
+			x = this.decls[x].owner
+		}
+		return x
 	}
 
 	/// Whether d is a method or field of its class's instances, which a call of it passes as `this`.
