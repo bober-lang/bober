@@ -19,7 +19,7 @@ import { combine, fnv } from "../../std/hash"
 import { alignUp, max, min } from "../../std/math"
 import { Arch } from "../../std/os"
 import { CompileError } from "../error"
-import { Bytes, zeros } from "./bytes"
+import { Bytes, relr, unrelr, zeros } from "./bytes"
 import { Region, State, read, record, rest, write } from "./keep"
 
 import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Image32, Init, Kept, Local, Machine, Object, Page,
@@ -42,10 +42,17 @@ export class Image {
 	exports: [string, u64][] = []
 	libraries: string[] = []
 	binds: Bind[] = []
-	/// The addresses of the pointers the loader adds the image's address to, ascending.
+	/// The addresses of the pointers the loader adds the image's address to, ascending; of a kept image whose format has
+	/// its tables, but those of words, which are as RELR from and to where relr says.
 	rebases: u64[] = []
+	relr: [u64, u64] = [0, 0]
 	/// From and to where the Unwind sections are, ascending, and the Init ones, laid out as one.
 	unwinds: [u64, u64][] = []
+	/// Of a kept image whose format has its tables: from and to where the unwinder's table may be, the code freed since
+	/// the image continued, whose FDEs are gone, and from and to where the Unwind sections laid out now are.
+	hdr: [u64, u64] = [0, 0]
+	gone: [u64, u64][] = []
+	fresh: [u64, u64][] = []
 	inits: [u64, u64] = [0, 0]
 	/// From and to where the Thread sections are, laid out as one, a thread's copy's template, and the largest of
 	/// their alignments.
@@ -92,8 +99,8 @@ export class Image {
 /// loads an image sets a pointer to an import wherever it is, or its slots only; the name code knows the image's first
 /// byte by, which the linker defines where no object does; read, the Object an object file's bytes are; exports, the
 /// names a shared library's file defines; and write, which makes the image's bytes its file. Each entry of its symbol
-/// table takes symbol bytes, 0 if it has none.
-export type Format = { headers: u64, symbol: u64, bindsAnywhere: bool, start: string,
+/// table takes symbol bytes, 0 if it has none. Whether its loader reads a kept image's tables where they are (Image.relr).
+export type Format = { headers: u64, symbol: u64, bindsAnywhere: bool, start: string, tables: bool,
 	read: (name: string, bytes: string) => Object throws CompileError,
 	exports: (name: string, bytes: string) => string[] throws CompileError,
 	write: (image: Image) => void throws CompileError }
@@ -134,6 +141,11 @@ const Symbols: u8 = 8
 const regions: u8[][] = [[Code], [Const, Unwind], [Data, Init, Thread, Zero], [Kept], [Symbols]]
 const keptRegions: u8[][] = [[Unwind], [Code], [Const], [Data, Init, Thread], [Zero], [Kept], [Symbols]]
 const room: u64 = 1 << 28
+/// The name of a kept image's run of its Const region of its rebases of words, as RELR, which no section's can be; the
+/// holes in it are entries of no rebase.
+const rebasing = ".relr"
+/// That of its run of the unwinder's table, if its format has its tables.
+const unwinding = ".eh_frame_hdr"
 /// Of a machine with veneers, the code has an island of them at each multiple of span from its start but the first,
 /// which no section is laid out over, so that a call too far for its symbol reaches one, on arm64 128 MiB away.
 const span: u64 = 1 << 26
@@ -174,7 +186,9 @@ function moved(n: Name, was: Name, address: bool): bool {
 /// An object as linked: per symbol, the index of its Name, -1 if it is local; per section, its address, 0 while it is
 /// to be laid out, or dropped; whether it is frozen; the bytes the continued image has its object as, "" once it is
 /// not as there; its blocks of the file, as State has them, none until saved; and the bytes its symbols' links are in
-/// (Linker.links), its block of them in the image's, or until saved, bytes of its own, and where they are in those.
+/// (Linker.links), its block of them in the image's, or until saved, bytes of its own, and where they are in those. In a
+/// kept image, its blocks of the run of rebases (rebased): of those its fixups set, and the frozen one's then of those
+/// set for good.
 class Unit {
 	object: Object
 	names: i32[] = []
@@ -182,6 +196,7 @@ class Unit {
 	frozen: bool
 	encoded = ""
 	blocks: [u64, u64][] = []
+	relr: [u64, u64][] = []
 	links = new Bytes()
 	from: u64 = 0
 
@@ -245,6 +260,8 @@ export class Linker {
 	/// Where the fixups this link sets anew are, or those of the units it unlinks, whose pointers, binds and descs the
 	/// continued image keeps no longer; ascending once fixed.
 	private redone: u64[] = []
+	/// From and to where the code is that it unlinks.
+	private gone: [u64, u64][] = []
 	/// The frozen unit's record as the continued image has it, apart from its encoded, which fix may clear: make reads
 	/// its symbols with a name, and freeze, on making a frozen unit anew, its local ones.
 	private held = ""
@@ -276,6 +293,7 @@ export class Linker {
 			u.at = e[1]
 			u.encoded = e[2]
 			u.blocks = e[3]
+			u.relr = e[4]
 			u.links = kept!
 			u.from = if (u.blocks.length > 1) u.blocks[1][0] else 0
 			return u
@@ -471,6 +489,7 @@ export class Linker {
 		}
 		this.units.push(own)
 		const image = new Image(this.machine.arch, this.machine.page)
+		image.gone = this.gone
 		image.libraries = this.libraries
 		image.inits = this.state.inits
 		image.thread = this.state.thread
@@ -530,6 +549,14 @@ export class Linker {
 		}
 		if (this.keep) {
 			this.save(image, exports)
+			const run = this.state.runs.find(e => e[0] == rebasing)
+			const [from, to] = if (run != null) [run[1].start, run[1].top] else [0, 0]
+			if (this.format.tables) {
+				image.relr = [from, to]
+			} else {
+				image.rebases = [...image.rebases, ...unrelr(this.bytes.slice(from, to))]
+				sort(image.rebases)
+			}
 		}
 		const [kept, table] = [this.state.regions[this.regions.length - 2], this.state.regions[this.regions.length - 1]]
 		image.symtab = [table.start, table.top]
@@ -577,6 +604,9 @@ export class Linker {
 			}
 			if (u.at[i] != 0 && u.at[i] != dropped) {
 				this.free(u.at[i], sec.size)
+				if (sec.kind == Code) {
+					this.gone.push([u.at[i], u.at[i] + sec.size])
+				}
 				for (const f of sec.fixups) {
 					this.redone.push(u.at[i] + f.at)
 				}
@@ -591,7 +621,7 @@ export class Linker {
 				}
 			}
 		}
-		for (const [at, size] of u.blocks) {
+		for (const [at, size] of [...u.blocks, ...u.relr]) {
 			this.free(at, size)
 		}
 		this.units[k] = new Unit(new Object("", this.machine.arch))
@@ -872,6 +902,14 @@ export class Linker {
 				this.state.regions[r].top += if (regions[r][0] >= Kept) this.format.symbol else 0
 			}
 			const region = this.state.regions[r]
+			// Before it, the run of the rebases, of the pointers of the data, and of the unwinder's table, made once there
+			// are those.
+			if (this.keep && regions[r][0] == Const) {
+				const has = (kinds: u8[]) => runs.some(e => kinds.includes(e[0]) && e[2].some(ref => sec(ref).size > 0))
+				this.run(region, rebasing, has([Data, Init, Thread]))
+				const hdr = if (this.format.tables) this.run(region, unwinding, has([Unwind])) else null
+				image.hdr = if (hdr != null) [hdr.start, hdr.cap] else [0, 0]
+			}
 			let end = if (regions[r][0] == Zero) region.start else region.top
 			for (const kind of regions[r]) {
 				for (const [rk, name, secs] of runs) {
@@ -894,6 +932,9 @@ export class Linker {
 					}
 					const [from, to] = this.place(this.run(region, name) ?? region, todo)
 					laid.push([name, kind, from, to])
+					if (kind == Unwind) {
+						image.fresh.push([from, to])
+					}
 					if (to > from && kind == Init) {
 						image.inits = [if (image.inits[1] == 0) from else image.inits[0], to]
 					} else if (to > from && kind == Thread) {
@@ -972,15 +1013,15 @@ export class Linker {
 		return [this.units[refs[0] >> 32].at[refs[0] & 0xffffffff], at]
 	}
 
-	/// The run of region r the sections of x are laid out in, made at first if x is bound in a kept image, else null; a
-	/// CompileError if it is of another region.
-	private run(r: Region, x: string): Region | null throws CompileError {
+	/// The run of region r the sections of x are laid out in, made at first if x is bound in a kept image, or made is,
+	/// else null; a CompileError if it is of another region.
+	private run(r: Region, x: string, made = false): Region | null throws CompileError {
 		const e = this.state.runs.find(e => e[0] == x)
 		if (e != null && (e[1].start < r.start || e[1].start >= r.cap)) {
 			throw new CompileError(`${x} is of another kind now`)
 		} else if (e != null) {
 			return e[1]
-		} else if (!this.keep || !this.bounded.includes(x)) {
+		} else if (!this.keep || !made && !this.bounded.includes(x)) {
 			return null
 		}
 		const run = new Region(alignUp(this.room(r, this.machine.page, from => from + room / 16, x), this.machine.page))
@@ -1061,12 +1102,21 @@ export class Linker {
 	}
 
 	/// Frees the size bytes at at for what is laid out later. They stay as they are but in what is read entry by entry,
-	/// the unwinder's and the symbol table's regions and the runs, which have zeros there until then.
+	/// the unwinder's and the symbol table's regions and the runs, which have zeros there until then, and the rebases'
+	/// run, entries of no rebase.
 	private free(at: u64, size: u64) {
 		const k = partitionPoint(this.state.regions, r => r.cap > at) as i32
 		const run = this.state.runs.find(e => e[1].start <= at && at < e[1].cap)
 		const r = if (run != null) run[1] else this.state.regions[k]
-		if (run != null && this.regions[k][0] != Zero || this.regions[k][0] == Unwind
+		if (size == 0) {
+			return
+		} else if (run != null && run[0] == rebasing) {
+			const b = new u8[](size as i32)
+			for (const i of 0 ... b.length / 8 - 1) {
+				b[8 * i] = 1
+			}
+			this.bytes.set(at, fromBytes(b))
+		} else if (run != null && this.regions[k][0] != Zero || this.regions[k][0] == Unwind
 			|| this.regions[k][0] == Symbols) {
 			this.bytes.set(at, zeros(size as i32))
 		}
@@ -1089,12 +1139,13 @@ export class Linker {
 	/// Sets the bytes each fixup of units ks is at, noting where (redone), and a pointer to an address in the image as a
 	/// rebase, one to an import as a bind, and a Desc as a desc, which the image keeps until it is set again, and a
 	/// frozen unit's record not, once set for good; reaching an import relative to the code itself is only possible
-	/// through a stub or slot.
+	/// through a stub or slot. A kept image keeps a unit's rebases of words in a block of its own.
 	private fix(image: Image, ks: i32[]) throws CompileError {
 		const word = new u8[](8) // where a fixup is set, of the 8 bytes at its address
 		for (const k of ks) {
 			const u = this.read(k)
 			const o = u.object
+			const words: u64[] = []
 			for (const i of 0 ... o.sections.length - 1) {
 				if (u.at[i] == dropped) {
 					continue
@@ -1150,7 +1201,9 @@ export class Linker {
 						}
 						continue
 					}
-					if (inside && f.kind == Abs64) {
+					if (inside && f.kind == Abs64 && this.keep && p % 8 == 0) {
+						words.push(p)
+					} else if (inside && f.kind == Abs64) {
 						image.rebases.push(p)
 					}
 					const v = s + (f.addend as u64) - (if (f.kind == Thread32) image.thread[0] else 0)
@@ -1168,7 +1221,21 @@ export class Linker {
 					}
 				}
 			}
+			if (this.keep) {
+				sort(words)
+				this.rebased(u, 0, words)
+			}
 		}
+	}
+
+	/// Makes u's block i of the rebases' run the RELR of words, ascending: none if there are none.
+	private rebased(u: Unit, i: i32, words: u64[]) throws CompileError {
+		while (u.relr.length <= i) {
+			u.relr.push([0, 0])
+		}
+		this.free(u.relr[i][0], u.relr[i][1])
+		const b = relr(words)
+		u.relr[i] = if (b == "") [0, 0] else this.block(this.state.runs.find(e => e[0] == rebasing)![1], b, "rebases")
 	}
 
 	/// Whether fixup f, at p, of a frozen unit is set for good: if it reaches a local symbol or a local's unshared
@@ -1213,7 +1280,7 @@ export class Linker {
 				image.symbols.push([syms, u.blocks[2][0], u.blocks[3][0]])
 			}
 		}
-		s.units = units.map(u => [u.object, u.at, u.encoded, u.blocks])
+		s.units = units.map(u => [u.object, u.at, u.encoded, u.blocks, u.relr])
 		// A table not in the image's bytes is one made anew, or grown, its entries with it.
 		if (this.table != this.bytes) {
 			if (this.loaded > 0) {
@@ -1367,6 +1434,23 @@ export class Linker {
 		o.symbols = [...o.symbols, ...locals]
 		const frozen = new Unit(o, true)
 		frozen.at = regions.map(r => r.start)
+		// The frozen units' rebases, of those of o's fixups, which a link sets anew, and those set for good.
+		const fixups = new HashMap[u64, bool]()
+		for (const r of 0 ... regions.length - 1) {
+			for (const f of o.sections[r].fixups) {
+				fixups.set(regions[r].start + f.at, true)
+			}
+		}
+		const words: u64[] = []
+		for (const u of units) {
+			for (const [at, size] of u.relr) {
+				words.push(...unrelr(this.bytes.slice(at, at + size)))
+				this.free(at, size)
+			}
+		}
+		sort(words)
+		this.rebased(frozen, 0, words.filter(p => fixups.has(p)))
+		this.rebased(frozen, 1, words.filter(p => !fixups.has(p)))
 		frozen.names = [...names, ...locals.map(_ => -1)]
 		// What the frozen units define, this one does, which takes their place.
 		for (const n of this.touched.map(g => this.names[g]!).filter(n => n.unit > 0 && this.units[n.unit].frozen)) {
@@ -1416,6 +1500,7 @@ export class Linker {
 		kept.names = u.names.map(g => if (g < this.shared) g else -1)
 		kept.links = u.links
 		kept.from = u.from
+		kept.relr = u.relr
 		return kept
 	}
 

@@ -8,7 +8,7 @@ import { get, put } from "../../std/encoding/binary"
 import { alignUp, max, min } from "../../std/math"
 import { Arch } from "../../std/os"
 import { CompileError } from "../error"
-import { le, str, u, zeros } from "./bytes"
+import { le, relr, str, u, zeros } from "./bytes"
 import { Format, Image, Segment } from "./link"
 
 import { Abs64, Call, Code, Const, Data, Desc, Fixup, Global, Init, Local, Object, Page, PageOff, Rel32, Rel64, Section,
@@ -383,8 +383,18 @@ function write(image: Image) throws CompileError {
 		}
 		image.bytes.set(at, fromBytes(b))
 	}
-	// Of each entry, held or new, the stretch it is in, which a new cut moves.
-	for (const i of 1 ... (((image.symtab[1] - image.symtab[0]) / 24) as i32) - 1) {
+	// Of each entry, held or new, the stretch it is in, which a new cut moves: unless the file kept has the same, its
+	// section headers after the first, up to its .dynsym.
+	const was = image.bytes.file
+	const sh = (i: i32, field: i32, n: i32) => {
+		const at = (if (was.length >= 64) u(was, 40, 8) as i32 else was.length) + 64 * i + field
+		return if (at + n <= was.length) u(was, at, n) else 0
+	}
+	let cut = sh(stretches.length + 1, 4, 4) != SHT_DYNSYM
+	for (const i of 0 ... stretches.length - 1) {
+		cut = cut || sh(i + 1, 16, 8) != stretches[i][1] || sh(i + 1, 32, 8) != stretches[i][2]
+	}
+	for (const i of 1 ... if (cut) (((image.symtab[1] - image.symtab[0]) / 24) as i32) - 1 else 0) {
 		const e = image.symtab[0] + 24 * (i as u64)
 		if (image.bytes.get(e, 4) != 0) {
 			const value = image.bytes.get(e + 8, 8)
@@ -428,28 +438,11 @@ function write(image: Image) throws CompileError {
 	const symAt = place(fromBytes(dynsym))
 	const strAt = place(strs)
 	const hashAt = place(fromBytes(hash(dynamic)))
-	// The rebases of words as RELR: an address, then bitmaps of the 63 words after what the entry before covers.
-	const words = image.rebases.filter(at => at % 8 == 0)
-	const relr: string[] = []
-	let i = 0
-	while (i < words.length) {
-		relr.push(le(words[i], 8))
-		let next = words[i] + 8
-		i++
-		let bits: u64 = 1
-		while (bits != 0) {
-			bits = 0
-			while (i < words.length && words[i] < next + 63 * 8) {
-				bits |= 1 << (words[i] - next) / 8
-				i++
-			}
-			if (bits != 0) {
-				relr.push(le(bits << 1 | 1, 8))
-			}
-			next += 63 * 8
-		}
-	}
-	const relrAt = place(relr.join(""))
+	// The rebases of words as RELR, which a kept image holds where it is mapped.
+	const held = image.relr[1] > image.relr[0]
+	const words = if (held) "" else relr(image.rebases.filter(at => at % 8 == 0))
+	const relrAt = if (held) image.relr[0] else place(words)
+	const relrSize = if (held) image.relr[1] - image.relr[0] else words.length as u64
 	// The other rebases, the binds and the descs as RELA.
 	const x64 = image.arch == "x86_64"
 	const rebases = image.rebases.filter(at => at % 8 != 0)
@@ -476,12 +469,14 @@ function write(image: Image) throws CompileError {
 	}
 	const relaAt = place(fromBytes(rela))
 	const at = base + alignUp(tail.length as u64, 8)
-	const hdrAt = if (image.unwinds.length > 0) place(fromBytes(frames(image, at))) else 0
-	const hdrSize = base + (tail.length as u64) - hdrAt
+	const hdrAt = if (image.hdr[1] > image.hdr[0]) image.hdr[0]
+		else if (image.unwinds.length > 0) place(fromBytes(frames(image, at, false)))
+		else 0
+	const hdrSize = if (image.hdr[1] > image.hdr[0]) kept(image) else base + (tail.length as u64) - hdrAt
 	let dyn = needed.map(at => le(DT_NEEDED, 8) + le(at as u64, 8)).join("")
 	for (const [tag, v] of [[DT_HASH, hashAt], [DT_STRTAB, strAt], [DT_SYMTAB, symAt], [DT_STRSZ, strs.length as u64],
 		[DT_SYMENT, 24], [DT_RELA, relaAt], [DT_RELASZ, rela.length as u64], [DT_RELAENT, 24], [DT_RELR, relrAt],
-		[DT_RELRSZ, 8 * (relr.length as u64)], [DT_RELRENT, 8]]) {
+		[DT_RELRSZ, relrSize], [DT_RELRENT, 8]]) {
 		dyn += le(tag, 8) + le(v, 8)
 	}
 	if (image.inits[1] > image.inits[0]) {
@@ -491,6 +486,8 @@ function write(image: Image) throws CompileError {
 	dyn += le(DT_NULL, 16)
 	const dynAt = place(dyn)
 	const loaded = tail.length as u64
+	// Where what is at an address is in the file: in a segment, there.
+	const t = (at: u64) => if (at < base) at else file + at - base
 	// What is not loaded: the section headers.
 	let shstrtab = "\x00"
 	let shdrs = le(0, 64)
@@ -509,11 +506,10 @@ function write(image: Image) throws CompileError {
 			| (if (threaded(image, at)) SHF_TLS else 0)
 		section(name, if (at >= seg.address + seg.size) SHT_NOBITS else SHT_PROGBITS, sflags, at, at, size, 0, 0, 0)
 	}
-	const t = (at: u64) => file + at - base
 	const dynsymIndex = section(".dynsym", SHT_DYNSYM, SHF_ALLOC, symAt, t(symAt), dynsym.length as u64, n + 2, 1, 24)
 	section(".dynstr", SHT_STRTAB, SHF_ALLOC, strAt, t(strAt), strs.length as u64, 0, 0, 0)
 	section(".hash", SHT_HASH, SHF_ALLOC, hashAt, t(hashAt), 8 * ((dynamic.length as u64) + 2), dynsymIndex, 0, 4)
-	section(".relr.dyn", SHT_RELR, SHF_ALLOC, relrAt, t(relrAt), 8 * (relr.length as u64), 0, 0, 8)
+	section(".relr.dyn", SHT_RELR, SHF_ALLOC, relrAt, t(relrAt), relrSize, 0, 0, 8)
 	section(".rela.dyn", SHT_RELA, SHF_ALLOC, relaAt, t(relaAt), rela.length as u64, dynsymIndex, 0, 24)
 	if (hdrAt != 0) {
 		section(".eh_frame_hdr", SHT_PROGBITS, SHF_ALLOC, hdrAt, t(hdrAt), hdrSize, 0, 0, 0)
@@ -602,38 +598,141 @@ function hash(syms: Symbol[]): u8[] {
 }
 
 /// The eh_frame_hdr, at address at, of the call frame information of image, from and to where its unwinds say: where
-/// the first is, and a table for the unwinder to search, of the code address of each FDE and its own, sorted.
-function frames(image: Image, at: u64): u8[] throws CompileError {
-	const spans = image.unwinds
-	const fdes: [u64, u64][] = []
-	for (const [from, to] of spans) {
-		const b = image.bytes.slice(from, to)
-		let p = from
-		while (p + 4 <= to) {
-			const length = u(b, (p - from) as i32, 4)
-			const cie = u(b, (p + 4 - from) as i32, 4)
-			// An FDE of a dropped function was not fixed up, and its pc is its own address. One of an empty function,
-			// of range 0, is at the next one's address, where it could hide that one's from the unwinder's search.
-			if (length != 0 && cie != 0) {
-				const enc = encoding(b, (p + 4 - cie - from) as i32)
-				const pc = pointer(b, p + 8, enc, from)
-				if ((pc < from || pc >= to) && u(b, ((p + 8 - from) as i32) + size(enc), size(enc)) != 0) {
-					fdes.push([pc, p])
-				}
-			}
-			p += 4 + length
+/// the first is, and a table for the unwinder to search, of the code address of each FDE and its own, sorted; if
+/// gapped, each 8th entry after a copy of it, room for one more there. An entry that is a copy of the one before is
+/// of no FDE more.
+function frames(image: Image, at: u64, gapped: bool): u8[] throws CompileError {
+	const all: [u64, u64][] = []
+	for (const [from, to] of image.unwinds) {
+		all.push(...fdes(image, from, to))
+	}
+	sortBy(all, (x, y) => x[0] < y[0])
+	const n = if (gapped) all.length + all.length / 8 else all.length
+	const h = new u8[](12 + 8 * n)
+	put(h, 0, 0x3b031b01, 4) // version 1; eh_frame_ptr pcrel sdata4; fde_count udata4; table datarel sdata4
+	put(h, 4, image.unwinds[0][0] - at - 4, 4)
+	put(h, 8, n as u64, 4)
+	let e = 12
+	for (const i of 0 ... all.length - 1) {
+		for (const _ of 0 ... (if (gapped && i % 8 == 7) 1 else 0)) {
+			put(h, e, all[i][0] - at, 4)
+			put(h, e + 4, all[i][1] - at, 4)
+			e += 8
 		}
 	}
-	sortBy(fdes, (x, y) => x[0] < y[0])
-	const h = new u8[](12 + 8 * fdes.length)
-	put(h, 0, 0x3b031b01, 4) // version 1; eh_frame_ptr pcrel sdata4; fde_count udata4; table datarel sdata4
-	put(h, 4, spans[0][0] - at - 4, 4)
-	put(h, 8, fdes.length as u64, 4)
-	for (const i of 0 ... fdes.length - 1) {
-		put(h, 12 + 8 * i, fdes[i][0] - at, 4)
-		put(h, 16 + 8 * i, fdes[i][1] - at, 4)
-	}
 	return h
+}
+
+/// The code address of each FDE of the call frame information from and to, and its own.
+function fdes(image: Image, from: u64, to: u64): [u64, u64][] throws CompileError {
+	const b = image.bytes.slice(from, to)
+	const all: [u64, u64][] = []
+	let p = from
+	while (p + 4 <= to) {
+		const length = u(b, (p - from) as i32, 4)
+		const cie = u(b, (p + 4 - from) as i32, 4)
+		// An FDE of a dropped function was not fixed up, and its pc is its own address. One of an empty function, of
+		// range 0, is at the next one's address, where it could hide that one's from the unwinder's search.
+		if (length != 0 && cie != 0) {
+			const enc = encoding(b, (p + 4 - cie - from) as i32)
+			const pc = pointer(b, p + 8, enc, from)
+			if ((pc < from || pc >= to) && u(b, ((p + 8 - from) as i32) + size(enc), size(enc)) != 0) {
+				all.push([pc, p])
+			}
+		}
+		p += 4 + length
+	}
+	return all
+}
+
+/// Of a kept image, its eh_frame_hdr where hdr has room for it, as frames makes it gapped, or as it was but the entries
+/// of the code gone, each then a copy of the one before, and of the FDEs laid out now, in the copies from where they go
+/// on, the entries between moved over; its size. Of too few copies, frames makes it anew.
+function kept(image: Image): u64 throws CompileError {
+	const [at, cap] = image.hdr
+	const b = image.bytes
+	// Of no FDEs, none, of which the next link makes it anew.
+	if (image.unwinds.length == 0) {
+		b.put(at + 8, 0, 4)
+		return 12
+	}
+	// The entries as numbers, the code address relative to at in the low 32 bits, of which the sign is the order.
+	const entry = (i: i64) => b.get(at + 12 + 8 * (i as u64), 8)
+	const set = (i: i64, x: u64) => b.put(at + 12 + 8 * (i as u64), x, 8)
+	const pc = (x: u64) => ((x as u32) as i32) as i64
+	let n = (if (b.get(at, 4) == 0x3b031b01) b.get(at + 8, 4) else 0) as i64
+	// The first entry whose code address is above p, or if also, at it or above.
+	const after = (p: i64, also: bool) => {
+		let [lo, hi] = [0 as i64, n]
+		while (lo < hi) {
+			const mid = (lo + hi) / 2
+			if (pc(entry(mid)) > p || also && pc(entry(mid)) == p) {
+				hi = mid
+			} else {
+				lo = mid + 1
+			}
+		}
+		return lo
+	}
+	let fits = n > 0
+	for (const [from, to] of image.gone) {
+		const [i, j] = [after((from - at) as i64, true), after((to - at) as i64, true)]
+		for (const k of (if (i > 0) i else j) ... j - 1) {
+			set(k, entry(i - 1))
+		}
+		fits = fits && (i > 0 || j == 0)
+	}
+	const room = ((cap - at - 12) / 8) as i64
+	const gap = (k: i64) => k >= n || k >= 1 && entry(k) == entry(k - 1)
+	for (const [from, to] of if (fits) image.fresh else []) {
+		const xs = fdes(image, from, to).map(e => (e[0] - at) & 0xffffffff | (e[1] - at) << 32)
+		if (xs.length == 0) {
+			continue
+		}
+		sortBy(xs, (x, y) => pc(x) < pc(y))
+		// Where they go, on until it holds as many copies as they are, each then one of them or of those between.
+		const lo = after(pc(xs[0]), false)
+		let [hi, gaps] = [after(pc(xs[xs.length - 1]), false), 0]
+		for (const k of lo ... hi - 1) {
+			gaps += if (gap(k)) 1 else 0
+		}
+		while (gaps < xs.length && hi < room) {
+			gaps += if (gap(hi)) 1 else 0
+			hi++
+		}
+		if (gaps < xs.length) {
+			fits = false
+			break
+		}
+		const es: u64[] = []
+		let j = 0
+		for (const k of lo ... min(hi, n) - 1) {
+			while (j < xs.length && pc(xs[j]) < pc(entry(k))) {
+				es.push(xs[j])
+				j++
+			}
+			if (!gap(k)) {
+				es.push(entry(k))
+			}
+		}
+		es.push(...xs.slice(j, xs.length))
+		for (const k of lo ... hi - 1) {
+			set(k, es[min(k - lo, (es.length as i64) - 1)])
+		}
+		n = max(n, hi)
+	}
+	if (!fits) {
+		const h = frames(image, at, true)
+		if (at + (h.length as u64) > cap) {
+			throw new CompileError("there is no room for the unwinder's table")
+		}
+		b.set(at, fromBytes(h))
+		return h.length as u64
+	}
+	b.put(at, 0x3b031b01, 4)
+	b.put(at + 4, image.unwinds[0][0] - at - 4, 4)
+	b.put(at + 8, n as u64, 4)
+	return 12 + 8 * (n as u64)
 }
 
 /// The encoding of the code addresses of the FDEs of the CIE at cie: that its augmentation gives after an R, else
@@ -693,5 +792,5 @@ function skip(b: string, p: i32): i32 {
 	return q + 1
 }
 
-export const elf: Format = { headers: headers, symbol: 24, bindsAnywhere: true, start: "__dso_handle", read: read,
-	exports: exports, write: write }
+export const elf: Format = { headers: headers, symbol: 24, bindsAnywhere: true, start: "__dso_handle", tables: true,
+	read: read, exports: exports, write: write }

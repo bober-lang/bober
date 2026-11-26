@@ -161,6 +161,52 @@ export function le(v: u64, n: i32): string {
 	return s
 }
 
+/// The addresses of words, ascending, as RELR: an address, then bitmaps of the 63 words after what the entry before
+/// covers.
+export function relr(words: u64[]): string {
+	let s = ""
+	let i = 0
+	while (i < words.length) {
+		s += le(words[i], 8)
+		let next = words[i] + 8
+		i++
+		let bits: u64 = 1
+		while (bits != 0) {
+			bits = 0
+			while (i < words.length && words[i] < next + 63 * 8) {
+				bits |= 1 << (words[i] - next) / 8
+				i++
+			}
+			if (bits != 0) {
+				s += le(bits << 1 | 1, 8)
+			}
+			next += 63 * 8
+		}
+	}
+	return s
+}
+
+/// The addresses the RELR s has, in its order.
+export function unrelr(s: string): u64[] {
+	const words: u64[] = []
+	let next: u64 = 0
+	for (const i of 0 ... s.length / 8 - 1) {
+		const w = u(s, 8 * i, 8)
+		if (w & 1 == 0) {
+			words.push(w)
+			next = w + 8
+			continue
+		}
+		for (const j of 0 ... 62) {
+			if ((w >> (j + 1)) & 1 != 0) {
+				words.push(next + 8 * (j as u64))
+			}
+		}
+		next += 63 * 8
+	}
+	return words
+}
+
 /// Writes bytes to f, as it has those the bytes are written over: their written pages, each, and their last page,
 /// at which the file ends; their first page last, zeros until then, so that a file left half written is no image, nor
 /// one a build continues.

@@ -1,9 +1,11 @@
 //! Tests of src/link/elf: a written shared library read back.
 
+import { startsWith } from "../../std/algo"
+import { makeTempDir, open, removeAll } from "../../std/fs"
 import { CompileError } from "../error"
 import { Tpde } from "../backend/tpde"
 import { arm64 } from "./arm64"
-import { Bytes, le, mapped, zeros } from "./bytes"
+import { Bytes, le, mapped, store, zeros } from "./bytes"
 import { elf } from "./elf"
 import { Linker } from "./link"
 import { Code, Fixup, Global, Local, Object, Rel32, Section, Symbol, Unwind } from "./object"
@@ -129,4 +131,75 @@ test "a call's stack map leaves out the refs whose definition does not dominate 
 	b.at(use)
 	b.ret(v)
 	assert elf.read("m.o", b.object()).sections.every(s => s.name != ".llvm_stackmaps")
+}
+
+/// An object named name of size bytes of code, which defines name there, and of an FDE of it.
+function unwound(name: string, size: u64): Object {
+	const o = text(name)
+	o.sections[0].bytes = zeros(size as i32)
+	o.sections[0].size = size
+	const eh = new Section(".eh_frame", Unwind)
+	eh.bytes = le(16, 4) + zeros(4) + "\x01zR\0\x01\x7c\x1e\x01\x1b\0\0\0" + le(16, 4) + le(24, 4) + zeros(4)
+		+ le(size, 4) + zeros(4)
+	eh.size = 40
+	eh.fixups = [new Fixup(28, Rel32, 0, 0)]
+	o.sections.push(eh)
+	return o
+}
+
+/// The FDE the unwinder finds for the code at pc in d by its eh_frame_hdr's table, the last entry at pc or below, if
+/// its function has pc; else 0.
+function unwinder(d: Bytes, pc: u64): u64 {
+	let ph = d.get(32, 8)
+	while (d.get(ph, 4) != 0x6474e550) {
+		ph += 56
+	}
+	const hdr = d.get(ph + 16, 8)
+	const signed = (v: u64) => (((v as u32) as i32) as i64) as u64
+	const entry = (i: u64, field: u64) => hdr + signed(d.get(hdr + 12 + 8 * i + field, 4))
+	let [lo, hi] = [0 as u64, d.get(hdr + 8, 4)]
+	while (lo < hi) {
+		const mid = (lo + hi) / 2
+		if (entry(mid, 0) <= pc) {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	const fde = if (lo > 0) entry(lo - 1, 4) else 0
+	const start = fde + 8 + signed(d.get(fde + 8, 4))
+	return if (fde > 0 && pc >= start && pc < start + d.get(fde + 12, 4)) fde else 0
+}
+
+test "a kept image's unwinder's table, continued, finds each function's FDE, and none of a function it no longer has" {
+	let l = new Linker(arm64, elf, new Bytes())
+	for (const i of 0 ... 19) {
+		l.add(unwound(`f${i}.0`, 8))
+		l.export(`f${i}.0`)
+	}
+	let image = l.link()
+	elf.write(image)
+	// Each file stored over a copy of the one before, as a build stores it.
+	const dir = makeTempDir("bober-")
+	let f = open(`${dir}/0`, "w+")
+	store(f, image.bytes)
+	for (const step of 1 ... 60) {
+		const was = image.exports
+		l = new Linker(arm64, elf, new Bytes(f.map()))
+		const i = step * 7 % 20
+		l.remove(l.objects().find(o => startsWith(o, `f${i}.`))!)
+		l.add(unwound(`f${i}.${step}`, 8 * (1 + (step as u64) % 7)))
+		l.export(`f${i}.${step}`)
+		image = l.link()
+		elf.write(image)
+		const next = f.copy(`${dir}/${step}`, image.bytes.length)
+		f.close()
+		f = next
+		store(f, image.bytes)
+		const d = image.bytes
+		assert image.exports.every(e => unwinder(d, e[1]) != 0 && unwinder(d, e[1] + 4) == unwinder(d, e[1]))
+		assert was.every(e => unwinder(d, e[1]) == 0 || image.exports.some(x => unwinder(d, x[1]) == unwinder(d, e[1])))
+	}
+	f.close()
+	removeAll(dir)
 }
