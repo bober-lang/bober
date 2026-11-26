@@ -1,7 +1,6 @@
 //! Tests of src/bober.bob's builds into the image, which keeps what it holds across them.
 
 import { endsWith, indexOf, sort, startsWith } from "../std/algo"
-import { isDigit } from "../std/ascii"
 import { fromCString } from "../std/c"
 import { exists, glob, mkdirAll, open, remove, stat } from "../std/fs"
 import { base } from "../std/fs/path"
@@ -606,27 +605,19 @@ test "a file is known by its time and size once older than a build, else read, a
 	assert at("3", ["-t", "209901010000"]) == "3\n" && at("4", ["-t", "209901010000"]) == "4\n"
 }
 
-/// Of a unit, the marks it defines and names, and the rest of it but its bytecode and the ABIs of modules, which its
-/// names have after a ^ and its marks do not cover (unit).
+/// Of a unit, the marks it defines and names, and the rest of it but its bytecode.
 function shape(x: Object): [string, string] {
-	const plain = (name: string) => split(name, "^").map(s => {
-		let i = 0
-		while (i < s.length && isDigit(s[i])) {
-			i++
-		}
-		return s.slice(i, s.length)
-	}).join("^")
 	const marks = x.symbols.filter(s => startsWith(s.name, "~")).map(s => `${s.name}${s.section >= 0}`)
 	sort(marks)
 	let rest = ""
 	for (const s of x.sections.filter(s => s.name != "bober_bc")) {
 		rest += `${s.name} ${s.kind} ${s.align} ${s.size} ${s.bytes}\n`
 		for (const f of s.fixups) {
-			rest += `${f.at} ${f.kind} ${plain(x.symbols[f.symbol].name)} ${f.addend}\n`
+			rest += `${f.at} ${f.kind} ${x.symbols[f.symbol].name} ${f.addend}\n`
 		}
 	}
-	for (const s of x.symbols.filter(s => !startsWith(s.name, "~") && !startsWith(s.name, "bober.abi."))) {
-		rest += `${plain(s.name)} ${s.binding} ${s.section} ${s.value} ${s.size}\n`
+	for (const s of x.symbols.filter(s => !startsWith(s.name, "~"))) {
+		rest += `${s.name} ${s.binding} ${s.section} ${s.value} ${s.size}\n`
 	}
 	return [marks.join(" "), rest]
 }
@@ -735,4 +726,18 @@ test "-release makes anew a module that copies a function of another, once a clo
 	assert built([["lib.bob", "export function f(xs: i32[]): i32 { return xs.map(x => x + 1)[0] }\n"], ["main.bob", main]],
 		"-release") == "2\n"
 	assert built([["lib.bob", "export function f(xs: i32[]): i32 { return xs.map(x => x + 2)[0] }\n"]], "-release") == "3\n"
+}
+
+test "a unit kept calls another module's function as edited, though a union that module's functions take grew" {
+	const lib = (k: i32) => `export interface Shape { area(): i32 }\n
+export function area(s: Shape): i32 { return s.area() }\n\nexport function k(): i32 { return ${k} }\n`
+	const main = (c: string) => `import { area } from "./lib"\nimport { kb } from "./b"\n
+class A { area(): i32 { return 1 } }\n${c}
+function main() { print(\`\${area(new A())} \${kb()}\`) }\n`
+	anew()
+	assert built([["lib.bob", lib(1)],
+		["b.bob", `import { k } from "./lib"\n\nexport function kb(): i32 { return k() }\n`], ["main.bob", main("")]],
+		"-O1") == "1 1\n"
+	const b = "\nclass B { area(): i32 { return 2 } }\n\nfunction b(): i32 { return area(new B()) }\n"
+	assert built([["lib.bob", lib(2)], ["main.bob", main(b)]], "-O1") == "1 2\n"
 }

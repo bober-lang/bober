@@ -1072,10 +1072,10 @@ let done: [Program, u64, u64] | null = null
 /// which loads the C library, on macOS the system's with those and libc++ in it, and exports the entries of p's modules
 /// mains. The image is kept (src/link/link.bob), and a build links only what it does not hold: each object is named
 /// by what it is made of, `<what>@<version>`, a module by its bytecode, which has the ABIs of the modules it imports,
-/// and its Bound, and monomorphized, `<path>^<abi>^O1@`, by its bytecode as such too, beside the one as lowered, its
+/// and its Bound, and monomorphized, `<path>^<world>^O1@`, by its bytecode as such too, beside the one as lowered, its
 /// symbols its own (unit), what it instances its local copies, so that programs share it, -tune specs of those per
 /// module; a file by its bytes; an archive, which is linked for good, by its size and when it was written. A
-/// monomorphized module is compiled by TPDE, or by LLVM as `<path>^<abi>^O2@` of the same version, which any build
+/// monomorphized module is compiled by TPDE, or by LLVM as `<path>^<world>^O2@` of the same version, which any build
 /// keeps, at -O2, and with no level given where the image holds TPDE's, a build finding it unchanged. A release
 /// build's is the object LLVM makes of it, `<path>^R@`, held as it is for executable, not linked, nor any file:
 /// compiled as its program whole learns (learn), on x86-64 for x86-64-v2 unless baseline, and against builtin/ as it
@@ -1129,7 +1129,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	const unchanged = old != null && d != null && left == d[0]
 	const kept = if (unchanged) d![2] else mapped
 	const l = if (unchanged) d![1] else new Linker(machine, format, kept)
-	// The image's objects by the path they are of (home), of which evict looks for those of other ABIs.
+	// The image's objects by the path they are of (home), of which evict looks for those of other worlds.
 	const held = new HashMap[string, string[]]()
 	for (const h of l.objects()) {
 		if (!held.has(home(h))) {
@@ -1162,8 +1162,8 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		}
 	}
 	const compiler = compilerId()
-	// Of each module's unit, <path>@<source>.<version>, or monomorphized <path>^<abi>^O1@<source>.<version>, which names
-	// LLVM's of its code too, <path>^<abi>^O2@...; and the unit the program is linked from.
+	// Of each module's unit, <path>@<source>.<version>, or monomorphized <path>^<world>^O1@<source>.<version>, which
+	// names LLVM's of its code too, <path>^<world>^O2@...; and the unit the program is linked from.
 	const ms = program(p, mains, o.dyn)
 	// Monomorphized, it is compiled as tuned; a release build's, <path>^R@..., as its program whole learns, as LLVM is
 	// told, and against builtin/ as it is: of those too.
@@ -1174,9 +1174,14 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	const parts: string[] = []
 	const bodies = new Bodies(p)
 	// Monomorphized, the marks of each module's decls, which its unit defines; and of the unions values are held as at
-	// run time, which a unit of the world's (world) does, which each program of it shares.
+	// run time and of the signatures of builtin/'s decls, whose functions emit calls unasked, which no bytecode names,
+	// which a unit of the world's (world) does, which each program of it shares: of its package's home, or of a file
+	// alone the directory it is in, which the units' symbols are named by.
 	const defs: u64[][] = p.modules.map(_ => [] as u64[])
+	let lang = ""
 	if (!o.dyn && !c.release) {
+		const builtins = p.modules.map(m => builtin(m.path))
+		const sigs: u64[] = []
 		for (const d of 0 ... p.decls.length - 1) {
 			// Of its code too if an instance may be of it, which names that: generic, nested or taking a Type.
 			const x = p.decls[d]
@@ -1185,11 +1190,18 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			}
 			const instanced = x.owner >= 0 || x.params.length > 0 || takesType(p, d)
 			defs[x.module].append([x.sig, if (instanced) x.body else 0].filter(h => h != 0))
+			if (builtins[x.module]) {
+				sigs.push(x.sig)
+			}
 		}
-		const whole = p.unions.values().map(u => marker(heldHash(p, u)))
+		sort(sigs)
+		lang = marker(fnv(sigs.join(" ")))
+		const whole = [...p.unions.values().map(u => marker(heldHash(p, u))), lang]
 		sort(whole)
 		const w = world(p.modules[mains[0]].path)
-		const name = `bober.marks.${if (w.length > 1) nearest(w[0])! else w[0]}@${fnv(whole.join(" "))}`
+		const where = if (w.length > 1) nearest(w[0])! else parent(w[0])
+		p.world = fnv(where)
+		const name = `bober.marks.${where}@${fnv(whole.join(" "))}`
 		parts.push(name)
 		if (lacks(name)) {
 			const x = new Object(name, machine.arch)
@@ -1230,7 +1242,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 				stdout.write(`${clear}[${m + 1}/${p.modules.length}] compiling ${split(path, ": ")[0]}`)
 			}
 			l.add(unit(p, m, wanted, o, bc, b, llvm, c, facts,
-				if (o.dyn || c.release) [[], []] else [defs[m].map(marker), marks.map(marker)]))
+				if (o.dyn || c.release) [[], []] else [defs[m].map(marker), [...marks.map(marker), lang]]))
 			c.compiled.set(wanted, true)
 		}
 	}
@@ -1331,15 +1343,13 @@ function pinned(at: string, tmp: string): string {
 	return own
 }
 
-/// Module m of p, compiled by TPDE, or if llvm by LLVM, as o says, as the object name. It defines a symbol named by
-/// its ABI, and names those of the modules it imports and of builtin/'s, whose functions the compiler calls unasked,
-/// so that a kept image unlinks it once one of them has another: an object another program left there, or after a
-/// change of builtin/, which no bytecode names. Of marks, it defines those of its module's decls and of its source,
-/// and names those of what of others its code is made of. It holds bc, its bytecode as lowered, in section bober_bc,
-/// which a build links rather than checks the module of (lowered), and its Bound, if any (src/lift.bob), in bober_bind.
-/// Monomorphized, its names but local ones end in monoSuffix, as the module as lowered has the same ones of other
-/// layouts and calling conventions: bober's, which have a . or :, unlike C's. A release build's, compiled as facts
-/// say, holds but those two and the object file LLVM made, in bober_obj, which executable links.
+/// Module m of p, compiled by TPDE, or if llvm by LLVM, as o says, as the object name. Of marks, it defines those of
+/// its module's decls and names those of what of others its code is made of, so that a kept image unlinks it once one
+/// is gone. It holds bc, its bytecode as lowered, in section bober_bc, which a build links rather than checks the
+/// module of (lowered), and its Bound, if any (src/lift.bob), in bober_bind. Monomorphized, its names but local ones
+/// end in monoSuffix, as the module as lowered has the same ones of other layouts and calling conventions: bober's,
+/// which have a . or :, unlike C's. A release build's, compiled as facts say, holds but those two and the object file
+/// LLVM made, in bober_obj, which executable links.
 function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: string, llvm: bool, f: Compile,
 	facts: Facts, marks: [string[], string[]]): Object {
 	const path = p.modules[m].path
@@ -1359,12 +1369,6 @@ function unit(p: Program, m: i32, name: string, o: Options, bc: string, bound: s
 	}
 	cached(x, bc, bound)
 	x.sections.push(new Section(".rodata", Const))
-	x.symbols.push(new Symbol(abiSymbol(p, m), Global, x.sections.length - 1))
-	for (const d of 0 ... p.modules.length - 1) {
-		if (d != m && (builtin(p.modules[d].path) || p.modules[m].deps.includes(d))) {
-			x.symbols.push(new Symbol(abiSymbol(p, d), Global, -1))
-		}
-	}
 	x.symbols.append(marks[0].map(n => new Symbol(n, Weak, x.sections.length - 1)))
 	x.symbols.append(marks[1].map(n => new Symbol(n, Global, -1)))
 	for (const s of x.symbols.filter(s => !o.dyn && s.binding != Local
@@ -1431,9 +1435,6 @@ function marker(h: u64): string {
 
 /// If not null, given each unit unit makes but a release build's, which a test compares.
 export let onUnit: ((x: Object) => void) | null = null
-
-/// The symbol named by the ABI of p's module m.
-function abiSymbol(p: Program, m: i32): string { return `bober.abi.${p.modules[m].path}.${abi(p, m)}` }
 
 /// The objects of the glue of p's modules ms of C headers but the bundle's, of source hash 0, compiled with includes
 /// and those of the packages of these modules, and all C libraries of each package one of whose headers it imports,
