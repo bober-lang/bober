@@ -123,10 +123,10 @@ export function write(s: State, arch: Arch): string {
 	return w.bytes
 }
 
-/// The record of o, a unit's object as State has it, and of the indices of its symbols' names: its head, the sections
-/// but their fixups, first.
-export function record(o: Object, names: i32[]): string {
-	const w = new Writer()
+/// The record of o, a unit's object as State has it, of the fixups of section i keeps says, and of the indices of its
+/// symbols' names: its head, the sections but their fixups, first. Written after what w has, which it shares.
+export function record(w: Writer, o: Object, keeps: (i: i32, f: Fixup) => bool, names: i32[]): string {
+	const from = w.bytes.length
 	const str = (x: string) => {
 		w.uleb(x.length as u64)
 		w.raw(x)
@@ -140,8 +140,8 @@ export function record(o: Object, names: i32[]): string {
 		w.uleb(sec.size)
 		str(sec.group)
 	})
-	for (const sec of o.sections) {
-		list(w, sec.fixups, f => {
+	for (const i of 0 ... o.sections.length - 1) {
+		list(w, o.sections[i].fixups.filter(f => keeps(i, f)), f => {
 			w.uleb(f.at)
 			w.u8(f.kind)
 			w.uleb(f.symbol as u64)
@@ -158,7 +158,7 @@ export function record(o: Object, names: i32[]): string {
 		w.uleb((names[i] + 1) as u64)
 		i++
 	})
-	return w.bytes
+	return w.bytes.slice(from, w.bytes.length)
 }
 
 /// The stamp of the file of a kept image whose format's headers take headers bytes, after where its head is.

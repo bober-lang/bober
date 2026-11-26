@@ -14,7 +14,7 @@
 import { lastIndexOf, merge, partitionPoint, sort, sortBy, stableSort, startsWith } from "../../std/algo"
 import { HashMap } from "../../std/collections/hashmap"
 import { bytes as random } from "../../std/crypto/random"
-import { get, put } from "../../std/encoding/binary"
+import { Writer, get, put } from "../../std/encoding/binary"
 import { combine, fnv } from "../../std/hash"
 import { alignUp, max, min } from "../../std/math"
 import { Arch } from "../../std/os"
@@ -1253,19 +1253,25 @@ export class Linker {
 			|| n.unit >= 0 && n.section >= 0 && this.units[n.unit].frozen || g >= this.shared
 	}
 
-	/// Keeps in the image what a later link continues it from: its units, the frozen ones as one and the others
-	/// stripped, each with blocks of its own where no loader maps, made once: of its record, its symbols' links and
-	/// their names in the Kept sections' region, and of their entries in the symbol table's, which the format writes;
-	/// the names' entries; and exports. The head, of all but the records, is at the end of the Kept region's
+	/// Keeps in the image what a later link continues it from: its units, the frozen ones as one, each with blocks of
+	/// its own where no loader maps, made once: of its record, of the fixups a later link sets again, its symbols'
+	/// links and their names in the Kept sections' region, and of their entries in the symbol table's, which the format
+	/// writes; the names' entries; and exports. The head, of all but the records, is at the end of the Kept region's
 	/// room, where most of it is as the file has it, and the 16 bytes after the headers say where; 8 more are left for
 	/// who stores the image to stamp it (stamped).
 	private save(image: Image, exports: string[]) throws CompileError {
 		const s = this.state
-		const units = [this.freeze(), ...this.units.filter(u => !u.frozen).map(u => this.strip(u))]
+		const units = [this.freeze(), ...this.units.filter(u => !u.frozen)]
 		const [kept, table] = [s.regions[s.regions.length - 2], s.regions[s.regions.length - 1]]
+		const records = new Writer()
 		for (const u of units.filter(u => u.blocks.length == 0 && u.object.name != "")) {
 			const what = u.object.name
-			u.encoded = record(u.object, u.names)
+			// Its fixups a later link sets again: of a shared name, or a pointer or Desc, which the image's lists drop with it,
+			// or through a veneer.
+			const again = (i: i32, f: Fixup) => u.at[i] != dropped
+				&& (u.object.symbols[f.symbol].binding != Local || f.kind == Abs64 || f.kind == Desc
+				|| this.veneered.has(u.at[i] + f.at))
+			u.encoded = record(records, u.object, again, u.names.map(g => if (g < this.shared) g else -1))
 			u.blocks = [this.block(kept, u.encoded, what),
 				this.block(kept, u.links.slice(0, 16 * (u.object.symbols.length as u64)), what)]
 			// Not those whose address a later link may change: of a thread's copy.
@@ -1275,7 +1281,8 @@ export class Linker {
 					&& sec.kind < Kept && sec.kind != Thread
 			}).map(x => new Symbol(x.name, x.binding, 0, u.at[x.section] + x.value, x.size))
 			if (syms.length > 0) {
-				u.blocks.push(this.block(table, zeros((this.format.symbol as i32) * syms.length), what))
+				const size = this.format.symbol * (syms.length as u64)
+				u.blocks.push([this.room(table, 1, from => from + size, what), size])
 				u.blocks.push(this.block(kept, syms.map(x => `_${x.name}\x00`).join(""), what))
 				image.symbols.push([syms, u.blocks[2][0], u.blocks[3][0]])
 			}
@@ -1473,37 +1480,6 @@ export class Linker {
 		return names
 	}
 
-	/// u without the bytes of its sections, and but the fixups a later link sets again: of a shared name, or a pointer
-	/// or Desc, which the image's lists drop with it, or through a veneer.
-	/// One the continued image holds is that.
-	private strip(u: Unit): Unit {
-		if (u.encoded != "" || u.object.name == "") {
-			return u
-		}
-		const o = new Object(u.object.name, u.object.arch)
-		o.symbols = u.object.symbols
-		for (const i of 0 ... u.object.sections.length - 1) {
-			const sec = u.object.sections[i]
-			const t = new Section(sec.name, sec.kind)
-			t.order = sec.order
-			t.align = sec.align
-			t.size = sec.size
-			t.group = sec.group
-			if (u.at[i] != dropped) {
-				t.fixups = sec.fixups.filter(f => o.symbols[f.symbol].binding != Local || f.kind == Abs64
-					|| f.kind == Desc || this.veneered.has(u.at[i] + f.at))
-			}
-			o.sections.push(t)
-		}
-		const kept = new Unit(o)
-		kept.at = u.at
-		kept.names = u.names.map(g => if (g < this.shared) g else -1)
-		kept.links = u.links
-		kept.from = u.from
-		kept.relr = u.relr
-		return kept
-	}
-
 	/// Sets the bytes of b at at by the rule of kind, v being S + A, or G + A for a slot's, and p their address: data
 	/// itself, an instruction by the machine. False if v is out of reach.
 	private apply(b: u8[], at: i32, kind: u8, v: u64, p: u64): bool {
@@ -1535,19 +1511,20 @@ export class Linker {
 		}
 		const u = this.units[k]
 		const o = u.object
-		u.links = new Bytes()
-		u.from = 0
+		const b = new u8[](16 * o.symbols.length)
 		for (const j of 0 ... o.symbols.length - 1) {
 			const s = o.symbols[j]
 			if (u.names[j] >= 0) {
 				const defines = s.section >= 0 && u.at[s.section] != dropped
 				const n = this.entry(u.names[j])
-				u.links.put(16 * (j as u64), n.chain, 8)
-				u.links.put(16 * (j as u64) + 8, if (defines) (s.section as u64) << 32 | s.value else 0, 8)
+				put(b, 16 * j, n.chain, 8)
+				put(b, 16 * j + 8, if (defines) (s.section as u64) << 32 | s.value else 0, 8)
 				n.chain = ((k + 1) as u64) << 32 | (j as u64) | (if (defines) defining else 0)
 					| (if (s.binding == Global) strong else 0)
 			}
 		}
+		u.links = new Bytes(fromBytes(b))
+		u.from = 0
 	}
 
 	/// The chain of n: per symbol with its name of the units linked, the latest first, (k + 1) << 32 | j of symbol j of

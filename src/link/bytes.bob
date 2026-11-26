@@ -65,12 +65,12 @@ export class Bytes {
 
 	/// Whether the bytes at at, on one page, are s already.
 	private holds(at: u64, s: string): bool {
-		const page = if (this.written(at)) this.pages[(at >> 12) as i32] else none
-		const n = this.file.length as u64
+		if (!this.written(at)) {
+			return this.under(at, at + (s.length as u64)) == s
+		}
+		const page = this.pages[(at >> 12) as i32]
 		for (const i of 0 ... s.length - 1) {
-			const a = at + (i as u64)
-			const b = if (page.length > 0) page[(a & 0xfff) as i32] else if (a < n) this.file[a as i32] else 0
-			if (b != s[i]) {
+			if (page[((at & 0xfff) as i32) + i] != s[i]) {
 				return false
 			}
 		}
