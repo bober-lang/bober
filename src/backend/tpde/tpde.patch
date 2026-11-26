@@ -80,7 +80,7 @@ index fe9d002..2d1b61c 100644
          if (dst.has_assignment()) {
            dst.lock(this);
 diff --git a/tpde/include/tpde/arm64/CompilerA64.hpp b/tpde/include/tpde/arm64/CompilerA64.hpp
-index 4de1bc9..aad0f3b 100644
+index 4de1bc9..e9831e7 100644
 --- a/tpde/include/tpde/arm64/CompilerA64.hpp
 +++ b/tpde/include/tpde/arm64/CompilerA64.hpp
 @@ -161,10 +161,10 @@
@@ -131,6 +131,28 @@ index 4de1bc9..aad0f3b 100644
          nsaa = util::align_up(nsaa, size);
          arg.stack_off = nsaa;
          nsaa += size;
+@@ -1056,9 +1063,9 @@
+           template <typename, typename, typename> typename BaseTy,
+           typename Config>
+ void CompilerA64<Adaptor, Derived, BaseTy, Config>::gen_func_epilog() {
+-  // Patched at the end, just reserve the space here.
+-  func_ret_offs.push_back(this->text_writer.offset());
++  // Patched at the end, just reserve the space here; after ensure_space, which may insert a veneer here.
+   this->text_writer.ensure_space(4); // Single branch to actual epilogue.
++  func_ret_offs.push_back(this->text_writer.offset());
+   this->text_writer.cur_ptr() += 4;
+ }
+ 
+@@ -1612,7 +1619,8 @@
+ void CompilerA64<Adaptor, Derived, BaseTy, Config>::generate_raw_jump(
+     Jump jmp, Label target_label) {
+   const auto is_pending = this->text_writer.label_is_pending(target_label);
+-  this->text_writer.ensure_space(4);
++  // The most of any jump, before offsets are taken: a veneer ensure_space inserts would move them.
++  this->text_writer.ensure_space(2 * 4);
+   if (jmp.kind == Jump::jmp) {
+     if (is_pending) {
+       ASMNC(B, 0);
 diff --git a/tpde/include/tpde/util/SmallVector.hpp b/tpde/include/tpde/util/SmallVector.hpp
 index 6976ba9..3d620d7 100644
 --- a/tpde/include/tpde/util/SmallVector.hpp
