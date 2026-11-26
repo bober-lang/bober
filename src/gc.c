@@ -476,8 +476,9 @@ static void **spilled(struct Call *c, void **fp, const Location *l) {
 /// Traces the refs each frame of a stack holds across its call, each derived one moved with its base, a vector of them,
 /// as the SLP vectorizer makes, by each 8 bytes. From the frame of frame pointer fp, each frame's caller's is where its
 /// own points, with the return address into it after, up to the program's entry or a fiber's first frame, whose
-/// caller's is 0.
+/// caller's is 0. The first indexes the stack maps, which a program that collects only to freeze never reads.
 static void frames(void **fp) {
+  pthread_once(&indexed, records);
   for (; fp && fp != h_.bottom; fp = *fp) {
     struct Call *c = call((uintptr_t)fp[1]);
     const Record *r = c->r;
@@ -501,7 +502,6 @@ static void frames(void **fp) {
 /// collection, and bober:gc_end with those old.
 static void collect(bool freezing) {
   PROBE(gc_start, h_.young);
-  pthread_once(&indexed, records);
   h_.minor = !freezing && h_.olds <= h_.major;
   memset(h_.bumped, 0, sizeof h_.bumped);
   for (const Root *g = bober_roots; !frozen_top && g < bober_roots_end; g++)
