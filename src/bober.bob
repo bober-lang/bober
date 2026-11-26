@@ -1203,7 +1203,6 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	}
 	const cxxs: string[] = if (cxx) [`${lib}/libc++.a`, `${lib}/libc++abi.a`] else []
 	const archives: string[] = []
-	let added = false // an archive the image did not look in
 	for (const f of if (c.release) []
 		else [...files, ...(if (mac) [] else [...cxxs, `${lib}/libunwind.a`, `${lib}/libclang_rt.builtins.a`])]) {
 		if (!endsWith(f, ".a")) {
@@ -1219,12 +1218,11 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		const info = stat(f)
 		const name = `${f}@${info.modified}.${info.size}`
 		parts.push(name)
-		if (l.holds(f).some(h => h != name)) {
-			return image(p, mains, files, cxx, pin, o, c, true)
-		}
 		if (!has(name)) {
+			if (old != null) {
+				return image(p, mains, files, cxx, pin, o, c, true) // the continued image did not look in it
+			}
 			l.add(new Object(name, machine.arch))
-			added = true
 		}
 		archives.push(f)
 	}
@@ -1242,21 +1240,16 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	const changed = l.changed()
 	let at = out // where the image is written
 	if (changed) {
-		// The archives' members, listed once a name is looked for in them that the image did not look for; at once if an
-		// archive is new to it.
-		const list = () => {
+		// The archives' members, listed once a name is looked for in them that the image did not look for.
+		l.lazily(() => {
+			const all: [string[], () => Object throws CompileError][] = []
 			for (const f of archives) {
-				const bytes = mapFile(f)
-				for (const [member, b, names] of members(f, bytes)) {
-					l.lazy(if (mac) names.map(named) else names, () => format.read(member, b))
+				for (const [member, b, names] of members(f, mapFile(f))) {
+					all.push([if (mac) names.map(named) else names, () => format.read(member, b)])
 				}
 			}
-		}
-		if (added) {
-			list()
-		} else {
-			l.lazily(list)
-		}
+			return all
+		})
 		try {
 			const linked = l.link()
 			stamped(linked.bytes, format.headers)

@@ -211,12 +211,8 @@ export class Linker {
 	private machine: Machine
 	private format: Format
 	private units: Unit[] = []
-	private lazies: (() => Object throws CompileError)[] = []
-	private taken: bool[] = []
-	/// Per name a lazy object defines, the first that does.
-	private members = new HashMap[string, i32]()
-	/// What lists the lazy objects, until called.
-	private listed: () => void throws CompileError = () => {}
+	/// What is given the names wanted and the units gone (supply).
+	private supplier: (names: string[], gone: string[]) => void throws CompileError = (names, gone) => {}
 	private libraries: string[] = []
 	/// Per name a library defines, the first that does.
 	private imports = new HashMap[string, i32]()
@@ -237,7 +233,7 @@ export class Linker {
 	private entries: u64 = 0
 	private seed: u64 = 0
 	private broken = false
-	/// The names wanted, in the order first wanted, for which lazy objects are looked for.
+	/// The names wanted, in the order first wanted, which the supplier is given.
 	private wanted: i32[] = []
 	/// Per group, the unit whose sections of it are taken.
 	private groups = new HashMap[string, i32]()
@@ -364,21 +360,43 @@ export class Linker {
 		}
 	}
 
-	/// Links the object read returns if it defines one of names, which the linked ones name and none of them defines,
-	/// as an archive's member is; read is called only then.
-	lazy(names: string[], read: () => Object throws CompileError) {
-		for (const name of names) {
-			if (!this.members.has(name)) {
-				this.members.set(name, this.lazies.length)
-			}
+	/// Has f, after those given before, add objects for the names the units want that none defines, but those the
+	/// continued image's units name, which a link before looked for; once there are none, f is given by name the units
+	/// the continued image held that name what none defines, unlinked now. Again until neither is left.
+	supply(f: (names: string[], gone: string[]) => void throws CompileError) {
+		const before = this.supplier
+		this.supplier = (names, gone) => {
+			before(names, gone)
+			f(names, gone)
 		}
-		this.lazies.push(read)
-		this.taken.push(false)
 	}
 
-	/// Calls list, which gives the lazy objects, only once a name not defined is looked for that no object a continued
-	/// image holds names: one that one names an earlier link looked for in them, so they define none still undefined.
-	lazily(list: () => void throws CompileError) { this.listed = list }
+	/// Links for good, as an archive's members are, of the objects list gives, each the names it defines and how to read
+	/// it, those first to define a name wanted, each once; list is called once a name is wanted.
+	lazily(list: () => [string[], () => Object throws CompileError][] throws CompileError) {
+		let members: [string[], () => Object throws CompileError][] | null = null
+		const first = new HashMap[string, i32]() // -1 once taken
+		this.supply((names, gone) => {
+			if (members == null && names.length > 0) {
+				members = list()
+				for (const m of 0 ... members!.length - 1) {
+					for (const name of members![m][0].filter(name => !first.has(name))) {
+						first.set(name, m)
+					}
+				}
+			}
+			for (const name of names) {
+				const m = first.get(name) ?? -1
+				if (m >= 0) {
+					const [defined, read] = members![m]
+					for (const n of defined) {
+						first.set(n, -1)
+					}
+					this.units.push(new Unit(read(), this.keep))
+				}
+			}
+		})
+	}
 
 	/// A shared library the image is loaded with, and the symbols it defines.
 	library(name: string, symbols: string[]) {
@@ -567,29 +585,28 @@ export class Linker {
 		return image
 	}
 
-	/// Resolves the names: the objects given before any lazy one, and each lazy one linked before the next is looked
-	/// for. The objects the continued image holds that name what no one defines are unlinked, and the names they
-	/// defined defined anew.
+	/// Resolves the names of the units, and of those the supplier adds. The units the continued image holds that name
+	/// what none defines are unlinked, and the names they defined defined anew.
 	private resolve() throws CompileError {
 		let k = this.loaded
 		let w = 0
 		while (true) {
-			while (k < this.units.length || w < this.wanted.length) {
-				if (k < this.units.length) {
-					this.define(k)
-					k++
-				} else {
-					this.pull(this.names[this.wanted[w]]!)
-					w++
-				}
+			while (k < this.units.length) {
+				this.define(k)
+				k++
 			}
-			const gone = this.settle()
-			if (gone.length == 0) {
+			const names = this.wanted.slice(w, this.wanted.length).map(g => this.names[g]!).filter(n => n.unit < 0
+				&& this.first(n, l => l & (defining | strong) == strong && this.unit(l) < this.loaded) == 0)
+			w = this.wanted.length
+			const gone = if (names.length > 0) [] as i32[] else this.settle()
+			if (names.length == 0 && gone.length == 0) {
 				return
 			}
+			const lost = gone.map(k => this.units[k].object.name)
 			for (const k of gone) {
 				this.unlink(k)
 			}
+			this.supplier(names.map(n => n.name), lost)
 		}
 	}
 
@@ -681,20 +698,6 @@ export class Linker {
 				n.namer = k
 				this.wanted.push(g)
 			}
-		}
-	}
-
-	/// Links the lazy object that defines n, if one does and n is still not defined.
-	private pull(n: Name) throws CompileError {
-		if (n.unit < 0 && this.first(n, l => l & (defining | strong) == strong && this.unit(l) < this.loaded) == 0) {
-			const list = this.listed
-			this.listed = () => {}
-			list()
-		}
-		const m = this.members.get(n.name) ?? -1
-		if (n.unit < 0 && m >= 0 && !this.taken[m]) {
-			this.taken[m] = true
-			this.units.push(new Unit(this.lazies[m](), this.keep))
 		}
 	}
 

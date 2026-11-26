@@ -88,14 +88,17 @@ function link(objects: Object[], names: string[], lazy: Object[] = [], bindsAnyw
 	for (const o of objects) {
 		l.add(o)
 	}
-	for (const o of lazy) {
-		l.lazy(o.symbols.filter(s => s.binding != Local && s.section >= 0).map(s => s.name), () => o)
-	}
+	l.lazily(() => lazy.map(member))
 	l.library("libc.so", ["puts", "environ"])
 	for (const name of names) {
 		l.export(name)
 	}
 	return l.link()
+}
+
+/// o as an archive's member, listed for the names it defines.
+function member(o: Object): [string[], () => Object throws CompileError] {
+	return [o.symbols.filter(s => s.binding != Local && s.section >= 0).map(s => s.name), () => o]
 }
 
 /// The address the image exports name at.
@@ -148,9 +151,7 @@ test "a lazy object is linked when a linked one wants what it defines, and only 
 	const g = obj("g.o", Code, [0xd65f03c0], [new Symbol("g", Global, 0)])
 	const h = obj("h.o", Code, [0xd65f03c0], [new Symbol("h", Global, 0)])
 	const l = kept()
-	for (const o of [h, g, f]) {
-		l.lazy(o.symbols.filter(s => s.section >= 0).map(s => s.name), () => o)
-	}
+	l.lazily(() => [h, g, f].map(member))
 	const image = keep(l, [main], ["f", "g"])
 	assert image.symbols.map(s => s[0].map(s => s.name).join(" ")).join(" ") == "f g"
 	assert get(image, at(image, "f")) == 0x94000000 | (at(image, "g") - at(image, "f")) >> 2
@@ -160,12 +161,10 @@ test "a lazy object is read only once a linked one wants a name it is listed for
 	const l = linker()
 	l.add(obj("main", Code, [0x94000000], [new Symbol("f", Global)], [new Fixup(0, Call, 0, 0)]))
 	const read: string[] = []
-	for (const name of ["g", "f"]) {
-		l.lazy([name], () => {
-			read.push(name)
-			return obj(name, Code, [0xd65f03c0], [new Symbol(name, Global, 0)])
-		})
-	}
+	l.lazily(() => ["g", "f"].map(name => [[name], () => {
+		read.push(name)
+		return obj(name, Code, [0xd65f03c0], [new Symbol(name, Global, 0)])
+	}]))
 	l.link()
 	assert read.join(" ") == "f"
 }
@@ -177,7 +176,7 @@ test "a continued image lists the lazy objects only once a name is looked for in
 	let listed = 0
 	const list = (l: Linker) => l.lazily(() => {
 		listed++
-		l.lazy(["f"], () => obj("f.o", Code, [0xd65f03c0], [new Symbol("f", Global, 0)]))
+		return [member(obj("f.o", Code, [0xd65f03c0], [new Symbol("f", Global, 0)]))]
 	})
 	const l = kept(first)
 	list(l)
@@ -407,7 +406,7 @@ test "a pointer a kept image's frozen unit has set for good is rebased once" {
 		obj("z", Data, [0, 0], [new Symbol("__start_set", Global), new Symbol("lz", Global, 0)],
 		[new Fixup(0, Abs64, 0, 0)]))
 	const l = kept()
-	l.lazy(["lz"], () => z)
+	l.lazily(() => [member(z)])
 	const first = keep(l, [v])
 	const second = file(keep(kept(file(first)), []))
 	assert first.rebases.length == 2 && keep(kept(second), []).rebases.length == 2
@@ -450,7 +449,7 @@ test "a kept image holds a lazy object for good, and a definition over its weak 
 	const a = obj("a", Code, [0x94000000], [new Symbol("lz", Global)], [new Fixup(0, Call, 0, 0)])
 	const z = obj("z", Code, [0xd65f03c0], [new Symbol("lz", Global, 0), new Symbol("w", Weak, 0)])
 	const l = kept()
-	l.lazy(["lz", "w"], () => z)
+	l.lazily(() => [member(z)])
 	const first = file(keep(l, [a]))
 	assert kept(first).objects().join(" ") == "a"
 	assert keep(kept(first),
@@ -462,10 +461,10 @@ test "the sections a kept image has for good are not one where another object's 
 		x: string) => obj(name, Data, [0, 0], [new Symbol(x, Global)], [new Fixup(0, Abs64, 0, 0)])
 	const has = (name: string, x: string) => named("f", obj(name, Data, [1], [new Symbol(x, Global, 0)]))
 	const l = kept()
-	l.lazy(["x"], () => has("zx", "x"))
+	l.lazily(() => [member(has("zx", "x"))])
 	const first = file(keep(l, [wants("a", "x")]))
 	const m = kept(first)
-	m.lazy(["y"], () => has("zy", "y"))
+	m.lazily(() => [member(has("zy", "y"))])
 	const second = file(keep(m, [wants("b", "y")]))
 	assert keep(kept(second), []).sections.filter(s => s[0] == "f").length == 2
 }
@@ -541,7 +540,7 @@ test "a kept image's units keep their records and symbols where they are, and on
 test "an object a continued image links, a lazy one too, with a section the image has for good is stale" {
 	const first = file(keep(kept(), [obj("a", Code, [0xd65f03c0], [])]))
 	const l = kept(first)
-	l.lazy(["lz"], () => obj("z", Init, [0, 0], [new Symbol("lz", Global, 0)]))
+	l.lazily(() => [member(obj("z", Init, [0, 0], [new Symbol("lz", Global, 0)]))])
 	assert keep(l, [obj("b", Data, [0, 0], [new Symbol("lz", Global)], [new Fixup(0, Abs64, 0, 0)])]) throws new Stale("z has sections the image has for good")
 }
 
@@ -586,7 +585,7 @@ test "a kept image whose record of a unit is cut short is stale once it is read"
 
 test "a kept image whose frozen unit's record has its tail flipped is stale once its local symbols are read" {
 	const l = kept()
-	l.lazy(["lz"], () => obj("z", Code, [0xd65f03c0], [new Symbol("lz", Global, 0), new Symbol("here", Local, 0)]))
+	l.lazily(() => [member(obj("z", Code, [0xd65f03c0], [new Symbol("lz", Global, 0), new Symbol("here", Local, 0)]))])
 	const first = keep(l, [obj("a", Code, [0x94000000], [new Symbol("lz", Global)], [new Fixup(0, Call, 0, 0)])])
 	// The record's last byte, of the local's name, then one of the 126th, which the table has not.
 	const [at, size] = read(first.bytes, 0x200, "arm64")!.units[0][3][0]
@@ -640,12 +639,11 @@ test "a frozen unit's call too far for a local symbol reaches it through a venee
 	helper.size = 4
 	z.sections.push(helper)
 	const l = kept()
-	for (const name of ["a", "b", "c"]) {
+	l.lazily(() => [...["a", "b", "c"].map(name => {
 		const o = far(name)
 		o.symbols = [new Symbol(name, Global, 0)]
-		l.lazy([name], () => o)
-	}
-	l.lazy(["lz"], () => z)
+		return member(o)
+	}), member(z)])
 	const first = keep(l, [obj("main", Code, [0x94000000], [new Symbol("lz", Global)], [new Fixup(0, Call, 0, 0)])],
 		["lz"])
 	const [from, to] = [at(first, "lz"), section(first, "text.z")]
@@ -699,8 +697,9 @@ function made(name: string): Object {
 	return version(decimal(iv[0]) as u64, decimal(iv[1]) as u64)
 }
 
-/// The image l links of objects too, or if it is stale, one linked anew of those named; null if that is an error.
-function relinked(l: Linker, objects: Object[], names: string[]): Image | null throws Stale {
+/// The image l links of objects too, or if it is stale, one linked anew of those names names then; null if that is an
+/// error.
+function relinked(l: Linker, objects: Object[], names: () => string[]): Image | null throws Stale {
 	try {
 		return keep(l, objects)
 	} catch (e: CompileError | Stale) {
@@ -708,7 +707,7 @@ function relinked(l: Linker, objects: Object[], names: string[]): Image | null t
 			return null
 		}
 	}
-	return anew(names)
+	return anew(names())
 }
 
 /// The image linked anew of the objects named; null if it is an error.
@@ -755,6 +754,8 @@ test "a kept image continued, by objects added, removed and replaced, reaches wh
 	let cur = file(keep(kept(), [made("bounds")]))
 	const versions = new u64[](10)
 	let linked = 0
+	let remade = 0
+	let supplied = 0
 	for (const step of 1 ... 1000) {
 		const l = kept(cur)
 		let held = l.objects()
@@ -771,14 +772,33 @@ test "a kept image continued, by objects added, removed and replaced, reaches wh
 				added.push(version(i, versions[i]))
 			}
 		}
-		const names = [...held, ...added.map(o => o.name)]
+		// A new version of the objects that name what is no longer defined, and of those that define n<i> wanted.
+		const next = (i: u64) => {
+			versions[i]++
+			added.push(version(i, versions[i]))
+			l.add(added[added.length - 1])
+		}
+		l.supply((wanted, gone) => {
+			for (const name of gone) {
+				held = held.filter(h => h != name)
+				remade++
+				next(decimal(split(name.slice(1, name.length), ".")[0]) as u64)
+			}
+			for (const name of wanted.filter(n => startsWith(n, "n"))) {
+				const i = decimal(name.slice(1, name.length)) as u64
+				if (![...held, ...added.map(o => o.name)].some(h => startsWith(h, `o${i}.`))) {
+					supplied++
+					next(i)
+				}
+			}
+		})
+		const names = () => [...held, ...added.map(o => o.name)]
 		const image = relinked(l, added, names)
 		if (image == null) {
 			// An error of the objects given, which a link anew of them has too.
-			assert anew(names) == null
+			assert anew(names()) == null
 			continue
 		}
-		// Of the objects it holds, those that name what is no longer defined unlinked.
 		cur = file(image!)
 		const objects = kept(cur).objects().map(made)
 		const versioned = objects.filter(o => o.name != "bounds")
@@ -791,7 +811,7 @@ test "a kept image continued, by objects added, removed and replaced, reaches wh
 		assert was == now && first == words && second == words
 		linked++
 	}
-	assert linked > 600
+	assert linked > 600 && remade > 0 && supplied > 0
 }
 
 test "a kept image's sections a name bounds once laid out are stale, and a run has those added once nothing bounds them" {
@@ -825,4 +845,38 @@ test "a kept image whose entry of a name, or link of its chain, is broken is sta
 	const l = kept(file(first))
 	l.remove("a")
 	assert keep(l, []) throws new Stale("a chain of names is broken")
+}
+
+test "the supplier is given the names wanted, then the units that name what is no longer defined, and links what it adds" {
+	const calls = (name: string,
+		x: string) => obj(name, Code, [0x94000000], [new Symbol(x, Global)], [new Fixup(0, Call, 0, 0)])
+	const defines = (name: string, x: string) => obj(name, Code, [0xd65f03c0], [new Symbol(x, Global, 0)])
+	const first = file(keep(kept(), [defines("m", "m.1"), calls("a", "m.1"), calls("b", "m.1"), calls("c", "puts")]))
+	const l = kept(first)
+	l.remove("m")
+	const given: string[] = []
+	l.supply((names, gone) => {
+		given.push(`${names.join(" ")}|${gone.join(" ")}`)
+		for (const name of gone) {
+			l.add(calls(name, "m.2"))
+		}
+		for (const name of names) {
+			l.add(defines(`${name}.o`, name))
+		}
+	})
+	const image = keep(l, [defines("m", "m.2"), calls("d", "f")], ["m.2"])
+	assert given == ["f|", "|b a"] && kept(file(image)).objects().join(" ") == "c m d f.o b a"
+}
+
+test "a continued image whose units lose a name they need does not list the lazy objects for it" {
+	const a = obj("a", Code, [0x94000000], [new Symbol("x", Global)], [new Fixup(0, Call, 0, 0)])
+	const l = kept(file(keep(kept(), [obj("m", Code, [0xd65f03c0], [new Symbol("x", Global, 0)]), a])))
+	l.remove("m")
+	let listed = 0
+	l.lazily(() => {
+		listed++
+		return []
+	})
+	const image = keep(l, [])
+	assert listed == 0 && kept(file(image)).objects().length == 0
 }
