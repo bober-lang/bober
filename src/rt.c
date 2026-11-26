@@ -454,18 +454,17 @@ static bool helped(void) {
 }
 
 /// A test running in a process of its own: its name, source and function, whether it runs alone, the files its output
-/// and its result go to, and its entry of the report once it exited.
+/// and its result go to, and its entry of the report and the files it read once it exited.
 typedef struct {
   pid_t pid;
   const char *name, *file;
   void (*f)(void);
   bool alone;
   FILE *out, *res;
-  Level entry;
+  Level entry, reads;
 } Child;
 static Child *children;
 static int nchildren, running;
-static Level reads;  // of the tests that ran, the files each read, by name, or null if it may depend on more
 
 /// Forks c's test from this process as its module initialized it, so that it sees that state and none of another test,
 /// in a directory of its own if tmp. The child writes its entry of the report, then a line of whether it is tainted, or
@@ -520,14 +519,14 @@ static bool reap(int i, bool wait) {
     return true;
   }
   if (nl && nl + 1 < r + n && WIFEXITED(status)) {
-    add(&c->entry, r, nl - r, false), key(&reads, c->name), paths(&reads, nl + 2, r + n - nl - 2, nl[1] == '1');
+    add(&c->entry, r, nl - r, false), paths(&c->reads, nl + 2, r + n - nl - 2, nl[1] == '1');
     all.failed |= WEXITSTATUS(status) != 0;
   } else {
     char how[32];
     snprintf(how, sizeof how, WIFEXITED(status) ? "exit %d" : "signal %d",
              WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status));
     key(&c->entry, c->name), raw(&c->entry, "\""), tail(&c->entry, fileno(c->out), 0);
-    raw(&c->entry, how), raw(&c->entry, "\""), key(&reads, c->name), raw(&reads, "null"), all.failed = true, give();
+    raw(&c->entry, how), raw(&c->entry, "\""), raw(&c->reads, "null"), all.failed = true, give();
   }
   free(r), fclose(c->out), fclose(c->res), c->pid = 0, running--;
   return true;
@@ -559,9 +558,12 @@ void bober_mark(int32_t at) { testAt = at; }
 /// read, a JSON object of arrays, each null if it did what else its result may depend on (src/io.c), and a line of
 /// those the module's initialization read, which each depends on too; whether one failed.
 int32_t bober_tested(void) {
+  Level reads = {0};
   for (int i = 0; i < nchildren; i++) {
     while (children[i].pid) reap(i, true);
     raw(&all, i ? "," : ""), add(&all, children[i].entry.kids, children[i].entry.n, false);
+    Level *r = &children[i].reads;
+    if (r->n) key(&reads, children[i].name), add(&reads, r->kids, r->n, false);
   }
   Level init = {0};
   paths(&init, bober_reads, bober_nreads, false);
