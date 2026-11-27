@@ -15,7 +15,7 @@ import { Bytes } from "./link/bytes"
 import { Linker } from "./link/link"
 import { Object } from "./link/object"
 import { CLib, dir } from "./pkg"
-import { root } from "./root"
+import { builtinPath, root } from "./root"
 import { getcwd } from "unistd.h"
 
 /// Where the running test builds, a directory of its own, by the number of its TMPDIR, that tests running at once do not
@@ -1393,6 +1393,20 @@ function main() {\n\tconst h = new H()\n\tconst o = make()\n${set}\th.t = o\n\tp
 	built([["lib.bob", lib], ["rg.bob", rg], ["main.bob", main("")]], "-O1")
 	const grown = remade([["main.bob", main("\to.f = new A()\n")]])
 	assert grown == "5\nlib.bob main.bob rg.bob"
+}
+
+test "builtin/'s modules, as the image holds their files, are linked from those, not checked again" {
+	const main = (k: i32) => `function main() { print(\`\${[${k}].length}\`) }\n`
+	anew()
+	built([["main.bob", main(1)]], "-O1")
+	const names: string[] = []
+	checking = path => names.push(path)
+	try {
+		built([["main.bob", main(2)]], "-O1")
+	} finally {
+		checking = path => {}
+	}
+	assert !names.includes(builtinPath("array"))
 }
 
 test "an object's unit is named by its file's time and size, which a link reads it for only when they change" {
