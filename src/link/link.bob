@@ -142,12 +142,17 @@ const Symbols: u8 = 8
 /// The sections of each segment, by kind, in order; and of a kept image's, where the Zero ones are a segment of their
 /// own, as each before the last has room after it: addresses no file holds, for what later links add; and the Unwind
 /// ones the first, with the headers, where Mach-O's unwinder reads them one after another. An image with a full region
-/// is linked anew. Last, two regions no loader maps: of the Kept sections and what a kept image keeps (save), and of
-/// the symbol table's entries. A kept image's sections of a bound name are in a run of their region, of a 16th of its
-/// room, that they are laid out in as others in theirs, where its holes are zeros.
-const regions: u8[][] = [[Code], [Const, Unwind], [Data, Init, Thread, Zero], [Kept], [Symbols]]
-const keptRegions: u8[][] = [[Unwind], [Code], [Const], [Data, Init, Thread], [Zero], [Kept], [Symbols]]
+/// is linked anew. Last, two regions no loader maps: of the symbol table's entries, and of the Kept sections and what a
+/// kept image keeps (save), whose room, the most, is past the file's end. A kept image's sections of a bound name are
+/// in a run of their region, of a 16th of its room, that they are laid out in as others in theirs, where its holes are
+/// zeros.
+const regions: u8[][] = [[Code], [Const, Unwind], [Data, Init, Thread, Zero], [Symbols], [Kept]]
+const keptRegions: u8[][] = [[Unwind], [Code], [Const], [Data, Init, Thread], [Zero], [Symbols], [Kept]]
+/// Of a region's room; of the symbol table's, which has the head too, of some 7 MiB of entries and 1 of head measured;
+/// and of the Kept region's. An image's bytes stay below 2 GiB.
 const room: u64 = 1 << 28
+const tableRoom: u64 = 1 << 26
+const keptRoom: u64 = 1 << 30
 /// The name of a kept image's run of its Const region of its rebases of words, as RELR, which no section's can be; the
 /// holes in it are entries of no rebase.
 const rebasing = ".relr"
@@ -609,12 +614,15 @@ export class Linker {
 				sort(image.rebases)
 			}
 		}
-		const [kept, table] = [this.state.regions[this.regions.length - 2], this.state.regions[this.regions.length - 1]]
+		const [table, kept] = [this.state.regions[this.regions.length - 2], this.state.regions[this.regions.length - 1]]
 		image.symtab = [table.start, table.top]
-		// The names end at the top, where a head it moved up from may have left a byte.
+		// The names end at the top, where a link before may have left a byte.
 		image.bytes.set(kept.top, "\x00")
 		image.strtab = [kept.start, kept.top + 1]
-		image.bytes.length = max(image.bytes.length, table.top)
+		image.bytes.length = max(image.bytes.length, kept.top + 1)
+		if (image.bytes.length >= 1 << 31) {
+			throw new CompileError(`the image would be ${image.bytes.length} bytes, 2 GiB or more`)
+		}
 		return image
 	}
 
@@ -1029,7 +1037,8 @@ export class Linker {
 				}
 			}
 			if (fresh) {
-				region.cap = alignUp(region.top, image.page) + (if (this.keep) room else 0)
+				const of = if (regions[r][0] == Symbols) tableRoom else if (regions[r][0] == Kept) keptRoom else room
+				region.cap = alignUp(region.top, image.page) + (if (this.keep) of else 0)
 			}
 			if (region.top > region.start) {
 				if (regions[r][0] < Kept) {
@@ -1346,9 +1355,9 @@ export class Linker {
 	/// Keeps in the image what a later link continues it from: its units, the frozen ones as one, each with blocks of
 	/// its own where no loader maps, made once: of its record, of the fixups a later link sets again, its symbols'
 	/// links and their names in the Kept sections' region, and of their entries in the symbol table's, which the format
-	/// writes; the names' entries; and exports. The head, of all but the records, is at the end of the Kept region's
-	/// room, where most of it is as the file has it, and the 16 bytes after the headers say where; 8 more are left for
-	/// who stores the image to stamp it (stamped).
+	/// writes; the names' entries; and exports. The head, of all but the records, is at the end of the symbol table's
+	/// region's room, where most of it is as the file has it, and the 16 bytes after the headers say where; 8 more are
+	/// left for who stores the image to stamp it (stamped).
 	private save(image: Image, exports: string[]) throws CompileError {
 		const s = this.state
 		this.freeze()
@@ -1360,7 +1369,7 @@ export class Linker {
 				ks.push(k)
 			}
 		}
-		const [kept, table] = [s.regions[s.regions.length - 2], s.regions[s.regions.length - 1]]
+		const [table, kept] = [s.regions[s.regions.length - 2], s.regions[s.regions.length - 1]]
 		// The names made, in one block, each as the symbol table has it.
 		const made = this.touched.filter(g => g < this.shared && this.names[g]!.was == null).map(g => this.names[g]!)
 		let name = this.block(kept, made.map(n => `_${n.name}\x00`).join(""), "names")[0]
@@ -1488,8 +1497,8 @@ export class Linker {
 		s.inits = image.inits
 		s.thread = image.thread
 		const head = write(s, this.machine.arch)
-		const at = kept.cap - alignUp(head.length as u64, image.page)
-		if (at <= kept.top) {
+		const at = table.cap - alignUp(head.length as u64, image.page)
+		if (at <= table.top) {
 			throw new CompileError("there is no room for what the image keeps")
 		}
 		image.bytes.set(at, head)

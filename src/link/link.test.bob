@@ -1,6 +1,6 @@
 //! Tests of src/link: hand-made Objects linked, and arm64's and x86-64's fixups on known instructions.
 
-import { indexOf, sort, startsWith } from "../../std/algo"
+import { endsWith, indexOf, sort, startsWith } from "../../std/algo"
 import { makeTempDir, open, removeAll } from "../../std/fs"
 import { fnv } from "../../std/hash"
 import { File } from "../../std/io"
@@ -1126,4 +1126,16 @@ test "a supplied unit stays while a name it defines is named so that it must be,
 	const image = keep(again, [])
 	const held = kept(file(image)).objects().join(" ")
 	assert held == "s2 s3 s4 w q"
+}
+
+test "a kept image whose bytes would be 2 GiB or more is not made" {
+	const o = obj("big", Const, [], [new Symbol("big", Global, 0)])
+	o.sections[0].size = 1 << 31
+	let error = ""
+	try {
+		keep(kept(), [o])
+	} catch (e: CompileError) {
+		error = e.msg
+	}
+	assert startsWith(error, "the image would be ") && endsWith(error, " bytes, 2 GiB or more")
 }

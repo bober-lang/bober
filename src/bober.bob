@@ -1491,6 +1491,13 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			left = stamp(linked.bytes, format.headers)
 			format.write(linked)
 			const continued = linked.bytes == kept
+			if (linked.bytes.length >= 1 << 31) { // with what the format added after the regions
+				const msg = `${out} would be ${linked.bytes.length} bytes, 2 GiB or more`
+				if (continued) {
+					throw new Stale(msg)
+				}
+				throw new CompileError(msg)
+			}
 			at = if (continued && alone) out else tmp
 			const f = if (at == out) old! else if (continued) old!.copy(tmp, linked.bytes.length) else open(tmp, "w")
 			store(f, linked.bytes)
