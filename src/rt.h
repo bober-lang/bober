@@ -42,6 +42,9 @@ void *bober_alloc(int64_t n, const bober_layout *l);
 /// Collects now if allocating n more bytes would, n the sizes of the allocations that follow, each rounded up to 16:
 /// before any other call that may collect, those then do not, so that refs held across them stay.
 void bober_reserve(int64_t n);
+/// Counts n bytes less as allocated: of a buffer made next, those that bober_io_map maps a file's over, less what
+/// lets mapping many collect before the heap's addresses run out.
+void bober_unallocated(int64_t n);
 /// n new zero bytes for a string's buffer, in pages of their own, by which a value crossing isolates has its strings
 /// copied.
 void *bober_strbuf(int64_t n);

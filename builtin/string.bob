@@ -5,7 +5,7 @@
 
 import { elements } from "./array"
 import { Ref, addr, deref, get, load, memcmp, memcpy, set, store, strbuf, trap } from "./mem"
-import { BOBER_PAGE, bober_io_map } from "../src/rt.h"
+import { BOBER_PAGE, bober_io_map, bober_unallocated } from "../src/rt.h"
 
 /// The methods of a string, which is this.
 ///
@@ -227,6 +227,7 @@ function full(n: i64): Ref {
 /// failure of mapping them, < 0.
 export function mapped(fd: i32, n: i64): string | i64 {
 	const at = BOBER_PAGE
+	bober_unallocated(n - n / 1024) // the file's bytes take the heap's addresses, but none of its memory
 	const buf = full(at - 16 + n)
 	const r = bober_io_map(fd, deref(buf) + (at as u64), n as u64)
 	return if (r < 0) r else shared(buf, at as u64, n)

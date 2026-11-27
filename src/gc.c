@@ -654,6 +654,9 @@ void bober_reserve(int64_t n) {
   h_.reserved = h_.young + n;
 }
 
+/// Counts n bytes less as allocated (src/rt.h), lest mapping a large file collect.
+void bober_unallocated(int64_t n) { h_.young -= n; }
+
 /// Bumps through the young page of class c of the size, which no page yet is before the first allocation.
 static inline void *bump(int64_t n, int c, const bober_layout *l) {
   int64_t size = (n + 15) & ~15;
