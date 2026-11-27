@@ -1468,6 +1468,7 @@ void *bober_malloc(uint64_t n) { return malloc(n ? n : 1); }
 void bober_free(void *p) { free(p); }
 const char *bober_arg(int32_t i) { return i < argc_ ? argv_[i] : 0; }
 long bober_entropy(unsigned char *p, long n) { return memset(p, 0, n), 0; }
+void bober_reserve(int64_t n) {}
 
 static Val bi_fromC(Val self, Val *a, int n, Node *site) {
   char *p = n ? (char *)(intptr_t)a[0].i : 0;
