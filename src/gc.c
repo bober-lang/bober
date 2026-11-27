@@ -220,11 +220,26 @@ static uint32_t take(int n, int kind) {
   return h_.owned = p;
 }
 
-/// Frees n pages from p, zeroing them and their bits: several by mapping them anew (src/rt.h). The caller takes them
-/// off its isolate's.
+#ifndef MADV_HUGEPAGE  // macOS, which pages the heap as it will
+#define MADV_HUGEPAGE 0
+#define MADV_NOHUGEPAGE 0
+#endif
+
+/// How the heap is paged: of huge pages while 2 MiB or more are reserved, a fault per 2 MiB of them, not per 4 KiB;
+/// not once it collects, as of all a long run allocates it pays more than it gains; as the system will before (0).
+static int advice;
+
+static void advise(int a) {
+  if (a != advice) madvise(heap, bober_heap_size, advice = a);
+}
+
+/// Frees n pages from p, zeroing them and their bits: several by mapping them anew (src/rt.h), advised as the heap is,
+/// lest they be a mapping of their own. The caller takes them off its isolate's.
 static void release(uint32_t p, int n) {
-  if (n > 1) mmap(at(p), (int64_t)n * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED, -1, 0);
-  else memset(at(p), 0, PAGE);
+  if (n > 1) {
+    mmap(at(p), (int64_t)n * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED, -1, 0);
+    if (advice) madvise(at(p), (int64_t)n * PAGE, advice);
+  } else memset(at(p), 0, PAGE);
   memset(&refs[word(at(p)) / 64], 0, (int64_t)n * PAGE / 64);
   memset(&marks[cell(at(p)) / 64], 0, (int64_t)n * PAGE / 128);
   pthread_mutex_lock(&page_mu);
@@ -567,6 +582,7 @@ static void collect(bool freezing) {
   pthread_mutex_lock(&page_mu);
   allocated += h_.young, collections++, majors += !h_.minor;
   pthread_mutex_unlock(&page_mu);
+  if (advice) advise(MADV_NOHUGEPAGE);
   h_.young = h_.reserved = 0;
   PROBE(gc_end, h_.olds);
 }
@@ -658,6 +674,7 @@ void bober_reserve(int64_t n) {
   if (h_.young + n <= h_.reserved) return;  // within what was reserved before, as bober's first 256 MiB
   if (h_.young + n > every) collect(false);
   h_.reserved = h_.young + n;
+  if (n >= 2 << 20 && !collections) advise(MADV_HUGEPAGE);
 }
 
 /// Counts n bytes less as allocated (src/rt.h), lest mapping a large file collect.
