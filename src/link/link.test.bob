@@ -570,15 +570,6 @@ test "a kept image whose table of names is broken is stale" {
 	assert keep(kept(file(first)), [c]) throws new Stale("the table of names is broken")
 }
 
-test "a kept image whose table of names is full is stale" {
-	const first = file(keep(kept(), [obj("a", Data, [0], [new Symbol("g", Global, 0)])]))
-	const syms: Symbol[] = []
-	for (const i of 1 ... 600) {
-		syms.push(new Symbol(`g${i}`, Global, 0))
-	}
-	assert keep(kept(first), [obj("b", Data, [0], syms)]) throws new Stale("the table of names is full")
-}
-
 test "a kept image whose record of a unit is cut short is stale once it is read" {
 	const first = keep(kept(), [obj("a", Code, [0xd65f03c0], [new Symbol("f", Global, 0)])], ["f"])
 	// a's entry, of its record's block a byte shorter.
@@ -1166,4 +1157,20 @@ test "a continued image that freezes a lazy object each link keeps the frozen un
 	// Each link adds a name and a unit's record, not another of the frozen unit's, of some 9 KiB.
 	const last = top(image)
 	assert last - first < 1024
+}
+
+test "a continued image of more names than its table of names has room for grows the table, and continues it" {
+	const first = file(keep(kept(), [obj("a", Data, [0], [new Symbol("g", Global, 0)])]))
+	const syms: Symbol[] = []
+	for (const i of 1 ... 600) {
+		syms.push(new Symbol(`g${i}`, Global, 0))
+	}
+	const second = file(keep(kept(first), [obj("b", Data, [0], syms)]))
+	const c = obj("c", Data, [0, 0, 0, 0],
+		[new Symbol("g", Global), new Symbol("g600", Global), new Symbol("c", Global, 0)],
+		[new Fixup(0, Abs64, 0, 0), new Fixup(8, Abs64, 1, 0)])
+	const image = keep(kept(second), [c], ["c", "g", "g600"])
+	const [p, g, g600] = [at(image, "c"), at(image, "g"), at(image, "g600")]
+	const [x, y] = [get(image, p, 8), get(image, p + 8, 8)]
+	assert g != 0 && g600 != 0 && g != g600 && x == g && y == g600
 }

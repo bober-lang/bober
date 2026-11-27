@@ -244,8 +244,8 @@ export class Linker {
 	private touched: i32[] = []
 	/// The table of the shared names' indices by their hash of seed, slot by slot (slot); in the image's bytes where a
 	/// continued image has it, else in bytes of its own; and whether it is not as made, so that the image is linked anew.
-	/// A kept image's has room for as many names again as it was made with, and is linked anew once that is full,
-	/// which drops those no longer named. After it, the names' entries.
+	/// A kept image's is made anew, of more slots, once over half full; names no longer named stay until the image is
+	/// linked anew. After it, the names' entries.
 	private table = new Bytes()
 	private at: u64 = 0
 	private cap: u64 = 1024
@@ -1415,7 +1415,7 @@ export class Linker {
 			}
 		}
 		// The table of units, made anew once over half full, of room for 4 times as many: of the slots taken, and the
-		// entries as they were. Unlike that of names, also in a continued link, as each unit replaced takes an index.
+		// entries as they were.
 		const count = (this.units.length - 1) as u64
 		const [was, old, had] = s.units
 		if (2 * count > old) {
@@ -1461,17 +1461,19 @@ export class Linker {
 			}
 		}
 		s.grouped = s.grouped.filter(k => this.held(k).object.name != "")
-		// A table not in the image's bytes is one made anew, or grown, its entries with it.
+		// A table not in the image's bytes is one made anew, or grown, its entries with it, those the continued image has
+		// as they were.
 		if (this.table != this.bytes) {
-			if (this.loaded > 0) {
-				throw new CompileError("the table of names is full")
-			}
 			if (4 * (this.shared as u64) > this.cap) {
 				this.grow()
 			}
-			const b = this.table.slice(this.at, this.at + 12 * this.cap) + zeros((entry * this.cap / 2) as i32)
+			const [was, old, had] = s.names
+			const entries = this.bytes.slice(was + 12 * old, was + 12 * old + entry * had)
+			const b = this.table.slice(this.at, this.at + 12 * this.cap) + entries
+				+ zeros((entry * (this.cap / 2 - had)) as i32)
 			this.at = this.block(kept, b, "names")[0]
 			this.entries = this.at + 12 * this.cap
+			this.free(was, 12 * old + entry * old / 2)
 		}
 		// The entries of the names read or made.
 		for (const g of this.touched.filter(g => g < this.shared)) {
