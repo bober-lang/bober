@@ -1434,3 +1434,19 @@ test "an edited module reaching a kept module's class, method and var and a clas
 		assert made.filter(x => !all.includes(x)) == []
 	}
 }
+
+test "a program copying a generic class's instance of a module it does not import, read through an object type, links that one" {
+	const other = (set: string) => `class Holder[T] {\n\tf: (x: T) => T\n\n\tconstructor(f: (x: T) => T) { ${set} }\n}\n
+export function view(): { f: (x: i32) => i32 } { return new Holder[i32](x => x + 1) }\n`
+	const a = "function main() {\n\tconst p = { x: 1, f: (a: i32): i32 => a }\n\tconst r: { f: (a: i32) => i32 } = p\n\tprint(`${r.f(4)}`)\n}\n"
+	anew()
+	mkdirAll(`${home()}/apart`)
+	const first = built([["apart/bober.pkg", `{ "name": "@test/apart" }\n`], ["apart/other.bob", other("this.f = f")],
+		["apart/a.bob", a]], "-O1", "apart/a.bob")
+	const edited = remade([["apart/other.bob", other("const g = f\n\t\tthis.f = g")]], "-O1", "apart/a.bob")
+	const continued = units()
+	anew()
+	const again = built([], "-O1", "apart/a.bob")
+	assert [first, edited, again] == ["4\n", "4\na.bob other.bob", "4\n"]
+	assert units() == continued
+}
