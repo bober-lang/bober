@@ -364,9 +364,19 @@ export function unbundle(s: string): HashMap[string, string] throws ParseError {
 	return files
 }
 
-/// The hash of the compiler's ID: of an image's, its entry and version, which name the code it runs (src/launch.c);
-/// else of its executable Mach-O's UUID, which signing it keeps, else its first page, with ELF's build ID.
+/// The hash of the compiler's ID, made once: of an image's, its entry and version, which name the code it runs
+/// (src/launch.c); else of its executable Mach-O's UUID, which signing it keeps, else its first page, with ELF's build
+/// ID.
 export function compilerId(): u64 throws IoError {
+	if (compiler == 0) {
+		compiler = idHash()
+	}
+	return compiler
+}
+
+let compiler: u64 = 0
+
+function idHash(): u64 throws IoError {
 	const launched = name()
 	if (startsWith(launched, "bober.") && indexOf(launched, "@") > 0) {
 		return fnv(launched)
