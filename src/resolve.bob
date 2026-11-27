@@ -239,7 +239,7 @@ export class Instances {
 		this.insts.set(k, i)
 		this.order.push(k)
 		this.reach(this.p.decls[k].type)
-		if (this.p.decls[source(this.p, k)].code != null) {
+		if (this.p.decls[source(this.p, k)].coded()) {
 			this.todo.push(k)
 		}
 		return k
@@ -651,9 +651,8 @@ function coded(p: Program, t: i32): bool {
 /// Whether decl x is a module's const of a number literal, which its uses take, as they do an untyped one's, rather
 /// than load the global that its module's init sets.
 function numeral(x: Decl): bool {
-	const c = x.code
-	return x.owner < 0 && (x.mods & decl.Readonly) != 0 && c != null && c.ops.length == 2
-		&& (c.ops[0] == op.Int || c.ops[0] == op.Float)
+	const c = if (x.owner < 0 && (x.mods & decl.Readonly) != 0) x.code() else null
+	return c != null && c.ops.length == 2 && (c.ops[0] == op.Int || c.ops[0] == op.Float)
 }
 
 /// Whether t is a literal type or a union of them.
@@ -709,7 +708,7 @@ class Copy {
 		this.inst = i
 		this.env = p.decls[k].env
 		const d = source(p, k)
-		this.src = p.decls[d].code!
+		this.src = p.decls[d].code()!
 		this.values = if (i.values.length > 0) [...i.values] else this.src.locals.map(_ => null)
 		// A var's code inits it, of no params.
 		const f = if (p.decls[d].kind == decl.Var) -1 else p.decls[k].type
@@ -1148,7 +1147,7 @@ class Copy {
 	/// The number of type t that untyped or numeral const d stands for: its initializer is a literal or such a const,
 	/// negated as many times as it says (4.1).
 	private untyped(d: i32, t: i32): Op throws CompileError {
-		const c = this.p.decls[d].code!
+		const c = this.p.decls[d].code()!
 		const folded = this.p.folded.get(this.k)
 		if (folded == null) {
 			this.p.folded.set(this.k, [d])
@@ -1230,7 +1229,7 @@ class Copy {
 	/// via.fn, d its source, of its code for those values too, with the env of its object under the args.
 	private call(d: i32, env: i32, via: Known | null = null, spawning = false) throws CompileError {
 		const p = this.p
-		const c = p.decls[d].code
+		const c = p.decls[d].code()
 		const n = p.items(p.decls[d].type).length + (if (p.method(d)) 1 else 0)
 		if (c == null && env != 0) {
 			const f = p.subst(p.decls[d].type, env)
@@ -1290,7 +1289,7 @@ class Copy {
 	/// known, which so are not captured, and owned by this instance where it is one for known values.
 	private closure(d: i32, env: i32, ls: i32[]) throws CompileError {
 		const p = this.p
-		const c = p.decls[d].code!
+		const c = p.decls[d].code()!
 		const values: (Known | null)[] = c.locals.map(_ => null)
 		let special = this.inst.special
 		const kept: i32[] = []

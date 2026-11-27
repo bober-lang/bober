@@ -46,11 +46,11 @@ export function signature(p: Program, d: i32, value = true): string throws Compi
 			if ((x.mods & decl.Mixin) != 0) {
 				return `...${showType(p, x.type, at)}${tags}`
 			}
-			const e = if (value && x.code != null) expr(p, x.code!, 0, x.code!.ops.length - 1, at) else ""
+			const e = if (value && x.code() != null) expr(p, x.code()!, 0, x.code()!.ops.length - 1, at) else ""
 			const v = if (indexOf(e, "\n") < 0) e else "" // but of more lines, as a closure's
 			// Its type as written, else as resolved, a const's of one value its base, but of a value that says it.
 			const r = if (p.kind(x.type) == kind.Literal) p.a(x.type) else x.type
-			const t = if (s != 0) s else if (v != "" && says(x.code!, r)) 0 else r
+			const t = if (s != 0) s else if (v != "" && says(x.code()!, r)) 0 else r
 			out += (if (top) (if ((x.mods & decl.Readonly) != 0) "const " else "let ") else "") + name
 				+ (if (t == 0) "" else `: ${showType(p, t, at)}`) + tags
 			return out + (if (v == "") "" else ` = ${v}`)
@@ -90,7 +90,7 @@ function params(p: Program, d: i32): string {
 
 /// The default of param i of function d, as expr prints it.
 function fallback(p: Program, d: i32, i: i32): string throws CompileError {
-	const c = p.decls[d].code
+	const c = p.decls[d].code()
 	const l = i + (if (p.method(d)) 1 else 0)
 	for (const j of 0 ... (c?.ops.length ?? 0) - 1) {
 		if (c!.ops[j] == op.Default && c!.a(j) == l) {
@@ -116,7 +116,7 @@ export function expr(p: Program, c: Code, from: i32, to: i32, at: i32): string t
 /// prints; throws why not where Printer cannot print them.
 export function body(p: Program, d: i32): string throws string | CompileError {
 	local(p, d)
-	const c = p.decls[d].code!
+	const c = p.decls[d].code()!
 	const w = new Printer(p, c, p.decls[d].module, p.items(p.decls[d].type).length + (if (p.method(d)) 1 else 0))
 	while (c.ops[w.i] == op.Default) {
 		w.i = c.next(w.i) + 1
@@ -977,8 +977,8 @@ class Printer {
 		const r = p.b(p.a(sig))
 		const bare = ps.length == 1 && ts[0] == 0 && r == 0 && sig == f.spelled
 		const head = `${if (bare) ps[0] else `(${ps.join(", ")})`}${if (r == 0) "" else `: ${this.type(r)}`}${if (sig == f.spelled) "" else ` throws ${this.type(p.b(f.spelled))}`}`
-		const w = new Printer(p, f.code!, this.at, ts.length)
-		const ls = w.statements(f.code!.ops.length - 1)
+		const w = new Printer(p, f.code()!, this.at, ts.length)
+		const ls = w.statements(f.code()!.ops.length - 1)
 		if (!isDigit(name[0])) {
 			// declared by name, as its store says
 			const l = this.c.a(this.i)

@@ -136,7 +136,7 @@ class Js {
 	run(main: i32, tests: bool) throws CompileError {
 		const p = this.p
 		for (const x of p.decls) {
-			const c = x.code
+			const c = x.code()
 			if (c != null) {
 				for (const i of 0 ... c.ops.length - 1) {
 					if (c.ops[i] == op.Closure) {
@@ -232,7 +232,7 @@ class Js {
 		const p = this.p
 		const x = p.decls[d]
 		const c = p.classOf(d)
-		const code = x.code
+		const code = x.code()
 		if (c >= 0 && p.decls[c].kind == decl.Interface) {
 			return
 		}
@@ -279,7 +279,7 @@ class Js {
 	private params(d: i32): i32[] {
 		const x = this.p.decls[d]
 		const ps = this.p.items(x.type)
-		return if (this.p.method(d)) [x.code!.locals[0].type, ...ps] else ps
+		return if (this.p.method(d)) [x.code()!.locals[0].type, ...ps] else ps
 	}
 
 	/// Module init: runs once, initializing deps (and builtin/) then this module's non-lazy vars.
@@ -318,7 +318,7 @@ class Js {
 	/// Sets var decl d to its initializer's value, if it has one.
 	private initialize(d: i32) {
 		const t = this.p.decls[d].type
-		if (this.p.decls[d].code != null) {
+		if (this.p.decls[d].code() != null) {
 			this.pushCall(`i:${d}`, `${this.initName(d)}()`, t)
 			this.emit(`${this.fn(d)} = ${this.put(this.pop(), t)};`)
 		}
@@ -368,7 +368,7 @@ class Js {
 			for (const k of 0 ... slots.length - 1) {
 				const s = slots[k]
 				const t = this.norm(s.t)
-				const code = p.decls[s.decl].code
+				const code = p.decls[s.decl].code()
 				if (s.embed) {
 					this.emit(`_s.f${k} = ${this.instance(t, []).e};`)
 				}
@@ -798,11 +798,11 @@ class Js {
 		const p = this.p
 		const x = p.decls[d]
 		const t = p.subst(x.type, env)
-		if (x.code == null && (x.mods & decl.Extern) == 0 && this.intrinsic(this.name(d), env, p.b(t))) {
+		if (x.code() == null && (x.mods & decl.Extern) == 0 && this.intrinsic(this.name(d), env, p.b(t))) {
 			return
 		}
 		const xs = this.popN(p.items(t).length)
-		const spec = if (x.code == null) specifier(p.modules[x.module].path, this.file) else null
+		const spec = if (x.code() == null) specifier(p.modules[x.module].path, this.file) else null
 		if (spec != null) {
 			return this.foreign(d, spec!, this.args(xs, p.items(t)), t)
 		}
@@ -814,7 +814,7 @@ class Js {
 			first.push("null")
 		}
 		const callArgs = [...first, ...this.args(xs, p.items(t))]
-		if (x.code == null) {
+		if (x.code() == null) {
 			const h = this.name(d)
 			this.pushCall(`h:${h}`, `$h.${h}(${callArgs.join(", ")})`, p.b(t), true)
 		} else {
@@ -971,9 +971,9 @@ class Js {
 	private value(d: i32): string {
 		const x = this.p.decls[d]
 		const ft = this.norm(x.type)
-		if (x.code == null && specifier(this.p.modules[x.module].path, this.file) != null) {
+		if (x.code() == null && specifier(this.p.modules[x.module].path, this.file) != null) {
 			throw new CompileError(`js: ${this.name(d)}, of TypeScript typings, is called, not taken as a value`)
-		} else if (x.code == null) {
+		} else if (x.code() == null) {
 			const h = this.name(d)
 			this.edge(`t:${ft}`, `h:${h}`)
 			const k = this.kindOf(this.p.b(ft))

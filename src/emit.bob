@@ -423,7 +423,7 @@ class Emitter {
 	run() {
 		const p = this.p
 		// With units, the glue defines every position, as one a unit defined would be gone with it.
-		for (const d of this.src.roots.filter(d => this.keys.length > 0 || p.decls[d].code != null)) {
+		for (const d of this.src.roots.filter(d => this.keys.length > 0 || p.decls[d].code() != null)) {
 			this.base(d)
 		}
 		for (const d of this.decls) {
@@ -431,7 +431,7 @@ class Emitter {
 			this.kins.set(k, [...this.kins.get(k) ?? [], d])
 		}
 		for (const d of this.decls) {
-			const c = p.decls[d].code
+			const c = p.decls[d].code()
 			if (c != null) {
 				const frozen = if (this.facts.phase == "learned") this.frozen(c, this.envOf(d) ?? []) else []
 				for (const i of 0 ... c.ops.length - 1) {
@@ -536,7 +536,7 @@ class Emitter {
 		if (c >= 0 && p.decls[c].kind == decl.Interface) {
 			return
 		}
-		if (this.keys.length > 0 && (x.code != null || x.kind != decl.Function)) {
+		if (this.keys.length > 0 && (x.code() != null || x.kind != decl.Function)) {
 			this.to(this.home(d))
 		}
 		this.fnDecl = d
@@ -545,7 +545,7 @@ class Emitter {
 		}
 		this.src = p.modules[x.module]
 		this.ctor = c >= 0 && (if (x.kind == decl.Function) this.name(d) == "constructor" else (x.mods & Static) == 0)
-		const code = x.code
+		const code = x.code()
 		if (x.kind == decl.Class) {
 			this.construct(d)
 			if (this.dyn) {
@@ -611,7 +611,7 @@ class Emitter {
 		this.start(init)
 		this.ir().store(this.i64Const(1), set, false) // first, as d's initializer may read d
 		this.put(q, { v: this.zero(x.type), t: this.norm(x.type) }, x.type)
-		if (x.code != null) {
+		if (x.code() != null) {
 			const g = this.initOf(d)
 			const v = this.returned(this.call(b.valueType(g), g, this.descs), x.type)
 			this.put(q, { v: v, t: this.norm(x.type) }, x.type)
@@ -645,7 +645,7 @@ class Emitter {
 		for (const k of 0 ... slots.length - 1) {
 			const s = slots[k]
 			const q = this.gep(self, n, k)
-			const set = this.p.decls[s.decl].code != null
+			const set = this.p.decls[s.decl].code() != null
 			const g = if (set) this.fieldInit(s.decl) else 0
 			const init = () => this.returned(this.call(this.b.valueType(g), g, [...this.descs, self]), s.t)
 			if (s.embed) {
@@ -715,7 +715,7 @@ class Emitter {
 			if (this.lazy(d) || this.isLet(d) != lets) {
 				continue
 			}
-			if (x.code != null) {
+			if (x.code() != null) {
 				const init = this.initOf(d)
 				this.put(this.varPlace(d),
 					{ v: this.returned(this.call(b.valueType(init), init, []), x.type), t: this.norm(x.type) }, x.type)
@@ -1534,7 +1534,7 @@ class Emitter {
 		if (self) {
 			// A method takes this, as its code types it: a class instance's or array's ref, or a string; a constructor
 			// a ref, of a class held by value too.
-			first.push(if (this.name(d) == "constructor") this.ref else this.ll(x.code!.locals[0].type))
+			first.push(if (this.name(d) == "constructor") this.ref else this.ll(x.code()!.locals[0].type))
 		}
 		const val = this.facts.byValue.has(d)
 		const ft = if (this.dyn && env) this.codeType(ret, params) else this.fnType(ret, first, params, val)
@@ -1571,7 +1571,7 @@ class Emitter {
 		const x = this.p.decls[d]
 		const f = this.b.function(this.symbol(d), t, this.onlyHere(this.copies.has(d)
 			|| this.here.has(d) && x.owner >= 0 && this.p.classOf(d) < 0 && (x.mods & decl.Export) == 0))
-		const code = x.code
+		const code = x.code()
 		if ((x.mods & decl.Outlined) != 0
 			|| this.facts.phase == "none" && code != null && code.ops.length >= this.o.tune.small) {
 			this.b.attr(f, -1, "noinline", 0)
@@ -1782,7 +1782,7 @@ class Emitter {
 	private invoke(d: i32, env: i32) {
 		const p = this.p
 		const x = p.decls[d]
-		if (x.code == null && (x.mods & Extern) == 0) {
+		if (x.code() == null && (x.mods & Extern) == 0) {
 			this.intrinsic(this.name(d), env, p.subst(p.b(x.type), env))
 			return
 		}
@@ -2074,7 +2074,7 @@ class Emitter {
 	private dispatched(d: i32): bool {
 		const x = this.p.decls[d]
 		const c = this.p.classOf(d)
-		return this.dyn && c >= 0 && this.p.decls[c].kind == decl.Class && x.kind == decl.Function && x.code != null
+		return this.dyn && c >= 0 && this.p.decls[c].kind == decl.Class && x.kind == decl.Function && x.code() != null
 			&& x.params.length == 0 && this.name(d) != "constructor"
 	}
 
@@ -2090,7 +2090,7 @@ class Emitter {
 		const start = this.startThunk(fn, f.scope)
 		const args = this.descs.slice(0, this.descs.length)
 		if (f.self) {
-			args.push(this.cast({ v: this.b.param(fn, 0), t: this.any }, this.p.decls[d].code!.locals[0].type))
+			args.push(this.cast({ v: this.b.param(fn, 0), t: this.any }, this.p.decls[d].code()!.locals[0].type))
 		}
 		const [argv, n] = [this.b.param(fn, 1), this.b.param(fn, 2)]
 		for (const k of 0 ... f.params.length - 1) {
@@ -3914,7 +3914,7 @@ class Emitter {
 		for (const m of 0 ... p.modules.length - 1) {
 			for (const d of listed(p, [...p.modules[m].decls, ...p.modules[m].copies])) {
 				const x = p.decls[d]
-				const c = x.code
+				const c = x.code()
 				if (c == null) {
 					continue
 				}
@@ -3940,7 +3940,7 @@ class Emitter {
 				const np = p.items(x.type).length + (if (p.method(d)) 1 else 0)
 				const ret = p.b(x.type)
 				if (!vals.has(d) && !closures.has(d)
-					&& (this.inlined(ret) || this.returnsFresh(x.code!, np, ret, vals))) {
+					&& (this.inlined(ret) || this.returnsFresh(x.code()!, np, ret, vals))) {
 					vals.set(d, true)
 					more = true
 				}
@@ -4173,7 +4173,7 @@ class Emitter {
 	private writes(d: i32, j: i32): bool { return (this.kins.get(this.kin(d)) ?? [d]).some(e => this.wrote(e, j)) }
 
 	private wrote(d: i32, j: i32): bool {
-		const c = this.p.decls[d].code!
+		const c = this.p.decls[d].code()!
 		const l = c.captures[j]
 		for (const k of 0 ... c.ops.length - 1) {
 			if (this.assigned(c, k) == l) {

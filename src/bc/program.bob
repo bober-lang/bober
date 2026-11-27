@@ -64,8 +64,10 @@ export class Decl {
 	members: i32[] = []
 	/// The list of the types a class implements or an interface extends.
 	supers = 0
-	/// A Var's initializer or a Function's or Test's body; null for none.
-	code: Code | null = null
+	/// Its code (code), as made or read.
+	held: Code | null = null
+	/// Of a decl read from a file, how its code is read, once asked and not held; null for none, or once read.
+	later: (() => Code) | null = null
 	/// Where its declaration is in its module's source, a byte offset.
 	pos = 0
 	/// Its doc, a Str, as document makes it of its module's comments.
@@ -97,6 +99,18 @@ export class Decl {
 		this.owner = owner
 		this.hash = hash
 	}
+
+	/// A Var's initializer or a Function's or Test's body; null for none. Throws a ParseError where read malformed.
+	code(): Code | null {
+		if (this.held == null && this.later != null) {
+			this.held = this.later!()
+			this.later = null
+		}
+		return this.held
+	}
+
+	/// Whether it has code, not read for asking.
+	coded(): bool { return this.held != null || this.later != null }
 }
 
 export class Module {

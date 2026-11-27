@@ -27,9 +27,9 @@
 //! imports  per decl of another module it uses: dep, owner, Str name, nth of that name in its owner
 //! types    per type, after its parts: kind byte, a and b as its kind says
 //! defs     per decl: mods, type params (Str name, constraint, default, then both exact), type, supers, tags, throws,
-//!          its position, type as spelled, exact type, 0 or 1 and its code; then the module's decls, inits and deps,
-//!          its imports (position, Str specifier, dep, Str namespace, the decls named with their Str names), and where
-//!          its lines end, each after the one before
+//!          its position, type as spelled, exact type, its code's length, 0 for none, and its code; then the
+//!          module's decls, inits and deps, its imports (position, Str specifier, dep, Str namespace, the decls named
+//!          with their Str names), and where its lines end, each after the one before
 //! comments per comment: its position less the one before's, 1 if code is before it on its line else 0, its text
 //!          after `//`, and the decl whose doc comment it is, as an owner; a decl's doc is made of these
 //! ```
@@ -41,8 +41,8 @@
 //! A file is fresh while its compiler and source hashes are the current ones and the ABI hash it has of each dep is
 //! that dep's; reading a stale one is a miss. A changed compiler makes each stale, so the format has no version. The
 //! source hash is 0 in a package, whose paths are relative to bober's root (src/root.bob), as the repo's are. Files are
-//! read as a set, as modules of builtin/ and std/ import each other, and are first linked into a scratch Program, so
-//! that a malformed one leaves the Program as it was.
+//! read as a set, as modules of builtin/ and std/ import each other; a malformed one throws, perhaps once the Program
+//! holds part of it, and a code malformed within its length once it is read (Decl.code).
 //!
 //! ## ABI
 //!
@@ -373,7 +373,7 @@ class Out {
 		uleb(decls, this.order.length)
 		for (const d of this.order) {
 			const x = p.decls[d]
-			x.body = if (x.code == null) 0 else combine(x.hash, codes.body(d)[0])
+			x.body = if (x.code() == null) 0 else combine(x.hash, codes.body(d)[0])
 			uleb(decls, this.str(x.name))
 			decls.u8(x.kind)
 			this.owner(decls, x.owner)
@@ -395,10 +395,11 @@ class Out {
 			uleb(defs, x.pos)
 			uleb(defs, this.type(x.spelled))
 			uleb(defs, this.type(x.exact))
-			defs.u8(if (x.code == null) 0 else 1)
-			if (x.code != null) {
-				this.code(defs, x.code!, p.decls[p.based(d)].pos)
+			const c = new Writer()
+			if (x.code() != null) {
+				this.code(c, x.code()!, p.decls[p.based(d)].pos)
 			}
+			text(defs, c.bytes)
 		}
 		const mod = p.modules[this.m]
 		ids(defs, mod.decls.map(d => this.decl(d)))
@@ -584,6 +585,9 @@ function text(w: Writer, s: string) {
 	w.raw(s)
 }
 
+/// Called with a module's path as a code of its file is read (Decl.code).
+export let decoding = (path: string) => {}
+
 /// A file being read into p: its header and deps, read when made, then the Program's id of each id of its tables.
 export class In {
 	p: Program
@@ -703,8 +707,20 @@ export class In {
 			x.pos = this.n()
 			x.spelled = this.type()
 			x.exact = this.type()
-			if (this.r.u8() == 1) {
-				x.code = this.code(p.decls[p.based(d)].pos)
+			const n = this.n()
+			const [at, base] = [this.r.pos, p.decls[p.based(d)].pos]
+			this.r.pos += n
+			if (n > this.end - at) {
+				throw this.bad()
+			}
+			x.later = if (n == 0) null else () => {
+				decoding(p.modules[this.m].path)
+				this.r.pos = at
+				const c = this.code(base)
+				if (this.r.pos != at + n) {
+					throw this.bad()
+				}
+				return c
 			}
 		}
 		const mod = p.modules[this.m]
@@ -965,7 +981,7 @@ class Abi {
 		this.h = seed
 		this.uses = []
 		this.at = d
-		this.code(this.p.decls[d].code!, true, this.p.decls[this.p.based(d)].pos)
+		this.code(this.p.decls[d].code()!, true, this.p.decls[this.p.based(d)].pos)
 		for (const y of this.p.folded.get(d) ?? []) {
 			this.named(y)
 		}
@@ -982,7 +998,7 @@ class Abi {
 		const x = this.p.decls[d]
 		this.h = combine(combine(combine(this.h, x.hash), x.kind), x.mods)
 		this.h = combine(combine(this.h, if (x.kind == decl.Function) 0 else fnv(this.p.strings[x.doc])),
-			if (x.code == null) 0 else 1)
+			if (x.coded()) 1 else 0)
 		for (const t of x.params) {
 			this.h = combine(this.h, fnv(this.p.strings[t.name]))
 			this.type(t.exactConstraint) // which the inexact one is made of
@@ -1001,14 +1017,14 @@ class Abi {
 		if (this.all && this.m >= 0 && s.module != this.m) {
 			this.marks.append([s.sig, if (own) s.body else 0].filter(h => h != 0))
 		}
-		if (x.code != null && own && this.bodies != null) {
+		if (own && x.coded() && this.bodies != null) {
 			const [h, ds] = this.bodies!.of(d)
 			this.h = combine(this.h, h)
 			for (const y of ds) {
 				this.named(y)
 			}
-		} else if (x.code != null && (own || x.kind == decl.Var && (x.mods & decl.Readonly) != 0)) {
-			this.code(x.code!)
+		} else if ((own || x.kind == decl.Var && (x.mods & decl.Readonly) != 0) && x.coded()) {
+			this.code(x.code()!)
 		}
 		if (own || x.kind == decl.Class || x.kind == decl.Interface) {
 			for (const y of x.members) {

@@ -8,6 +8,7 @@ import { base } from "../std/fs/path"
 import * as process from "../std/process"
 import { replace, split } from "../std/string"
 import { Build, Compile, Run, build, format, ignored, machine, monoKept, onUnit, runTests, toolchain } from "./bober"
+import { decoding } from "./bc/file"
 import { Bytes } from "./link/bytes"
 import { Linker } from "./link/link"
 import { Object } from "./link/object"
@@ -977,4 +978,25 @@ test "a module embedding a test file's class that embeds a private class of anot
 	const first = built([["lib.bob", lib("")], ["w.test.bob", w], ["mid.bob", mid], ["main.bob", main]], "-O1")
 	const edited = built([["lib.bob", lib("\tz = 5\n\ty = 6\n")]], "-O1")
 	assert first == "7\n" && edited == "7\n"
+}
+
+test "a leaf edited at -O1, no code of a module unchanged is read of its file" {
+	const lib = (k: i32) => `export function k(): i32 { return ${k} }\n\nconst unused${k} = ${k}\n`
+	const mid = "import { k } from \"./lib\"\n\nexport function m(): i32 { return k() + 1 }\n"
+	const main = "import { m } from \"./mid\"\n\nfunction main() { print(`${m()}`) }\n"
+	anew()
+	built([["lib.bob", lib(1)], ["mid.bob", mid], ["main.bob", main]], "-O1")
+	const read: string[] = []
+	decoding = path => {
+		if (startsWith(path, home())) {
+			read.push(base(path))
+		}
+	}
+	let out = ""
+	try {
+		out = built([["lib.bob", lib(2)]], "-O1")
+	} finally {
+		decoding = path => {}
+	}
+	assert out == "3\n" && unique(read) == []
 }

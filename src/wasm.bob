@@ -190,7 +190,7 @@ class Wasm {
 		BinaryenAddTag(this.m, "bober", box, this.none)
 		BinaryenAddTagExport(this.m, "bober", "bober")
 		for (const x of p.decls) {
-			const c = x.code
+			const c = x.code()
 			if (c != null) {
 				for (const i of 0 ... c.ops.length - 1) {
 					if (c.ops[i] == op.Closure) {
@@ -242,7 +242,7 @@ class Wasm {
 		const p = this.p
 		const x = p.decls[d]
 		const c = p.classOf(d)
-		const code = x.code
+		const code = x.code()
 		if (c >= 0 && p.decls[c].kind == decl.Interface) {
 			return
 		}
@@ -293,7 +293,7 @@ class Wasm {
 	private params(d: i32): i32[] {
 		const x = this.p.decls[d]
 		const ps = this.p.items(x.type)
-		return if (this.p.method(d)) [x.code!.locals[0].type, ...ps] else ps
+		return if (this.p.method(d)) [x.code()!.locals[0].type, ...ps] else ps
 	}
 
 	/// The init of module m, which runs once: the inits of the modules it depends on, and of builtin/ but in builtin/,
@@ -331,7 +331,7 @@ class Wasm {
 	/// Sets var decl d to its initializer's value, if it has one.
 	private initialize(d: i32) {
 		const t = this.p.decls[d].type
-		if (this.p.decls[d].code != null) {
+		if (this.p.decls[d].code() != null) {
 			this.pushCall(this.initName(d), [], t)
 			this.emit(BinaryenGlobalSet(this.m, this.fn(d), this.put(this.pop(), t)))
 		}
@@ -403,7 +403,7 @@ class Wasm {
 			for (const k of 0 ... slots.length - 1) {
 				const s = slots[k]
 				const t = this.norm(s.t)
-				const code = p.decls[s.decl].code
+				const code = p.decls[s.decl].code()
 				if (s.embed) {
 					const e = this.instance(t, [])
 					this.emit(BinaryenStructSet(this.m, k as u32, this.get(self), this.get(e)))
@@ -931,7 +931,7 @@ class Wasm {
 		const p = this.p
 		const x = p.decls[d]
 		const t = p.subst(x.type, env)
-		if (x.code == null && (x.mods & decl.Extern) == 0 && this.intrinsic(this.name(d), env, p.b(t))) {
+		if (x.code() == null && (x.mods & decl.Extern) == 0 && this.intrinsic(this.name(d), env, p.b(t))) {
 			return
 		}
 		const xs = this.popN(p.items(t).length)
@@ -948,7 +948,7 @@ class Wasm {
 	/// The function a call of decl d of env calls: its own, or the import of one without a body, of its name.
 	private callee(d: i32, env: i32): string {
 		const x = this.p.decls[d]
-		if (x.code != null) {
+		if (x.code() != null) {
 			return this.fn(d)
 		}
 		const name = `import:${this.name(d)}:${d}:${env}`
@@ -1134,7 +1134,7 @@ class Wasm {
 	/// Method d bound to obj, as a field of obj gives it: its code a thunk calling d on its env.
 	private bound(d: i32, obj: V): u64 {
 		const t = this.p.decls[d].type
-		const self = this.val(this.p.decls[d].code!.locals[0].type)
+		const self = this.val(this.p.decls[d].code()!.locals[0].type)
 		const name = this.thunk(`bound#${d}`, t, n => {
 			const args = [BinaryenRefCast(this.m, this.param(0), self)]
 			for (const i of 1 ... n - 1) {
@@ -2329,7 +2329,7 @@ class Wasm {
 				} else {
 					ts.append(if (x.kind == decl.Function && p.classOf(d) < 0) p.parts(x.type) else [x.type])
 				}
-				const c = x.code
+				const c = x.code()
 				if (c != null) {
 					ts.append(c.locals.map(l => l.type))
 					for (const i of 0 ... c.ops.length - 1) {

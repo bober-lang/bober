@@ -15,7 +15,7 @@ function add(p: Program, m: i32, owner: i32, name: string, k: decl.Kind, t: i32,
 	params: string[] = []): i32 {
 	const d = p.decl(m, owner, name, k)
 	p.decls[d].type = t
-	p.decls[d].code = c
+	p.decls[d].held = c
 	p.decls[d].params = params.map(x => ({ name: p.intern(x), constraint: 0, fallback: 0, exactConstraint: 0,
 		exactFallback: 0 }))
 	if (owner < 0) {
@@ -46,7 +46,7 @@ function entry(p: Program, d: i32): string {
 	const x = p.decls[d]
 	const mods = if ((x.mods & decl.Export) != 0) "export " else ""
 	return `${mods}${decl.names[x.kind]} ${qualified(p, d)}${if (x.type == 0) "" else ": " + showType(p, x.type)}\n`
-		+ (if (x.code == null) "" else showCode(p, x.code!)) + x.members.map(y => entry(p, y)).join("")
+		+ (if (x.code() == null) "" else showCode(p, x.code()!)) + x.members.map(y => entry(p, y)).join("")
 }
 
 /// `function id[T](x: T): T { return x }` and a main calling it with an i32 and a string.
@@ -56,7 +56,7 @@ test "a generic function gets an instance per type arg" {
 	const id = add(p, m, -1, "id", decl.Function, 0, code(p, [], []), ["T"])
 	const t = p.type(kind.Param, id, 0)
 	p.decls[id].type = fn(p, [t], t)
-	p.decls[id].code = code(p, [["x", t]], [[op.Local, 0], [op.Return], [op.End]])
+	p.decls[id].held = code(p, [["x", t]], [[op.Local, 0], [op.Return], [op.End]])
 	add(p, m, -1, "main", decl.Function, fn(p, [], I32),
 		code(p, [],
 		[[op.Int, I32, p.int(1)], [op.Call, id, p.list([I32])], [op.Drop], [op.Str, p.intern("a")],
@@ -110,7 +110,7 @@ test "a generic instanced with type args nested ever deeper is an error" {
 	const f = add(p, m, -1, "f", decl.Function, 0, null, ["T"])
 	const t = p.type(kind.Param, f, 0)
 	p.decls[f].type = fn(p, [t], Null)
-	p.decls[f].code = code(p, [["x", t]],
+	p.decls[f].held = code(p, [["x", t]],
 		[[op.Local, 0], [op.Array, p.type(kind.Array, t), 1], [op.Call, f, p.list([p.type(kind.Array, t)])], [op.Drop],
 		[op.Null], [op.Return], [op.End]])
 	add(p, m, -1, "main", decl.Function, fn(p, [], I32),
@@ -183,7 +183,7 @@ test "what is known folds per instance" {
 		[op.Field, p.intern("name")], [op.Add], [op.Add], [op.SetLocal, 1], [op.End], [op.Local, 1], [op.Return], [op.End], [op.Unreachable], [op.End]])
 	c.locals[2].mods = decl.Readonly
 	c.locals[3].mods = decl.Readonly
-	p.decls[describe].code = c
+	p.decls[describe].held = c
 	const pt = p.type(kind.Named, pair, 0)
 	add(p, m, -1, "main", decl.Function, fn(p, [], I32),
 		code(p, [],
@@ -262,7 +262,7 @@ test "an interface is the union of the classes converted to it" {
 	ops.append([[op.Int, I32, p.int(0)], [op.Return], [op.End]])
 	add(p, m, -1, "main", decl.Function, fn(p, [], I32), code(p, [["s", s]], ops))
 	mono(p, m)
-	const u = p.decls[p.modules[m].decls[2]].code!.locals[0].type
+	const u = p.decls[p.modules[m].decls[2]].code()!.locals[0].type
 	const [first, second] = if (showType(p, u) == "Square | Circle") ["Square", "Circle"] else ["Circle", "Square"]
 	const branch = (c: string) => `		Local 0
 		Cast ${c}
@@ -331,7 +331,7 @@ test "a dispatch function is per type, whatever its name" {
 	ops.append([[op.Int, I32, p.int(0)], [op.Return], [op.End]])
 	add(p, m, -1, "main", decl.Function, fn(p, [], I32), code(p, locals, ops))
 	mono(p, m)
-	const calls = p.decls[p.modules[m].decls[0]].code!
+	const calls = p.decls[p.modules[m].decls[0]].code()!
 	const targets: i32[] = []
 	for (const i of 0 ... calls.ops.length - 1) {
 		if (calls.ops[i] == op.Call) {
@@ -350,7 +350,7 @@ test "an instance lives in its generic's module" {
 	const t = p.type(kind.Param, wrap, 0)
 	p.decls[wrap].mods = decl.Export
 	p.decls[wrap].type = fn(p, [t], p.type(kind.Array, t))
-	p.decls[wrap].code = code(p, [["x", t]],
+	p.decls[wrap].held = code(p, [["x", t]],
 		[[op.Local, 0], [op.Array, p.type(kind.Array, t), 1], [op.Return], [op.End]])
 	const io = p.addModule("builtin/io.bob")
 	const print = add(p, io, -1, "print", decl.Function, fn(p, [String], Null),
@@ -503,12 +503,12 @@ test "a static subscript out of range is a compile error at its site, and where 
 		[[op.Type, t], [op.Field, p.intern("fields")], [op.Int, I32, p.int(0)], [op.Subscript],
 		[op.Field, p.intern("name")], [op.Return], [op.End]])
 	c.pos[3] = 15
-	p.decls[first].code = c
+	p.decls[first].held = c
 	const et = p.type(kind.Named, empty, 0)
 	const main = add(p, m, -1, "main", decl.Function, fn(p, [], I32),
 		code(p, [],
 		[[op.New, et], [op.Call, first, p.list([et])], [op.Drop], [op.Int, I32, p.int(0)], [op.Return], [op.End]]))
-	p.decls[main].code!.pos[1] = 20
+	p.decls[main].code()!.pos[1] = 20
 	assert mono(p, m) throws new CompileError(
 		"main.bob:2:5: index 0 out of range for length 0 (first[Empty], instanced at main.bob:2:10 in main)")
 }
