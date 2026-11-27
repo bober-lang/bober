@@ -608,6 +608,7 @@ export class In {
 	/// Its module, once added.
 	m = -1
 	private deps: i32[] = []
+	/// Of each of its strings, the Program's id once asked (str), else -1 less where it is.
 	private strings: i32[] = [0]
 	private ints: i32[] = [0]
 	private names: i32[] = [0]
@@ -640,10 +641,16 @@ export class In {
 		}
 	}
 
-	/// Reads the strings, ints, names entries and decls, made in its module.
+	/// Reads the strings, ints, names entries and decls, made in its module; a string interned once asked, as most are
+	/// of code, which is read once asked.
 	declare() throws ParseError {
 		const p = this.p
-		this.table(this.strings, () => p.intern(this.text()))
+		this.table(this.strings, () => {
+			const at = this.r.pos
+			const n = this.n()
+			this.r.pos += n
+			return -1 - at
+		})
 		this.table(this.ints, () => p.int(this.r.sleb()))
 		this.table(this.names, () => {
 			const pairs: i32[] = []
@@ -810,7 +817,7 @@ export class In {
 			case op.TypeList: return this.p.list(this.list(() => this.type()))
 			case op.TypeId: return this.of(this.types)
 			case op.DeclId: return this.of(this.decls)
-			case op.StrId: return this.of(this.strings)
+			case op.StrId: return this.str()
 			case op.IntId: return this.of(this.ints)
 			case Names: return this.of(this.names)
 		}
@@ -818,7 +825,18 @@ export class In {
 	}
 
 	private type(): i32 throws ParseError { return this.of(this.types) }
-	private str(): i32 throws ParseError { return this.of(this.strings) }
+
+	/// The next string, interned once first asked.
+	private str(): i32 throws ParseError {
+		const i = this.id(this.strings.length)
+		if (this.strings[i] < 0) {
+			const at = this.r.pos
+			this.r.pos = -1 - this.strings[i]
+			this.strings[i] = this.p.intern(this.text())
+			this.r.pos = at
+		}
+		return this.strings[i]
+	}
 
 	/// The next owner: -1 for none, else a decl.
 	private owner(): i32 throws ParseError {
