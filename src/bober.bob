@@ -1300,7 +1300,7 @@ let done: [Program, u64, u64] | null = null
 /// by what it is made of, `<what>@<version>`, a module by its bytecode, which has the ABIs of the modules it imports,
 /// and its Bound, and monomorphized, `<path>^<world>^O1@`, by its bytecode as such too, beside the one as lowered, its
 /// symbols its own (unit), what it instances its local copies, so that programs share it, -tune specs of those per
-/// module; a file by its bytes; an archive, which is linked for good, by its size and when it was written. A
+/// module; a file, and an archive, which is linked for good, by its size and when it was written. A
 /// monomorphized module is compiled by TPDE, or by LLVM as `<path>^<world>^O2@` of the same version, which any build
 /// keeps, at -O2, and with no level given where the image holds TPDE's, a build finding it unchanged. A release
 /// build's is the object LLVM makes of it, `<path>^R@`, held as it is for executable, not linked, nor any file:
@@ -1530,19 +1530,17 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	const archives: string[] = []
 	for (const f of if (c.release) []
 		else [...files, ...(if (mac) [] else [...cxxs, `${lib}/libunwind.a`, `${lib}/libclang_rt.builtins.a`])]) {
+		// An object's unit, as one that stands for an archive, is named by its file's time and size.
+		const info = stat(f)
+		const name = `${f}@${info.modified}.${info.size}`
+		parts.push(name)
 		if (!endsWith(f, ".a")) {
-			const bytes = readFile(f)
-			const name = `${f}@${fnv(bytes)}`
-			parts.push(name)
 			if (lacks(name)) {
-				l.add(format.read(name, bytes))
+				l.add(format.read(name, readFile(f)))
 			}
 			continue
 		}
 		// An object stands for the archive, whose members are linked as what they define is named.
-		const info = stat(f)
-		const name = `${f}@${info.modified}.${info.size}`
-		parts.push(name)
 		if (!has(name)) {
 			if (old != null) {
 				return image(p, mains, files, cxx, pin, o, c, true) // the continued image did not look in it
