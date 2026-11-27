@@ -360,9 +360,13 @@ export class Linker {
 	defined(of: string): string[] throws CompileError {
 		const out: string[] = []
 		for (const k of this.removed) {
-			const o = this.read(k).object
-			out.append(o.symbols.filter(s => s.section >= 0 && s.binding != Local
-				&& startsWith(s.name, of)).map(s => s.name))
+			const u = this.read(k)
+			for (const j of 0 ... u.names.length - 1) {
+				const name = if (u.names[j] >= 0) this.entry(u.names[j]).name else ""
+				if (u.names[j] >= 0 && u.object.symbols[j].section >= 0 && startsWith(name, of)) {
+					out.push(name)
+				}
+			}
 		}
 		return out
 	}
@@ -691,6 +695,9 @@ export class Linker {
 			if (sec.kind == Const && sec.fixups.some(f => f.kind == Abs64) && !this.state.pointed.includes(sec.name)) {
 				this.state.pointed.push(sec.name)
 			}
+		}
+		if (this.keep) {
+			ordered(o)
 		}
 		u.names = o.symbols.map(s => if (s.binding == Local) -1 else this.name(s.name))
 		this.chained(k)
@@ -1304,9 +1311,9 @@ export class Linker {
 			const again = (i: i32, f: Fixup) => u.at[i] != dropped
 				&& (u.object.symbols[f.symbol].binding != Local || f.kind == Abs64 || f.kind == Desc
 				|| this.veneered.has(u.at[i] + f.at))
-			u.encoded = record(records, u.object, u.at, again, u.names.map(g => if (g < this.shared) g else -1))
+			u.encoded = record(records, u.object, u.at, again, u.names.map(g => if (g < this.shared) g else -1), u.frozen)
 			u.blocks = [this.block(kept, u.encoded, what),
-				this.block(kept, u.links.slice(0, 24 * (u.object.symbols.length as u64)), what)]
+				this.block(kept, u.links.slice(0, 24 * (leading(u.object) as u64)), what)]
 			// Not those whose address a later link may change: of a thread's copy.
 			const syms = u.object.symbols.filter(x => {
 				const sec = if (x.section >= 0) u.object.sections[x.section] else null
@@ -1577,14 +1584,15 @@ export class Linker {
 		return true
 	}
 
-	/// Links unit k's symbols with a name into the chains of their names, first, if the image is kept.
+	/// Links unit k's symbols with a name into the chains of their names, first, if the image is kept: symbol j's at
+	/// 24 * j of its links, as those with a name are the first, leading(o), of an object ordered.
 	private chained(k: i32) {
 		if (!this.keep) {
 			return
 		}
 		const u = this.held(k)
 		const o = u.object
-		u.links = new Bytes(zeros(24 * o.symbols.length))
+		u.links = new Bytes(zeros(24 * leading(o)))
 		u.from = 0
 		for (const j of 0 ... o.symbols.length - 1) {
 			const s = o.symbols[j]
@@ -1878,6 +1886,38 @@ function merged(entries: [string, u8, u64, u64][]): [string, u8, u64, u64][] {
 export function key(name: string): string {
 	const at = lastIndexOf(name, "@")
 	return if (at >= 0) name.slice(0, at) else name
+}
+
+/// Orders o's symbols with a name before the local ones, as a kept image's records and links have them; o is the
+/// object as given (Linker.add), which this changes.
+function ordered(o: Object) {
+	const order: i32[] = []
+	for (const local of [false, true]) {
+		for (const j of 0 ... o.symbols.length - 1) {
+			if ((o.symbols[j].binding == Local) == local) {
+				order.push(j)
+			}
+		}
+	}
+	const index = new i32[](order.length)
+	for (const i of 0 ... order.length - 1) {
+		index[order[i]] = i
+	}
+	o.symbols = order.map(j => o.symbols[j])
+	for (const sec of o.sections) {
+		for (const f of sec.fixups) {
+			f.symbol = index[f.symbol]
+		}
+	}
+}
+
+/// How many of o's symbols are before its first local one.
+function leading(o: Object): i32 {
+	let n = 0
+	while (n < o.symbols.length && o.symbols[n].binding != Local) {
+		n++
+	}
+	return n
 }
 
 /// Where fixup f of section i of o is, for messages.
