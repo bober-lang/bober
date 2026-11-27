@@ -380,12 +380,24 @@ export class Linker {
 	defined(of: string): string[] throws CompileError {
 		const out: string[] = []
 		for (const k of this.removed) {
-			const u = this.read(k)
-			for (const j of 0 ... u.names.length - 1) {
-				const name = if (u.names[j] >= 0) this.entry(u.names[j]).name else ""
-				if (u.names[j] >= 0 && u.object.symbols[j].section >= 0 && startsWith(name, of)) {
-					out.push(name)
-				}
+			out.append(this.symbols(k, of))
+		}
+		return out
+	}
+
+	/// The names starting with of that the object of that name the continued image holds defines.
+	defines(name: string, of: string): string[] throws CompileError {
+		const k = this.keyed(key(name)).find(k => this.held(k).object.name == name)
+		return if (k == null) [] else this.symbols(k!, of)
+	}
+
+	private symbols(k: i32, of: string): string[] throws CompileError {
+		const u = this.read(k)
+		const out: string[] = []
+		for (const j of 0 ... u.names.length - 1) {
+			const name = if (u.names[j] >= 0) this.entry(u.names[j]).name else ""
+			if (u.names[j] >= 0 && u.object.symbols[j].section >= 0 && startsWith(name, of)) {
+				out.push(name)
 			}
 		}
 		return out
