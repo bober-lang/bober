@@ -281,3 +281,24 @@ test "a link that grows a section but starts none elsewhere leaves the entries o
 	const [held, added] = [e.get(f + 6, 2), e.get(f + 24 + 6, 2)]
 	assert held == shndx + 1 && added == shndx
 }
+
+test "a kept image's unwinder's table, continued without the first function, is as it was but its entry" {
+	const l = new Linker(arm64, elf, new Bytes())
+	for (const i of 0 ... 15) {
+		l.add(unwound(`f${i}`, 8))
+		l.export(`f${i}`)
+	}
+	const again = new Linker(arm64, elf, new Bytes(mapped(file(l))))
+	again.remove("f0")
+	const image = again.link()
+	elf.write(image)
+	const d = image.bytes
+	let ph = d.get(32, 8)
+	while (d.get(ph, 4) != 0x6474e550) {
+		ph += 56
+	}
+	// Made anew, it would be of 15 entries and a copy.
+	const entries = d.get(d.get(ph + 16, 8) + 8, 4)
+	const found = image.exports.every(e => unwinder(d, e[1]) != 0)
+	assert entries == 18 && found
+}

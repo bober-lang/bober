@@ -639,8 +639,8 @@ function fdes(image: Image, from: u64, to: u64): [u64, u64][] throws CompileErro
 }
 
 /// Of a kept image, its eh_frame_hdr where hdr has room for it, as frames makes it gapped, or as it was but the entries
-/// of the code gone, each then a copy of the one before, and of the FDEs laid out now, in the copies from where they go
-/// on, the entries between moved over; its size. Of too few copies, frames makes it anew.
+/// of the code gone, each then a copy of the one before, or if first, of the one after, and of the FDEs laid out now, in
+/// the copies from where they go on, the entries between moved over; its size. Of too few copies, frames makes it anew.
 function kept(image: Image): u64 throws CompileError {
 	const [at, cap] = image.hdr
 	const b = image.bytes
@@ -670,10 +670,10 @@ function kept(image: Image): u64 throws CompileError {
 	let fits = n > 0
 	for (const [from, to] of image.gone) {
 		const [i, j] = [after((from - at) as i64, true), after((to - at) as i64, true)]
-		for (const k of (if (i > 0) i else j) ... j - 1) {
-			set(k, entry(i - 1))
+		for (const k of i ... j - 1) {
+			set(k, entry(if (i > 0) i - 1 else j))
 		}
-		fits = fits && (i > 0 || j == 0)
+		fits = fits && (i > 0 || j < n)
 	}
 	const room = ((cap - at - 12) / 8) as i64
 	const gap = (k: i64) => k >= n || k >= 1 && entry(k) == entry(k - 1)
