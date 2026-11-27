@@ -16,8 +16,8 @@
 //!
 //! A minor collection, once 32 MiB are allocated, neither marks nor frees what is old: its roots are the isolate's
 //! lets, the refs the stack maps say the frames of its fibers that ran since the last collection hold (src/fiber.c),
-//! and the refs of its old objects on dirty cards. A card is 512 bytes of the heap, a byte after its 64
-//! GiB, which the write barrier sets for each place a ref is stored to (src/backend/backend.bob); so an old object holds a ref
+//! and the refs of its old objects on dirty cards. A card is 512 bytes of the heap, a byte of the 128 MiB before it,
+//! which the write barrier sets for each place a ref is stored to (src/backend/backend.bob); so an old object holds a ref
 //! to a young or new one only where its card is dirty, and a fiber that has not run since a collection none. A major
 //! collection, once the old objects take over 64 MiB and two to four times the bytes live after the last, the more the
 //! less of what became old before the last had died by it, traces from every fiber and marks each old object it reaches
@@ -35,8 +35,9 @@
 #include <sys/mman.h>
 
 #define PAGE BOBER_PAGE
-#define PAGES (1 << 20)  // of address space, 64 GiB
+#define PAGES (1 << 20)  // of address space, 64 GiB at most
 #define CARD 9           // the bits of a card's size, as the write barrier has it
+#define CARDS ((int64_t)PAGES * PAGE >> CARD)  // the cards of the most heap, which end where it starts
 #define SMALL 8192       // the size of the largest object of a size class
 #define CLASSES 36       // those of objects with refs; class c + CLASSES is c's size, of objects without, and
                          // c + 2 * CLASSES of strings' buffers
@@ -46,8 +47,11 @@ enum { FREE, YOUNG, OLD, BIG, REST, FROZEN };
 /// young or whether new if big, the pages of a big object if its first, or else how far back that is, and the isolate.
 typedef struct { uint8_t kind, class; uint32_t used, pages, owner; } Page;
 
-char *bober_heap;  // as the write barrier finds it, and the cards after it
+char *bober_heap;  // as the write barrier finds it, and the cards before it
 #define heap bober_heap
+/// The bytes of address space the heap takes, at most 64 GiB; a program linked with one of its own defines it less,
+/// where little is, as on iOS.
+__attribute__((weak)) const int64_t bober_heap_size = (int64_t)PAGES * PAGE;
 static uint8_t *cards;
 static uint64_t *refs;   // a bit for each word of the heap, set if it holds a ref
 static uint64_t *marks;  // a bit for each 16 bytes, set at an object's start if marked, or moved
@@ -157,9 +161,8 @@ void bober_gc_isolate(void **at) {
   begin(id, at);
 }
 
-/// The 16 sizes up to 256 bytes, then 4 for each doubling, of up to SMALL; the heap's address space, its cards after,
-/// and one past them that the barrier marks for a place outside the heap; and its bits: bober_start's first (src/rt.c),
-/// with the frame pointer of the program's entry.
+/// The 16 sizes up to 256 bytes, then 4 for each doubling, of up to SMALL; the heap's address space, its cards before,
+/// and its bits after: bober_start's first (src/rt.c), with the frame pointer of the program's entry.
 void bober_gc_start(void **at) {
   for (int c = 0; c < CLASSES; c++)
     sizes[c] = sizes[c + CLASSES] = sizes[c + 2 * CLASSES] =
@@ -168,13 +171,14 @@ void bober_gc_start(void **at) {
     while (16 * n > sizes[c]) c++;
     classOf[n] = c;
   }
-  int64_t n = (int64_t)PAGES * PAGE;
-  heap = mmap(0, n + (n >> CARD) + 8 + n / 64 + n / 128, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
-  if (heap == MAP_FAILED) fputs("out of memory\n", stderr), exit(1);
+  int64_t n = bober_heap_size;
+  if (n % PAGE || n > (int64_t)PAGES * PAGE) fputs("gc: bober_heap_size not pages, or over 64 GiB\n", stderr), abort();
+  cards = mmap(0, CARDS + n + n / 64 + n / 128, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+  if (cards == MAP_FAILED) fputs("out of memory\n", stderr), exit(1);
+  heap = (char *)cards + CARDS;
   // Above 4 GiB, so that a number below 2^32 a packed union holds in its refs' word is no ref (§4.4).
   if ((uintptr_t)heap >> 32 == 0) fputs("gc: the heap below 4 GiB\n", stderr), abort();
-  cards = (uint8_t *)heap + n;
-  refs = (uint64_t *)(cards + (n >> CARD) + 8), marks = refs + n / 512;
+  refs = (uint64_t *)(heap + n), marks = refs + n / 512;
   for (const Let *l = bober_lets; l < bober_lets_end; l++)
     if (l->offset) *l->offset = lets_size, lets_size += (l->size + 15) & ~15;
   begin(0, at);
@@ -191,9 +195,10 @@ int bober_frozen(void *p) {
   return a < (uintptr_t)frozen_top * PAGE && pages[a / PAGE].kind == FROZEN;
 }
 
+/// As the write barrier: a place outside the heap marks the last card, or one past the heap's, which none scans.
 void bober_written(void *p) {
-  uint64_t card = (uint64_t)((char *)p - heap) >> CARD, spare = (uint64_t)PAGES * PAGE >> CARD;
-  cards[card < spare ? card : spare] = 1;
+  uint64_t card = (uint64_t)((char *)p - heap) >> CARD;
+  cards[card < CARDS ? card : CARDS - 1] = 1;
 }
 
 /// n free pages in a row, of kind, their memory zero, the running isolate's.
@@ -207,7 +212,7 @@ static uint32_t take(int n, int kind) {
       break;
     }
   if (n == 1) hint = p + 1;
-  if (p + n > PAGES) fputs("out of memory\n", stderr), exit(1);
+  if ((int64_t)(p + n) * PAGE > bober_heap_size) fputs("out of memory\n", stderr), exit(1);
   if (p + n > top) __atomic_store_n(&top, p + n, __ATOMIC_RELEASE);
   for (int i = 0; i < n; i++) pages[p + i] = (Page){i ? REST : kind, 0, 0, i ? i : n, h_.id};
   next[p] = h_.owned;
