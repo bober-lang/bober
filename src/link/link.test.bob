@@ -1139,3 +1139,31 @@ test "a kept image whose bytes would be 2 GiB or more is not made" {
 	}
 	assert startsWith(error, "the image would be ") && endsWith(error, " bytes, 2 GiB or more")
 }
+
+test "a continued image that freezes a lazy object each link keeps the frozen unit's record once" {
+	// Of many names, and pointers to those the links after it define, so that each of those sets the frozen unit's anew.
+	const syms: Symbol[] = []
+	const fixups: Fixup[] = []
+	for (const i of 0 ... 299) {
+		syms.push(new Symbol(`big${i}`, Global, 0))
+	}
+	for (const i of 1 ... 8) {
+		syms.push(new Symbol(`lz${i}`, Weak))
+		fixups.push(new Fixup(8 * (i as u64), Abs64, 299 + i, 0))
+	}
+	const wants = (name: string,
+		x: string) => obj(name, Data, [0, 0], [new Symbol(x, Global)], [new Fixup(0, Abs64, 0, 0)])
+	const l = kept()
+	l.lazily(() => [member(obj("z", Data, new u64[](18), syms, fixups))])
+	let image = file(keep(l, [wants("a", "big0")]))
+	const top = (file: string) => read(new Bytes(file), 0x200, "arm64")!.regions[6].top
+	const first = top(image)
+	for (const i of 1 ... 8) {
+		const m = kept(image)
+		m.lazily(() => [member(obj(`z${i}`, Data, [0], [new Symbol(`lz${i}`, Global, 0)]))])
+		image = file(keep(m, [wants(`b${i}`, `lz${i}`)]))
+	}
+	// Each link adds a name and a unit's record, not another of the frozen unit's, of some 9 KiB.
+	const last = top(image)
+	assert last - first < 1024
+}
