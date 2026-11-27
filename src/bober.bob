@@ -29,7 +29,7 @@ import { File, stderr, stdin, stdout } from "../std/io"
 import { arch, os } from "../std/os"
 import { ParseError, codePoint, replace, split, trim, utf8 } from "../std/string"
 import * as decl from "./bc/decl"
-import { Bodies, Reached, abi, readFacts, sigMarks, signatures, write, writeFacts } from "./bc/file"
+import { Bodies, Reached, abi, header, readFacts, sigMarks, signatures, write, writeFacts } from "./bc/file"
 import { Program } from "./bc/program"
 import { show } from "./bc/show"
 import { glue, includesOf, sysroot } from "./c/bind"
@@ -926,9 +926,8 @@ function keep(p: Program, mains: i32[], f: Compile, stale: string[], none: bool)
 		const tuned = encode(f.tuned)
 		for (const m of 0 ... p.modules.length - 1) {
 			const x = p.modules[m]
-			const made = x.bc + (bound.get(x.path)?.bytes(x.path) ?? "")
 			const spec = symbolPath(p, m, false)
-			const v = unitVersion(p, m, made + tuned)
+			const v = unitVersion(p, m, x.bc, tuned)
 			const [fast, opt] = [`${spec}^O1${v}`, `${spec}^O2${v}`]
 			const e = p.fold.get(x.path)
 			if (e == null || e![1] != v) {
@@ -938,7 +937,7 @@ function keep(p: Program, mains: i32[], f: Compile, stale: string[], none: bool)
 				}
 			} else if (!stale.includes(x.path)) {
 				units[m] = has(opt) || has(fast) && !f.O2 && !promoted(f, has, fast)
-				x.kept = units[m] || has(`${x.path}^bc@${fnv(made)}`)
+				x.kept = units[m] || has(`${x.path}^bc@${fnv(madeOf(p, m, x.bc))}`)
 			}
 		}
 		for (const m of naming(p, l, old, "~", n => !defined.has(n))) {
@@ -1026,8 +1025,16 @@ function promoted(c: Compile, has: (name: string) => bool, fast: string): bool {
 	return !c.O1 && has(fast) && !c.compiled.has(fast)
 }
 
-/// The version of module m's unit made of what made says: of its source, and the hash of the rest.
-function unitVersion(p: Program, m: i32, made: string): string { return `@${p.modules[m].source}.${fnv(made)}` }
+/// What module m's unit and its bytecode alone are made of, of bytecode bc: its header, and its Bound's src by its hash.
+function madeOf(p: Program, m: i32, bc: string): string {
+	return header(bc) + (bound.get(p.modules[m].path)?.bytes(p.modules[m].path, true) ?? "")
+}
+
+/// The version of module m's unit of bytecode bc, compiled as rest says: of its source, and the hash of what it is
+/// made of (madeOf) and rest.
+function unitVersion(p: Program, m: i32, bc: string, rest: string): string {
+	return `@${p.modules[m].source}.${fnv(madeOf(p, m, bc) + rest)}`
+}
 
 /// Of p's modules, as monomorphized, the marks of their decls, which their units define, and the mark of the
 /// signatures of builtin/'s decls, whose functions emit calls unasked, which no bytecode names.
@@ -1413,8 +1420,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		for (const path of order) {
 			const m = p.module(path)
 			const x = p.modules[m]
-			const version = () => unitVersion(p, m, x.bc + (bound.get(path)?.bytes(path) ?? "") + learned)
-			const e = if (x.kept) p.fold.get(path)! else [path, version(), writeFacts(p, m)]
+			const e = if (x.kept) p.fold.get(path)! else [path, unitVersion(p, m, x.bc, learned), writeFacts(p, m)]
 			for (const bytes of e) {
 				text(bytes)
 			}
@@ -1435,19 +1441,17 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			l.remove(h)
 		}
 	}
-	// Of each unit of the program by name, its module, TPDE's name of it and LLVM's, its bytecode and Bound; and those
-	// to make.
-	const units = new HashMap[string, [i32, string, string, string, string]]()
+	// Of each unit of the program by name, its module, TPDE's name of it and LLVM's and its bytecode; and those to make.
+	const units = new HashMap[string, [i32, string, string, string]]()
 	const made: string[] = []
 	for (const m of 0 ... p.modules.length - 1) {
 		const path = p.modules[m].path
 		const bc = if (p.modules[m].bc != "") p.modules[m].bc else write(p, m, compiler)
-		const b = bound.get(path)?.bytes(path) ?? ""
 		if (!ms.includes(m)) {
 			// Not the program's: what a build links it from alone, <path>^bc@<version>, rather than check it again.
-			const name = `${path}^bc@${fnv(bc + b)}`
+			const name = `${path}^bc@${fnv(madeOf(p, m, bc))}`
 			if (lacks(name)) {
-				l.add(cached(new Object(name, machine.arch), bc, b, ""))
+				l.add(cached(new Object(name, machine.arch), bc, bound.get(path)?.bytes(path) ?? "", ""))
 			}
 			continue
 		}
@@ -1455,8 +1459,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		// names, keep it while they are. A release build's, which names none, is of its code as mono made it and what it
 		// names.
 		const own = if (c.release) `${signatures(p, m, bodies)[0]}` else ""
-		const version = unitVersion(p, m,
-			bc + b + (if (o.dyn) "" else `${own}${learned}${facts.nounwind.get(m) ?? ""}`))
+		const version = unitVersion(p, m, bc, if (o.dyn) "" else `${own}${learned}${facts.nounwind.get(m) ?? ""}`)
 		const spec = symbolPath(p, m, o.dyn)
 		const [fast, opt] = [`${spec}^O1${version}`, if (c.release) `${path}^R${version}` else `${spec}^O2${version}`]
 		parts.push(if (o.dyn) `${path}${version}` else fast)
@@ -1468,7 +1471,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 			}
 			made.push(wanted)
 		}
-		units.set(wanted, [m, fast, opt, bc, b])
+		units.set(wanted, [m, fast, opt, bc])
 	}
 	// A unit held that names a mark the units unlinked defined but none of the program's does is made anew, as what of
 	// another it is made of changed, if the program's, TPDE's unless -O2, as after an edit; else unlinked. Then, of the
@@ -1501,7 +1504,8 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		}
 	}
 	for (const u of made) {
-		const [m, _, opt, bc, b] = units.get(u)!
+		const [m, _, opt, bc] = units.get(u)!
+		const b = bound.get(p.modules[m].path)?.bytes(p.modules[m].path) ?? ""
 		if (p.modules[m].kept) {
 			throw new Unkept(`the image lacks ${u}`)
 		}

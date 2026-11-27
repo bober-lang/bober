@@ -1323,3 +1323,15 @@ test "a program of a package builds while another file of it does not compile, a
 	const edited = built([["bad/lib.bob", lib("2")]], "-O1", "bad/main.bob")
 	assert first == "1\n" && edited == "2\n"
 }
+
+test "an importer's unit is kept after a body-only edit of a module it imports, and made anew after a layout or value" {
+	const lib = (field: string, k: i32, one: i32) =>
+		`export class P {\n${field}\tx = 1\n}\n\nexport const K = ${k}\n\nexport function f(): i32 { return ${one} }\n`
+	const main = "import { K, P, f } from \"./lib\"\n\nfunction main() { print(`${new P().x + K + f()}`) }\n"
+	anew()
+	built([["lib.bob", lib("", 3, 1)], ["main.bob", main]], "-O1")
+	const body = remade([["lib.bob", lib("", 3, 2)]])
+	const layout = remade([["lib.bob", lib("\tprivate y = 0\n", 3, 2)]])
+	const value = remade([["lib.bob", lib("\tprivate y = 0\n", 4, 2)]])
+	assert [body, layout, value] == ["6\nlib.bob", "6\nlib.bob main.bob", "7\nlib.bob main.bob"]
+}
