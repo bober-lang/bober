@@ -129,10 +129,11 @@ export function read(p: Program, files: string[], compiler: u64, sources: u64[],
 		}
 		abis.set(heads[i].path, heads[i].abi)
 	}
+	const tops = new HashMap[i32, u64]()
 	for (const x of heads) {
 		for (const i of 0 ... x.paths.length - 1) {
 			const m = p.module(x.paths[i])
-			if (x.hashes[i] != abis.get(x.paths[i]) && (m < 0 || !holds(p, m, x.path, x.hashes[i]))) {
+			if (x.hashes[i] != abis.get(x.paths[i]) && (m < 0 || !holds(p, m, x.path, x.hashes[i], tops))) {
 				return null
 			}
 		}
@@ -174,9 +175,15 @@ export function abi(p: Program, m: i32): u64 {
 }
 
 /// Whether h, the hash the module at path has of module m, which it uses (Out.dep), is m's now: its ABI hash, or, of
-/// one a test file imports, tops.
-export function holds(p: Program, m: i32, path: string, h: u64): bool {
-	return h == abi(p, m) || endsWith(path, ".test.bob") && h == tops(p, m)
+/// one a test file imports, tops, kept by module in made, which holds while the ABIs they hash do.
+export function holds(p: Program, m: i32, path: string, h: u64, made: HashMap[i32, u64]): bool {
+	if (h == abi(p, m) || !endsWith(path, ".test.bob")) {
+		return h == abi(p, m)
+	}
+	if (made.get(m) == null) {
+		made.set(m, tops(p, m))
+	}
+	return h == made.get(m)
 }
 
 /// Of module m, the hash of the signatures of each of its top-level decls, which a test file importing it sees
