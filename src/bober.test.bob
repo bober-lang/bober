@@ -5,6 +5,7 @@ import { fromCString } from "../std/c"
 import { HashMap } from "../std/collections/hashmap"
 import { exists, glob, mkdirAll, open, remove, stat } from "../std/fs"
 import { base } from "../std/fs/path"
+import { os } from "../std/os"
 import * as process from "../std/process"
 import { replace, split } from "../std/string"
 import { Build, Compile, Run, build, format, ignored, machine, monoKept, onUnit, runTests, toolchain } from "./bober"
@@ -1061,4 +1062,24 @@ test "a leaf edited at -O1, no code of a module unchanged is read of its file" {
 		decoding = path => {}
 	}
 	assert out == "3\n" && unique(read) == []
+}
+
+test "an image edited twice is read by nm and codesign, of each unit's symbols once, but of no mark" {
+	if (os != "macos") {
+		return
+	}
+	const dep = (n: i32) => `export function one(): i32 { return ${n} }\n`
+	const main = "import { one } from \"./dep\"\n\nfunction main() { print(`${one()}`) }\n"
+	anew()
+	built([["dep.bob", dep(1)], ["main.bob", main]], "-O1")
+	built([["dep.bob", dep(2)]], "-O1")
+	const out = built([["dep.bob", dep(3)]], "-O1")
+	const [image, listed] = [`${home()}/build/image.so`, `${home()}/nm`]
+	const nm = process.run(["nm", "-ap", image], listed)
+	const lines = split(readFile(listed)!, "\n")
+	const ones = lines.filter(l => indexOf(l, "/dep.bob^") >= 0 && endsWith(l, ":one^mono")).length
+	const mains = lines.filter(l => indexOf(l, "/main.bob^") >= 0 && endsWith(l, ":main^mono")).length
+	const marks = lines.filter(l => indexOf(l, " _~") >= 0).length
+	const signed = process.run(["codesign", "-v", image])
+	assert out == "3\n" && nm == 0 && ones == 1 && mains == 1 && marks == 0 && signed == 0
 }

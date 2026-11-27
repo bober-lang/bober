@@ -60,9 +60,9 @@ export class Image {
 	/// The address of each Desc fixup's bytes, and the offset of its S + A in the thread's copy.
 	descs: [u64, u64][] = []
 	/// Of the units whose entries in the symbol table are new: the symbols with a name each defines, their value their
-	/// address and their section 0; where its entries go, of the format's size each; and where their names are, each
+	/// address and their section 0; where its entries go, of the format's size each; and where each one's name is,
 	/// `_<name>` and a NUL. From and to where the table's entries are, the first zeros; and the names, the first a NUL.
-	symbols: [Symbol[], u64, u64][] = []
+	symbols: [Symbol[], u64, u64[]][] = []
 	symtab: [u64, u64] = [0, 0]
 	strtab: [u64, u64] = [0, 0]
 
@@ -178,6 +178,8 @@ class Name {
 	/// the continued image has it, null if new.
 	chain: u64 = 0
 	was: Name | null = null
+	/// In a kept image, where its name is, after a `_` and before a NUL, as the symbol table has it; 0 until saved.
+	at: u64 = 0
 
 	constructor(name: string) { this.name = name }
 }
@@ -1303,6 +1305,13 @@ export class Linker {
 			}
 		}
 		const [kept, table] = [s.regions[s.regions.length - 2], s.regions[s.regions.length - 1]]
+		// The names made, in one block, each as the symbol table has it.
+		const made = this.touched.filter(g => g < this.shared && this.names[g]!.was == null).map(g => this.names[g]!)
+		let name = this.block(kept, made.map(n => `_${n.name}\x00`).join(""), "names")[0]
+		for (const n of made) {
+			n.at = name + 1
+			name += (n.name.length + 2) as u64
+		}
 		const records = new Writer()
 		for (const u of ks.map(k => this.held(k)).filter(u => u.blocks.length == 0 && u.object.name != "")) {
 			const what = u.object.name
@@ -1314,17 +1323,29 @@ export class Linker {
 			u.encoded = record(records, u.object, u.at, again, u.names.map(g => if (g < this.shared) g else -1), u.frozen)
 			u.blocks = [this.block(kept, u.encoded, what),
 				this.block(kept, u.links.slice(0, 24 * (leading(u.object) as u64)), what)]
-			// Not those whose address a later link may change: of a thread's copy.
-			const syms = u.object.symbols.filter(x => {
+			// Not those whose address a later link may change: of a thread's copy; nor marks, named `~...`, which no debugger
+			// or profiler has a use for. Each with the index of its shared name, whose name the symbol table's is, else -1.
+			const syms: [Symbol, i32][] = []
+			for (const j of 0 ... u.object.symbols.length - 1) {
+				const x = u.object.symbols[j]
 				const sec = if (x.section >= 0) u.object.sections[x.section] else null
-				return this.format.symbol > 0 && x.name != "" && sec != null && u.at[x.section] != dropped
-					&& sec.kind < Kept && sec.kind != Thread
-			}).map(x => new Symbol(x.name, x.binding, 0, u.at[x.section] + x.value, x.size))
+				if (this.format.symbol > 0 && x.name != "" && !startsWith(x.name, "~") && sec != null
+					&& u.at[x.section] != dropped && sec.kind < Kept && sec.kind != Thread) {
+					syms.push([new Symbol(x.name, x.binding, 0, u.at[x.section] + x.value, x.size),
+						if (u.names[j] < this.shared) u.names[j] else -1])
+				}
+			}
 			if (syms.length > 0) {
 				const size = this.format.symbol * (syms.length as u64)
 				u.blocks.push([this.room(table, 1, from => from + size, what), size])
-				u.blocks.push(this.block(kept, syms.map(x => `_${x.name}\x00`).join(""), what))
-				image.symbols.push([syms, u.blocks[2][0], u.blocks[3][0]])
+				u.blocks.push(this.block(kept, syms.filter(e => e[1] < 0).map(e => `_${e[0].name}\x00`).join(""), what))
+				const names: u64[] = []
+				let at = u.blocks[3][0]
+				for (const [x, g] of syms) {
+					names.push(if (g >= 0) this.entry(g).at - 1 else at)
+					at += if (g >= 0) 0 else (x.name.length + 2) as u64
+				}
+				image.symbols.push([syms.map(e => e[0]), u.blocks[2][0], names])
 			}
 		}
 		// The table of units, made anew once over half full, of room for 4 times as many: of the slots taken, and the
@@ -1386,16 +1407,13 @@ export class Linker {
 			this.at = this.block(kept, b, "names")[0]
 			this.entries = this.at + 12 * this.cap
 		}
-		// The entries of the names read or made, of those made after their names, all of which take one block.
-		const made = this.touched.filter(g => g < this.shared && this.names[g]!.was == null)
-		let name = this.block(kept, made.map(g => this.names[g]!.name).join(""), "names")[0]
+		// The entries of the names read or made.
 		for (const g of this.touched.filter(g => g < this.shared)) {
 			const n = this.names[g]!
 			const p = this.entries + entry * (g as u64)
 			if (n.was == null) {
-				this.bytes.put(p, name, 8)
+				this.bytes.put(p, n.at, 8)
 				this.bytes.put(p + 8, n.name.length as u64, 4)
-				name += n.name.length as u64
 			}
 			this.bytes.put(p + 12, (n.library + 1) as u64, 4)
 			this.bytes.put(p + 16, (n.unit + 1) as u64, 4)
@@ -1777,6 +1795,7 @@ export class Linker {
 			throw new CompileError("the names' entries are broken")
 		}
 		const n = new Name(b.slice(at, at + size))
+		n.at = at
 		n.library = (b.get(p + 12, 4) as i32) - 1
 		n.unit = (b.get(p + 16, 4) as i32) - 1
 		n.section = (b.get(p + 20, 4) as i32) - 1

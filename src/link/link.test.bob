@@ -530,7 +530,8 @@ test "the Zero sections of a kept image are a segment its file has no bytes of, 
 test "a kept image's units keep their records and symbols where they are, and only new ones' are written" {
 	const first = keep(kept(), [obj("a", Code, [0xd65f03c0], [new Symbol("f", Global, 0)])], ["f"])
 	const image = keep(kept(file(first)), [obj("b", Code, [0xd65f03c0], [new Symbol("g", Global, 0)])], ["f", "g"])
-	const [g, _, name] = image.symbols[0]
+	const [g, _, names] = image.symbols[0]
+	const name = names[0]
 	assert image.symbols.length == 1 && g.length == 1 && g[0].name == "g" && g[0].value == at(image, "g")
 	// Of the Kept sections' region, but its last byte, the top a later link adds from, only g's slot in the names' table
 	// and its entry, and b's in the units'.
@@ -974,4 +975,10 @@ test "a continued link of an image of thousands of units reads only those it cha
 		now.push(reached(keep(linker(""), units, names)))
 	}
 	assert reads.every(n => n <= 4) && was == now
+}
+
+test "a kept image's symbol table has no marks, the names starting with ~" {
+	const image = keep(kept(), [obj("a", Code, [0xd65f03c0], [new Symbol("f", Global, 0), new Symbol("~m", Weak, 0)])])
+	const names = image.symbols.map(e => e[0].map(s => s.name).join(" "))
+	assert names == ["f"]
 }

@@ -7,7 +7,7 @@ import { arm64 } from "./arm64"
 import { Bytes, big, le, mapped, pad, u, zeros } from "./bytes"
 import { Linker } from "./link"
 import { macho } from "./macho"
-import { Code, Data, Desc, Fixup, Global, Object, Section, Symbol, Thread, Unwind } from "./object"
+import { Call, Code, Data, Desc, Fixup, Global, Local, Object, Section, Symbol, Thread, Unwind, Weak } from "./object"
 import { sha256 } from "./sha256"
 
 /// A section named name of kind, of bytes.
@@ -171,4 +171,60 @@ test "a kept dylib's symbol table has each unit's symbols, those of one it holds
 	again.add(text("g"))
 	const [second, more] = symbols(file(again))
 	assert first == "_f" && second == "_f _g" && more.slice(0, entries.length) == entries
+}
+
+test "a kept dylib's symbol table names the units' symbols, local ones too, but marks, over generations" {
+	// Unit name, defining defines, a local symbol and a mark, of a call to calls if not "".
+	const text = (name: string, defines: string, calls: string) => {
+		const code = if (calls != "") "\x00\x00\x00\x94\xc0\x03\x5f\xd6" else zeros(8)
+		const o = object(name, [section("text", Code, code)])
+		o.symbols = [new Symbol(`loc_${name}`, Local, 0, 4), new Symbol(defines, Global, 0),
+			new Symbol(`~m${defines}`, Weak, 0)]
+		if (calls != "") {
+			o.symbols.push(new Symbol(calls, Global))
+			o.sections[0].fixups.push(new Fixup(0, Call, 3, 0))
+		}
+		return o
+	}
+	// The names of the entries in LC_SYMTAB, sorted, and how many are past its strings.
+	const symbols = (d: Bytes) => {
+		const head = d.slice(0, 0x1000)
+		let at = 32
+		while (u(head, at, 4) != 0x2) {
+			at += u(head, at + 4, 4) as i32
+		}
+		const [entries, n] = [u(head, at + 8, 4), u(head, at + 12, 4)]
+		const [strings, size] = [u(head, at + 16, 4), u(head, at + 20, 4)]
+		const names: string[] = []
+		let outside = 0
+		for (const i of 0 ... (n as i32) - 1) {
+			const x = d.get(entries + 16 * (i as u64), 4)
+			if (x != 0) {
+				outside += if (x >= size) 1 else 0
+				let end = strings + x
+				while (d.get(end, 1) != 0) {
+					end++
+				}
+				names.push(d.slice(strings + x, end))
+			}
+		}
+		sort(names)
+		return `${names.join(" ")} outside ${outside}`
+	}
+	const l = new Linker(arm64, macho, new Bytes())
+	l.add(text("f@1", "f", ""))
+	l.add(text("h@1", "h", "f"))
+	const d1 = file(l)
+	const l2 = new Linker(arm64, macho, new Bytes(mapped(d1)))
+	l2.remove("f@1")
+	l2.add(text("f@2", "f", ""))
+	l2.add(text("g@1", "g", "h"))
+	const d2 = file(l2)
+	const l3 = new Linker(arm64, macho, new Bytes(mapped(d2)))
+	l3.remove("h@1")
+	l3.add(text("h@2", "h", "g"))
+	const d3 = file(l3)
+	const [first, second, third] = [symbols(d1), symbols(d2), symbols(d3)]
+	assert first == "_f _h _loc_f@1 _loc_h@1 outside 0" && second == "_f _g _h _loc_f@2 _loc_g@1 _loc_h@1 outside 0"
+		&& third == "_f _g _h _loc_f@2 _loc_g@1 _loc_h@2 outside 0"
 }
