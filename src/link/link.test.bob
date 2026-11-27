@@ -124,6 +124,12 @@ function section(image: Image, name: string): u64 {
 /// The n bytes of image at address a, little-endian.
 function get(image: Image, a: u64, n: i32 = 4): u64 { return image.bytes.get(a, n) }
 
+/// Where unit k's block i is, of a kept image of arm64: in its entry, after the table of units, of 12 bytes each.
+function block(image: Image, k: i32, i: i32): u64 {
+	const [at, cap, _] = read(image.bytes, 0x200, "arm64")!.units
+	return at + 12 * cap + 72 * (k as u64) + 12 * (i as u64)
+}
+
 test "a strong definition is taken over a weak one, and the first weak one over the others" {
 	const a = obj("a", Data, [1, 0], [new Symbol("x", Weak, 0), new Symbol("y", Weak, 0, 4)])
 	const b = obj("b", Data, [2, 0], [new Symbol("x", Global, 0), new Symbol("y", Weak, 0)])
@@ -456,7 +462,7 @@ test "a kept image holds a lazy object for good, and a definition over its weak 
 		[obj("d", Code, [0], [new Symbol("w", Global, 0)])]) throws new Stale("w of d is defined for good")
 }
 
-test "the sections a kept image has for good are not one where another object's are between" {
+test "the sections a kept image has for good are laid out, which a name added bounds only as stale" {
 	const wants = (name: string,
 		x: string) => obj(name, Data, [0, 0], [new Symbol(x, Global)], [new Fixup(0, Abs64, 0, 0)])
 	const has = (name: string, x: string) => named("f", obj(name, Data, [1], [new Symbol(x, Global, 0)]))
@@ -466,7 +472,9 @@ test "the sections a kept image has for good are not one where another object's 
 	const m = kept(first)
 	m.lazily(() => [member(has("zy", "y"))])
 	const second = file(keep(m, [wants("b", "y")]))
-	assert keep(kept(second), []).sections.filter(s => s[0] == "f").length == 2
+	const x = obj("x", Data, [0, 0], [new Symbol("__start_f", Global)], [new Fixup(0, Abs64, 0, 0)])
+	const stale = "__start_f bounds sections the image has laid out\n__start_f is not defined, but x names it"
+	assert keep(kept(second), [x]) throws new Stale(stale)
 }
 
 test "a region of a kept image has room its file has a hole for, and one that is full is stale" {
@@ -525,14 +533,14 @@ test "a kept image's units keep their records and symbols where they are, and on
 	const [g, _, name] = image.symbols[0]
 	assert image.symbols.length == 1 && g.length == 1 && g[0].name == "g" && g[0].value == at(image, "g")
 	// Of the Kept sections' region, but its last byte, the top a later link adds from, only g's slot in the names' table
-	// and its entry.
+	// and its entry, and b's in the units'.
 	const [from, to] = [first.strtab[0], first.strtab[1] - 1]
 	const [was, now] = [first.bytes.slice(from, to), image.bytes.slice(from, to)]
 	let changed = 0
 	for (const i of 0 ... was.length - 1) {
 		changed += if (now[i] != was[i]) 1 else 0
 	}
-	assert now.length == was.length && changed <= 12 + 72
+	assert now.length == was.length && changed <= 2 * (12 + 72)
 	assert image.symtab[0] == first.symtab[0] && image.symtab[1] == first.symtab[1] + 24
 	assert image.bytes.slice(name, name + 3) == "_g\x00"
 }
@@ -570,13 +578,9 @@ test "a kept image whose table of names is full is stale" {
 
 test "a kept image whose record of a unit is cut short is stale once it is read" {
 	const first = keep(kept(), [obj("a", Code, [0xd65f03c0], [new Symbol("f", Global, 0)])], ["f"])
-	// The head, where the 16 bytes after the headers say, written anew of a's record's block a byte shorter.
-	const s = read(first.bytes, 0x200, "arm64")!
-	const [at, size] = s.units[1][3][0]
-	s.units[1][3][0] = [at, size - 1]
-	const head = write(s, "arm64")
-	first.bytes.set(first.bytes.get(0x200, 8), head)
-	first.bytes.put(0x208, head.length as u64, 8)
+	// a's entry, of its record's block a byte shorter.
+	const p = block(first, 1, 0) + 8
+	first.bytes.put(p, first.bytes.get(p, 4) - 1, 4)
 	assert keep(kept(file(first)), []).exports.length == 1
 	const l = kept(file(first))
 	l.remove("a")
@@ -588,7 +592,8 @@ test "a kept image whose frozen unit's record has its tail flipped is stale once
 	l.lazily(() => [member(obj("z", Code, [0xd65f03c0], [new Symbol("lz", Global, 0), new Symbol("here", Local, 0)]))])
 	const first = keep(l, [obj("a", Code, [0x94000000], [new Symbol("lz", Global)], [new Fixup(0, Call, 0, 0)])])
 	// The record's last byte, of the local's name, then one of the 126th, which the table has not.
-	const [at, size] = read(first.bytes, 0x200, "arm64")!.units[0][3][0]
+	const p = block(first, 0, 0)
+	const [at, size] = [first.bytes.get(p, 8), first.bytes.get(p + 8, 4)]
 	first.bytes.put(at + size - 1, first.bytes.get(at + size - 1, 1) ^ 0x7f, 1)
 	assert keep(kept(file(first)), []).exports.length == 0
 	const b = obj("b", Code, [0x94000000], [new Symbol("puts", Global)], [new Fixup(0, Call, 0, 0)])
@@ -685,13 +690,14 @@ function listing(o: Object): Object {
 	return o
 }
 
-/// The object version made that is named name, or `bounds`, of 0xb0 and pointers to the start and stop of the
-/// `listed` sections, which it lists too.
+/// The object version made that is named name, or `bounds`, which defines it, of 0xb0 and pointers to the start and
+/// stop of the `listed` sections, which it lists too.
 function made(name: string): Object {
 	if (name == "bounds") {
-		return listing(named("bounds", obj(name, Data, [0xb0, 0, 0, 0, 0, 0],
-			[new Symbol("", Local, 0), new Symbol("__start_listed", Global), new Symbol("__stop_listed", Global)],
-			[new Fixup(8, Abs64, 1, 0), new Fixup(16, Abs64, 2, 0)])))
+		return listing(named("bounds",
+			obj(name, Data, [0xb0, 0, 0, 0, 0, 0],
+			[new Symbol("", Local, 0), new Symbol("__start_listed", Global), new Symbol("__stop_listed", Global),
+			new Symbol("bounds", Global, 0)], [new Fixup(8, Abs64, 1, 0), new Fixup(16, Abs64, 2, 0)])))
 	}
 	const iv = split(name.slice(1, name.length), ".")
 	return version(decimal(iv[0]) as u64, decimal(iv[1]) as u64)
@@ -713,7 +719,7 @@ function relinked(l: Linker, objects: Object[], names: () => string[]): Image | 
 /// The image linked anew of the objects named; null if it is an error.
 function anew(names: string[]): Image | null throws Stale {
 	try {
-		return keep(kept(), names.map(made))
+		return keep(kept(), names.map(made), ["bounds"])
 	} catch (e: CompileError) {
 		return null
 	}
@@ -723,8 +729,9 @@ function anew(names: string[]): Image | null throws Stale {
 /// call reaches a stub, `br x17` its third instruction.
 function reached(image: Image, objects: Object[]): u64[] {
 	const words: u64[] = []
+	const listed = pointed(image)
 	for (const o of objects) {
-		const at = section(image, o.sections[0].name)
+		const at = listed.find(p => get(image, p) == new Bytes(o.sections[0].bytes).get(0, 4)) ?? 0
 		for (const f of o.sections[0].fixups) {
 			const to = if (f.kind == Call) jumped(image, at + f.at) else get(image, at + f.at, 8)
 			words.push(if (to == 0 || get(image, to + 8) == 0xd61f0220) 0 else get(image, to))
@@ -733,25 +740,30 @@ function reached(image: Image, objects: Object[]): u64[] {
 	return words
 }
 
-/// The words of the objects image's `listed` sections point to, as held from the start of them to the stop, but zeros;
-/// ascending.
-function listed(image: Image): u64[] {
-	const words: u64[] = []
-	const bounds = section(image, "bounds")
-	let at = get(image, bounds + 8, 8)
-	while (at < get(image, bounds + 16, 8)) {
-		const p = get(image, at, 8)
-		if (p != 0) {
-			words.push(get(image, p))
+/// What the image's `listed` sections point to, the objects' first sections, as held from the start of them to the
+/// stop, but zeros.
+function pointed(image: Image): u64[] {
+	const ps: u64[] = []
+	const bounds = at(image, "bounds")
+	let p = get(image, bounds + 8, 8)
+	while (p < get(image, bounds + 16, 8)) {
+		if (get(image, p, 8) != 0) {
+			ps.push(get(image, p, 8))
 		}
-		at += 8
+		p += 8
 	}
+	return ps
+}
+
+/// The words of the objects image's `listed` sections point to; ascending.
+function listed(image: Image): u64[] {
+	const words = pointed(image).map(p => get(image, p))
 	sort(words)
 	return words
 }
 
 test "a kept image continued, by objects added, removed and replaced, reaches what one linked anew of its objects does" {
-	let cur = file(keep(kept(), [made("bounds")]))
+	let cur = file(keep(kept(), [made("bounds")], ["bounds"]))
 	const versions = new u64[](10)
 	let linked = 0
 	let remade = 0
@@ -805,7 +817,7 @@ test "a kept image continued, by objects added, removed and replaced, reaches wh
 		const words = objects.map(o => new Bytes(o.sections[0].bytes).get(0, 4))
 		sort(words)
 		// Not in the assert, which shows what its calls are given: the images, their bytes too.
-		const again = keep(kept(), objects)
+		const again = keep(kept(), objects, ["bounds"])
 		const [was, now] = [reached(image!, versioned), reached(again, versioned)]
 		const [first, second] = [listed(image!), listed(again)]
 		assert was == now && first == words && second == words
@@ -913,4 +925,53 @@ test "of a continued image, the names the objects removed define, and the object
 	const naming = l.naming("~a").join(" ")
 	const none = l.naming("~b").length
 	assert defined == "~a" && naming == "a" && none == 0
+}
+
+test "a continued link of an image of thousands of units reads only those it changes, and reaches what a link anew does" {
+	// Unit i of version v: a call to name, and f<i>, a word of i << 8 | v.
+	const unit = (i: i32, v: i32, name: string) => obj(`u${i}@${v}`, Code, [0x94000000, (i << 8 | v) as u64],
+		[new Symbol(`f${i}`, Global, 0, 4), new Symbol(name, Global)], [new Fixup(0, Call, 1, 0)])
+	const next = (i: i32) => `f${(i + 1) % 3000}`
+	const z = obj("z", Code, [0xd65f03c0], [new Symbol("lz", Global, 0)])
+	const linker = (file: string) => {
+		const l = kept(file)
+		l.lazily(() => [member(z)])
+		return l
+	}
+	const units: Object[] = []
+	for (const i of 0 ... 2999) {
+		units.push(unit(i, 0, next(i)))
+	}
+	let image = keep(linker(""), units)
+	// Per link, how many units it read, and the words the calls of the units replaced reach, as continued and anew.
+	const reads: i32[] = []
+	const names: string[] = []
+	const [was, now]: [string[], string[]] = [[], []]
+	const reached = (image: Image) => names.map(n => get(image, jumped(image, at(image, n) - 4))).join(" ")
+	// u7 replaced 4 times; one added, then removed; one added of a call to puts, through a stub, and to lz, of z,
+	// lazy; then others replaced.
+	for (const step of 1 ... 12) {
+		const l = linker(file(image))
+		const added: Object[] = []
+		if (step <= 4 || step >= 9) {
+			const i = if (step <= 4) 7 else step * 331 % 3000
+			l.remove(units[i].name)
+			units[i] = unit(i, step, next(i))
+			added.push(units[i])
+			if (!names.includes(`f${i}`)) {
+				names.push(`f${i}`)
+			}
+		} else if (step == 6) {
+			l.remove(units[units.length - 1].name)
+			units.pop()
+		} else {
+			units.push(unit(3000 + step, 0, if (step == 7) "puts" else if (step == 8) "lz" else next(step)))
+			added.push(units[units.length - 1])
+		}
+		image = keep(l, added, names)
+		reads.push(l.reads)
+		was.push(reached(image))
+		now.push(reached(keep(linker(""), units, names)))
+	}
+	assert reads.every(n => n <= 4) && was == now
 }

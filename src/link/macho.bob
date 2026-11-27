@@ -9,7 +9,7 @@
 //! thread's copy, a key of dyld's, and the offset in the copy, which the writer sets.
 
 import { HashMap } from "../../std/collections/hashmap"
-import { indexOf, partitionPoint, sortBy, startsWith } from "../../std/algo"
+import { indexOf, partitionPoint, sort, sortBy, startsWith } from "../../std/algo"
 import { ParseError, lower, replace, split, trim } from "../../std/string"
 import { Reader, Writer } from "../../std/encoding/binary"
 import { alignUp, max, min } from "../../std/math"
@@ -528,7 +528,18 @@ function write(image: Image) throws CompileError {
 	// are `__eh_frame`, as the unwinder finds them by that name. It reads them entry by entry up to one of length 0, so
 	// each run of zeros there, the hole a kept image has where an object was, is made a CIE of no FDE: one of 8 bytes
 	// at least, as an object's entries are padded to that.
-	const vars = image.sections.filter(s => s[0] == "__thread_vars")
+	// The descriptors, of 24 bytes each, which a Desc ends, those one after another as one.
+	const descs = image.descs.map(d => d[0] - 16)
+	sort(descs)
+	const vars: [string, u64, u64][] = []
+	for (const at of descs) {
+		const last = vars.length - 1
+		if (last >= 0 && vars[last][1] + vars[last][2] == at) {
+			vars[last] = ["__thread_vars", vars[last][1], vars[last][2] + 24]
+		} else {
+			vars.push(["__thread_vars", at, 24])
+		}
+	}
 	const cuts = [from, to, image.inits[0], image.inits[1], image.thread[0], image.thread[1]]
 	for (const [_, at, size] of vars) {
 		cuts.push(...[at, at + size])

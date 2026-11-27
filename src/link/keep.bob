@@ -1,5 +1,6 @@
 //! What the file of a kept image (link.bob) holds of its linker, for a later link to continue it: the State, its head
-//! where the 16 bytes after the format's headers say, and each unit's record in a block of its own (Linker.save).
+//! where the 16 bytes after the format's headers say; the table of units and their entries (Linker.held); and each
+//! unit's record in a block of its own (Linker.save).
 
 import { bytes as random } from "../../std/crypto/random"
 import { Reader, Writer } from "../../std/encoding/binary"
@@ -9,7 +10,7 @@ import { Bytes, u } from "./bytes"
 import { Fixup, Local, Object, Section, Symbol } from "./object"
 
 /// What the head starts with, and the version of the encoding.
-const magic = "bober image 15"
+const magic = "bober image 16"
 
 /// Where the sections of one of regions, or of a run, are: from start to top, of which holes, in order, are free; cap,
 /// which top stays below, where the next region starts.
@@ -28,20 +29,18 @@ export class Region {
 /// What a link continues a kept image from, beside its bytes.
 export class State {
 	regions: Region[] = []
-	/// The objects of the frozen unit, then those given, stripped, as read but their symbols and fixups (rest), of no
-	/// name and blocks where one was unlinked; where their sections are; the bytes an object was read from, its record,
-	/// so that it must be as read: "" if it is not; and the blocks of the file it has, from and to where: its record's,
-	/// its symbols' links (Linker.chained), then their entries in the symbol table and their names, if the format has one;
-	/// and its blocks of the rebases' run (Unit).
-	units: [Object, u64[], string, [u64, u64][], [u64, u64][]][] = []
-	/// The table of names (Linker.slot) and their entries: where, of how many slots, and how many names it has; and its
-	/// hashes' seed.
+	/// The table of units (Linker.held) and their entries, and that of names (Linker.slot) and theirs: each where, of
+	/// how many slots, and how many it has; and their hashes' seed.
+	units: [u64, u64, u64] = [0, 0, 0]
 	names: [u64, u64, u64] = [0, 0, 0]
 	seed: u64 = 0
-	/// Of the frozen units: per name and kind, from and to where their sections are. The pointers the loader adds the
-	/// image's address to that are not of words, ascending, and sets to an import's, and the descs, as Image has them;
-	/// and the veneers, by the island and the address they jump to.
-	sections: [string, u8, u64, u64][] = []
+	/// The units with a section of a group; and the names of Const sections laid out as Data (Linker.kind).
+	grouped: i32[] = []
+	pointed: string[] = []
+	/// The names of the frozen units' sections. The pointers the loader adds the image's address to that are not of
+	/// words, ascending, and sets to an import's, and the descs, as Image has them; and the veneers, by the island and
+	/// the address they jump to.
+	sections: string[] = []
 	rebases: u64[] = []
 	binds: [u64, i32, string, bool, i64][] = []
 	descs: [u64, u64][] = []
@@ -73,21 +72,7 @@ export function write(s: State, arch: Arch): string {
 	w.raw(magic)
 	str(arch)
 	list(w, s.regions, region)
-	list(w, s.units, u => {
-		list(w, u[1], at => w.uleb(at))
-		for (const blocks of [u[3], u[4]]) {
-			list(w, blocks, b => {
-				w.uleb(b[0])
-				w.uleb(b[1])
-			})
-		}
-	})
-	list(w, s.sections, e => {
-		str(e[0])
-		w.u8(e[1])
-		w.uleb(e[2])
-		w.uleb(e[3])
-	})
+	list(w, s.sections, str)
 	// The rebases, each as how far it is past the one before.
 	let last: u64 = 0
 	list(w, s.rebases, at => {
@@ -110,10 +95,12 @@ export function write(s: State, arch: Arch): string {
 		w.uleb(v[1])
 		w.uleb(v[2])
 	})
-	for (const v of [s.inits[0], s.inits[1], s.thread[0], s.thread[1], s.thread[2], s.names[0], s.names[1], s.names[2],
-		s.seed]) {
+	for (const v of [s.inits[0], s.inits[1], s.thread[0], s.thread[1], s.thread[2], s.units[0], s.units[1], s.units[2],
+		s.names[0], s.names[1], s.names[2], s.seed]) {
 		w.uleb(v)
 	}
+	list(w, s.grouped, k => w.uleb(k as u64))
+	list(w, s.pointed, str)
 	list(w, s.runs, e => {
 		str(e[0])
 		region(e[1])
@@ -123,15 +110,17 @@ export function write(s: State, arch: Arch): string {
 	return w.bytes
 }
 
-/// The record of o, a unit's object as State has it, of the fixups of section i keeps says, and of the indices of its
-/// symbols' names: its head, the sections but their fixups, first. Written after what w has, which it shares.
-export function record(w: Writer, o: Object, keeps: (i: i32, f: Fixup) => bool, names: i32[]): string {
+/// The record of o, a unit's object stripped, its sections at at, of the fixups of section i keeps says, and of the
+/// indices of its symbols' names: its head, the sections but their fixups, first. Written after what w has, which it
+/// shares.
+export function record(w: Writer, o: Object, at: u64[], keeps: (i: i32, f: Fixup) => bool, names: i32[]): string {
 	const from = w.bytes.length
 	const str = (x: string) => {
 		w.uleb(x.length as u64)
 		w.raw(x)
 	}
 	str(o.name)
+	let i = 0
 	list(w, o.sections, sec => {
 		str(sec.name)
 		w.u8(sec.kind)
@@ -139,6 +128,8 @@ export function record(w: Writer, o: Object, keeps: (i: i32, f: Fixup) => bool, 
 		w.uleb(sec.align)
 		w.uleb(sec.size)
 		str(sec.group)
+		w.uleb(at[i])
+		i++
 	})
 	for (const i of 0 ... o.sections.length - 1) {
 		list(w, o.sections[i].fixups.filter(f => keeps(i, f)), f => {
@@ -148,7 +139,7 @@ export function record(w: Writer, o: Object, keeps: (i: i32, f: Fixup) => bool, 
 			w.sleb(f.addend)
 		})
 	}
-	let i = 0
+	i = 0
 	list(w, o.symbols, sym => {
 		str(sym.name)
 		w.u8(sym.binding)
@@ -190,14 +181,7 @@ export function read(file: Bytes, headers: u64, arch: Arch): State | null {
 		}
 		const s = new State()
 		s.regions = many(r, region)
-		s.units = many(r, () => {
-			const at = many(r, () => r.uleb())
-			const blocks: [u64, u64][] = many(r, () => [r.uleb(), r.uleb()])
-			const relr: [u64, u64][] = many(r, () => [r.uleb(), r.uleb()])
-			const kept = if (blocks.length == 0) "" else block(blocks[0][0], blocks[0][1])
-			return [if (kept == "") new Object("", arch) else object(new Reader(kept), arch), at, kept, blocks, relr]
-		})
-		s.sections = many(r, () => [str(), r.u8(), r.uleb(), r.uleb()])
+		s.sections = many(r, str)
 		let last: u64 = 0
 		s.rebases = many(r, () => {
 			last += r.uleb()
@@ -208,8 +192,11 @@ export function read(file: Bytes, headers: u64, arch: Arch): State | null {
 		s.veneers = many(r, () => [r.uleb(), r.uleb(), r.uleb()])
 		s.inits = [r.uleb(), r.uleb()]
 		s.thread = [r.uleb(), r.uleb(), r.uleb()]
+		s.units = [r.uleb(), r.uleb(), r.uleb()]
 		s.names = [r.uleb(), r.uleb(), r.uleb()]
 		s.seed = r.uleb()
+		s.grouped = many(r, () => r.uleb() as i32)
+		s.pointed = many(r, str)
 		s.runs = many(r, () => [str(), region()])
 		s.exports = many(r, str)
 		s.libraries = many(r, str)
@@ -219,19 +206,31 @@ export function read(file: Bytes, headers: u64, arch: Arch): State | null {
 	}
 }
 
-/// The object whose record r reads, of arch, but its symbols and fixups.
-function object(r: Reader, arch: Arch): Object throws ParseError {
+/// The object of a unit's record, of arch, but its symbols and fixups, and where its sections are; null if the record
+/// is not as written.
+export function head(record: string, arch: Arch): [Object, u64[]] | null {
+	try {
+		return object(new Reader(record), arch)
+	} catch (e: ParseError) {
+		return null
+	}
+}
+
+/// The object whose record r reads, of arch, but its symbols and fixups, and where its sections are.
+function object(r: Reader, arch: Arch): [Object, u64[]] throws ParseError {
 	const str = () => r.raw(r.uleb() as i32)
 	const o = new Object(str(), arch)
+	const at: u64[] = []
 	o.sections = many(r, () => {
 		const sec = new Section(str(), r.u8())
 		sec.order = str()
 		sec.align = r.uleb()
 		sec.size = r.uleb()
 		sec.group = str()
+		at.push(r.uleb())
 		return sec
 	})
-	return o
+	return [o, at]
 }
 
 /// Reads o's symbols and fixups from its record, of which read read the head, if named but the local symbols after
