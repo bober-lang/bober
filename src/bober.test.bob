@@ -9,6 +9,7 @@ import * as process from "../std/process"
 import { replace, split } from "../std/string"
 import { Build, Compile, Run, build, format, ignored, machine, monoKept, onUnit, runTests, toolchain } from "./bober"
 import { decoding } from "./bc/file"
+import { checking } from "./check"
 import { Bytes } from "./link/bytes"
 import { Linker } from "./link/link"
 import { Object } from "./link/object"
@@ -958,6 +959,67 @@ test "with no level given, a unit made anew as a mark it names is gone is TPDE's
 	assert mains() == ["O1"]
 	assert built([["lib.bob", lib(3)]], "") == "3\n"
 	assert mains() == ["O1"]
+}
+
+/// What main prints, built at -O1 as built does, and the files of home the build checked, by name.
+function rechecked(files: [string, string][]): string {
+	const names: string[] = []
+	checking = path => {
+		if (startsWith(path, home())) {
+			names.push(base(path))
+		}
+	}
+	try {
+		const out = built(files, "-O1")
+		sort(names)
+		return `${out}${names.join(" ")}`
+	} finally {
+		checking = path => {}
+	}
+}
+
+test "a leaf edited, only it is checked again, and each unit made is as a build anew makes it" {
+	const lib = (k: i32) => `export function k(): i32 { return ${k} }\n\nconst unused${k} = ${k}\n`
+	const mid = "import { k } from \"./lib\"\n\nexport function m(): i32 { return k() + 1 }\n"
+	const main = "import { m } from \"./mid\"\n\nfunction main() { print(`${m()}`) }\n"
+	anew()
+	const first = rechecked([["lib.bob", lib(1)], ["mid.bob", mid], ["main.bob", main]])
+	const whole = (x: Object) => `${shape(x)[0]}\n${shape(x)[1]}`
+	const units = new HashMap[string, string]()
+	onUnit = x => units.set(x.name, whole(x))
+	let edited = ""
+	try {
+		edited = rechecked([["lib.bob", lib(2)]])
+	} finally {
+		onUnit = null
+	}
+	const made = units.size
+	let [same, differ] = [0, 0]
+	onUnit = x => {
+		const u = units.get(x.name)
+		same += if (u != null && u == whole(x)) 1 else 0
+		differ += if (u != null && u != whole(x)) 1 else 0
+	}
+	anew()
+	try {
+		built([], "-O1")
+	} finally {
+		onUnit = null
+	}
+	assert first == "2\nlib.bob main.bob mid.bob" && edited == "3\nlib.bob" && made > 0 && same == made && differ == 0
+}
+
+test "a signature changed, the modules importing it are checked again, of each whose ABI that changed too, and no others" {
+	const lib = (t: string) => `export type Num = ${t}\n\nexport function k(): Num { return 1 }\n`
+	const mid = "import { Num, k } from \"./lib\"\n\nexport function m(): Num { return k() + 1 }\n"
+	const top = "import { m } from \"./mid\"\n\nexport function t(): i64 { return m() + 1 }\n"
+	const solo = "export function s(): i32 { return 5 }\n"
+	const main = "import { t } from \"./top\"\nimport { s } from \"./solo\"\n\nfunction main() { print(`${t()} ${s()}`) }\n"
+	anew()
+	const first = rechecked([["lib.bob", lib("i32")], ["mid.bob", mid], ["top.bob", top], ["solo.bob", solo],
+		["main.bob", main]])
+	const edited = rechecked([["lib.bob", lib("i64")]])
+	assert first == "3 5\nlib.bob main.bob mid.bob solo.bob top.bob" && edited == "3 5\nlib.bob mid.bob top.bob"
 }
 
 test "a test file importing a private function is compiled anew once its type changed" {

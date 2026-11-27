@@ -588,8 +588,18 @@ class Module {
 	info: [i32, HashMap[string, Member]][] = []
 	handed: ((next: Checked) => void)[] = []
 	warnings: TypeError[] = []
+	/// Of one linked, how its names are bound, until they are.
+	link: (() => void) | null = null
 
 	constructor(path: string) { this.path = path }
+
+	/// This, its names bound.
+	bound(): Module {
+		const l = this.link
+		this.link = null
+		l?.()
+		return this
+	}
 }
 
 /// The modules the bundle or the cache holds (src/lift.bob), made from the decls linked into its Program rather than
@@ -608,26 +618,28 @@ class Linked {
 		this.p = lift.prog
 	}
 
-	/// The module at path, of its top-level decls but tests, done; null if lift has none, loading those it uses by load
-	/// (Lift.module).
+	/// The module at path, of its top-level decls but tests, done, bound once imported (Module.bound) but builtin/'s;
+	/// null if lift has none, loading those it uses by load (Lift.module).
 	module(path: string, load: (path: string) => bool): Module | null throws CompileError {
 		const m = this.lift.module(path, load)
 		if (m < 0) {
 			return null
 		}
 		const x = new Module(path)
-		for (const d of this.p.modules[m].decls.filter(d => this.p.decls[d].kind != decl.Test)) {
-			const name = this.p.strings[this.p.decls[d].name]
-			const b = this.binding(d)
-			b.symbol = `${path}:${name}`
-			x.tops.set(name, b)
-			if ((this.p.decls[d].mods & decl.Export) != 0) {
-				x.names.push(name)
-				x.exports.set(name, b)
+		x.link = () => {
+			for (const d of this.p.modules[m].decls.filter(d => this.p.decls[d].kind != decl.Test)) {
+				const name = this.p.strings[this.p.decls[d].name]
+				const b = this.binding(d)
+				b.symbol = `${path}:${name}`
+				x.tops.set(name, b)
+				if ((this.p.decls[d].mods & decl.Export) != 0) {
+					x.names.push(name)
+					x.exports.set(name, b)
+				}
 			}
 		}
 		x.done = true
-		return x
+		return if (builtin(path)) x.bound() else x
 	}
 
 	private binding(d: i32): Binding {
@@ -1085,7 +1097,7 @@ class Checker {
 		for (const p of if (builtin(m.path) || indexOf(m.path, ": ") >= 0 && !ts) [] else first) {
 			const loaded = modules.load(p)
 			if (loaded instanceof Module) {
-				m.imports.push(loaded)
+				m.imports.push(loaded.bound())
 				for (const name of if (ts) ["Promise"] else prelude) {
 					const b = loaded.exports.get(name)
 					if (b != null) {
@@ -1293,7 +1305,7 @@ class Checker {
 		if (m instanceof string) {
 			return this.report(s.loc, m)
 		}
-		this.m.imports.push(m)
+		this.m.imports.push(m.bound())
 		n.symbol = m.path + ":"
 		if (listed) {
 			const tests = endsWith(this.m.path, ".test.bob")

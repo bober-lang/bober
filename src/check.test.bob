@@ -1059,3 +1059,12 @@ test "an @Embed[\"deflate\"] module inflates the file into its length" {
 	assert packed.slice(0, 47) == "import { inflate } from \"std/compress/deflate\"\n"
 	assert packed.slice(packed.length - 5, packed.length) == ", 6)\n"
 }
+
+test "a module linked from the cache that no module checked imports is not bound, the code of its consts not read" {
+	const b = ["b.bob", "import { k } from \"a\"\nexport function f(): i32 { return k }", "a.bob", "export const k = 5"]
+	const main = (v: i32) => `import { f } from "b"\nexport function main(): i32 { return f() + ${v} }`
+	const read = (path: string) => source(path, main(2), b)
+	const p = lower(["main.bob"], [], built(main(1), b)[2][0], read, path => hash(read(path)))
+	const k = p.decls[p.find(p.module("a.bob"), -1, "k")]
+	assert p.modules[p.module("b.bob")].bc != "" && k.held == null && k.coded()
+}
