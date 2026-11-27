@@ -9,6 +9,7 @@
 #include <ranges>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "ir.hpp"
 #include "tpde.h"
@@ -21,6 +22,9 @@ using tpde::SymRef;
 struct Adaptor {
 	Module *m;
 	u32 cur = 0;
+	/// The functions and globals each unit's object holds, in the order made, and the unit being compiled.
+	std::vector<std::vector<u32>> held;
+	u32 unit = 0;
 	std::vector<u32> fns, allocas;
 	/// If collected, the current function's parameters, instructions and allocas that hold refs, each with the block it
 	/// is defined in, the entry for the parameters and allocas.
@@ -38,10 +42,25 @@ struct Adaptor {
 	static constexpr bool TPDE_PROVIDES_HIGHEST_VAL_IDX = true;
 	static constexpr bool TPDE_LIVENESS_VISIT_ARGS = true;
 
-	explicit Adaptor(Module *m) : m(m) {
+	/// Fails if two units define a global of one name, as each unit checks only its own.
+	explicit Adaptor(Module *m) : m(m), held(m->names.size()) {
+		std::unordered_set<std::string_view> globals;
 		for (const Sym &s : m->syms) {
-			if (m->vals[s.val].op == Op::Function && !s.removed) {
-				fns.push_back(s.val);
+			if (m->held(s.val)) {
+				held[s.unit].push_back(s.val);
+				if (!s.local && !s.weak && m->defined(s.val) && !globals.insert(s.name).second) {
+					m->fail("the symbol " + s.name + " is defined twice");
+				}
+			}
+		}
+	}
+	/// Has TPDE compile unit u next.
+	void select(u32 u) {
+		unit = u;
+		fns.clear();
+		for (u32 v : held[u]) {
+			if (m->vals[v].op == Op::Function) {
+				fns.push_back(v);
 			}
 		}
 	}
@@ -178,6 +197,15 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 
 	explicit Base(Adaptor *a) : B(a), syms(a->m->syms.size()) {}
 
+	/// Forgets the symbols of the unit compiled, for the next.
+	void reset() {
+		B::reset();
+		std::ranges::fill(syms, SymRef());
+		libs.clear();
+		typeinfos.clear();
+		sections.clear();
+	}
+
 	Derived *derived() { return static_cast<Derived *>(this); }
 	Module &m() { return *this->adaptor->m; }
 	const Type &type(u32 v) { return m().types[m().vals[v].type]; }
@@ -187,7 +215,7 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 	bool cur_func_may_emit_calls() const { return true; }
 	SymRef cur_personality_func() {
 		u32 p = this->adaptor->sym().personality;
-		return p ? syms[m().vals[p].imm] : SymRef();
+		return p ? sym(p) : SymRef();
 	}
 	bool try_force_fixed_assignment(u32) const { return false; }
 	void setup_var_ref_assignments() {}
@@ -235,12 +263,36 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 	std::tuple<SymRef, i64, bool> address(u32 v) {
 		const Value &c = m().vals[v];
 		u32 base = c.op == Op::Addr ? m().ops(v)[0] : v;
-		return {syms[m().vals[base].imm], c.op == Op::Addr ? i64(c.imm) : 0, m().defined(base)};
+		bool here = m().defined(base) && m().sym(base).unit == this->adaptor->unit;
+		return {sym(base), c.op == Op::Addr ? i64(c.imm) : 0, here};
 	}
 
-	SymRef lib(const std::string &name) {
+	/// The symbol of the function or global v: one its unit holds, made before any code, else one of its name, which
+	/// another unit defines, so it must not be local.
+	SymRef sym(u32 v) {
+		SymRef &s = syms[m().vals[v].imm];
+		if (s.valid()) {
+			return s;
+		}
+		const Sym &d = m().sym(v);
+		auto &names = m().names[this->adaptor->unit];
+		if (auto it = names.find(d.name); it != names.end() && syms[m().vals[it->second].imm].valid()) {
+			return s = syms[m().vals[it->second].imm];
+		}
+		if (d.local) {
+			m().fail("the local symbol " + d.name + " is used by another unit");
+		}
+		s = lib(d.name, d.weak);
+		if (d.hidden) {
+			this->assembler.sym_set_visibility(s, std::remove_reference_t<decltype(this->assembler)>::SymVisibility::HIDDEN);
+		}
+		return s;
+	}
+
+	SymRef lib(const std::string &name, bool weak = false) {
+		using enum tpde::Assembler::SymBinding;
 		SymRef &s = libs[name];
-		return s.valid() ? s : s = this->assembler.sym_add_undef(name, tpde::Assembler::SymBinding::GLOBAL);
+		return s.valid() ? s : s = this->assembler.sym_add_undef(name, weak ? WEAK : GLOBAL);
 	}
 
 	/// Defines the globals, now that every symbol exists to be relocated against.
@@ -248,26 +300,27 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 		using enum tpde::SectionKind;
 		using enum tpde::Assembler::SymBinding;
 		auto &as = this->assembler;
-		for (const Sym &s : m().syms) {
-			if (m().vals[s.val].op == Op::Global && !s.removed) {
+		const std::vector<u32> &held = this->adaptor->held[this->adaptor->unit];
+		for (u32 v : held) {
+			if (const Sym &s = m().sym(v); m().vals[v].op == Op::Global) {
 				auto binding = s.local ? LOCAL : s.weak ? WEAK : GLOBAL;
-				SymRef &sym = syms[m().vals[s.val].imm];
-				sym = s.init ? as.sym_predef_data(s.name, binding) : as.sym_add_undef(s.name, binding);
+				syms[m().vals[v].imm] = s.init ? as.sym_predef_data(s.name, binding) : as.sym_add_undef(s.name, binding);
 			}
 		}
-		for (const Sym &s : m().syms) {
-			if (s.hidden && !s.removed) {
-				as.sym_set_visibility(syms[m().vals[s.val].imm], std::remove_reference_t<decltype(as)>::SymVisibility::HIDDEN);
+		for (u32 v : held) {
+			if (m().sym(v).hidden) {
+				as.sym_set_visibility(syms[m().vals[v].imm], std::remove_reference_t<decltype(as)>::SymVisibility::HIDDEN);
 			}
 		}
-		for (const Sym &s : m().syms) {
-			if (m().vals[s.val].op != Op::Global || s.init == 0 || s.removed) {
+		for (u32 v : held) {
+			const Sym &s = m().sym(v);
+			if (m().vals[v].op != Op::Global || s.init == 0) {
 				continue;
 			}
 			std::vector<u8> data(type(s.init).size);
 			std::vector<std::pair<u64, u32>> relocs;
 			flatten(s.init, 0, data, relocs);
-			SymRef sym = syms[m().vals[s.val].imm];
+			SymRef sym = syms[m().vals[v].imm];
 			u32 align = s.align ? s.align : type(s.init).align;
 			if (m().vals[s.init].op == Op::Zero && !s.constant) {
 				as.sym_def_predef_zero(as.get_default_section(BSS), sym, data.size(), align);
@@ -955,7 +1008,7 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 		}
 		bool variadic = m().types[v.imm].n;
 		if (m().vals[callee].op == Op::Function) {
-			derived()->generate_call(syms[m().vals[callee].imm], args, res ? &*res : nullptr, variadic);
+			derived()->generate_call(sym(callee), args, res ? &*res : nullptr, variadic);
 		} else {
 			ValueRef target = this->val_ref(callee);
 			derived()->generate_call(target.part(0), args, res ? &*res : nullptr, variadic);
@@ -997,5 +1050,20 @@ struct Base : tpde::CompilerBase<Adaptor, Derived, Config> {
 		return s;
 	}
 };
+
+/// Compiles each unit of the adaptor's module with c, one compiler for all, into an object of its own.
+template <typename C> bool compileUnits(C &c, std::vector<std::vector<u8>> &out) {
+	for (u32 u = 0; u < c.adaptor->held.size(); u++) {
+		if (u > 0) {
+			c.reset();
+		}
+		c.adaptor->select(u);
+		if (!c.compile()) {
+			return false;
+		}
+		out.push_back(c.assembler.build_object_file());
+	}
+	return true;
+}
 
 } // namespace bober

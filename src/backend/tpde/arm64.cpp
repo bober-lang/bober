@@ -121,14 +121,10 @@ struct A64 : tpde::a64::CompilerA64<Adaptor, A64, bober::Base, ConfigA64>,
 	}
 };
 
-bool compile(Module &m, std::vector<u8> &out) {
+bool compile(Module &m, std::vector<std::vector<u8>> &out) {
 	Adaptor a(&m);
 	A64 c(&a);
-	if (!c.compile()) {
-		return false;
-	}
-	out = c.assembler.build_object_file();
-	return true;
+	return compileUnits(c, out);
 }
 
 } // namespace bober

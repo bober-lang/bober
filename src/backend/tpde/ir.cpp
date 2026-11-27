@@ -151,8 +151,9 @@ bool terminates(Op op) { return (op >= Op::Ret && op <= Op::Unreachable) || op =
 u32 symbol(Module &m, const char *name, Value v, Sym s) {
 	s.val = m.vals.size();
 	s.name = name;
+	s.unit = m.unit;
 	// Local symbols may share a name, as LLVM's would by renaming; the name then finds the first.
-	if (!s.name.empty() && !m.names.emplace(s.name, s.val).second && !s.local) {
+	if (!s.name.empty() && !m.names[m.unit].emplace(s.name, s.val).second && !s.local) {
 		return m.fail("the symbol " + s.name + " is defined twice");
 	}
 	v.type = type(m, Type::Ptr);
@@ -162,8 +163,18 @@ u32 symbol(Module &m, const char *name, Value v, Sym s) {
 }
 
 u32 named(Module &m, const char *name, Op op) {
-	auto it = m.names.find(name);
-	return it != m.names.end() && m.vals[it->second].op == op ? it->second : 0;
+	auto it = m.names[m.unit].find(name);
+	return it != m.names[m.unit].end() && m.vals[it->second].op == op ? it->second : 0;
+}
+
+/// Moves the function or global v to the unit being built, which defines it, and has its name find it there.
+void home(Module &m, u32 v) {
+	if (Sym &s = m.sym(v); s.unit != m.unit) {
+		s.unit = m.unit;
+		if (!s.name.empty()) {
+			m.names[m.unit][s.name] = v;
+		}
+	}
 }
 
 } // namespace
@@ -320,6 +331,7 @@ TpdeValueRef TpdeAddExternal(TpdeModuleRef m, const char *name, TpdeTypeRef t) {
 	return symbol(*m, name, {.op = Op::Global}, {.type = u32(t)});
 }
 void TpdeDefineGlobal(TpdeModuleRef m, TpdeValueRef g, TpdeValueRef init, int local, unsigned align) {
+	home(*m, g);
 	Sym &s = m->sym(g);
 	s.local = local != 0;
 	s.init = u32(init);
@@ -340,14 +352,14 @@ void TpdeReplace(TpdeModuleRef m, TpdeValueRef old, TpdeValueRef by) {
 		s.personality = s.personality == old ? by : s.personality;
 		s.init = s.init == old ? by : s.init;
 	}
-	m->names.erase(m->sym(by).name);
+	m->names[m->sym(by).unit].erase(m->sym(by).name);
 	m->sym(by).name = m->sym(old).name;
 	TpdeDeleteFunction(m, old);
-	m->names[m->sym(by).name] = by;
+	m->names[m->sym(by).unit][m->sym(by).name] = by;
 }
 void TpdeDeleteFunction(TpdeModuleRef m, TpdeValueRef fn) {
 	m->sym(fn).removed = true;
-	m->names.erase(m->sym(fn).name);
+	m->names[m->sym(fn).unit].erase(m->sym(fn).name);
 }
 void TpdeSetWeak(TpdeModuleRef m, TpdeValueRef g) { m->sym(g).weak = true; }
 void TpdeSetHidden(TpdeModuleRef m, TpdeValueRef g) { m->sym(g).hidden = true; }
@@ -360,6 +372,7 @@ TpdeTypeRef TpdeGetReturnType(TpdeModuleRef m, TpdeTypeRef t) { return m->elems(
 TpdeTypeRef TpdeGlobalGetValueType(TpdeModuleRef m, TpdeValueRef g) { return m->sym(g).type; }
 
 TpdeBasicBlockRef TpdeAppendBasicBlock(TpdeModuleRef m, TpdeValueRef fn) {
+	home(*m, fn);
 	m->blocks.push_back({.fn = u32(fn)});
 	m->sym(fn).blocks.n++;
 	return m->blocks.size() - 1;
@@ -556,7 +569,8 @@ const char *TpdeVerifyModule(TpdeModuleRef m) {
 void TpdeSetCollected(TpdeModuleRef m) { m->collected = true; }
 int TpdeHoldsRef(TpdeModuleRef m, TpdeTypeRef t) { return std::ranges::any_of(m->parts(m->types[t]), &Part::ref); }
 TpdeValueRef TpdeLayout(TpdeModuleRef m, TpdeTypeRef t) {
-	if (u32 have = m->layouts[t]) {
+	u32 &have = m->layouts[u64(m->unit) << 32 | t];
+	if (have) {
 		return have;
 	}
 	const Type &ty = m->types[t];
@@ -569,22 +583,32 @@ TpdeValueRef TpdeLayout(TpdeModuleRef m, TpdeTypeRef t) {
 		b = constant(*m, word, b);
 	}
 	TpdeValueRef fields[] = {constant(*m, word, ty.size), TpdeConstArray(m, word, bits.data(), bits.size())};
-	return m->layouts[t] = TpdeAddGlobal(m, "", TpdeConstStruct(m, fields, 2, 0), 1, 0);
+	return have = TpdeAddGlobal(m, "", TpdeConstStruct(m, fields, 2, 0), 1, 0);
 }
 void TpdeSetSection(TpdeModuleRef m, TpdeValueRef g, const char *name) { m->sym(g).section = name; }
 
-const char *TpdeEmit(TpdeModuleRef m, uint8_t **object, uint64_t *size) {
+void TpdeUnit(TpdeModuleRef m, unsigned n) {
+	m->unit = n;
+	m->names.resize(std::max<size_t>(m->names.size(), n + 1));
+}
+
+const char *TpdeEmit(TpdeModuleRef m, uint8_t **objects, uint64_t *sizes, unsigned n) {
 	if (const char *err = TpdeVerifyModule(m)) {
 		return err;
 	}
-	std::vector<u8> obj;
-	if (!compile(*m, obj) || !m->error.empty()) {
+	if (n != m->names.size()) {
+		m->fail(std::to_string(m->names.size()) + " units, not " + std::to_string(n));
+	}
+	std::vector<std::vector<u8>> objs;
+	if (!m->error.empty() || !compile(*m, objs) || !m->error.empty()) {
 		m->msg = m->error.empty() ? "TPDE could not compile the module" : m->error;
 		return m->msg.c_str();
 	}
-	*size = obj.size();
-	*object = static_cast<uint8_t *>(malloc(obj.size()));
-	memcpy(*object, obj.data(), obj.size());
+	for (size_t n = 0; n < objs.size(); n++) {
+		sizes[n] = objs[n].size();
+		objects[n] = static_cast<uint8_t *>(malloc(objs[n].size()));
+		memcpy(objects[n], objs[n].data(), objs[n].size());
+	}
 	return nullptr;
 }
 

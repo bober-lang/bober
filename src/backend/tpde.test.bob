@@ -8,6 +8,8 @@ import { LLVM } from "./llvm"
 import { Tpde } from "./tpde"
 import { CompileError } from "../error"
 import { ld } from "../bober"
+import { elf } from "../link/elf"
+import { Local } from "../link/object"
 import { getpid } from "unistd.h"
 
 test "a broken module does not verify" {
@@ -138,5 +140,92 @@ test "TPDE and LLVM pass each other's args and results where the other takes the
 	}
 	for (const f of [".callee.o", ".main.o", ""]) {
 		remove(out + f)
+	}
+}
+
+test "each unit of a module is an object of its own, naming the symbols of the others" {
+	if (os == "macos" || os == "windows") {
+		return // as above
+	}
+	const b = new Tpde("m")
+	b.collected()
+	const [i32, i64, r] = [b.int(32), b.int(64), b.ref()]
+	const pt = b.fn(i64, [i64])
+	// Unit 1: a switch dense enough for a jump table.
+	b.unit(1)
+	const pick = b.function("pick", pt, false)
+	b.at(b.block(pick))
+	const blocks = [0, 1, 2, 3, 4, 5, 6].map(_ => b.block(pick))
+	b.switch(b.param(pick, 0), [1, 2, 3, 4, 5, 6], blocks.slice(1, 7), blocks[0])
+	for (const k of 0 ... 6) {
+		b.at(blocks[k])
+		b.ret(b.constInt(i64, k * 10))
+	}
+	// Unit 2: a ref live across a call, in its stack map.
+	b.unit(2)
+	const kt = b.fn(r, [r])
+	const keep = b.function("keep", kt, false)
+	b.at(b.block(keep))
+	b.call(pt, pick, [b.constInt(i64, 1)])
+	b.ret(b.param(keep, 0))
+	// Unit 3: an invoke, unwinding to a landing pad, of a personality unit 0 defines.
+	b.unit(3)
+	const guard = b.function("guard", b.fn(i64, []), false)
+	const [entry, then, pad] = [b.block(guard), b.block(guard), b.block(guard)]
+	b.at(entry)
+	const v = b.invoke(pt, pick, [b.constInt(i64, 3)], then, pad)
+	b.at(then)
+	b.ret(v)
+	b.at(pad)
+	b.landingPad(b.constZero(b.ptr()))
+	b.ret(b.constInt(i64, -1))
+	b.unit(0)
+	const persona = b.function("persona", b.fn(i32, []), false)
+	b.at(b.block(persona))
+	b.ret(b.constInt(i32, 0))
+	b.personality(guard, persona)
+	const main = b.function("main", b.fn(i32, []), false)
+	b.at(b.block(main))
+	const sum = b.binary("add", b.call(pt, pick, [b.constInt(i64, 2)]), b.call(b.fn(i64, []), guard, []))
+	const kept = b.cast("ptrtoint", b.call(kt, keep, [b.constZero(r)]), i64)
+	b.ret(b.cast("trunc", b.binary("or", b.binary("xor", sum, b.constInt(i64, 50)), kept), i32))
+	b.verify()
+	const bytes = b.objects(4)
+	const objects = bytes.map(o => elf.read("m.o", o))
+	const defined = objects.map(o => o.symbols.filter(s => s.section >= 0 && s.binding != Local && s.name != "")
+		.map(s => s.name).join(" "))
+	assert defined == ["persona main", "pick", "keep", "guard"]
+	const named = objects.map(o => o.symbols.filter(s => s.section < 0 && s.name != "").map(s => s.name).join(" "))
+	assert named == ["pick guard keep", "", "pick", "pick persona"]
+	const maps = objects.map(o => o.sections.some(s => s.name == ".llvm_stackmaps"))
+	assert maps == [false, false, true, false]
+	const out = `/tmp/bober-units${getpid()}`
+	const files = ["0", "1", "2", "3"].map(n => `${out}.${n}.o`)
+	for (const n of 0 ... 3) {
+		writeFile(files[n], bytes[n])
+	}
+	ld(files, out)
+	const status = run([out])
+	assert status == 0
+	for (const f of [...files, out]) {
+		remove(f)
+	}
+}
+
+test "a unit naming a local function of another, or a global another defines too, is an error" {
+	for (const local of [true, false]) {
+		const b = new Tpde("m")
+		const t = b.fn(b.int(64), [])
+		b.unit(1)
+		const f = b.function("f", t, local)
+		b.at(b.block(f))
+		b.ret(b.constInt(b.int(64), 1))
+		b.unit(0)
+		const g = b.function(if (local) "g" else "f", t, false)
+		b.at(b.block(g))
+		b.ret(if (local) b.call(t, f, []) else b.constInt(b.int(64), 2))
+		b.verify()
+		assert b.objects(2) throws new CompileError(if (local) "the local symbol f is used by another unit"
+			else "the symbol f is defined twice")
 	}
 }

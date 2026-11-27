@@ -25,7 +25,7 @@ import { TpdeABISizeOfType, TpdeAShr, TpdeAdd, TpdeAddAttributeAtIndex, TpdeAddE
 	TpdeRealOEQ, TpdeRealOGE, TpdeRealOGT, TpdeRealOLE, TpdeRealOLT, TpdeRealONE, TpdeRealORD, TpdeRealUEQ, TpdeRealUGE,
 	TpdeRealUGT, TpdeRealULE, TpdeRealULT, TpdeRealUNE, TpdeRealUNO, TpdeReplace, TpdeSDiv, TpdeSExt, TpdeSIToFP,
 	TpdeSRem, TpdeSetInlineOnly, TpdeSetPersonalityFn, TpdeSetWeak, TpdeShl, TpdeSizeOf, TpdeStructType, TpdeSub,
-	TpdeTrunc, TpdeTypeOf, TpdeUDiv, TpdeUIToFP, TpdeURem, TpdeVerifyModule, TpdeVoidType, TpdeXor, TpdeZExt,
+	TpdeTrunc, TpdeTypeOf, TpdeUnit, TpdeUDiv, TpdeUIToFP, TpdeURem, TpdeVerifyModule, TpdeVoidType, TpdeXor, TpdeZExt,
 	TpdeBuildAtomicRMW, TpdeBuildAtomicCmpXchg, TpdeAtomicXchg, TpdeAtomicAdd, TpdeAtomicSub, TpdeAtomicAnd,
 	TpdeAtomicOr, TpdeAtomicXor } from "tpde/tpde.h"
 
@@ -257,13 +257,24 @@ export class Tpde implements Backend {
 	verify() { checked(TpdeVerifyModule(this.m)) }
 
 	/// The object file's bytes, ELF's.
-	object(): string {
-		const bytes: u64[] = [0]
-		const size: u64[] = [0]
-		checked(TpdeEmit(this.m, bytes, size))
-		const s = fromBytes(bytes[0], size[0])
-		free(bytes[0])
-		return s
+	object(): string { return this.objects(1)[0] }
+
+	unit(n: u32) { TpdeUnit(this.m, n) }
+
+	/// The objects of its n units, as many as it has.
+	objects(n: u32): string[] {
+		const [bytes, sizes]: [u64[], u64[]] = [[], []]
+		for (const _ of 1 ... n) {
+			bytes.push(0)
+			sizes.push(0)
+		}
+		checked(TpdeEmit(this.m, bytes, sizes, n))
+		const objects: string[] = []
+		for (const i of 0 ... n - 1) {
+			objects.push(fromBytes(bytes[i], sizes[i]))
+			free(bytes[i])
+		}
+		return objects
 	}
 
 	dispose() { TpdeModuleDispose(this.m) }

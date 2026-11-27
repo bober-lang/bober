@@ -92,6 +92,8 @@ struct Sym {
 	u32 val;
 	std::string name;
 	bool local = false, constant = false, removed = false, weak = false, hidden = false, inlineOnly = false;
+	/// The unit it was made or last defined in.
+	u32 unit = 0;
 	/// A global's initializer, or 0 if declared only.
 	u32 init = 0;
 	/// A global's section, or "" for the one its kind goes to.
@@ -133,15 +135,18 @@ struct Module {
 	std::vector<u32> addrs;
 	/// Type ids by a hash of kind, n and elements; a colliding type takes the next free hash.
 	std::unordered_map<u64, u32> typeIds;
-	std::unordered_map<std::string, u32> names;
+	/// Per unit, the symbols by name; a unit is a namespace of its own.
+	std::vector<std::unordered_map<std::string, u32>> names{1};
+	/// The unit symbols are made and defined in, each compiled into an object of its own.
+	u32 unit = 0;
 	/// Sorted by val once grouped.
 	std::vector<Attr> attrs;
 	u32 cur = 0;
 	/// Whether the collector walks the frames of its functions, which then keep the refs live across a call in the
 	/// frame, where the stack maps say.
 	bool collected = false;
-	/// The layout global made for each type.
-	std::unordered_map<u32, u32> layouts;
+	/// The layout global made for each type, by unit and type.
+	std::unordered_map<u64, u32> layouts;
 	/// The first thing that went wrong.
 	std::string error;
 
@@ -154,6 +159,9 @@ struct Module {
 	Sym &sym(u32 v) { return syms[vals[v].imm]; }
 	/// Whether the function or global v is defined in this object.
 	bool defined(u32 v) { return sym(v).init != 0 || (sym(v).blocks.n != 0 && !sym(v).inlineOnly); }
+	/// Whether its unit's object holds the function or global v: all it names if there is one unit, else what it defines,
+	/// as another unit's symbols are named only where used.
+	bool held(u32 v) { return !sym(v).removed && (names.size() == 1 || defined(v)); }
 	bool isConst(u32 v) const { return vals[v].op <= Op::Global; }
 	bool isAddr(u32 v) const { return vals[v].op >= Op::Addr && vals[v].op <= Op::Global; }
 	/// The attribute kind on index of the function or call v, or null.
@@ -178,7 +186,7 @@ struct Module {
 /// Sorts the instructions into their blocks, the blocks into their functions, and the attributes by value.
 void group(Module &m);
 
-/// Compiles m for the host, in x64.cpp or arm64.cpp, into an ELF object; false if TPDE could not.
-bool compile(Module &m, std::vector<u8> &out);
+/// Compiles m for the host, in x64.cpp or arm64.cpp, into an ELF object per unit; false if TPDE could not.
+bool compile(Module &m, std::vector<std::vector<u8>> &out);
 
 } // namespace bober

@@ -148,9 +148,12 @@ int TpdeHoldsRef(TpdeModuleRef m, TpdeTypeRef t);
 TpdeValueRef TpdeLayout(TpdeModuleRef m, TpdeTypeRef t);
 void TpdeSetSection(TpdeModuleRef m, TpdeValueRef g, const char *name);
 
+/// Has what is made or defined from here on go in unit n, 0 at first, which is compiled into an object of its own and
+/// is a namespace of its own: another unit's functions and globals it uses are named there, so must not be local.
+void TpdeUnit(TpdeModuleRef m, unsigned n);
 const char *TpdeVerifyModule(TpdeModuleRef m);
-/// An object file for this host, of size bytes at *object, from malloc, for the caller to free.
-const char *TpdeEmit(TpdeModuleRef m, uint8_t **object, uint64_t *size);
+/// An object file for this host per unit of its n, of sizes[u] bytes at objects[u], from malloc, for the caller to free.
+const char *TpdeEmit(TpdeModuleRef m, uint8_t **objects, uint64_t *sizes, unsigned n);
 
 #ifdef __cplusplus
 }
