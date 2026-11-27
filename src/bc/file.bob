@@ -93,9 +93,8 @@ function parts(k: kind.Kind, a: i32): Part[] {
 
 /// The file of module m of p as lowered, of the hash of the compiler.
 export function write(p: Program, m: i32, compiler: u64): string { return new Out(p, m).file(compiler) }
-/// Of module m's unit as mono made it, its facts, the modules it uses, the marks it names, typed and demand (Module):
-/// of a file's tables, with no decls of its own, so that they read back (readFacts) into a Program of its sources as
-/// they name decls, by name.
+/// Of module m's unit as mono made it, its facts and the modules it uses (Module): of a file's tables, with no decls
+/// of its own, so that they read back (readFacts) into a Program of its sources as they name decls, by name.
 export function writeFacts(p: Program, m: i32): string { return new Out(p, m, false).facts(p.modules[m]) }
 
 /// The module of a file writeFacts wrote, read into p, which holds its modules, with what it holds given it.
@@ -446,10 +445,6 @@ class Out {
 			uleb(w, if (fs[3 * j] == op.Field) this.str(fs[3 * j + 2]) else this.type(fs[3 * j + 2]))
 		}
 		ids(w, m.uses.map(x => this.dep(x)))
-		uleb(w, m.named.length)
-		for (const h of [...m.named, m.typed, m.demand]) {
-			w.fixed(h, 8)
-		}
 		const none = new Writer()
 		uleb(none, 0)
 		return this.sections(0, 0, none.bytes, [w.bytes])
@@ -764,12 +759,6 @@ export class In {
 		}
 		m.facts = fs
 		m.uses = this.list(() => this.of(this.deps))
-		m.named = []
-		for (const _ of 1 ... this.n()) {
-			m.named.push(this.r.fixed(8))
-		}
-		m.typed = this.r.fixed(8)
-		m.demand = this.r.fixed(8)
 		if (this.r.pos != this.end || this.end != this.r.bytes.length) {
 			throw this.bad()
 		}

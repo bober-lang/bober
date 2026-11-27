@@ -16,7 +16,7 @@
 //! it and `.f()[T]` for calling method f. An intrinsic, a function of builtin/ without a body, is called as itself with
 //! its type args, for emit.
 
-import { sort, stableSort, unique } from "../std/algo"
+import { sort, sortBy, stableSort, unique } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
 import { combine, fnv } from "../std/hash"
 import { min } from "../std/math"
@@ -35,15 +35,14 @@ import { builtin, builtinPath } from "./root"
 /// module's typed vars and builtin/'s plain exported functions are the roots, and only decls they reach are kept.
 /// Each module's decls and inits become their instances, its dispatch functions after its decls, and each instance's
 /// members those of its members' instances it owns, those of one decl in the order of their hashes, the same however p
-/// is read; its ABI hash, which mono changes, forgotten; each module's facts, typed and demand made (versions).
+/// is read; its ABI hash, which mono changes, forgotten; each module's facts and marks made (marks).
 /// If units, a module's decls are its roots and vars, and the statics of instances of its classes, which are one per
 /// program, its copies the others its code reaches, and its uses the modules of what else it names. A function of
 /// fewer than small ops, but a closure, is a copy of each module that reaches it, which compiled by itself may so
 /// inline it, and but a root not its module's own.
 /// Of modules kept (Module.kept), their facts are folded and their own code left uncopied, but what they demand of
-/// the others rooted; returns those kept whose typed or demand mono finds changed: their units are to be made anew
-/// too, of p read again.
-export function mono(p: Program, main: i32, units = false, small = 0): i32[] throws CompileError {
+/// the others rooted.
+export function mono(p: Program, main: i32, units = false, small = 0) throws CompileError {
 	return new Mono(p, units, small).run(main)
 }
 
@@ -99,7 +98,7 @@ class Mono {
 		this.small = small
 	}
 
-	run(main: i32): i32[] throws CompileError {
+	run(main: i32) throws CompileError {
 		const p = this.p
 		this.main = main
 		for (const m of p.modules) {
@@ -141,23 +140,22 @@ class Mono {
 			from = this.collect(from)
 		}
 		this.write()
-		const stale = this.versions()
+		this.marks()
 		for (const m of p.modules) {
 			m.abi = 0
 		}
 		if (!this.units) {
 			this.number()
 		}
-		return stale
 	}
 
-	/// Gives each module its typed, the hash of the interface and object types its unit lowers (its Type facts) and the
-	/// unions they are held as, and of the Init facts of all, its demand: the hash of the instances of its generic
-	/// classes with statics that units hold, whose statics it holds, and of the methods spreads bind of the instances of
-	/// generic classes it holds, which those hold as members. Returns the modules kept whose typed or demand changed.
-	private versions(): i32[] {
+	/// Gives each module its marks: of each interface and object type its unit lowers (its Type facts), the hash of it
+	/// and the union it is held as; and of the Init facts of all, its demand: the hash of its path, the instances of its
+	/// generic classes with statics that units hold, whose statics it holds, and the methods spreads bind of the
+	/// instances of generic classes it holds, which those hold as members.
+	private marks() {
 		const p = this.p
-		const ds = p.modules.map(_ => [] as u64[])
+		const ds = p.modules.map(m => [fnv(m.path)])
 		for (const mi of 0 ... p.modules.length - 1) {
 			const fs = p.modules[mi].facts
 			for (const j of 0 ... fs.length / 3 - 1) {
@@ -173,30 +171,18 @@ class Mono {
 				}
 			}
 		}
-		const stale: i32[] = []
 		for (const mi of 0 ... p.modules.length - 1) {
 			const m = p.modules[mi]
-			const typed = this.typedOf(m)
-			if (m.kept && (hashOf(ds[mi]) != m.demand || typed != m.typed)) {
-				stale.push(mi)
+			m.marks = [hashOf(ds[mi])]
+			for (const j of 0 ... m.facts.length / 3 - 1) {
+				const x = m.facts[3 * j + 1]
+				if (m.facts[3 * j] == op.Type) {
+					m.marks.push(combine(p.hash(x), p.hash(this.ins.held.get(x) ?? p.union([]))))
+				}
 			}
-			m.demand = hashOf(ds[mi])
-			m.typed = typed
+			sort(m.marks)
+			m.marks = unique(m.marks)
 		}
-		return stale
-	}
-
-	/// The hash of the types of m's Type facts and the unions they are held as.
-	private typedOf(m: Module): u64 {
-		const p = this.p
-		const hs: u64[] = []
-		for (const j of 0 ... m.facts.length / 3 - 1) {
-			const x = m.facts[3 * j + 1]
-			if (m.facts[3 * j] == op.Type) {
-				hs.push(combine(p.hash(x), p.hash(this.ins.held.get(x) ?? p.union([]))))
-			}
-		}
-		return hashOf(hs)
 	}
 
 	/// Whether class d has a static field.
@@ -509,8 +495,28 @@ class Mono {
 				m.facts = []
 				m.uses = []
 				m.copies = this.copies(m)
+				this.canonical(m)
 			}
 		}
+	}
+
+	/// Orders m's facts by their hashes, each once, and its uses by their paths, the same however p is read.
+	private canonical(m: Module) {
+		const p = this.p
+		const fs = m.facts
+		const keyed: [u64, i32][] = []
+		for (const j of 0 ... fs.length / 3 - 1) {
+			const b = if (fs[3 * j] == op.Field) fnv(p.strings[fs[3 * j + 2]]) else p.hash(fs[3 * j + 2])
+			keyed.push([combine(combine(fs[3 * j] as u64, p.hash(fs[3 * j + 1])), b), 3 * j])
+		}
+		sortBy(keyed, (x, y) => x[0] < y[0])
+		m.facts = []
+		for (const i of 0 ... keyed.length - 1) {
+			if (i == 0 || keyed[i][0] != keyed[i - 1][0]) {
+				m.facts.append(fs.slice(keyed[i][1], keyed[i][1] + 3))
+			}
+		}
+		sortBy(m.uses, (a, b) => p.modules[a].path < p.modules[b].path)
 	}
 
 	/// Whether the members of the owner of instance k hold it: but one apart, and if units, of a class, not an instance

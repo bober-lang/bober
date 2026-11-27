@@ -398,7 +398,7 @@ function main() { print(\`\${new Box[${t}](${v}).v} \${named(new ${c}())}\`) }\n
 	assert a == "1 A\n" && built([], "-O1", "b.bob") == "s B\n" && built([], "-O1", "a.bob") == a
 }
 
-test "programs that share a module keep its unit, one for both, though each instances its generic of its own" {
+test "programs that share a module each keep their unit of it, though each instances its generic of its own" {
 	const lib = `export class Box[T] {\n\tv: T\n\n\tconstructor(v: T) { this.v = v }\n}\n
 export class Made[T] {\n\tstatic made = 0\n\n\tconstructor() { Made[T].made++ }\n
 	count(): i32 { return Made[T].made }\n}\n
@@ -416,6 +416,7 @@ function main() {
 	assert a == "1 2 2 3\n" && built([], "-O1", "b.bob") == "s 2 2 3\n"
 	const both = held()
 	assert units.filter(o => both.indexOf(o) < 0) == [] && built([], "-O1", "a.bob") == a && held() == both
+	assert both.filter(o => startsWith(o, `${home()}/lib.bob^`) && indexOf(o, "^O1@") > 0).length == 2
 }
 
 test "programs of a package, each with a class of a module's interface, link the same units, its one for both" {
@@ -727,9 +728,10 @@ test "a unit made anew of the marks it defined and named before is the same, aft
 test "-release makes anew a module that copies a function of another, once a closure in that function changed" {
 	const main = "import { f } from \"./lib\"\n\nfunction main() {\n\tprint(`${f([1])}`)\n}\n"
 	anew()
-	assert built([["lib.bob", "export function f(xs: i32[]): i32 { return xs.map(x => x + 1)[0] }\n"], ["main.bob", main]],
-		"-release") == "2\n"
-	assert built([["lib.bob", "export function f(xs: i32[]): i32 { return xs.map(x => x + 2)[0] }\n"]], "-release") == "3\n"
+	assert built([["lib.bob", "export function f(xs: i32[]): i32 { return xs.map(x => x + 1)[0] }\n"],
+		["main.bob", main]], "-release") == "2\n"
+	assert built([["lib.bob", "export function f(xs: i32[]): i32 { return xs.map(x => x + 2)[0] }\n"]], "-release")
+		== "3\n"
 }
 
 test "a unit kept calls another module's function as edited, though a union that module's functions take grew" {
@@ -748,7 +750,7 @@ function main() { print(\`\${area(new A())} \${kb()}\`) }\n`
 
 /// What main prints, built as built does, and the files of home whose units the build made, by name, and * if it made
 /// others.
-function remade(files: [string, string][], level = "-O1"): string {
+function remade(files: [string, string][], level = "-O1", main = "main.bob"): string {
 	const made: string[] = []
 	onUnit = x => {
 		const name = if (startsWith(x.name, home())) base(split(x.name, "^")[0]) else "*"
@@ -757,7 +759,7 @@ function remade(files: [string, string][], level = "-O1"): string {
 		}
 	}
 	try {
-		const out = built(files, level)
+		const out = built(files, level, main)
 		sort(made)
 		return `${out}${made.join(" ")}`
 	} finally {
@@ -1082,4 +1084,242 @@ test "an image edited twice is read by nm and codesign, of each unit's symbols o
 	const marks = lines.filter(l => indexOf(l, " _~") >= 0).length
 	const signed = process.run(["codesign", "-v", image])
 	assert out == "3\n" && nm == 0 && ones == 1 && mains == 1 && marks == 0 && signed == 0
+}
+
+const shapes = (k = 0) => `export interface Sh { n(): i32 }
+
+export function pass(x: Sh): Sh { return x }
+
+export function bind(x: Sh): () => i32 { return x.n }
+
+export function k(): i32 { return ${k} }
+
+export class H {
+	a = 1 as u8
+	s: Sh | null = null
+	b = 2 as u8
+}
+`
+
+const total = `import { H, Sh, bind } from "./lib"
+
+export function total(xs: Sh[]): i32 {
+	let t = 0
+	for (const x of xs) {
+		const h = new H()
+		h.s = x
+		t += h.s!.n() + bind(x)() + h.a + h.b
+	}
+	return t
+}
+`
+
+/// main of k classes of Sh, which totals them, after the imports `head` and with the Sh values `first` before.
+function summed(k: i32, head = "", first = ""): string {
+	let [classes, xs] = ["", first]
+	for (const i of 1 ... k) {
+		classes += `class C${i} { n(): i32 { return ${i} } }\n`
+		xs += `pass(new C${i}()), `
+	}
+	return `import { Sh, k, pass } from "./lib"\nimport { total } from "./total"\n${head}\n${classes}
+function main() {\n\tconst xs: Sh[] = [${xs}]\n\tprint(\`\${total(xs) + k()}\`)\n}\n`
+}
+
+test "a union growing from none to three members is seen by the units that pass it, bind its methods and hold it packed" {
+	const other = "import { o } from \"./other\"\n"
+	anew()
+	assert built([["lib.bob", shapes()], ["total.bob", total], ["other.bob", "export function o(): i32 { return 0 }\n"],
+		["main.bob", summed(0, other)]], "-O1") == "0\n"
+	const one = remade([["main.bob", summed(1, other)]])
+	const two = remade([["main.bob", summed(2, other)]])
+	const three = remade([["main.bob", summed(3, other)]])
+	const all = "lib.bob main.bob total.bob" // each lowers Sh, its members changed, other.bob not
+	assert [one, two, three] == [`5\n${all}`, `12\n${all}`, `21\n${all}`]
+}
+
+test "a union shrinks once the module whose cast was its only source of a member is deleted" {
+	anew()
+	const extra = "import { Sh } from \"./lib\"\n\nclass E { n(): i32 { return 7 } }\n\nexport const e: Sh = new E()\n"
+	assert built([["lib.bob", shapes()], ["total.bob", total], ["extra.bob", extra],
+		["main.bob", summed(1, "import { e } from \"./extra\"\n", "e, ")]], "-O1") == "22\n"
+	remove(`${home()}/extra.bob`)
+	const out = remade([["main.bob", summed(1)]])
+	assert out == "5\nlib.bob main.bob total.bob"
+}
+
+test "a build continued after a body-only edit makes only the edited module's unit" {
+	anew()
+	assert built([["lib.bob", shapes(1)], ["total.bob", total], ["main.bob", summed(2)]], "-O1") == "13\n"
+	const out = remade([["lib.bob", shapes(2)]])
+	const kept = monoKept
+	built([], "-O1")
+	const all = monoKept
+	assert out == "14\nlib.bob" && kept == all - 1
+}
+
+test "a unit kept reads a field of a class another holds at its offset, once the union of a field before it grew" {
+	const lib = `export interface I { v(): i32 }
+
+export class A { v(): i32 { return 1 } }
+
+export class D {
+	s: I | null = null
+	k = 7
+}
+
+export class C { d = new D() }
+`
+	const m = "import { C } from \"./lib\"\n\nexport function k(c: C): i32 { return c.d.k }\n"
+	const main = (set: string) => `import { A, C } from "./lib"\nimport { k } from "./m"\n
+function main() {\n\tconst c = new C()\n${set}\tprint(\`\${k(c)} \${c.d.k}\`)\n}\n`
+	anew()
+	const first = built([["lib.bob", lib], ["m.bob", m], ["main.bob", main("")]], "-O1")
+	const edited = built([["main.bob", main("\tc.d.s = new A()\n")]], "-O1")
+	assert first == "7 7\n" && edited == "7 7\n"
+}
+
+test "units kept read a field of an object type at its offset, each lowering one that holds it, once a union of it grew" {
+	const lib = `export interface I { v(): i32 }
+
+export class A { v(): i32 { return 1 } }
+
+export type O = { s: I | null, k: i32 }
+export type T = { k: i32 }
+export type U = { s: I | null }
+
+export function make(): O { return { s: null, k: 7 } }
+`
+	const x1 = "import { T } from \"./lib\"\n\nexport function k1(t: T): i32 { return t.k }\n"
+	const x2 = "import { O } from \"./lib\"\n\nexport function k2(o: O): i32 { return o.k }\n"
+	const main = (set: string) => `import { A, make } from "./lib"\nimport { k1 } from "./x1"\nimport { k2 } from "./x2"\n
+function main() {\n\tconst o = make()\n${set}\tprint(\`\${k1(o)} \${k2(o)} \${o.k}\`)\n}\n`
+	anew()
+	const first = built([["lib.bob", lib], ["x1.bob", x1], ["x2.bob", x2], ["main.bob", main("")]], "-O1")
+	const edited = built([["main.bob", main("\to.s = new A()\n")]], "-O1")
+	assert first == "7 7 7\n" && edited == "7 7 7\n"
+}
+
+test "test files of two packages, given in turn, each keep their own world's facts once all were edited" {
+	const d = `${home()}/worlds`
+	const files = [`${d}/a.test.bob`, `${d}/sub/s.test.bob`, `${d}/z.test.bob`]
+	const f = new Compile()
+	f.O1 = true
+	anew()
+	mkdirAll(`${d}/sub`)
+	writeFile(`${d}/bober.pkg`, `{ "name": "@test/worlds" }\n`)
+	writeFile(`${d}/sub/bober.pkg`, `{ "name": "@test/sub" }\n`)
+	writeFile(`${d}/lib.bob`, `export function one(): i32 { return 1 }\n`)
+	const tests = (edit: string) => {
+		writeFile(files[0], `import { one } from "./lib"\n\ntest "a" { assert one() + 1 == 2 }\n${edit}`)
+		writeFile(files[1], `function f(): i32 { return 7 }\n\ntest "s" { assert f() + 1 == 8 }\n${edit}`)
+		writeFile(files[2], `import { one } from "./lib"\n\ntest "z" { assert one() + 6 == 7 }\n${edit}`)
+		return runTests(files, [], f).map(r => r()[0])
+	}
+	dir = `${home()}/build`
+	try {
+		const [first, edited] = [tests(""), tests("\nconst edited = 1\n")]
+		assert first == [0, 0, 0] && edited == [0, 0, 0]
+	} finally {
+		dir = "build"
+	}
+}
+
+test "a program of a package with a file that does not compile keeps the units of the package's other programs" {
+	const main = (lib: string, f: string) => `import { ${f} } from "./${lib}"\n\nfunction main() { print(${f}()) }\n`
+	anew()
+	mkdirAll(`${home()}/broken`)
+	const a = built([["broken/bober.pkg", `{ "name": "@test/broken" }\n`],
+		["broken/lib1.bob", `export function one(): string { return "1" }\n`],
+		["broken/lib2.bob", `export function two(): string { return "2" }\n`], ["broken/a.bob", main("lib1", "one")],
+		["broken/b.bob", main("lib2", "two")]], "-O1", "broken/a.bob")
+	const b = built([], "-O1", "broken/b.bob")
+	const lib2 = () => held().filter(o => startsWith(o, `${home()}/broken/lib2.bob^`) && indexOf(o, "^O1@") > 0)
+	const units = lib2()
+	const c = built([["broken/c.bob", "const c: i32 = nope\n"]], "-O1", "broken/a.bob")
+	const kept = lib2()
+	assert a == "1\n" && b == "2\n" && c == a && units.length == 1 && kept == units
+}
+
+test "a world whose union grew keeps the units of another world holding it as it was" {
+	const cls = "export class C1 { n(): i32 { return 1 } }\n\nexport class C2 { n(): i32 { return 2 } }\n"
+	const main = (xs: string) => `import { Sh, pass } from "./lib"\nimport { C1, C2 } from "./cls"\nimport { total } from "./total"\n
+function main() {\n\tconst xs: Sh[] = [${xs}]\n\tprint(\`\${total(xs)}\`)\n}\n`
+	anew()
+	const a = built([["lib.bob", shapes()], ["total.bob", total], ["cls.bob", cls], ["a.bob", main("pass(new C1())")],
+		["b.bob", main("pass(new C1())")]], "-O1", "a.bob")
+	const b = built([], "-O1", "b.bob")
+	const grown = built([["b.bob", main("pass(new C1()), pass(new C2())")]], "-O1", "b.bob")
+	const again = remade([], "-O1", "a.bob")
+	assert [a, b, grown, again] == ["5\n", "5\n", "12\n", "5\n"]
+}
+
+test "units reading fields of an interface holding itself, whose union of a field grew, are as made anew" {
+	const lib = `export interface I { v(): i32 }
+
+export class A { v(): i32 { return 1 } }
+
+export class B { v(): i32 { return 2 } }
+
+export interface T {
+	f: I | null
+	g: i32
+	next: T | null
+}
+
+export class N {
+	f: I | null = null
+	g = 5
+	next: T | null = null
+}
+
+export class H { t: T = new N() }
+`
+	const rf = "import { H } from \"./lib\"\n\nexport function rf(h: H): i32 { return h.t.f?.v() ?? 0 }\n"
+	const rg = "import { H } from \"./lib\"\n\nexport function rg(h: H): i32 { return h.t.g }\n"
+	const main = (set: string) => `import { A, B, H, N } from "./lib"\nimport { rf } from "./rf"\nimport { rg } from "./rg"\n
+function main() {\n\tconst h = new H()\n\th.t.next = new N()\n${set}\tprint(\`\${rf(h)} \${rg(h)} \${h.t.next!.g}\`)\n}\n`
+	const files: [string, string][] = [["lib.bob", lib], ["rf.bob", rf], ["rg.bob", rg], ["main.bob", main("")]]
+	anew()
+	built(files, "-O1")
+	const one = remade([["main.bob", main("\th.t.f = new A()\n")]])
+	const two = remade([["main.bob", main("\th.t.f = new A()\n\th.t.f = new B()\n")]])
+	anew()
+	const whole = built(files.slice(0, 3), "-O1")
+	const all = "lib.bob main.bob rf.bob rg.bob"
+	assert [one, two, whole] == [`1 5 5\n${all}`, `2 5 5\n${all}`, "2 5 5\n"]
+}
+
+test "two programs of a package, one instancing a generic whose body gains and loses a cast, continued are as made anew" {
+	const gen = (cast: bool) => `import { I } from "./i"\n\nexport function use[T extends I](x: T): i32 {\n${
+		if (cast) "\tconst i: I = x\n\treturn i.v()\n" else "\treturn 0\n"}}\n`
+	const i = "export interface I { v(): i32 }\n\nclass A { v(): i32 { return 1 } }\n\nexport function a(): I { return new A() }\n"
+	const other = "import { use } from \"./gen\"\n\nclass C { v(): i32 { return 30 } }\n\nexport function o(): i32 { return use(new C()) }\n"
+	const main1 = "import { a } from \"./i\"\n\nfunction main() { print(`${a().v()}`) }\n"
+	const main2 = "import { o } from \"./other\"\n\nfunction main() { print(`${o()}`) }\n"
+	mkdirAll(`${home()}/two`)
+	const both = (files: [string, string][]) => [remade(files, "-O1", "two/main1.bob"), remade([], "-O1", "two/main2.bob")]
+	const fresh = () => {
+		anew()
+		return [built([], "-O1", "two/main1.bob"), built([], "-O1", "two/main2.bob")]
+	}
+	anew()
+	both([["two/bober.pkg", `{ "name": "@test/two" }\n`], ["two/gen.bob", gen(false)], ["two/i.bob", i],
+		["two/other.bob", other], ["two/main1.bob", main1], ["two/main2.bob", main2]])
+	const gained = both([["two/gen.bob", gen(true)]])
+	const gainedAnew = fresh()
+	const lost = both([["two/gen.bob", gen(false)]])
+	const lostAnew = fresh()
+	assert [gained, gainedAnew, lost, lostAnew] == [["1\ngen.bob i.bob main1.bob other.bob", "30\n"], ["1\n", "30\n"],
+		["1\ni.bob main1.bob", "0\ngen.bob main2.bob other.bob"], ["1\n", "0\n"]]
+}
+
+test "a program of a package builds while another file of it does not compile, and again after an edit" {
+	const main = "import { one } from \"./lib\"\n\nfunction main() { print(one()) }\n"
+	const lib = (v: string) => `export function one(): string { return "${v}" }\n`
+	anew()
+	mkdirAll(`${home()}/bad`)
+	const first = built([["bad/bober.pkg", `{ "name": "@test/bad" }\n`], ["bad/lib.bob", lib("1")],
+		["bad/main.bob", main], ["bad/bad.bob", "const c: i32 = nope\n"]], "-O1", "bad/main.bob")
+	const edited = built([["bad/lib.bob", lib("2")]], "-O1", "bad/main.bob")
+	assert first == "1\n" && edited == "2\n"
 }
