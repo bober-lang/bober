@@ -228,3 +228,28 @@ test "a kept dylib's symbol table names the units' symbols, local ones too, but 
 	assert first == "_f _h _loc_f@1 _loc_h@1 outside 0" && second == "_f _g _h _loc_f@2 _loc_g@1 _loc_h@1 outside 0"
 		&& third == "_f _g _h _loc_f@2 _loc_g@1 _loc_h@2 outside 0"
 }
+
+test "a link that grows a section but starts none elsewhere leaves the entries of the units held as they are" {
+	const text = (name: string) => {
+		const o = object(name, [section("text", Code)])
+		o.symbols = [new Symbol(name, Global, 0)]
+		return o
+	}
+	const l = new Linker(arm64, macho, new Bytes())
+	l.add(text("f"))
+	const d = file(l)
+	// f's entry, the first after the null one, said to be of another section, which only a link reading it rights.
+	const head = d.slice(0, 0x1000)
+	let at = 32
+	while (u(head, at, 4) != 0x2) {
+		at += u(head, at + 4, 4) as i32
+	}
+	const f = u(head, at + 8, 4) + 16
+	const sect = d.get(f + 5, 1)
+	d.put(f + 5, sect + 1, 1)
+	const again = new Linker(arm64, macho, new Bytes(mapped(d)))
+	again.add(text("g"))
+	const e = file(again)
+	const [held, added] = [e.get(f + 5, 1), e.get(f + 16 + 5, 1)]
+	assert held == sect + 1 && added == sect
+}

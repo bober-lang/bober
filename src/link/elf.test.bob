@@ -29,13 +29,19 @@ function text(name: string): Object {
 	return o
 }
 
+/// The index of the section header of d's .symtab.
+function table(d: Bytes): u64 {
+	let i: u64 = 1
+	while (d.get(d.get(40, 8) + 64 * i + 4, 4) != 2) {
+		i++
+	}
+	return i
+}
+
 /// The names of the entries of d's .symtab, each with its value if in the section its st_shndx says; and the entries.
 function symbols(d: Bytes): [string, string] {
 	const header = (i: u64) => d.get(40, 8) + 64 * i
-	let symtab: u64 = 1
-	while (d.get(header(symtab) + 4, 4) != 2) {
-		symtab++
-	}
+	const symtab = table(d)
 	const [entries, size] = [d.get(header(symtab) + 24, 8), d.get(header(symtab) + 32, 8)]
 	const strings = d.get(header(d.get(header(symtab) + 40, 4)) + 24, 8)
 	const names: string[] = []
@@ -259,4 +265,19 @@ test "a kept image's symbol table names the units' symbols, local ones too, but 
 	const [first, second, third] = [names(d1), names(d2), names(d3)]
 	assert first == "f h loc_f@1 loc_h@1 outside 0" && second == "f g h loc_f@2 loc_g@1 loc_h@1 outside 0"
 		&& third == "f g h loc_f@2 loc_g@1 loc_h@2 outside 0"
+}
+
+test "a link that grows a section but starts none elsewhere leaves the entries of the units held as they are" {
+	const l = new Linker(arm64, elf, new Bytes())
+	l.add(text("f"))
+	const d = file(l)
+	// f's entry, the first after the null one, said to be of another section, which only a link reading it rights.
+	const f = d.get(d.get(40, 8) + 64 * table(d) + 24, 8) + 24
+	const shndx = d.get(f + 6, 2)
+	d.put(f + 6, shndx + 1, 2)
+	const again = new Linker(arm64, elf, new Bytes(mapped(d)))
+	again.add(text("g"))
+	const e = file(again)
+	const [held, added] = [e.get(f + 6, 2), e.get(f + 24 + 6, 2)]
+	assert held == shndx + 1 && added == shndx
 }
