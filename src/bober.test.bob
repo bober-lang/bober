@@ -1335,3 +1335,62 @@ test "an importer's unit is kept after a body-only edit of a module it imports, 
 	const value = remade([["lib.bob", lib("\tprivate y = 0\n", 4, 2)]])
 	assert [body, layout, value] == ["6\nlib.bob", "6\nlib.bob main.bob", "7\nlib.bob main.bob"]
 }
+
+test "a unit reading a field of an interface held as one class is made anew as that class, or one it embeds, is laid out anew" {
+	const lib = `export interface I { v(): i32 }
+
+export class A { v(): i32 { return 1 } }
+
+export interface T { g: i32 }
+
+export class H {
+	t: T
+
+	constructor(t: T) { this.t = t }
+}
+`
+	const n = (pre: string) => `import { I } from "./lib"
+
+export class W { f: I | null = null }
+
+export class N {
+	w: ...W
+${pre}	g = 5
+}
+`
+	const rg = "import { H } from \"./lib\"\n\nexport function rg(h: H): i32 { return h.t.g }\n"
+	const main = (set: string) => `import { A, H } from "./lib"\nimport { N } from "./n"\nimport { rg } from "./rg"\n
+function main() {\n\tconst n = new N()\n${set}\tprint(\`\${rg(new H(n))}\`)\n}\n`
+	anew()
+	built([["lib.bob", lib], ["n.bob", n("")], ["rg.bob", rg], ["main.bob", main("")]], "-O1")
+	const grown = remade([["main.bob", main("\tn.w.f = new A()\n")]])
+	const laid = remade([["n.bob", n("\ty = 7\n")]])
+	const all = "5\nlib.bob main.bob n.bob rg.bob"
+	assert [grown, laid] == [all, all]
+}
+
+test "a unit reading a field of an interface held as one object type holding itself is made anew as a field's union grew" {
+	const lib = `export interface I { v(): i32 }
+
+export class A { v(): i32 { return 1 } }
+
+export interface T {
+	f: I | null
+	g: i32
+	next: T | null
+}
+
+export type O = { f: I | null, g: i32, next: T | null }
+
+export function make(): O { return { f: null, g: 5, next: null } }
+
+export class H { t: T = make() }
+`
+	const rg = "import { H } from \"./lib\"\n\nexport function rg(h: H): i32 { return h.t.g }\n"
+	const main = (set: string) => `import { A, H, make } from "./lib"\nimport { rg } from "./rg"\n
+function main() {\n\tconst h = new H()\n\tconst o = make()\n${set}\th.t = o\n\tprint(\`\${rg(h)}\`)\n}\n`
+	anew()
+	built([["lib.bob", lib], ["rg.bob", rg], ["main.bob", main("")]], "-O1")
+	const grown = remade([["main.bob", main("\to.f = new A()\n")]])
+	assert grown == "5\nlib.bob main.bob rg.bob"
+}

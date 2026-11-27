@@ -149,10 +149,11 @@ class Mono {
 		}
 	}
 
-	/// Gives each module its marks: of each interface and object type its unit lowers (its Type facts), the hash of it
-	/// and the union it is held as; and of the Init facts of all, its demand: the hash of its path, the instances of its
-	/// generic classes with statics that units hold, whose statics it holds, and the methods spreads bind of the
-	/// instances of generic classes it holds, which those hold as members.
+	/// Gives each module its marks: of each interface and object type its unit lowers (its Type facts), the hash of it,
+	/// the union it is held as and, held as one class, that one's signature, which lays it out; and of the Init facts
+	/// of all, its demand: the hash of its path, the instances of its generic classes with statics that units hold,
+	/// whose statics it holds, and the methods spreads bind of the instances of generic classes it holds, which those
+	/// hold as members.
 	private marks() {
 		const p = this.p
 		const ds = p.modules.map(m => [fnv(m.path)])
@@ -177,7 +178,9 @@ class Mono {
 			for (const j of 0 ... m.facts.length / 3 - 1) {
 				const x = m.facts[3 * j + 1]
 				if (m.facts[3 * j] == op.Type) {
-					m.marks.push(combine(p.hash(x), p.hash(this.ins.held.get(x) ?? p.union([]))))
+					const h = this.ins.held.get(x) ?? p.union([])
+					const sig = if (this.ins.nominal(h) == decl.Class) p.decls[p.a(h)].sig else 0
+					m.marks.push(combine(combine(p.hash(x), p.hash(h)), sig))
 				}
 			}
 			sort(m.marks)
@@ -662,7 +665,7 @@ class Mono {
 			fs.append([op.Type, x, 0])
 			// held as one class, whose fields are read at their offsets
 			const one = this.lows.get(x) ?? 0
-			if (one != x && p.kind(one) == kind.Named) {
+			if (p.kind(one) == kind.Named) {
 				this.signed(p.a(one), seen, fs)
 			}
 		}
@@ -670,8 +673,8 @@ class Mono {
 			const t = p.decls[f].type
 			if (p.decls[f].kind == decl.Var && (p.decls[f].mods & decl.Static) == 0) {
 				this.signed(f, seen, fs)
-				if (p.kind(t) == kind.Embed && p.kind(p.a(t)) == kind.Named) {
-					this.signed(p.a(p.a(t)), seen, fs)
+				if (embedded(p, f) && p.kind(t) == kind.Named) {
+					this.signed(p.a(t), seen, fs)
 				}
 			}
 		}
@@ -730,6 +733,7 @@ class Mono {
 		const fs = p.decls[p.a(c)].members
 		for (const i of 0 ... fs.length - 1) {
 			p.decls[fs[i]].type = p.items(r)[i]
+			this.sigs.set(fs[i], this.under.get(p.items(t)[i]) ?? [])
 		}
 		return c
 	}
