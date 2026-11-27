@@ -1,0 +1,49 @@
+import { length, middle, numbers, units } from "./callback.c"
+
+class Point {
+	x: i32 = 0
+	y: i32 = 0
+}
+
+class Edge {
+	from: ...Point
+	to: ...Point
+	weight = 0.0
+
+	dx(): i32 { return this.to.x - this.from.x }
+}
+
+function sum(a: i32, b: i64, c: u8): i64 @C["cb_sum"] { return (a as i64) + b + (c as i64) }
+function odd(n: i32): bool @C["cb_odd"] { return n % 2 == 1 }
+
+function len(e: Edge): f64 @C["cb_length"] {
+	const garbage: i32[][] = []
+	for (const i of 0 ... 9_999) {
+		garbage.push(new i32[](i % 64)) // which collects, moving e, under C's frames
+	}
+	e.weight *= 2.0
+	const dy = e.to.y - e.from.y
+	return (e.dx() * e.dx() + dy * dy) as f64
+}
+
+function mid(e: Edge): Point @C["cb_mid"] {
+	const p = new Point()
+	p.x = (e.from.x + e.to.x) / 2
+	p.y = (e.from.y + e.to.y) / 2
+	return p
+}
+
+const metre = 1
+const kilometre = 2
+
+function unit(n: metre | kilometre): "m" | "kilometre" @C["cb_unit"] { return if (n == metre) "m" else "kilometre" }
+function scale(u: "cm" | "kilometre"): i32 @C["cb_scale"] { return if (u == "cm") 1 else 100_000 }
+
+test "C calls bober's functions tagged @C" {
+	assert numbers() == 5_000_000_198 + 1
+	const held: Point[] = [new Point()] // across C's call, which calls len, which collects
+	assert length() == 26.0
+	assert held[0].x == 0 && held.length == 1
+	assert middle() == 204
+	assert units() == 100_001
+}

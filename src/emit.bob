@@ -28,8 +28,10 @@ import { fromBits } from "../builtin/math"
 import { endsWith, sort, startsWith } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
 import { encode as hex } from "../std/encoding/hex"
+import { join } from "../std/fs/path"
 import { max, min } from "../std/math"
-import { Frame as AbiFrame, attrs, call as cCall, held as heldAs, signature } from "./backend/abi"
+import { Frame as AbiFrame, attrs, call as cCall, held as heldAs, params as cParams, ret as cRet,
+	signature } from "./backend/abi"
 import { Backend, Binary, Block, Cmp, FCmp, Type as IrType, Value, mark } from "./backend/backend"
 import * as decl from "./bc/decl"
 import { Embed, Extern, Mixin, Readonly, Static } from "./bc/decl"
@@ -38,12 +40,13 @@ import * as op from "./bc/op"
 import { Opcode } from "./bc/op"
 import { Code, Module, Program, pair } from "./bc/program"
 import { showType } from "./bc/show"
+import { system } from "./c/bind"
 import * as c from "./c/type"
 import { CompileError } from "./error"
 import { sha256 } from "./link/sha256"
 import { fits } from "./mono"
 import { bases, embedded, fieldOf } from "./resolve"
-import { builtin, runtime } from "./root"
+import { builtin, root, runtime } from "./root"
 
 /// How a program is emitted: whether it is as lowered, a debug build's; and the module that gets C's main, which runs
 /// the program's main or, with tests, each of the module's tests, or if -1 each module gets two entries like it, an
@@ -560,6 +563,9 @@ class Emitter {
 			this.define(f.fn, f.ret, ps, f.env, code, f.scope, f.val)
 			if (this.dispatched(d)) {
 				this.thunk(d)
+			}
+			if (p.cName(d) != "" && !this.copies.has(d)) {
+				this.cExport(d)
 			}
 		} else if (x.kind == decl.Var && c >= 0 && (x.mods & Static) == 0) {
 			if (code != null) {
@@ -1541,7 +1547,8 @@ class Emitter {
 		if ((x.mods & Extern) != 0 && endsWith(this.p.modules[x.module].path, " @TypeScript")) {
 			throw new CompileError(`${this.name(d)}, of TypeScript typings, is called only from JavaScript, compiled with -js`)
 		}
-		const fn = if ((x.mods & Extern) != 0) this.cFunction(this.name(d), ret, params, ft) else this.function(d, ft)
+		const fn = if ((x.mods & Extern) != 0) this.cFunction(this.name(d), ret, params, ft, p.modules[x.module].path)
+			else this.function(d, ft)
 		if ((x.mods & Extern) != 0 && runtime(p.modules[x.module].path) && !unwinding.includes(this.name(d))) {
 			this.nounwind(fn)
 		}
@@ -1600,7 +1607,7 @@ class Emitter {
 
 	/// C's function name, called through a local function of type ft, bober's convention, which makes the call as C's ABI
 	/// has it (src/backend/abi.bob): a class param ...T and a class result as the struct, another class param as a pointer to it.
-	private cFunction(name: string, ret: i32, params: i32[], ft: IrType): Value {
+	private cFunction(name: string, ret: i32, params: i32[], ft: IrType, path: string): Value {
 		const b = this.b
 		const sym = `${name}.c`
 		const have = b.named(sym)
@@ -1640,8 +1647,9 @@ class Emitter {
 			callee = b.function(name, signature(b, cft), false)
 			attrs(b, callee, cft)
 			// C does not collect, so long as it calls no bober that does; but the runtime's and std's bober_ functions may
-			// park, and others run and collect meanwhile.
-			if (!startsWith(name, "bober_")) {
+			// park, and others run and collect meanwhile, and a package's own C may call its functions tagged @C.
+			const own = !runtime(path) && !startsWith(path, system) && !startsWith(path, `${join(root, "vendor")}/`)
+			if (!startsWith(name, "bober_") && !own) {
 				b.attr(callee, -1, "gc-leaf-function", 0)
 			}
 		}
@@ -1665,6 +1673,63 @@ class Emitter {
 			b.line(line, col)
 		}
 		return f
+	}
+
+	/// The function C calls with C's ABI by the name function d is tagged with (§3.1), which calls d: a class param is the
+	/// address of its struct, copied into a new instance and back once d returns; a class result the struct, copied out;
+	/// a string literal's a C string, made once, which comes back as a copy of its bytes.
+	private cExport(d: i32) {
+		const b = this.b
+		const f = this.callee(d)
+		const chars = new c.Ptr(c.Char)
+		const cOf = (t: i32, held: bool) => if (this.kindOf(t) == kind.String) chars else this.cType(t, held)
+		const cft = new c.Fn(cOf(f.ret, true))
+		const cts = f.params.map(t => cOf(t, false))
+		cft.params = cts.map(t => [t, ""])
+		for (const t of [f.ret, ...f.params]) {
+			this.touch(t) // a class held by a ref, which C's copies cross through
+		}
+		const fn = b.function(this.p.cName(d), signature(b, cft), false)
+		attrs(b, fn, cft)
+		this.fn = fn
+		this.unwind = 0
+		this.enter([], []) // a block of its own, as C's ABI has allocas
+		const frame = new CFrame(b, fn)
+		const at = cParams(b, frame, fn, cft)
+		const back: [Value, Value, i64][] = []
+		const args: Value[] = []
+		for (const i of 0 ... cts.length - 1) {
+			const ct = cts[i]
+			const v = b.load(heldAs(b, ct), at[i], false)
+			if (ct instanceof c.Ptr && ct.base instanceof c.Record) {
+				const o = this.alloc(this.struct(f.params[i]))
+				b.copy(o, v, ct.base.size)
+				back.push([v, o, ct.base.size])
+				args.push(o)
+			} else {
+				args.push(if (ct.kind == "bool") b.icmp("ne", v, b.constInt(b.int(8), 0))
+					else if (ct instanceof c.Ptr) this.langCall("fromC", [b.cast("ptrtoint", v, this.i64)])
+					else v)
+			}
+		}
+		let r = this.call(f.type, f.fn, args, false)
+		for (const [v, o, size] of back) {
+			b.copy(v, this.raw(o), size)
+		}
+		if (cft.result instanceof c.Record) {
+			r = this.raw(r)
+		} else if (cft.result.kind == "bool") {
+			r = b.cast("zext", r, b.int(8))
+		} else if (cft.result instanceof c.Ptr) {
+			let s = b.constZero(b.ptr())
+			for (const m of this.p.members(this.p.b(this.p.decls[d].exact))) {
+				// its literals
+				const lit = this.p.strings[this.p.b(m)]
+				s = b.select(this.langCall("strEq", [r, this.str(lit)]), this.cstr(lit), s)
+			}
+			r = s
+		}
+		cRet(b, frame, fn, cft, r)
 	}
 
 	/// What builtin/'s cPtr takes for the member of u, a pointer param's string | T[] | u64, that tag says: 1 for
@@ -3925,9 +3990,10 @@ class Emitter {
 						closures.set(f, true)
 					}
 				}
-				// A finally may collect after a return has stored its value where the caller's slot is, no root.
+				// A finally may collect after a return has stored its value where the caller's slot is, no root; nor one
+				// C calls (@C), whose stub takes its result as a ref.
 				if (x.kind == decl.Function && (x.mods & Extern) == 0 && this.holdable(p.b(x.type))
-					&& !c.ops.includes(op.Finally)) {
+					&& !c.ops.includes(op.Finally) && p.cName(d) == "") {
 					fns.push(d)
 				}
 			}

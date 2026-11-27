@@ -33,7 +33,7 @@ let first = ["array", "string", "type", "c", "tag", "error", "io"].map(builtinPa
 
 /// The exports of first that every module sees without importing them.
 const prelude = ["print", "readFile", "writeFile", "args", "targetOs", "targetArch", "now", "random", "idOf", "chr",
-	"fromBytes", "fromC", "Deprecated", "Experimental", "Type", "IoError", "Trap", "void"]
+	"fromBytes", "fromC", "C", "Deprecated", "Experimental", "Type", "IoError", "Trap", "void"]
 
 /// The constructs a doc comment documents.
 const documented: Syntax[] = ["test", "var", "function", "class", "type", "method", "prop", "param", "typeParam"]
@@ -1410,6 +1410,7 @@ class Checker {
 			if (n.kind != "class") {
 				this.apart(() => this.tagged(n))
 			}
+			this.cTagged(n)
 			d.warning = this.warning(n)
 		})
 		d.state = "done"
@@ -2162,6 +2163,7 @@ class Checker {
 		for (const m of ms) {
 			const f = new Field(this.key(m.t).copy(), Empty, false, has(m, "static"))
 			this.apart(() => this.tagged(m))
+			this.cTagged(m)
 			let state: "typed" | "pending" | "failed" = "failed"
 			this.apart(() => {
 				state = this.declareMember(m, f, t, constructs)
@@ -2212,6 +2214,40 @@ class Checker {
 			}
 		}
 		return null
+	}
+
+	/// Checks the tag `@C["name"]` of function n, if it has it: C calls the function by that name (src/c/bind.bob), so it
+	/// is neither generic nor throws, and each param and its result crosses to C as a C type, copied: a number or bool;
+	/// a class of only such fields, embedded ones and `T[n]` too, as a pointer to its struct, a result as the struct; a
+	/// union of literals of one number type as that type, of strings as a C string.
+	///
+	/// ```
+	/// function area(r: Rect, unit: "m" | "cm"): f64 @C["rect_area"] { … }
+	/// function parse(s: string): i32 @C["parse"] { … }   // error: string does not cross to C
+	/// ```
+	private cTagged(n: Node) {
+		const c = tagTypes.get("C")
+		const i = if (c == null) -1 else (n.tags ?? []).map(t => t.generic).indexOf(c)
+		if (i < 0) {
+			return
+		}
+		const at = start(tags(n)[i])
+		if (n.kind != "function") {
+			this.report(at, "only a function is tagged @C")
+		}
+		const t = n.type
+		if (n.kind != "function" || t == null) {
+			return
+		}
+		if (t.params.length > 0 || after(n, "throws") != null || t.rest || t.n < t.types.length) {
+			this.report(at, "a function C calls is neither generic nor throws, and has no default or rest param")
+		}
+		if (n.tags![i].params[0].kind != "literal") {
+			this.report(at, "@C takes the name C calls the function by")
+		}
+		for (const p of [...t.types, ...(if (t.base == Null) [] else [t.base!])].filter(p => !crossesToC(p))) {
+			this.report(at, `${show(p)} does not cross to C`)
+		}
 	}
 
 	/// What @Deprecated adds to "deprecated", by its type argument e as written: ": why", "; use x", both, or none.
@@ -5005,6 +5041,24 @@ function held(t: Type): bool {
 		case "union": t.types.every(m => m.kind != "fixed" && held(m))  // a fixed one there is boxed
 		default: false
 	}
+}
+
+/// Whether a value of t crosses to C as @C has it: a number, a bool, a class of such fields, or a union of literals of
+/// one number type or of strings.
+function crossesToC(t: Type): bool {
+	const ms = t.alternatives()
+	return t.kind != "fixed" && cHeld(t) || t.kind == "class" && cWhole(t)
+		|| ms.every(m => m.kind == "literal" && m.base == ms[0].base)
+}
+
+/// Whether a value of t is a number, bool or T[n] of them.
+function cHeld(t: Type): bool {
+	return t.kind == "bool" || t.kind == "int" || t.kind == "float" || t.kind == "fixed" && cHeld(t.base!)
+}
+
+/// Whether the fields of class t, but its methods, are held as cHeld has them, embedded ones of such fields too.
+function cWhole(t: Type): bool {
+	return fields(t).every(f => about(t, f.name).method || (if (f.embedded) cWhole(f.type) else cHeld(f.type)))
 }
 
 /// The class that declares member k, or static member k, of class c: c or one it embeds (5.3), else null.

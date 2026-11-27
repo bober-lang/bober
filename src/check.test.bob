@@ -1082,3 +1082,20 @@ test "a module linked from the cache keeps the ABI hash its file holds" {
 	const p = lower(["main.bob"], [], files, read, path => hash(read(path)))
 	assert p.modules[p.module("a.bob")].abi == 12345
 }
+
+test "a function tagged @C is neither generic nor throws, and each param and its result crosses to C" {
+	const p = "class P { x: i32 = 0; n: i8[2] = [0, 0]; m(): i32 { return 1 } }\nclass E { p: ...P; w = 1.0 }\n"
+	const ok = "const one = 1\nconst two = 2\n"
+		+ "function f(a: i32, b: bool, e: E, u: one | two, s: \"a\" | \"b\"): P @C[\"f\"] { return new P() }"
+	assert errors(p + ok) == ""
+	assert errors(p
+		+ "function g[T](x: T): i32 @C[\"g\"] { return 1 }\nfunction h(): i32 throws Trap @C[\"h\"] { return 1 }")
+		== "120: a function C calls is neither generic nor throws, and has no default or rest param; "
+		+ "120: T does not cross to C; 171: a function C calls is neither generic nor throws, and has no default or rest param"
+	assert errors("class R { r: R | null = null }\nfunction f(s: string, r: R, xs: i32[4]): i32 | null @C[\"a\" | \"b\"] { return 1 }")
+		== "84: @C takes the name C calls the function by; 84: string does not cross to C; 84: R does not cross to C; "
+		+ "84: i32[4] does not cross to C; 84: i32 | null does not cross to C"
+	assert errors(p + "class Q { ps: P[2] = [new P(), new P()]; m(): i32 @C[\"m\"] { return 1 } }\n"
+		+ "function f(q: Q): i32 @C[\"f\"] { return 1 }")
+		== "145: only a function is tagged @C; 190: Q does not cross to C"
+}
