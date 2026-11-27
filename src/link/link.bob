@@ -124,8 +124,10 @@ export class Stale {
 /// library, unit and section, each plus 1; its value, address, slot, stub and chain; and whether weak.
 const entry: u64 = 72
 /// Those of a unit's, after the table of units: of its blocks, then of its two of rebases, where each is and how big,
-/// in 12 bytes; none of a unit unlinked or frozen but the first.
+/// in 12 bytes; none of a unit unlinked or frozen but the first. The size of its record has, past the 2 GiB the file
+/// stays below, whether it was supplied.
 const unitEntry: u64 = 72
+const supplying: u64 = 1 << 31
 /// Of a link of a chain (Linker.links), whether its symbol defines the name, and whether it does not weakly.
 const defining: u64 = 1 << 63
 const strong: u64 = 1 << 62
@@ -207,6 +209,8 @@ class Unit {
 	relr: [u64, u64][] = []
 	links = new Bytes()
 	from: u64 = 0
+	/// Whether it was supplied (Linker.add).
+	supplied = false
 
 	constructor(o: Object, frozen = false) {
 		this.object = o
@@ -245,7 +249,8 @@ export class Linker {
 	private broken = false
 	/// The names wanted, in the order first wanted, which the supplier is given.
 	private wanted: i32[] = []
-	/// Per group, the unit whose sections of it are taken.
+	/// Per group, the unit whose sections of it are taken; of those the continued image holds, as resolve found them,
+	/// but those unlinked since.
 	private groups = new HashMap[string, i32]()
 	/// The names x of the `__start_x` and `__stop_x` defined.
 	private bounded: string[] = []
@@ -257,6 +262,8 @@ export class Linker {
 	private state = new State()
 	private loaded = 0
 	private removed: i32[] = []
+	/// The names the units unlinked named, of which a supplied unit's may be named no more (orphans), until resolve.
+	private lost: i32[] = []
 	private bytes = new Bytes()
 	/// Of the units it holds, those unlinked or fixed, whose entries save writes anew; and how many it read (held).
 	private changes: i32[] = []
@@ -307,12 +314,15 @@ export class Linker {
 		this.names = new (Name | null)[](count as i32)
 	}
 
-	/// Links o, in a continued image after the objects it holds.
-	add(o: Object) {
+	/// Links o, in a continued image after the objects it holds; if supplied, made for names wanted (supply), so that a
+	/// continued image unlinks it once the units it holds name none of the names it defines (orphans).
+	add(o: Object, supplied = false) {
 		if (o.arch != this.machine.arch) {
 			this.errors.push(`${o.name} is of ${o.arch}, not ${this.machine.arch}`)
 		}
-		this.units.push(new Unit(o))
+		const u = new Unit(o)
+		u.supplied = supplied
+		this.units.push(u)
 	}
 
 	/// The names of the objects given that the continued image holds, in order.
@@ -383,7 +393,9 @@ export class Linker {
 
 	/// Has f, after those given before, add objects for the names the units want that none defines, but those the
 	/// continued image's units name, which a link before looked for; once there are none, f is given by name the units
-	/// the continued image held that name what none defines, unlinked now. Again until neither is left.
+	/// the continued image held that name what none defines, unlinked now. Again until neither is left; only then are
+	/// the supplied units no unit names any more unlinked (add), so that a name of a unit holds gave, but one removed,
+	/// is never wanted.
 	supply(f: (names: string[], gone: string[]) => void throws CompileError) {
 		const before = this.supplier
 		this.supplier = (names, gone) => {
@@ -607,7 +619,7 @@ export class Linker {
 	}
 
 	/// Resolves the names of the units, and of those the supplier adds. The units the continued image holds that name
-	/// what none defines are unlinked, and the names they defined defined anew.
+	/// what none defines are unlinked, and the names they defined defined anew; once the supplier adds none, the orphans.
 	private resolve() throws CompileError {
 		let k = this.loaded
 		let w = 0
@@ -620,8 +632,11 @@ export class Linker {
 				&& this.first(n, l => l & (defining | strong) == strong && this.unit(l) < this.loaded) == 0)
 			w = this.wanted.length
 			const gone = if (names.length > 0) [] as i32[] else this.settle()
-			if (names.length == 0 && gone.length == 0) {
+			if (names.length == 0 && gone.length == 0 && this.lost.length == 0) {
 				return
+			} else if (names.length == 0 && gone.length == 0) {
+				this.orphans()
+				continue
 			}
 			const lost = gone.map(k => this.held(k).object.name)
 			for (const k of gone) {
@@ -640,6 +655,9 @@ export class Linker {
 			if (u.at[i] != dropped && this.pinned(sec)) {
 				this.errors.push(`${u.object.name} has ${sec.name}, which the image has for good`)
 			}
+			if (sec.group != "" && this.groups.get(sec.group) == k) {
+				this.groups.delete(sec.group)
+			}
 			if (u.at[i] != 0 && u.at[i] != dropped) {
 				this.free(u.at[i], sec.size)
 				if (sec.kind == Code) {
@@ -656,6 +674,8 @@ export class Linker {
 				this.unchain(n, k, j)
 				if (n.unit == k) {
 					this.redefine(n)
+				} else if (u.object.symbols[j].binding == Global) {
+					this.lost.push(u.names[j])
 				}
 			}
 		}
@@ -664,6 +684,41 @@ export class Linker {
 		}
 		this.units[k] = new Unit(new Object("", this.machine.arch))
 		this.changes.push(k)
+	}
+
+	/// Unlinks each supplied unit the continued image holds that defines a name lost, once no unit names any name it
+	/// defines so that it must be defined, nor is it exported; and then those of the names it named. Supplied units that
+	/// name each other stay, until a link anew.
+	private orphans() {
+		while (this.lost.length > 0) {
+			const k = this.entry(this.lost.pop()!).unit
+			if (k > 0 && k < this.loaded && this.supplied(k) && !this.named(k)) {
+				this.unlink(k)
+			}
+		}
+	}
+
+	/// Whether unit k was supplied, of one held not read as its entry says.
+	private supplied(k: i32): bool {
+		const u = this.units[k]
+		return if (u != null) u.supplied else this.field(k, 8, 4) & supplying != 0
+	}
+
+	/// Whether a name unit k defines is named so that it must be defined, or exported.
+	private named(k: i32): bool {
+		const u = this.read(k)
+		for (const j of 0 ... u.names.length - 1) {
+			const s = u.object.symbols[j]
+			if (u.names[j] < 0 || s.section < 0 || u.at[s.section] == dropped) {
+				continue
+			}
+			const n = this.entry(u.names[j])
+			if (this.first(n, l => l & (defining | strong) == strong) != 0 || this.exported.includes(n.name)
+				|| this.state.exports.includes(n.name)) {
+				return true
+			}
+		}
+		return false
 	}
 
 	/// Takes the groups of unit k's sections no unit before has, and its definitions over weak ones, and notes what it
@@ -814,11 +869,12 @@ export class Linker {
 		const own = new Unit(new Object("linker", this.machine.arch), this.keep)
 		own.object.sections = [stubs, slots]
 		own.at = [0, 0]
-		for (const k of this.state.grouped) {
+		for (const k of [...this.state.grouped, ...ks.filter(k => k >= this.loaded)]) {
 			const u = this.held(k)
 			for (const i of 0 ... u.at.length - 1) {
 				if (u.at[i] == dropped && !this.groups.has(u.object.sections[i].group)) {
-					// A kept object's, whose bytes are gone, of a group no object has now.
+					// A kept object's, whose bytes are gone, or an added one's, of a group no object has now, as the unit
+					// taken is unlinked.
 					this.errors.push(`${u.object.name} has ${u.object.sections[i].group}, which no object has now`)
 				}
 			}
@@ -1391,7 +1447,7 @@ export class Linker {
 				const [from, size] = (if (i < 4) u.blocks.at(i) else u.relr.at(i - 4)) ?? [0, 0]
 				const p = this.entryAt(k) + 12 * (i as u64)
 				this.bytes.put(p, from, 8)
-				this.bytes.put(p + 8, size, 4)
+				this.bytes.put(p + 8, size | (if (i == 0 && u.supplied) supplying else 0), 4)
 			}
 		}
 		s.grouped = s.grouped.filter(k => this.held(k).object.name != "")
@@ -1664,7 +1720,7 @@ export class Linker {
 		}
 		const u = this.units[k]
 		const at = 24 * (l & 0xffffffff)
-		return if (u != null) [u.links, u.from + at] else [this.bytes, this.bytes.get(this.entryAt(k) + 12, 8) + at]
+		return if (u != null) [u.links, u.from + at] else [this.bytes, this.field(k, 12, 8) + at]
 	}
 
 	/// The units that name n so that it must be defined, but do not.
@@ -1723,13 +1779,13 @@ export class Linker {
 		const u = new Unit(new Object("", this.machine.arch), k == 0)
 		const b = this.bytes
 		this.reads++
-		const p = this.entryAt(k)
 		const blocks: [u64, u64][] = []
 		for (const i of 0 ... 5) {
-			blocks.push([b.get(p + 12 * (i as u64), 8), b.get(p + 12 * (i as u64) + 8, 4)])
+			blocks.push([this.field(k, 12 * (i as u64), 8), this.field(k, 12 * (i as u64) + 8, 4) & ~supplying])
 		}
 		u.blocks = blocks.slice(0, 4).filter(x => x[0] != 0)
 		u.relr = blocks.slice(4, 6)
+		u.supplied = this.supplied(k)
 		if (u.blocks.length > 0) {
 			const [from, size] = u.blocks[0]
 			u.encoded = if (from > b.length || size > b.length - from) "" else b.slice(from, from + size)
@@ -1749,7 +1805,8 @@ export class Linker {
 
 	/// Where the entry of unit k the continued image holds is.
 	private entryAt(k: i32): u64 { return this.state.units[0] + 12 * this.state.units[1] + unitEntry * (k as u64) }
-
+	/// The n bytes at at of the entry of unit k the continued image holds.
+	private field(k: i32, at: u64, n: i32): u64 { return this.bytes.get(this.entryAt(k) + at, n) }
 	/// Whether unit k is frozen, as of those the continued image holds only the first is.
 	private frozen(k: i32): bool { return if (k < this.loaded) k == 0 else this.units[k]!.frozen }
 

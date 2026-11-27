@@ -1,6 +1,6 @@
 //! Tests of src/link: hand-made Objects linked, and arm64's and x86-64's fixups on known instructions.
 
-import { sort, startsWith } from "../../std/algo"
+import { indexOf, sort, startsWith } from "../../std/algo"
 import { makeTempDir, open, removeAll } from "../../std/fs"
 import { fnv } from "../../std/hash"
 import { File } from "../../std/io"
@@ -541,7 +541,9 @@ test "a kept image's units keep their records and symbols where they are, and on
 	for (const i of 0 ... was.length - 1) {
 		changed += if (now[i] != was[i]) 1 else 0
 	}
-	assert now.length == was.length && changed <= 2 * (12 + 72)
+	// Of each table, a slot of 12 bytes, and an entry, of a name or of a unit, of 72.
+	const [slot, entry] = [12, 72]
+	assert now.length == was.length && changed <= 2 * (slot + entry)
 	assert image.symtab[0] == first.symtab[0] && image.symtab[1] == first.symtab[1] + 24
 	assert image.bytes.slice(name, name + 3) == "_g\x00"
 }
@@ -704,15 +706,16 @@ function made(name: string): Object {
 	return version(decimal(iv[0]) as u64, decimal(iv[1]) as u64)
 }
 
-/// The image l links of objects too, or if it is stale, one linked anew of those names names then; null if that is an
-/// error.
-function relinked(l: Linker, objects: Object[], names: () => string[]): Image | null throws Stale {
+/// The image l links of objects too, or if it is stale, noted in stales, one linked anew of those names names then;
+/// null if that is an error.
+function relinked(l: Linker, objects: Object[], names: () => string[], stales: string[]): Image | null throws Stale {
 	try {
 		return keep(l, objects)
 	} catch (e: CompileError | Stale) {
 		if (e instanceof CompileError) {
 			return null
 		}
+		stales.push(e.msg)
 	}
 	return anew(names())
 }
@@ -769,6 +772,7 @@ test "a kept image continued, by objects added, removed and replaced, reaches wh
 	let linked = 0
 	let remade = 0
 	let supplied = 0
+	const stales: string[] = []
 	for (const step of 1 ... 1000) {
 		const l = kept(cur)
 		let held = l.objects()
@@ -786,32 +790,35 @@ test "a kept image continued, by objects added, removed and replaced, reaches wh
 			}
 		}
 		// A new version of the objects that name what is no longer defined, and of those that define n<i> wanted.
-		const next = (i: u64) => {
+		const next = (i: u64, wanted: bool) => {
 			versions[i]++
 			added.push(version(i, versions[i]))
-			l.add(added[added.length - 1])
+			l.add(added[added.length - 1], wanted)
 		}
 		l.supply((wanted, gone) => {
 			for (const name of gone) {
 				held = held.filter(h => h != name)
 				remade++
-				next(decimal(split(name.slice(1, name.length), ".")[0]) as u64)
+				next(decimal(split(name.slice(1, name.length), ".")[0]) as u64, false)
 			}
 			for (const name of wanted.filter(n => startsWith(n, "n"))) {
 				const i = decimal(name.slice(1, name.length)) as u64
 				if (![...held, ...added.map(o => o.name)].some(h => startsWith(h, `o${i}.`))) {
 					supplied++
-					next(i)
+					next(i, true)
 				}
 			}
 		})
 		const names = () => [...held, ...added.map(o => o.name)]
-		const image = relinked(l, added, names)
+		const before = stales.length
+		const image = relinked(l, added, names, stales)
 		if (image == null) {
 			// An error of the objects given, which a link anew of them has too.
 			assert anew(names()) == null
 			continue
 		}
+		// Stale only of such an error, never linked anew silently.
+		assert stales.length == before
 		cur = file(image!)
 		const objects = kept(cur).objects().map(made)
 		const versioned = objects.filter(o => o.name != "bounds")
@@ -824,7 +831,8 @@ test "a kept image continued, by objects added, removed and replaced, reaches wh
 		assert was == now && first == words && second == words
 		linked++
 	}
-	assert linked > 600 && remade > 0 && supplied > 0
+	const errors = stales.filter(m => indexOf(m, " is not defined, but ") >= 0).length
+	assert linked > 600 && remade > 0 && supplied > 0 && stales.length == 15 && errors == 15
 }
 
 test "a kept image's sections a name bounds once laid out are stale, and a run has those added once nothing bounds them" {
@@ -981,4 +989,141 @@ test "a kept image's symbol table has no marks, the names starting with ~" {
 	const image = keep(kept(), [obj("a", Code, [0xd65f03c0], [new Symbol("f", Global, 0), new Symbol("~m", Weak, 0)])])
 	const names = image.symbols.map(e => e[0].map(s => s.name).join(" "))
 	assert names == ["f"]
+}
+
+test "a continued image unlinks the supplied units no unit names any more, and those only they named, but a cycle" {
+	// Unit name, defining name, of a call to each of calls.
+	const unit = (name: string, calls: string[]) => {
+		const words: u64[] = [...calls.map(c => 0x94000000 as u64), 0xd65f03c0]
+		const fixups: Fixup[] = []
+		for (const i of 0 ... calls.length - 1) {
+			fixups.push(new Fixup((4 * i) as u64, Call, i + 1, 0))
+		}
+		return obj(name, Code, words, [new Symbol(name, Global, 0), ...calls.map(c => new Symbol(c, Global))], fixups)
+	}
+	// A chain r a b c, a diamond r2 d e1 e2 f, s named by a and by q, which stays, and a cycle r3 x y; of a
+	// thousand units more, it reads those it unlinks or looks at.
+	const roots = [unit("r", ["a"]), unit("r2", ["d"]), unit("q", ["s"]), unit("r3", ["x"])]
+	const supplied = [unit("a", ["b", "s"]), unit("b", ["c"]), unit("c", []), unit("d", ["e1", "e2"]),
+		unit("e1", ["f"]), unit("e2", ["f"]), unit("f", []), unit("s", []), unit("x", ["y"]), unit("y", ["x"])]
+	const l = kept()
+	for (const o of supplied) {
+		l.add(o, true)
+	}
+	for (const i of 0 ... 999) {
+		l.add(unit(`u${i}`, []))
+	}
+	const first = file(keep(l, roots))
+	const again = kept(first)
+	again.remove("r")
+	again.remove("r2")
+	again.remove("r3")
+	const image = again.link()
+	const reads = again.reads
+	const held = kept(file(image)).objects().filter(o => !startsWith(o, "u")).join(" ")
+	assert held == "s x y q" && reads <= 13
+}
+
+/// An object named name, defining it, of a call to each of calls, and of a section of group k, defining k weakly, of
+/// word; a call to k is through that symbol.
+function grouped(name: string, word: u64, calls: string[]): Object {
+	const symbols = [new Symbol(name, Global, 0), new Symbol("k", Weak, 1)]
+	const fixups: Fixup[] = []
+	for (const i of 0 ... calls.length - 1) {
+		if (calls[i] != "k") {
+			symbols.push(new Symbol(calls[i], Global))
+		}
+		fixups.push(new Fixup((4 * i) as u64, Call, if (calls[i] == "k") 1 else symbols.length - 1, 0))
+	}
+	const o = obj(name, Code, [...calls.map(c => 0x94000000 as u64), 0xd65f03c0], symbols, fixups)
+	o.sections.push(named("text.k", obj("", Code, [word], [], [], "k")).sections[0])
+	return o
+}
+
+test "a continued image whose supplied unit is unlinked of a group whose sections others dropped is stale" {
+	const r = obj("r", Code, [0x94000000], [new Symbol("x", Global)], [new Fixup(0, Call, 0, 0)])
+	const l = kept()
+	l.add(grouped("x", 1, []), true)
+	const first = file(keep(l, [grouped("y", 2, ["k"]), r], ["y"]))
+	const again = kept(first)
+	again.remove("r")
+	assert keep(again, [], ["y"]) throws new Stale("y has k, which no object has now")
+	const other = kept(first)
+	other.remove("r")
+	assert keep(other, [grouped("z", 3, ["k"])],
+		["y", "z"]) throws new Stale("y has k, which no object has now\nz has k, which no object has now")
+}
+
+test "a continued image whose supplied unit is unlinked of a group an added unit dropped is stale" {
+	const r = obj("r", Code, [0x94000000], [new Symbol("x", Global)], [new Fixup(0, Call, 0, 0)])
+	const l = kept()
+	l.add(grouped("x", 1, []), true)
+	const again = kept(file(keep(l, [r])))
+	again.remove("r")
+	assert keep(again, [grouped("z", 3, ["k"])], ["z"]) throws new Stale("z has k, which no object has now")
+}
+
+test "a group whose unit is unlinked as it names what is no longer defined is taken by the unit supplied for it" {
+	const f = obj("f", Code, [0xd65f03c0], [new Symbol("f", Global, 0)])
+	const first = file(keep(kept(), [grouped("g@1", 1, ["f"]), grouped("y", 2, ["k"]), f], ["y"]))
+	const l = kept(first)
+	l.remove("f")
+	const gone: string[] = []
+	l.supply((names, lost) => {
+		gone.push(...lost)
+		if (lost.includes("g@1")) {
+			l.add(grouped("g@2", 3, []))
+		}
+	})
+	const image = keep(l, [], ["y"])
+	const word = get(image, jumped(image, at(image, "y")))
+	assert gone == ["g@1"] && word == 3
+}
+
+test "a supplied unit whose namer is replaced by one naming it through a unit supplied now stays" {
+	const unit = (name: string, calls: string[]) => grouped(name, 0, calls)
+	const l = kept()
+	l.add(unit("a", ["c"]), true)
+	l.add(unit("c", []), true)
+	const again = kept(file(keep(l, [unit("r@1", ["a"])])))
+	again.remove("r@1")
+	const given: string[] = []
+	again.supply((names, gone) => {
+		given.push(`${names.join(" ")}|${gone.join(" ")}`)
+		if (names.includes("b")) {
+			again.add(unit("b", ["a"]), true)
+		}
+	})
+	const image = keep(again, [unit("r@2", ["b"])])
+	const held = kept(file(image)).objects().join(" ")
+	assert given == ["b|"] && held == "a c r@2 b"
+}
+
+test "a supplied unit stays while a name it defines is named so that it must be, by the frozen unit too, or exported" {
+	// Unit name, defining defines, of a call to each of calls, strongly or if weak not.
+	const unit = (name: string, defines: string[], calls: string[], weak = false) => {
+		const words: u64[] = [...calls.map(c => 0x94000000 as u64), 0xd65f03c0]
+		const fixups: Fixup[] = []
+		for (const i of 0 ... calls.length - 1) {
+			fixups.push(new Fixup((4 * i) as u64, Call, defines.length + i, 0))
+		}
+		return obj(name, Code, words,
+			[...defines.map(d => new Symbol(d, Global, 0)),
+			...calls.map(c => new Symbol(c, if (weak) Weak else Global))], fixups)
+	}
+	// s1 is named weakly by w too, s2 exported, s3 named by the lazy z, and s4b of s4 by q.
+	const l = kept()
+	for (const o of [unit("s1", ["s1"], []), unit("s2", ["s2"], []), unit("s3", ["s3"], []),
+		unit("s4", ["s4a", "s4b"], [])]) {
+		l.add(o, true)
+	}
+	l.lazily(() => [member(unit("z", ["z"], ["s3"]))])
+	const first = file(keep(l,
+		[unit("r", ["r"], ["s1", "s2", "s3", "s4a", "z"]), unit("w", ["w"], ["s1"], true), unit("q", ["q"], ["s4b"])],
+		["s2"]))
+	const again = kept(first)
+	again.remove("r")
+	const image = keep(again, [])
+	const held = kept(file(image)).objects().join(" ")
+	assert held == "s2 s3 s4 w q"
 }
