@@ -1416,3 +1416,21 @@ test "an object's unit is named by its file's time and size, which a link reads 
 	const info = stat(split(objects[0], "@")[0])
 	assert objects.length > 0 && endsWith(objects[0], `@${info.modified}.${info.size}`)
 }
+
+test "an edited module reaching a kept module's class, method and var and a class of builtin/ makes the units a build anew does" {
+	const lib = "export class C {\n\tn: i32\n\n\tconstructor(n: i32) { this.n = n }\n\n\tget(): i32 { return this.n }\n\n\ttwice(): i32 { return 2 * this.n }\n}\n\nexport let count = 3\n\nexport function f(c: C): i32 { return c.get() + count }\n"
+	const main = (w: string) => `import { C, count, f } from "./lib"\n\nfunction main() {\n\tconst c = new C(2)\n\tprint(\`\${f(c)}\`)${w}\n}\n`
+	anew()
+	assert built([["lib.bob", lib], ["main.bob", main("")]], "-O1") == "5\n"
+	for (const [w, out] of [["\n\tprint(`${c.twice()} ${count} ${c.n}`)", "5\n4 3 2\n"],
+		["\n\tprint(`${f(new C(c.n + 1))} ${new IoError(\"NotFound\", \"open\", \"x\").message()}`)", "5\n6 open x: NotFound\n"]]) {
+		const [continued, made] = shaped([["main.bob", main(w)]])
+		const kept = monoKept
+		const held = units()
+		anew()
+		const [again, all] = shaped([])
+		assert continued == out && again == out && kept > 0
+		assert units() == held
+		assert made.filter(x => !all.includes(x)) == []
+	}
+}

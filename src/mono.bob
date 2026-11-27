@@ -108,15 +108,17 @@ class Mono {
 			}
 		}
 		for (const m of 0 ... p.modules.length - 1) {
+			// A kept module's roots, but builtin/'s, are their own instances, of env 0, made only as others reach them.
+			const kept = p.modules[m].kept && !builtin(p.modules[m].path)
 			for (const d of p.modules[m].inits) {
 				if (!kind.untyped(p.decls[d].type) && p.identity(d).length == 0) {
-					this.own.set(this.ins.instance(d, 0), true)
+					this.own.set(if (kept) d else this.ins.instance(d, 0), true)
 				}
 			}
 			for (const d of p.modules[m].decls.filter(d => this.root(m, d))) {
-				this.own.set(this.ins.instance(d, 0), true)
+				this.own.set(if (kept) d else this.ins.instance(d, 0), true)
 				// If units, the plain methods of a class too, instanced else only where named.
-				for (const k of p.decls[d].members.filter(k => this.units && p.decls[k].kind == decl.Function
+				for (const k of p.decls[d].members.filter(k => this.units && !kept && p.decls[k].kind == decl.Function
 					&& this.plain(k))) {
 					this.ins.instance(k, 0)
 				}
