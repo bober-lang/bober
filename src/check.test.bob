@@ -1,4 +1,5 @@
 import { indexOf, sort, startsWith } from "../std/algo"
+import { Writer } from "../std/encoding/binary"
 import { fnv } from "../std/hash"
 import { HashMap } from "../std/collections/hashmap"
 import { split } from "../std/string"
@@ -1067,4 +1068,17 @@ test "a module linked from the cache that no module checked imports is not bound
 	const p = lower(["main.bob"], [], built(main(1), b)[2][0], read, path => hash(read(path)))
 	const k = p.decls[p.find(p.module("a.bob"), -1, "k")]
 	assert p.modules[p.module("b.bob")].bc != "" && k.held == null && k.coded()
+}
+
+test "a module linked from the cache keeps the ABI hash its file holds" {
+	const a = ["a.bob", "export function g(): i32 { return 1 }"]
+	const main = (v: i32) => `import { g } from "a"\nexport function main(): i32 { return g() + ${v} }`
+	const read = (path: string) => source(path, main(2), a)
+	const w = new Writer()
+	w.fixed(12345, 8)
+	// its ABI hash, after the magic and the compiler and source hashes
+	const files = built(main(1), a)[2][0].map(f => if (head(f).path != "a.bob") f
+		else `${f.slice(0, 21)}${w.bytes}${f.slice(29, f.length)}`)
+	const p = lower(["main.bob"], [], files, read, path => hash(read(path)))
+	assert p.modules[p.module("a.bob")].abi == 12345
 }
