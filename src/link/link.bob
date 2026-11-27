@@ -149,7 +149,9 @@ const Symbols: u8 = 8
 const regions: u8[][] = [[Code], [Const, Unwind], [Data, Init, Thread, Zero], [Symbols], [Kept]]
 const keptRegions: u8[][] = [[Unwind], [Code], [Const], [Data, Init, Thread], [Zero], [Symbols], [Kept]]
 /// Of a region's room; of the symbol table's, which has the head too, of some 7 MiB of entries and 1 of head measured;
-/// and of the Kept region's. An image's bytes stay below 2 GiB.
+/// and of the Kept region's. An image's bytes stay below 2 GiB, so a mapped region's room is as much as its content,
+/// but no more than room nor less than an 8th of it, two runs: it fills, and the image is linked anew, of its rooms
+/// again, only once its content about doubles, and the Kept region has what the mapped ones leave.
 const room: u64 = 1 << 28
 const tableRoom: u64 = 1 << 26
 const keptRoom: u64 = 1 << 30
@@ -1038,8 +1040,10 @@ export class Linker {
 				}
 			}
 			if (fresh) {
-				const of = if (regions[r][0] == Symbols) tableRoom else if (regions[r][0] == Kept) keptRoom else room
-				region.cap = alignUp(region.top, image.page) + (if (this.keep) of else 0)
+				const of = if (regions[r][0] == Symbols) tableRoom
+					else if (regions[r][0] == Kept) keptRoom
+					else min(room, max(region.top - region.start, room / 8))
+				region.cap = alignUp(region.top + (if (this.keep) of else 0), image.page)
 			}
 			if (region.top > region.start) {
 				if (regions[r][0] < Kept) {
@@ -1153,7 +1157,7 @@ export class Linker {
 		const i = this.island(k)
 		const at = i + (this.filled.get(k) ?? 0)
 		const size = this.machine.veneer.length as u64
-		if (size == 0 || at + size > i + island) {
+		if (size == 0 || at + size > min(i + island, this.state.regions[this.code].cap)) {
 			return 0
 		}
 		this.filled.set(k, at + size - i)

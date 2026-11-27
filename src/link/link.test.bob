@@ -480,7 +480,7 @@ test "the sections a kept image has for good are laid out, which a name added bo
 test "a region of a kept image has room its file has a hole for, and one that is full is stale" {
 	const d = obj("d", Data, [7], [new Symbol("d", Global, 0)])
 	const first = keep(kept(), [obj("a", Code, [0xd65f03c0], []), d], ["d"])
-	assert at(first, "d") > 1 << 28 && first.bytes.pages.filter(p => p.length > 0).length < 10
+	assert at(first, "d") > 1 << 26 && first.bytes.pages.filter(p => p.length > 0).length < 10
 	// What is after a region that grows is where it was, its page not written again.
 	const image = keep(kept(file(first)), [obj("c", Code, new u64[](0x8000), [])])
 	assert at(image, "d") == at(first, "d") && get(image, at(image, "d")) == 7 && !image.bytes.written(at(image, "d"))
@@ -1173,4 +1173,13 @@ test "a continued image of more names than its table of names has room for grows
 	const [p, g, g600] = [at(image, "c"), at(image, "g"), at(image, "g600")]
 	const [x, y] = [get(image, p, 8), get(image, p + 8, 8)]
 	assert g != 0 && g600 != 0 && g != g600 && x == g && y == g600
+}
+
+test "a kept image's mapped region has room as much as its content, of an 8th of a region's at least, and one at most" {
+	const [big, mid] = [obj("big", Const, [], []), obj("mid", Data, [7], [])]
+	big.sections[0].size = (1 << 29) - (1 << 24)
+	mid.sections[0].size = 100 << 20
+	const first = keep(kept(), [obj("a", Code, [0xd65f03c0], []), big, mid])
+	const rooms = read(first.bytes, 0x200, "arm64")!.regions.slice(0, 5).map(r => (r.cap - r.top) >> 20)
+	assert rooms == [32, 32, 256, 100, 32]
 }
