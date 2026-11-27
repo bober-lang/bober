@@ -264,8 +264,9 @@ class Mono {
 	}
 
 	/// What the code of instance k contributes to the unions, as (op, a, b) triples: a Field of type a's member named b
-	/// reached, a Cast of a into b, a New of literal a, an Object of a spread into b, a Throw of a, a Catch of a. Its
-	/// Type facts follow as it is lowered (typeFacts), a module's Init ones as its copies are listed (copies).
+	/// reached, a Cast of a into b, a New of literal a, an Object of a spread into b, a Throw of a, a Catch of a, the
+	/// Init of a generic class instance's type; of casts and catches, those into an interface or object type. Its Type
+	/// facts follow as it is lowered (typeFacts).
 	private scan(k: i32): i32[] {
 		const p = this.p
 		const i = this.ins.insts.get(k)!
@@ -276,21 +277,27 @@ class Mono {
 			if ((o == op.CallMethod || o == op.Field || o == op.SetField) && i.info[j] >= 0) {
 				out.append([op.Field, i.info[j], c!.a(j)])
 			}
-			if (o == op.Cast || o == op.Is) {
+			if ((o == op.Cast || o == op.Is) && this.into(c!.a(j))) {
 				out.append([op.Cast, i.info[j], c!.a(j)])
-			} else if (o == op.Array && i.info[j] >= 0 && p.kind(c!.a(j)) == kind.Array) {
+			} else if (o == op.Array && i.info[j] >= 0 && p.kind(c!.a(j)) == kind.Array && this.into(p.a(c!.a(j)))) {
 				out.append([op.Cast, i.info[j], p.a(c!.a(j))])
 			} else if (o == op.Object || o == op.New && p.kind(c!.a(j)) == kind.Object) {
 				out.append([op.New, c!.a(j), 0])
 				if (o == op.Object && i.info[j] >= 0 && p.kind(c!.a(j)) == kind.Object) {
 					out.append([op.Object, i.info[j], c!.a(j)])
 				}
-			} else if (o == op.Throw || o == op.Catch && c!.a(j) != kind.None) {
+			} else if (o == op.Throw || o == op.Catch && c!.a(j) != kind.None && this.into(c!.a(j))) {
 				out.append([o, if (o == op.Throw) i.info[j] else c!.a(j), 0])
 			}
 		}
+		if (p.decls[k].kind == decl.Class && p.decls[k].generic >= 0) {
+			out.append([op.Init, p.type(kind.Named, p.decls[k].generic, p.decls[k].env), 0])
+		}
 		return out
 	}
+
+	/// Whether converting into t can put a value into one of its interfaces or object types (convert).
+	private into(t: i32): bool { return this.p.members(t).some(x => this.ins.abstract(x)) }
 
 	/// Notes facts as scan makes them, of code copied here if mine.
 	private fold(fs: i32[], mine = true) {
@@ -522,9 +529,9 @@ class Mono {
 	}
 
 	/// The decls apart that the code of m's decls, and of what they hold, names, but m's own, each in the order reached,
-	/// with what it holds: a module's copies; the modules of the own ones named, m's uses; the facts of all those, an
-	/// Init of each generic class instance's type and a Type of what the signatures and fields named lower, m's facts. Of
-	/// a class, also its constructor, which emit finds by name.
+	/// with what it holds: a module's copies; the modules of the own ones named, m's uses; the facts of all those and a
+	/// Type of what the signatures and fields named lower, m's facts. Of a class, also its constructor, which emit finds
+	/// by name.
 	private copies(m: Module): i32[] {
 		const p = this.p
 		const out: i32[] = []
@@ -537,6 +544,10 @@ class Mono {
 		const typed = new HashMap[i32, bool]()
 		const reach = (d: i32) => {
 			this.signed(d, typed, m.facts)
+			// A field read or written at its offset in the layout of its class.
+			if (p.decls[d].kind == decl.Var && p.decls[d].owner >= 0) {
+				this.signed(p.decls[d].owner, typed, m.facts)
+			}
 			const t = this.top(d)
 			if (this.own.has(t) && !m.uses.includes(p.decls[t].module)) {
 				m.uses.push(p.decls[t].module)
@@ -565,9 +576,6 @@ class Mono {
 			const x = p.decls[todo[i]]
 			ctor(todo[i])
 			m.facts.append(this.facts.get(todo[i]) ?? [])
-			if (x.kind == decl.Class && x.generic >= 0) {
-				m.facts.append([op.Init, p.type(kind.Named, x.generic, x.env), 0])
-			}
 			i++
 			todo.append(x.members)
 			const c = x.code() ?? new Code()
@@ -646,6 +654,11 @@ class Mono {
 		for (const x of (this.sigs.get(d) ?? []).filter(x => !seen.has(x))) {
 			seen.set(x, true)
 			fs.append([op.Type, x, 0])
+			// held as one class, whose fields are read at their offsets
+			const one = this.lows.get(x) ?? 0
+			if (one != x && p.kind(one) == kind.Named) {
+				this.signed(p.a(one), seen, fs)
+			}
 		}
 		for (const f of if (p.decls[d].kind == decl.Class) p.decls[d].members else []) {
 			const t = p.decls[f].type
@@ -695,6 +708,10 @@ class Mono {
 			this.structs.set(t, p.type(kind.Named, c, 0))
 		}
 		if (found != null) {
+			// Of one made a struct, its fields lowered again, which notes what they lowered for what lowers t now.
+			for (const x of if (found != 0 && p.kind(found!) == kind.Object) p.items(t) else []) {
+				this.low(x)
+			}
 			return this.structs.get(t)!
 		}
 		this.structs.set(t, 0)
