@@ -7,7 +7,7 @@ import { zeros } from "../link/bytes"
 import { lower } from "../lower"
 import { mono } from "../mono"
 import * as decl from "./decl"
-import { abi, read, write } from "./file"
+import { abi, read, sigMarks, write } from "./file"
 import * as kind from "./kind"
 import { Code, Import, Program } from "./program"
 import { showDecl, showType } from "./show"
@@ -247,6 +247,30 @@ test "monomorphized, a module's file is the same as lines are added above what o
 	assert a == b
 }
 
+test "a decl's signature mark read is the one made anew, as is that of a decl naming it" {
+	const p = lowered(`import { Box, f, k } from "./lib"\n\nexport function g(b: Box[i32]): i32 { return f(b) + k }`,
+		`export class Box[T] {\n\tv: T\n\n\tconstructor(v: T) { this.v = v }\n}\n\nexport const k = 3\n\n`
+		+ `export function f(b: Box[i32]): i32 { return b.v }`)
+	sigMarks(p)
+	const files = p.modules.map(x => write(p, p.module(x.path), 1))
+	const sources = p.modules.map(x => x.source)
+	const [anew, mixed] = [new Program(), new Program()]
+	read(anew, files, 1, sources)
+	read(mixed, files, 1, sources)
+	const stored = mixed.decls.map(x => x.sig)
+	for (const x of anew.decls) {
+		x.sig = 0
+	}
+	for (const x of mixed.decls.filter(x => mixed.modules[x.module].path == "main.bob")) {
+		x.sig = 0
+	}
+	sigMarks(anew)
+	sigMarks(mixed)
+	const [made, again] = [anew.decls.map(x => x.sig), mixed.decls.map(x => x.sig)]
+	assert made.length == p.decls.length && !made.includes(0)
+	assert stored.join(" ") == made.join(" ") && again.join(" ") == made.join(" ")
+}
+
 test "a module linked from the cache, and the paths it loads, are as they were once the file it was of is written over" {
 	const [main, lib] = ["/a/path/of/main.bob", "/a/path/of/lib.bob"] // longer than a string held inline
 	const p = lower([main], [], [],
@@ -271,4 +295,23 @@ test "a module linked from the cache, and the paths it loads, are as they were o
 	const q = l.prog
 	const shown = showDecl(q, q.find(m, -1, "f"))
 	assert loaded == [lib] && q.modules[m].path == main && shown == showDecl(p, p.find(p.module(main), -1, "f"))
+}
+
+test "of files with signature marks and one without, read together, each mark is the one made anew" {
+	const p = lowered(`import { Box, f } from "./lib"\n\nexport function g(b: Box[i32]): i32 { return f(b) }`,
+		`export class Box[T] {\n\tv: T\n\n\tconstructor(v: T) { this.v = v }\n}\n\nexport function f(b: Box[i32]): i32 { return b.v }`)
+	const lib = p.module("lib.bob")
+	const bare = write(p, lib, 1) // before any mark is made
+	sigMarks(p)
+	const files = p.modules.map(x => write(p, p.module(x.path), 1))
+	const sources = p.modules.map(x => x.source)
+	const [anew, mixed] = [new Program(), new Program()]
+	read(anew, files, 1, sources)
+	read(mixed, files.map(f => if (f == files[lib]) bare else f), 1, sources)
+	for (const x of anew.decls) {
+		x.sig = 0
+	}
+	sigMarks(anew)
+	sigMarks(mixed)
+	assert mixed.decls.map(x => x.sig).join(" ") == anew.decls.map(x => x.sig).join(" ")
 }

@@ -23,6 +23,7 @@
 //! ints     per int: SLEB
 //! names    per names entry: its (Str, mods) pairs
 //! decls    per decl of its own, in the order made: Str name, kind byte, owner, the hash of its code (Decl.body)
+//!          and the mark of its signature (Decl.sig), 0 if not made
 //! imports  per decl of another module it uses: dep, owner, Str name, nth of that name in its owner
 //! types    per type, after its parts: kind byte, a and b as its kind says
 //! defs     per decl: mods, type params (Str name, constraint, default, then both exact), type, supers, tags, throws,
@@ -51,7 +52,7 @@
 //! class, also of one two modules away, but not with a function's body. Modules whose signatures name each other have
 //! one hash, of all of theirs.
 
-import { sort, unique } from "../../std/algo"
+import { endsWith, sort, unique } from "../../std/algo"
 import { HashMap } from "../../std/collections/hashmap"
 import { Reader, Writer } from "../../std/encoding/binary"
 import { isAbs, join } from "../../std/fs/path"
@@ -122,8 +123,7 @@ export function read(p: Program, files: string[], compiler: u64, sources: u64[],
 	for (const x of heads) {
 		for (const i of 0 ... x.paths.length - 1) {
 			const m = p.module(x.paths[i])
-			const h = abis.get(x.paths[i]) ?? (if (m < 0) 0 else abi(p, m))
-			if (h == 0 || x.hashes[i] != h) {
+			if (x.hashes[i] != abis.get(x.paths[i]) && (m < 0 || !holds(p, m, x.path, x.hashes[i]))) {
 				return null
 			}
 		}
@@ -161,6 +161,26 @@ export function abi(p: Program, m: i32): u64 {
 	return p.modules[m].abi
 }
 
+/// Whether h, the hash the module at path has of module m, which it uses (Out.dep), is m's now: its ABI hash, or, of
+/// one a test file imports, tops.
+export function holds(p: Program, m: i32, path: string, h: u64): bool {
+	return h == abi(p, m) || endsWith(path, ".test.bob") && h == tops(p, m)
+}
+
+/// Of module m, the hash of the signatures of each of its top-level decls, which a test file importing it sees
+/// (src/check.bob).
+function tops(p: Program, m: i32): u64 {
+	const a = new Abi(p, m)
+	for (const d of p.modules[m].decls) {
+		a.decl(d)
+	}
+	let h = a.h
+	for (const u of a.uses) {
+		h = combine(h, abi(p, u))
+	}
+	return h
+}
+
 /// The hash of what module m's code is compiled against (Abi), which its bytecode with the ABIs of its imports does
 /// not hold once monomorphized: a generic's instance names the class it is of, of another module, exported or not;
 /// with the code of its decls and copies as emit reads it; and the marks of what of other modules it is made of (Abi),
@@ -176,11 +196,20 @@ export function signatures(p: Program, m: i32, bodies: Bodies): [u64, u64[]] {
 	return [h, marks]
 }
 
-/// Of each decl, the mark of its signature and of those of the decls it names (Decl.sig), before mono makes any.
+/// Of each decl, the mark of its signature and of those of the decls it names (Decl.sig), before mono makes any; but
+/// of one read with its mark, which holds while the ABI hashes its file has of its deps do, as these cover what of
+/// another module a signature names.
 export function sigMarks(p: Program) {
 	const r = new Reached(p)
 	for (const x of 0 ... p.decls.length - 1) {
-		p.decls[x].sig = r.of([x])
+		if (p.decls[x].sig != 0) {
+			r.known(x, p.decls[x].sig)
+		}
+	}
+	for (const x of 0 ... p.decls.length - 1) {
+		if (p.decls[x].sig == 0) {
+			p.decls[x].sig = r.hash(x)
+		}
 	}
 }
 
@@ -224,13 +253,21 @@ export class Reached {
 	of(roots: i32[]): u64 {
 		let h = seed
 		for (const d of roots) {
-			if (!this.hashes.has(d)) {
-				this.visit(d)
-			}
-			h = combine(h, this.hashes.get(d)!)
+			h = combine(h, this.hash(d))
 		}
 		return h
 	}
+
+	/// The hash of decl d, as given (known), else made.
+	hash(d: i32): u64 {
+		if (!this.hashes.has(d)) {
+			this.visit(d)
+		}
+		return this.hashes.get(d)!
+	}
+
+	/// Takes h as the hash of decl d.
+	known(d: i32, h: u64) { this.hashes.set(d, h) }
 
 	/// Hashes decl d, unvisited, unless it is in a component not done; returns the least index on the stack it reaches.
 	private visit(d: i32): i32 {
@@ -341,6 +378,7 @@ class Out {
 			decls.u8(x.kind)
 			this.owner(decls, x.owner)
 			decls.fixed(x.body, 8)
+			decls.fixed(x.sig, 8)
 			uleb(defs, x.mods)
 			uleb(defs, x.params.length)
 			for (const t of x.params) {
@@ -522,7 +560,9 @@ class Out {
 	private dep(m: i32): i32 {
 		return this.deps.find(m) ?? this.deps.add(m, w => {
 			text(w, this.p.modules[m].path)
-			w.fixed(if (this.whole) abi(this.p, m) else 0, 8)
+			const x = this.p.modules[this.m]
+			const tests = endsWith(x.path, ".test.bob") && x.imports.some(y => y.module == m)
+			w.fixed(if (!this.whole) 0 else if (tests) tops(this.p, m) else abi(this.p, m), 8)
 		})
 	}
 
@@ -552,7 +592,7 @@ export class In {
 	compiler: u64 = 0
 	source: u64 = 0
 	abi: u64 = 0
-	/// Its deps' paths and the ABI hash it has of each.
+	/// Its deps' paths and the hash it has of each (Out.dep).
 	paths: string[] = []
 	hashes: u64[] = []
 	/// Its module, once added.
@@ -611,6 +651,7 @@ export class In {
 			}
 			const d = p.decl(this.m, this.owner(), name, k as decl.Kind)
 			p.decls[d].body = this.r.fixed(8)
+			p.decls[d].sig = this.r.fixed(8)
 			return d
 		})
 		this.own = this.decls.length
@@ -933,7 +974,7 @@ class Abi {
 
 	/// Adds the signature of decl d, of its members if a class or interface, its code if a const; with its doc but a
 	/// function's, which a type's descriptor holds, and whether it has code, as a call of one without is an intrinsic.
-	private decl(d: i32) {
+	decl(d: i32) {
 		if (this.done.has(d)) {
 			return
 		}
@@ -1043,7 +1084,7 @@ class Abi {
 	}
 
 	/// Adds decl d if of this module, or if all one mono made or copied; if all, of another decl its mark (Decl.sig),
-	/// which covers what it names; else notes its module; or if m is -1, notes d.
+	/// which covers what it names; else, but of a private one, notes its module; or if m is -1, notes d.
 	private named(d: i32) {
 		const x = this.p.decls[d]
 		if (this.m < 0) {
@@ -1052,6 +1093,8 @@ class Abi {
 			this.decl(d)
 		} else if (this.all) {
 			this.marks.push(x.sig)
+		} else if ((this.p.decls[if (x.owner < 0) d else x.owner].mods & decl.Export) == 0) {
+			this.decl(d) // private, which only a test file's signatures name
 		} else if (!this.uses.includes(x.module)) {
 			this.uses.push(x.module)
 		}

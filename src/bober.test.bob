@@ -958,3 +958,23 @@ test "with no level given, a unit made anew as a mark it names is gone is TPDE's
 	assert built([["lib.bob", lib(3)]], "") == "3\n"
 	assert mains() == ["O1"]
 }
+
+test "a test file importing a private function is compiled anew once its type changed" {
+	const lib = (t: string, v: string) => `function hidden(): ${t} { return ${v} }\n`
+	const main = "import { hidden } from \"./lib\"\n\nfunction main() { print(`${hidden()}${1}`) }\n"
+	anew()
+	const first = built([["lib.bob", lib("i32", "1")], ["main.test.bob", main]], "-O1", "main.test.bob")
+	const edited = built([["lib.bob", lib("string", "\"a\"")]], "-O1", "main.test.bob")
+	assert first == "11\n" && edited == "a1\n"
+}
+
+test "a module embedding a test file's class that embeds a private class of another is compiled anew once that class grew" {
+	const lib = (f: string) => `class Hidden {\n${f}\ta = 1\n}\n\nexport function k(): i32 { return 2 }\n`
+	const w = "import { Hidden } from \"./lib\"\n\nexport class W {\n\th: ...Hidden\n}\n"
+	const mid = "import { W } from \"./w.test.bob\"\n\nexport class M {\n\tw: ...W\n\tb = 7\n}\n"
+	const main = "import { M } from \"./mid\"\n\nfunction main() { print(`${new M().b}`) }\n"
+	anew()
+	const first = built([["lib.bob", lib("")], ["w.test.bob", w], ["mid.bob", mid], ["main.bob", main]], "-O1")
+	const edited = built([["lib.bob", lib("\tz = 5\n\ty = 6\n")]], "-O1")
+	assert first == "7\n" && edited == "7\n"
+}
