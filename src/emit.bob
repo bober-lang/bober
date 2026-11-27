@@ -77,6 +77,15 @@ export function emit(p: Program, m: i32, b: Backend, o: Options, facts: Facts = 
 	new Emitter(p, m, b, o, facts).run()
 }
 
+/// Emits module m of a program as mono made it into b as units (Emitter.to), and gives their keys, in the order of b's
+/// objects.
+export function emitUnits(p: Program, m: i32, b: Backend, o: Options): string[] throws CompileError {
+	const e = new Emitter(p, m, b, o, new Facts())
+	e.to(e.named)
+	e.run()
+	return e.keys
+}
+
 /// What a release build learns of program p by emitting each module into a backend of its own, thrown away, so that it
 /// may hold values in place where it can: a release build's emission runs twice, to learn and as learned.
 export function learn(p: Program, o: Options, backend: (m: i32) => Backend): Facts throws CompileError {
@@ -233,6 +242,13 @@ class Emitter {
 	private callees = new HashMap[i32, Callee]()
 	/// The descriptors named and not yet defined, by type, with their placeholders.
 	private pending: [i32, Value][] = []
+	/// With units, the key of each, the glue's first, the unit being emitted, the units by key, and those left of
+	/// what each holds of its own: its strings, C strings, thunks and callees.
+	keys: string[] = []
+	private unit = 0
+	private units = new HashMap[string, i32]()
+	private owns = new HashMap[i32, [HashMap[string, Value], HashMap[string, Value], HashMap[string, Value],
+		HashMap[i32, Callee]]]()
 	/// The union of any type, the empty one (see above).
 	private any: i32
 	// The types every module uses.
@@ -406,7 +422,8 @@ class Emitter {
 
 	run() {
 		const p = this.p
-		for (const d of this.src.roots.filter(d => p.decls[d].code != null)) {
+		// With units, the glue defines every position, as one a unit defined would be gone with it.
+		for (const d of this.src.roots.filter(d => this.keys.length > 0 || p.decls[d].code != null)) {
 			this.base(d)
 		}
 		for (const d of this.decls) {
@@ -429,9 +446,9 @@ class Emitter {
 		for (const d of this.decls) {
 			this.decl(d)
 		}
-		this.src = p.modules[this.m]
-		for (const d of this.spawns) {
-			this.defineSpawn(d)
+		this.spawned()
+		if (this.keys.length > 0) {
+			this.to(this.named)
 		}
 		this.init()
 		if (this.o.main < 0) {
@@ -443,12 +460,72 @@ class Emitter {
 		// Each defined once all that named it are, as defining one may name more.
 		while (this.pending.length > 0) {
 			const [n, g] = this.pending.pop()
+			if (this.keys.length > 0) {
+				const key = `bober.type.${this.key(n)}`
+				if (this.units.has(key)) {
+					continue // defined, the placeholder of another unit naming it
+				}
+				this.to(key)
+			}
 			const d = this.b.define(g, this.descriptor(n), false, 0)
 			this.b.weak(d)
 			if (p.closed(n)) {
 				this.b.described(d)
 			}
 		}
+	}
+
+	/// Has what is emitted next go in the unit of key, made the first time; the spawn wrappers its code named are defined
+	/// in the unit left. A unit is one of its module's glue, of its vars, inits and main or tests, or of a function, of
+	/// a class with its fields' initializers, or of a descriptor, each defining what its key names. As it names the others'
+	/// symbols, it holds its own constants and thunks, and those of decls are not local.
+	to(key: string) {
+		let n = this.units.get(key) ?? -1
+		if (n < 0) {
+			n = this.keys.length
+			this.keys.push(key)
+			this.units.set(key, n)
+		}
+		if (n == this.unit) {
+			return
+		}
+		this.spawned()
+		this.owns.set(this.unit, [this.strs, this.cstrs, this.thunks, this.callees])
+		const [strs, cstrs, thunks, callees] = this.owns.get(n)
+			?? [new HashMap[string, Value](), new HashMap[string, Value](), new HashMap[string, Value](),
+				new HashMap[i32, Callee]()]
+		this.strs = strs
+		this.cstrs = cstrs
+		this.thunks = thunks
+		this.callees = callees
+		this.unit = n
+		this.b.unit(n as u32)
+	}
+
+	/// The key of the unit decl d is defined in: the glue's for a var but a field or lazy static, else that of the class
+	/// of the field or static, or of the outermost function or test it is nested in, but a var's as above.
+	private home(d: i32): string {
+		const x = this.p.decls[d]
+		if (x.kind == decl.Var && !this.lazy(d) && (this.p.classOf(d) < 0 || (x.mods & Static) != 0)) {
+			return this.named
+		}
+		const o = x.owner
+		if (o >= 0 && x.kind != decl.Class && (x.kind == decl.Var || this.p.decls[o].kind != decl.Class)) {
+			return this.home(o)
+		}
+		return this.symbol(d)
+	}
+
+	/// Whether a decl's symbol is local, l, as a copy's or a nested one's is; not with units, which name each other's.
+	private onlyHere(l: bool): bool { return l && this.keys.length == 0 }
+
+	/// Defines the spawn wrappers named so far.
+	private spawned() {
+		this.src = this.p.modules[this.m]
+		for (const d of this.spawns) {
+			this.defineSpawn(d)
+		}
+		this.spawns = []
 	}
 
 	// Decls.
@@ -458,6 +535,9 @@ class Emitter {
 		const c = p.classOf(d)
 		if (c >= 0 && p.decls[c].kind == decl.Interface) {
 			return
+		}
+		if (this.keys.length > 0 && (x.code != null || x.kind != decl.Function)) {
+			this.to(this.home(d))
 		}
 		this.fnDecl = d
 		if (this.facts.phase == "learning" && !this.facts.calls.has(d)) {
@@ -472,7 +552,8 @@ class Emitter {
 				this.construction(d)
 			}
 		} else if (x.kind == decl.Test) {
-			this.define(this.b.function(this.symbol(d), this.b.fn(this.void, []), true), kind.None, [], false, code!)
+			this.define(this.b.function(this.symbol(d), this.b.fn(this.void, []), this.onlyHere(true)), kind.None, [], false,
+				code!)
 		} else if (x.kind == decl.Function && code != null) {
 			const f = this.callee(d)
 			const ps = [...f.first, ...f.params.map(t => this.ll(t))]
@@ -674,7 +755,7 @@ class Emitter {
 			if (tests && x.kind == decl.Test) {
 				this.rt("test",
 					[this.cstr(this.name(d)), this.cstr(this.path),
-					b.function(this.symbol(d), b.fn(this.void, []), true)])
+					b.function(this.symbol(d), b.fn(this.void, []), this.onlyHere(true))])
 			} else if (!tests && x.kind == decl.Function && this.name(d) == "main") {
 				const c = this.callee(d)
 				const v = this.call(c.type, c.fn, [])
@@ -1488,9 +1569,8 @@ class Emitter {
 	/// Decl d as a function of type t, in this module or declared; a copy or one nested in a function local.
 	private function(d: i32, t: IrType): Value {
 		const x = this.p.decls[d]
-		const f = this.b.function(this.symbol(d), t,
-			this.copies.has(d)
-			|| this.here.has(d) && x.owner >= 0 && this.p.classOf(d) < 0 && (x.mods & decl.Export) == 0)
+		const f = this.b.function(this.symbol(d), t, this.onlyHere(this.copies.has(d)
+			|| this.here.has(d) && x.owner >= 0 && this.p.classOf(d) < 0 && (x.mods & decl.Export) == 0))
 		const code = x.code
 		if ((x.mods & decl.Outlined) != 0
 			|| this.facts.phase == "none" && code != null && code.ops.length >= this.o.tune.small) {
@@ -1674,19 +1754,20 @@ class Emitter {
 		}
 		const x = this.p.decls[d]
 		const t = this.mem(x.type)
+		const here = this.here.has(d) && (this.keys.length == 0 || this.home(d) == this.keys[this.unit])
+		const own = this.onlyHere(this.copies.has(d) || x.owner >= 0 && this.p.classOf(d) < 0)
 		if (this.isLet(d)) {
-			if (!this.here.has(d)) {
+			if (!here) {
 				return this.b.extern(sym, this.i64)
 			}
-			const own = this.copies.has(d) || x.owner >= 0 && this.p.classOf(d) < 0
 			const g = this.b.global(sym, this.i64Const(0), own, 0)
 			this.b.letSlot(g, t)
 			return g
 		}
-		if (!this.here.has(d)) {
+		if (!here) {
 			return this.b.extern(sym, t)
 		}
-		const g = this.b.global(sym, this.zero(x.type), this.copies.has(d) || x.owner >= 0 && this.p.classOf(d) < 0, 0)
+		const g = this.b.global(sym, this.zero(x.type), own, 0)
 		this.b.root(g)
 		return g
 	}
@@ -2945,7 +3026,7 @@ class Emitter {
 	private initializer(c: i32): Value {
 		const ps = [...this.scopeOf(c).map(_ => this.i64), this.ref]
 		return this.of(this.b.function(this.symbol(c) + ":init", this.b.fn(this.void, ps),
-			this.copies.has(c) || this.here.has(c) && this.p.decls[c].owner >= 0), c)
+			this.onlyHere(this.copies.has(c) || this.here.has(c) && this.p.decls[c].owner >= 0)), c)
 	}
 
 	/// Runs the initializers of class n on the instance at refers to, then its constructor, if it has one, with args.
@@ -4317,9 +4398,9 @@ class Emitter {
 			return found
 		}
 		const x = this.p.decls[d]
-		const name = `${this.symbol(d)}:pos`
+		const name = `${this.symbolOf(d)}:pos`
 		return put(this.poses, d,
-			if (x.module == this.m) this.b.literal(name, this.b.constInt(this.i32, x.pos))
+			if (x.module == this.m && this.unit == 0) this.b.literal(name, this.b.constInt(this.i32, x.pos))
 			else this.b.extern(name, this.i32))
 	}
 
@@ -4956,10 +5037,16 @@ class Emitter {
 	}
 
 	// Decls.
+	/// The symbol of decl d; with units, a copy's under its module's path, as no longer local.
+	private symbol(d: i32): string {
+		const s = this.symbolOf(d)
+		return if (this.keys.length > 0 && this.copies.has(d)) `${this.named}:${s}` else s
+	}
+
 	/// The symbol of decl d, the same in each build of its module: <path>:<name>, a test's <path>:test <name>, so that it
 	/// does not clash with a declaration's; an owned one's its owner's .<name>, with #n after it of the nth of its
 	/// owner's of its name; an instance's then with the keys of its own args.
-	private symbol(d: i32): string {
+	private symbolOf(d: i32): string {
 		const have = this.facts.symbols.get(d)
 		if (have != null) {
 			return have
@@ -4970,7 +5057,7 @@ class Emitter {
 		const name = p.strings[x.name]
 		let r = if (x.kind == decl.Test) `${path}:test ${name}`
 			else if (x.owner < 0) `${path}:${name}`
-			else `${this.symbol(x.owner)}.${name}${if (x.nth == 0) "" else `#${x.nth}`}`
+			else `${this.symbolOf(x.owner)}.${name}${if (x.nth == 0) "" else `#${x.nth}`}`
 		const n = if (x.generic < 0) 0 else p.decls[x.generic].params.length
 		if (n > 0) {
 			const args = p.lists[x.env]
