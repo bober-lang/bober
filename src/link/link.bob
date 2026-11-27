@@ -1306,7 +1306,7 @@ export class Linker {
 				|| this.veneered.has(u.at[i] + f.at))
 			u.encoded = record(records, u.object, u.at, again, u.names.map(g => if (g < this.shared) g else -1))
 			u.blocks = [this.block(kept, u.encoded, what),
-				this.block(kept, u.links.slice(0, 16 * (u.object.symbols.length as u64)), what)]
+				this.block(kept, u.links.slice(0, 24 * (u.object.symbols.length as u64)), what)]
 			// Not those whose address a later link may change: of a thread's copy.
 			const syms = u.object.symbols.filter(x => {
 				const sec = if (x.section >= 0) u.object.sections[x.section] else null
@@ -1343,7 +1343,6 @@ export class Linker {
 			this.free(was, 12 * old + unitEntry * old / 2)
 		}
 		s.units[2] = count
-		const [slots, cap, _] = s.units
 		for (const k of ks) {
 			const u = this.held(k)
 			if (k >= this.loaded && k > 0) {
@@ -1362,7 +1361,7 @@ export class Linker {
 			}
 			for (const i of 0 ... 5) {
 				const [from, size] = (if (i < 4) u.blocks.at(i) else u.relr.at(i - 4)) ?? [0, 0]
-				const p = slots + 12 * cap + unitEntry * (k as u64) + 12 * (i as u64)
+				const p = this.entryAt(k) + 12 * (i as u64)
 				this.bytes.put(p, from, 8)
 				this.bytes.put(p + 8, size, 4)
 			}
@@ -1578,32 +1577,36 @@ export class Linker {
 		return true
 	}
 
-	/// Links unit k's symbols with a name into the chains of their names, if the image is kept.
+	/// Links unit k's symbols with a name into the chains of their names, first, if the image is kept.
 	private chained(k: i32) {
 		if (!this.keep) {
 			return
 		}
 		const u = this.held(k)
 		const o = u.object
-		const b = new u8[](16 * o.symbols.length)
+		u.links = new Bytes(zeros(24 * o.symbols.length))
+		u.from = 0
 		for (const j of 0 ... o.symbols.length - 1) {
 			const s = o.symbols[j]
 			if (u.names[j] >= 0) {
 				const defines = s.section >= 0 && u.at[s.section] != dropped
 				const n = this.entry(u.names[j])
-				put(b, 16 * j, n.chain, 8)
-				put(b, 16 * j + 8, if (defines) (s.section as u64) << 32 | s.value else 0, 8)
-				n.chain = ((k + 1) as u64) << 32 | (j as u64) | (if (defines) defining else 0)
+				const l = ((k + 1) as u64) << 32 | (j as u64) | (if (defines) defining else 0)
 					| (if (s.binding == Global) strong else 0)
+				u.links.put(24 * (j as u64), n.chain, 8)
+				u.links.put(24 * (j as u64) + 16, if (defines) (s.section as u64) << 32 | s.value else 0, 8)
+				if (n.chain != 0) {
+					const [b, at] = this.linked(n.chain)
+					b.put(at + 8, l, 8)
+				}
+				n.chain = l
 			}
 		}
-		u.links = new Bytes(fromBytes(b))
-		u.from = 0
 	}
 
 	/// The chain of n: per symbol with its name of the units linked, the latest first, (k + 1) << 32 | j of symbol j of
-	/// unit k, and whether it defines n, and not weakly, or if it does not, names it so that it must be defined. Each is
-	/// where the one before it is linked (linked) has it, the first n.
+	/// unit k, and whether it defines n, and not weakly, or if it does not, names it so that it must be defined. Where
+	/// each is linked (linked) has the next and the one before, 0 if none, the first n.chain.
 	private links(n: Name): u64[] {
 		const ls: u64[] = []
 		this.first(n, l => {
@@ -1626,14 +1629,16 @@ export class Linker {
 	/// The unit of link l, -1 of none.
 	private unit(l: u64): i32 { return ((l >> 32 & 0x3fffffff) as i32) - 1 }
 
-	/// Where the links of link l's unit k have, of l to its symbol j, the next link, and if j defines its name, its
-	/// section << 32 | value.
+	/// Where the links of link l's unit k have, of l to its symbol j, the next link and the one before, and if j defines
+	/// its name, its section << 32 | value; of a unit held not read, as its entry says, which this reads no more of.
 	private linked(l: u64): [Bytes, u64] throws CompileError {
-		if (this.unit(l) < 0 || this.unit(l) >= this.units.length) {
+		const k = this.unit(l)
+		if (k < 0 || k >= this.units.length) {
 			throw new CompileError("a chain of names is broken")
 		}
-		const u = this.held(this.unit(l))
-		return [u.links, u.from + 16 * (l & 0xffffffff)]
+		const u = this.units[k]
+		const at = 24 * (l & 0xffffffff)
+		return if (u != null) [u.links, u.from + at] else [this.bytes, this.bytes.get(this.entryAt(k) + 12, 8) + at]
 	}
 
 	/// The units that name n so that it must be defined, but do not.
@@ -1644,17 +1649,20 @@ export class Linker {
 	/// Unlinks symbol j of unit k from n's chain.
 	private unchain(n: Name, k: i32, j: i32) {
 		const me = ((k + 1) as u64) << 32 | (j as u64)
-		let before: [Bytes, u64] | null = null // where the link to it is, if not n.chain
-		let l = n.chain
-		while (l & ~(defining | strong) != me) {
-			before = this.linked(l)
-			l = before[0].get(before[1], 8)
+		const [b, at] = this.linked(me)
+		const [next, prev] = [b.get(at, 8), b.get(at + 8, 8)]
+		const before = if (prev != 0) this.linked(prev) else null // where the link to it is, if not n.chain
+		if ((if (before != null) before[0].get(before[1], 8) else n.chain) & ~(defining | strong) != me) {
+			throw new CompileError("a chain of names is broken")
 		}
-		const [b, at] = this.linked(l)
 		if (before == null) {
-			n.chain = b.get(at, 8)
+			n.chain = next
 		} else {
-			before[0].put(before[1], b.get(at, 8), 8)
+			before[0].put(before[1], next, 8)
+		}
+		if (next != 0) {
+			const [c, to] = this.linked(next)
+			c.put(to + 8, prev, 8)
 		}
 	}
 
@@ -1662,7 +1670,7 @@ export class Linker {
 	private redefine(n: Name) {
 		const ls = this.links(n).filter(l => l & defining != 0)
 		const l = ls.find(l => l & strong != 0) ?? (if (ls.length > 0) ls[0] else 0)
-		const at = if (l != 0) this.linked(l)[0].get(this.linked(l)[1] + 8, 8) else 0
+		const at = if (l != 0) this.linked(l)[0].get(this.linked(l)[1] + 16, 8) else 0
 		n.unit = this.unit(l)
 		n.section = if (l != 0) (at >> 32) as i32 else -1
 		n.value = at & 0xffffffff
@@ -1689,8 +1697,7 @@ export class Linker {
 		const u = new Unit(new Object("", this.machine.arch), k == 0)
 		const b = this.bytes
 		this.reads++
-		const [at, cap, _] = this.state.units
-		const p = at + 12 * cap + unitEntry * (k as u64)
+		const p = this.entryAt(k)
 		const blocks: [u64, u64][] = []
 		for (const i of 0 ... 5) {
 			blocks.push([b.get(p + 12 * (i as u64), 8), b.get(p + 12 * (i as u64) + 8, 4)])
@@ -1713,6 +1720,9 @@ export class Linker {
 		this.units[k] = u
 		return u
 	}
+
+	/// Where the entry of unit k the continued image holds is.
+	private entryAt(k: i32): u64 { return this.state.units[0] + 12 * this.state.units[1] + unitEntry * (k as u64) }
 
 	/// Whether unit k is frozen, as of those the continued image holds only the first is.
 	private frozen(k: i32): bool { return if (k < this.loaded) k == 0 else this.units[k]!.frozen }
