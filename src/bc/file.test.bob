@@ -1,6 +1,9 @@
 //! Tests of src/bc/file.bob: modules lowered, written, and read back into another Program.
 
+import { makeTempDir, open, removeAll } from "../../std/fs"
 import { ParseError } from "../../std/string"
+import { Lift, compilerId } from "../lift"
+import { zeros } from "../link/bytes"
 import { lower } from "../lower"
 import { mono } from "../mono"
 import * as decl from "./decl"
@@ -242,4 +245,30 @@ test "monomorphized, a module's file is the same as lines are added above what o
 	const lib = `export function twice[T](x: T): T {\n\tassert x == x\n\treturn x\n}`
 	const [a, b] = [main(lib), main(`// moved\n\n${lib}`)]
 	assert a == b
+}
+
+test "a module linked from the cache, and the paths it loads, are as they were once the file it was of is written over" {
+	const [main, lib] = ["/a/path/of/main.bob", "/a/path/of/lib.bob"] // longer than a string held inline
+	const p = lower([main], [], [],
+		x => if (x == main) "import { k } from \"./lib\"\n\nexport function f(): i32 { return k }"
+		else if (x == lib) "export const k = 1"
+		else null)
+	const dir = makeTempDir("bober-")
+	const bc = write(p, p.module(main), compilerId())
+	writeFile(`${dir}/bc`, bc)
+	const f = open(`${dir}/bc`, "r+")
+	const l = new Lift()
+	l.cache.set(main, f.map())
+	l.cache.set(lib, write(p, p.module(lib), compilerId()))
+	const loaded: string[] = []
+	const m = l.module(main, x => {
+		loaded.push(x)
+		return l.module(x) >= 0
+	})
+	f.writeAt(0, zeros(bc.length))
+	f.close()
+	removeAll(dir)
+	const q = l.prog
+	const shown = showDecl(q, q.find(m, -1, "f"))
+	assert loaded == [lib] && q.modules[m].path == main && shown == showDecl(p, p.find(p.module(main), -1, "f"))
 }

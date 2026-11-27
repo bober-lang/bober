@@ -80,10 +80,11 @@ export class Lift {
 		try {
 			const h = head(file!)
 			if (h.paths.every(load) && this.prog.module(path) < 0) {
-				const ms = read(this.prog, [file!], compilerId(), [h.source])
+				const f = file!.copy() // of the image, which may change once lowered
+				const ms = read(this.prog, [f], compilerId(), [h.source])
 				if (ms != null) {
 					this.served.push(h)
-					this.prog.modules[ms![0]].bc = file!
+					this.prog.modules[ms![0]].bc = f
 					return this.entered(ms!)
 				}
 			}
@@ -167,12 +168,13 @@ export class Bound {
 
 	constructor(includes: string) { this.includes = includes }
 
-	/// Keeps each Bound of files, as bytes made them.
+	/// Keeps each Bound of files, as bytes made them, the last well-formed of a path, of copies of its bytes, which may
+	/// change.
 	static keep(files: string[]) {
 		for (const f of files) {
 			try {
 				const r = new Reader(f)
-				const s = () => r.raw(r.uleb() as i32)
+				const s = () => r.raw(r.uleb() as i32).copy()
 				const path = s()
 				const b = new Bound(s())
 				b.src = s()

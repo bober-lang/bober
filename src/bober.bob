@@ -1168,18 +1168,21 @@ function lowered(mains: string[], includes: string[]): Program {
 		cmake(h)
 	}
 	const image = `${dir}/image.so`
-	// Mapped of one descriptor, lest another build replace it, and read shared, lest one write it in place, which it may
-	// once this is done: what is taken of it, copied; the mapping, by relink only while the file has the same stamp.
+	// Mapped of one descriptor, lest another build replace it, and read shared while lowering, lest one write it in
+	// place, which it may once this is done: what is taken of it, copied, a module's bytecode once linked (Lift.module);
+	// the mapping, by relink only while the file has the same stamp.
 	const f = if (exists(image)) open(image) else null
 	f?.lock(true, true)
-	const kept = if (f == null) null else new Bytes(f.map())
-	const l = new Linker(machine, format, kept)
-	const cache = l.sections("bober_bc").map(s => s.copy())
-	Bound.keep(l.sections("bober_bind").map(s => s.copy()))
-	decoded = if (kept == null) null else [stamp(kept, format.headers), l, kept]
-	f?.close()
-	mkdirAll(dir)
-	return hashing(`${dir}/hashes`, () => lower(mains, includes, cache))
+	try {
+		const kept = if (f == null) null else new Bytes(f.map())
+		const l = new Linker(machine, format, kept)
+		Bound.keep(l.sections("bober_bind"))
+		decoded = if (kept == null) null else [stamp(kept, format.headers), l, kept]
+		mkdirAll(dir)
+		return hashing(`${dir}/hashes`, () => lower(mains, includes, l.sections("bober_bc")))
+	} finally {
+		f?.close()
+	}
 }
 
 /// Whether bober runs from its package, whose lib/ has the run time, the C of the bundle's modules and the launcher,
