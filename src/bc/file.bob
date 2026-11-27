@@ -251,10 +251,11 @@ export class Reached {
 	private abi: Abi
 	/// Of each decl visited, its own hash and the decls it names, till its component is hashed.
 	private made = new HashMap[i32, [u64, i32[]]]()
-	private hashes = new HashMap[i32, u64]()
+	private hashes: u64[] // of each decl, 0 till hashed
 
 	constructor(p: Program, mark = -1) {
 		this.p = p
+		this.hashes = p.decls.map(_ => 0 as u64)
 		this.abi = new Abi(p, -1, mark >= 0, mark)
 	}
 
@@ -269,14 +270,14 @@ export class Reached {
 
 	/// The hash of decl d, as given (known), else made.
 	hash(d: i32): u64 {
-		if (!this.hashes.has(d)) {
+		if (this.hashes[d] == 0) {
 			this.visit(d)
 		}
-		return this.hashes.get(d)!
+		return this.hashes[d]
 	}
 
 	/// Takes h as the hash of decl d.
-	known(d: i32, h: u64) { this.hashes.set(d, h) }
+	known(d: i32, h: u64) { this.hashes[d] = h }
 
 	/// Hashes decl d, unvisited, unless it is in a component not done; returns the least index on the stack it reaches.
 	private visit(d: i32): i32 {
@@ -287,7 +288,7 @@ export class Reached {
 		this.made.set(d, a)
 		let low = i
 		for (const u of a[1]) {
-			if (!this.hashes.has(u)) {
+			if (this.hashes[u] == 0) {
 				low = min(low, this.index.get(u) ?? this.visit(u))
 			}
 		}
@@ -303,11 +304,11 @@ export class Reached {
 			for (const y of c) {
 				own += this.made.get(y)![0]
 				for (const u of this.made.get(y)![1]) {
-					others += this.hashes.get(u) ?? 0 // of the component's, which are not hashed yet, none
+					others += this.hashes[u] // of the component's, which are not hashed yet, none
 				}
 			}
 			for (const y of c) {
-				this.hashes.set(y, combine(own, others))
+				this.hashes[y] = combine(own, others)
 				this.made.delete(y)
 			}
 		}
