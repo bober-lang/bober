@@ -163,6 +163,8 @@ export class Lift {
 /// the hash of its bytes, 0 if there are none.
 export class Bound {
 	src = ""
+	/// Of one kept, the hash of src, which the image holds as a read of no path; else 0.
+	private srcHash = 0 as u64
 	includes: string
 	reads: [string, u64][] = []
 
@@ -179,7 +181,13 @@ export class Bound {
 				const b = new Bound(s())
 				b.src = s()
 				while (r.pos < f.length) {
-					b.reads.push([s(), r.fixed(8)])
+					const p = s()
+					const h = r.fixed(8)
+					if (p == "") {
+						b.srcHash = h
+					} else {
+						b.reads.push([p, h])
+					}
 				}
 				bound.set(path, b)
 			} catch (e: ParseError) {}
@@ -202,6 +210,9 @@ export class Bound {
 		}
 	}
 
+	/// The hash of src.
+	hashed(): u64 { return if (this.srcHash != 0) this.srcHash else fnv(this.src) }
+
 	/// This, of the module at path, as a build's kept image holds it.
 	bytes(path: string): string {
 		const w = new Writer()
@@ -209,7 +220,7 @@ export class Bound {
 			w.uleb(s.length as u64)
 			w.raw(s)
 		}
-		for (const [f, h] of this.reads) {
+		for (const [f, h] of [...this.reads, ["", this.hashed()] as [string, u64]]) {
 			w.uleb(f.length as u64)
 			w.raw(f)
 			w.fixed(h, 8)
@@ -242,7 +253,7 @@ function hashedSource(path: string, includes: string, digest: (path: string) => 
 	if (b != null && !b.current(includes, digest)) {
 		return 0
 	}
-	const h = if (b != null && b.src != "") fnv(b!.src) else digest(path)
+	const h = if (b != null && b.src != "") b!.hashed() else digest(path)
 	return if (h == 0) 0 else sourceHash(path, h)
 }
 
