@@ -43,10 +43,10 @@ export let lowered = [...first, ...["equal", "show", "math", "fiber"].map(builti
 
 /// The errors of the modules at paths and of those they import, each checked once and handed on to next, after
 /// builtin/'s lowered ones, so that those are done before lift compares a module's ABI hash, which may reach them; one
-/// lift's bundle or cache holds is made from its decls instead.
+/// lift's bundle or cache holds is made from its decls instead. Without errors, then those of the paths more gives.
 export function check(paths: string[], includes: string[] = [],
 	read: (path: string) => string | null = p => readFile(p), next: Checked = new Ignore(),
-	lift = new Lift()): TypeError[] {
+	lift = new Lift(), more: () => string[] = () => []): TypeError[] {
 	info = new HashMap[i32, HashMap[string, Member]]()
 	fills = new HashMap[i32, () => void]()
 	fillWith(t => {
@@ -64,11 +64,17 @@ export function check(paths: string[], includes: string[] = [],
 	deferred = []
 	visited = 0
 	const ms = new Modules(includes, read, next, new Linked(lift))
-	for (const path of [...lowered, ...paths]) {
-		const m = ms.load(normal(path))
-		if (m instanceof string) {
-			ms.errors.push(new TypeError(path, Loc.at(0, 0), m))
+	const load = (ps: string[]) => {
+		for (const path of ps) {
+			const m = ms.load(normal(path))
+			if (m instanceof string) {
+				ms.errors.push(new TypeError(path, Loc.at(0, 0), m))
+			}
 		}
+	}
+	load([...lowered, ...paths])
+	if (ms.errors.every(e => e.warning)) {
+		load(more())
 	}
 	return ms.errors
 }
