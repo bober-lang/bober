@@ -279,6 +279,8 @@ export class Linker {
 	/// The names the units unlinked named, of which a supplied unit's may be named no more (orphans), until resolve.
 	private lost: i32[] = []
 	private bytes = new Bytes()
+	/// The links of the units chained (chained) not read of the image, each at its from.
+	private chains = new Bytes()
 	/// Of the units it holds but the frozen one, those unlinked or fixed, whose entries save writes anew; and how many it
 	/// read (held).
 	private changes: i32[] = []
@@ -1421,7 +1423,7 @@ export class Linker {
 				|| this.veneered.has(u.at[i] + f.at))
 			u.encoded = record(records, u.object, u.at, again, u.names.map(g => if (g < this.shared) g else -1), u.frozen)
 			u.blocks = [this.block(kept, u.encoded, what),
-				this.block(kept, u.links.slice(0, 24 * (leading(u.object) as u64)), what)]
+				this.block(kept, u.links.slice(u.from, u.from + 24 * (leading(u.object) as u64)), what)]
 			// Not those whose address a later link may change: of a thread's copy; nor marks, named `~...`, which no debugger
 			// or profiler has a use for. Each with the index of its shared name, whose name the symbol table's is, else -1.
 			const syms: [Symbol, i32][] = []
@@ -1713,8 +1715,9 @@ export class Linker {
 		}
 		const u = this.held(k)
 		const o = u.object
-		u.links = new Bytes(zeros(24 * leading(o)))
-		u.from = 0
+		u.links = this.chains
+		u.from = this.chains.length
+		this.chains.length += 24 * (leading(o) as u64)
 		for (const j of 0 ... o.symbols.length - 1) {
 			const s = o.symbols[j]
 			if (u.names[j] >= 0) {
@@ -1722,8 +1725,8 @@ export class Linker {
 				const n = this.entry(u.names[j])
 				const l = ((k + 1) as u64) << 32 | (j as u64) | (if (defines) defining else 0)
 					| (if (s.binding == Global) strong else 0)
-				u.links.put(24 * (j as u64), n.chain, 8)
-				u.links.put(24 * (j as u64) + 16, if (defines) (s.section as u64) << 32 | s.value else 0, 8)
+				u.links.put(u.from + 24 * (j as u64), n.chain, 8)
+				u.links.put(u.from + 24 * (j as u64) + 16, if (defines) (s.section as u64) << 32 | s.value else 0, 8)
 				if (n.chain != 0) {
 					const [b, at] = this.linked(n.chain)
 					b.put(at + 8, l, 8)
