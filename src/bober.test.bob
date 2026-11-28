@@ -284,8 +284,7 @@ test "with no level a module is compiled by TPDE until a build finds it unchange
 	assert edited == replace(out, "true i32", "true i64")
 		&& units().some(o => startsWith(o, `${home()}/lib.bob^`) && indexOf(o, "^O1@") > 0)
 	assert built([], "") == edited && by("^O2@")
-	const opt = units()
-	assert built([], "-O1") == edited && units() == opt
+	assert built([], "-O1") == edited && by("^O1@") // of units apart, not -O2's of the module
 	assert built([["lib.bob", lib]], "-O2") == out && by("^O2@")
 }
 
@@ -416,7 +415,7 @@ function main() {
 	assert a == "1 2 2 3\n" && built([], "-O1", "b.bob") == "s 2 2 3\n"
 	const both = held()
 	assert units.filter(o => both.indexOf(o) < 0) == [] && built([], "-O1", "a.bob") == a && held() == both
-	assert both.filter(o => startsWith(o, `${home()}/lib.bob^`) && indexOf(o, "^O1@") > 0).length == 2
+	assert both.filter(o => startsWith(o, `${home()}/lib.bob^`) && indexOf(o, "^G@") > 0).length == 2 // its glue
 }
 
 test "programs of a package, each with a class of a module's interface, link the same units, its one for both" {
@@ -592,7 +591,7 @@ function main() { print(named(new ${c}())) }\n`
 	assert a == "A\n" && built([], "-O1", "b/main.bob") == "B\n"
 	const units = held()
 	assert built([], "-O1", "a/main.bob") == a && held() == units
-	assert units.filter(o => startsWith(o, `${home()}/lib.bob^`)).length == 2
+	assert units.filter(o => startsWith(o, `${home()}/lib.bob^`) && indexOf(o, "^G@") > 0).length == 2 // its glue
 }
 
 test "a file is known by its time and size once older than a build, else read, as touched, edited or of a later time" {
@@ -699,7 +698,7 @@ test "a unit made anew of the marks it defined and named before is the same, aft
 		const now: [string, string, string][] = []
 		onUnit = x => {
 			const [marks, rest] = shape(x)
-			now.push([split(x.name, "^")[0], `${marks} ${split(x.name, "@")[1]}`, rest]) // and its version
+			now.push([split(x.name, "@")[0], `${marks} ${split(x.name, "@")[1]}`, rest]) // and its version
 		}
 		anew()
 		try {
@@ -1449,4 +1448,178 @@ export function view(): { f: (x: i32) => i32 } { return new Holder[i32](x => x +
 	const again = built([], "-O1", "apart/a.bob")
 	assert [first, edited, again] == ["4\n", "4\na.bob other.bob", "4\n"]
 	assert units() == continued
+}
+
+/// The shape (shape) of each unit made, by name, the last made of it.
+let lastShape = new HashMap[string, string]()
+
+/// Of a build at -O1 of files and main, its output and the units of home it made, each as its module, and that of the
+/// decl it copies, and the decl, if any; with a build anew of them after it holding the units it held, each of the shape
+/// it was made of before, if it was.
+function apart(files: [string, string][], main = "main.bob"): string {
+	const made: string[] = []
+	onUnit = x => {
+		const [marks, rest] = shape(x)
+		lastShape.set(x.name, `${marks}\n${rest}`)
+		const ps = split(replace(x.name, `${home()}/`, ""), "^")
+		const at = (s: string) => indexOf(s, ":") + 1 // past the world
+		const of = ps.slice(1, ps.length - 1).filter(s => at(s) > 0).map(s => s.slice(at(s), s.length))
+		if (startsWith(x.name, home())) {
+			made.push([ps[0], ...of].join(":"))
+		}
+	}
+	try {
+		const out = built(files, "-O1", main)
+		sort(made)
+		const names = made.join(" ")
+		const continued = units()
+		const was = held().map(n => [n, lastShape.get(n) ?? ""] as [string, string])
+		anew()
+		const again = built([], "-O1", main)
+		const all = units()
+		const stale = was.filter(x => x[1] != "" && x[1] != lastShape.get(x[0])).map(x => x[0])
+		assert again == out && all == continued && stale == []
+		return `${out}${names}`
+	} finally {
+		onUnit = null
+	}
+}
+
+test "at -O1 an edit makes anew the units of only the functions and copies it changed, and unlinks those unused" {
+	const lib = (f: string, get: string) => `export class Box[T] {\n\tv: T\n\n\tconstructor(v: T) { this.v = v }\n
+\tget(): T { ${get} }\n}\n\nexport function f(): i32 { return ${f} }\n\nexport function g(): i32 { return 2 }\n`
+	const main = (more: string) => `import { Box, f, g } from "./lib"\n
+function main() {\n\tprint(\`\${f()} \${g()} \${new Box[i32](3).get()}\`)${more}\n}\n`
+	anew()
+	assert apart([["lib.bob", lib("1", "return this.v")], ["main.bob", main("")]]) != ""
+	const body = apart([["lib.bob", lib("5", "return this.v")]])
+	const generic = apart([["lib.bob", lib("5", "const v = this.v\n\t\treturn v")]])
+	const string = apart([["main.bob", main("\n\tprint(new Box[string](\"s\").get())")]])
+	const unused = apart([["main.bob", main("")]])
+	const copied = held().filter(o => indexOf(o, "/main.bob^") >= 0 && indexOf(o, "/lib.bob^") > 0)
+	assert body == "5 2 3\nlib.bob lib.bob:f"
+	// main's unit of the copies of the generic decl
+	assert generic == "5 2 3\nlib.bob main.bob:lib.bob:Box.get"
+	assert indexOf(string, " main.bob:lib.bob:Box.get") > 0 && indexOf(string, " lib.bob") < 0
+	// of Box, its constructor and get
+	assert startsWith(unused, "5 2 3\n") && copied.length == 3
+}
+
+test "at -O1 the glue holding a closure reading an interface's field is made anew once the union of it grew" {
+	const g = "export interface HasN { n: i32 }\n\nexport const fOf = (h: HasN): i32 => h.n\n"
+	const main = (more: string) => `import { A } from "./a"\nimport { fOf } from "./g"\n${more}
+function main() {\n\tprint(\`\${fOf(new A())}\`)\n}\n`
+	anew()
+	assert startsWith(apart([["g.bob", g], ["a.bob", "export class A { n = 1 }\n"], ["main.bob", main("")]]), "1\n")
+	const grown = apart([["main.bob", main("\nclass B {\n\tm = 7\n\tn = 2\n}\n\nconst b = fOf(new B())\n")]])
+	assert startsWith(grown, "1\n")
+}
+
+test "at -O1 the units of an instance, and those naming it, are made anew once a class it is of is laid out anew" {
+	const lib = "export class In[T] {\n\theld: ...T\n\ttail = 9\n\n\ttl(): i32 { return this.tail }\n}\n"
+	const p = (more: string) => `export class Pt {\n${more}\tx = 1\n\ty = 7\n}\n`
+	const main = `import { In } from "./lib"\nimport { Pt } from "./p"\n
+function main() {\n\tconst i = new In[Pt]()\n\tprint(\`\${i.tl()}\`)\n}\n`
+	anew()
+	assert startsWith(apart([["lib.bob", lib], ["p.bob", p("")], ["main.bob", main]]), "9\n")
+	const grown = apart([["p.bob", p("\tw = 30\n\tz = 18\n")]])
+	assert startsWith(grown, "9\n")
+}
+
+test "at -O1 a special of a function taking a Type is made anew once the class given is laid out anew in another module" {
+	const lib = "export function count(t: Type): i32 { return t.fields.length }\n"
+	const p = (more: string) => `export class P {\n\tx = 1\n${more}}\n`
+	const main = `import { count } from "./lib"\nimport { P } from "./p"\n\nfunction main() {\n\tprint(\`\${count(P)}\`)\n}\n`
+	anew()
+	assert startsWith(apart([["lib.bob", lib], ["p.bob", p("")], ["main.bob", main]]), "1\n")
+	const grown = apart([["p.bob", p("\ty = 2\n")]])
+	assert startsWith(grown, "2\n")
+}
+
+test "at -O1 a class that implements an interface anew makes anew only the units that use the interface" {
+	const lib = `export interface I { n(): i32 }\n\nexport function f(): i32 { return 1 }\n
+export function h(i: I): i32 { return i.n() }\n`
+	const main = (more: string) => `import { I, f, h } from "./lib"\n\nclass A { n(): i32 { return 3 } }\n${more}
+function main() {\n\tprint(\`\${f()} \${h(new A())}\`)\n}\n`
+	anew()
+	assert apart([["lib.bob", lib], ["main.bob", main("")]]) != ""
+	const grown = apart([["main.bob", main("\nclass B { n(): i32 { return 4 } }\n\nconst b = h(new B())\n")]])
+	// lib's glue, h and the method dispatch of I; main's glue, B, and main, which passes an A as I
+	assert grown == "1 3\nlib.bob lib.bob:h lib.bob:lib.bob:.n()[I] main.bob main.bob:B main.bob:B.n main.bob:main"
+}
+
+test "at -O1 reordering a module's functions makes anew none of its units of copies" {
+	const lib = "export class Box[T] {\n\tv: T\n\n\tconstructor(v: T) { this.v = v }\n\n\tget(): T { return this.v }\n}\n"
+	const one = "function one(): i32 { return new Box[i32](1).get() }\n"
+	const two = "function two(): string { return new Box[string](\"2\").get() }\n"
+	const main = (fs: string) => `import { Box } from "./lib"\n\n${fs}\nfunction main() {\n\tprint(\`\${one()} \${two()}\`)\n}\n`
+	anew()
+	assert apart([["lib.bob", lib], ["main.bob", main(`${one}\n${two}`)]]) != ""
+	const reordered = apart([["main.bob", main(`${two}\n${one}`)]])
+	assert reordered == "1 2\nmain.bob" // of its glue, which defines where each function is
+}
+
+test "at -O1 a generic's edited body makes anew its units and the copies of it, not its users' glue nor other copies" {
+	const lib = (get: string) => `export class Box[T] {\n\tv: T\n\n\tconstructor(v: T) { this.v = v }\n
+\tget(): T { ${get} }\n}\n\nexport function id[T](v: T): T { return v }\n\nexport function n(): i32 { return new Box[i32](1).get() }\n`
+	const main = `import { Box, id, n } from "./lib"\n
+function main() {\n\tprint(\`\${n()} \${new Box[string]("s").get()} \${id(2)}\`)\n}\n`
+	anew()
+	assert apart([["lib.bob", lib("return this.v")], ["main.bob", main]]) != ""
+	const edited = apart([["lib.bob", lib("const v = this.v\n\t\treturn v")]])
+	assert edited == "1 s 2\nlib.bob lib.bob:lib.bob:Box.get main.bob:lib.bob:Box.get"
+}
+
+test "at -O1 a private edit of a module makes anew none of the units of a test file importing it" {
+	const lib = (more: string) => `export function f(): i32 { return g() }\n\nfunction g(): i32 { return 1 }\n${more}`
+	const main = `import { f } from "./lib"\n\nfunction main() {\n\tprint(\`\${f()}\`)\n}\n`
+	anew()
+	assert apart([["lib.bob", lib("")], ["main.test.bob", main]], "main.test.bob") != ""
+	const edited = apart([["lib.bob", lib("\nconst k = 7\n\nfunction dead(x: string): i32 { return k }\n")]], "main.test.bob")
+	assert edited == "1\nlib.bob lib.bob:dead"
+}
+
+test "at -O1 the copies of a generic of a module main does not import go with that module's glue, also once its body is edited" {
+	const lib = (get: string) => `export class Box[T] {\n\tv: T\n\n\tconstructor(v: T) { this.v = v }\n\n\tget(): T { ${get} }\n}\n`
+	const mid = "import { Box } from \"./lib\"\n\nexport function boxed[T](v: T): T { return new Box[T](v).get() }\n"
+	const main = "import { boxed } from \"./mid\"\n\nfunction main() {\n\tprint(`${boxed(7)}`)\n}\n"
+	anew()
+	assert startsWith(apart([["lib.bob", lib("return this.v")], ["mid.bob", mid], ["main.bob", main]]), "7\n")
+	const edited = apart([["lib.bob", lib("const v = this.v\n\t\treturn v")]])
+	assert edited == "7\nlib.bob main.bob:lib.bob:Box.get"
+}
+
+test "at -O1 the units of a class embedding one of a third module by value are made anew once that one grows" {
+	const foo = (more: string) => `export class Foo {\n${more}\ta = 1\n}\n`
+	const bar = `import { Foo } from "./foo"\n\nexport class Bar {\n\tfoo: ...Foo\n\tt = 9\n}\n
+export function mk(): Bar { return new Bar() }\n`
+	const main = `import { mk } from "./bar"\n\nfunction main() {\n\tprint(\`\${mk().t}\`)\n}\n`
+	anew()
+	assert startsWith(apart([["foo.bob", foo("")], ["bar.bob", bar], ["main.bob", main]]), "9\n")
+	const grown = apart([["foo.bob", foo("\tz = 4\n\tw = 5\n")]])
+	assert grown == "9\nbar.bob bar.bob:Bar bar.bob:mk foo.bob foo.bob:Foo main.bob:main"
+}
+
+test "at -O1 a new implementer of an interface, in a module its caller does not import, makes its dispatch anew" {
+	const i = "export interface I { n(): i64 }\n\nexport function h(i: I): i64 { return i.n() }\n"
+	const c = (more: string) => `import { h } from "./i"\n${more}`
+	const main = `import { h } from "./i"\nimport { A } from "./a"\nimport { useC } from "./c"\n
+function main() {\n\tprint(\`\${h(new A())} \${useC()}\`)\n}\n`
+	const a = "export class A {\n\tn(): i64 { return 3 }\n}\n"
+	anew()
+	const first = apart([["i.bob", i], ["a.bob", a], ["c.bob", c("\nexport function useC(): i64 { return 0 }\n")], ["main.bob", main]])
+	const grown = apart([["c.bob", c("\nclass C { n(): i64 { return 9 } }\n\nexport function useC(): i64 { return h(new C()) }\n")]])
+	assert startsWith(first, "3 0\n")
+	assert grown == "3 9\nc.bob c.bob:C c.bob:C.n c.bob:useC i.bob i.bob:h i.bob:i.bob:.n()[I] main.bob main.bob:main"
+}
+
+test "at -O1 an interface and its dispatch removed leave no unit of the dispatch" {
+	const lib = "export interface I { n(): i32 }\n\nexport function h(i: I): i32 { return i.n() }\n"
+	const main = (a: string, shown: string) => `import { h } from "./lib"\n\nclass A { ${a} }\n
+function main() {\n\tprint(\`${shown}\`)\n}\n`
+	anew()
+	assert startsWith(apart([["lib.bob", lib], ["main.bob", main("n(): i32 { return 3 }", "\${h(new A())}")]]), "3\n")
+	const gone = apart([["lib.bob", "export function h(): i32 { return 5 }\n"],
+		["main.bob", main("m(): i32 { return 4 }", "\${h()} \${new A().m()}")]])
+	assert gone == "5 4\nlib.bob lib.bob:h main.bob main.bob:A main.bob:A.m main.bob:main" // and none held of I
 }

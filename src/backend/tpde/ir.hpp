@@ -159,9 +159,9 @@ struct Module {
 	Sym &sym(u32 v) { return syms[vals[v].imm]; }
 	/// Whether the function or global v is defined in this object.
 	bool defined(u32 v) { return sym(v).init != 0 || (sym(v).blocks.n != 0 && !sym(v).inlineOnly); }
-	/// Whether its unit's object holds the function or global v: all it names if there is one unit, else what it defines,
-	/// as another unit's symbols are named only where used.
-	bool held(u32 v) { return !sym(v).removed && (names.size() == 1 || defined(v)); }
+	/// Whether its unit's object holds the function or global v, which it defines; others are named only where used, so
+	/// that a unit's object is the same however many others are made with it.
+	bool held(u32 v) { return !sym(v).removed && defined(v); }
 	bool isConst(u32 v) const { return vals[v].op <= Op::Global; }
 	bool isAddr(u32 v) const { return vals[v].op >= Op::Addr && vals[v].op <= Op::Global; }
 	/// The attribute kind on index of the function or call v, or null.

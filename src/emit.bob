@@ -25,7 +25,7 @@
 //! of a type, its key, members, layout and struct, it computes once per id.
 
 import { fromBits } from "../builtin/math"
-import { endsWith, sort, startsWith } from "../std/algo"
+import { endsWith, sort, sortBy, startsWith } from "../std/algo"
 import { HashMap } from "../std/collections/hashmap"
 import { encode as hex } from "../std/encoding/hex"
 import { join } from "../std/fs/path"
@@ -80,13 +80,16 @@ export function emit(p: Program, m: i32, b: Backend, o: Options, facts: Facts = 
 	new Emitter(p, m, b, o, facts).run()
 }
 
-/// Emits module m of a program as mono made it into b as units (Emitter.to), and gives their keys, in the order of b's
-/// objects.
-export function emitUnits(p: Program, m: i32, b: Backend, o: Options): string[] throws CompileError {
+/// Emits module m of a program as mono made it into b as units (Emitter.to), of those of its decls the ones want takes
+/// by key and the decls each holds, and the descriptors, and gives their keys, in the order of b's objects, with the
+/// decls each holds.
+export function emitUnits(p: Program, m: i32, b: Backend, o: Options,
+	want: (key: string, ds: i32[]) => bool = (_, __) => true): [string, i32[]][] throws CompileError {
 	const e = new Emitter(p, m, b, o, new Facts())
 	e.to(e.named)
+	e.plan(want)
 	e.run()
-	return e.keys
+	return e.keys.map(k => [k, e.ofUnit.get(k) ?? []] as [string, i32[]])
 }
 
 /// What a release build learns of program p by emitting each module into a backend of its own, thrown away, so that it
@@ -221,6 +224,8 @@ class Emitter {
 	private decls: i32[] = []
 	private here = new HashMap[i32, bool]()
 	private copies = new HashMap[i32, bool]()
+	/// With units, the symbol of each copy (symbol).
+	private copySymbols = new HashMap[i32, string]()
 	/// The runtime's functions, and its heap's start, by name, without bober_.
 	private rts = new HashMap[string, Value]()
 	/// The functions of decls, by function, and those that never unwind.
@@ -248,6 +253,11 @@ class Emitter {
 	/// With units, the key of each, the glue's first, the unit being emitted, the units by key, and those left of
 	/// what each holds of its own: its strings, C strings, thunks and callees.
 	keys: string[] = []
+	/// With units, the key of the unit each decl that has one is in (home), the decls of each, and whether it is
+	/// emitted.
+	private unitOf = new HashMap[i32, string]()
+	ofUnit = new HashMap[string, i32[]]()
+	private wanted = new HashMap[string, bool]()
 	private unit = 0
 	private units = new HashMap[string, i32]()
 	private owns = new HashMap[i32, [HashMap[string, Value], HashMap[string, Value], HashMap[string, Value],
@@ -446,19 +456,21 @@ class Emitter {
 				}
 			}
 		}
-		for (const d of this.decls) {
+		for (const d of this.decls.filter(d => !this.unitOf.has(d) || this.wanted.has(this.unitOf.get(d)!))) {
 			this.decl(d)
 		}
 		this.spawned()
 		if (this.keys.length > 0) {
 			this.to(this.named)
 		}
-		this.init()
-		if (this.o.main < 0) {
-			this.cMain(entry(p, this.m, this.dyn, false), false)
-			this.cMain(entry(p, this.m, this.dyn, true), true)
-		} else if (this.m == this.o.main) {
-			this.cMain("main", this.o.tests)
+		if (this.keys.length == 0 || this.wanted.has(this.named)) {
+			this.init()
+			if (this.o.main < 0) {
+				this.cMain(entry(p, this.m, this.dyn, false), false)
+				this.cMain(entry(p, this.m, this.dyn, true), true)
+			} else if (this.m == this.o.main) {
+				this.cMain("main", this.o.tests)
+			}
 		}
 		// Each defined once all that named it are, as defining one may name more.
 		while (this.pending.length > 0) {
@@ -478,10 +490,36 @@ class Emitter {
 		}
 	}
 
+	/// Has the key of each decl's unit be its home, and those of the keys want takes, given the decls of each, emitted.
+	plan(want: (key: string, ds: i32[]) => bool) {
+		const p = this.p
+		// the copies in the order of their symbols, so that each unit of them is the same however the module names them
+		const tops = p.modules[this.m].copies.map(d => [this.symbolOf(d), d] as [string, i32])
+		sortBy(tops, (a, b) => a[0] < b[0])
+		this.decls = [...this.decls.filter(d => !this.copies.has(d)), ...listed(p, tops.map(x => x[1]))]
+		const ks = [this.named]
+		for (const d of this.decls) {
+			const x = p.decls[d]
+			const c = p.classOf(d)
+			if ((x.code() != null || x.kind != decl.Function) && (c < 0 || p.decls[c].kind != decl.Interface)) {
+				const k = this.home(d)
+				this.unitOf.set(d, k)
+				if (!this.ofUnit.has(k) && k != this.named) {
+					ks.push(k)
+				}
+				(this.ofUnit.get(k) ?? put(this.ofUnit, k, [])).push(d)
+			}
+		}
+		for (const k of ks.filter(k => want(k, this.ofUnit.get(k) ?? []))) {
+			this.wanted.set(k, true)
+		}
+	}
+
 	/// Has what is emitted next go in the unit of key, made the first time; the spawn wrappers its code named are defined
 	/// in the unit left. A unit is one of its module's glue, of its vars, inits and main or tests, or of a function, of
-	/// a class with its fields' initializers, or of a descriptor, each defining what its key names. As it names the others'
-	/// symbols, it holds its own constants and thunks, and those of decls are not local.
+	/// a class with its fields' initializers, of the copies of one generic decl of another module (group), or of a
+	/// descriptor, each defining what its key names. As it names the others' symbols, it holds its own constants and
+	/// thunks, and those of decls are not local.
 	to(key: string) {
 		let n = this.units.get(key) ?? -1
 		if (n < 0) {
@@ -516,7 +554,9 @@ class Emitter {
 		if (o >= 0 && x.kind != decl.Class && (x.kind == decl.Var || this.p.decls[o].kind != decl.Class)) {
 			return this.home(o)
 		}
-		return this.symbol(d)
+		// a copy's, that of the copies of the decl it is an instance of, which change together
+		return if (this.copies.has(d)) `${this.named}:${this.symbolOf(if (x.generic < 0) d else x.generic)}`
+			else this.symbol(d)
 	}
 
 	/// Whether a decl's symbol is local, l, as a copy's or a nested one's is; not with units, which name each other's.
@@ -539,8 +579,8 @@ class Emitter {
 		if (c >= 0 && p.decls[c].kind == decl.Interface) {
 			return
 		}
-		if (this.keys.length > 0 && (x.code() != null || x.kind != decl.Function)) {
-			this.to(this.home(d))
+		if (this.unitOf.has(d)) {
+			this.to(this.unitOf.get(d)!)
 		}
 		this.fnDecl = d
 		if (this.facts.phase == "learning" && !this.facts.calls.has(d)) {
@@ -5105,8 +5145,8 @@ class Emitter {
 	// Decls.
 	/// The symbol of decl d; with units, a copy's under its module's path, as no longer local.
 	private symbol(d: i32): string {
-		const s = this.symbolOf(d)
-		return if (this.keys.length > 0 && this.copies.has(d)) `${this.named}:${s}` else s
+		return if (this.keys.length == 0 || !this.copies.has(d)) this.symbolOf(d)
+			else this.copySymbols.get(d) ?? put(this.copySymbols, d, `${this.named}:${this.symbolOf(d)}`)
 	}
 
 	/// The symbol of decl d, the same in each build of its module: <path>:<name>, a test's <path>:test <name>, so that it

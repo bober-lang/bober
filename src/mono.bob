@@ -178,16 +178,25 @@ class Mono {
 			const m = p.modules[mi]
 			m.marks = [hashOf(ds[mi])]
 			for (const j of 0 ... m.facts.length / 3 - 1) {
-				const x = m.facts[3 * j + 1]
 				if (m.facts[3 * j] == op.Type) {
-					const h = this.ins.held.get(x) ?? p.union([])
-					const sig = if (this.ins.nominal(h) == decl.Class) p.decls[p.a(h)].sig else 0
-					m.marks.push(combine(combine(p.hash(x), p.hash(h)), sig))
+					m.marks.push(this.mark(m.facts[3 * j + 1]))
 				}
+			}
+			for (const hs of m.decides.values()) {
+				hs.push(m.marks[0])
 			}
 			sort(m.marks)
 			m.marks = unique(m.marks)
 		}
+	}
+
+	/// The mark of interface or object type x: of its hash, the union it is held as and, held as one class, that one's
+	/// signature, which lays it out.
+	private mark(x: i32): u64 {
+		const p = this.p
+		const h = this.ins.held.get(x) ?? p.union([])
+		const sig = if (this.ins.nominal(h) == decl.Class) p.decls[p.a(h)].sig else 0
+		return combine(combine(p.hash(x), p.hash(h)), sig)
 	}
 
 	/// Whether class d has a static field.
@@ -499,6 +508,7 @@ class Mono {
 			if (!m.kept) {
 				m.facts = []
 				m.uses = []
+				m.decides = new HashMap[i32, u64[]]()
 				m.copies = this.copies(m)
 				this.canonical(m)
 			}
@@ -542,7 +552,8 @@ class Mono {
 	/// The decls apart that the code of m's decls, and of what they hold, names, but m's own, each in the order reached,
 	/// with what it holds: a module's copies; the modules of the own and copied ones named, m's uses, whose units define
 	/// the marks a copy names, though m imports none; the facts of all those and a Type of what the signatures and fields
-	/// named lower, m's facts. Of a class, also its constructor, which emit finds by name.
+	/// named lower, m's facts, of each decl the marks of its own (Module.decides). Of a class, also its constructor, which
+	/// emit finds by name.
 	private copies(m: Module): i32[] {
 		const p = this.p
 		const out: i32[] = []
@@ -551,13 +562,15 @@ class Mono {
 		for (const d of m.decls) {
 			seen.set(d, true)
 		}
-		const types = new HashMap[i32, bool]()
-		const typed = new HashMap[i32, bool]()
+		// of the decl worked on, the types named and Type facts
+		let types = new HashMap[i32, bool]()
+		let typed = new HashMap[i32, bool]()
+		let fs: i32[] = []
 		const reach = (d: i32) => {
-			this.signed(d, typed, m.facts)
+			this.signed(d, typed, fs)
 			// A field read or written at its offset in the layout of its class.
 			if (p.decls[d].kind == decl.Var && p.decls[d].owner >= 0) {
-				this.signed(p.decls[d].owner, typed, m.facts)
+				this.signed(p.decls[d].owner, typed, fs)
 			}
 			const t = this.top(d)
 			if ((this.own.has(t) || this.apart.has(t)) && !m.uses.includes(p.decls[t].module)) {
@@ -582,11 +595,15 @@ class Mono {
 				ctor(d)
 			}
 		}
+		const all = new HashMap[i32, bool]()
 		let i = 0
 		while (i < todo.length) {
-			const x = p.decls[todo[i]]
-			ctor(todo[i])
-			m.facts.append(this.facts.get(todo[i]) ?? [])
+			const d = todo[i]
+			const x = p.decls[d]
+			types = new HashMap[i32, bool]()
+			typed = new HashMap[i32, bool]()
+			fs = (this.facts.get(d) ?? []).slice(0, (this.facts.get(d) ?? []).length)
+			ctor(d)
 			i++
 			todo.append(x.members)
 			const c = x.code() ?? new Code()
@@ -606,6 +623,22 @@ class Mono {
 					}
 				}
 			}
+			const hs: u64[] = []
+			for (const j of 0 ... fs.length / 3 - 1) {
+				// of m, each Type once
+				const t = fs[3 * j + 1]
+				if (fs[3 * j] != op.Type) {
+					m.facts.append(fs.slice(3 * j, 3 * j + 3))
+				} else if (!all.has(t)) {
+					all.set(t, true)
+					m.facts.append([op.Type, t, 0])
+				}
+				if (fs[3 * j] == op.Type) {
+					hs.push(this.mark(t))
+				}
+			}
+			sort(hs)
+			m.decides.set(d, unique(hs))
 		}
 		return out
 	}

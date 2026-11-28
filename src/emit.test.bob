@@ -7,7 +7,7 @@ import { CompileError } from "./error"
 import { Outlined } from "./bc/decl"
 import { lower } from "./lower"
 import { mono } from "./mono"
-import { endsWith, startsWith } from "../std/algo"
+import { endsWith, indexOf, lastIndexOf, startsWith } from "../std/algo"
 import { appendFile, mkdirAll } from "../std/fs"
 import { base } from "../std/fs/path"
 import { os } from "../std/os"
@@ -44,14 +44,18 @@ function run(name: string, src: string, lib: string = "", tests: bool = false): 
 		b.emit(files[i], false)
 		if (os != "macos" && os != "windows") {
 			const t = new Tpde("")
-			const keys = emitUnits(p, i, t, o)
+			const keys = emitUnits(p, i, t, o).map(u => u[0])
 			const objects = t.objects(keys.length as u32)
 			for (const n of 0 ... keys.length - 1) {
 				units.push(`${dir()}/${name}${i}.${units.length}.o`)
 				writeFile(units[units.length - 1], objects[n])
-				// what a unit but the glue defines is under its key, a global once in the program
+				// what a unit but the glue defines is under its key, of copies under the module's path they are of, a
+				// global once in the program
+				const at = lastIndexOf(keys[n], "^")
+				const of = indexOf(keys[n], ":", at) + 1
+				const under = if (at > indexOf(keys[n], "^")) keys[n].slice(0, of) else keys[n]
 				for (const s of elf.read(keys[n], objects[n]).symbols.filter(s => s.section >= 0 && s.binding != Local)) {
-					if (n > 0 && !startsWith(s.name, keys[n]) && !startsWith(s.name, "bober.str.")
+					if (n > 0 && !startsWith(s.name, under) && !startsWith(s.name, "bober.str.")
 						|| s.binding == Global && globals.has(s.name)) {
 						strays.push(`${keys[n]}: ${s.name}`)
 					}
