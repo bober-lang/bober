@@ -51,11 +51,20 @@ import { Bool, Field, Null, String, Type, basics, members, spells } from "./type
 /// cache (Lift.cached) of their sources as digest hashes them; checked again without them on an import cycle, which
 /// they may let it report through another module, if one of them is malformed, or if the ABI of a module one of them
 /// uses is not what it holds (Lift.current). Throws the type errors, or what is not lowered, as a CompileError.
+/// Of paths, those pick picks of what the Lift holds are lowered alone, the rest linked as asked
+/// (Program.need), if each file of the cache not linked holds as those lowered are (Lift.unlinked) and holds says so
+/// of the Lift then; else, or if it picks none, all, the rest checked after those.
 export function lower(paths: string[], dirs: string[] = [], cache: string[] = [],
-	read: (path: string) => string | null = p => readFile(p), digest: (path: string) => u64 = hashed): Program {
+	read: (path: string) => string | null = p => readFile(p), digest: (path: string) => u64 = hashed,
+	pick: (lift: Lift) => string[] | null = _ => null, holds: (lift: Lift) => bool = _ => true): Program {
 	const l = new Lower()
 	l.lift.cached(cache, dirs, digest)
-	const errors = check(paths, dirs, read, l, l.lift).filter(e => !e.warning)
+	const some = pick(l.lift)
+	let part = some != null
+	const errors = check(some ?? paths, dirs, read, l, l.lift, () => {
+		part = part && l.lift.current() && l.lift.unlinked() && holds(l.lift)
+		return if (part || some == null) [] else paths
+	}).filter(e => !e.warning)
 	if (cache.length > 0 && (l.lift.malformed || errors.some(e => startsWith(e.msg, "import cycle")))) {
 		return lower(paths, dirs, [], read)
 	}
@@ -63,7 +72,12 @@ export function lower(paths: string[], dirs: string[] = [], cache: string[] = []
 		throw new CompileError(errors.map(e => `${e.path}:${e.line}:${e.col}: ${e.msg}`).join("\n"))
 	}
 	const p = l.finish()
-	return if (l.lift.current()) p else lower(paths, dirs, [], read)
+	if (!l.lift.current()) {
+		return lower(paths, dirs, [], read)
+	} else if (part) {
+		p.need = path => l.lift.linked(path)
+	}
+	return p
 }
 
 /// The stage after the checker: lowers each module's declarations as they are handed on.

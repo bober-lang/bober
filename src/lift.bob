@@ -43,6 +43,8 @@ export class Lift {
 	/// The cache: the files a build's kept image holds (src/bober.bob) of modules of their source as it is, made by
 	/// this compiler, by the path each holds (cached).
 	cache = new HashMap[string, string]()
+	/// The headers of the cache's files, by path.
+	heads = new HashMap[string, In]()
 	/// The headers of the files linked from the cache.
 	private served: In[] = []
 	/// Whether a file of the cache was malformed, perhaps once prog held part of it, after which the cache is dropped.
@@ -62,6 +64,7 @@ export class Lift {
 				const src = hashedSource(h.path, joined, digest)
 				if (src != 0 && h.source == src && h.compiler == compiler) {
 					this.cache.set(h.path, f)
+					this.heads.set(h.path, h)
 				}
 			} catch (e: ParseError) {}
 		}
@@ -107,6 +110,29 @@ export class Lift {
 		for (const h of this.served) {
 			for (const i of 0 ... h.paths.length - 1) {
 				if (!holds(p, p.module(h.paths[i]), h.path, h.hashes[i], tops)) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	/// The module at path, linked from the bundle or the cache as module does, with those it uses, once all lowered are
+	/// made; -1 if neither has it.
+	linked(path: string): i32 {
+		const m = this.prog.module(path)
+		return if (m >= 0) m else this.module(path, d => this.linked(d) >= 0)
+	}
+
+	/// Whether each file of the cache not linked holds the ABI hash each module it uses that was lowered anew has, as
+	/// current checks those linked.
+	unlinked(): bool {
+		const p = this.prog
+		const tops = new HashMap[i32, u64]()
+		for (const h of this.heads.values().filter(h => p.module(h.path) < 0)) {
+			for (const i of 0 ... h.paths.length - 1) {
+				const m = p.module(h.paths[i])
+				if (m >= 0 && p.modules[m].bc == "" && !holds(p, m, h.path, h.hashes[i], tops)) {
 					return false
 				}
 			}
