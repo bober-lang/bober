@@ -264,8 +264,20 @@ export class FileInfo {
 
 /// Of the file at path, following a last symlink if follow.
 export function stat(path: string, follow: bool): FileInfo throws IoError {
+	const i = found(path, follow)
+	if (i == null) {
+		throw new IoError("NotFound", if (follow) "stat" else "lstat", path)
+	}
+	return i!
+}
+
+/// stat, but null if there is no file at path.
+export function found(path: string, follow: bool): FileInfo | null throws IoError {
 	const op = if (follow) "stat" else "lstat"
 	const s = bober_io_stat(cPath(op, path), if (follow) 1 else 0)
+	if (s.err < 0 && fromC(bober_io_kind(s.err)) == "NotFound") {
+		return null
+	}
 	checked(s.err, op, path)
 	const i = new FileInfo()
 	const kind = fromC(s.kind)
