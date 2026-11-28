@@ -788,11 +788,15 @@ let made: string[] = []
 /// headers they import, the bober.pkg of their packages, and the C made.
 function inputs(p: Program, main: i32): string[] {
 	const files = [...made]
+	const looked = new HashMap[string, bool]() // the directories nearest looked above
 	for (const path of imported(p, main).map(m => p.modules[m].path)) {
 		const source = split(path, ": ")[0]
-		const d = nearest(source)
-		const reads = (bound.get(path)?.reads ?? []).map(r => r[0])
-		files.push(...[source, ...(if (d == null) [] else [join(d, "bober.pkg")]), ...reads])
+		files.push(...[source, ...(bound.get(path)?.reads ?? []).map(r => r[0])])
+		const d = if (looked.has(parent(source))) null else nearest(source)
+		looked.set(parent(source), true)
+		if (d != null) {
+			files.push(join(d, "bober.pkg"))
+		}
 	}
 	return files
 }
@@ -2089,6 +2093,7 @@ function cObjects(p: Program, ms: i32[], includes: string[]): [string[], bool] {
 	const packages: [string, string[]][] = []
 	const headers: string[] = []
 	const cIncludes = includes.slice(0, includes.length)
+	const looked = new HashMap[string, bool]() // the directories nearest looked above
 	for (const m of ms.map(m => p.modules[m]).filter(m => m.source != 0)) {
 		const path = split(m.path, ": ")[0]
 		if (startsWith(path, `${sysroot}/`)) {
@@ -2097,6 +2102,10 @@ function cObjects(p: Program, ms: i32[], includes: string[]): [string[], bool] {
 		if (path != m.path) {
 			headers.push(path)
 		}
+		if (looked.has(parent(path))) {
+			continue
+		}
+		looked.set(parent(path), true)
 		const d = nearest(path)
 		if (d != null && !packages.some(e => e[0] == d)) {
 			packages.push([d, includesOf(path, [])])
