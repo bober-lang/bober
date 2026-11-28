@@ -1506,9 +1506,10 @@ export class Linker {
 			}
 			const [was, old, had] = s.names
 			const entries = this.bytes.slice(was + 12 * old, was + 12 * old + entry * had)
+			// Past them, room for the entries of the names made later, which a save writes before any is read.
 			const b = this.table.slice(this.at, this.at + 12 * this.cap) + entries
-				+ zeros((entry * (this.cap / 2 - had)) as i32)
-			this.at = this.block(kept, b, "names")[0]
+			this.at = this.room(kept, 1, from => from + (b.length as u64) + entry * (this.cap / 2 - had), "names")
+			this.bytes.set(this.at, b)
 			this.entries = this.at + 12 * this.cap
 			this.free(was, 12 * old + entry * old / 2)
 		}
