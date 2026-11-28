@@ -632,8 +632,11 @@ function together(mains: string[], f: Compile): (main: string) => string[] {
 /// hash, while the files it read are as they were, and those the initialization read, and those of the build's files
 /// that are not bober's sources or are builtin/'s.
 function passing(k: TestCache | null, built: string[], tests: [string, string][]): [string, string, string[]][] {
-	const files = byPath(k)
-	const same = (x: string) => files.has(x) && unchanged(files.get(x)!)
+	const files = new HashMap[string, bool]()
+	for (const f of k?.files ?? []) {
+		files.set(f[0], unchanged(f))
+	}
+	const same = (x: string) => files.get(x) ?? false
 	const other = built.filter(x => !endsWith(x, ".bob") || builtin(x))
 	return if (k == null || ![...other, ...k.init].every(same)) []
 		else k.passed.filter(t => tests.some(x => x[0] == t[0] && x[1] == t[1]) && t[2].every(same))
