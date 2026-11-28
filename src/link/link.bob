@@ -290,6 +290,8 @@ export class Linker {
 	private redone: u64[] = []
 	/// From and to where the code is that it unlinks.
 	private gone: [u64, u64][] = []
+	/// Of the units it unlinks, where each section was, by the unit's key and the section's index (place).
+	private places = new HashMap[string, u64]()
 	/// The veneers, per island and address they jump to, and how much of each island they take; and where the fixups
 	/// this link set through one are, which a unit's record keeps.
 	private veneers = new HashMap[string, u64]()
@@ -696,6 +698,7 @@ export class Linker {
 			}
 			if (u.at[i] != 0 && u.at[i] != dropped) {
 				this.free(u.at[i], sec.size)
+				this.places.set(`${key(u.object.name)} ${i}`, u.at[i])
 				if (sec.kind == Code) {
 					this.gone.push([u.at[i], u.at[i] + sec.size])
 				}
@@ -1050,20 +1053,21 @@ export class Linker {
 					if (rk != kind) {
 						continue
 					}
-					const [from, to] = this.place(this.run(region, name) ?? region, todo)
-					laid.push([name, kind, from, to])
-					if (kind == Unwind) {
-						image.fresh.push([from, to])
-					}
-					if (to > from && kind == Init) {
-						image.inits = [if (image.inits[1] == 0) from else image.inits[0], to]
-					} else if (to > from && kind == Thread) {
-						const [first, _, most] = image.thread
-						let align = most
-						for (const ref of todo) {
-							align = max(align, sec(ref).align)
+					for (const [from, to] of this.place(this.run(region, name) ?? region, todo)) {
+						laid.push([name, kind, from, to])
+						if (kind == Unwind) {
+							image.fresh.push([from, to])
 						}
-						image.thread = [if (image.thread[1] == 0) from else first, to, align]
+						if (to > from && kind == Init) {
+							image.inits = [if (image.inits[1] == 0) from else image.inits[0], to]
+						} else if (to > from && kind == Thread) {
+							const [first, _, most] = image.thread
+							let align = most
+							for (const ref of todo) {
+								align = max(align, sec(ref).align)
+							}
+							image.thread = [if (image.thread[1] == 0) from else first, to, align]
+						}
 					}
 					if (kind != Zero) {
 						end = region.top
@@ -1120,9 +1124,25 @@ export class Linker {
 	}
 
 	/// Lays the sections refs out one after another in region r, where room puts them, around its islands; the bytes
-	/// between them zeros, where a hole may have others, as macho.bob's CIEs. From and to where.
-	private place(r: Region, refs: i64[]): [u64, u64] throws CompileError {
+	/// between them zeros, where a hole may have others, as macho.bob's CIEs; but each of a unit of the key of one it
+	/// unlinks where that one's of its index was, if there is room there, so that what it defines stays where it was.
+	/// From and to where.
+	private place(r: Region, all: i64[]): [u64, u64][] throws CompileError {
 		const sec = (ref: i64) => this.held((ref >> 32) as i32).object.sections[ref & 0xffffffff]
+		const out: [u64, u64][] = []
+		const refs = all.filter(ref => {
+			const u = this.held((ref >> 32) as i32)
+			const at = this.places.get(`${key(u.object.name)} ${ref & 0xffffffff}`) ?? 0
+			if (at % sec(ref).align != 0 || !this.take(r, at, sec(ref).size)) {
+				return true
+			}
+			u.at[ref & 0xffffffff] = at
+			out.push([at, at + sec(ref).size])
+			return false
+		})
+		if (refs.length == 0) {
+			return out
+		}
 		const end = (from: u64) => {
 			let at = from
 			for (const ref of refs) {
@@ -1142,7 +1162,8 @@ export class Linker {
 			this.held((ref >> 32) as i32).at[ref & 0xffffffff] = to
 			at = to + sec(ref).size
 		}
-		return [this.held((refs[0] >> 32) as i32).at[refs[0] & 0xffffffff], at]
+		out.push([this.held((refs[0] >> 32) as i32).at[refs[0] & 0xffffffff], at])
+		return out
 	}
 
 	/// The run of region r the sections of x are laid out in, made at first if x is bound in a kept image, or made is,
@@ -1224,6 +1245,28 @@ export class Linker {
 			throw new CompileError(`there is no room for ${what}`)
 		}
 		return at
+	}
+
+	/// Whether the size bytes at at in region r are free, of a hole or past its top, and over none of its islands, taken
+	/// then; if none, whether at is in r.
+	private take(r: Region, at: u64, size: u64): bool {
+		const i = partitionPoint(r.holes, h => h[1] > at) as i32
+		if (size == 0 || at < r.start || at + size >= r.cap || this.skip(r, at, size) != at) {
+			return size == 0 && at >= r.start && at < r.cap
+		} else if (i < r.holes.length && r.holes[i][0] <= at && at + size <= r.holes[i][1]) {
+			const [hole, last] = r.holes[i]
+			const rest: [u64, u64][] = [[hole, at], [at + size, last]]
+			r.holes = [...r.holes.slice(0, i), ...rest.filter(h => h[1] > h[0]),
+				...r.holes.slice(i + 1, r.holes.length)]
+			return true
+		} else if (at < r.top) {
+			return false
+		}
+		if (at > r.top) {
+			r.holes.push([r.top, at])
+		}
+		r.top = at + size
+		return true
 	}
 
 	/// A block of region r, where room puts it, of b, what's: from where, and its size.

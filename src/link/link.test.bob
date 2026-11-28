@@ -651,7 +651,8 @@ test "a frozen unit's call too far for a local symbol reaches it through a venee
 	}
 }
 
-/// Version v of the differential test's object i, o<i>.<v>, of a section s<i> of code if i is even, else of data.
+/// Version v of the differential test's object i, o<i>@<v>, of a section s<i> of code if i is even, else of data,
+/// aligned to 16 if v is odd.
 /// It defines n<i> by a word of its own; if i is below 6, w<i % 3> weakly, by a word of that name's, and if 9, w0
 /// strongly, by one of its own; it names three of n0 to n9 and w0 to w2, by calls if code, else by pointers, which a
 /// quarter of its names must be defined for, the others weak; and it has a section `listed`, which `bounds` bounds, of
@@ -675,7 +676,9 @@ function version(i: u64, v: u64): Object {
 		words.push(...[if (i % 2 == 0) 0x94000000 else 0, 0])
 	}
 	words.push(...new u64[]((fnv(`${i}.${v}`) % 8) as i32))
-	return listing(named(`s${i}`, obj(`o${i}.${v}`, if (i % 2 == 0) Code else Data, words, symbols, fixups)))
+	const o = named(`s${i}`, obj(`o${i}@${v}`, if (i % 2 == 0) Code else Data, words, symbols, fixups))
+	o.sections[0].align = if (v % 2 == 0) 8 else 16
+	return listing(o)
 }
 
 /// o, whose first symbol is its first section's, with a section `listed` of a pointer to it.
@@ -693,7 +696,7 @@ function made(name: string): Object {
 			[new Symbol("", Local, 0), new Symbol("__start_listed", Global), new Symbol("__stop_listed", Global),
 			new Symbol("bounds", Global, 0)], [new Fixup(8, Abs64, 1, 0), new Fixup(16, Abs64, 2, 0)])))
 	}
-	const iv = split(name.slice(1, name.length), ".")
+	const iv = split(name.slice(1, name.length), "@")
 	return version(decimal(iv[0]) as u64, decimal(iv[1]) as u64)
 }
 
@@ -770,7 +773,7 @@ test "a kept image continued, by objects added, removed and replaced, reaches wh
 		const added: Object[] = []
 		for (const k of 0 ... step % 2) {
 			const i = (fnv(`${step}`) + 3 * (k as u64)) % 10
-			const was = held.find(h => startsWith(h, `o${i}.`))
+			const was = held.find(h => startsWith(h, `o${i}@`))
 			if (was != null) {
 				l.remove(was!)
 				held = held.filter(h => h != was)
@@ -790,11 +793,11 @@ test "a kept image continued, by objects added, removed and replaced, reaches wh
 			for (const name of gone) {
 				held = held.filter(h => h != name)
 				remade++
-				next(decimal(split(name.slice(1, name.length), ".")[0]) as u64, false)
+				next(decimal(split(name.slice(1, name.length), "@")[0]) as u64, false)
 			}
 			for (const name of wanted.filter(n => startsWith(n, "n"))) {
 				const i = decimal(name.slice(1, name.length)) as u64
-				if (![...held, ...added.map(o => o.name)].some(h => startsWith(h, `o${i}.`))) {
+				if (![...held, ...added.map(o => o.name)].some(h => startsWith(h, `o${i}@`))) {
 					supplied++
 					next(i, true)
 				}
@@ -819,7 +822,8 @@ test "a kept image continued, by objects added, removed and replaced, reaches wh
 		const again = keep(kept(), objects, ["bounds"])
 		const [was, now] = [reached(image!, versioned), reached(again, versioned)]
 		const [first, second] = [listed(image!), listed(again)]
-		assert was == now && first == words && second == words
+		const aligned = pointed(image!).every(p => get(image!, p) & 1 == 0 || p % 16 == 0)
+		assert was == now && first == words && second == words && aligned
 		linked++
 	}
 	const errors = stales.filter(m => indexOf(m, " is not defined, but ") >= 0).length
@@ -1202,4 +1206,31 @@ test "the sections of the objects of a key are of those alone, which are all it 
 	const data = l.sections("data", "u7")
 	const reads = l.reads
 	assert data.join("") == "\x07\x00\x00\x00" && reads == 1
+}
+
+test "a unit linked anew in place of one of its key is where that one was, so that no unit naming what it defines is read" {
+	// g of version v, defining f and a mark, ~m; u0 calling f, and units naming ~m, which none sets a fixup of.
+	const g = (v: i32) => obj(`g@${v}`, Code, [0xd65f03c0, v as u64],
+		[new Symbol("f", Global, 0), new Symbol("~m", Weak, 0, 4)])
+	const u = (i: i32, v: i32) => obj(`u${i}@${v}`, Code, [0x94000000, v as u64],
+		[new Symbol(`u${i}`, Global, 0), new Symbol(if (i == 0) "f" else "~m", Global)], [new Fixup(0, Call, 1, 0)])
+	const units = [g(0)]
+	for (const i of 0 ... 99) {
+		units.push(u(i, 0))
+	}
+	let image = keep(kept(), units, ["f", "u0"])
+	const was = at(image, "f")
+	// g edited, then g and u7 at once.
+	const reads: i32[] = []
+	for (const v of 1 ... 2) {
+		const l = kept(file(image))
+		l.remove(`g@${v - 1}`)
+		if (v == 2) {
+			l.remove("u7@0")
+		}
+		image = keep(l, if (v == 1) [g(v)] else [g(v), u(7, v)], ["f", "u0"])
+		reads.push(l.reads)
+	}
+	const [f, called] = [at(image, "f"), jumped(image, at(image, "u0"))]
+	assert reads.every(n => n <= 4) && f == was && called == f
 }
