@@ -51,7 +51,7 @@ import { elf } from "./link/elf"
 import { macho, named } from "./link/macho"
 import { pe } from "./link/pe"
 import { x64 } from "./link/x64"
-import { Bytes, store } from "./link/bytes"
+import { Bytes, store, u } from "./link/bytes"
 import { stamp, stamped } from "./link/keep"
 import { Linker, Stale, key } from "./link/link"
 import { Const, Global, Kept, Local, Object, Section, Symbol, Weak } from "./link/object"
@@ -910,18 +910,12 @@ function keep(p: Program, mains: i32[], f: Compile, stale: string[], none: bool)
 	}
 	const l = decoded![1]
 	const has = (name: string) => l.holds(key(name)).includes(name)
-	const fold = l.holds(`bober.fold.${p.world}`)
 	try {
-		// copied, as another build may write the image in place before relink reads them
-		const r = new Reader(if (fold.length == 1) l.sections("bober_fold", key(fold[0])).join("").copy() else "")
-		const text = () => r.raw(r.uleb() as i32)
-		if (r.bytes == "" || text() != marker(p.marks[1])) {
+		const fold = folded(p.world)
+		if (fold == null || fold![0] != marker(p.marks[1])) {
 			return units
 		}
-		while (r.pos < r.bytes.length) {
-			const e = [text(), text(), text()]
-			p.fold.set(e[0], [e[0], e[1], e[2]])
-		}
+		p.fold = fold![1]
 		// Of the modules of another version, the units held and the marks their decls define now.
 		const old = gone(p, l)
 		const defined = new Set()
@@ -1016,6 +1010,42 @@ function derived(p: Program): string[] {
 	}
 	sort(hs)
 	return unique(hs).map(h => decided(p, h))
+}
+
+/// The marks of what mono decides, of each 8 bytes, as relink keeps them (Program.fold); and those marks.
+function marked(hs: u64[]): string {
+	const w = new Writer()
+	for (const h of hs) {
+		w.fixed(h, 8)
+	}
+	return w.bytes
+}
+
+function unmarked(bytes: string): u64[] {
+	const hs: u64[] = []
+	for (const i of 0 ... bytes.length / 8 - 1) {
+		hs.push(u(bytes, 8 * i, 8))
+	}
+	return hs
+}
+
+/// Of the image as lowering read it (decoded), the world's fold unit, copied, as another build may write the image in
+/// place before relink reads it: the mark of builtin/'s signatures it was made with and its entries (Program.fold);
+/// null if none.
+function folded(world: u64): [string, HashMap[string, [string, string, string, string]]] | null throws ParseError {
+	const fold = if (decoded == null) [] else decoded![1].holds(`bober.fold.${world}`)
+	if (fold.length != 1) {
+		return null
+	}
+	const r = new Reader(decoded![1].sections("bober_fold", key(fold[0])).join("").copy())
+	const text = () => r.raw(r.uleb() as i32)
+	const mark = text()
+	const entries = new HashMap[string, [string, string, string, string]]()
+	while (r.pos < r.bytes.length) {
+		const e = [text(), text(), text(), text()]
+		entries.set(e[0], [e[0], e[1], e[2], e[3]])
+	}
+	return [mark, entries]
 }
 
 /// The mark of hash h of what mono decides (Module.marks), of p's world, as another's of the same hash is of other
@@ -1420,8 +1450,8 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	// Monomorphized, the marks of each module's decls, which its unit defines; and of the signatures of builtin/'s
 	// decls, whose functions emit calls unasked, which no bytecode names, and of what mono decides (derived), which a
 	// unit of the world's defines (marksUnit), which each program of it shares. Another, the fold unit, holds after
-	// that one each module's path, its unit's version and its facts (Program.fold), and the units of modules gone are
-	// unlinked.
+	// that one each module's path, its unit's version, its facts and marks (Program.fold), and the units of modules gone
+	// are unlinked.
 	const [defs, lang] = p.marks
 	const now = p.derived
 	if (!o.dyn && !c.release) {
@@ -1436,7 +1466,8 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		for (const path of order) {
 			const m = p.module(path)
 			const x = p.modules[m]
-			const e = if (x.kept) p.fold.get(path)! else [path, unitVersion(p, m, x.bc, learned), writeFacts(p, m)]
+			const e = if (x.kept) p.fold.get(path)!
+				else [path, unitVersion(p, m, x.bc, learned), writeFacts(p, m), marked(x.marks)]
 			for (const bytes of e) {
 				text(bytes)
 			}
