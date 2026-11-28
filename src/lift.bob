@@ -11,7 +11,7 @@ import { fnv } from "../std/hash"
 import { executable, name } from "../std/process"
 import { ParseError } from "../std/string"
 import * as decl from "./bc/decl"
-import { In, head, holds, read, write } from "./bc/file"
+import { In, head, read, seen, write } from "./bc/file"
 import { Program, sourceHash } from "./bc/program"
 import { system } from "./c/bind"
 import { CompileError } from "./error"
@@ -106,10 +106,9 @@ export class Lift {
 		for (const x of p.modules.filter(x => x.source != 0 && x.bc == "")) {
 			x.abi = 0
 		}
-		const tops = new HashMap[i32, u64]()
 		for (const h of this.served) {
 			for (const i of 0 ... h.paths.length - 1) {
-				if (!holds(p, p.module(h.paths[i]), h.path, h.hashes[i], tops)) {
+				if (h.hashes[i] != seen(p, p.module(h.paths[i]), h.hidden[i])) {
 					return false
 				}
 			}
@@ -128,11 +127,10 @@ export class Lift {
 	/// current checks those linked.
 	unlinked(): bool {
 		const p = this.prog
-		const tops = new HashMap[i32, u64]()
 		for (const h of this.heads.values().filter(h => p.module(h.path) < 0)) {
 			for (const i of 0 ... h.paths.length - 1) {
 				const m = p.module(h.paths[i])
-				if (m >= 0 && p.modules[m].bc == "" && !holds(p, m, h.path, h.hashes[i], tops)) {
+				if (m >= 0 && p.modules[m].bc == "" && h.hashes[i] != seen(p, m, h.hidden[i])) {
 					return false
 				}
 			}

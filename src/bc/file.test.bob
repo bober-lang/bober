@@ -7,7 +7,7 @@ import { zeros } from "../link/bytes"
 import { lower } from "../lower"
 import { mono } from "../mono"
 import * as decl from "./decl"
-import { abi, read, sigMarks, write } from "./file"
+import { abi, head, read, seen, sigMarks, write } from "./file"
 import * as kind from "./kind"
 import { Code, Import, Program } from "./program"
 import { showDecl, showType } from "./show"
@@ -352,4 +352,21 @@ test "of files with signature marks and one without, read together, each mark is
 	sigMarks(anew)
 	sigMarks(mixed)
 	assert mixed.decls.map(x => x.sig).join(" ") == anew.decls.map(x => x.sig).join(" ")
+}
+
+test "a test file's hash of a module holds as decls it does not import change, not as a private one it imports does" {
+	const t = "import { f, h } from \"./lib\"\n\ntest \"t\" { assert f() == h() }\n"
+	const files = (h: string) => (path: string) => if (path == "t.test.bob") t
+		else if (path == "lib.bob") `export function f(): i32 { return 1 }\n\n${h}\n`
+		else null
+	const p = lower(["t.test.bob"], [], [], files("function h(): i32 { return 1 }"))
+	const x = head(write(p, p.module("t.test.bob"), 1))
+	const i = x.paths.indexOf("lib.bob")
+	const holds = (h: string) => {
+		const q = lower(["lib.bob"], [], [], files(h))
+		return x.hashes[i] == seen(q, q.module("lib.bob"), x.hidden[i])
+	}
+	assert x.hidden[i] == ["h"]
+	assert holds("function h(): i32 { return 2 }\n\nconst k = 7\n\nfunction g(): i32 { return k }")
+	assert !holds("function h(): i64 { return 1 }") && !holds("function h2(): i32 { return 1 }")
 }

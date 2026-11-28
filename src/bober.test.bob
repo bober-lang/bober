@@ -1845,3 +1845,13 @@ test "a build continued after a class of the module edited is added, changed or 
 	assert reads.map(r => if (r[1] == r[2]) "whole" else if (r[1] < r[2]) "part" else "twice")
 		== ["whole", "whole", "part", "whole"]
 }
+
+test "a private edit of a module, of which a test file imports only exports, leaves a build continued in part" {
+	const lib = (more: string) => `export function one(): i32 { return 1 }\n${more}`
+	const t = "import { one } from \"./lib\"\n\ntest \"t\" { assert one() == 1 }\n"
+	const main = "import { one } from \"./lib\"\n\nfunction main() { print(`${one()}`) }\n"
+	anew()
+	parted([["lib.bob", lib("")], ["t.test.bob", t], ["o.bob", main], ["main.bob", main]])
+	const [out, read, whole] = parted([["lib.bob", lib("\nconst k = 7\n")]])
+	assert out == "1\n1\n" && read < whole
+}

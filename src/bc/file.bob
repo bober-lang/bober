@@ -18,7 +18,8 @@
 //!
 //! ```
 //! header   "bober", compiler hash, source hash, ABI hash, path
-//! deps     per module whose decls it uses: path, ABI hash
+//! deps     per module whose decls it uses: path, the hash it has of it (seen), the names of what it imports of it not
+//!          exported
 //! strings  per string: its bytes
 //! ints     per int: SLEB
 //! names    per names entry: its (Str, mods) pairs
@@ -52,7 +53,7 @@
 //! class, also of one two modules away, but not with a function's body. Modules whose signatures name each other have
 //! one hash, of all of theirs.
 
-import { endsWith, sort, unique } from "../../std/algo"
+import { sort, unique } from "../../std/algo"
 import { HashMap } from "../../std/collections/hashmap"
 import { Reader, Writer } from "../../std/encoding/binary"
 import { isAbs, join } from "../../std/fs/path"
@@ -129,11 +130,10 @@ export function read(p: Program, files: string[], compiler: u64, sources: u64[],
 		}
 		abis.set(heads[i].path, heads[i].abi)
 	}
-	const tops = new HashMap[i32, u64]()
 	for (const x of heads) {
 		for (const i of 0 ... x.paths.length - 1) {
 			const m = p.module(x.paths[i])
-			if (x.hashes[i] != abis.get(x.paths[i]) && (m < 0 || !holds(p, m, x.path, x.hashes[i], tops))) {
+			if (x.hashes[i] != abis.get(x.paths[i]) && (m < 0 || x.hashes[i] != seen(p, m, x.hidden[i]))) {
 				return null
 			}
 		}
@@ -174,23 +174,18 @@ export function abi(p: Program, m: i32): u64 {
 	return p.modules[m].abi
 }
 
-/// Whether h, the hash the module at path has of module m, which it uses (Out.dep), is m's now: its ABI hash, or, of
-/// one a test file imports, tops, kept by module in made, which holds while the ABIs they hash do.
-export function holds(p: Program, m: i32, path: string, h: u64, made: HashMap[i32, u64]): bool {
-	if (h == abi(p, m) || !endsWith(path, ".test.bob")) {
-		return h == abi(p, m)
+/// The hash a module importing names of module m has of it (Out.dep): its ABI hash, or with those not exported, which
+/// a test file may import (src/check.bob), the signatures of each and what it reaches too; 0 if m lacks one.
+export function seen(p: Program, m: i32, names: string[]): u64 {
+	if (names.length == 0) {
+		return abi(p, m)
 	}
-	if (made.get(m) == null) {
-		made.set(m, tops(p, m))
-	}
-	return h == made.get(m)
-}
-
-/// Of module m, the hash of the signatures of each of its top-level decls, which a test file importing it sees
-/// (src/check.bob).
-function tops(p: Program, m: i32): u64 {
 	const a = new Abi(p, m)
-	for (const d of p.modules[m].decls) {
+	for (const name of names) {
+		const d = p.find(m, -1, name)
+		if (d < 0) {
+			return 0
+		}
 		a.decl(d)
 	}
 	let h = a.h
@@ -576,10 +571,18 @@ class Out {
 
 	private dep(m: i32): i32 {
 		return this.deps.find(m) ?? this.deps.add(m, w => {
-			text(w, this.p.modules[m].path)
-			const x = this.p.modules[this.m]
-			const tests = endsWith(x.path, ".test.bob") && x.imports.some(y => y.module == m)
-			w.fixed(if (!this.whole) 0 else if (tests) tops(this.p, m) else abi(this.p, m), 8)
+			const p = this.p
+			const names: string[] = []
+			for (const x of p.modules[this.m].imports.filter(x => x.module == m)) {
+				const hidden = x.names.map(n => p.decls[n[0]]).filter(d => (d.mods & decl.Export) == 0)
+				names.append(hidden.map(d => p.strings[d.name]))
+			}
+			text(w, p.modules[m].path)
+			w.fixed(if (this.whole) seen(p, m, names) else 0, 8)
+			uleb(w, names.length)
+			for (const s of names) {
+				text(w, s)
+			}
 		})
 	}
 
@@ -612,9 +615,10 @@ export class In {
 	compiler: u64 = 0
 	source: u64 = 0
 	abi: u64 = 0
-	/// Its deps' paths and the hash it has of each (Out.dep).
+	/// Its deps' paths, the hash it has of each and what it imports of each not exported (Out.dep).
 	paths: string[] = []
 	hashes: u64[] = []
+	hidden: string[][] = []
 	/// Its module, once added.
 	m = -1
 	private deps: i32[] = []
@@ -648,6 +652,10 @@ export class In {
 		for (const _ of 1 ... this.n()) {
 			this.paths.push(at(this.text()))
 			this.hashes.push(this.r.fixed(8))
+			this.hidden.push([])
+			for (const _ of 1 ... this.n()) {
+				this.hidden[this.hidden.length - 1].push(this.text().copy())
+			}
 		}
 	}
 
