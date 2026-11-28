@@ -3,14 +3,16 @@
 import { endsWith, indexOf, sort, startsWith, unique } from "../std/algo"
 import { fromCString } from "../std/c"
 import { HashMap } from "../std/collections/hashmap"
-import { exists, glob, mkdirAll, open, remove, stat } from "../std/fs"
+import { exists, glob, mkdirAll, open, remove, removeAll, stat } from "../std/fs"
 import { base } from "../std/fs/path"
 import { os } from "../std/os"
 import * as process from "../std/process"
 import { replace, split } from "../std/string"
-import { Build, Compile, Run, build, format, ignored, machine, monoKept, onUnit, runTests, toolchain } from "./bober"
+import { Build, Compile, Run, build, format, ignored, machine, monoKept, monoRead, onUnit, runTests,
+	toolchain } from "./bober"
 import { decoding } from "./bc/file"
 import { checking } from "./check"
+import { CompileError } from "./error"
 import { Bytes } from "./link/bytes"
 import { Linker } from "./link/link"
 import { Object } from "./link/object"
@@ -1641,4 +1643,205 @@ test "at -O1 a module gone leaves none of its units, nor its bytecode's, as a bu
 	remove(`${home()}/gone.bob`)
 	const two = apart([["main.bob", "function main() {\n\tprint(\"2\")\n}\n"]])
 	assert startsWith(one, "1\n") && startsWith(two, "2\n")
+}
+
+/// Of package part/ with files written, or removed if "", its programs main.bob and o.bob continued: their output and how
+/// many modules main's read, of which builds anew print the same and hold the same units; and how many those read.
+function parted(files: [string, string][]): [string, i32, i32] {
+	const d = `${home()}/part`
+	mkdirAll(d)
+	writeFile(`${d}/bober.pkg`, `{ "name": "@test/part" }\n`)
+	for (const [name, src] of files) {
+		if (src != "") {
+			writeFile(`${d}/${name}`, src)
+		} else if (exists(`${d}/${name}`)) {
+			remove(`${d}/${name}`)
+		}
+	}
+	const out = built([], "-O1", "part/main.bob")
+	const read = monoRead
+	const other = built([], "-O1", "part/o.bob")
+	const continued = units()
+	anew()
+	const again = built([], "-O1", "part/main.bob")
+	const whole = monoRead
+	const otherAgain = built([], "-O1", "part/o.bob")
+	const all = units()
+	assert again == out && otherAgain == other
+	assert all == continued
+	return [`${out}${other}`, read, whole]
+}
+
+test "a build continued reads but the modules its program needs of its world, and holds the units a build anew does" {
+	const o = "import { one } from \"./lib\"\n\nfunction main() { print(`o${one()}`) }\n"
+	const main = (k: i32) => `import { one } from "./lib"\n\nconst k = ${k}\n\nfunction main() { print(\`\${one()}\`) }\n`
+	anew()
+	parted([["lib.bob", "export function one(): i32 { return 1 }\n"], ["o.bob", o], ["main.bob", main(1)]])
+	const [out, read, whole] = parted([["main.bob", main(2)]])
+	assert out == "1\no1\n" && read < whole
+}
+
+test "a build continued of part of its world holds the units a build anew does, of what modules it did not read decide" {
+	const lib = (body: string, get: string) => `export interface Named { name(): string }\n\nexport interface Shape {\n\tname(): string\n\tarea(): i32\n}\n
+export function area(s: Shape): i32 { return s.area() }\n\nexport function twice[T](x: T): T[] { ${body} }\n
+export class Box[T] {\n\tv: T\n\n\tconstructor(v: T) { this.v = v }\n\n\tget(): T { ${get} }\n}\n`
+	const o = `import { Box, Named, Shape, area, twice } from "./lib"\n\nclass Sq {\n\tname(): string { return \"sq\" }\n\tarea(): i32 { return 4 }\n}\n
+export function size(n: Named): i32 { return if (n instanceof Shape) (n as Shape).area() else 0 }\n
+function main() { print(\`\${area(new Sq())} \${twice("o")} \${new Box[string]("b").get()}\`) }\n`
+	const main = (p: string, c = "", w = "", u = "") => `import { Named, area, twice } from "./lib"\n${u}
+class P {\n\tname(): string { return "p" }${p}\n}\n\nclass R { name(): string { return "r" } }\n${c}
+function main() {\n\tconst ns: Named[] = [new P(), new R()]\n\tprint(\`\${ns.map(n => n.name())} \${twice(1)}${w}\`)\n}\n`
+	const steps: [string, string][][] = [
+		[["lib.bob", lib("return [x, x]", "return this.v")], ["o.bob", o], ["main.bob", main("")]],
+		[["main.bob", main("\n\n\tarea(): i32 { return 2 }")]], // a private class fits an interface o casts into
+		[["lib.bob", lib("const y = x\n\t\treturn [y, x]", "const v = this.v\n\t\treturn v")]], // generics' bodies, which o copies
+		[["main.bob", main("", "\nclass Tri {\n\tname(): string { return \"tri\" }\n\tarea(): i32 { return 3 }\n}\n", " ${area(new Tri())}")]], // o dispatches over
+		[["two.bob", "export function two(): i32 { return 2 }\n"], // a file new
+			["main.bob", main("", "", " ${two()}", "import { two } from \"./two\"\n")]],
+		[["two.bob", ""], ["main.bob", main("")]] // a file deleted
+	]
+	anew()
+	const outs = steps.map(files => parted(files)[0])
+	const [mine, its] = [`["p", "r"] [1, 1]`, `\n4 ["o", "o"] b\n`]
+	assert outs[0] == `${mine}${its}` && outs[3] == `${mine} 3${its}` && outs[4] == `${mine} 2${its}`
+}
+
+test "a test file of a world built in part runs the tests it holds as edited" {
+	const d = `${home()}/part`
+	const f = new Compile()
+	f.O1 = true
+	anew()
+	mkdirAll(d)
+	writeFile(`${d}/bober.pkg`, `{ "name": "@test/part" }\n`)
+	writeFile(`${d}/lib.bob`, "export function one(): i32 { return 1 }\n")
+	const tests = (t: string) => {
+		writeFile(`${d}/a.test.bob`, `import { one } from "./lib"\n\ntest "a" { assert one() == 1 }\n${t}`)
+		return runTests([`${d}/a.test.bob`], [], f).map(r => r()[0])
+	}
+	dir = `${home()}/build`
+	try {
+		const [first, failing, fixed] = [tests(""), tests("\ntest \"b\" { assert one() == 2 }\n"), tests("\nconst k = 1\n")]
+		assert first == [0] && failing != [0] && fixed == [0]
+	} finally {
+		dir = "build"
+	}
+}
+
+test "a build continued after an exported signature edit, of an importer its program lacks, holds the units a build anew does" {
+	const lib = (more: string) => `export function one(): i32 { return 1 }\n${more}`
+	const o = "import { one } from \"./lib\"\n\nfunction main() { print(`o${one()}`) }\n"
+	const main = "import { one } from \"./lib\"\n\nfunction main() { print(`${one()}`) }\n"
+	anew()
+	parted([["lib.bob", lib("")], ["o.bob", o], ["main.bob", main]])
+	assert parted([["lib.bob", lib("\nexport function two(): i32 { return 2 }\n")]])[0] == "1\no1\n"
+}
+
+test "a build continued fails as a build anew does once a module its program imports no longer compiles" {
+	const lib = (t: string) => `export function one(): ${t} { return 1 }\n`
+	const mid = "import { one } from \"./lib\"\n\nexport function two(): i32 { return one() + 1 }\n"
+	const main = "import { two } from \"./mid\"\n\nfunction main() { print(`${two()}`) }\n"
+	const failed = () => {
+		try {
+			return built([], "-O1", "part/main.bob")
+		} catch (e: CompileError) {
+			return e.msg
+		}
+	}
+	anew()
+	parted([["lib.bob", lib("i32")], ["mid.bob", mid], ["o.bob", main], ["main.bob", main]])
+	writeFile(`${home()}/part/lib.bob`, lib("i64"))
+	const continued = failed()
+	anew()
+	const again = failed()
+	assert continued == again && indexOf(again, "mid.bob") >= 0
+}
+
+test "test files of a world continued in turns, then together, hold the units a build anew does" {
+	const d = `${home()}/part`
+	const f = new Compile()
+	f.O1 = true
+	anew()
+	mkdirAll(d)
+	writeFile(`${d}/bober.pkg`, `{ "name": "@test/part" }\n`)
+	writeFile(`${d}/a.test.bob`, "import { one } from \"./lib\"\n\ntest \"a\" { assert one() == 1 }\n")
+	writeFile(`${d}/b.test.bob`, "import { Box } from \"./lib\"\n\ntest \"b\" { assert new Box[i32](2).get() == 2 }\n")
+	const lib = (k: i32) => `const k = ${k}\n\nexport function one(): i32 { return 1 }\n
+export class Box[T] {\n\tv: T\n\n\tconstructor(v: T) { this.v = v }\n\n\tget(): T { return this.v }\n}\n`
+	const run = (k: i32, tests: string[]) => {
+		writeFile(`${d}/lib.bob`, lib(k))
+		return runTests(tests.map(t => `${d}/${t}`), [], f).map(r => r()[0])
+	}
+	dir = `${home()}/build`
+	try {
+		const codes = [run(1, ["a.test.bob"]), run(2, ["b.test.bob"]), run(3, ["a.test.bob"]), run(4, ["a.test.bob", "b.test.bob"])]
+		assert codes == [[0], [0], [0], [0, 0]]
+		const continued = units()
+		anew()
+		removeAll(`${home()}/build/kept`) // the reports kept, which a build anew would run none for
+		const again = run(4, ["a.test.bob", "b.test.bob"])
+		const all = units()
+		assert codes == [[0], [0], [0], [0, 0]] && again == [0, 0] && all == continued
+	} finally {
+		dir = "build"
+	}
+}
+
+test "a build continued after one continued of part of its world reads but the modules its program needs" {
+	const o = "import { one } from \"./lib\"\n\nfunction main() { print(`o${one()}`) }\n"
+	const main = (k: i32) => `import { one } from "./lib"\n\nconst k = ${k}\n\nfunction main() { print(\`\${one()}\`) }\n`
+	anew()
+	const whole = parted([["lib.bob", "export function one(): i32 { return 1 }\n"], ["o.bob", o], ["main.bob", main(1)]])[2]
+	writeFile(`${home()}/part/main.bob`, main(2))
+	built([], "-O1", "part/main.bob")
+	writeFile(`${home()}/part/main.bob`, main(3))
+	const out = built([], "-O1", "part/main.bob")
+	const read = monoRead
+	assert out == "1\n" && read < whole
+}
+
+test "a build continued, once a module its program lacks no longer compiles, lowers its mains alone as a build anew does" {
+	const lib = (t: string) => `export function one(): ${t} { return 1 }\n`
+	const o = "import { one } from \"./lib\"\n\nconst x: i32 = one()\n\nfunction main() { print(`o${x}`) }\n"
+	const main = "import { one } from \"./lib\"\n\nfunction main() { print(`${one()}`) }\n"
+	anew()
+	parted([["lib.bob", lib("i32")], ["o.bob", o], ["main.bob", main]])
+	writeFile(`${home()}/part/lib.bob`, lib("i64"))
+	const out = built([], "-O1", "part/main.bob")
+	const kept = monoKept
+	anew()
+	const again = built([], "-O1", "part/main.bob")
+	assert out == "1\n" && again == out && kept == monoKept
+}
+
+test "a build continued after an edit of a file embedded or a C header imported holds the units a build anew does" {
+	const lib = "import d from \"./d.txt\" @Embed\nimport { K } from \"./k.h\"\n\nexport function n(): string { return `${d.length} ${K}` }\n"
+	const main = "import { n } from \"./lib\"\n\nfunction main() { print(n()) }\n"
+	const o = "import e from \"./e.txt\" @Embed\n\nfunction main() { print(`o${e.length}`) }\n"
+	anew()
+	parted([["d.txt", "ab"], ["k.h", "#define K 1\n"], ["e.txt", "a"], ["lib.bob", lib], ["o.bob", o], ["main.bob", main]])
+	const outs = [parted([["d.txt", "abc"]])[0], parted([["k.h", "#define K 2\n"]])[0], parted([["e.txt", "ab"]])[0]]
+	assert outs == ["3 1\no1\n", "3 2\no1\n", "3 2\no2\n"]
+}
+
+test "a build continued after a body edit of a generic another program copies holds the units a build anew does" {
+	const lib = (s: string) => `export function show[T](x: T): string { return \`${s}\${x}\` }\n\nexport function k(): i32 { return 2 }\n`
+	const main = "import { k } from \"./lib\"\n\nfunction main() { print(`${k()}`) }\n"
+	const o = "import { show } from \"./lib\"\n\nclass Mine { toString(): string { return \"mine\" } }\n\n" +
+		"function main() { print(`${show(new Mine())} ${show(3)}`) }\n"
+	anew()
+	parted([["lib.bob", lib("<")], ["o.bob", o], ["main.bob", main]])
+	assert parted([["lib.bob", lib(">")]])[0] == "2\n>mine >3\n"
+}
+
+test "a build continued after a class of the module edited is added, changed or removed reads its world once, whole" {
+	const o = "import { one } from \"./lib\"\n\nfunction main() { print(`o${one()}`) }\n"
+	const main = (c: string, k: i32) => `import { one } from "./lib"\n${c}\nfunction main() {\n\tconst k = [${k}]\n\tprint(\`\${one()}\`)\n}\n`
+	anew()
+	parted([["lib.bob", "export function one(): i32 { return 1 }\n"], ["o.bob", o], ["main.bob", main("", 1)]])
+	const steps = [main("\nclass C { x = 1 }\n", 1), main("\nclass C { x = \"a\" }\n", 1),
+		main("\nclass C { x = \"a\" }\n", 2), main("", 2)]
+	const reads = steps.map(m => parted([["main.bob", m]]))
+	assert reads.map(r => r[0]) == ["1\no1\n", "1\no1\n", "1\no1\n", "1\no1\n"]
+	assert reads.map(r => if (r[1] == r[2]) "whole" else if (r[1] < r[2]) "part" else "twice")
+		== ["whole", "whole", "part", "whole"]
 }

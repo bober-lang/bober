@@ -31,8 +31,8 @@ import { arch, os } from "../std/os"
 import { ParseError, codePoint, replace, split, trim, utf8 } from "../std/string"
 import * as decl from "./bc/decl"
 import * as kind from "./bc/kind"
-import { Bodies, Reached, abi, header, readFacts, sigMarks, signatures, write, writeFacts } from "./bc/file"
-import { Program } from "./bc/program"
+import { Bodies, Reached, abi, head, header, readFacts, sigMarks, signatures, write, writeFacts } from "./bc/file"
+import { Module, Program } from "./bc/program"
 import { show } from "./bc/show"
 import { glue, includesOf, sysroot } from "./c/bind"
 import { link, object } from "./c/bobcc"
@@ -44,7 +44,7 @@ import { formatFile } from "./format"
 import { Backend } from "./backend/backend"
 import { LLVM, options, shutdown, triple } from "./backend/llvm"
 import { Tpde } from "./backend/tpde"
-import { Bound, bound, bundle, bundleName, compilerId, hashing } from "./lift"
+import { Bound, Lift, bound, bundle, bundleName, compilerId, hashed, hashing } from "./lift"
 import { members } from "./link/ar"
 import { arm64 } from "./link/arm64"
 import { elf } from "./link/elf"
@@ -57,9 +57,9 @@ import { Linker, Stale, key } from "./link/link"
 import { Const, Global, Kept, Local, Object, Section, Symbol, Weak } from "./link/object"
 import { SyntaxError } from "./lex"
 import { js } from "./js"
-import { lower } from "./lower"
+import { lower, readSource } from "./lower"
 import { serve } from "./lsp"
-import { mono } from "./mono"
+import { digest, mono, shapes } from "./mono"
 import { Parser } from "./parse"
 import { builtin, root } from "./root"
 import { CLib, Package, dir, given, here, load, nearest, out } from "./pkg"
@@ -868,9 +868,15 @@ function monomorphized(mains: string[], tests: bool, f: Compile, dyn: bool,
 	whole: bool): [Program, [string, string][][]] {
 	const stale: string[] = []
 	let round = 0
+	let part = !whole
+	monoRead = 0
 	while (true) {
-		const p = if (dyn || f.release) lowered(mains, f.headers.I) else ofWorld(mains, f.headers.I)
+		const p = if (dyn || f.release) lowered(mains, f.headers.I) else ofWorld(mains, f.headers.I, round == 0 && part)
 		const ms = mains.map(m => p.module(normal(m)))
+		if (p.need != null && !sought(p, ms)) {
+			part = false
+			continue
+		}
 		const hashed = if (tests) testHashes(p, ms) else [] // before mono changes the code
 		if (dyn) {
 			return [p, hashed]
@@ -884,9 +890,26 @@ function monomorphized(mains: string[], tests: bool, f: Compile, dyn: bool,
 		}
 		p.marks = marksOf(p)
 		const units = keep(p, ms, f, stale, whole || f.release || round == 3)
-		mono(p, ms[0], true, if (f.release) f.tuned.small else 0)
+		if (units == null) {
+			part = false
+			continue
+		}
+		let fits = true // of a world lowered in part, the unions as they were, one of which a class may no longer fit
+		monoRead += p.modules.length
+		try {
+			mono(p, ms[0], true, if (f.release) f.tuned.small else 0)
+		} catch (e: CompileError) {
+			if (p.need == null) {
+				throw e
+			}
+			fits = false
+		}
+		if (p.need != null && (!fits || p.modules.some(x => !same(p, x)))) {
+			part = false
+			continue
+		}
 		p.derived = derived(p)
-		const more = changed(p)
+		const more = if (p.need != null) [] else changed(p)
 		// A module kept by its bytecode alone is of the program now: its unit is to be made.
 		more.append(program(p, ms, false).filter(m => p.modules[m].kept && !units[m]))
 		if (more.length == 0) {
@@ -903,7 +926,7 @@ function monomorphized(mains: string[], tests: bool, f: Compile, dyn: bool,
 /// fold unit the facts of that version; but those whose unit names a mark of p's modules' decls (Program.marks) that
 /// one of another version or a module gone defined but none of p's does; none if none, or the mark of builtin/'s
 /// signatures is another. Returns whether each is kept by its unit.
-function keep(p: Program, mains: i32[], f: Compile, stale: string[], none: bool): bool[] {
+function keep(p: Program, mains: i32[], f: Compile, stale: string[], none: bool): bool[] | null {
 	const units = p.modules.map(_ => false)
 	if (decoded == null || none) {
 		return units
@@ -913,7 +936,7 @@ function keep(p: Program, mains: i32[], f: Compile, stale: string[], none: bool)
 	try {
 		const fold = folded(p.world)
 		if (fold == null || fold![0] != marker(p.marks[1])) {
-			return units
+			return if (p.need != null) null else units
 		}
 		p.fold = fold![1]
 		// Of the modules of another version, the units held and the marks their decls define now.
@@ -943,10 +966,13 @@ function keep(p: Program, mains: i32[], f: Compile, stale: string[], none: bool)
 		for (const m of naming(p, l, old, "~", n => !defined.has(n))) {
 			p.modules[m].kept = false
 		}
-		for (const x of p.modules.filter(x => x.kept)) {
+		for (const x of if (p.need == null) p.modules.filter(x => x.kept) else []) {
 			readFacts(p, p.fold.get(x.path)![2])
 		}
 	} catch (e: ParseError | CompileError) {
+		if (p.need != null) {
+			return null
+		}
 		for (const x of p.modules) {
 			x.kept = false
 		}
@@ -975,9 +1001,13 @@ function changed(p: Program): i32[] {
 	return naming(p, l, held, "~~", n => !now.has(n)).filter(m => p.modules[m].kept)
 }
 
-/// The units l holds of the modules the world's fold unit holds the facts of (Program.fold) that p lacks: gone.
+/// The units l holds of the modules the world's fold unit holds the facts of (Program.fold) that p lacks: gone; none if
+/// p is lowered of part of its world, which lacks those it did not link.
 function gone(p: Program, l: Linker): string[] {
 	const out: string[] = []
+	if (p.need != null) {
+		return out
+	}
 	for (const e of p.fold.values().filter(e => p.module(e[0]) < 0)) {
 		for (const v of ["O1", "O2", "G"]) {
 			out.append(l.holds(`${e[0]}^${p.world}^${v}`))
@@ -988,14 +1018,19 @@ function gone(p: Program, l: Linker): string[] {
 }
 
 /// The modules of p whose units l holds that name a mark starting with of that one of units defines, but those not
-/// gone.
+/// gone. Throws if one is of a module of p's world not lowered (Program.need).
 function naming(p: Program, l: Linker, units: string[], of: string,
 	gone: (n: string) => bool): i32[] throws CompileError {
 	const out: i32[] = []
 	for (const u of units) {
 		for (const n of l.defines(u, of).filter(gone)) {
-			for (const m of l.naming(n).map(v => p.module(home(v))).filter(m => m >= 0 && !out.includes(m))) {
-				out.push(m)
+			for (const v of l.naming(n)) {
+				const m = p.module(home(v))
+				if (m < 0 && p.need != null && p.fold.has(home(v))) {
+					throw new CompileError(`${home(v)} names ${n}`)
+				} else if (m >= 0 && !out.includes(m)) {
+					out.push(m)
+				}
 			}
 		}
 	}
@@ -1005,8 +1040,8 @@ function naming(p: Program, l: Linker, units: string[], of: string,
 /// The marks of what mono decides that p's modules name (decided), which the world's marks unit defines.
 function derived(p: Program): string[] {
 	const hs: u64[] = []
-	for (const x of p.modules) {
-		hs.append(x.marks)
+	for (const ms of if (p.need == null) p.modules.map(x => x.marks) else p.fold.values().map(e => unmarked(e[3]))) {
+		hs.append(ms)
 	}
 	sort(hs)
 	return unique(hs).map(h => decided(p, h))
@@ -1027,6 +1062,57 @@ function unmarked(bytes: string): u64[] {
 		hs.push(u(bytes, 8 * i, 8))
 	}
 	return hs
+}
+
+/// Of p lowered of part of its world, whether module x, monomorphized again, has the facts, uses and marks the fold
+/// unit holds of it, so that what mono decided of all, which it did not decide again, is as it was; kept, whether its
+/// marks are of those.
+function same(p: Program, x: Module): bool {
+	const e = p.fold.get(x.path)
+	if (e != null && x.kept) {
+		const was = unmarked(e![3])
+		return x.marks.every(h => was.includes(h)) // of the methods of it spreads bind, those of modules not read lacking
+	}
+	if (e == null || marked(x.marks) != e![3]) {
+		return false
+	}
+	const [facts, uses] = [x.facts, x.uses]
+	const now = digest(p, x)
+	const n = p.modules.length
+	try {
+		readFacts(p, e![2]) // as sought read it, which linked the modules it names
+	} catch (e: ParseError) {
+		return false
+	}
+	const was = digest(p, x)
+	x.facts = facts
+	x.uses = uses
+	return now == was && p.modules.length == n
+}
+
+/// Of p lowered of part of its world, read from the fold unit's entries (Program.fold), the facts and uses of each
+/// module of the program of mains as it was, linking the modules they name (Program.need); false if one is not of it.
+function sought(p: Program, mains: i32[]): bool {
+	const done = new HashMap[i32, bool]()
+	const lowered = p.modules.map(x => p.module(x.path))
+	try {
+		while (true) {
+			const todo = [...lowered, ...program(p, mains, false)].filter(m => !done.has(m))
+			if (todo.length == 0) {
+				return true
+			}
+			for (const m of todo) {
+				done.set(m, true)
+				const e = p.fold.get(p.modules[m].path)
+				if (e == null) {
+					return false
+				}
+				readFacts(p, e![2])
+			}
+		}
+	} catch (e: ParseError) {
+		return false
+	}
 }
 
 /// Of the image as lowering read it (decoded), the world's fold unit, copied, as another build may write the image in
@@ -1195,17 +1281,88 @@ function world(main: string): string[] {
 /// The Program of mains lowered with the files of the first's world, or of mains alone where another of those does not
 /// compile, as one being edited; of the hash of where its world is (Program.world), which the symbols of its units are
 /// named by, as a world's are of its unions: its package's home, else the first of mains, a world of its own.
-function ofWorld(mains: string[], includes: string[]): Program {
+function ofWorld(mains: string[], includes: string[], partial = false): Program {
 	const w = world(mains[0])
 	try {
-		const p = lowered(w, includes)
-		p.world = fnv(if (w.length > 1) nearest(w[0])! else w[0])
+		const world = fnv(if (w.length > 1) nearest(w[0])! else w[0])
+		const p = lowered(w, includes, if (partial && w.length > 1) partly(w, mains, world) else _ => null, within)
+		p.world = world
 		return p
 	} catch (e: CompileError) {
 		const p = lowered(mains, includes)
 		p.world = fnv(mains[0])
 		return p
 	}
+}
+
+/// Of world w, that of hash world, what lower lowers for mains, the rest linked as asked (Program.need): mains,
+/// builtin/'s, and those of the world's fold unit (folded) of a source other than the Lift's cache holds (Lift.heads)
+/// but the bundle's, with the fold unit's entries the Program's (Program.fold); null, all, if one of w is not of the
+/// fold unit, or one of it of another source is neither.
+function partly(w: string[], mains: string[], world: u64): (lift: Lift) => string[] | null {
+	return lift => {
+		try {
+			const fold = folded(world)
+			const ws = new HashMap[string, bool]()
+			for (const x of w) {
+				ws.set(normal(x), true)
+			}
+			if (fold == null || w.some(x => !fold![1].has(normal(x)))) {
+				return null
+			}
+			const paths = fold![1].values().map(e => e[0])
+			const fresh = paths.filter(x => !lift.heads.has(x) && !lift.bundle.has(x))
+			if (fresh.some(x => endsWith(x, ".bob") && !ws.has(x) && !builtin(x))) {
+				return null
+			}
+			lift.prog.fold = fold![1]
+			return [...mains, ...fresh.filter(x => endsWith(x, ".bob")), ...paths.filter(builtin)]
+		} catch (e: ParseError) {
+			return null
+		}
+	}
+}
+
+/// Of the Lift of part of a world (partly), whether each module lowered anew but builtin/'s has the classes (shapes)
+/// its fold unit's entry has, which mono marks, and uses only modules it holds: else its unit holds what mono decided
+/// of the code of others, the members their values reach and convert, which mono of part of a world does not decide
+/// again (src/mono.bob's settle).
+function within(lift: Lift): bool {
+	const p = lift.prog
+	sigMarks(p)
+	const shape = shapes(p)
+	try {
+		for (const x of p.modules.filter(x => x.bc == "" && x.source != 0 && !builtin(x.path))) {
+			const e = p.fold.get(x.path)
+			if (e != null
+				&& (!unmarked(e![3]).includes(shape[p.module(x.path)]) || used(e![2]).some(d => p.module(d) < 0))) {
+				return false
+			}
+		}
+		return true
+	} catch (e: ParseError) {
+		return false
+	}
+}
+
+/// Of the facts of a fold unit's entry (writeFacts), the paths of the modules its module uses (Module.uses).
+function used(facts: string): string[] throws ParseError {
+	const x = head(facts)
+	const r = x.r
+	for (const _ of 1 ... 6) {
+		r.raw(r.uleb() as i32) // the strings, ints, names, decls, imports and types
+	}
+	r.uleb() // the facts' length
+	for (const _ of 1 ... (r.uleb() as i32)) {
+		r.raw(1)
+		r.uleb()
+		r.uleb()
+	}
+	const out: string[] = []
+	for (const _ of 1 ... (r.uleb() as i32)) {
+		out.push(x.paths[r.uleb() as i32])
+	}
+	return out
 }
 
 /// The modules the program of p's modules mains links: all, as lowered, where a type may name any; else, monomorphized,
@@ -1286,7 +1443,8 @@ function inspect(path: string, out: string, f: Compile, ir: bool) {
 /// Program p of mains, lowered after the CMake projects of main's package are built, but the modules linked from the
 /// bytecode build/image.so holds, of the Bound each holds if any (unit), of files hashed as build/hashes keeps them
 /// (hashing), with the build directory made; its linker kept for relink.
-function lowered(mains: string[], includes: string[]): Program {
+function lowered(mains: string[], includes: string[], pick: (lift: Lift) => string[] | null = _ => null,
+	holds: (lift: Lift) => bool = _ => true): Program {
 	const h = nearest(mains[0])
 	if (h != null) {
 		cmake(h)
@@ -1303,7 +1461,8 @@ function lowered(mains: string[], includes: string[]): Program {
 		Bound.keep(l.sections("bober_bind"))
 		decoded = if (kept == null) null else [stamp(kept, format.headers), l, kept]
 		mkdirAll(dir)
-		return hashing(`${dir}/hashes`, () => lower(mains, includes, l.sections("bober_bc")))
+		return hashing(`${dir}/hashes`,
+			() => lower(mains, includes, l.sections("bober_bc"), readSource, hashed, pick, holds))
 	} finally {
 		f?.close()
 	}
@@ -1451,7 +1610,7 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 	// decls, whose functions emit calls unasked, which no bytecode names, and of what mono decides (derived), which a
 	// unit of the world's defines (marksUnit), which each program of it shares. Another, the fold unit, holds after
 	// that one each module's path, its unit's version, its facts and marks (Program.fold), and the units of modules gone
-	// are unlinked.
+	// are unlinked; of a world lowered in part, the others' as they were.
 	const [defs, lang] = p.marks
 	const now = p.derived
 	if (!o.dyn && !c.release) {
@@ -1462,12 +1621,12 @@ function relink(p: Program, mains: i32[], files: string[], cxx: bool, pin: bool,
 		}
 		text(marker(lang))
 		const order = p.modules.map(x => x.path)
+		order.append(p.fold.values().map(e => e[0]).filter(path => p.need != null && p.module(path) < 0))
 		sort(order)
 		for (const path of order) {
 			const m = p.module(path)
-			const x = p.modules[m]
-			const e = if (x.kept) p.fold.get(path)!
-				else [path, unitVersion(p, m, x.bc, learned), writeFacts(p, m), marked(x.marks)]
+			const e = if (m < 0 || p.modules[m].kept) p.fold.get(path)!
+				else [path, unitVersion(p, m, p.modules[m].bc, learned), writeFacts(p, m), marked(p.modules[m].marks)]
 			for (const bytes of e) {
 				text(bytes)
 			}
@@ -1938,6 +2097,9 @@ function marker(h: u64, of = "~"): string {
 export let onUnit: ((x: Object) => void) | null = null
 /// Of the last program monomorphized, how many modules it kept (Module.kept), which a test asks.
 export let monoKept = 0
+/// And how many modules its runs of mono read in all, lowered or linked: of a world lowered in part (Program.need),
+/// fewer than all.
+export let monoRead = 0
 
 /// The objects of the glue of p's modules ms of C headers but the bundle's, of source hash 0, compiled with includes
 /// and those of the packages of these modules, and all C libraries of each package one of whose headers it imports,
