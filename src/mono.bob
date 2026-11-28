@@ -562,15 +562,16 @@ class Mono {
 		for (const d of m.decls) {
 			seen.set(d, true)
 		}
-		// of the decl worked on, the types named and Type facts
-		let types = new HashMap[i32, bool]()
-		let typed = new HashMap[i32, bool]()
+		// of the decl worked on, the ith, the types named and Type facts: those the ith marked
+		const types = new HashMap[i32, i32]()
+		const typed = new HashMap[i32, i32]()
 		let fs: i32[] = []
+		let i = 0
 		const reach = (d: i32) => {
-			this.signed(d, typed, fs)
+			this.signed(d, typed, i, fs)
 			// A field read or written at its offset in the layout of its class.
 			if (p.decls[d].kind == decl.Var && p.decls[d].owner >= 0) {
-				this.signed(p.decls[d].owner, typed, fs)
+				this.signed(p.decls[d].owner, typed, i, fs)
 			}
 			const t = this.top(d)
 			if ((this.own.has(t) || this.apart.has(t)) && !m.uses.includes(p.decls[t].module)) {
@@ -596,19 +597,15 @@ class Mono {
 			}
 		}
 		const all = new HashMap[i32, bool]()
-		let i = 0
 		while (i < todo.length) {
 			const d = todo[i]
 			const x = p.decls[d]
-			types = new HashMap[i32, bool]()
-			typed = new HashMap[i32, bool]()
-			fs = (this.facts.get(d) ?? []).slice(0, (this.facts.get(d) ?? []).length)
+			fs = [...this.facts.get(d) ?? []]
 			ctor(d)
-			i++
 			todo.append(x.members)
 			const c = x.code() ?? new Code()
 			for (const t of [x.type, ...p.lists[x.tags], ...c.locals.map(l => l.type)]) {
-				this.named(t, types, named)
+				this.named(t, types, i, named)
 			}
 			for (const j of 0 ... c.ops.length - 1) {
 				const s = op.shape[c.ops[j]]
@@ -618,7 +615,7 @@ class Mono {
 						reach(v)
 					} else if (s[k] == op.TypeId || s[k] == op.TypeList) {
 						for (const t of if (s[k] == op.TypeId) [v] else p.lists[v]) {
-							this.named(t, types, named)
+							this.named(t, types, i, named)
 						}
 					}
 				}
@@ -628,10 +625,14 @@ class Mono {
 				// of m, each Type once
 				const t = fs[3 * j + 1]
 				if (fs[3 * j] != op.Type) {
-					m.facts.append(fs.slice(3 * j, 3 * j + 3))
+					m.facts.push(fs[3 * j])
+					m.facts.push(t)
+					m.facts.push(fs[3 * j + 2])
 				} else if (!all.has(t)) {
 					all.set(t, true)
-					m.facts.append([op.Type, t, 0])
+					m.facts.push(op.Type)
+					m.facts.push(t)
+					m.facts.push(0)
 				}
 				if (fs[3 * j] == op.Type) {
 					hs.push(this.mark(t))
@@ -639,21 +640,22 @@ class Mono {
 			}
 			sort(hs)
 			m.decides.set(d, unique(hs))
+			i++
 		}
 		return out
 	}
 
-	/// Calls reach of each decl that type t and its parts name, once per type, as seen says.
-	private named(t: i32, seen: HashMap[i32, bool], reach: (d: i32) => void) {
-		if (seen.has(t)) {
+	/// Calls reach of each decl that type t and its parts name, once per type of the ith decl, as seen says.
+	private named(t: i32, seen: HashMap[i32, i32], i: i32, reach: (d: i32) => void) {
+		if (seen.get(t) == i) {
 			return
 		}
-		seen.set(t, true)
+		seen.set(t, i)
 		if (this.p.kind(t) == kind.Named) {
 			reach(this.p.a(t))
 		}
 		for (const x of this.p.parts(t)) {
-			this.named(x, seen, reach)
+			this.named(x, seen, i, reach)
 		}
 	}
 
@@ -692,24 +694,29 @@ class Mono {
 	}
 
 	/// Of decl d, a Type fact in fs of each interface or object type its type's lowering lowered, or of a class those of
-	/// its fields, through the classes it embeds, which lay it out; but those of seen.
-	private signed(d: i32, seen: HashMap[i32, bool], fs: i32[]) {
+	/// its fields, through the classes it embeds, which lay it out; but those seen of the ith decl.
+	private signed(d: i32, seen: HashMap[i32, i32], i: i32, fs: i32[]) {
 		const p = this.p
-		for (const x of (this.sigs.get(d) ?? []).filter(x => !seen.has(x))) {
-			seen.set(x, true)
-			fs.append([op.Type, x, 0])
+		for (const x of this.sigs.get(d) ?? []) {
+			if (seen.get(x) == i) {
+				continue
+			}
+			seen.set(x, i)
+			fs.push(op.Type)
+			fs.push(x)
+			fs.push(0)
 			// held as one class, whose fields are read at their offsets
 			const one = this.lows.get(x) ?? 0
 			if (p.kind(one) == kind.Named) {
-				this.signed(p.a(one), seen, fs)
+				this.signed(p.a(one), seen, i, fs)
 			}
 		}
 		for (const f of if (p.decls[d].kind == decl.Class) p.decls[d].members else []) {
 			const t = p.decls[f].type
 			if (p.decls[f].kind == decl.Var && (p.decls[f].mods & decl.Static) == 0) {
-				this.signed(f, seen, fs)
+				this.signed(f, seen, i, fs)
 				if (embedded(p, f) && p.kind(t) == kind.Named) {
-					this.signed(p.a(t), seen, fs)
+					this.signed(p.a(t), seen, i, fs)
 				}
 			}
 		}
