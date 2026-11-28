@@ -674,7 +674,7 @@ void bober_reserve(int64_t n) {
   if (h_.young + n <= h_.reserved) return;  // within what was reserved before, as bober's first 256 MiB
   if (h_.young > every) collect(false);
   h_.reserved = h_.young + n;
-  if (n >= 2 << 20 && !collections) advise(MADV_HUGEPAGE);
+  if (n >= 2 << 20 && !advice) advise(MADV_HUGEPAGE);
 }
 
 /// Counts n bytes less as allocated (src/rt.h), lest mapping a large file collect.
