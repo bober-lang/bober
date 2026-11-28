@@ -80,6 +80,8 @@ class Mono {
 	/// The values each object spreads and its type, and the methods of classes those bind, which a class holds.
 	private binds: [i32, i32][] = []
 	private bound = new HashMap[i32, bool]()
+	/// Per method bound, the module of it and its mark, the hash of its class type and name (marks).
+	private spread: [i32, u64][] = []
 	/// Per class type, the names of the methods spreads bind of it.
 	private binding = new HashMap[i32, i32[]]()
 	/// Per instance, what its code contributes (scan), and as lowered, the interfaces and object types held as unions
@@ -101,6 +103,14 @@ class Mono {
 	run(main: i32) throws CompileError {
 		const p = this.p
 		this.main = main
+		// Lowered of part of its world, the unions as the facts read hold them (marks), which settle does not make.
+		for (const m of if (p.need != null) p.modules else []) {
+			for (const j of 0 ... m.facts.length / 3 - 1) {
+				if (m.facts[3 * j] == op.Type) {
+					this.ins.held.set(m.facts[3 * j + 1], m.facts[3 * j + 2])
+				}
+			}
+		}
 		for (const m of p.modules) {
 			for (const d of m.decls) {
 				m.roots.push(d)
@@ -155,10 +165,13 @@ class Mono {
 	/// the union it is held as and, held as one class, that one's signature, which lays it out; and of the Init facts
 	/// of all, its demand: the hash of its path, the instances of its generic classes with statics that units hold,
 	/// whose statics it holds, and the methods spreads bind of the instances of generic classes it holds, which those
-	/// hold as members.
+	/// hold as members; and apart from those, which its glue alone names, that of its classes (shapes), and the hash of
+	/// its path and its methods spreads bind (spread), which it holds, not copied.
 	private marks() {
 		const p = this.p
 		const ds = p.modules.map(m => [fnv(m.path)])
+		const shape = shapes(p)
+		const spread = p.modules.map(m => [fnv(`${m.path}^^`)])
 		for (const mi of 0 ... p.modules.length - 1) {
 			const fs = p.modules[mi].facts
 			for (const j of 0 ... fs.length / 3 - 1) {
@@ -174,6 +187,9 @@ class Mono {
 				}
 			}
 		}
+		for (const [mi, h] of this.spread) {
+			spread[mi].push(h)
+		}
 		for (const mi of 0 ... p.modules.length - 1) {
 			const m = p.modules[mi]
 			m.marks = [hashOf(ds[mi])]
@@ -186,6 +202,7 @@ class Mono {
 			for (const hs of m.decides.values()) {
 				hs.push(m.marks[0])
 			}
+			m.marks.append([shape[mi], hashOf(spread[mi])])
 			sort(m.marks)
 			m.marks = unique(m.marks)
 		}
@@ -332,13 +349,13 @@ class Mono {
 	private settle() throws CompileError {
 		const p = this.p
 		const thrown = this.thrown
-		const caught = this.caught
+		const caught = if (p.need != null) [] else this.caught
 		for (const t of caught) {
 			for (const s of thrown) {
 				this.convert(s, t)
 			}
 		}
-		let changed = true
+		let changed = p.need == null
 		while (changed) {
 			changed = false
 			for (const [t, name] of this.reached.values()) {
@@ -367,7 +384,9 @@ class Mono {
 					const o = this.ins.owner(m, name)
 					const d = this.ins.member(o, name)
 					if (d >= 0 && p.decls[d].kind == decl.Function) {
-						this.bound.set(this.ins.memberOf(o, name), true)
+						const k = this.ins.memberOf(o, name)
+						this.bound.set(k, true)
+						this.spread.push([p.decls[k].module, combine(p.hash(o), fnv(p.strings[name]))])
 						add(this.binding, o, name)
 					}
 				}
@@ -522,8 +541,7 @@ class Mono {
 		const fs = m.facts
 		const keyed: [u64, i32][] = []
 		for (const j of 0 ... fs.length / 3 - 1) {
-			const b = if (fs[3 * j] == op.Field) fnv(p.strings[fs[3 * j + 2]]) else p.hash(fs[3 * j + 2])
-			keyed.push([combine(combine(fs[3 * j] as u64, p.hash(fs[3 * j + 1])), b), 3 * j])
+			keyed.push([key(p, fs, j), 3 * j])
 		}
 		sortBy(keyed, (x, y) => x[0] < y[0])
 		m.facts = []
@@ -935,6 +953,31 @@ class Mono {
 		this.lowered = outer
 		return k
 	}
+}
+
+/// The hash of module m's facts and its uses, the same however p is read.
+export function digest(p: Program, m: Module): u64 {
+	const hs = m.uses.map(x => fnv(p.modules[x].path))
+	for (const j of 0 ... m.facts.length / 3 - 1) {
+		hs.push(key(p, m.facts, j))
+	}
+	return hashOf(hs)
+}
+
+/// Of each module of p, the hash of its path and of the signature of each of its classes (Decl.sig), which one may
+/// newly fit an interface by, as lowered.
+export function shapes(p: Program): u64[] {
+	const hs = p.modules.map(m => [fnv(`${m.path}^`)])
+	for (const x of p.decls.filter(x => x.kind == decl.Class && x.generic < 0 && x.module >= 0)) {
+		hs[x.module].push(x.sig)
+	}
+	return hs.map(hashOf)
+}
+
+/// Of facts fs, the hash of the jth.
+function key(p: Program, fs: i32[], j: i32): u64 {
+	const b = if (fs[3 * j] == op.Field) fnv(p.strings[fs[3 * j + 2]]) else p.hash(fs[3 * j + 2])
+	return combine(combine(fs[3 * j] as u64, p.hash(fs[3 * j + 1])), b)
 }
 
 /// The hash of the hashes xs, as a set.
