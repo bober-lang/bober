@@ -131,9 +131,10 @@ export class Stale {
 const entry: u64 = 72
 /// Those of a unit's, after the table of units: of its blocks, then of its two of rebases, where each is and how big,
 /// in 12 bytes; none of a unit unlinked or frozen but the first. The size of its record has, past the 2 GiB the file
-/// stays below, whether it was supplied.
+/// stays below, whether it was supplied, and past 1 GiB, which no unit's record nears, whether it has Kept sections.
 const unitEntry: u64 = 72
 const supplying: u64 = 1 << 31
+const keeping: u64 = 1 << 30
 /// Of a link of a chain (Linker.links), whether its symbol defines the name, and whether it does not weakly.
 const defining: u64 = 1 << 63
 const strong: u64 = 1 << 62
@@ -360,6 +361,9 @@ export class Linker {
 		}
 		const out: string[] = []
 		for (const k of ks) {
+			if (!this.keeps(k)) {
+				continue // as all such sections are Kept
+			}
 			const u = this.held(k)
 			for (const i of 0 ... u.object.sections.length - 1) {
 				const sec = u.object.sections[i]
@@ -732,6 +736,12 @@ export class Linker {
 	private supplied(k: i32): bool {
 		const u = this.units[k]
 		return if (u != null) u.supplied else this.field(k, 8, 4) & supplying != 0
+	}
+
+	/// Whether unit k has Kept sections, of one held not read as its entry says.
+	private keeps(k: i32): bool {
+		const u = this.units[k]
+		return if (u != null) u.object.sections.some(x => x.kind == Kept) else this.field(k, 8, 4) & keeping != 0
 	}
 
 	/// Whether a name unit k defines is named so that it must be defined, or exported.
@@ -1476,11 +1486,13 @@ export class Linker {
 					s.grouped.push(k)
 				}
 			}
+			const flags = (if (u.supplied) supplying else 0)
+				| (if (u.object.sections.some(x => x.kind == Kept)) keeping else 0)
 			for (const i of 0 ... 5) {
 				const [from, size] = (if (i < 4) u.blocks.at(i) else u.relr.at(i - 4)) ?? [0, 0]
 				const p = this.entryAt(k) + 12 * (i as u64)
 				this.bytes.put(p, from, 8)
-				this.bytes.put(p + 8, size | (if (i == 0 && u.supplied) supplying else 0), 4)
+				this.bytes.put(p + 8, size | (if (i == 0) flags else 0), 4)
 			}
 		}
 		s.grouped = s.grouped.filter(k => this.held(k).object.name != "")
@@ -1816,7 +1828,8 @@ export class Linker {
 		this.reads++
 		const blocks: [u64, u64][] = []
 		for (const i of 0 ... 5) {
-			blocks.push([this.field(k, 12 * (i as u64), 8), this.field(k, 12 * (i as u64) + 8, 4) & ~supplying])
+			const at = 12 * (i as u64)
+			blocks.push([this.field(k, at, 8), this.field(k, at + 8, 4) & ~(if (i == 0) supplying | keeping else 0)])
 		}
 		u.blocks = blocks.slice(0, 4).filter(x => x[0] != 0)
 		u.relr = blocks.slice(4, 6)
