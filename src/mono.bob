@@ -103,10 +103,12 @@ class Mono {
 	run(main: i32) throws CompileError {
 		const p = this.p
 		this.main = main
-		// Lowered of part of its world, the unions as the facts read hold them (marks), which settle does not make.
+		// Lowered of part of its world, the unions as the facts read hold them (marks), which settle does not make; as a
+		// Member fact does only one no Type fact holds, which a module kept by it alone holds as it was.
 		for (const m of if (p.need != null) p.modules else []) {
 			for (const j of 0 ... m.facts.length / 3 - 1) {
-				if (m.facts[3 * j] == op.Type) {
+				const o = m.facts[3 * j]
+				if (o == op.Type || o == op.Member && !this.ins.held.has(m.facts[3 * j + 1])) {
 					this.ins.held.set(m.facts[3 * j + 1], m.facts[3 * j + 2])
 				}
 			}
@@ -201,8 +203,8 @@ class Mono {
 			const m = p.modules[mi]
 			m.marks = [hashOf(ds[mi])]
 			for (const j of 0 ... m.facts.length / 3 - 1) {
-				if (m.facts[3 * j] == op.Type) {
-					m.marks.push(this.mark(m.facts[3 * j + 1]))
+				if (m.facts[3 * j] == op.Type || m.facts[3 * j] == op.Member) {
+					m.marks.push(this.mark(m.facts[3 * j + 1], m.facts[3 * j]))
 					m.facts[3 * j + 2] = this.ins.held.get(m.facts[3 * j + 1]) ?? p.union([])
 				}
 			}
@@ -216,10 +218,15 @@ class Mono {
 	}
 
 	/// The mark of interface or object type x: of its hash, the union it is held as and, held as one class, that one's
-	/// signature, which lays it out.
-	private mark(x: i32): u64 {
+	/// signature, which lays it out; of a Member fact, held as 1 to 255 classes, of its hash alone, as a field held as a
+	/// ref, tagged or not, is laid out the same whatever classes (signed).
+	private mark(x: i32, o: i32 = op.Type): u64 {
 		const p = this.p
 		const h = this.ins.held.get(x) ?? p.union([])
+		const ms = p.members(h)
+		if (o == op.Member && ms.length >= 1 && ms.length <= 255 && ms.every(m => this.ins.nominal(m) == decl.Class)) {
+			return combine(p.hash(x), op.Member)
+		}
 		const sig = if (this.ins.nominal(h) == decl.Class) p.decls[p.a(h)].sig else 0
 		return combine(combine(p.hash(x), p.hash(h)), sig)
 	}
@@ -593,11 +600,12 @@ class Mono {
 		const typed = new HashMap[i32, i32]()
 		let fs: i32[] = []
 		let i = 0
+		let filled: i32[] | null = null
 		const reach = (d: i32) => {
-			this.signed(d, typed, i, fs)
+			this.signed(d, typed, i, fs, filled)
 			// A field read or written at its offset in the layout of its class.
 			if (p.decls[d].kind == decl.Var && p.decls[d].owner >= 0) {
-				this.signed(p.decls[d].owner, typed, i, fs)
+				this.signed(p.decls[d].owner, typed, i, fs, filled)
 			}
 			const t = this.top(d)
 			if ((this.own.has(t) || this.apart.has(t)) && !m.uses.includes(p.decls[t].module)) {
@@ -627,9 +635,20 @@ class Mono {
 			const d = todo[i]
 			const x = p.decls[d]
 			fs = [...this.facts.get(d) ?? []]
+			const c = x.code() ?? new Code()
+			// The classes it fills a literal of or copies by a spread, field by field; all, if one is not a class, but an
+			// array or tuple, which holds a class by its ref.
+			filled = []
+			for (const j of 0 ... c.ops.length - 1) {
+				const k = if (c.ops[j] == op.Object || c.ops[j] == op.Init) p.kind(c.a(j)) else kind.Array
+				if (k == kind.Named && filled != null) {
+					filled = [...filled!, p.a(c.a(j))]
+				} else if (k != kind.Array && k != kind.Tuple) {
+					filled = null
+				}
+			}
 			ctor(d)
 			todo.append(x.members)
-			const c = x.code() ?? new Code()
 			for (const t of [x.type, ...p.lists[x.tags], ...c.locals.map(l => l.type)]) {
 				this.named(t, types, i, named)
 			}
@@ -660,8 +679,8 @@ class Mono {
 					m.facts.push(t)
 					m.facts.push(0)
 				}
-				if (fs[3 * j] == op.Type) {
-					hs.push(this.mark(t))
+				if (fs[3 * j] == op.Type || fs[3 * j] == op.Member) {
+					hs.push(this.mark(t, fs[3 * j]))
 				}
 			}
 			sort(hs)
@@ -720,8 +739,10 @@ class Mono {
 	}
 
 	/// Of decl d, a Type fact in fs of each interface or object type its type's lowering lowered, or of a class those of
-	/// its fields, through the classes it embeds, which lay it out; but those seen of the ith decl.
-	private signed(d: i32, seen: HashMap[i32, i32], i: i32, fs: i32[]) {
+	/// its fields, through the classes it embeds, which lay it out; but those seen of the ith decl. Of a class not filled,
+	/// of a field held as a ref, tagged or not, which lays it out the same whatever classes its union holds, a Member fact
+	/// of each instead (mark); but through a class embedded, which is copied whole.
+	private signed(d: i32, seen: HashMap[i32, i32], i: i32, fs: i32[], filled: i32[] | null = null) {
 		const p = this.p
 		for (const x of this.sigs.get(d) ?? []) {
 			if (seen.get(x) == i) {
@@ -739,8 +760,16 @@ class Mono {
 		}
 		for (const f of if (p.decls[d].kind == decl.Class) p.decls[d].members else []) {
 			const t = p.decls[f].type
+			const ms = p.members(t)
 			if (p.decls[f].kind == decl.Var && (p.decls[f].mods & decl.Static) == 0) {
-				this.signed(f, seen, i, fs)
+				if (filled != null && !filled!.includes(d) && this.small == 0 && p.kind(t) == kind.Union
+					&& ms.length <= 256 && ms.every(m => m == kind.Null || this.ins.nominal(m) == decl.Class)) {
+					for (const x of this.sigs.get(f) ?? []) {
+						fs.append([op.Member, x, 0])
+					}
+				} else {
+					this.signed(f, seen, i, fs)
+				}
 				if (embedded(p, f) && p.kind(t) == kind.Named) {
 					this.signed(p.a(t), seen, i, fs)
 				}

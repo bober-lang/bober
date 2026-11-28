@@ -1883,3 +1883,15 @@ test "a test file is compiled anew once an alias it imports changed, which its c
 		dir = "build"
 	}
 }
+
+test "at -O1 a class cast anew into an interface leaves the units of a function that only passes along a holder of it" {
+	const lib = `export interface I { n(): i32 }\n\nexport class Holder {\n\tk = 5\n\ti: I | null = null\n}\n
+export function k(h: Holder): i32 { return h.k }\n\nexport function pass(h: Holder): i32 { return k(h) }\n`
+	const main = (more: string) => `import { Holder, I, pass } from "./lib"\n\nclass A { n(): i32 { return 1 } }\n${more}
+function main() {\n\tconst h = new Holder()\n\th.i = new A()\n\tprint(\`\${pass(h)}\`)\n}\n`
+	anew()
+	assert apart([["lib.bob", lib], ["main.bob", main("")]]) != ""
+	const grown = apart([["main.bob", main("\nclass B { n(): i32 { return 2 } }\n\nconst b: I = new B()\n")]])
+	// lib's glue and Holder, whose field holds B now; main's glue, B and main: not pass nor k, which only lay out a Holder
+	assert grown == "5\nlib.bob lib.bob:Holder main.bob main.bob:B main.bob:B.n main.bob:main"
+}
