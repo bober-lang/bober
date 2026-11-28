@@ -1855,3 +1855,15 @@ test "a private edit of a module, of which a test file imports only exports, lea
 	const [out, read, whole] = parted([["lib.bob", lib("\nconst k = 7\n")]])
 	assert out == "1\n1\n" && read < whole
 }
+
+test "a build continued, of which a union holds a generic class only a module it lacks makes, stays in part" {
+	const s = "export class Stream[T] {\n\tv: T\n\n\tconstructor(v: T) { this.v = v }\n\n\tsize(): i32 { return 2 }\n}\n"
+	const o = `import { Body } from "./lib"\nimport { Stream } from "./s"\n
+function main() {\n\tconst b: Body = new Stream[string]("s")\n\tprint(\`o\${b.size()}\`)\n}\n`
+	const main = (k: i32) => `import { Body } from "./lib"\n\nclass P { size(): i32 { return 1 } }\n
+function main() {\n\tconst k = [${k}]\n\tconst bs: Body[] = [new P()]\n\tprint(\`\${bs.length}\`)\n}\n`
+	anew()
+	parted([["lib.bob", "export interface Body { size(): i32 }\n"], ["s.bob", s], ["o.bob", o], ["main.bob", main(1)]])
+	const [out, read, whole] = parted([["main.bob", main(2)]])
+	assert out == "1\no2\n" && read < whole
+}

@@ -31,7 +31,7 @@ import { arch, os } from "../std/os"
 import { ParseError, codePoint, replace, split, trim, utf8 } from "../std/string"
 import * as decl from "./bc/decl"
 import * as kind from "./bc/kind"
-import { Bodies, Reached, abi, head, header, readFacts, sigMarks, signatures, write, writeFacts } from "./bc/file"
+import { Bodies, Reached, abi, header, readFacts, sigMarks, signatures, write, writeFacts } from "./bc/file"
 import { Module, Program } from "./bc/program"
 import { show } from "./bc/show"
 import { glue, includesOf, sysroot } from "./c/bind"
@@ -1324,45 +1324,16 @@ function partly(w: string[], mains: string[], world: u64): (lift: Lift) => strin
 }
 
 /// Of the Lift of part of a world (partly), whether each module lowered anew but builtin/'s has the classes (shapes)
-/// its fold unit's entry has, which mono marks, and uses only modules it holds: else its unit holds what mono decided
-/// of the code of others, the members their values reach and convert, which mono of part of a world does not decide
-/// again (src/mono.bob's settle).
+/// its fold unit's entry has, which mono marks: else one may newly fit an interface the code of others converts into,
+/// which mono of part of a world does not decide again (src/mono.bob's settle).
 function within(lift: Lift): bool {
 	const p = lift.prog
 	sigMarks(p)
 	const shape = shapes(p)
-	try {
-		for (const x of p.modules.filter(x => x.bc == "" && x.source != 0 && !builtin(x.path))) {
-			const e = p.fold.get(x.path)
-			if (e != null
-				&& (!unmarked(e![3]).includes(shape[p.module(x.path)]) || used(e![2]).some(d => p.module(d) < 0))) {
-				return false
-			}
-		}
-		return true
-	} catch (e: ParseError) {
-		return false
-	}
-}
-
-/// Of the facts of a fold unit's entry (writeFacts), the paths of the modules its module uses (Module.uses).
-function used(facts: string): string[] throws ParseError {
-	const x = head(facts)
-	const r = x.r
-	for (const _ of 1 ... 6) {
-		r.raw(r.uleb() as i32) // the strings, ints, names, decls, imports and types
-	}
-	r.uleb() // the facts' length
-	for (const _ of 1 ... (r.uleb() as i32)) {
-		r.raw(1)
-		r.uleb()
-		r.uleb()
-	}
-	const out: string[] = []
-	for (const _ of 1 ... (r.uleb() as i32)) {
-		out.push(x.paths[r.uleb() as i32])
-	}
-	return out
+	return p.modules.filter(x => x.bc == "" && x.source != 0 && !builtin(x.path)).every(x => {
+		const e = p.fold.get(x.path)
+		return e == null || unmarked(e![3]).includes(shape[p.module(x.path)])
+	})
 }
 
 /// The modules the program of p's modules mains links: all, as lowered, where a type may name any; else, monomorphized,
