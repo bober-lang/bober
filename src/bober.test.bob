@@ -1633,3 +1633,12 @@ export function all(): N[] { return [new B()] }\n`
 	const plain = built([], "")
 	assert startsWith(fast, "[\"b\"]\n") && plain == "[\"b\"]\n"
 }
+
+test "at -O1 a module gone leaves none of its units, nor its bytecode's, as a build anew" {
+	anew()
+	const one = apart([["gone.bob", "export function g(): i32 { return 1 }\n"],
+		["main.bob", "import { g } from \"./gone\"\n\nfunction main() {\n\tprint(`${g()}`)\n}\n"]])
+	remove(`${home()}/gone.bob`)
+	const two = apart([["main.bob", "function main() {\n\tprint(\"2\")\n}\n"]])
+	assert startsWith(one, "1\n") && startsWith(two, "2\n")
+}
