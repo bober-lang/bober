@@ -1614,11 +1614,13 @@ class Emitter {
 			else this.fnType(ret, [this.ref], ps)
 	}
 
-	/// Decl d as a function of type t, in this module or declared; a copy or one nested in a function local.
+	/// Decl d as a function of type t, in this module or declared; one nested in a function or a field's initializer
+	/// local, as only the unit of its owner names it (home), and without units a copy too.
 	private function(d: i32, t: IrType): Value {
 		const x = this.p.decls[d]
-		const f = this.b.function(this.symbol(d), t, this.onlyHere(this.copies.has(d)
-			|| this.here.has(d) && x.owner >= 0 && this.p.classOf(d) < 0 && (x.mods & decl.Export) == 0))
+		const nested = this.here.has(d) && x.owner >= 0
+			&& (this.p.classOf(d) < 0 && (x.mods & decl.Export) == 0 || x.kind == decl.Var)
+		const f = this.b.function(this.symbol(d), t, this.onlyHere(this.copies.has(d)) || nested)
 		const code = x.code()
 		if ((x.mods & decl.Outlined) != 0
 			|| this.facts.phase == "none" && code != null && code.ops.length >= this.o.tune.small) {
