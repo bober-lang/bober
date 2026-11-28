@@ -1623,3 +1623,13 @@ function main() {\n\tprint(\`${shown}\`)\n}\n`
 		["main.bob", main("m(): i32 { return 4 }", "\${h()} \${new A().m()}")]])
 	assert gone == "5 4\nlib.bob lib.bob:h main.bob main.bob:A main.bob:A.m main.bob:main" // and none held of I
 }
+
+test "a program reading an interface of a module holding only that, which main does not import, links at -O1 and as is" {
+	const mid = `import { N } from "./lib"\n\nclass B { n(): string { return "b" } }\n
+export function all(): N[] { return [new B()] }\n`
+	anew()
+	const fast = apart([["lib.bob", "export interface N { n(): string }\n"], ["mid.bob", mid],
+		["main.bob", "import { all } from \"./mid\"\n\nfunction main() {\n\tprint(`${all().map(x => x.n())}`)\n}\n"]])
+	const plain = built([], "")
+	assert startsWith(fast, "[\"b\"]\n") && plain == "[\"b\"]\n"
+}
