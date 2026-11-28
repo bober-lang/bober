@@ -669,10 +669,10 @@ __attribute__((noinline, cold)) static void *slow(int64_t n, int64_t size, int c
   return h;
 }
 
-/// Collects now if allocating n more bytes would, so that slow does not while they are allocated.
+/// Collects now if what was allocated would, so that slow does not while n more bytes are allocated.
 void bober_reserve(int64_t n) {
   if (h_.young + n <= h_.reserved) return;  // within what was reserved before, as bober's first 256 MiB
-  if (h_.young + n > every) collect(false);
+  if (h_.young > every) collect(false);
   h_.reserved = h_.young + n;
   if (n >= 2 << 20 && !collections) advise(MADV_HUGEPAGE);
 }
