@@ -1867,3 +1867,19 @@ function main() {\n\tconst k = [${k}]\n\tconst bs: Body[] = [new P()]\n\tprint(\
 	const [out, read, whole] = parted([["main.bob", main(2)]])
 	assert out == "1\no2\n" && read < whole
 }
+
+test "a test file is compiled anew once an alias it imports changed, which its code does not name" {
+	const [main, lib] = [`${home()}/alias.test.bob`, `${home()}/alias.bob`]
+	mkdirAll(home())
+	writeFile(main, `import { N } from "./alias"\n\ntest "t" {\n\tconst n: N = 1\n\tassert n == 1\n}\n`)
+	const ran = (t: string) => {
+		writeFile(lib, `export type N = ${t}\n`)
+		return runTests([main], [], new Compile())[0]()[0]
+	}
+	dir = `${home()}/build`
+	try {
+		assert ran("i32") == 0 && ran("string") == 1
+	} finally {
+		dir = "build"
+	}
+}

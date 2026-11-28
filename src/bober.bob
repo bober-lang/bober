@@ -794,12 +794,18 @@ function inputs(p: Program, main: i32): string[] {
 	return files
 }
 
-/// The modules of the program of p's module main: it, those of builtin/ every program holds, and those they import.
+/// The modules of the program of p's module main: it, those of builtin/ every program holds, and those they import or
+/// their code names (Module.deps), which a module imported for an alias alone is not.
 function imported(p: Program, main: i32): i32[] {
 	const ms = [main, ...always.map(b => p.module(b))]
 	let i = 0
 	while (i < ms.length) {
-		ms.push(...p.modules[ms[i]].deps.filter(d => !ms.includes(d)))
+		const x = p.modules[ms[i]]
+		for (const d of [...x.imports.map(y => y.module), ...x.deps]) {
+			if (!ms.includes(d)) {
+				ms.push(d)
+			}
+		}
 		i++
 	}
 	return ms
